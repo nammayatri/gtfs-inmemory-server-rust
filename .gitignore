@@ -1,0 +1,47 @@
+# Byte-compiled files
+__pycache__/
+*.pyc
+
+# Virtual environment
+*venv/
+env/
+
+# Environment variables
+*.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Mock data for testing
+mock-data/
+
+# Temporary files
+*.tmp
+*.temp

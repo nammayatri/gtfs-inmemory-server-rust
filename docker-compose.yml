@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  gtfs-routes-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GTFS_BASE_URL=http://localhost:8080
+      - GTFS_POLLING_INTERVAL=30
+      - GTFS_API_HOST=0.0.0.0
+      - GTFS_API_PORT=8000
+      - GTFS_MAX_RETRIES=3
+      - GTFS_RETRY_DELAY=5
+      - GTFS_CPU_THRESHOLD=80.0
+      - GTFS_MEMORY_THRESHOLD=5000
+      - RUST_LOG=info
+    volumes:
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - gtfs-network
+
+  # Optional: Add a mock GTFS server for testing
+  mock-gtfs-server:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./mock-data:/usr/share/nginx/html
+    networks:
+      - gtfs-network
+    profiles:
+      - test
+
+networks:
+  gtfs-network:
+    driver: bridge

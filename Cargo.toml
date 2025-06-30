@@ -1,0 +1,62 @@
+[package]
+name = "gtfs-routes-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "compression-full", "trace"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "gzip", "deflate"] }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Configuration
+config = "0.14"
+dotenv = "0.15"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL parsing and encoding
+url = "2.5"
+urlencoding = "2.1"
+
+# Hash computation
+sha2 = "0.10"
+
+# System information
+sysinfo = "0.30"
+
+# Rate limiting
+governor = "0.6"
+
+# Connection pooling
+deadpool = "0.12"
+
+# UUID generation
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Database support
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "uuid"] }
+async-trait = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
