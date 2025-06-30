@@ -1,6 +1,6 @@
-# GTFS Routes Service (Rust)
+# GTFS In Memory Service (Rust)
 
-A high-performance GTFS (General Transit Feed Specification) routes service written in Rust, providing real-time access to transit data with automatic polling and caching.
+A high-performance GTFS (General Transit Feed Specification) in memory service written in Rust, providing real-time access to transit data with automatic polling and caching.
 
 ## Features
 
