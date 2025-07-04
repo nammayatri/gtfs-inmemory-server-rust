@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 use chrono::{DateTime, Utc, NaiveDate};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -112,43 +113,34 @@ pub struct GTFSStop {
     pub cluster: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+pub struct GTFSRouteData {
+    pub mappings: Vec<Arc<RouteStopMapping>>,
+    pub by_route: HashMap<String, Vec<usize>>,
+    pub by_stop: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct GTFSData {
-    pub routes: BTreeMap<String, NandiRoutesRes>,
-    pub route_stop_map: BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>>,
-    pub stop_route_map: BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>>,
-    pub routes_by_gtfs: BTreeMap<String, BTreeMap<String, NandiRoutesRes>>,
-    pub children_by_parent: BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    pub data_hash: BTreeMap<String, String>,
+    pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
+    pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
+    pub children_by_parent: HashMap<String, HashMap<String, Vec<String>>>,
+    pub data_hash: HashMap<String, String>,
 }
 
 impl GTFSData {
     pub fn new() -> Self {
-        Self {
-            routes: BTreeMap::new(),
-            route_stop_map: BTreeMap::new(),
-            stop_route_map: BTreeMap::new(),
-            routes_by_gtfs: BTreeMap::new(),
-            children_by_parent: BTreeMap::new(),
-            data_hash: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     pub fn update_data(&mut self, temp_data: GTFSData) {
-        self.routes = temp_data.routes;
-        self.route_stop_map = temp_data.route_stop_map;
-        self.stop_route_map = temp_data.stop_route_map;
         self.routes_by_gtfs = temp_data.routes_by_gtfs;
+        self.route_data_by_gtfs = temp_data.route_data_by_gtfs;
         self.children_by_parent = temp_data.children_by_parent;
         self.data_hash = temp_data.data_hash;
     }
 }
 
-impl Default for GTFSData {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {

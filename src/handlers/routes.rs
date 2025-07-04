@@ -30,6 +30,7 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/ready", get(readiness_probe))
         .route("/version/:gtfs_id", get(get_version))
         .route("/vehicle/:vehicle_no/service-type", get(get_service_type_by_vehicle))
+        .route("/memory-stats", get(get_memory_stats))
         .with_state(app_state)
 }
 
@@ -203,4 +204,11 @@ async fn get_service_type_by_vehicle(
         schedule_no: Some(vehicle_data.schedule_no),
         last_updated: vehicle_data.last_updated,
     }))
+}
+
+async fn get_memory_stats(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let stats = app_state.gtfs_service.get_memory_stats().await;
+    Ok(Json(serde_json::json!(stats)))
 }

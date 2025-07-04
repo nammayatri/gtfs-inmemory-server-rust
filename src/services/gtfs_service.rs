@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -13,7 +13,7 @@ use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
     GTFSData, GTFSStop, LatLong, NandiPattern, NandiPatternDetails, 
-    NandiRoutesRes, RouteStopMapping, cast_vehicle_type, clean_identifier
+    NandiRoutesRes, RouteStopMapping, cast_vehicle_type, clean_identifier, GTFSRouteData
 };
 
 pub struct GTFSService {
@@ -89,11 +89,11 @@ impl GTFSService {
             &route_stop_counts
         );
 
-        // Build route and stop maps
-        let (route_stop_map, stop_route_map) = self.build_route_stop_maps(&pattern_details, &routes_by_gtfs);
+        // Build route data
+        let route_data_by_gtfs = self.build_route_data(&pattern_details, &routes_by_gtfs);
 
         // Update start and end points
-        self.update_start_end_points(&mut routes_by_gtfs, &route_stop_map);
+        self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
 
         // Fetch stops and build children mapping
         let stops = self.fetch_stops().await?;
@@ -102,8 +102,7 @@ impl GTFSService {
         // Compute data hashes
         let data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
 
-        temp_data.route_stop_map = route_stop_map;
-        temp_data.stop_route_map = stop_route_map;
+        temp_data.route_data_by_gtfs = route_data_by_gtfs;
         temp_data.routes_by_gtfs = routes_by_gtfs;
         temp_data.children_by_parent = children_by_parent;
         temp_data.data_hash = data_hash;
@@ -163,8 +162,8 @@ impl GTFSService {
         routes: Vec<NandiRoutesRes>,
         trip_counts: &HashMap<String, i32>,
         stop_counts: &HashMap<String, HashMap<String, usize>>,
-    ) -> BTreeMap<String, BTreeMap<String, NandiRoutesRes>> {
-        let mut routes_by_gtfs: BTreeMap<String, BTreeMap<String, NandiRoutesRes>> = BTreeMap::new();
+    ) -> HashMap<String, HashMap<String, NandiRoutesRes>> {
+        let mut routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>> = HashMap::new();
         for route in routes {
             let parts: Vec<&str> = route.id.split(':').collect();
             if parts.len() < 2 { continue; }
@@ -187,16 +186,12 @@ impl GTFSService {
         routes_by_gtfs
     }
 
-    fn build_route_stop_maps(
+    fn build_route_data(
         &self,
         pattern_details: &[NandiPatternDetails],
-        routes_by_gtfs: &BTreeMap<String, BTreeMap<String, NandiRoutesRes>>,
-    ) -> (
-        BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>>,
-        BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>>,
-    ) {
-        let mut route_stop_map: BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>> = BTreeMap::new();
-        let mut stop_route_map: BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>> = BTreeMap::new();
+        routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
+    ) -> HashMap<String, GTFSRouteData> {
+        let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
         for pattern in pattern_details {
             let parts: Vec<&str> = pattern.route_id.split(':').collect();
@@ -209,8 +204,10 @@ impl GTFSService {
                 .map(|route| route.mode.clone())
                 .unwrap_or_else(|| "UNKNOWN".to_string());
 
+            let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
+
             for (seq, stop) in pattern.stops.iter().enumerate() {
-                let mapping = RouteStopMapping {
+                let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
                     provider_code: "GTFS".to_string(),
                     route_code: route_code.to_string(),
@@ -219,35 +216,45 @@ impl GTFSService {
                     stop_name: stop.name.clone(),
                     stop_point: LatLong { lat: stop.lat, lon: stop.lon },
                     vehicle_type: vehicle_type.clone(),
-                };
-                route_stop_map.entry(gtfs_id.to_string()).or_default().entry(route_code.to_string()).or_default().push(mapping.clone());
-                stop_route_map.entry(gtfs_id.to_string()).or_default().entry(stop.code.clone()).or_default().push(mapping);
+                });
+
+                let mapping_idx = route_data.mappings.len();
+                route_data.mappings.push(mapping);
+
+                route_data.by_route.entry(route_code.to_string()).or_default().push(mapping_idx);
+                route_data.by_stop.entry(stop.code.clone()).or_default().push(mapping_idx);
             }
         }
-        (route_stop_map, stop_route_map)
+        route_data_by_gtfs
     }
 
     fn update_start_end_points(
         &self,
-        routes_by_gtfs: &mut BTreeMap<String, BTreeMap<String, NandiRoutesRes>>,
-        route_stop_map: &BTreeMap<String, BTreeMap<String, Vec<RouteStopMapping>>>,
+        routes_by_gtfs: &mut HashMap<String, HashMap<String, NandiRoutesRes>>,
+        route_data_by_gtfs: &HashMap<String, GTFSRouteData>,
     ) {
         for (gtfs_id, routes) in routes_by_gtfs.iter_mut() {
-            for (route_code, route) in routes.iter_mut() {
-                if let Some(stops) = route_stop_map.get(gtfs_id).and_then(|r| r.get(route_code)) {
-                    if let Some(first_stop) = stops.first() {
-                        route.start_point = Some(first_stop.stop_point.clone());
-                    }
-                    if let Some(last_stop) = stops.last() {
-                        route.end_point = Some(last_stop.stop_point.clone());
+            if let Some(route_data) = route_data_by_gtfs.get(gtfs_id) {
+                for (route_code, route) in routes.iter_mut() {
+                    if let Some(indices) = route_data.by_route.get(route_code) {
+                        if let Some(&first_idx) = indices.first() {
+                            if let Some(first_stop) = route_data.mappings.get(first_idx) {
+                                route.start_point = Some(first_stop.stop_point.clone());
+                            }
+                        }
+                        if let Some(&last_idx) = indices.last() {
+                            if let Some(last_stop) = route_data.mappings.get(last_idx) {
+                                route.end_point = Some(last_stop.stop_point.clone());
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    fn build_children_mapping(&self, stops: Vec<GTFSStop>) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
-        let mut children_by_parent: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    fn build_children_mapping(&self, stops: Vec<GTFSStop>) -> HashMap<String, HashMap<String, Vec<String>>> {
+        let mut children_by_parent: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         for stop in stops {
             if let Some(station_id) = &stop.station_id {
                 let gtfs_id = stop.id.split(':').next().unwrap_or_default();
@@ -261,7 +268,7 @@ impl GTFSService {
         children_by_parent
     }
 
-    fn compute_all_data_hashes(&self, routes_by_gtfs: &BTreeMap<String, BTreeMap<String, NandiRoutesRes>>) -> BTreeMap<String, String> {
+    fn compute_all_data_hashes(&self, routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>) -> HashMap<String, String> {
         routes_by_gtfs.iter().map(|(gtfs_id, routes)| {
             (gtfs_id.clone(), self.compute_data_hash(routes))
         }).collect()
@@ -324,7 +331,7 @@ impl GTFSService {
         Ok(false)
     }
 
-    fn compute_data_hash(&self, data: &BTreeMap<String, NandiRoutesRes>) -> String {
+    fn compute_data_hash(&self, data: &HashMap<String, NandiRoutesRes>) -> String {
         let json = serde_json::to_string(data).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
@@ -400,22 +407,65 @@ impl GTFSService {
 
     pub async fn get_route_stop_mapping_by_route(&self, gtfs_id: &str, route_code: &str) -> AppResult<Vec<RouteStopMapping>> {
         let data = self.data.read().await;
-        data.route_stop_map.get(clean_identifier(gtfs_id).as_str()).and_then(|r| r.get(clean_identifier(route_code).as_str())).cloned().ok_or_else(|| AppError::NotFound("Route not found".to_string()))
+        let gtfs_id = clean_identifier(gtfs_id);
+        let route_code = clean_identifier(route_code);
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
+            if let Some(indices) = route_data.by_route.get(&route_code) {
+                return Ok(indices
+                    .iter()
+                    .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
+                    .collect());
+            }
+        }
+        Err(AppError::NotFound("Route not found".to_string()))
     }
 
     pub async fn get_route_stop_mapping_by_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<Vec<RouteStopMapping>> {
         let data = self.data.read().await;
-        data.stop_route_map.get(clean_identifier(gtfs_id).as_str()).and_then(|s| s.get(clean_identifier(stop_code).as_str())).cloned().ok_or_else(|| AppError::NotFound("Stop not found".to_string()))
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = clean_identifier(stop_code);
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
+            if let Some(indices) = route_data.by_stop.get(&stop_code) {
+                return Ok(indices
+                    .iter()
+                    .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
+                    .collect());
+            }
+        }
+        Err(AppError::NotFound("Stop not found".to_string()))
     }
 
     pub async fn get_stops(&self, gtfs_id: &str) -> AppResult<Vec<RouteStopMapping>> {
         let data = self.data.read().await;
-        data.stop_route_map.get(clean_identifier(gtfs_id).as_str()).map(|s| s.values().filter_map(|m| m.first()).cloned().collect()).ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+        let gtfs_id = clean_identifier(gtfs_id);
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
+            return Ok(route_data
+                .mappings
+                .iter()
+                .map(|m| m.as_ref().clone())
+                .collect());
+        }
+        Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
 
     pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMapping> {
         let data = self.data.read().await;
-        data.stop_route_map.get(clean_identifier(gtfs_id).as_str()).and_then(|s| s.get(clean_identifier(stop_code).as_str())).and_then(|m| m.first()).cloned().ok_or_else(|| AppError::NotFound("Stop not found".to_string()))
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = clean_identifier(stop_code);
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
+            if let Some(indices) = route_data.by_stop.get(&stop_code) {
+                if let Some(&index) = indices.first() {
+                    if let Some(mapping) = route_data.mappings.get(index) {
+                        return Ok(mapping.as_ref().clone());
+                    }
+                }
+            }
+        }
+        Err(AppError::NotFound("Stop not found".to_string()))
     }
 
     pub async fn get_station_children(&self, gtfs_id: &str, stop_code: &str) -> AppResult<Vec<String>> {
@@ -426,5 +476,34 @@ impl GTFSService {
     pub async fn get_version(&self, gtfs_id: &str) -> AppResult<String> {
         let data = self.data.read().await;
         data.data_hash.get(clean_identifier(gtfs_id).as_str()).cloned().ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+    }
+
+    // Memory monitoring utility
+    pub async fn get_memory_stats(&self) -> std::collections::HashMap<String, usize> {
+        let data = self.data.read().await;
+        let mut stats = std::collections::HashMap::new();
+
+        stats.insert("routes_by_gtfs_count".to_string(), data.routes_by_gtfs.len());
+        stats.insert("route_data_by_gtfs_count".to_string(), data.route_data_by_gtfs.len());
+        stats.insert("children_by_parent_count".to_string(), data.children_by_parent.len());
+        stats.insert("data_hash_count".to_string(), data.data_hash.len());
+
+        let total_routes = data.routes_by_gtfs.values().map(|r| r.len()).sum::<usize>();
+        stats.insert("total_routes".to_string(), total_routes);
+
+        let (total_mappings, total_by_route, total_by_stop) =
+            data.route_data_by_gtfs.values().fold((0, 0, 0), |acc, d| {
+                (
+                    acc.0 + d.mappings.len(),
+                    acc.1 + d.by_route.len(),
+                    acc.2 + d.by_stop.len(),
+                )
+            });
+
+        stats.insert("total_mappings".to_string(), total_mappings);
+        stats.insert("total_by_route_keys".to_string(), total_by_route);
+        stats.insert("total_by_stop_keys".to_string(), total_by_stop);
+
+        stats
     }
 }
