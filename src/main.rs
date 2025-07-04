@@ -1,19 +1,19 @@
 use std::sync::Arc;
-use tracing::{info, error};
-use tracing_subscriber::{FmtSubscriber, EnvFilter};
+use tracing::{error, info};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 mod config;
+mod errors;
+mod handlers;
 mod models;
 mod services;
-mod handlers;
-mod errors;
 
 use config::AppConfig;
-use services::{
-    gtfs_service::GTFSService,
-    db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
-};
 use handlers::routes;
+use services::{
+    db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
+    gtfs_service::GTFSService,
+};
 use tower_http::trace::TraceLayer;
 
 #[derive(Clone)]
@@ -40,8 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .with_line_number(true)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     info!("Starting GTFS Routes Service...");
 
@@ -92,12 +91,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create and run the web server
-    let app = routes::create_router(app_state)
-        .layer(TraceLayer::new_for_http());
-    
+    let app = routes::create_router(app_state).layer(TraceLayer::new_for_http());
+
     info!("Starting server on {}:{}", config.api_host, config.api_port);
-    
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", config.api_host, config.api_port)).await?;
+
+    let listener =
+        tokio::net::TcpListener::bind(format!("{}:{}", config.api_host, config.api_port)).await?;
     axum::serve(listener, app).await?;
 
     Ok(())

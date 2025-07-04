@@ -1,7 +1,7 @@
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{DateTime, Utc, NaiveDate};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleData {
@@ -141,7 +141,6 @@ impl GTFSData {
     }
 }
 
-
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {
         "METRO".to_string()
@@ -152,9 +151,8 @@ pub fn cast_vehicle_type(vehicle_type: &str) -> String {
 
 pub fn clean_identifier(identifier: &str) -> String {
     // URL decode and remove GTFS ID prefix if present
-    let decoded = urlencoding::decode(identifier)
-        .unwrap_or_else(|_| identifier.to_string().into());
-    
+    let decoded = urlencoding::decode(identifier).unwrap_or_else(|_| identifier.to_string().into());
+
     // Remove GTFS ID prefix if present (format: gtfs_id:code)
     decoded.split(':').last().unwrap_or(&decoded).to_string()
 }

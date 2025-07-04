@@ -1,19 +1,19 @@
+use chrono::{DateTime, Utc};
+use futures::future::join_all;
+use serde_json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
-use chrono::{DateTime, Utc};
-use futures::future::join_all;
-use sha2::{Sha256, Digest};
-use serde_json;
 
 use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
-    GTFSData, GTFSStop, LatLong, NandiPattern, NandiPatternDetails, 
-    NandiRoutesRes, RouteStopMapping, cast_vehicle_type, clean_identifier, GTFSRouteData
+    cast_vehicle_type, clean_identifier, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
+    NandiPatternDetails, NandiRoutesRes, RouteStopMapping,
 };
 
 pub struct GTFSService {
@@ -41,25 +41,25 @@ impl GTFSService {
         };
 
         service.load_initial_data().await?;
-        
+
         Ok(service)
     }
 
     async fn load_initial_data(&self) -> AppResult<()> {
         info!("Loading initial GTFS data...");
         let start_time = std::time::Instant::now();
-        
+
         let temp_data = self.fetch_and_process_data().await?;
-        
+
         let mut data = self.data.write().await;
         data.update_data(temp_data);
-        
+
         let mut is_ready = self.is_ready.write().await;
         *is_ready = true;
-        
+
         let mut last_update = self.last_update.write().await;
         *last_update = Utc::now();
-        
+
         let duration = start_time.elapsed();
         info!("Initial data load complete in {:?}", duration);
         Ok(())
@@ -83,11 +83,8 @@ impl GTFSService {
 
         // Fetch routes
         let routes = self.fetch_routes().await?;
-        let mut routes_by_gtfs = self.build_routes_by_gtfs(
-            routes, 
-            &route_trip_counts, 
-            &route_stop_counts
-        );
+        let mut routes_by_gtfs =
+            self.build_routes_by_gtfs(routes, &route_trip_counts, &route_stop_counts);
 
         // Build route data
         let route_data_by_gtfs = self.build_route_data(&pattern_details, &routes_by_gtfs);
@@ -110,7 +107,10 @@ impl GTFSService {
         Ok(temp_data)
     }
 
-    async fn fetch_pattern_details_batch(&self, patterns: &[NandiPattern]) -> AppResult<Vec<NandiPatternDetails>> {
+    async fn fetch_pattern_details_batch(
+        &self,
+        patterns: &[NandiPattern],
+    ) -> AppResult<Vec<NandiPatternDetails>> {
         let mut pattern_details = Vec::new();
         let chunks = patterns.chunks(self.config.process_batch_size);
 
@@ -128,33 +128,51 @@ impl GTFSService {
         Ok(pattern_details)
     }
 
-    fn calculate_trip_counts(&self, pattern_details: &[NandiPatternDetails]) -> HashMap<String, i32> {
+    fn calculate_trip_counts(
+        &self,
+        pattern_details: &[NandiPatternDetails],
+    ) -> HashMap<String, i32> {
         let mut counts = HashMap::new();
         for details in pattern_details {
-            let route_code = details.route_id.split(':').last().unwrap_or(&details.route_id);
+            let route_code = details
+                .route_id
+                .split(':')
+                .last()
+                .unwrap_or(&details.route_id);
             *counts.entry(route_code.to_string()).or_insert(0) += details.trips.len() as i32;
         }
         counts
     }
 
-    fn calculate_stop_counts(&self, pattern_details: &[NandiPatternDetails]) -> HashMap<String, HashMap<String, usize>> {
+    fn calculate_stop_counts(
+        &self,
+        pattern_details: &[NandiPatternDetails],
+    ) -> HashMap<String, HashMap<String, usize>> {
         let mut counts: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
         for details in pattern_details {
             let parts: Vec<&str> = details.route_id.split(':').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let gtfs_id = parts[0];
             let route_code = parts[1];
 
-            let stop_codes = details.stops.iter().map(|s| s.code.clone()).collect::<HashSet<String>>();
-            counts.entry(gtfs_id.to_string())
-                  .or_default()
-                  .entry(route_code.to_string())
-                  .or_default()
-                  .extend(stop_codes);
+            let stop_codes = details
+                .stops
+                .iter()
+                .map(|s| s.code.clone())
+                .collect::<HashSet<String>>();
+            counts
+                .entry(gtfs_id.to_string())
+                .or_default()
+                .entry(route_code.to_string())
+                .or_default()
+                .extend(stop_codes);
         }
-        counts.into_iter().map(|(k, v)| {
-            (k, v.into_iter().map(|(k2, v2)| (k2, v2.len())).collect())
-        }).collect()
+        counts
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(|(k2, v2)| (k2, v2.len())).collect()))
+            .collect()
     }
 
     fn build_routes_by_gtfs(
@@ -166,7 +184,9 @@ impl GTFSService {
         let mut routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>> = HashMap::new();
         for route in routes {
             let parts: Vec<&str> = route.id.split(':').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let gtfs_id = parts[0];
             let route_code = parts[1];
 
@@ -177,11 +197,18 @@ impl GTFSService {
                 mode: cast_vehicle_type(&route.mode),
                 agency_name: route.agency_name,
                 trip_count: trip_counts.get(route_code).copied(),
-                stop_count: stop_counts.get(gtfs_id).and_then(|r| r.get(route_code)).copied().map(|c| c as i32),
+                stop_count: stop_counts
+                    .get(gtfs_id)
+                    .and_then(|r| r.get(route_code))
+                    .copied()
+                    .map(|c| c as i32),
                 start_point: None,
                 end_point: None,
             };
-            routes_by_gtfs.entry(gtfs_id.to_string()).or_default().insert(route_code.to_string(), route_res);
+            routes_by_gtfs
+                .entry(gtfs_id.to_string())
+                .or_default()
+                .insert(route_code.to_string(), route_res);
         }
         routes_by_gtfs
     }
@@ -195,11 +222,14 @@ impl GTFSService {
 
         for pattern in pattern_details {
             let parts: Vec<&str> = pattern.route_id.split(':').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let gtfs_id = parts[0];
             let route_code = parts[1];
 
-            let vehicle_type = routes_by_gtfs.get(gtfs_id)
+            let vehicle_type = routes_by_gtfs
+                .get(gtfs_id)
                 .and_then(|r| r.get(route_code))
                 .map(|route| route.mode.clone())
                 .unwrap_or_else(|| "UNKNOWN".to_string());
@@ -214,15 +244,26 @@ impl GTFSService {
                     sequence_num: seq as i32,
                     stop_code: stop.code.clone(),
                     stop_name: stop.name.clone(),
-                    stop_point: LatLong { lat: stop.lat, lon: stop.lon },
+                    stop_point: LatLong {
+                        lat: stop.lat,
+                        lon: stop.lon,
+                    },
                     vehicle_type: vehicle_type.clone(),
                 });
 
                 let mapping_idx = route_data.mappings.len();
                 route_data.mappings.push(mapping);
 
-                route_data.by_route.entry(route_code.to_string()).or_default().push(mapping_idx);
-                route_data.by_stop.entry(stop.code.clone()).or_default().push(mapping_idx);
+                route_data
+                    .by_route
+                    .entry(route_code.to_string())
+                    .or_default()
+                    .push(mapping_idx);
+                route_data
+                    .by_stop
+                    .entry(stop.code.clone())
+                    .or_default()
+                    .push(mapping_idx);
             }
         }
         route_data_by_gtfs
@@ -253,7 +294,10 @@ impl GTFSService {
         }
     }
 
-    fn build_children_mapping(&self, stops: Vec<GTFSStop>) -> HashMap<String, HashMap<String, Vec<String>>> {
+    fn build_children_mapping(
+        &self,
+        stops: Vec<GTFSStop>,
+    ) -> HashMap<String, HashMap<String, Vec<String>>> {
         let mut children_by_parent: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         for stop in stops {
             if let Some(station_id) = &stop.station_id {
@@ -261,17 +305,26 @@ impl GTFSService {
                 let stop_code = stop.id.split(':').last().unwrap_or_default();
                 let parent_code = station_id.split(':').last().unwrap_or_default();
                 if !gtfs_id.is_empty() && !stop_code.is_empty() && !parent_code.is_empty() {
-                    children_by_parent.entry(gtfs_id.to_string()).or_default().entry(parent_code.to_string()).or_default().push(stop_code.to_string());
+                    children_by_parent
+                        .entry(gtfs_id.to_string())
+                        .or_default()
+                        .entry(parent_code.to_string())
+                        .or_default()
+                        .push(stop_code.to_string());
                 }
             }
         }
         children_by_parent
     }
 
-    fn compute_all_data_hashes(&self, routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>) -> HashMap<String, String> {
-        routes_by_gtfs.iter().map(|(gtfs_id, routes)| {
-            (gtfs_id.clone(), self.compute_data_hash(routes))
-        }).collect()
+    fn compute_all_data_hashes(
+        &self,
+        routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
+    ) -> HashMap<String, String> {
+        routes_by_gtfs
+            .iter()
+            .map(|(gtfs_id, routes)| (gtfs_id.clone(), self.compute_data_hash(routes)))
+            .collect()
     }
 
     pub async fn start_polling(&self) -> AppResult<()> {
@@ -294,7 +347,7 @@ impl GTFSService {
                     info!("Changes detected, updating data...");
                     let mut data = self.data.write().await;
                     data.update_data(new_data);
-                    
+
                     let mut last_update = self.last_update.write().await;
                     *last_update = Utc::now();
                     let duration = start_time.elapsed();
@@ -351,22 +404,35 @@ impl GTFSService {
             match self.http_client.get(url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        return response.json::<T>().await.map_err(|e| AppError::Internal(format!("Failed to deserialize response: {}", e)));
+                        return response.json::<T>().await.map_err(|e| {
+                            AppError::Internal(format!("Failed to deserialize response: {}", e))
+                        });
                     } else if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after = response.headers().get("Retry-After").and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(self.config.retry_delay);
+                        let retry_after = response
+                            .headers()
+                            .get("Retry-After")
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(self.config.retry_delay);
                         warn!("Rate limited, waiting {} seconds", retry_after);
                         sleep(Duration::from_secs(retry_after)).await;
                     } else {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
                         error!("HTTP request failed with status {}: {}", status, body);
-                        return Err(AppError::Internal(format!("HTTP request failed: {} - {}", status, body)));
+                        return Err(AppError::Internal(format!(
+                            "HTTP request failed: {} - {}",
+                            status, body
+                        )));
                     }
                 }
                 Err(e) => {
                     error!("Error fetching {}: {}", url, e);
                     if attempt < self.config.max_retries - 1 {
-                        sleep(Duration::from_secs(self.config.retry_delay * (attempt as u64 + 1))).await;
+                        sleep(Duration::from_secs(
+                            self.config.retry_delay * (attempt as u64 + 1),
+                        ))
+                        .await;
                     } else {
                         return Err(AppError::HttpRequest(e));
                     }
@@ -377,12 +443,18 @@ impl GTFSService {
     }
 
     async fn fetch_patterns(&self) -> AppResult<Vec<NandiPattern>> {
-        let url = format!("{}/otp/routers/default/index/patterns", self.config.base_url);
+        let url = format!(
+            "{}/otp/routers/default/index/patterns",
+            self.config.base_url
+        );
         self.fetch_with_retry(&url).await
     }
 
     async fn fetch_pattern_details(&self, pattern_id: &str) -> AppResult<NandiPatternDetails> {
-        let url = format!("{}/otp/routers/default/index/patterns/{}", self.config.base_url, pattern_id);
+        let url = format!(
+            "{}/otp/routers/default/index/patterns/{}",
+            self.config.base_url, pattern_id
+        );
         self.fetch_with_retry(&url).await
     }
 
@@ -402,15 +474,26 @@ impl GTFSService {
 
     pub async fn get_route(&self, gtfs_id: &str, route_id: &str) -> AppResult<NandiRoutesRes> {
         let data = self.data.read().await;
-        data.routes_by_gtfs.get(clean_identifier(gtfs_id).as_str()).and_then(|r| r.get(clean_identifier(route_id).as_str())).cloned().ok_or_else(|| AppError::NotFound("Route not found".to_string()))
+        data.routes_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+            .and_then(|r| r.get(clean_identifier(route_id).as_str()))
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("Route not found".to_string()))
     }
 
     pub async fn get_routes(&self, gtfs_id: &str) -> AppResult<Vec<NandiRoutesRes>> {
         let data = self.data.read().await;
-        data.routes_by_gtfs.get(clean_identifier(gtfs_id).as_str()).map(|r| r.values().cloned().collect()).ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+        data.routes_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+            .map(|r| r.values().cloned().collect())
+            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_route_stop_mapping_by_route(&self, gtfs_id: &str, route_code: &str) -> AppResult<Vec<RouteStopMapping>> {
+    pub async fn get_route_stop_mapping_by_route(
+        &self,
+        gtfs_id: &str,
+        route_code: &str,
+    ) -> AppResult<Vec<RouteStopMapping>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let route_code = clean_identifier(route_code);
@@ -426,7 +509,11 @@ impl GTFSService {
         Err(AppError::NotFound("Route not found".to_string()))
     }
 
-    pub async fn get_route_stop_mapping_by_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<Vec<RouteStopMapping>> {
+    pub async fn get_route_stop_mapping_by_stop(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<Vec<RouteStopMapping>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
@@ -473,14 +560,26 @@ impl GTFSService {
         Err(AppError::NotFound("Stop not found".to_string()))
     }
 
-    pub async fn get_station_children(&self, gtfs_id: &str, stop_code: &str) -> AppResult<Vec<String>> {
+    pub async fn get_station_children(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<Vec<String>> {
         let data = self.data.read().await;
-        Ok(data.children_by_parent.get(clean_identifier(gtfs_id).as_str()).and_then(|p| p.get(clean_identifier(stop_code).as_str())).cloned().unwrap_or_default())
+        Ok(data
+            .children_by_parent
+            .get(clean_identifier(gtfs_id).as_str())
+            .and_then(|p| p.get(clean_identifier(stop_code).as_str()))
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn get_version(&self, gtfs_id: &str) -> AppResult<String> {
         let data = self.data.read().await;
-        data.data_hash.get(clean_identifier(gtfs_id).as_str()).cloned().ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+        data.data_hash
+            .get(clean_identifier(gtfs_id).as_str())
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
     // Memory monitoring utility
@@ -488,9 +587,18 @@ impl GTFSService {
         let data = self.data.read().await;
         let mut stats = std::collections::HashMap::new();
 
-        stats.insert("routes_by_gtfs_count".to_string(), data.routes_by_gtfs.len());
-        stats.insert("route_data_by_gtfs_count".to_string(), data.route_data_by_gtfs.len());
-        stats.insert("children_by_parent_count".to_string(), data.children_by_parent.len());
+        stats.insert(
+            "routes_by_gtfs_count".to_string(),
+            data.routes_by_gtfs.len(),
+        );
+        stats.insert(
+            "route_data_by_gtfs_count".to_string(),
+            data.route_data_by_gtfs.len(),
+        );
+        stats.insert(
+            "children_by_parent_count".to_string(),
+            data.children_by_parent.len(),
+        );
         stats.insert("data_hash_count".to_string(), data.data_hash.len());
 
         let total_routes = data.routes_by_gtfs.values().map(|r| r.len()).sum::<usize>();
@@ -520,20 +628,21 @@ impl GTFSService {
         operation_name: Option<String>,
     ) -> AppResult<serde_json::Value> {
         let url = format!("{}/otp/gtfs/v1", self.config.base_url);
-        
+
         let mut request_body = serde_json::json!({
             "query": query
         });
-        
+
         if let Some(vars) = variables {
             request_body["variables"] = vars;
         }
-        
+
         if let Some(op_name) = operation_name {
             request_body["operationName"] = serde_json::Value::String(op_name);
         }
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&request_body)
@@ -542,13 +651,17 @@ impl GTFSService {
             .map_err(|e| AppError::HttpRequest(e))?;
 
         if response.status().is_success() {
-            let result: serde_json::Value = response.json().await
-                .map_err(|e| AppError::Internal(format!("Failed to deserialize GraphQL response: {}", e)))?;
+            let result: serde_json::Value = response.json().await.map_err(|e| {
+                AppError::Internal(format!("Failed to deserialize GraphQL response: {}", e))
+            })?;
             Ok(result)
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!("GraphQL request failed: {} - {}", status, body)))
+            Err(AppError::Internal(format!(
+                "GraphQL request failed: {} - {}",
+                status, body
+            )))
         }
     }
 }

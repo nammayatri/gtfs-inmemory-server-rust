@@ -1,5 +1,5 @@
+use anyhow::{Context, Result};
 use std::env;
-use anyhow::{Result, Context};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -33,7 +33,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "3600".to_string())
                 .parse()
                 .context("Failed to parse CACHE_DURATION")?,
-            base_url: env::var("GTFS_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            base_url: env::var("GTFS_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             polling_interval: env::var("GTFS_POLLING_INTERVAL")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()

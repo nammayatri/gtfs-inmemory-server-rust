@@ -14,7 +14,8 @@ use crate::models::VehicleData;
 pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicle_data(&self, vehicle_no: &str) -> AppResult<VehicleData>;
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>>;
-    async fn get_vehicles_by_service_type(&self, service_type: &str) -> AppResult<Vec<VehicleData>>;
+    async fn get_vehicles_by_service_type(&self, service_type: &str)
+        -> AppResult<Vec<VehicleData>>;
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicle_count(&self) -> AppResult<i64>;
 }
@@ -31,23 +32,36 @@ impl MockDBVehicleReader {
 #[async_trait]
 impl VehicleDataReader for MockDBVehicleReader {
     async fn get_vehicle_data(&self, _vehicle_no: &str) -> AppResult<VehicleData> {
-        Err(AppError::NotFound("Database is not connected in local testing mode.".to_string()))
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>> {
-        Err(AppError::NotFound("Database is not connected in local testing mode.".to_string()))
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 
-    async fn get_vehicles_by_service_type(&self, _service_type: &str) -> AppResult<Vec<VehicleData>> {
-        Err(AppError::NotFound("Database is not connected in local testing mode.".to_string()))
+    async fn get_vehicles_by_service_type(
+        &self,
+        _service_type: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 
     async fn search_vehicles(&self, _query: &str) -> AppResult<Vec<VehicleData>> {
-        Err(AppError::NotFound("Database is not connected in local testing mode.".to_string()))
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 
     async fn get_vehicle_count(&self) -> AppResult<i64> {
-        Err(AppError::NotFound("Database is not connected in local testing mode.".to_string()))
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 }
 
@@ -59,7 +73,10 @@ pub struct DBVehicleReader {
 
 impl DBVehicleReader {
     pub async fn new(config: &AppConfig) -> AppResult<Self> {
-        let db_url = config.database_url.as_ref().ok_or_else(|| AppError::Internal("DATABASE_URL is not set".to_string()))?;
+        let db_url = config
+            .database_url
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("DATABASE_URL is not set".to_string()))?;
         let pool = PgPoolOptions::new()
             .max_connections(config.db_max_connections)
             .connect(db_url)
@@ -143,7 +160,10 @@ impl VehicleDataReader for DBVehicleReader {
             .map_err(|e| AppError::DbError(e.to_string()))
     }
 
-    async fn get_vehicles_by_service_type(&self, service_type: &str) -> AppResult<Vec<VehicleData>> {
+    async fn get_vehicles_by_service_type(
+        &self,
+        service_type: &str,
+    ) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
               waybill_id, service_type, vehicle_no, schedule_no, updated_at as last_updated, duty_date
@@ -177,10 +197,11 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_vehicle_count(&self) -> AppResult<i64> {
-        let row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        let row =
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
         Ok(row.0)
     }
 }
