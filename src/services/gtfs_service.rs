@@ -511,4 +511,44 @@ impl GTFSService {
 
         stats
     }
+
+    // GraphQL query execution
+    pub async fn execute_graphql_query(
+        &self,
+        query: &str,
+        variables: Option<serde_json::Value>,
+        operation_name: Option<String>,
+    ) -> AppResult<serde_json::Value> {
+        let url = format!("{}/otp/gtfs/v1", self.config.base_url);
+        
+        let mut request_body = serde_json::json!({
+            "query": query
+        });
+        
+        if let Some(vars) = variables {
+            request_body["variables"] = vars;
+        }
+        
+        if let Some(op_name) = operation_name {
+            request_body["operationName"] = serde_json::Value::String(op_name);
+        }
+
+        let response = self.http_client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| AppError::HttpRequest(e))?;
+
+        if response.status().is_success() {
+            let result: serde_json::Value = response.json().await
+                .map_err(|e| AppError::Internal(format!("Failed to deserialize GraphQL response: {}", e)))?;
+            Ok(result)
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(AppError::Internal(format!("GraphQL request failed: {} - {}", status, body)))
+        }
+    }
 }
