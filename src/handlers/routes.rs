@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     response::Json,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;
@@ -31,6 +31,7 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/version/:gtfs_id", get(get_version))
         .route("/vehicle/:vehicle_no/service-type", get(get_service_type_by_vehicle))
         .route("/memory-stats", get(get_memory_stats))
+        .route("/graphql", post(graphql_query))
         .with_state(app_state)
 }
 
@@ -211,4 +212,19 @@ async fn get_memory_stats(
 ) -> AppResult<Json<serde_json::Value>> {
     let stats = app_state.gtfs_service.get_memory_stats().await;
     Ok(Json(serde_json::json!(stats)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GraphQLRequest {
+    query: String,
+    variables: Option<serde_json::Value>,
+    operation_name: Option<String>,
+}
+
+async fn graphql_query(
+    State(app_state): State<AppState>,
+    Json(payload): Json<GraphQLRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let result = app_state.gtfs_service.execute_graphql_query(&payload.query, payload.variables, payload.operation_name).await?;
+    Ok(Json(result))
 }
