@@ -535,9 +535,10 @@ impl GTFSService {
 
         if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
             return Ok(route_data
-                .mappings
-                .iter()
-                .map(|m| m.as_ref().clone())
+                .by_stop
+                .values()
+                .filter_map(|indices| indices.first())
+                .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
                 .collect());
         }
         Err(AppError::NotFound("GTFS ID not found".to_string()))
