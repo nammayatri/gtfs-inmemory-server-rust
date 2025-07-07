@@ -3,6 +3,8 @@ FROM rustlang/rust:nightly-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
+    curl \
+    htop \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
