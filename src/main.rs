@@ -13,6 +13,7 @@ use handlers::routes;
 use services::{
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
     gtfs_service::GTFSService,
+    otp_manager::OtpManager,
 };
 use tower_http::trace::TraceLayer;
 
@@ -20,6 +21,7 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
+    pub otp_manager: Arc<OtpManager>,
 }
 
 #[tokio::main]
@@ -84,10 +86,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Initialize OTP manager
+    let otp_manager = Arc::new(OtpManager::new(config.otp_instances.clone()));
+    info!("OTP manager initialized");
+
     // Create application state
     let app_state = AppState {
         gtfs_service,
         db_vehicle_reader,
+        otp_manager,
     };
 
     // Create and run the web server

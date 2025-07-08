@@ -257,15 +257,22 @@ struct GraphQLRequest {
     query: String,
     variables: Option<serde_json::Value>,
     operation_name: Option<String>,
+    city: Option<String>,
 }
 
 async fn graphql_query(
     State(app_state): State<AppState>,
     Json(payload): Json<GraphQLRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let city = payload.city.unwrap_or_else(|| "default".to_string());
     let result = app_state
         .gtfs_service
-        .execute_graphql_query(&payload.query, payload.variables, payload.operation_name)
+        .execute_graphql_query(
+            &city,
+            &payload.query,
+            payload.variables,
+            payload.operation_name,
+        )
         .await?;
     Ok(Json(result))
 }

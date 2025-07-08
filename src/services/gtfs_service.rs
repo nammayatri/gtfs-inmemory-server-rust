@@ -67,34 +67,40 @@ impl GTFSService {
 
     async fn fetch_and_process_data(&self) -> AppResult<GTFSData> {
         let mut temp_data = GTFSData::new();
+        let mut all_pattern_details = Vec::new();
+        let mut all_routes = Vec::new();
+        let mut all_stops = Vec::new();
 
-        // Fetch patterns
-        let patterns = self.fetch_patterns().await?;
-        info!("Fetched {} patterns", patterns.len());
-
-        // Fetch pattern details in batches
-        let pattern_details = self.fetch_pattern_details_batch(&patterns).await?;
+        for otp_instance in &self.config.otp_instances {
+            let base_url = &otp_instance.url;
+            let patterns = self.fetch_patterns(base_url).await?;
+            let pattern_details = self
+                .fetch_pattern_details_batch(base_url, &patterns)
+                .await?;
+            all_pattern_details.extend(pattern_details);
+            all_routes.extend(self.fetch_routes(base_url).await?);
+            all_stops.extend(self.fetch_stops(base_url).await?);
+        }
+        info!("Fetched {} patterns", all_pattern_details.len());
 
         // Calculate trip counts
-        let route_trip_counts = self.calculate_trip_counts(&pattern_details);
+        let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
         // Calculate stop counts
-        let route_stop_counts = self.calculate_stop_counts(&pattern_details);
+        let route_stop_counts = self.calculate_stop_counts(&all_pattern_details);
 
         // Fetch routes
-        let routes = self.fetch_routes().await?;
         let mut routes_by_gtfs =
-            self.build_routes_by_gtfs(routes, &route_trip_counts, &route_stop_counts);
+            self.build_routes_by_gtfs(all_routes, &route_trip_counts, &route_stop_counts);
 
         // Build route data
-        let route_data_by_gtfs = self.build_route_data(&pattern_details, &routes_by_gtfs);
+        let route_data_by_gtfs = self.build_route_data(&all_pattern_details, &routes_by_gtfs);
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
 
         // Fetch stops and build children mapping
-        let stops = self.fetch_stops().await?;
-        let children_by_parent = self.build_children_mapping(stops);
+        let children_by_parent = self.build_children_mapping(all_stops);
 
         // Compute data hashes
         let data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
@@ -109,13 +115,16 @@ impl GTFSService {
 
     async fn fetch_pattern_details_batch(
         &self,
+        base_url: &str,
         patterns: &[NandiPattern],
     ) -> AppResult<Vec<NandiPatternDetails>> {
         let mut pattern_details = Vec::new();
         let chunks = patterns.chunks(self.config.process_batch_size);
 
         for chunk in chunks {
-            let futures = chunk.iter().map(|p| self.fetch_pattern_details(&p.id));
+            let futures = chunk
+                .iter()
+                .map(|p| self.fetch_pattern_details(base_url, &p.id));
             let results = join_all(futures).await;
 
             for result in results {
@@ -442,29 +451,30 @@ impl GTFSService {
         Err(AppError::Internal("All retry attempts failed".to_string()))
     }
 
-    async fn fetch_patterns(&self) -> AppResult<Vec<NandiPattern>> {
-        let url = format!(
-            "{}/otp/routers/default/index/patterns",
-            self.config.base_url
-        );
+    async fn fetch_patterns(&self, base_url: &str) -> AppResult<Vec<NandiPattern>> {
+        let url = format!("{}/otp/routers/default/index/patterns", base_url);
         self.fetch_with_retry(&url).await
     }
 
-    async fn fetch_pattern_details(&self, pattern_id: &str) -> AppResult<NandiPatternDetails> {
+    async fn fetch_pattern_details(
+        &self,
+        base_url: &str,
+        pattern_id: &str,
+    ) -> AppResult<NandiPatternDetails> {
         let url = format!(
             "{}/otp/routers/default/index/patterns/{}",
-            self.config.base_url, pattern_id
+            base_url, pattern_id
         );
         self.fetch_with_retry(&url).await
     }
 
-    async fn fetch_routes(&self) -> AppResult<Vec<NandiRoutesRes>> {
-        let url = format!("{}/otp/routers/default/index/routes", self.config.base_url);
+    async fn fetch_routes(&self, base_url: &str) -> AppResult<Vec<NandiRoutesRes>> {
+        let url = format!("{}/otp/routers/default/index/routes", base_url);
         self.fetch_with_retry(&url).await
     }
 
-    async fn fetch_stops(&self) -> AppResult<Vec<GTFSStop>> {
-        let url = format!("{}/otp/routers/default/index/stops", self.config.base_url);
+    async fn fetch_stops(&self, base_url: &str) -> AppResult<Vec<GTFSStop>> {
+        let url = format!("{}/otp/routers/default/index/stops", base_url);
         self.fetch_with_retry(&url).await
     }
 
@@ -624,11 +634,19 @@ impl GTFSService {
     // GraphQL query execution
     pub async fn execute_graphql_query(
         &self,
+        city: &str,
         query: &str,
         variables: Option<serde_json::Value>,
         operation_name: Option<String>,
     ) -> AppResult<serde_json::Value> {
-        let url = format!("{}/otp/gtfs/v1", self.config.base_url);
+        let instance = self
+            .config
+            .otp_instances
+            .iter()
+            .find(|c| c.name == city)
+            .ok_or_else(|| AppError::NotFound(format!("City '{}' not found", city)))?;
+
+        let url = format!("{}/otp/gtfs/v1", instance.url);
 
         let mut request_body = serde_json::json!({
             "query": query

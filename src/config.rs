@@ -2,11 +2,17 @@ use anyhow::{Context, Result};
 use std::env;
 
 #[derive(Debug, Clone)]
+pub struct OtpConfig {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub database_url: Option<String>,
     pub db_max_connections: u32,
     pub cache_duration: u64,
-    pub base_url: String,
+    pub otp_instances: Vec<OtpConfig>,
     pub polling_interval: u64,
     pub process_batch_size: usize,
     pub api_host: String,
@@ -33,8 +39,23 @@ impl AppConfig {
                 .unwrap_or_else(|_| "3600".to_string())
                 .parse()
                 .context("Failed to parse CACHE_DURATION")?,
-            base_url: env::var("GTFS_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            otp_instances: env::var("OTP_INSTANCES")
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|pair| {
+                            let mut parts = pair.splitn(2, '-');
+                            let name = parts.next()?.trim().to_string();
+                            let url = parts.next()?.trim().to_string();
+                            Some(OtpConfig { name, url })
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|_| {
+                    vec![OtpConfig {
+                        name: "default".to_string(),
+                        url: "http://localhost:8080".to_string(),
+                    }]
+                }),
             polling_interval: env::var("GTFS_POLLING_INTERVAL")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
