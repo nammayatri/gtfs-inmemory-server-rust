@@ -1,10 +1,13 @@
 use chrono::{DateTime, Utc};
+use csv::ReaderBuilder;
 use futures::future::join_all;
 use serde_json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -13,7 +16,7 @@ use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
     cast_vehicle_type, clean_identifier, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
-    NandiPatternDetails, NandiRoutesRes, RouteStopMapping,
+    NandiPatternDetails, NandiRoutesRes, RouteStopMapping, RouteStopMappingWithGeojson, StopGeojson,
 };
 
 pub struct GTFSService {
@@ -82,6 +85,10 @@ impl GTFSService {
             all_stops.extend(self.fetch_stops(base_url).await?);
         }
         info!("Fetched {} patterns", all_pattern_details.len());
+        
+         // Read stop geojsons CSV file
+         let stop_geojsons = self.read_stop_geojsons_csv().await?;
+         info!("Loaded {} stop geojsons from CSV", stop_geojsons.len());
 
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
@@ -109,8 +116,46 @@ impl GTFSService {
         temp_data.routes_by_gtfs = routes_by_gtfs;
         temp_data.children_by_parent = children_by_parent;
         temp_data.data_hash = data_hash;
+        temp_data.stop_geojsons = stop_geojsons;
 
         Ok(temp_data)
+    }
+
+    async fn read_stop_geojsons_csv(&self) -> AppResult<HashMap<String, StopGeojson>> {
+        let file_path = "stop_geojsons.csv";
+        
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("stop_geojsons.csv file not found, proceeding without geojson data");
+                return Ok(HashMap::new());
+            }
+        };
+        
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+        
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+        
+        let mut stop_geojsons = HashMap::new();
+        
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let geojson: StopGeojson = record;
+                    stop_geojsons.insert(geojson.stop_code.clone(), geojson);
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+        
+        Ok(stop_geojsons)
     }
 
     async fn fetch_pattern_details_batch(
@@ -554,7 +599,7 @@ impl GTFSService {
         Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMapping> {
+    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMappingWithGeojson> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
@@ -563,7 +608,24 @@ impl GTFSService {
             if let Some(indices) = route_data.by_stop.get(&stop_code) {
                 if let Some(&index) = indices.first() {
                     if let Some(mapping) = route_data.mappings.get(index) {
-                        return Ok(mapping.as_ref().clone());
+                        // Find geojson for this stop from the CSV data
+                        let stop_geojson = data.stop_geojsons.get(&stop_code)
+                            .map(|geojson_data| geojson_data.geo_json.clone());
+
+                        // Create the enhanced mapping with geojson
+                        let enhanced_mapping = RouteStopMappingWithGeojson {
+                            estimated_travel_time_from_previous_stop: mapping.estimated_travel_time_from_previous_stop,
+                            provider_code: mapping.provider_code.clone(),
+                            route_code: mapping.route_code.clone(),
+                            sequence_num: mapping.sequence_num,
+                            stop_code: mapping.stop_code.clone(),
+                            stop_name: mapping.stop_name.clone(),
+                            stop_point: mapping.stop_point.clone(),
+                            vehicle_type: mapping.vehicle_type.clone(),
+                            stop_geojson,
+                        };
+
+                        return Ok(enhanced_mapping);
                     }
                 }
             }
