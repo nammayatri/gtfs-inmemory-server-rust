@@ -43,7 +43,7 @@ impl AppConfig {
                 .map(|s| {
                     s.split(',')
                         .filter_map(|pair| {
-                            let mut parts = pair.splitn(2, '-');
+                            let mut parts = pair.splitn(2, '#');
                             let name = parts.next()?.trim().to_string();
                             let url = parts.next()?.trim().to_string();
                             Some(OtpConfig { name, url })
