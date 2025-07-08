@@ -99,28 +99,10 @@ pub struct RouteStopMapping {
     pub stop_point: LatLong,
     #[serde(rename = "vehicleType")]
     pub vehicle_type: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteStopMappingWithGeojson {
-    #[serde(rename = "estimatedTravelTimeFromPreviousStop")]
-    pub estimated_travel_time_from_previous_stop: Option<i32>,
-    #[serde(rename = "providerCode")]
-    pub provider_code: String,
-    #[serde(rename = "routeCode")]
-    pub route_code: String,
-    #[serde(rename = "sequenceNum")]
-    pub sequence_num: i32,
-    #[serde(rename = "stopCode")]
-    pub stop_code: String,
-    #[serde(rename = "stopName")]
-    pub stop_name: String,
-    #[serde(rename = "stopPoint")]
-    pub stop_point: LatLong,
-    #[serde(rename = "vehicleType")]
-    pub vehicle_type: String,
-    #[serde(rename = "stopGeojson")]
-    pub stop_geojson: Option<String>,
+    #[serde(rename = "geoJson")]
+    pub geo_json: Option<serde_json::Value>,
+    #[serde(rename = "gates")]
+    pub gates: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,11 +118,16 @@ pub struct GTFSStop {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StopGeojson {
+pub struct StopGeojsonRecord {
     pub stop_code: String,
     pub gtfs_id: String,
-    pub geo_json: String,
-    pub gates: String,
+    pub geo_json: serde_json::Value,
+    pub gates: serde_json::Value,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopGeojson {
+    pub geo_json: serde_json::Value,
+    pub gates: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]

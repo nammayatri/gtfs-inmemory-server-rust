@@ -16,7 +16,7 @@ use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
     cast_vehicle_type, clean_identifier, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
-    NandiPatternDetails, NandiRoutesRes, RouteStopMapping, RouteStopMappingWithGeojson, StopGeojson,
+    NandiPatternDetails, NandiRoutesRes, RouteStopMapping, StopGeojson, StopGeojsonRecord,
 };
 
 pub struct GTFSService {
@@ -101,7 +101,7 @@ impl GTFSService {
             self.build_routes_by_gtfs(all_routes, &route_trip_counts, &route_stop_counts);
 
         // Build route data
-        let route_data_by_gtfs = self.build_route_data(&all_pattern_details, &routes_by_gtfs);
+        let route_data_by_gtfs = self.build_route_data(&all_pattern_details, &routes_by_gtfs, &stop_geojsons);
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
@@ -122,7 +122,7 @@ impl GTFSService {
     }
 
     async fn read_stop_geojsons_csv(&self) -> AppResult<HashMap<String, StopGeojson>> {
-        let file_path = "stop_geojsons.csv";
+        let file_path = "./src/services/stop_geojsons.csv";
         
         // Check if file exists, if not return empty HashMap
         let mut file = match File::open(file_path).await {
@@ -142,12 +142,11 @@ impl GTFSService {
             .from_reader(contents.as_bytes());
         
         let mut stop_geojsons = HashMap::new();
-        
         for result in reader.deserialize() {
             match result {
                 Ok(record) => {
-                    let geojson: StopGeojson = record;
-                    stop_geojsons.insert(geojson.stop_code.clone(), geojson);
+                    let geojson: StopGeojsonRecord = record;
+                    stop_geojsons.insert(geojson.stop_code.clone(), StopGeojson { geo_json: geojson.geo_json.clone(), gates: geojson.gates.clone() });
                 }
                 Err(e) => {
                     error!("Error parsing CSV row: {}", e);
@@ -271,6 +270,7 @@ impl GTFSService {
         &self,
         pattern_details: &[NandiPatternDetails],
         routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
+        stop_geojsons: &HashMap<String, StopGeojson>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
@@ -291,6 +291,7 @@ impl GTFSService {
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
 
             for (seq, stop) in pattern.stops.iter().enumerate() {
+                let stop_geojson = stop_geojsons.get(&stop.code);
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
                     provider_code: "GTFS".to_string(),
@@ -303,6 +304,8 @@ impl GTFSService {
                         lon: stop.lon,
                     },
                     vehicle_type: vehicle_type.clone(),
+                    geo_json: stop_geojson.map(|s| s.geo_json.clone()),
+                    gates: stop_geojson.map(|s| s.gates.clone()),
                 });
 
                 let mapping_idx = route_data.mappings.len();
@@ -599,7 +602,7 @@ impl GTFSService {
         Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMappingWithGeojson> {
+    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMapping> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
@@ -609,11 +612,10 @@ impl GTFSService {
                 if let Some(&index) = indices.first() {
                     if let Some(mapping) = route_data.mappings.get(index) {
                         // Find geojson for this stop from the CSV data
-                        let stop_geojson = data.stop_geojsons.get(&stop_code)
-                            .map(|geojson_data| geojson_data.geo_json.clone());
+                        let stop_geojson = data.stop_geojsons.get(&stop_code);
 
                         // Create the enhanced mapping with geojson
-                        let enhanced_mapping = RouteStopMappingWithGeojson {
+                        let enhanced_mapping = RouteStopMapping {
                             estimated_travel_time_from_previous_stop: mapping.estimated_travel_time_from_previous_stop,
                             provider_code: mapping.provider_code.clone(),
                             route_code: mapping.route_code.clone(),
@@ -622,7 +624,8 @@ impl GTFSService {
                             stop_name: mapping.stop_name.clone(),
                             stop_point: mapping.stop_point.clone(),
                             vehicle_type: mapping.vehicle_type.clone(),
-                            stop_geojson,
+                            geo_json: stop_geojson.map(|s| s.geo_json.clone()),
+                            gates: stop_geojson.map(|s| s.gates.clone()),
                         };
 
                         return Ok(enhanced_mapping);
