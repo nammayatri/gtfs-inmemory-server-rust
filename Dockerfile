@@ -24,6 +24,7 @@ RUN cargo build --release && rm -rf target/release/.fingerprint/gtfs-routes-serv
 # Remove dummy main.rs and copy actual source code
 RUN rm src/main.rs
 COPY src ./src
+COPY stop_geojsons.csv ./stop_geojsons.csv
 
 # Build the application
 RUN cargo build --release
@@ -45,6 +46,7 @@ WORKDIR /app
 
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
+COPY --from=builder /app/stop_geojsons.csv /app/stop_geojsons.csv
 
 # Change ownership to non-root user
 RUN chown app:app /app/gtfs-routes-service
