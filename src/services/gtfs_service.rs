@@ -701,6 +701,10 @@ impl GTFSService {
         variables: Option<serde_json::Value>,
         operation_name: Option<String>,
     ) -> AppResult<serde_json::Value> {
+        // Print debug information before looking up the instance
+        tracing::info!("GraphQL query execution - Requested city: {}", city);
+        tracing::info!("Available OTP instances: {:?}", self.config.otp_instances);
+        
         let instance = self
             .config
             .otp_instances

@@ -7,6 +7,7 @@ use axum::{
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse, RouteStopMappingWithGeojson};
 use crate::AppState;
@@ -43,6 +44,7 @@ pub fn create_router(app_state: AppState) -> Router {
             get(get_service_type_by_vehicle),
         )
         .route("/memory-stats", get(get_memory_stats))
+        .route("/config", get(get_config))
         .route("/graphql", post(graphql_query))
         .with_state(app_state)
 }
@@ -250,6 +252,10 @@ async fn get_service_type_by_vehicle(
 async fn get_memory_stats(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let stats = app_state.gtfs_service.get_memory_stats().await;
     Ok(Json(serde_json::json!(stats)))
+}
+
+async fn get_config(State(app_state): State<AppState>) -> AppResult<Json<AppConfig>> {
+    Ok(Json(app_state.config.clone()))
 }
 
 #[derive(Debug, serde::Deserialize)]

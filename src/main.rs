@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use std::env;
 
 mod config;
 mod errors;
@@ -22,6 +23,7 @@ pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
     pub otp_manager: Arc<OtpManager>,
+    pub config: AppConfig,
 }
 
 #[tokio::main]
@@ -49,6 +51,24 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = AppConfig::from_env()?;
     info!("Configuration loaded successfully");
+
+    // Print all environment variables after successful bootup
+    info!("=== Environment Variables After Bootup ===");
+    let mut env_vars: Vec<(String, String)> = env::vars().collect();
+    env_vars.sort_by(|a, b| a.0.cmp(&b.0)); // Sort alphabetically by key
+    
+    for (key, value) in env_vars {
+        // Hide sensitive values for security
+        if key.to_uppercase().contains("PASSWORD") || 
+           key.to_uppercase().contains("SECRET") || 
+           key.to_uppercase().contains("KEY") ||
+           key.to_uppercase().contains("TOKEN") {
+            info!("{}=***HIDDEN***", key);
+        } else {
+            info!("{}={}", key, value);
+        }
+    }
+    info!("=== End Environment Variables ===");
 
     // Initialize services
     let gtfs_service = Arc::new(GTFSService::new(config.clone()).await?);
@@ -95,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         gtfs_service,
         db_vehicle_reader,
         otp_manager,
+        config: config.clone(),
     };
 
     // Create and run the web server

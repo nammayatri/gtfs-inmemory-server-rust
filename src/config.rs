@@ -1,14 +1,16 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::env;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OtpConfig {
     pub name: String,
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AppConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
     pub db_max_connections: u32,
     pub cache_duration: u64,
