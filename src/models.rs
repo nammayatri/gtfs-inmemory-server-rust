@@ -102,6 +102,28 @@ pub struct RouteStopMapping {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteStopMappingWithGeojson {
+    #[serde(rename = "estimatedTravelTimeFromPreviousStop")]
+    pub estimated_travel_time_from_previous_stop: Option<i32>,
+    #[serde(rename = "providerCode")]
+    pub provider_code: String,
+    #[serde(rename = "routeCode")]
+    pub route_code: String,
+    #[serde(rename = "sequenceNum")]
+    pub sequence_num: i32,
+    #[serde(rename = "stopCode")]
+    pub stop_code: String,
+    #[serde(rename = "stopName")]
+    pub stop_name: String,
+    #[serde(rename = "stopPoint")]
+    pub stop_point: LatLong,
+    #[serde(rename = "vehicleType")]
+    pub vehicle_type: String,
+    #[serde(rename = "stopGeojson")]
+    pub stop_geojson: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GTFSStop {
     pub id: String,
     pub code: String,
@@ -111,6 +133,14 @@ pub struct GTFSStop {
     #[serde(rename = "stationId")]
     pub station_id: Option<String>,
     pub cluster: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopGeojson {
+    pub stop_code: String,
+    pub gtfs_id: String,
+    pub geo_json: String,
+    pub gates: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +156,7 @@ pub struct GTFSData {
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
     pub children_by_parent: HashMap<String, HashMap<String, Vec<String>>>,
     pub data_hash: HashMap<String, String>,
+    pub stop_geojsons: HashMap<String, StopGeojson>,
 }
 
 impl GTFSData {
@@ -138,6 +169,7 @@ impl GTFSData {
         self.route_data_by_gtfs = temp_data.route_data_by_gtfs;
         self.children_by_parent = temp_data.children_by_parent;
         self.data_hash = temp_data.data_hash;
+        self.stop_geojsons = temp_data.stop_geojsons;
     }
 }
 

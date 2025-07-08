@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::errors::{AppError, AppResult};
-use crate::models::{NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse};
+use crate::models::{NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse, RouteStopMappingWithGeojson};
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -160,7 +160,7 @@ async fn get_stops(
 async fn get_stop(
     State(app_state): State<AppState>,
     Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<RouteStopMapping>> {
+) -> AppResult<Json<RouteStopMappingWithGeojson>> {
     let stop = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)

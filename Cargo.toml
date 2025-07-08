@@ -58,5 +58,8 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chron
 async-trait = "0.1"
 futures = "0.3"
 
+# CSV parsing
+csv = "1.3"
+
 [dev-dependencies]
 tokio-test = "0.4"
