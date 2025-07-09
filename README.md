@@ -21,17 +21,20 @@ A high-performance GTFS (General Transit Feed Specification) in memory service w
 ## Installation
 
 1. Clone the repository:
+
 ```bash
 git clone <repository-url>
 cd gtfs-routes-service-rust
 ```
 
 2. Build the project:
+
 ```bash
 cargo build --release
 ```
 
 3. Create a `.env` file with your configuration:
+
 ```env
 GTFS_BASE_URL=http://localhost:8080
 GTFS_POLLING_INTERVAL=30
@@ -44,78 +47,101 @@ GTFS_MEMORY_THRESHOLD=5000
 ```
 
 4. Run the service:
+
 ```bash
 cargo run --release
 ```
 
 ## Configuration
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `GTFS_BASE_URL` | `http://localhost:8080` | Base URL of the GTFS data source |
-| `GTFS_POLLING_INTERVAL` | `30` | Polling interval in seconds |
-| `GTFS_API_HOST` | `0.0.0.0` | Host to bind the API server |
-| `GTFS_API_PORT` | `8000` | Port to bind the API server |
-| `GTFS_MAX_RETRIES` | `3` | Maximum retry attempts for API calls |
-| `GTFS_RETRY_DELAY` | `5` | Delay between retries in seconds |
-| `GTFS_CPU_THRESHOLD` | `80.0` | CPU usage threshold percentage |
-| `GTFS_MEMORY_THRESHOLD` | `5000` | Memory usage threshold in MB |
+| Environment Variable    | Default                 | Description                          |
+| ----------------------- | ----------------------- | ------------------------------------ |
+| `GTFS_BASE_URL`         | `http://localhost:8080` | Base URL of the GTFS data source     |
+| `GTFS_POLLING_INTERVAL` | `30`                    | Polling interval in seconds          |
+| `GTFS_API_HOST`         | `0.0.0.0`               | Host to bind the API server          |
+| `GTFS_API_PORT`         | `8000`                  | Port to bind the API server          |
+| `GTFS_MAX_RETRIES`      | `3`                     | Maximum retry attempts for API calls |
+| `GTFS_RETRY_DELAY`      | `5`                     | Delay between retries in seconds     |
+| `GTFS_CPU_THRESHOLD`    | `80.0`                  | CPU usage threshold percentage       |
+| `GTFS_MEMORY_THRESHOLD` | `5000`                  | Memory usage threshold in MB         |
 
 ## API Endpoints
 
 ### Health Check
+
 - `GET /ready` - Readiness probe
 
 ### Routes
+
 - `GET /route/{gtfs_id}/{route_id}` - Get specific route
 - `GET /routes/{gtfs_id}` - Get all routes for a GTFS ID
 - `GET /routes/{gtfs_id}/fuzzy/{query}?limit={limit}` - Fuzzy search routes
 
 ### Route-Stop Mappings
+
 - `GET /route-stop-mapping/{gtfs_id}/route/{route_code}` - Get stops for a route
 - `GET /route-stop-mapping/{gtfs_id}/stop/{stop_code}` - Get routes for a stop
 
 ### Stops
+
 - `GET /stops/{gtfs_id}` - Get all stops for a GTFS ID
 - `GET /stop/{gtfs_id}/{stop_code}` - Get specific stop
 - `GET /stops/{gtfs_id}/fuzzy/{query}?limit={limit}` - Fuzzy search stops
 
+### Stop Code From Provider Stop Code
+
+- `GET /stop-code/{gtfs_id}/provider_stop_code}` - Get stop code from provider stop code
+
 ### Station Children
+
 - `GET /station-children/{gtfs_id}/{stop_code}` - Get child stations
 
 ### Version
+
 - `GET /version/{gtfs_id}` - Get data version hash
 
 ## Example Usage
 
 ### Get all routes for a GTFS ID
+
 ```bash
 curl http://localhost:8000/routes/chennai_data
 ```
 
 ### Get specific route
+
 ```bash
 curl http://localhost:8000/route/chennai_data/12345
 ```
 
 ### Fuzzy search routes
+
 ```bash
 curl "http://localhost:8000/routes/chennai_data/fuzzy/bus?limit=10"
 ```
 
 ### Get stops for a route
+
 ```bash
 curl http://localhost:8000/route-stop-mapping/chennai_data/route/12345
 ```
 
 ### Get routes for a stop
+
 ```bash
 curl http://localhost:8000/route-stop-mapping/chennai_data/stop/STOP001
+```
+
+### Get stop code from provider stop code
+
+```bash
+curl http://localhost:8000/stop-code/chennai_data/PROVIDER001
 ```
 
 ## Response Format
 
 ### Route Response
+
 ```json
 {
   "id": "12345",
@@ -137,6 +163,7 @@ curl http://localhost:8000/route-stop-mapping/chennai_data/stop/STOP001
 ```
 
 ### Route-Stop Mapping Response
+
 ```json
 [
   {
@@ -153,6 +180,16 @@ curl http://localhost:8000/route-stop-mapping/chennai_data/stop/STOP001
     "vehicle_type": "BUS"
   }
 ]
+```
+
+### Provider Stop Code Response
+
+```json
+{
+  "gtfs_id": "chennai_data",
+  "provider_stop_code": "PROVIDER001",
+  "stop_code": "STOP001"
+}
 ```
 
 ## Error Handling
@@ -183,16 +220,19 @@ Error responses include a JSON object with error details:
 ## Development
 
 ### Running Tests
+
 ```bash
 cargo test
 ```
 
 ### Running with Debug Logging
+
 ```bash
 RUST_LOG=debug cargo run
 ```
 
 ### Building for Production
+
 ```bash
 cargo build --release
 ```
@@ -200,11 +240,13 @@ cargo build --release
 ## Docker
 
 ### Build Docker Image
+
 ```bash
 docker build -t gtfs-routes-service .
 ```
 
 ### Run with Docker
+
 ```bash
 docker run -p 8000:8000 --env-file .env gtfs-routes-service
 ```

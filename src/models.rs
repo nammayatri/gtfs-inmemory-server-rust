@@ -149,13 +149,26 @@ pub struct GTFSRouteData {
     pub by_stop: HashMap<String, Vec<usize>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderStopCodeRecord {
+    pub gtfs_id: String,
+    pub provider_stop_code: String,
+    pub stop_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopCodeFromProviderStopCodeResponse {
+    pub stop_code: String,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct GTFSData {
     pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
     pub children_by_parent: HashMap<String, HashMap<String, HashSet<String>>>,
     pub data_hash: HashMap<String, String>,
     pub stop_geojsons: HashMap<String, StopGeojson>,
+    pub provider_stop_code_mapping: HashMap<String, HashMap<String, String>>,
 }
 
 impl GTFSData {
@@ -163,12 +176,13 @@ impl GTFSData {
         Self::default()
     }
 
-    pub fn update_data(&mut self, temp_data: GTFSData) {
-        self.routes_by_gtfs = temp_data.routes_by_gtfs;
-        self.route_data_by_gtfs = temp_data.route_data_by_gtfs;
-        self.children_by_parent = temp_data.children_by_parent;
-        self.data_hash = temp_data.data_hash;
-        self.stop_geojsons = temp_data.stop_geojsons;
+    pub fn update_data(&mut self, new_data: GTFSData) {
+        self.routes_by_gtfs = new_data.routes_by_gtfs;
+        self.route_data_by_gtfs = new_data.route_data_by_gtfs;
+        self.children_by_parent = new_data.children_by_parent;
+        self.data_hash = new_data.data_hash;
+        self.stop_geojsons = new_data.stop_geojsons;
+        self.provider_stop_code_mapping = new_data.provider_stop_code_mapping;
     }
 }
 

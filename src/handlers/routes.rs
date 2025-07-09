@@ -7,10 +7,10 @@ use axum::{
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse};
 use crate::AppState;
+use crate::{config::AppConfig, models::StopCodeFromProviderStopCodeResponse};
 
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
@@ -33,6 +33,10 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/stops/:gtfs_id", get(get_stops))
         .route("/stop/:gtfs_id/:stop_code", get(get_stop))
         .route("/stops/:gtfs_id/fuzzy/:query", get(get_stops_fuzzy))
+        .route(
+            "/stop-code/:gtfs_id/:provider_stop_code",
+            get(get_stop_code_from_provider_stop_code),
+        )
         .route(
             "/station-children/:gtfs_id/:stop_code",
             get(get_station_children),
@@ -195,6 +199,17 @@ async fn get_stops_fuzzy(
     }
 
     Ok(Json(unique_stops.into_values().collect()))
+}
+
+async fn get_stop_code_from_provider_stop_code(
+    State(app_state): State<AppState>,
+    Path((gtfs_id, provider_stop_code)): Path<(String, String)>,
+) -> AppResult<Json<StopCodeFromProviderStopCodeResponse>> {
+    let stop_code = app_state
+        .gtfs_service
+        .get_provider_stop_code(&gtfs_id, &provider_stop_code)
+        .await?;
+    Ok(Json(StopCodeFromProviderStopCodeResponse { stop_code }))
 }
 
 async fn get_station_children(

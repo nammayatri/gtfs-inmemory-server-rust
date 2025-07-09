@@ -16,7 +16,8 @@ use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
     cast_vehicle_type, clean_identifier, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
-    NandiPatternDetails, NandiRoutesRes, RouteStopMapping, StopGeojson, StopGeojsonRecord,
+    NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord, RouteStopMapping, StopGeojson,
+    StopGeojsonRecord,
 };
 
 use serde::Serialize;
@@ -104,6 +105,12 @@ impl GTFSService {
         let stop_geojsons = self.read_stop_geojsons_csv().await?;
         info!("Loaded {} stop geojsons from CSV", stop_geojsons.len());
 
+        let provider_stop_code_mapping = self.read_provider_stop_code_mapping_csv().await?;
+        info!(
+            "Loaded {} provider stop code mappings from CSV",
+            provider_stop_code_mapping.len()
+        );
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -132,12 +139,13 @@ impl GTFSService {
         temp_data.children_by_parent = children_by_parent;
         temp_data.data_hash = data_hash;
         temp_data.stop_geojsons = stop_geojsons;
+        temp_data.provider_stop_code_mapping = provider_stop_code_mapping;
 
         Ok(temp_data)
     }
 
     async fn read_stop_geojsons_csv(&self) -> AppResult<HashMap<String, StopGeojson>> {
-        let file_path = "stop_geojsons.csv";
+        let file_path = "./assets/stop_geojsons.csv";
 
         // Check if file exists, if not return empty HashMap
         let mut file = match File::open(file_path).await {
@@ -177,6 +185,48 @@ impl GTFSService {
         }
 
         Ok(stop_geojsons)
+    }
+
+    async fn read_provider_stop_code_mapping_csv(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, String>>> {
+        let file_path = "./assets/stop_provider_mapping.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("stop_provider_mapping.csv file not found, proceeding without provider stop code mapping data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let record: ProviderStopCodeRecord = record;
+                    mapping
+                        .entry(record.gtfs_id)
+                        .or_default()
+                        .insert(record.provider_stop_code, record.stop_code);
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+
+        Ok(mapping)
     }
 
     async fn fetch_pattern_details_batch(
@@ -689,6 +739,22 @@ impl GTFSService {
             .get(clean_identifier(gtfs_id).as_str())
             .cloned()
             .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+    }
+
+    pub async fn get_provider_stop_code(
+        &self,
+        gtfs_id: &str,
+        provider_stop_code: &str,
+    ) -> AppResult<String> {
+        let data = self.data.read().await;
+        let gtfs_id = clean_identifier(gtfs_id);
+        let provider_stop_code = clean_identifier(provider_stop_code);
+
+        data.provider_stop_code_mapping
+            .get(&gtfs_id)
+            .and_then(|mapping| mapping.get(&provider_stop_code))
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("Provider stop code not found".to_string()))
     }
 
     // Memory monitoring utility

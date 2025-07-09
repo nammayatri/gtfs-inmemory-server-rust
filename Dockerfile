@@ -16,7 +16,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 
 # Create a dummy main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN mkdir -p assets && mkdir -p src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies (this layer will be cached)
 RUN cargo build --release && rm -rf target/release/.fingerprint/gtfs-routes-service-*
@@ -24,7 +24,7 @@ RUN cargo build --release && rm -rf target/release/.fingerprint/gtfs-routes-serv
 # Remove dummy main.rs and copy actual source code
 RUN rm src/main.rs
 COPY src ./src
-COPY stop_geojsons.csv ./stop_geojsons.csv
+COPY assets ./assets
 
 # Build the application
 RUN cargo build --release
