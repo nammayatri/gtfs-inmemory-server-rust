@@ -1,6 +1,6 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -106,6 +106,18 @@ pub struct RouteStopMapping {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stop {
+    #[serde(rename = "stopCode")]
+    pub stop_code: String,
+    #[serde(rename = "stopPoint")]
+    pub stop_point: LatLong,
+    #[serde(rename = "stopName")]
+    pub stop_name: String,
+    #[serde(rename = "vehicleType")]
+    pub vehicle_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GTFSStop {
     pub id: String,
     pub code: String,
@@ -141,7 +153,7 @@ pub struct GTFSRouteData {
 pub struct GTFSData {
     pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
-    pub children_by_parent: HashMap<String, HashMap<String, Vec<String>>>,
+    pub children_by_parent: HashMap<String, HashMap<String, HashSet<String>>>,
     pub data_hash: HashMap<String, String>,
     pub stop_geojsons: HashMap<String, StopGeojson>,
 }
