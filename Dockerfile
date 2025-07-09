@@ -46,7 +46,7 @@ WORKDIR /app
 
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
-COPY --from=builder /app/stop_geojsons.csv /app/stop_geojsons.csv
+COPY --from=builder /app/assets /app/assets
 
 # Change ownership to non-root user
 RUN chown app:app /app/gtfs-routes-service
