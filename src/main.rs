@@ -1,7 +1,12 @@
+use axum::{
+    extract::Request,
+    middleware::{self, Next},
+    response::Response,
+};
+use std::env;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
-use std::env;
 
 mod config;
 mod errors;
@@ -24,6 +29,28 @@ pub struct AppState {
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
     pub otp_manager: Arc<OtpManager>,
     pub config: AppConfig,
+}
+
+// Middleware to log all API requests and responses
+async fn logging_middleware(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let start = std::time::Instant::now();
+
+    info!("API Request: {} {}", method, uri);
+
+    let response = next.run(request).await;
+    let latency = start.elapsed();
+
+    info!(
+        "API Response: {} {} - Status: {} - Latency: {:?}",
+        method,
+        uri,
+        response.status(),
+        latency
+    );
+
+    response
 }
 
 #[tokio::main]
@@ -56,13 +83,14 @@ async fn main() -> anyhow::Result<()> {
     info!("=== Environment Variables After Bootup ===");
     let mut env_vars: Vec<(String, String)> = env::vars().collect();
     env_vars.sort_by(|a, b| a.0.cmp(&b.0)); // Sort alphabetically by key
-    
+
     for (key, value) in env_vars {
         // Hide sensitive values for security
-        if key.to_uppercase().contains("PASSWORD") || 
-           key.to_uppercase().contains("SECRET") || 
-           key.to_uppercase().contains("KEY") ||
-           key.to_uppercase().contains("TOKEN") {
+        if key.to_uppercase().contains("PASSWORD")
+            || key.to_uppercase().contains("SECRET")
+            || key.to_uppercase().contains("KEY")
+            || key.to_uppercase().contains("TOKEN")
+        {
             info!("{}=***HIDDEN***", key);
         } else {
             info!("{}={}", key, value);
@@ -119,7 +147,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create and run the web server
-    let app = routes::create_router(app_state).layer(TraceLayer::new_for_http());
+    let app = routes::create_router(app_state)
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(logging_middleware));
 
     info!("Starting server on {}:{}", config.api_host, config.api_port);
 
