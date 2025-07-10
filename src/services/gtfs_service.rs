@@ -85,7 +85,7 @@ impl GTFSService {
         let mut all_stops = Vec::new();
         let mut already_visited: HashMap<String, bool> = HashMap::new();
 
-        for otp_instance in &self.config.otp_instances {
+        for otp_instance in self.config.otp_instances.get_all_instances() {
             let base_url = &otp_instance.url;
             if already_visited.contains_key(base_url) {
                 continue;
@@ -185,7 +185,7 @@ impl GTFSService {
                         geojson.stop_code.clone(),
                         StopGeojson {
                             geo_json: geojson.geo_json.clone(),
-                            gates: geojson.gates.clone(),
+                            gates: None,
                         },
                     );
                 }
@@ -826,17 +826,17 @@ impl GTFSService {
         query: &str,
         variables: Option<serde_json::Value>,
         operation_name: Option<String>,
+        gtfs_id: Option<String>,
     ) -> AppResult<serde_json::Value> {
-        // Print debug information before looking up the instance
-        tracing::info!("GraphQL query execution - Requested city: {}", city);
-        tracing::info!("Available OTP instances: {:?}", self.config.otp_instances);
-
-        let instance = self
-            .config
-            .otp_instances
-            .iter()
-            .find(|c| c.name == city)
-            .ok_or_else(|| AppError::NotFound(format!("City '{}' not found", city)))?;
+        // Try to find instance by gtfs_id first, then by city, then fallback to default
+        let instance = if let Some(gtfs_id) = gtfs_id {
+            self.config.otp_instances.find_instance_by_gtfs_id(&gtfs_id)
+                .or_else(|| self.config.otp_instances.find_instance_by_city(city))
+                .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
+        } else {
+            self.config.otp_instances.find_instance_by_city(city)
+                .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
+        };
 
         let url = format!("{}/otp/gtfs/v1", instance.url);
 

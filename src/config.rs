@@ -3,9 +3,39 @@ use serde::Serialize;
 use std::env;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct OtpConfig {
-    pub name: String,
+pub struct OtpInstance {
     pub url: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OtpConfig {
+    pub city_based_instances: Vec<OtpInstance>,
+    pub gtfs_id_based_instances: Vec<OtpInstance>,
+    pub default_instance: OtpInstance,
+}
+
+impl OtpConfig {
+    pub fn find_instance_by_gtfs_id(&self, gtfs_id: &str) -> Option<&OtpInstance> {
+        self.gtfs_id_based_instances.iter()
+            .find(|instance| instance.identifier == gtfs_id)
+    }
+
+    pub fn find_instance_by_city(&self, city: &str) -> Option<&OtpInstance> {
+        self.city_based_instances.iter()
+            .find(|instance| instance.identifier == city)
+    }
+
+    pub fn get_default_instance(&self) -> &OtpInstance {
+        &self.default_instance
+    }
+
+    pub fn get_all_instances(&self) -> Vec<&OtpInstance> {
+        let mut instances = Vec::new();
+        instances.extend(&self.gtfs_id_based_instances);
+        instances.extend(&self.city_based_instances);
+        instances
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -14,7 +44,7 @@ pub struct AppConfig {
     pub database_url: Option<String>,
     pub db_max_connections: u32,
     pub cache_duration: u64,
-    pub otp_instances: Vec<OtpConfig>,
+    pub otp_instances: OtpConfig,
     pub polling_interval: u64,
     pub process_batch_size: usize,
     pub api_host: String,
@@ -41,23 +71,54 @@ impl AppConfig {
                 .unwrap_or_else(|_| "3600".to_string())
                 .parse()
                 .context("Failed to parse CACHE_DURATION")?,
-            otp_instances: env::var("OTP_INSTANCES")
-                .map(|s| {
-                    s.split(',')
-                        .filter_map(|pair| {
-                            let mut parts = pair.splitn(2, '#');
-                            let name = parts.next()?.trim().to_string();
-                            let url = parts.next()?.trim().to_string();
-                            Some(OtpConfig { name, url })
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(|_| {
-                    vec![OtpConfig {
-                        name: "default".to_string(),
-                        url: "http://localhost:8080".to_string(),
-                    }]
-                }),
+            otp_instances: {
+                let city_based = env::var("CITY_ID_OTP_INSTANCES")
+                    .map(|s| {
+                        s.split(',')
+                            .filter_map(|pair| {
+                                let mut parts = pair.splitn(2, '#');
+                                let identifier = parts.next()?.trim().to_string();
+                                let url = parts.next()?.trim().to_string();
+                                Some(OtpInstance { identifier, url })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_else(|_| vec![]);
+
+                let gtfs_id_based = env::var("GTFS_ID_OTP_INSTANCES")
+                    .map(|s| {
+                        s.split(',')
+                            .filter_map(|pair| {
+                                let mut parts = pair.splitn(2, '#');
+                                let identifier = parts.next()?.trim().to_string();
+                                let url = parts.next()?.trim().to_string();
+                                Some(OtpInstance { identifier, url })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_else(|_| vec![]);
+
+                let default_instance = OtpInstance {
+                    identifier: "default".to_string(),
+                    url: env::var("DEFAULT_OTP_INSTANCE")
+                        .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+                };
+
+                // If both are empty, provide default
+                if city_based.is_empty() && gtfs_id_based.is_empty() {
+                    OtpConfig {
+                        city_based_instances: vec![],
+                        gtfs_id_based_instances: vec![],
+                        default_instance,
+                    }
+                } else {
+                    OtpConfig {
+                        city_based_instances: city_based,
+                        gtfs_id_based_instances: gtfs_id_based,
+                        default_instance,
+                    }
+                }
+            },
             polling_interval: env::var("GTFS_POLLING_INTERVAL")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()

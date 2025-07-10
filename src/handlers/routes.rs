@@ -287,6 +287,8 @@ struct GraphQLRequest {
     variables: Option<serde_json::Value>,
     operation_name: Option<String>,
     city: Option<String>,
+    #[serde(alias = "feedId")]
+    gtfs_id: Option<String>, // accept "feedId" as "gtfs_id"
 }
 
 async fn graphql_query(
@@ -301,6 +303,7 @@ async fn graphql_query(
             &payload.query,
             payload.variables,
             payload.operation_name,
+            payload.gtfs_id,
         )
         .await?;
     Ok(Json(result))
