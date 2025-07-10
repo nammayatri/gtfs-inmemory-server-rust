@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
-    cast_vehicle_type, clean_identifier, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
     NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord, RouteStopMapping, StopGeojson,
     StopGeojsonRecord,
 };
@@ -809,6 +809,14 @@ impl GTFSService {
         stats.insert("total_by_stop_keys".to_string(), total_by_stop);
 
         stats
+    }
+
+    pub async fn get_all_cached_data(&self) -> CachedDataResponse {
+        let data = self.data.read().await;
+        CachedDataResponse {
+            route_data_by_gtfs: data.route_data_by_gtfs.clone(),
+            stop_geojsons_by_gtfs: data.stop_geojsons_by_gtfs.clone(),
+        }
     }
 
     // GraphQL query execution

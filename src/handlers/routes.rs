@@ -48,6 +48,7 @@ pub fn create_router(app_state: AppState) -> Router {
             get(get_service_type_by_vehicle),
         )
         .route("/memory-stats", get(get_memory_stats))
+        .route("/cached-data", get(get_all_cached_data))
         .route("/config", get(get_config))
         .route("/graphql", post(graphql_query))
         .with_state(app_state)
@@ -267,6 +268,13 @@ async fn get_service_type_by_vehicle(
 async fn get_memory_stats(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let stats = app_state.gtfs_service.get_memory_stats().await;
     Ok(Json(serde_json::json!(stats)))
+}
+
+async fn get_all_cached_data(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+    let cached_data = app_state.gtfs_service.get_all_cached_data().await;
+    Ok(Json(serde_json::to_value(cached_data).map_err(|e| {
+        AppError::Internal(format!("Failed to serialize cached data: {}", e))
+    })?))
 }
 
 async fn get_config(State(app_state): State<AppState>) -> AppResult<Json<AppConfig>> {

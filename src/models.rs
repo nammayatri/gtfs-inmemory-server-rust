@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub struct Gate {
     #[serde(rename = "gateName")]
     pub gate_name: String,
+    #[serde(rename = "stopCode")]
     pub stop_code: String,
     pub lat: f64,
     pub lon: f64,
@@ -151,7 +152,7 @@ pub struct StopGeojson {
     pub gates: Option<Vec<Gate>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct GTFSRouteData {
     pub mappings: Vec<Arc<RouteStopMapping>>,
     pub by_route: HashMap<String, Vec<usize>>,
@@ -170,7 +171,13 @@ pub struct StopCodeFromProviderStopCodeResponse {
     pub stop_code: String,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Serialize)]
+pub struct CachedDataResponse {
+    pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
+    pub stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct GTFSData {
     pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
