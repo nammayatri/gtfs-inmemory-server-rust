@@ -1,8 +1,16 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Gate {
+    #[serde(rename = "gateName")]
+    pub gate_name: String,
+    pub stop_code: String,
+    pub lat: f64,
+    pub lon: f64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleData {
     pub waybill_id: String,
@@ -102,7 +110,7 @@ pub struct RouteStopMapping {
     #[serde(rename = "geoJson")]
     pub geo_json: Option<serde_json::Value>,
     #[serde(rename = "gates")]
-    pub gates: Option<serde_json::Value>,
+    pub gates: Option<Vec<Gate>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,12 +142,13 @@ pub struct StopGeojsonRecord {
     pub stop_code: String,
     pub gtfs_id: String,
     pub geo_json: serde_json::Value,
-    pub gates: serde_json::Value,
+    #[serde(deserialize_with = "deserialize_gates_from_json_str")]
+    pub gates: Option<Vec<Gate>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopGeojson {
     pub geo_json: serde_json::Value,
-    pub gates: serde_json::Value,
+    pub gates: Option<Vec<Gate>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,7 +176,7 @@ pub struct GTFSData {
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
     pub children_by_parent: HashMap<String, HashMap<String, HashSet<String>>>,
     pub data_hash: HashMap<String, String>,
-    pub stop_geojsons: HashMap<String, StopGeojson>,
+    pub stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>>,
     pub provider_stop_code_mapping: HashMap<String, HashMap<String, String>>,
 }
 
@@ -181,7 +190,7 @@ impl GTFSData {
         self.route_data_by_gtfs = new_data.route_data_by_gtfs;
         self.children_by_parent = new_data.children_by_parent;
         self.data_hash = new_data.data_hash;
-        self.stop_geojsons = new_data.stop_geojsons;
+        self.stop_geojsons_by_gtfs = new_data.stop_geojsons_by_gtfs;
         self.provider_stop_code_mapping = new_data.provider_stop_code_mapping;
     }
 }
@@ -200,4 +209,17 @@ pub fn clean_identifier(identifier: &str) -> String {
 
     // Remove GTFS ID prefix if present (format: gtfs_id:code)
     decoded.split(':').last().unwrap_or(&decoded).to_string()
+}
+
+pub fn deserialize_gates_from_json_str<'de, D>(deserializer: D) -> Result<Option<Vec<Gate>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).map(Some).map_err(serde::de::Error::custom)
+        }
+        _ => Ok(None),
+    }
 }
