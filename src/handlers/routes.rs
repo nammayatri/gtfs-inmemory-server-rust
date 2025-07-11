@@ -8,10 +8,13 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::errors::{AppError, AppResult};
-use crate::models::{NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse};
+use crate::models::{GTFSStop, NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse};
 use crate::AppState;
 use crate::{config::AppConfig, models::StopCodeFromProviderStopCodeResponse};
+use crate::{
+    errors::{AppError, AppResult},
+    models::LatLong,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
@@ -162,11 +165,31 @@ async fn get_stops(
 async fn get_stop(
     State(app_state): State<AppState>,
     Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<Arc<RouteStopMapping>>> {
+) -> AppResult<Json<RouteStopMapping>> {
     let stop = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)
-        .await?;
+        .await
+        .map(
+            |GTFSStop {
+                 code,
+                 name,
+                 lat,
+                 lon,
+                 ..
+             }| RouteStopMapping {
+                stop_code: code.to_string(),
+                stop_name: name.to_string(),
+                stop_point: LatLong { lat: lat, lon: lon },
+                estimated_travel_time_from_previous_stop: None,
+                geo_json: None,
+                gates: None,
+                provider_code: "GTFS".to_string(),
+                route_code: "UNKNOWN".to_string(),
+                vehicle_type: "BUS".to_string(),
+                sequence_num: 0,
+            },
+        )?;
     Ok(Json(stop))
 }
 

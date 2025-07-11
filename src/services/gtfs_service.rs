@@ -16,8 +16,8 @@ use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
-    LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord,
-    RouteStopMapping, StopGeojson, StopGeojsonRecord,
+    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes,
+    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
 };
 use serde::Serialize;
 
@@ -130,6 +130,9 @@ impl GTFSService {
             &provider_stop_code_mapping,
         );
 
+        // Build stops data
+        let stops_by_gtfs = self.build_stops_by_gtfs(all_stops.clone());
+
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
 
@@ -140,6 +143,7 @@ impl GTFSService {
         let data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
 
         temp_data.route_data_by_gtfs = route_data_by_gtfs;
+        temp_data.stops_by_gtfs = stops_by_gtfs;
         temp_data.routes_by_gtfs = routes_by_gtfs;
         temp_data.children_by_parent = children_by_parent;
         temp_data.data_hash = data_hash;
@@ -345,6 +349,36 @@ impl GTFSService {
                 .insert(route_code.to_string(), route_res);
         }
         routes_by_gtfs
+    }
+
+    fn build_stops_by_gtfs(&self, stops: Vec<GTFSStop>) -> HashMap<String, GTFSStopData> {
+        let mut stops_by_gtfs: HashMap<String, GTFSStopData> = HashMap::new();
+
+        for stop in stops {
+            let parts: Vec<&str> = stop.id.split(':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let gtfs_id = parts[0];
+            let stop_code = parts[1];
+
+            let stop_data = stops_by_gtfs.entry(gtfs_id.to_string()).or_default();
+
+            // Create a new GTFSStop with the clean stop code
+            let stop_res = GTFSStop {
+                id: stop.id.clone(),
+                code: stop_code.to_string(),
+                name: stop.name,
+                lat: stop.lat,
+                lon: stop.lon,
+                station_id: stop.station_id,
+                cluster: stop.cluster,
+            };
+
+            stop_data.stops.insert(stop_code.to_string(), stop_res);
+        }
+
+        stops_by_gtfs
     }
 
     fn build_route_data(
@@ -727,22 +761,14 @@ impl GTFSService {
         Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_stop(
-        &self,
-        gtfs_id: &str,
-        stop_code: &str,
-    ) -> AppResult<Arc<RouteStopMapping>> {
+    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<GTFSStop> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
 
-        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            if let Some(indices) = route_data.by_stop.get(&stop_code) {
-                if let Some(&index) = indices.first() {
-                    if let Some(mapping) = route_data.mappings.get(index) {
-                        return Ok(mapping.clone());
-                    }
-                }
+        if let Some(stops_data) = data.stops_by_gtfs.get(&gtfs_id) {
+            if let Some(stop) = stops_data.stops.get(&stop_code) {
+                return Ok(stop.clone());
             }
         }
         Err(AppError::NotFound("Stop not found".to_string()))
@@ -801,6 +827,7 @@ impl GTFSService {
             "route_data_by_gtfs_count".to_string(),
             data.route_data_by_gtfs.len(),
         );
+        stats.insert("stops_by_gtfs_count".to_string(), data.stops_by_gtfs.len());
         stats.insert(
             "children_by_parent_count".to_string(),
             data.children_by_parent.len(),
@@ -823,6 +850,13 @@ impl GTFSService {
         stats.insert("total_by_route_keys".to_string(), total_by_route);
         stats.insert("total_by_stop_keys".to_string(), total_by_stop);
 
+        let total_stops = data
+            .stops_by_gtfs
+            .values()
+            .map(|s| s.stops.len())
+            .sum::<usize>();
+        stats.insert("total_stops".to_string(), total_stops);
+
         stats
     }
 
@@ -830,6 +864,7 @@ impl GTFSService {
         let data = self.data.read().await;
         CachedDataResponse {
             route_data_by_gtfs: data.route_data_by_gtfs.clone(),
+            stops_by_gtfs: data.stops_by_gtfs.clone(),
             stop_geojsons_by_gtfs: data.stop_geojsons_by_gtfs.clone(),
         }
     }
