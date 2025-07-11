@@ -355,7 +355,7 @@ impl GTFSService {
         stop_geojsons_by_gtfs: &HashMap<String, HashMap<String, StopGeojson>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
-
+        let mut visited_combinations: HashSet<(String, String)> = HashSet::new();
         for pattern in pattern_details {
             let parts: Vec<&str> = pattern.route_id.split(':').collect();
             if parts.len() < 2 {
@@ -371,9 +371,16 @@ impl GTFSService {
                 .unwrap_or_else(|| "UNKNOWN".to_string());
 
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
-            let mut visited_mapping = HashMap::new();
 
             for (seq, stop) in pattern.stops.iter().enumerate() {
+                let combination = (route_code.to_string(), stop.code.clone());
+                
+                // Skip if we've already seen this route_code + stop_code combination
+                if visited_combinations.contains(&combination) {
+                    continue;
+                }
+                visited_combinations.insert(combination);
+
                 let stop_geojson = stop_geojsons_by_gtfs
                     .get(gtfs_id)
                     .and_then(|g| g.get(&stop.code))
@@ -393,12 +400,6 @@ impl GTFSService {
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
                 });
-
-                let hash = get_sha256_hash(&mapping);
-                if visited_mapping.contains_key(&hash) {
-                    continue;
-                }
-                visited_mapping.insert(hash, true);
 
                 let mapping_idx = route_data.mappings.len();
                 route_data.mappings.push(mapping);
