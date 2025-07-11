@@ -366,7 +366,7 @@ impl GTFSService {
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
 
             for (seq, stop) in pattern.stops.iter().enumerate() {
-                let combination = (route_code.to_string(), stop.code.clone());
+                let combination = (route_code.to_string(), stop.code.clone(), seq.clone());
 
                 // Skip if we've already seen this route_code + stop_code combination
                 if visited_combinations.contains(&combination) {
