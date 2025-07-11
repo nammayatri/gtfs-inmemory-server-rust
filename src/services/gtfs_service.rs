@@ -19,7 +19,14 @@ use crate::models::{
     LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord,
     RouteStopMapping, StopGeojson, StopGeojsonRecord,
 };
+use serde::Serialize;
 
+fn get_sha256_hash<T: Serialize>(val: &T) -> String {
+    let json = serde_json::to_vec(val).unwrap(); // handles f64 fine
+    let mut hasher = Sha256::new();
+    hasher.update(json);
+    format!("{:x}", hasher.finalize())
+}
 pub struct GTFSService {
     config: AppConfig,
     data: Arc<RwLock<GTFSData>>,
@@ -348,11 +355,33 @@ impl GTFSService {
         provider_stop_code_mapping: &HashMap<String, HashMap<String, String>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
+
+        // Group patterns by route to find the longest pattern for each route
+        let mut patterns_by_route: HashMap<String, Vec<&NandiPatternDetails>> = HashMap::new();
         for pattern in pattern_details {
             let parts: Vec<&str> = pattern.route_id.split(':').collect();
             if parts.len() < 2 {
                 continue;
             }
+            let gtfs_id = parts[0];
+            let route_code = parts[1];
+            let route_key = format!("{}:{}", gtfs_id, route_code);
+
+            patterns_by_route
+                .entry(route_key)
+                .or_default()
+                .push(pattern);
+        }
+
+        // Process only the longest pattern for each route
+        for (route_key, patterns) in patterns_by_route {
+            // Find the pattern with the most stops
+            let longest_pattern = patterns
+                .iter()
+                .max_by_key(|pattern| pattern.stops.len())
+                .unwrap();
+
+            let parts: Vec<&str> = longest_pattern.route_id.split(':').collect();
             let gtfs_id = parts[0];
             let route_code = parts[1];
 
@@ -363,8 +392,9 @@ impl GTFSService {
                 .unwrap_or_else(|| "UNKNOWN".to_string());
 
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
+            let mut visited_mapping: HashMap<String, bool> = HashMap::new();
 
-            for (seq, stop) in pattern.stops.iter().enumerate() {
+            for (seq, stop) in longest_pattern.stops.iter().enumerate() {
                 let stop_geojson = stop_geojsons_by_gtfs
                     .get(gtfs_id)
                     .and_then(|g| g.get(&stop.code))
@@ -395,8 +425,14 @@ impl GTFSService {
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
                 });
+                let hash = get_sha256_hash(&mapping);
+                if visited_mapping.contains_key(&hash) {
+                    continue;
+                }
+                visited_mapping.insert(hash, true);
 
                 let mapping_idx = route_data.mappings.len();
+
                 route_data.mappings.push(mapping);
 
                 route_data

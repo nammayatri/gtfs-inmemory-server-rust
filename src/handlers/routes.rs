@@ -82,8 +82,8 @@ async fn get_route_stop_mapping_by_route(
         .gtfs_service
         .get_route_stop_mapping_by_route(&gtfs_id, &route_code)
         .await?;
-    let max_sequence_mappings = get_max_sequence_route_stop_mapping(mappings);
-    Ok(Json(max_sequence_mappings))
+    // let max_sequence_mappings = get_max_sequence_route_stop_mapping(mappings);
+    Ok(Json(mappings))
 }
 
 fn get_max_sequence_route_stop_mapping(
