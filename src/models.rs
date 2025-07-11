@@ -112,8 +112,6 @@ pub struct RouteStopMapping {
     pub geo_json: Option<serde_json::Value>,
     #[serde(rename = "gates")]
     pub gates: Option<Vec<Gate>>,
-    #[serde(rename = "providerStopCode")]
-    pub provider_stop_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

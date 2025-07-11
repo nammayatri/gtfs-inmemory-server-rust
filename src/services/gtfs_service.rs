@@ -391,7 +391,7 @@ impl GTFSService {
 
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
-                    provider_code: "GTFS".to_string(),
+                    provider_code: provider_stop_code.unwrap_or("GTFS".to_string()),
                     route_code: route_code.to_string(),
                     sequence_num: seq as i32,
                     stop_code: stop.code.clone(),
@@ -403,7 +403,6 @@ impl GTFSService {
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
-                    provider_stop_code,
                 });
 
                 let mapping_idx = route_data.mappings.len();
