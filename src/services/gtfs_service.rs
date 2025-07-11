@@ -348,7 +348,6 @@ impl GTFSService {
         provider_stop_code_mapping: &HashMap<String, HashMap<String, String>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
-        let mut visited_combinations: HashSet<(String, String, usize)> = HashSet::new();
         for pattern in pattern_details {
             let parts: Vec<&str> = pattern.route_id.split(':').collect();
             if parts.len() < 2 {
@@ -366,14 +365,6 @@ impl GTFSService {
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
 
             for (seq, stop) in pattern.stops.iter().enumerate() {
-                let combination = (route_code.to_string(), stop.code.clone(), seq.clone());
-
-                // Skip if we've already seen this route_code + stop_code combination
-                if visited_combinations.contains(&combination) {
-                    continue;
-                }
-                visited_combinations.insert(combination);
-
                 let stop_geojson = stop_geojsons_by_gtfs
                     .get(gtfs_id)
                     .and_then(|g| g.get(&stop.code))
