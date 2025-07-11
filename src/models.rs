@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -112,6 +112,8 @@ pub struct RouteStopMapping {
     pub geo_json: Option<serde_json::Value>,
     #[serde(rename = "gates")]
     pub gates: Option<Vec<Gate>>,
+    #[serde(rename = "providerStopCode")]
+    pub provider_stop_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,15 +220,17 @@ pub fn clean_identifier(identifier: &str) -> String {
     decoded.split(':').last().unwrap_or(&decoded).to_string()
 }
 
-pub fn deserialize_gates_from_json_str<'de, D>(deserializer: D) -> Result<Option<Vec<Gate>>, D::Error>
+pub fn deserialize_gates_from_json_str<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<Gate>>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
-        Some(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).map(Some).map_err(serde::de::Error::custom)
-        }
+        Some(s) if !s.trim().is_empty() => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
 }

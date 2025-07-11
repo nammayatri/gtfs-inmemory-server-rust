@@ -120,6 +120,7 @@ impl GTFSService {
             &all_pattern_details,
             &routes_by_gtfs,
             &stop_geojsons_by_gtfs,
+            &provider_stop_code_mapping,
         );
 
         // Update start and end points
@@ -344,6 +345,7 @@ impl GTFSService {
         pattern_details: &[NandiPatternDetails],
         routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
         stop_geojsons_by_gtfs: &HashMap<String, HashMap<String, StopGeojson>>,
+        provider_stop_code_mapping: &HashMap<String, HashMap<String, String>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
         let mut visited_combinations: HashSet<(String, String)> = HashSet::new();
@@ -376,6 +378,17 @@ impl GTFSService {
                     .get(gtfs_id)
                     .and_then(|g| g.get(&stop.code))
                     .map(|geojson| geojson.clone());
+
+                // Find provider stop code for this stop code
+                let provider_stop_code =
+                    provider_stop_code_mapping.get(gtfs_id).and_then(|mapping| {
+                        // Find the provider_stop_code that maps to this stop_code
+                        mapping
+                            .iter()
+                            .find(|(_, stop_code)| stop_code == &&stop.code)
+                            .map(|(provider_stop_code, _)| provider_stop_code.clone())
+                    });
+
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
                     provider_code: "GTFS".to_string(),
@@ -390,6 +403,7 @@ impl GTFSService {
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
+                    provider_stop_code,
                 });
 
                 let mapping_idx = route_data.mappings.len();
