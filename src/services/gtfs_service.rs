@@ -15,19 +15,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
-    NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord, RouteStopMapping, StopGeojson,
-    StopGeojsonRecord,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
+    LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord,
+    RouteStopMapping, StopGeojson, StopGeojsonRecord,
 };
-
-use serde::Serialize;
-
-fn get_sha256_hash<T: Serialize>(val: &T) -> String {
-    let json = serde_json::to_vec(val).unwrap(); // handles f64 fine
-    let mut hasher = Sha256::new();
-    hasher.update(json);
-    format!("{:x}", hasher.finalize())
-}
 
 pub struct GTFSService {
     config: AppConfig,
@@ -374,7 +365,7 @@ impl GTFSService {
 
             for (seq, stop) in pattern.stops.iter().enumerate() {
                 let combination = (route_code.to_string(), stop.code.clone());
-                
+
                 // Skip if we've already seen this route_code + stop_code combination
                 if visited_combinations.contains(&combination) {
                     continue;
@@ -645,7 +636,7 @@ impl GTFSService {
         &self,
         gtfs_id: &str,
         route_code: &str,
-    ) -> AppResult<Vec<RouteStopMapping>> {
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let route_code = clean_identifier(route_code);
@@ -654,7 +645,7 @@ impl GTFSService {
             if let Some(indices) = route_data.by_route.get(&route_code) {
                 return Ok(indices
                     .iter()
-                    .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
+                    .filter_map(|&i| route_data.mappings.get(i).cloned())
                     .collect());
             }
         }
@@ -665,7 +656,7 @@ impl GTFSService {
         &self,
         gtfs_id: &str,
         stop_code: &str,
-    ) -> AppResult<Vec<RouteStopMapping>> {
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
@@ -674,14 +665,14 @@ impl GTFSService {
             if let Some(indices) = route_data.by_stop.get(&stop_code) {
                 return Ok(indices
                     .iter()
-                    .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
+                    .filter_map(|&i| route_data.mappings.get(i).cloned())
                     .collect());
             }
         }
         Err(AppError::NotFound("Stop not found".to_string()))
     }
 
-    pub async fn get_stops(&self, gtfs_id: &str) -> AppResult<Vec<RouteStopMapping>> {
+    pub async fn get_stops(&self, gtfs_id: &str) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
 
@@ -690,13 +681,17 @@ impl GTFSService {
                 .by_stop
                 .values()
                 .filter_map(|indices| indices.first())
-                .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
+                .filter_map(|&i| route_data.mappings.get(i).cloned())
                 .collect());
         }
         Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMapping> {
+    pub async fn get_stop(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<Arc<RouteStopMapping>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
@@ -705,28 +700,7 @@ impl GTFSService {
             if let Some(indices) = route_data.by_stop.get(&stop_code) {
                 if let Some(&index) = indices.first() {
                     if let Some(mapping) = route_data.mappings.get(index) {
-                        // Find geojson for this stop from the CSV data
-                        let stop_geojson = data
-                            .stop_geojsons_by_gtfs
-                            .get(&gtfs_id)
-                            .and_then(|g| g.get(&stop_code))
-                            .map(|geojson| geojson.clone());
-                        // Create the enhanced mapping with geojson
-                        let enhanced_mapping = RouteStopMapping {
-                            estimated_travel_time_from_previous_stop: mapping
-                                .estimated_travel_time_from_previous_stop,
-                            provider_code: mapping.provider_code.clone(),
-                            route_code: mapping.route_code.clone(),
-                            sequence_num: mapping.sequence_num,
-                            stop_code: mapping.stop_code.clone(),
-                            stop_name: mapping.stop_name.clone(),
-                            stop_point: mapping.stop_point.clone(),
-                            vehicle_type: mapping.vehicle_type.clone(),
-                            geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
-                            gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
-                        };
-
-                        return Ok(enhanced_mapping);
+                        return Ok(mapping.clone());
                     }
                 }
             }
@@ -831,11 +805,15 @@ impl GTFSService {
     ) -> AppResult<serde_json::Value> {
         // Try to find instance by gtfs_id first, then by city, then fallback to default
         let instance = if let Some(gtfs_id) = gtfs_id {
-            self.config.otp_instances.find_instance_by_gtfs_id(&gtfs_id)
+            self.config
+                .otp_instances
+                .find_instance_by_gtfs_id(&gtfs_id)
                 .or_else(|| self.config.otp_instances.find_instance_by_city(city))
                 .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
         } else {
-            self.config.otp_instances.find_instance_by_city(city)
+            self.config
+                .otp_instances
+                .find_instance_by_city(city)
                 .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
         };
 

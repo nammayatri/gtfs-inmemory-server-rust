@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::errors::{AppError, AppResult};
 use crate::models::{NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse};
@@ -76,7 +77,7 @@ async fn get_routes(
 async fn get_route_stop_mapping_by_route(
     State(app_state): State<AppState>,
     Path((gtfs_id, route_code)): Path<(String, String)>,
-) -> AppResult<Json<Vec<RouteStopMapping>>> {
+) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
     let mappings = app_state
         .gtfs_service
         .get_route_stop_mapping_by_route(&gtfs_id, &route_code)
@@ -86,25 +87,19 @@ async fn get_route_stop_mapping_by_route(
 }
 
 fn get_max_sequence_route_stop_mapping(
-    all_mappings: Vec<RouteStopMapping>,
-) -> Vec<RouteStopMapping> {
+    all_mappings: Vec<Arc<RouteStopMapping>>,
+) -> Vec<Arc<RouteStopMapping>> {
     if all_mappings.is_empty() {
         return Vec::new();
     }
 
-    let mut seq_map: HashMap<i32, RouteStopMapping> = HashMap::new();
+    let mut seq_map: HashMap<i32, Arc<RouteStopMapping>> = HashMap::new();
     for mapping in all_mappings {
         seq_map.insert(mapping.sequence_num, mapping);
     }
 
-    let max_seq = seq_map.keys().max().unwrap_or(&0);
-    let mut result = Vec::new();
-
-    for seq in 0..=*max_seq {
-        if let Some(mapping) = seq_map.get(&seq) {
-            result.push(mapping.clone());
-        }
-    }
+    let mut result: Vec<Arc<RouteStopMapping>> = seq_map.into_values().collect();
+    result.sort_by_key(|m| m.sequence_num);
 
     result
 }
@@ -112,7 +107,7 @@ fn get_max_sequence_route_stop_mapping(
 async fn get_route_stop_mapping_by_stop(
     State(app_state): State<AppState>,
     Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<Vec<RouteStopMapping>>> {
+) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
     let mappings = app_state
         .gtfs_service
         .get_route_stop_mapping_by_stop(&gtfs_id, &stop_code)
@@ -159,7 +154,7 @@ async fn get_routes_fuzzy(
 async fn get_stops(
     State(app_state): State<AppState>,
     Path(gtfs_id): Path<String>,
-) -> AppResult<Json<Vec<RouteStopMapping>>> {
+) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
     Ok(Json(stops))
 }
@@ -167,7 +162,7 @@ async fn get_stops(
 async fn get_stop(
     State(app_state): State<AppState>,
     Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<RouteStopMapping>> {
+) -> AppResult<Json<Arc<RouteStopMapping>>> {
     let stop = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)
@@ -179,18 +174,18 @@ async fn get_stops_fuzzy(
     State(app_state): State<AppState>,
     Path((gtfs_id, query)): Path<(String, String)>,
     Query(params): Query<LimitQuery>,
-) -> AppResult<Json<Vec<RouteStopMapping>>> {
+) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
     let query_lower = query.to_lowercase();
 
-    let mut unique_stops: HashMap<String, RouteStopMapping> = HashMap::new();
+    let mut unique_stops: HashMap<String, Arc<RouteStopMapping>> = HashMap::new();
 
     for stop in stops {
         let matches = stop.stop_name.to_lowercase().contains(&query_lower)
             || stop.stop_code.to_lowercase().contains(&query_lower);
 
         if matches {
-            unique_stops.insert(stop.stop_code.clone(), stop);
+            unique_stops.insert(stop.stop_code.clone(), stop.clone());
             if let Some(limit) = params.limit {
                 if unique_stops.len() >= limit as usize {
                     break;
@@ -270,7 +265,9 @@ async fn get_memory_stats(State(app_state): State<AppState>) -> AppResult<Json<s
     Ok(Json(serde_json::json!(stats)))
 }
 
-async fn get_all_cached_data(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+async fn get_all_cached_data(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
     let cached_data = app_state.gtfs_service.get_all_cached_data().await;
     Ok(Json(serde_json::to_value(cached_data).map_err(|e| {
         AppError::Internal(format!("Failed to serialize cached data: {}", e))
