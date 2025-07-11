@@ -393,7 +393,7 @@ impl GTFSService {
                     estimated_travel_time_from_previous_stop: None,
                     provider_code: provider_stop_code.unwrap_or("GTFS".to_string()),
                     route_code: route_code.to_string(),
-                    sequence_num: seq + 1 as i32,
+                    sequence_num: (seq + 1) as i32,
                     stop_code: stop.code.clone(),
                     stop_name: stop.name.clone(),
                     stop_point: LatLong {
