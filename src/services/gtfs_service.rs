@@ -367,13 +367,27 @@ impl GTFSService {
             // Create a new GTFSStop with the clean stop code
             let stop_res = GTFSStop {
                 id: stop.id.clone(),
-                code: stop_code.to_string(),
-                name: stop.name,
+                code: stop.code.clone(),
+                name: stop.name.clone(),
                 lat: stop.lat,
                 lon: stop.lon,
-                station_id: stop.station_id,
-                cluster: stop.cluster,
+                station_id: stop.station_id.clone(),
+                cluster: stop.cluster.clone(),
             };
+            if stop.cluster.is_some() {
+                let cluster_stop_res = GTFSStop {
+                    id: stop.cluster.clone().unwrap(),
+                    code: stop.code.clone(),
+                    name: stop.name.clone(),
+                    lat: stop.lat,
+                    lon: stop.lon,
+                    station_id: stop.station_id.clone(),
+                    cluster: stop.cluster.clone(),
+                };
+                stop_data
+                    .stops
+                    .insert(stop.cluster.clone().unwrap(), cluster_stop_res);
+            }
 
             stop_data.stops.insert(stop_code.to_string(), stop_res);
         }
