@@ -47,6 +47,9 @@ sysinfo = "0.30"
 # Rate limiting
 governor = "0.6"
 
+# System calls for socket optimization
+libc = "0.2"
+
 # Connection pooling
 deadpool = "0.12"
 

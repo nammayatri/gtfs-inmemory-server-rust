@@ -55,6 +55,7 @@ pub fn create_router(app_state: AppState) -> Router {
         .route("/cached-data", get(get_all_cached_data))
         .route("/config", get(get_config))
         .route("/graphql", post(graphql_query))
+        .route("/connection-stats", get(get_connection_stats))
         .with_state(app_state)
 }
 
@@ -327,4 +328,43 @@ async fn graphql_query(
         )
         .await?;
     Ok(Json(result))
+}
+
+async fn get_connection_stats(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+    // Get configuration-based connection stats
+    let db_stats = serde_json::json!({
+        "database": {
+            "max_connections": app_state.config.db_max_connections,
+            "min_connections": app_state.config.db_min_connections,
+            "acquire_timeout": app_state.config.db_acquire_timeout,
+            "idle_timeout": app_state.config.db_idle_timeout,
+            "max_lifetime": app_state.config.db_max_lifetime
+        }
+    });
+
+    // Get HTTP client stats
+    let http_stats = serde_json::json!({
+        "http_client": {
+            "connection_limit": app_state.config.connection_limit,
+            "pool_idle_timeout": app_state.config.http_pool_idle_timeout,
+            "tcp_keepalive": app_state.config.http_tcp_keepalive
+        }
+    });
+
+    // Get system TCP stats
+    let tcp_stats = serde_json::json!({
+        "tcp_optimizations": {
+            "tcp_nodelay": true,
+            "http2_enabled": false,
+            "connection_reuse": true
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "connection_stats": {
+            "database": db_stats["database"],
+            "http_client": http_stats["http_client"],
+            "tcp_optimizations": tcp_stats["tcp_optimizations"]
+        }
+    })))
 }

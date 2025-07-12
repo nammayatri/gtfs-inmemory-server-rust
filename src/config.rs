@@ -43,6 +43,10 @@ pub struct AppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
     pub db_max_connections: u32,
+    pub db_min_connections: u32,
+    pub db_acquire_timeout: u64,
+    pub db_idle_timeout: u64,
+    pub db_max_lifetime: u64,
     pub cache_duration: u64,
     pub otp_instances: OtpConfig,
     pub polling_interval: u64,
@@ -55,6 +59,8 @@ pub struct AppConfig {
     pub rate_limit_delay: f64,
     pub cpu_threshold: f32,
     pub connection_limit: usize,
+    pub http_pool_idle_timeout: u64,
+    pub http_tcp_keepalive: u64,
     pub dns_ttl: u64,
     pub memory_threshold: u64,
 }
@@ -67,6 +73,22 @@ impl AppConfig {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .context("Failed to parse WAYBILLS_DB_MAX_CONNECTIONS")?,
+            db_min_connections: env::var("WAYBILLS_DB_MIN_CONNECTIONS")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse()
+                .context("Failed to parse WAYBILLS_DB_MIN_CONNECTIONS")?,
+            db_acquire_timeout: env::var("WAYBILLS_DB_ACQUIRE_TIMEOUT")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .context("Failed to parse WAYBILLS_DB_ACQUIRE_TIMEOUT")?,
+            db_idle_timeout: env::var("WAYBILLS_DB_IDLE_TIMEOUT")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .context("Failed to parse WAYBILLS_DB_IDLE_TIMEOUT")?,
+            db_max_lifetime: env::var("WAYBILLS_DB_MAX_LIFETIME")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .context("Failed to parse WAYBILLS_DB_MAX_LIFETIME")?,
             cache_duration: env::var("CACHE_DURATION")
                 .unwrap_or_else(|_| "3600".to_string())
                 .parse()
@@ -156,6 +178,14 @@ impl AppConfig {
                 .unwrap_or_else(|_| "100".to_string())
                 .parse()
                 .context("Failed to parse GTFS_CONNECTION_LIMIT")?,
+            http_pool_idle_timeout: env::var("GTFS_HTTP_POOL_IDLE_TIMEOUT")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .context("Failed to parse GTFS_HTTP_POOL_IDLE_TIMEOUT")?,
+            http_tcp_keepalive: env::var("GTFS_HTTP_TCP_KEEPALIVE")
+                .unwrap_or_else(|_| "7200".to_string())
+                .parse()
+                .context("Failed to parse GTFS_HTTP_TCP_KEEPALIVE")?,
             dns_ttl: env::var("GTFS_DNS_TTL")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()

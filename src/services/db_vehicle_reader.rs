@@ -79,6 +79,10 @@ impl DBVehicleReader {
             .ok_or_else(|| AppError::Internal("DATABASE_URL is not set".to_string()))?;
         let pool = PgPoolOptions::new()
             .max_connections(config.db_max_connections)
+            .min_connections(config.db_min_connections)
+            .acquire_timeout(Duration::from_secs(config.db_acquire_timeout))
+            .idle_timeout(Duration::from_secs(config.db_idle_timeout))
+            .max_lifetime(Duration::from_secs(config.db_max_lifetime))
             .connect(db_url)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;

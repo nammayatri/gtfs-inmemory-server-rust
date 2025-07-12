@@ -7,6 +7,7 @@ use std::env;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use std::os::unix::io::AsRawFd;
 
 mod config;
 mod errors;
@@ -153,9 +154,33 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting server on {}:{}", config.api_host, config.api_port);
 
-    let listener =
-        tokio::net::TcpListener::bind(format!("{}:{}", config.api_host, config.api_port)).await?;
-    axum::serve(listener, app).await?;
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", config.api_host, config.api_port)).await?;
+    
+    // Configure TCP socket options for better performance
+    let socket = listener.as_raw_fd();
+    unsafe {
+        // Enable TCP_NODELAY for lower latency
+        let nodelay: libc::c_int = 1;
+        libc::setsockopt(
+            socket,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &nodelay as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        
+        // Enable SO_REUSEADDR for faster restarts
+        let reuseaddr: libc::c_int = 1;
+        libc::setsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &reuseaddr as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    
+     axum::serve(listener, app).await?;
 
     Ok(())
 }

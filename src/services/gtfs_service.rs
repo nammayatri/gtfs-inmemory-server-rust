@@ -40,6 +40,10 @@ impl GTFSService {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(config.connection_limit)
+            .pool_idle_timeout(Duration::from_secs(config.http_pool_idle_timeout))
+            .tcp_keepalive(Some(Duration::from_secs(config.http_tcp_keepalive)))
+            .tcp_nodelay(true) // Disable Nagle's algorithm for lower latency
+            .local_address(None) // Allow system to choose optimal local address
             .build()
             .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
