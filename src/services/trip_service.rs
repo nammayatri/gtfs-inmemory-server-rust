@@ -52,14 +52,14 @@ impl TripService {
 
         // Cache miss - fetch from GraphQL
         info!("Cache miss, fetching from GraphQL for key: {}", cache_key);
-        let mut trip_data = self.fetch_trip_from_graphql(trip_id, gtfs_id, city).await?;
+        let trip_data = self.fetch_trip_from_graphql(trip_id, gtfs_id, city).await?;
         
-        // Change source to "cache" before storing
-        trip_data.source = "cache".to_string();
+        // Store in cache (with source = "cache")
+        let mut cached_data = trip_data.clone();
+        cached_data.source = "cache".to_string();
+        self.store_in_cache(&cache_key, &cached_data).await?;
         
-        // Store in cache
-        self.store_in_cache(&cache_key, &trip_data).await?;
-        
+        // Return original data with source = "graphql"
         Ok(trip_data)
     }
 
