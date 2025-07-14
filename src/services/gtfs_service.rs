@@ -8,10 +8,12 @@ use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use futures::future::join_all;
+use reqwest::Method;
 use serde::Serialize;
 use serde_json;
 use sha2::{Digest, Sha256};
 use shared::call_external_api;
+use shared::tools::callapi::{call_api, Protocol};
 use shared::tools::prometheus::CALL_EXTERNAL_API;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -21,6 +23,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 fn get_sha256_hash<T: Serialize>(val: &T) -> String {
     let json = serde_json::to_vec(val).unwrap(); // handles f64 fine
@@ -917,7 +920,8 @@ impl GTFSService {
                 .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
         };
 
-        let url = format!("{}/otp/gtfs/v1", instance.url);
+        let url: Url = Url::parse(&format!("{}/otp/gtfs/v1", instance.url))
+            .map_err(|e| AppError::Internal(format!("Failed to parse URL: {}", e)))?;
 
         let mut request_body = serde_json::json!({
             "query": query
@@ -931,27 +935,15 @@ impl GTFSService {
             request_body["operationName"] = serde_json::Value::String(op_name);
         }
 
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| AppError::HttpRequest(e))?;
-
-        if response.status().is_success() {
-            let result: serde_json::Value = response.json().await.map_err(|e| {
-                AppError::Internal(format!("Failed to deserialize GraphQL response: {}", e))
-            })?;
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!(
-                "GraphQL request failed: {} - {}",
-                status, body
-            )))
-        }
+        call_api::<serde_json::Value, serde_json::Value>(
+            Protocol::Http1,
+            Method::POST,
+            &url,
+            vec![("Content-Type", "application/json")],
+            Some(request_body),
+            Some("execute_graphql_query"),
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to call API: {}", e)))
     }
 }
