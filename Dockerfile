@@ -48,12 +48,6 @@ WORKDIR /app
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
 COPY --from=builder /app/assets /app/assets
 
-# Change ownership to non-root user
-RUN chown app:app /app/gtfs-routes-service
-
-# Switch to non-root user
-USER app
-
 # Expose port
 EXPOSE 8000
 
