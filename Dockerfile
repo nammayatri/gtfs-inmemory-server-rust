@@ -14,6 +14,7 @@ WORKDIR /app
 
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock* ./
+COPY ./log-processor log-processor
 
 # Create a dummy main.rs to build dependencies
 RUN mkdir -p assets && mkdir -p src && echo "fn main() {}" > src/main.rs
@@ -47,6 +48,7 @@ WORKDIR /app
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
 COPY --from=builder /app/assets /app/assets
+COPY --from=builder /app/log-processor /app/log-processor
 
 # Expose port
 EXPOSE 8000
