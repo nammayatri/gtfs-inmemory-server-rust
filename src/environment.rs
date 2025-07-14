@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::services::{
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
     gtfs_service::GTFSService,
+    trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
 use shared::tools::logger::LoggerConfig;
@@ -83,6 +84,7 @@ pub fn read_dhall_config(dhall_config_path: &str) -> Result<AppConfig> {
 pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
+    pub trip_service: Arc<TripService>,
     pub config: AppConfig,
 }
 
@@ -118,10 +120,15 @@ impl AppState {
             Arc::new(MockDBVehicleReader::new())
         };
 
-        Ok(AppState {
+        let trip_service = Arc::new(TripService::new(gtfs_service.clone()));
+
+        let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
+            trip_service,
             config: app_config,
-        })
+        };
+
+        Ok(app_state)
     }
 }

@@ -21,7 +21,7 @@ in {
   cache_duration = 300,
   
   -- API configuration  
-  port = 8085,
+  port = 8000,
   
   -- GTFS configuration
   polling_interval = 60,
@@ -42,12 +42,9 @@ in {
   -- OTP configuration
   otp_instances = {
     city_based_instances = [
-      { url = "http://localhost:8090", identifier = "city1" }      
+      { url = "http://localhost:8080", identifier = "city1" }
     ],
-    gtfs_id_based_instances = [
-      { url = "http://localhost:8090", identifier = "gtfs_1" },
-      { url = "http://localhost:8090", identifier = "gtfs_2" }
-    ],
-    default_instance = { url = "http://localhost:8090", identifier = "default" }
+    gtfs_id_based_instances = [] : List { identifier : Text, url : Text },
+    default_instance = { url = "http://localhost:8000/nandi", identifier = "default" }
   }
 }

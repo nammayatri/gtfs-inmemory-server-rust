@@ -5,12 +5,14 @@ use actix_web::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{error, info};
 
 use crate::environment::AppState;
 use crate::models::{
     GTFSStop, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
     VehicleServiceTypeResponse,
 };
+use crate::graphql::TripQueryParams;
 use crate::{
     models::LatLong,
     tools::error::{AppError, AppResult},
@@ -74,7 +76,24 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/connection-stats",
                 actix_web::web::get().to(get_connection_stats),
-            ),
+            )
+            .route(
+                "/trip/{trip_id}",
+                actix_web::web::get().to(get_trip_data),
+            )
+            .route(
+                "/trip-cache/stats",
+                actix_web::web::get().to(get_trip_cache_stats),
+            )
+            .route(
+                "/trip-cache/clear",
+                actix_web::web::post().to(clear_trip_cache),
+            )
+            .route(
+                "/refresh-data",
+                actix_web::web::post().to(force_refresh_data),
+            )
+
     );
 }
 
@@ -108,23 +127,7 @@ async fn get_route_stop_mapping_by_route(
     Ok(HttpResponse::Ok().json(mappings))
 }
 
-fn get_max_sequence_route_stop_mapping(
-    all_mappings: Vec<Arc<RouteStopMapping>>,
-) -> Vec<Arc<RouteStopMapping>> {
-    if all_mappings.is_empty() {
-        return Vec::new();
-    }
 
-    let mut seq_map: HashMap<i32, Arc<RouteStopMapping>> = HashMap::new();
-    for mapping in all_mappings {
-        seq_map.insert(mapping.sequence_num, mapping);
-    }
-
-    let mut result: Vec<Arc<RouteStopMapping>> = seq_map.into_values().collect();
-    result.sort_by_key(|m| m.sequence_num);
-
-    result
-}
 
 async fn get_route_stop_mapping_by_stop(
     app_state: Data<AppState>,
@@ -391,3 +394,52 @@ async fn get_connection_stats(app_state: Data<AppState>) -> AppResult<HttpRespon
         }
     })))
 }
+
+async fn get_trip_data(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<TripQueryParams>,
+) -> AppResult<HttpResponse> {
+    let trip_id = path.into_inner();
+    let query_params = query.into_inner();
+    
+    let trip_data = app_state
+        .trip_service
+        .get_trip_data(&trip_id, query_params.gtfs_id, query_params.city)
+        .await?;
+    
+    Ok(HttpResponse::Ok().json(trip_data))
+}
+
+async fn get_trip_cache_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    let stats = app_state.trip_service.get_cache_stats().await;
+    Ok(HttpResponse::Ok().json(stats))
+}
+
+async fn clear_trip_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    app_state.trip_service.clear_cache().await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Trip cache cleared successfully"
+    })))
+}
+
+async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    // Trigger a background refresh of GTFS data
+    let gtfs_service = app_state.gtfs_service.clone();
+    
+    // Spawn a background task to refresh data
+    tokio::spawn(async move {
+        info!("Starting forced GTFS data refresh...");
+        match gtfs_service.force_refresh_data().await {
+            Ok(_) => info!("GTFS data refresh completed successfully"),
+            Err(e) => error!("GTFS data refresh failed: {}", e),
+        }
+    });
+    
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "GTFS data refresh initiated in background",
+        "status": "started"
+    })))
+}
+
+

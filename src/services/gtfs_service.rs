@@ -430,7 +430,7 @@ impl GTFSService {
         }
 
         // Process only the longest pattern for each route
-        for (route_key, patterns) in patterns_by_route {
+        for (_route_key, patterns) in patterns_by_route {
             // Find the pattern with the most stops
             let longest_pattern = patterns
                 .iter()
@@ -898,6 +898,24 @@ impl GTFSService {
     }
 
     // GraphQL query execution
+    pub async fn force_refresh_data(&self) -> AppResult<()> {
+        info!("Force refresh triggered - checking for GTFS data updates...");
+        let start_time = std::time::Instant::now();
+
+        // Use the same efficient polling mechanism
+        match self.update_data().await {
+            Ok(_) => {
+                let duration = start_time.elapsed();
+                info!("Force refresh completed in {:?}", duration);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Force refresh failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
     pub async fn execute_graphql_query(
         &self,
         city: &str,

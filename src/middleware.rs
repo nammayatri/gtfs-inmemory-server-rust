@@ -13,14 +13,13 @@ use actix_http::StatusCode;
 use actix_web::{
     body::{BoxBody, MessageBody},
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    web::Bytes,
     Error, HttpRequest,
 };
 use futures::future::LocalBoxFuture;
 use regex::Regex;
 use tokio::time::Instant;
 use tracing::Span;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_actix_web::{DefaultRootSpanBuilder, RootSpanBuilder};
 use uuid::Uuid;
 
@@ -231,14 +230,4 @@ fn calculate_metrics(
     }
 }
 
-/// Logs the request body for the allowed error codes.
-///
-/// # Arguments
-/// * `err_codes` - Allowed error codes for whom the request body is allowed to be logged.
-/// * `err_resp` - reference to an error response.
-/// * `request_body` - Request body represented in byte string.
-fn log_request_and_response_body(err_codes: Vec<String>, err_resp: &Error, request_body: Bytes) {
-    if err_codes.contains(&err_resp.to_string()) {
-        warn!("Raw Request Body: {:?}", request_body);
-    }
-}
+
