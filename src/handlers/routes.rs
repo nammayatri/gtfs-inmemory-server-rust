@@ -1,19 +1,19 @@
-use axum::{
-    extract::{Path, Query, State},
-    response::Json,
-    routing::{get, post},
-    Router,
+use actix_web::{
+    web::{Data, Json, Path, Query},
+    HttpResponse,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::models::{GTFSStop, NandiRoutesRes, RouteStopMapping, VehicleServiceTypeResponse};
-use crate::AppState;
-use crate::{config::AppConfig, models::StopCodeFromProviderStopCodeResponse};
+use crate::environment::AppState;
+use crate::models::{
+    GTFSStop, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
+    VehicleServiceTypeResponse,
+};
 use crate::{
-    errors::{AppError, AppResult},
     models::LatLong,
+    tools::error::{AppError, AppResult},
 };
 
 #[derive(Debug, Deserialize)]
@@ -21,73 +21,91 @@ pub struct LimitQuery {
     limit: Option<i32>,
 }
 
-pub fn create_router(app_state: AppState) -> Router {
-    Router::new()
-        .route("/route/:gtfs_id/:route_id", get(get_route))
-        .route("/routes/:gtfs_id", get(get_routes))
-        .route(
-            "/route-stop-mapping/:gtfs_id/route/:route_code",
-            get(get_route_stop_mapping_by_route),
-        )
-        .route(
-            "/route-stop-mapping/:gtfs_id/stop/:stop_code",
-            get(get_route_stop_mapping_by_stop),
-        )
-        .route("/routes/:gtfs_id/fuzzy/:query", get(get_routes_fuzzy))
-        .route("/stops/:gtfs_id", get(get_stops))
-        .route("/stop/:gtfs_id/:stop_code", get(get_stop))
-        .route("/stops/:gtfs_id/fuzzy/:query", get(get_stops_fuzzy))
-        .route(
-            "/stop-code/:gtfs_id/:provider_stop_code",
-            get(get_stop_code_from_provider_stop_code),
-        )
-        .route(
-            "/station-children/:gtfs_id/:stop_code",
-            get(get_station_children),
-        )
-        .route("/ready", get(readiness_probe))
-        .route("/version/:gtfs_id", get(get_version))
-        .route(
-            "/vehicle/:vehicle_no/service-type",
-            get(get_service_type_by_vehicle),
-        )
-        .route("/memory-stats", get(get_memory_stats))
-        .route("/cached-data", get(get_all_cached_data))
-        .route("/config", get(get_config))
-        .route("/graphql", post(graphql_query))
-        .route("/connection-stats", get(get_connection_stats))
-        .with_state(app_state)
+pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
+    cfg.service(
+        actix_web::web::scope("")
+            .route(
+                "/route/{gtfs_id}/{route_id}",
+                actix_web::web::get().to(get_route),
+            )
+            .route("/routes/{gtfs_id}", actix_web::web::get().to(get_routes))
+            .route(
+                "/route-stop-mapping/{gtfs_id}/route/{route_code}",
+                actix_web::web::get().to(get_route_stop_mapping_by_route),
+            )
+            .route(
+                "/route-stop-mapping/{gtfs_id}/stop/{stop_code}",
+                actix_web::web::get().to(get_route_stop_mapping_by_stop),
+            )
+            .route(
+                "/routes/{gtfs_id}/fuzzy/{query}",
+                actix_web::web::get().to(get_routes_fuzzy),
+            )
+            .route("/stops/{gtfs_id}", actix_web::web::get().to(get_stops))
+            .route(
+                "/stop/{gtfs_id}/{stop_code}",
+                actix_web::web::get().to(get_stop),
+            )
+            .route(
+                "/stops/{gtfs_id}/fuzzy/{query}",
+                actix_web::web::get().to(get_stops_fuzzy),
+            )
+            .route(
+                "/stop-code/{gtfs_id}/{provider_stop_code}",
+                actix_web::web::get().to(get_stop_code_from_provider_stop_code),
+            )
+            .route(
+                "/station-children/{gtfs_id}/{stop_code}",
+                actix_web::web::get().to(get_station_children),
+            )
+            .route("/ready", actix_web::web::get().to(readiness_probe))
+            .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
+            .route(
+                "/vehicle/{vehicle_no}/service-type",
+                actix_web::web::get().to(get_service_type_by_vehicle),
+            )
+            .route("/memory-stats", actix_web::web::get().to(get_memory_stats))
+            .route(
+                "/cached-data",
+                actix_web::web::get().to(get_all_cached_data),
+            )
+            .route("/config", actix_web::web::get().to(get_config))
+            .route("/graphql", actix_web::web::post().to(graphql_query))
+            .route(
+                "/connection-stats",
+                actix_web::web::get().to(get_connection_stats),
+            ),
+    );
 }
 
 async fn get_route(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, route_id)): Path<(String, String)>,
-) -> AppResult<Json<NandiRoutesRes>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_id) = path.into_inner();
     let route = app_state
         .gtfs_service
         .get_route(&gtfs_id, &route_id)
         .await?;
-    Ok(Json(route))
+    Ok(HttpResponse::Ok().json(route))
 }
 
-async fn get_routes(
-    State(app_state): State<AppState>,
-    Path(gtfs_id): Path<String>,
-) -> AppResult<Json<Vec<NandiRoutesRes>>> {
+async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
     let routes = app_state.gtfs_service.get_routes(&gtfs_id).await?;
-    Ok(Json(routes))
+    Ok(HttpResponse::Ok().json(routes))
 }
 
 async fn get_route_stop_mapping_by_route(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, route_code)): Path<(String, String)>,
-) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_code) = path.into_inner();
     let mappings = app_state
         .gtfs_service
         .get_route_stop_mapping_by_route(&gtfs_id, &route_code)
         .await?;
-    // let max_sequence_mappings = get_max_sequence_route_stop_mapping(mappings);
-    Ok(Json(mappings))
+    Ok(HttpResponse::Ok().json(mappings))
 }
 
 fn get_max_sequence_route_stop_mapping(
@@ -109,23 +127,25 @@ fn get_max_sequence_route_stop_mapping(
 }
 
 async fn get_route_stop_mapping_by_stop(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, stop_code) = path.into_inner();
     let mappings = app_state
         .gtfs_service
         .get_route_stop_mapping_by_stop(&gtfs_id, &stop_code)
         .await?;
-    Ok(Json(mappings))
+    Ok(HttpResponse::Ok().json(mappings))
 }
 
 async fn get_routes_fuzzy(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, query)): Path<(String, String)>,
-    Query(params): Query<LimitQuery>,
-) -> AppResult<Json<Vec<NandiRoutesRes>>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<LimitQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, query_str) = path.into_inner();
     let routes = app_state.gtfs_service.get_routes(&gtfs_id).await?;
-    let query_lower = query.to_lowercase();
+    let query_lower = query_str.to_lowercase();
 
     let mut unique_routes: HashMap<String, NandiRoutesRes> = HashMap::new();
 
@@ -144,7 +164,7 @@ async fn get_routes_fuzzy(
 
         if matches {
             unique_routes.insert(route.id.clone(), route);
-            if let Some(limit) = params.limit {
+            if let Some(limit) = query.limit {
                 if unique_routes.len() >= limit as usize {
                     break;
                 }
@@ -152,21 +172,20 @@ async fn get_routes_fuzzy(
         }
     }
 
-    Ok(Json(unique_routes.into_values().collect()))
+    Ok(HttpResponse::Ok().json(unique_routes.into_values().collect::<Vec<_>>()))
 }
 
-async fn get_stops(
-    State(app_state): State<AppState>,
-    Path(gtfs_id): Path<String>,
-) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
+async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
-    Ok(Json(stops))
+    Ok(HttpResponse::Ok().json(stops))
 }
 
 async fn get_stop(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<RouteStopMapping>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, stop_code) = path.into_inner();
     let stop = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)
@@ -191,16 +210,17 @@ async fn get_stop(
                 sequence_num: 0,
             },
         )?;
-    Ok(Json(stop))
+    Ok(HttpResponse::Ok().json(stop))
 }
 
 async fn get_stops_fuzzy(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, query)): Path<(String, String)>,
-    Query(params): Query<LimitQuery>,
-) -> AppResult<Json<Vec<Arc<RouteStopMapping>>>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<LimitQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, query_str) = path.into_inner();
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
-    let query_lower = query.to_lowercase();
+    let query_lower = query_str.to_lowercase();
 
     let mut unique_stops: HashMap<String, Arc<RouteStopMapping>> = HashMap::new();
 
@@ -210,7 +230,7 @@ async fn get_stops_fuzzy(
 
         if matches {
             unique_stops.insert(stop.stop_code.clone(), stop.clone());
-            if let Some(limit) = params.limit {
+            if let Some(limit) = query.limit {
                 if unique_stops.len() >= limit as usize {
                     break;
                 }
@@ -218,64 +238,65 @@ async fn get_stops_fuzzy(
         }
     }
 
-    Ok(Json(unique_stops.into_values().collect()))
+    Ok(HttpResponse::Ok().json(unique_stops.into_values().collect::<Vec<_>>()))
 }
 
 async fn get_stop_code_from_provider_stop_code(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, provider_stop_code)): Path<(String, String)>,
-) -> AppResult<Json<StopCodeFromProviderStopCodeResponse>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, provider_stop_code) = path.into_inner();
     let stop_code = app_state
         .gtfs_service
         .get_provider_stop_code(&gtfs_id, &provider_stop_code)
         .await?;
-    Ok(Json(StopCodeFromProviderStopCodeResponse { stop_code }))
+    Ok(HttpResponse::Ok().json(StopCodeFromProviderStopCodeResponse { stop_code }))
 }
 
 async fn get_station_children(
-    State(app_state): State<AppState>,
-    Path((gtfs_id, stop_code)): Path<(String, String)>,
-) -> AppResult<Json<Vec<String>>> {
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, stop_code) = path.into_inner();
     let children = app_state
         .gtfs_service
         .get_station_children(&gtfs_id, &stop_code)
         .await?;
-    Ok(Json(children))
+    Ok(HttpResponse::Ok().json(children))
 }
 
-async fn readiness_probe(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+async fn readiness_probe(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     if !app_state.gtfs_service.is_ready().await {
         return Err(AppError::NotReady(
             "Service not ready - still loading initial data".to_string(),
         ));
     }
 
-    Ok(Json(serde_json::json!({
+    Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "message": "Service is ready to handle requests"
     })))
 }
 
-async fn get_version(
-    State(app_state): State<AppState>,
-    Path(gtfs_id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
+async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
     let version = app_state.gtfs_service.get_version(&gtfs_id).await?;
-    Ok(Json(serde_json::json!({
+    Ok(HttpResponse::Ok().json(serde_json::json!({
         "gtfs_id": gtfs_id,
         "version": version
     })))
 }
 
 async fn get_service_type_by_vehicle(
-    State(app_state): State<AppState>,
-    Path(vehicle_no): Path<String>,
-) -> AppResult<Json<VehicleServiceTypeResponse>> {
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let vehicle_no = path.into_inner();
     let vehicle_data = app_state
         .db_vehicle_reader
         .get_vehicle_data(&vehicle_no)
         .await?;
-    Ok(Json(VehicleServiceTypeResponse {
+    Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type: vehicle_data.service_type,
         waybill_id: Some(vehicle_data.waybill_id),
@@ -284,22 +305,21 @@ async fn get_service_type_by_vehicle(
     }))
 }
 
-async fn get_memory_stats(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+async fn get_memory_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let stats = app_state.gtfs_service.get_memory_stats().await;
-    Ok(Json(serde_json::json!(stats)))
+    Ok(HttpResponse::Ok().json(serde_json::json!(stats)))
 }
 
-async fn get_all_cached_data(
-    State(app_state): State<AppState>,
-) -> AppResult<Json<serde_json::Value>> {
+async fn get_all_cached_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let cached_data = app_state.gtfs_service.get_all_cached_data().await;
-    Ok(Json(serde_json::to_value(cached_data).map_err(|e| {
-        AppError::Internal(format!("Failed to serialize cached data: {}", e))
-    })?))
+    Ok(HttpResponse::Ok().json(
+        serde_json::to_value(cached_data)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize cached data: {}", e)))?,
+    ))
 }
 
-async fn get_config(State(app_state): State<AppState>) -> AppResult<Json<AppConfig>> {
-    Ok(Json(app_state.config.clone()))
+async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    Ok(HttpResponse::Ok().json(app_state.config.clone()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -313,24 +333,27 @@ struct GraphQLRequest {
 }
 
 async fn graphql_query(
-    State(app_state): State<AppState>,
-    Json(payload): Json<GraphQLRequest>,
-) -> AppResult<Json<serde_json::Value>> {
-    let city = payload.city.unwrap_or_else(|| "default".to_string());
+    app_state: Data<AppState>,
+    payload: Json<GraphQLRequest>,
+) -> AppResult<HttpResponse> {
+    let city = payload
+        .city
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let result = app_state
         .gtfs_service
         .execute_graphql_query(
             &city,
             &payload.query,
-            payload.variables,
-            payload.operation_name,
-            payload.gtfs_id,
+            payload.variables.clone(),
+            payload.operation_name.clone(),
+            payload.gtfs_id.clone(),
         )
         .await?;
-    Ok(Json(result))
+    Ok(HttpResponse::Ok().json(result))
 }
 
-async fn get_connection_stats(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+async fn get_connection_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     // Get configuration-based connection stats
     let db_stats = serde_json::json!({
         "database": {
@@ -360,7 +383,7 @@ async fn get_connection_stats(State(app_state): State<AppState>) -> AppResult<Js
         }
     });
 
-    Ok(Json(serde_json::json!({
+    Ok(HttpResponse::Ok().json(serde_json::json!({
         "connection_stats": {
             "database": db_stats["database"],
             "http_client": http_stats["http_client"],

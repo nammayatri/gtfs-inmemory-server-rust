@@ -138,6 +138,58 @@ curl http://localhost:8000/route-stop-mapping/chennai_data/stop/STOP001
 curl http://localhost:8000/stop-code/chennai_data/PROVIDER001
 ```
 
+## Testing with Newman
+
+[Newman](https://github.com/postmanlabs/newman) is a command-line collection runner for Postman. You can use it to run the included Postman collection for comprehensive API testing.
+
+### Prerequisites
+
+Install Newman globally:
+
+```bash
+npm install -g newman
+```
+
+Port Forward To Nandi:
+
+```bash
+kubectl port-forward service/beckn-nandi-master 8090:8080 -n atlas
+```
+
+### Running the Collection
+
+Run the entire test collection with the local environment:
+
+```bash
+newman run GIMS.postman_collection.json --env-var "gtfs-inmemory=http://localhost:8085"
+```
+
+### Running Specific Tests
+
+You can also run specific requests from the collection:
+
+```bash
+# Run only the "Get All Routes" test
+newman run GIMS.postman_collection.json --folder "Get All Routes" --env-var "gtfs-inmemory=http://localhost:8085"
+```
+
+### Environment Variables
+
+The collection uses the following environment variable:
+
+- `gtfs-inmemory` - Base URL for the GTFS service (default: `http://localhost:8085`)
+
+### Sample Collection Tests
+
+The collection includes tests for:
+
+- GraphQL queries for trips with stop codes
+- Getting all routes and specific routes
+- Fuzzy matching for routes and stops
+- Route-stop mappings
+- Station information and children
+- Provider stop code lookups
+
 ## Response Format
 
 ### Route Response

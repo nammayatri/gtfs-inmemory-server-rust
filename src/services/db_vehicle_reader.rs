@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::config::AppConfig;
-use crate::errors::{AppError, AppResult};
+use crate::environment::AppConfig;
 use crate::models::VehicleData;
+use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {

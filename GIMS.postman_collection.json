@@ -1,0 +1,246 @@
+{
+	"info": {
+		"_postman_id": "2fc52d1a-ceb5-496a-bfef-7c8b6dd40453",
+		"name": "GIMS",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "40641660",
+		"_collection_link": "https://namma-team.postman.co/workspace/Namma-Team-Workspace~6f4dc87b-9fb0-45a7-8447-747591e95680/collection/40641660-2fc52d1a-ceb5-496a-bfef-7c8b6dd40453?action=share&source=collection_link&creator=40641660"
+	},
+	"item": [
+		{
+			"name": "Trips With Stop Code",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"query\": \"query RouteStopTimeTableQuery($stopId: String!) { stop(id: $stopId) { gtfsId name stoptimesWithoutPatterns(numberOfDepartures: 500) { scheduledArrival realtimeArrival arrivalDelay scheduledDeparture headsign trip { serviceId tripShortName gtfsId route { gtfsId } } } } }\",\n    \"variables\": {\n        \"stopId\": \"bangalore_metro:7_1\"\n    },\n    \"city\": \"ecd5edce-8300-1cdc-f351-25157e82ee66\",\n    \"feedId\": \"bangalore_metro\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{gtfs-inmemory}}/graphql",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"graphql"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get All Routes",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/routes/bangalore_metro",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"routes",
+						"bangalore_metro"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get All Routes By Code",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/route/bangalore_metro/GREEN_U",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"route",
+						"bangalore_metro",
+						"GREEN_U"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get Routes By Fuzzy Match",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/routes/bangalore_metro/fuzzy/GREEN?limit=10",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"routes",
+						"bangalore_metro",
+						"fuzzy",
+						"GREEN"
+					],
+					"query": [
+						{
+							"key": "limit",
+							"value": "10"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get All Stations",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/stops/bangalore_metro",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"stops",
+						"bangalore_metro"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get Provider Code By Station Code",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/stop-code/chennai_metro_nammayatri_partnerorg/SKP|01F5",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"stop-code",
+						"chennai_metro_nammayatri_partnerorg",
+						"SKP|01F5"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get Stations By Code",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/stop/bangalore_metro/1",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"stop",
+						"bangalore_metro",
+						"1"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get Children Stations By Code",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/station-children/bangalore_metro/2",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"station-children",
+						"bangalore_metro",
+						"2"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get Stations By Fuzzy Match",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/stops/bangalore_metro/fuzzy/Maha?limit=10",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"stops",
+						"bangalore_metro",
+						"fuzzy",
+						"Maha"
+					],
+					"query": [
+						{
+							"key": "limit",
+							"value": "10"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Route Stop Mapping By Route Code",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/route-stop-mapping/bangalore_metro/route/GREEN_D",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"route-stop-mapping",
+						"bangalore_metro",
+						"route",
+						"GREEN_D"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Route Stop Mapping By Stop Code",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{gtfs-inmemory}}/route-stop-mapping/bangalore_metro/stop/70",
+					"host": [
+						"{{gtfs-inmemory}}"
+					],
+					"path": [
+						"route-stop-mapping",
+						"bangalore_metro",
+						"stop",
+						"70"
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}

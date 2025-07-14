@@ -1,8 +1,18 @@
+use crate::environment::AppConfig;
+use crate::models::{
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
+    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes,
+    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
+};
+use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use futures::future::join_all;
+use serde::Serialize;
 use serde_json;
 use sha2::{Digest, Sha256};
+use shared::call_external_api;
+use shared::tools::prometheus::CALL_EXTERNAL_API;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,15 +21,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
-
-use crate::config::AppConfig;
-use crate::errors::{AppError, AppResult};
-use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
-    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes,
-    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
-};
-use serde::Serialize;
 
 fn get_sha256_hash<T: Serialize>(val: &T) -> String {
     let json = serde_json::to_vec(val).unwrap(); // handles f64 fine
@@ -630,18 +631,22 @@ impl GTFSService {
         format!("{:x}", hasher.finalize())
     }
 
-    async fn fetch_with_retry<T>(&self, url: &str) -> AppResult<T>
+    async fn fetch_with_retry<T>(&self, url_str: &str, service: &str) -> AppResult<T>
     where
         T: for<'de> serde::Deserialize<'de>,
     {
+        let start_time = std::time::Instant::now();
+        let method = "GET";
         for attempt in 0..self.config.max_retries {
-            match self.http_client.get(url).send().await {
+            match self.http_client.get(url_str).send().await {
                 Ok(response) => {
-                    if response.status().is_success() {
+                    let status = response.status();
+                    if status.is_success() {
+                        call_external_api!(method, url_str, service, status.as_str(), start_time);
                         return response.json::<T>().await.map_err(|e| {
                             AppError::Internal(format!("Failed to deserialize response: {}", e))
                         });
-                    } else if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         let retry_after = response
                             .headers()
                             .get("Retry-After")
@@ -654,6 +659,7 @@ impl GTFSService {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
                         error!("HTTP request failed with status {}: {}", status, body);
+                        call_external_api!(method, url_str, service, status.as_str(), start_time);
                         return Err(AppError::Internal(format!(
                             "HTTP request failed: {} - {}",
                             status, body
@@ -661,13 +667,14 @@ impl GTFSService {
                     }
                 }
                 Err(e) => {
-                    error!("Error fetching {}: {}", url, e);
+                    error!("Error fetching {}: {}", url_str, e);
                     if attempt < self.config.max_retries - 1 {
                         sleep(Duration::from_secs(
                             self.config.retry_delay * (attempt as u64 + 1),
                         ))
                         .await;
                     } else {
+                        call_external_api!(method, url_str, service, "500", start_time);
                         return Err(AppError::HttpRequest(e));
                     }
                 }
@@ -678,7 +685,7 @@ impl GTFSService {
 
     async fn fetch_patterns(&self, base_url: &str) -> AppResult<Vec<NandiPattern>> {
         let url = format!("{}/otp/routers/default/index/patterns", base_url);
-        self.fetch_with_retry(&url).await
+        self.fetch_with_retry(&url, "fetch_patterns").await
     }
 
     async fn fetch_pattern_details(
@@ -690,17 +697,17 @@ impl GTFSService {
             "{}/otp/routers/default/index/patterns/{}",
             base_url, pattern_id
         );
-        self.fetch_with_retry(&url).await
+        self.fetch_with_retry(&url, "fetch_pattern_details").await
     }
 
     async fn fetch_routes(&self, base_url: &str) -> AppResult<Vec<NandiRoutesRes>> {
         let url = format!("{}/otp/routers/default/index/routes", base_url);
-        self.fetch_with_retry(&url).await
+        self.fetch_with_retry(&url, "fetch_routes").await
     }
 
     async fn fetch_stops(&self, base_url: &str) -> AppResult<Vec<GTFSStop>> {
         let url = format!("{}/otp/routers/default/index/stops", base_url);
-        self.fetch_with_retry(&url).await
+        self.fetch_with_retry(&url, "fetch_stops").await
     }
 
     pub async fn is_ready(&self) -> bool {
