@@ -1,5 +1,5 @@
 # Multi-stage build for Rust application
-FROM rust:1.77-slim as builder
+FROM rust:slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
