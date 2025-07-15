@@ -145,7 +145,11 @@ where
 /// # Returns
 /// * `String` - The path string with placeholders for matched info.
 fn get_path(request: &HttpRequest) -> String {
-    let mut path = request.path().to_string();
+    let mut path = urlencoding::decode(request.path())
+        .ok()
+        .map(|s| s.to_string())
+        .unwrap_or(request.path().to_string());
+
     request
         .match_info()
         .iter()
@@ -229,5 +233,3 @@ fn calculate_metrics(
         );
     }
 }
-
-

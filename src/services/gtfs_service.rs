@@ -640,12 +640,22 @@ impl GTFSService {
     {
         let start_time = std::time::Instant::now();
         let method = "GET";
+        let host = Url::parse(url_str)
+            .ok()
+            .and_then(|url| url.host_str().map(|s| s.to_string()))
+            .unwrap_or(url_str.to_string());
         for attempt in 0..self.config.max_retries {
             match self.http_client.get(url_str).send().await {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        call_external_api!(method, url_str, service, status.as_str(), start_time);
+                        call_external_api!(
+                            method,
+                            host.as_str(),
+                            service,
+                            status.as_str(),
+                            start_time
+                        );
                         return response.json::<T>().await.map_err(|e| {
                             AppError::Internal(format!("Failed to deserialize response: {}", e))
                         });
@@ -662,7 +672,13 @@ impl GTFSService {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
                         error!("HTTP request failed with status {}: {}", status, body);
-                        call_external_api!(method, url_str, service, status.as_str(), start_time);
+                        call_external_api!(
+                            method,
+                            host.as_str(),
+                            service,
+                            status.as_str(),
+                            start_time
+                        );
                         return Err(AppError::Internal(format!(
                             "HTTP request failed: {} - {}",
                             status, body
@@ -677,7 +693,7 @@ impl GTFSService {
                         ))
                         .await;
                     } else {
-                        call_external_api!(method, url_str, service, "500", start_time);
+                        call_external_api!(method, host.as_str(), service, "500", start_time);
                         return Err(AppError::HttpRequest(e));
                     }
                 }
