@@ -7,12 +7,12 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::environment::AppConfig;
-use crate::models::VehicleData;
+use crate::models::{BusSchedule, VehicleData, VehicleDataWithRouteId};
 use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
-    async fn get_vehicle_data(&self, vehicle_no: &str) -> AppResult<VehicleData>;
+    async fn get_vehicle_data(&self, vehicle_no: &str) -> AppResult<VehicleDataWithRouteId>;
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicles_by_service_type(&self, service_type: &str)
         -> AppResult<Vec<VehicleData>>;
@@ -31,7 +31,7 @@ impl MockDBVehicleReader {
 
 #[async_trait]
 impl VehicleDataReader for MockDBVehicleReader {
-    async fn get_vehicle_data(&self, _vehicle_no: &str) -> AppResult<VehicleData> {
+    async fn get_vehicle_data(&self, _vehicle_no: &str) -> AppResult<VehicleDataWithRouteId> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -67,7 +67,7 @@ impl VehicleDataReader for MockDBVehicleReader {
 
 pub struct DBVehicleReader {
     pool: PgPool,
-    cache: Arc<RwLock<HashMap<String, (VehicleData, SystemTime)>>>,
+    cache: Arc<RwLock<HashMap<String, (VehicleDataWithRouteId, SystemTime)>>>,
     cache_duration: Duration,
 }
 
@@ -96,7 +96,7 @@ impl DBVehicleReader {
         })
     }
 
-    async fn get_cached_vehicle_data(&self, vehicle_no: &str) -> Option<VehicleData> {
+    async fn get_cached_vehicle_data(&self, vehicle_no: &str) -> Option<VehicleDataWithRouteId> {
         let cache = self.cache.read().await;
         if let Some((data, timestamp)) = cache.get(vehicle_no) {
             if timestamp.elapsed().unwrap_or_default() < self.cache_duration {
@@ -108,18 +108,18 @@ impl DBVehicleReader {
         None
     }
 
-    async fn cache_vehicle_data(&self, vehicle_data: VehicleData) {
+    async fn cache_vehicle_data(&self, vehicle_data: &VehicleDataWithRouteId) {
         let mut cache = self.cache.write().await;
         cache.insert(
             vehicle_data.vehicle_no.clone(),
-            (vehicle_data, SystemTime::now()),
+            (vehicle_data.clone(), SystemTime::now()),
         );
     }
 }
 
 #[async_trait]
 impl VehicleDataReader for DBVehicleReader {
-    async fn get_vehicle_data(&self, vehicle_no: &str) -> AppResult<VehicleData> {
+    async fn get_vehicle_data(&self, vehicle_no: &str) -> AppResult<VehicleDataWithRouteId> {
         if let Some(cached_data) = self.get_cached_vehicle_data(vehicle_no).await {
             return Ok(cached_data);
         }
@@ -132,6 +132,8 @@ impl VehicleDataReader for DBVehicleReader {
             LIMIT 1
         ";
 
+        let schedule_query = "select schedule_number, schedule_id::text, route_id::text, deleted, status from bus_schedule where schedule_number = $1 and deleted = false limit 1";
+
         let result = sqlx::query_as::<_, VehicleData>(query)
             .bind(vehicle_no)
             .fetch_optional(&self.pool)
@@ -140,8 +142,25 @@ impl VehicleDataReader for DBVehicleReader {
 
         match result {
             Some(vehicle_data) => {
-                self.cache_vehicle_data(vehicle_data.clone()).await;
-                Ok(vehicle_data)
+                let schedule_result = sqlx::query_as::<_, BusSchedule>(schedule_query)
+                    .bind(vehicle_data.schedule_no.clone())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| AppError::DbError(e.to_string()))?;
+                let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
+                    waybill_id: vehicle_data.waybill_id,
+                    service_type: vehicle_data.service_type,
+                    vehicle_no: vehicle_data.vehicle_no,
+                    schedule_no: vehicle_data.schedule_no,
+                    last_updated: vehicle_data.last_updated,
+                    duty_date: vehicle_data.duty_date,
+                    route_id: None,
+                };
+                if let Some(schedule) = schedule_result {
+                    vehicle_data_with_route_id.route_id = Some(schedule.route_id);
+                }
+                self.cache_vehicle_data(&vehicle_data_with_route_id).await;
+                Ok(vehicle_data_with_route_id)
             }
             None => Err(AppError::NotFound(format!(
                 "Vehicle not found: {}",
