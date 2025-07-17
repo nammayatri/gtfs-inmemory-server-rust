@@ -125,7 +125,7 @@ impl VehicleDataReader for DBVehicleReader {
         }
 
         let query = "
-            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE vehicle_no = $1
             ORDER BY updated_at DESC
@@ -172,7 +172,7 @@ impl VehicleDataReader for DBVehicleReader {
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             ORDER BY vehicle_no, updated_at DESC
         ";
@@ -189,7 +189,7 @@ impl VehicleDataReader for DBVehicleReader {
     ) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE service_type = $1
             ORDER BY vehicle_no, updated_at DESC
@@ -206,7 +206,7 @@ impl VehicleDataReader for DBVehicleReader {
         let search_pattern = format!("%{}%", query);
         let query_sql = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE vehicle_no ILIKE $1 OR waybill_id::text ILIKE $1 OR schedule_no ILIKE $1
             ORDER BY vehicle_no, updated_at DESC
