@@ -196,7 +196,7 @@ impl GTFSService {
                         geojson.stop_code.clone(),
                         StopGeojson {
                             geo_json: geojson.geo_json.clone(),
-                            gates: None,
+                            gates: geojson.gates.clone(),
                         },
                     );
                 }
