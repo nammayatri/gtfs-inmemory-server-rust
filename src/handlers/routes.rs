@@ -23,6 +23,44 @@ pub struct LimitQuery {
     limit: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GetAllRoutesByIdsRequest {
+    #[serde(rename = "gtfsId")]
+    pub gtfs_id: String,
+    #[serde(rename = "routeIds")]
+    pub route_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetAllStopsByIdsRequest {
+    #[serde(rename = "gtfsId")]
+    pub gtfs_id: String,
+    #[serde(rename = "stopIds")]
+    pub stop_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetAllRouteStopMappingsByRouteCodesRequest {
+    #[serde(rename = "gtfsId")]
+    pub gtfs_id: String,
+    #[serde(rename = "routeCodes")]
+    pub route_codes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetAllRouteStopMappingsByStopCodesRequest {
+    #[serde(rename = "gtfsId")]
+    pub gtfs_id: String,
+    #[serde(rename = "stopCodes")]
+    pub stop_codes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetAllVehiclesByIdsRequest {
+    #[serde(rename = "vehicleIds")]
+    pub vehicle_ids: Vec<String>,
+}
+
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
         actix_web::web::scope("")
@@ -92,6 +130,26 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/refresh-data",
                 actix_web::web::post().to(force_refresh_data),
+            )
+            .route(
+                "/getAllRoutesByIds",
+                actix_web::web::post().to(get_all_routes_by_ids),
+            )
+            .route(
+                "/getAllStopsByIds",
+                actix_web::web::post().to(get_all_stops_by_ids),
+            )
+            .route(
+                "/getAllRouteStopMappingsByRouteCodes",
+                actix_web::web::post().to(get_all_route_stop_mappings_by_route_codes),
+            )
+            .route(
+                "/getAllRouteStopMappingsByStopCodes",
+                actix_web::web::post().to(get_all_route_stop_mappings_by_stop_codes),
+            )
+            .route(
+                "/getAllVehiclesByIds",
+                actix_web::web::post().to(get_all_vehicles_by_ids),
             )
 
     );
@@ -443,4 +501,62 @@ async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse
     })))
 }
 
+async fn get_all_routes_by_ids(
+    app_state: Data<AppState>,
+    payload: Json<GetAllRoutesByIdsRequest>,
+) -> AppResult<HttpResponse> {
+    let routes = app_state
+        .gtfs_service
+        .get_routes_by_ids(&payload.gtfs_id, payload.route_ids.clone())
+        .await?;
+    
+    Ok(HttpResponse::Ok().json(routes))
+}
 
+async fn get_all_stops_by_ids(
+    app_state: Data<AppState>,
+    payload: Json<GetAllStopsByIdsRequest>,
+) -> AppResult<HttpResponse> {
+    let stops = app_state
+        .gtfs_service
+        .get_stops_by_ids(&payload.gtfs_id, payload.stop_ids.clone())
+        .await?;
+    
+    Ok(HttpResponse::Ok().json(stops))
+}
+
+async fn get_all_route_stop_mappings_by_route_codes(
+    app_state: Data<AppState>,
+    payload: Json<GetAllRouteStopMappingsByRouteCodesRequest>,
+) -> AppResult<HttpResponse> {
+    let mappings = app_state
+        .gtfs_service
+        .get_route_stop_mappings_by_route_codes(&payload.gtfs_id, payload.route_codes.clone())
+        .await?;
+    
+    Ok(HttpResponse::Ok().json(mappings))
+}
+
+async fn get_all_route_stop_mappings_by_stop_codes(
+    app_state: Data<AppState>,
+    payload: Json<GetAllRouteStopMappingsByStopCodesRequest>,
+) -> AppResult<HttpResponse> {
+    let mappings = app_state
+        .gtfs_service
+        .get_route_stop_mappings_by_stop_codes(&payload.gtfs_id, payload.stop_codes.clone())
+        .await?;
+    
+    Ok(HttpResponse::Ok().json(mappings))
+}
+
+async fn get_all_vehicles_by_ids(
+    app_state: Data<AppState>,
+    payload: Json<GetAllVehiclesByIdsRequest>,
+) -> AppResult<HttpResponse> {
+    let vehicles = app_state
+        .db_vehicle_reader
+        .get_vehicles_by_ids(payload.vehicle_ids.clone())
+        .await?;
+    
+    Ok(HttpResponse::Ok().json(vehicles))
+}

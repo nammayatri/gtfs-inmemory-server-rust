@@ -750,6 +750,23 @@ impl GTFSService {
             .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
+    pub async fn get_routes_by_ids(&self, gtfs_id: &str, route_ids: Vec<String>) -> AppResult<Vec<NandiRoutesRes>> {
+        let data = self.data.read().await;
+        let gtfs_id = clean_identifier(gtfs_id);
+        let mut found_routes = Vec::new();
+        
+        if let Some(routes) = data.routes_by_gtfs.get(&gtfs_id) {
+            for route_id in route_ids {
+                let route_code = clean_identifier(&route_id);
+                if let Some(route) = routes.get(&route_code) {
+                    found_routes.push(route.clone());
+                }
+            }
+        }
+        
+        Ok(found_routes)
+    }
+
     pub async fn get_route_stop_mapping_by_route(
         &self,
         gtfs_id: &str,
@@ -816,6 +833,62 @@ impl GTFSService {
             }
         }
         Err(AppError::NotFound("Stop not found".to_string()))
+    }
+
+    pub async fn get_stops_by_ids(&self, gtfs_id: &str, stop_codes: Vec<String>) -> AppResult<Vec<GTFSStop>> {
+        let data = self.data.read().await;
+        let mut found_stops = Vec::new();
+        
+        if let Some(stops_data) = data.stops_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
+            for stop_code in stop_codes {
+                let clean_stop_code = clean_identifier(&stop_code);
+                if let Some(stop) = stops_data.stops.get(clean_stop_code.as_str()) {
+                    found_stops.push(stop.clone());
+                }
+            }
+        }
+        
+        Ok(found_stops)
+    }
+
+    pub async fn get_route_stop_mappings_by_route_codes(&self, gtfs_id: &str, route_codes: Vec<String>) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+        let data = self.data.read().await;
+        let mut found_mappings = Vec::new();
+        
+        if let Some(route_data) = data.route_data_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
+            for route_code in route_codes {
+                let clean_route_code = clean_identifier(&route_code);
+                if let Some(indices) = route_data.by_route.get(clean_route_code.as_str()) {
+                    for &i in indices {
+                        if let Some(mapping) = route_data.mappings.get(i) {
+                            found_mappings.push(mapping.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(found_mappings)
+    }
+
+    pub async fn get_route_stop_mappings_by_stop_codes(&self, gtfs_id: &str, stop_codes: Vec<String>) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+        let data = self.data.read().await;
+        let mut found_mappings = Vec::new();
+        
+        if let Some(route_data) = data.route_data_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
+            for stop_code in stop_codes {
+                let clean_stop_code = clean_identifier(&stop_code);
+                if let Some(indices) = route_data.by_stop.get(clean_stop_code.as_str()) {
+                    for &i in indices {
+                        if let Some(mapping) = route_data.mappings.get(i) {
+                            found_mappings.push(mapping.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(found_mappings)
     }
 
     pub async fn get_station_children(
