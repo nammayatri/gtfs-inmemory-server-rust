@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# Pre-commit hook for Rust formatting
+# This hook will format all Rust files before committing
+
+set -e
+
+echo "🔧 Running pre-commit hook..."
+
+# Check if rustfmt is installed and install if not
+if ! command -v rustfmt &> /dev/null; then
+    echo "🔧 rustfmt not found. Installing rustfmt..."
+    if command -v rustup &> /dev/null; then
+        rustup component add rustfmt
+        echo "✅ rustfmt installed successfully!"
+    else
+        echo "❌ rustup not found. Please install rustup first:"
+        echo "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        exit 1
+    fi
+fi
+
+# Get list of staged Rust files
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "✅ No Rust files to format"
+    exit 0
+fi
+
+echo "📝 Formatting Rust files..."
+
+# Store original content hash to detect changes
+ORIGINAL_HASH=$(git diff --cached | sha256sum)
+
+# Format each staged Rust file
+for file in $STAGED_FILES; do
+    if [ -f "$file" ]; then
+        echo "  Formatting: $file"
+        rustfmt --edition 2021 "$file"
+        # Stage the formatted file
+        git add "$file"
+    fi
+done
+
+echo "✅ Rust formatting complete!"
+
+# Check if any files were actually changed by rustfmt
+NEW_HASH=$(git diff --cached | sha256sum)
+if [ "$ORIGINAL_HASH" != "$NEW_HASH" ]; then
+    echo "❌ Some files were reformatted by rustfmt and re-staged."
+    echo "   Please review the changes, run 'git add .' if needed, and commit again."
+    exit 1
+fi
+
+# Run cargo check to ensure code still compiles
+echo "🔍 Running cargo check..."
+if ! cargo check --quiet --message-format=short; then
+    echo "❌ Cargo check failed. Please fix compilation errors before committing."
+    exit 1
+fi
+
+echo "✅ Pre-commit hook completed successfully!" 

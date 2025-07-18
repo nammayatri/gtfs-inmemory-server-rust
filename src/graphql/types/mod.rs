@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripQuery {
@@ -44,9 +44,9 @@ pub struct TripStop {
 pub struct TripSchedule {
     pub stop_id: String,
     #[serde(rename = "arrivalTime")]
-    pub arrival_time: Option<String>,
+    pub arrival_time: Option<i32>,
     #[serde(rename = "departureTime")]
-    pub departure_time: Option<String>,
+    pub departure_time: Option<i32>,
     pub sequence: i32,
 }
 
@@ -119,4 +119,4 @@ pub struct TripGraphQLStop {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
-} 
+}

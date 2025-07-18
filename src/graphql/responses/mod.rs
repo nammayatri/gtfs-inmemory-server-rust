@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripApiResponse {
@@ -38,9 +38,9 @@ pub struct TripScheduleResponse {
     #[serde(rename = "stopCode")]
     pub stop_code: String,
     #[serde(rename = "arrivalTime")]
-    pub arrival_time: Option<String>,
+    pub arrival_time: Option<i32>,
     #[serde(rename = "departureTime")]
-    pub departure_time: Option<String>,
+    pub departure_time: Option<i32>,
     pub sequence: i32,
 }
 
@@ -64,4 +64,4 @@ pub struct TripCacheStats {
     pub cache_misses: u64,
     #[serde(rename = "lastCacheCleanup")]
     pub last_cache_cleanup: Option<DateTime<Utc>>,
-} 
+}
