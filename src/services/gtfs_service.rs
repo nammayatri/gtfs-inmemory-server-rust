@@ -2,7 +2,7 @@ use crate::environment::AppConfig;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes,
-    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
+    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
 };
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
@@ -120,6 +120,13 @@ impl GTFSService {
             provider_stop_code_mapping.len()
         );
 
+        // Read stop regional names CSV file
+        let stop_regional_names_by_gtfs = self.read_stop_regional_names_csv().await?;
+        info!(
+            "Loaded {} stop regional names from CSV",
+            stop_regional_names_by_gtfs.len()
+        );
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -157,6 +164,7 @@ impl GTFSService {
         temp_data.data_hash = data_hash;
         temp_data.stop_geojsons_by_gtfs = stop_geojsons_by_gtfs;
         temp_data.provider_stop_code_mapping = provider_stop_code_mapping;
+        temp_data.stop_regional_names_by_gtfs = stop_regional_names_by_gtfs;
 
         Ok(temp_data)
     }
@@ -248,6 +256,50 @@ impl GTFSService {
         }
 
         Ok(mapping)
+    }
+
+    async fn read_stop_regional_names_csv(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, StopRegionalNameRecord>>> {
+        let file_path = "./assets/stop_regional_names.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("stop_regional_names.csv file not found, proceeding without regional names data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut stop_regional_names_by_gtfs = HashMap::new();
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let regional_name_record: StopRegionalNameRecord = record;
+                    let inner = stop_regional_names_by_gtfs
+                        .entry(regional_name_record.gtfs_id.clone())
+                        .or_insert_with(HashMap::new);
+                    inner.insert(
+                        regional_name_record.stop_code.clone(),
+                        regional_name_record,
+                    );
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+        Ok(stop_regional_names_by_gtfs)
     }
 
     async fn fetch_pattern_details_batch(
@@ -812,12 +864,24 @@ impl GTFSService {
         let gtfs_id = clean_identifier(gtfs_id);
 
         if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            return Ok(route_data
-                .by_stop
-                .values()
-                .filter_map(|indices| indices.first())
-                .filter_map(|&i| route_data.mappings.get(i).cloned())
-                .collect());
+            let mut stops: Vec<Arc<RouteStopMapping>> = Vec::new();
+            let regional_names_by_stop = data.stop_regional_names_by_gtfs.get(&gtfs_id);
+            for indices in route_data.by_stop.values() {
+                if let Some(&i) = indices.first() {
+                    if let Some(mapping) = route_data.mappings.get(i) {
+                        let mut mapping = (**mapping).clone();
+                        // Populate hindi_name and regional_name if available
+                        if let Some(regional_names) = regional_names_by_stop {
+                            if let Some(regional_record) = regional_names.get(&mapping.stop_code) {
+                                mapping.hindi_name = Some(regional_record.hindi_name.clone());
+                                mapping.regional_name = Some(regional_record.regional_name.clone());
+                            }
+                        }
+                        stops.push(Arc::new(mapping));
+                    }
+                }
+            }
+            return Ok(stops);
         }
         Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
@@ -828,8 +892,15 @@ impl GTFSService {
         let stop_code = clean_identifier(stop_code);
 
         if let Some(stops_data) = data.stops_by_gtfs.get(&gtfs_id) {
-            if let Some(stop) = stops_data.stops.get(&stop_code) {
-                return Ok(stop.clone());
+            if let Some(mut stop) = stops_data.stops.get(&stop_code).cloned() {
+                // Try to populate hindi_name and regional_name from stop_regional_names_by_gtfs
+                if let Some(regional_names_by_stop) = data.stop_regional_names_by_gtfs.get(&gtfs_id) {
+                    if let Some(regional_record) = regional_names_by_stop.get(&stop_code) {
+                        stop.hindi_name = Some(regional_record.hindi_name.clone());
+                        stop.regional_name = Some(regional_record.regional_name.clone());
+                    }
+                }
+                return Ok(stop);
             }
         }
         Err(AppError::NotFound("Stop not found".to_string()))

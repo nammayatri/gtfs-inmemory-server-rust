@@ -1,0 +1,105 @@
+gtfs_id,stop_code,stop_name,hindi_name,regional_name
+chennai_suburban,MTCN,TIRUVALLIKENI,तिरुवल्लिकेनी,திருவல்லிக்கேணி
+chennai_suburban,MLHS,LIGHT HOUSE,लाइट हाउस,லைட் ஹவுஸ்
+chennai_suburban,PWU,PARANUR,परनूर,பரனூர்
+chennai_suburban,MBM,MAMBALAM,माम्बलम,மாம்பலம்
+chennai_suburban,GI,GUDUVANCHERI,गुडुवनचेरी,கூடுவாஞ்சேரி
+chennai_suburban,TRT,TIRUTTANI,तिरुत्तानी,திருத்தணி
+chennai_suburban,MSC,CHENNAI CHETPAT,चेन्नई चेतपट,சென்னை சேப்பாட்
+chennai_suburban,MKK,KODAMBAKKAM,कोडमबक्कम,கோடம்பாக்கம்
+chennai_suburban,AJJ,ARAKKONAM,अराकोणम,அரக்கோணம்
+chennai_suburban,CJ,KANCHIPURAM,कांचीपुरम,காஞ்சிபுரம்
+chennai_suburban,PTLR,PUTLUR HALT,पुतलूर हॉल्ट,புட்லூர் ஹால்ட்
+chennai_suburban,GPD,GUMMIDIPUNDI,गुम्मिडिपुंडी,கும்மிடிப்பூண்டி
+chennai_suburban,ANNR,ANNANUR,अन्नानुर,அண்ணனூர்
+chennai_suburban,MCPK,CHEPAUK,चेपॉक,சேப்பாக்கம்
+chennai_suburban,WJ,WALAJABAD,वालाजाबाद,வாலாஜாபாத்
+chennai_suburban,MKAK,MUNDAKAKANNI AMMAN KOIL,मुंडकाकन्नी अम्मान कोइल,முண்டககன்னி அம்மன் கோயில்
+chennai_suburban,TMLP,TIRUMALPUR,तिरुमलपुर,திருமால்பூர்
+chennai_suburban,MSU,MOSUR,मोसूर,மோசூர்
+chennai_suburban,EGT,EGATTUR,EGATTUR,ஈகாட்டூர்
+chennai_suburban,KTPM,KOTTURPURAM,कोट्टूरपुरम,கோட்டூர்புரம்
+chennai_suburban,KTBR,KASTURBA NAGAR,कस्तूरबा नगर,கஸ்தூர்பா நகர்
+chennai_suburban,MPKT,CHENNAI PARK TOWN,चेन्नई पार्क टाउन,சென்னை பூங்கா நகரம்
+chennai_suburban,PTMS,PATTABIRAM M SIDING,पट्टाभिराम एम साइडिंग,பட்டாபிராம் எம் சைடிங்
+chennai_suburban,TRL,TIRUVALLUR,तिरुवल्लुर,திருவள்ளூர்
+chennai_suburban,TBM,TAMBARAM,ताम्बरम,தாம்பரம்
+chennai_suburban,MTMY,THIRUMAYILAI,थिरुमायிலाई,திருமயிலை
+chennai_suburban,GDY,GUINDY,गिंडी,கிண்டி
+chennai_suburban,NTT,NATHAPETTAI,नाथापेट्टई,நத்தப்பேட்டை
+chennai_suburban,PER,PERAMBUR,पेराम्बुर,பெரம்பூர்
+chennai_suburban,VLK,VILLIVAKKAM,विल्लिवक्कम,வில்லிவாக்கம்
+chennai_suburban,TI,TIRUNINRAVUR,तिरुनिरावुर,திருநின்றவூர்
+chennai_suburban,AVD,AVADI,अवादी,ஆவடி
+chennai_suburban,POTI,POTHERI,पोथेरी,போதேரி
+chennai_suburban,TLM,TIRUSULAM,तिरुसुलम,திருசூலம்
+chennai_suburban,PRGL,PERUNGALALATTUR,पेरुंगलालत्तूर,பெருங்களலத்தூர்
+chennai_suburban,PRES,PATTABIRAM 'E' DEPOT-PRES,पट्टाभिराम 'ई' डिपो-प्रेस,பட்டாபிராம் 'இ' டிப்போ-பிரஸ்
+chennai_suburban,SP,SAIDAPET,सैदापेट,சைதாப்பேட்டை
+chennai_suburban,NBK,NUNGAMBAKKAM,नुंगमबक्कम,நுங்கம்பாக்கம்
+chennai_suburban,MPK,CHENNAI PARK,चेन्नई पार्क,சென்னை பூங்கா
+chennai_suburban,PV,PALLAVARAM,पल्लावरम,பல்லாவரம்
+chennai_suburban,MJR,MINJUR,मिंजूर,மிஞ்சூர்
+chennai_suburban,MS,CHENNAI EGMORE,चेन्नई एग्मोर,சென்னை எழும்பூர்
+chennai_suburban,CGL,CHENGALPATTU JN.,चेंगलपट्टू जंक्शन.,செங்கல்பட்டு ஜே.என்.
+chennai_suburban,PAB,PATTABIRAM,पट्टाभिराम,பட்ட`??பிராம்
+chennai_suburban,VDR,VANDALUR,वंडालूर,வண்டலூர்
+chennai_suburban,HC,HINDU COLLEGE,हिंदू कॉलेज,இந்துக் கல்லூரி
+chennai_suburban,VEU,VEPPAMPATTU,वेप्पमपट्टू,வேப்பம்பட்டு
+chennai_suburban,BBQ,BASIN BRIDGE JN.(MADRAS),बेसिन ब्रिज जंक्शन (मद्रास),பேசின் பிரிட்ஜ் ஜே.என்.(மெட்ராஸ்)
+chennai_suburban,ABU,AMBATTUR,अंबात्तुर,அம்பத்தூர்
+chennai_suburban,PLMG,PULIYAMANGALAM,पुलियामंगलम,புளியமங்கலம்
+chennai_suburban,STM,ST. THOMAS MOUNT,अनुसूचित जनजाति। थ`??मस माउंट,எஸ்.டி. தாமஸ் மவுண்ட்
+chennai_suburban,TRMN,TARAMANI,तारामणி,தரமணி
+chennai_suburban,VLCY,VELACHERY,वेलाचेरी,வேளச்சேரி
+chennai_suburban,PZA,PALAVANTANGAL,पलवंतंगल,பழவந்தாங்கல்
+chennai_suburban,PYV,PALAYASIVARAM,पलयशिवराम,பாலயசிவரம்
+chennai_suburban,MMNK,MARAIMALAI NAGAR KAMARAJAR,मरईमलाई नगर कामराजर,மறைமலை நகர் காமராஜர்
+chennai_suburban,KOK,KORUKKUPET,कोरूक्कुपेट,கொருக்குப்பேட்டை
+chennai_suburban,TVT,TIRUVOTTIYUR,Tirūvottiyūr,திருவொற்றியூர்
+chennai_suburban,KOTR,KORATTUR,कोरत्तुर,கொரட்டூர்
+chennai_suburban,ENR,ENNORE,एन्नोर,எண்ணூர்
+chennai_suburban,SVR,SEVVAPET ROAD,सेव्वापेट रोड,செவ்வாப்பேட்டை சாலை
+chennai_suburban,WCN,WIMCO NAGAR,विमको नगर,விம்கோ நகர்
+chennai_suburban,KVP,KAVARAIPPETTAI,कावरइप्पेट्टाई,கவரைப்பேட்டை
+chennai_suburban,TO,TIRUVALANGADU,तिरुवलंगाडु,திருவாலங்காடு
+chennai_suburban,MCPT,CHINTADARIPET,चिंताडारिपेट,சிந்தாதரிப்பேட்டை
+chennai_suburban,MAF,MANAVUR,मनावुर,மணவூர்
+chennai_suburban,UPM,URAPPAKKAM,उराप्पक्कम,ஊரப்பாக்கம்
+chennai_suburban,PRGD,PERUNGUDI,पेरुंगुडी,பெருங்குடி
+chennai_suburban,GWYR,GREENWAYS ROAD,ग्रीनवेज़ रोड,கிரீன்வேஸ் சாலை
+chennai_suburban,AKM,ARAMBAKKAM,अरंबक्कम,ஆரம்பாக்கம்
+chennai_suburban,KAVM,KATHIVAKKAM,कथिवाक्कम,கத்திவாக்கம்
+chennai_suburban,AIPP,ATTIPATTU PUDU NAGAR.H,अट्टीपट्टू पुडु नगर.एच,அ`??்திப்பட்டு புதுநகர்.எச்
+chennai_suburban,RPM,ROYAPURAM,रोयापुरम,ராயபுரம்
+chennai_suburban,VB,VILLIYAMBAKKAM,विल्लियांबक्कम,வில்லியம்பாக்கம்
+chennai_suburban,NPKM,NANDIYAMPAKKAM,नंदियम्पक्कम,நந்தியம்பாக்கம்
+chennai_suburban,TKO,TAKKOLAM,ताक्कोलम,தக்கோலம்
+chennai_suburban,TMVL,TIRUMULLAIVAYIL,तिरुमुल्लैवायिल,திருமுல்லைவாயில்
+chennai_suburban,CMP,CHROMEPET,क्रोमपेट,;;;`??ெட்
+chennai_suburban,PON,PONNERI,पोन्नेरी,பொன்னேரி
+chennai_suburban,MSF,CHENNAI FORT,चेन्नई किला,சென்னை கோட்டை
+chennai_suburban,TBMS,TAMBARAM SANATORIUM,ताम्बरम सेनेटोरियम,தாம்பரம் சானடோரியம்
+chennai_suburban,VPY,VYASARPADI,व्यासर्पाडि,வியாசர்பாடி
+chennai_suburban,WST,WASHERMANPET,वॉशरमैनपेट,வண்ணாரப்பேட்டை
+chennai_suburban,SKL,SINGAPERUMALKOIL,सिंगारपெருமल कोविल,சிங்கப்பெருமாள்கோயில்
+chennai_suburban,KBT,KADAMBATTUR,कदमबत्तूर,கடம்பத்தூர்
+chennai_suburban,PEW,PERAMBUR LOCO WORKS,पेरम्बूर लोको वर्क्स,பெரம்பூர் லோகோ ஒர்க்ஸ்
+chennai_suburban,APB,ANUPPAMBATTU,अनुप्पमबट्टू,அனுப்பம்பட்டு
+chennai_suburban,VOC,VOC NAGAR,वोक नगर,VOC நகர்
+chennai_suburban,PCW,PERAMBUR CARRIAGE WORKS,पेरम्बूर कैरिज वर्क्स,பெரம்பூர் வண்டி வேலைகள்
+chennai_suburban,MSB,CHENNAI BEACH JN.,चेन्नई बीच,சென்னை கடற்கரை
+chennai_suburban,PVM,PATTARAVAKKAM,पत्तरवक्कम,பட்டரவாக்கம்
+chennai_suburban,VJM,VYASARPADI JEEVA,व्यासर्पदी जीवः,வியாசர்பாடி ஜீவா
+chennai_suburban,AIP,ATTIPPATTU,अट्टिपट्टू,அத்திப்பட்டு
+chennai_suburban,TNP,TONDIARPET,टोंडियारपेट,தொண்டியார்பேட்டை
+chennai_suburban,CTM,KATTANGULATUR,कट्टांगुलतुर,காட? `??ாங்குளத்தூர்
+chennai_suburban,SPAM,SENJI PANAMBAKKAM,सेन्जी पनम्बक्कम,செஞ்சி பனம்பாக்கம்
+chennai_suburban,RDY,REDDIPALAYAM,रेड्डीपालयम,ரெட்டிபாளையம்
+chennai_suburban,MNDY,MANDAVELI,मंडावेली,மண்டவெளி
+chennai_suburban,MAS,CHENNAI CENTRAL SUBURBAN ,चेन्नई सेंट्रल उपनगर,சென்னை மத்திய புறநகர்
+chennai_suburban,ELR,ELAVUR,इलावुर,எளவூர்
+chennai_suburban,TYMR,TIRUVANMIYUR,तिरुवन्मियूर,திருவான்மியூர்
+chennai_suburban,PALR,PALUR,पलूर,பாலூர்
+chennai_suburban,CJE,KANCHIPURAM EAST,कांचीपुरम पूर्व,காஞ்சிபுரம் கிழக்கு
+chennai_suburban,MN,MINAMBAKKAM,मिनामबक्कम,மினம்பாக?/?கம்
