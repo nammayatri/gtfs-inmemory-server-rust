@@ -2,7 +2,8 @@ use crate::environment::AppConfig;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes,
-    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
+    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
+    StopRegionalNameRecord,
 };
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
@@ -143,10 +144,12 @@ impl GTFSService {
             &routes_by_gtfs,
             &stop_geojsons_by_gtfs,
             &provider_stop_code_mapping,
+            &stop_regional_names_by_gtfs,
         );
 
         // Build stops data
-        let stops_by_gtfs = self.build_stops_by_gtfs(all_stops.clone());
+        let stops_by_gtfs =
+            self.build_stops_by_gtfs(all_stops.clone(), &stop_regional_names_by_gtfs);
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
@@ -289,10 +292,7 @@ impl GTFSService {
                     let inner = stop_regional_names_by_gtfs
                         .entry(regional_name_record.gtfs_id.clone())
                         .or_insert_with(HashMap::new);
-                    inner.insert(
-                        regional_name_record.stop_code.clone(),
-                        regional_name_record,
-                    );
+                    inner.insert(regional_name_record.stop_code.clone(), regional_name_record);
                 }
                 Err(e) => {
                     error!("Error parsing CSV row: {}", e);
@@ -411,7 +411,11 @@ impl GTFSService {
         routes_by_gtfs
     }
 
-    fn build_stops_by_gtfs(&self, stops: Vec<GTFSStop>) -> HashMap<String, GTFSStopData> {
+    fn build_stops_by_gtfs(
+        &self,
+        stops: Vec<GTFSStop>,
+        stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
+    ) -> HashMap<String, GTFSStopData> {
         let mut stops_by_gtfs: HashMap<String, GTFSStopData> = HashMap::new();
 
         for stop in stops {
@@ -423,6 +427,9 @@ impl GTFSService {
             let stop_code = parts[1];
 
             let stop_data = stops_by_gtfs.entry(gtfs_id.to_string()).or_default();
+            let regional_name = stop_regional_names_by_gtfs
+                .get(gtfs_id)
+                .and_then(|m| m.get(stop_code));
 
             // Create a new GTFSStop with the clean stop code
             let stop_res = GTFSStop {
@@ -433,6 +440,8 @@ impl GTFSService {
                 lon: stop.lon,
                 station_id: stop.station_id.clone(),
                 cluster: stop.cluster.clone(),
+                hindi_name: regional_name.map(|r| r.hindi_name.clone()),
+                regional_name: regional_name.map(|r| r.regional_name.clone()),
             };
             if stop.cluster.is_some() {
                 let cluster_stop_res = GTFSStop {
@@ -443,6 +452,8 @@ impl GTFSService {
                     lon: stop.lon,
                     station_id: stop.station_id.clone(),
                     cluster: stop.cluster.clone(),
+                    hindi_name: regional_name.map(|r| r.hindi_name.clone()),
+                    regional_name: regional_name.map(|r| r.regional_name.clone()),
                 };
                 stop_data
                     .stops
@@ -461,6 +472,7 @@ impl GTFSService {
         routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
         stop_geojsons_by_gtfs: &HashMap<String, HashMap<String, StopGeojson>>,
         provider_stop_code_mapping: &HashMap<String, HashMap<String, String>>,
+        stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
@@ -532,6 +544,14 @@ impl GTFSService {
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
+                    hindi_name: stop_regional_names_by_gtfs
+                        .get(gtfs_id)
+                        .and_then(|m| m.get(&stop.code))
+                        .map(|r| r.hindi_name.clone()),
+                    regional_name: stop_regional_names_by_gtfs
+                        .get(gtfs_id)
+                        .and_then(|m| m.get(&stop.code))
+                        .map(|r| r.regional_name.clone()),
                 });
                 let hash = get_sha256_hash(&mapping);
                 if visited_mapping.contains_key(&hash) {
@@ -802,11 +822,15 @@ impl GTFSService {
             .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_routes_by_ids(&self, gtfs_id: &str, route_ids: Vec<String>) -> AppResult<Vec<NandiRoutesRes>> {
+    pub async fn get_routes_by_ids(
+        &self,
+        gtfs_id: &str,
+        route_ids: Vec<String>,
+    ) -> AppResult<Vec<NandiRoutesRes>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let mut found_routes = Vec::new();
-        
+
         if let Some(routes) = data.routes_by_gtfs.get(&gtfs_id) {
             for route_id in route_ids {
                 let route_code = clean_identifier(&route_id);
@@ -815,7 +839,7 @@ impl GTFSService {
                 }
             }
         }
-        
+
         Ok(found_routes)
     }
 
@@ -894,7 +918,8 @@ impl GTFSService {
         if let Some(stops_data) = data.stops_by_gtfs.get(&gtfs_id) {
             if let Some(mut stop) = stops_data.stops.get(&stop_code).cloned() {
                 // Try to populate hindi_name and regional_name from stop_regional_names_by_gtfs
-                if let Some(regional_names_by_stop) = data.stop_regional_names_by_gtfs.get(&gtfs_id) {
+                if let Some(regional_names_by_stop) = data.stop_regional_names_by_gtfs.get(&gtfs_id)
+                {
                     if let Some(regional_record) = regional_names_by_stop.get(&stop_code) {
                         stop.hindi_name = Some(regional_record.hindi_name.clone());
                         stop.regional_name = Some(regional_record.regional_name.clone());
@@ -906,10 +931,14 @@ impl GTFSService {
         Err(AppError::NotFound("Stop not found".to_string()))
     }
 
-    pub async fn get_stops_by_ids(&self, gtfs_id: &str, stop_codes: Vec<String>) -> AppResult<Vec<GTFSStop>> {
+    pub async fn get_stops_by_ids(
+        &self,
+        gtfs_id: &str,
+        stop_codes: Vec<String>,
+    ) -> AppResult<Vec<GTFSStop>> {
         let data = self.data.read().await;
         let mut found_stops = Vec::new();
-        
+
         if let Some(stops_data) = data.stops_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
             for stop_code in stop_codes {
                 let clean_stop_code = clean_identifier(&stop_code);
@@ -918,15 +947,22 @@ impl GTFSService {
                 }
             }
         }
-        
+
         Ok(found_stops)
     }
 
-    pub async fn get_route_stop_mappings_by_route_codes(&self, gtfs_id: &str, route_codes: Vec<String>) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+    pub async fn get_route_stop_mappings_by_route_codes(
+        &self,
+        gtfs_id: &str,
+        route_codes: Vec<String>,
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let mut found_mappings = Vec::new();
-        
-        if let Some(route_data) = data.route_data_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
+
+        if let Some(route_data) = data
+            .route_data_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+        {
             for route_code in route_codes {
                 let clean_route_code = clean_identifier(&route_code);
                 if let Some(indices) = route_data.by_route.get(clean_route_code.as_str()) {
@@ -938,15 +974,22 @@ impl GTFSService {
                 }
             }
         }
-        
+
         Ok(found_mappings)
     }
 
-    pub async fn get_route_stop_mappings_by_stop_codes(&self, gtfs_id: &str, stop_codes: Vec<String>) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+    pub async fn get_route_stop_mappings_by_stop_codes(
+        &self,
+        gtfs_id: &str,
+        stop_codes: Vec<String>,
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let mut found_mappings = Vec::new();
-        
-        if let Some(route_data) = data.route_data_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
+
+        if let Some(route_data) = data
+            .route_data_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+        {
             for stop_code in stop_codes {
                 let clean_stop_code = clean_identifier(&stop_code);
                 if let Some(indices) = route_data.by_stop.get(clean_stop_code.as_str()) {
@@ -958,7 +1001,7 @@ impl GTFSService {
                 }
             }
         }
-        
+
         Ok(found_mappings)
     }
 

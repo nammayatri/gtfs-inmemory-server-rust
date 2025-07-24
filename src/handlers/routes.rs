@@ -8,11 +8,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::environment::AppState;
+use crate::graphql::TripQueryParams;
 use crate::models::{
     GTFSStop, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
     VehicleServiceTypeResponse,
 };
-use crate::graphql::TripQueryParams;
 use crate::{
     models::LatLong,
     tools::error::{AppError, AppResult},
@@ -115,10 +115,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/connection-stats",
                 actix_web::web::get().to(get_connection_stats),
             )
-            .route(
-                "/trip/{trip_id}",
-                actix_web::web::get().to(get_trip_data),
-            )
+            .route("/trip/{trip_id}", actix_web::web::get().to(get_trip_data))
             .route(
                 "/trip-cache/stats",
                 actix_web::web::get().to(get_trip_cache_stats),
@@ -150,8 +147,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getAllVehiclesByIds",
                 actix_web::web::post().to(get_all_vehicles_by_ids),
-            )
-
+            ),
     );
 }
 
@@ -184,8 +180,6 @@ async fn get_route_stop_mapping_by_route(
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
 }
-
-
 
 async fn get_route_stop_mapping_by_stop(
     app_state: Data<AppState>,
@@ -257,6 +251,8 @@ async fn get_stop(
                  name,
                  lat,
                  lon,
+                 hindi_name,
+                 regional_name,
                  ..
              }| RouteStopMapping {
                 stop_code: code.to_string(),
@@ -269,6 +265,8 @@ async fn get_stop(
                 route_code: "UNKNOWN".to_string(),
                 vehicle_type: "BUS".to_string(),
                 sequence_num: 0,
+                hindi_name,
+                regional_name,
             },
         )?;
     Ok(HttpResponse::Ok().json(stop))
@@ -363,7 +361,7 @@ async fn get_service_type_by_vehicle(
         waybill_id: Some(vehicle_data.waybill_id),
         schedule_no: Some(vehicle_data.schedule_no),
         last_updated: vehicle_data.last_updated,
-        route_id: vehicle_data.route_id
+        route_id: vehicle_data.route_id,
     }))
 }
 
@@ -461,12 +459,12 @@ async fn get_trip_data(
 ) -> AppResult<HttpResponse> {
     let trip_id = path.into_inner();
     let query_params = query.into_inner();
-    
+
     let trip_data = app_state
         .trip_service
         .get_trip_data(&trip_id, query_params.gtfs_id, query_params.city)
         .await?;
-    
+
     Ok(HttpResponse::Ok().json(trip_data))
 }
 
@@ -485,7 +483,7 @@ async fn clear_trip_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> 
 async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     // Trigger a background refresh of GTFS data
     let gtfs_service = app_state.gtfs_service.clone();
-    
+
     // Spawn a background task to refresh data
     tokio::spawn(async move {
         info!("Starting forced GTFS data refresh...");
@@ -494,7 +492,7 @@ async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse
             Err(e) => error!("GTFS data refresh failed: {}", e),
         }
     });
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "message": "GTFS data refresh initiated in background",
         "status": "started"
@@ -509,7 +507,7 @@ async fn get_all_routes_by_ids(
         .gtfs_service
         .get_routes_by_ids(&payload.gtfs_id, payload.route_ids.clone())
         .await?;
-    
+
     Ok(HttpResponse::Ok().json(routes))
 }
 
@@ -521,7 +519,7 @@ async fn get_all_stops_by_ids(
         .gtfs_service
         .get_stops_by_ids(&payload.gtfs_id, payload.stop_ids.clone())
         .await?;
-    
+
     Ok(HttpResponse::Ok().json(stops))
 }
 
@@ -533,7 +531,7 @@ async fn get_all_route_stop_mappings_by_route_codes(
         .gtfs_service
         .get_route_stop_mappings_by_route_codes(&payload.gtfs_id, payload.route_codes.clone())
         .await?;
-    
+
     Ok(HttpResponse::Ok().json(mappings))
 }
 
@@ -545,7 +543,7 @@ async fn get_all_route_stop_mappings_by_stop_codes(
         .gtfs_service
         .get_route_stop_mappings_by_stop_codes(&payload.gtfs_id, payload.stop_codes.clone())
         .await?;
-    
+
     Ok(HttpResponse::Ok().json(mappings))
 }
 
@@ -557,6 +555,6 @@ async fn get_all_vehicles_by_ids(
         .db_vehicle_reader
         .get_vehicles_by_ids(payload.vehicle_ids.clone())
         .await?;
-    
+
     Ok(HttpResponse::Ok().json(vehicles))
 }
