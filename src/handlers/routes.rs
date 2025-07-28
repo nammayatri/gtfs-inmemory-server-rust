@@ -340,10 +340,9 @@ async fn readiness_probe(app_state: Data<AppState>) -> AppResult<HttpResponse> {
 async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let version = app_state.gtfs_service.get_version(&gtfs_id).await?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "gtfs_id": gtfs_id,
-        "version": version
-    })))
+    Ok(HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(format!("{}", version)))
 }
 
 async fn get_service_type_by_vehicle(
