@@ -236,40 +236,43 @@ async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<H
     Ok(HttpResponse::Ok().json(stops))
 }
 
+pub fn merge_stop_and_mapping(
+    stop: GTFSStop,
+    mapping: Option<Arc<RouteStopMapping>>,
+) -> RouteStopMapping {
+    let mapping_ref = mapping.as_deref();
+    RouteStopMapping {
+        stop_code: stop.code,
+        stop_name: stop.name,
+        stop_point: LatLong {
+            lat: stop.lat,
+            lon: stop.lon,
+        },
+        estimated_travel_time_from_previous_stop: None,
+        geo_json: mapping_ref.and_then(|m| m.geo_json.clone()),
+        gates: mapping_ref.and_then(|m| m.gates.clone()),
+        provider_code: "GTFS".to_string(),
+        route_code: "UNKNOWN".to_string(),
+        vehicle_type: mapping_ref
+            .map(|m| m.vehicle_type.clone())
+            .unwrap_or_else(|| "BUS".to_string()),
+        sequence_num: 0,
+        hindi_name: stop.hindi_name,
+        regional_name: stop.regional_name,
+    }
+}
+
 async fn get_stop(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
-    let stop = app_state
+    let (stop, maybe_mapping) = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)
-        .await
-        .map(
-            |GTFSStop {
-                 code,
-                 name,
-                 lat,
-                 lon,
-                 hindi_name,
-                 regional_name,
-                 ..
-             }| RouteStopMapping {
-                stop_code: code.to_string(),
-                stop_name: name.to_string(),
-                stop_point: LatLong { lat: lat, lon: lon },
-                estimated_travel_time_from_previous_stop: None,
-                geo_json: None,
-                gates: None,
-                provider_code: "GTFS".to_string(),
-                route_code: "UNKNOWN".to_string(),
-                vehicle_type: "BUS".to_string(),
-                sequence_num: 0,
-                hindi_name,
-                regional_name,
-            },
-        )?;
-    Ok(HttpResponse::Ok().json(stop))
+        .await?;
+    let merged_stop = merge_stop_and_mapping(stop, maybe_mapping);
+    Ok(HttpResponse::Ok().json(merged_stop))
 }
 
 async fn get_stops_fuzzy(
