@@ -910,25 +910,44 @@ impl GTFSService {
         Err(AppError::NotFound("GTFS ID not found".to_string()))
     }
 
-    pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<GTFSStop> {
+    pub async fn get_stop(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<(GTFSStop, Option<Arc<RouteStopMapping>>)> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
 
-        if let Some(stops_data) = data.stops_by_gtfs.get(&gtfs_id) {
-            if let Some(mut stop) = stops_data.stops.get(&stop_code).cloned() {
-                // Try to populate hindi_name and regional_name from stop_regional_names_by_gtfs
-                if let Some(regional_names_by_stop) = data.stop_regional_names_by_gtfs.get(&gtfs_id)
-                {
-                    if let Some(regional_record) = regional_names_by_stop.get(&stop_code) {
-                        stop.hindi_name = Some(regional_record.hindi_name.clone());
-                        stop.regional_name = Some(regional_record.regional_name.clone());
-                    }
-                }
-                return Ok(stop);
-            }
+        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
+            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
+        })?;
+
+        let mut stop = stops_data.stops.get(&stop_code).cloned().ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Stop not found for stop_code: {} under gtfs_id: {}",
+                stop_code, gtfs_id
+            ))
+        })?;
+
+        if let Some(regional_record) = data
+            .stop_regional_names_by_gtfs
+            .get(&gtfs_id)
+            .and_then(|names| names.get(&stop_code))
+        {
+            stop.hindi_name = Some(regional_record.hindi_name.clone());
+            stop.regional_name = Some(regional_record.regional_name.clone());
         }
-        Err(AppError::NotFound("Stop not found".to_string()))
+        let first_mapping = data
+            .route_data_by_gtfs
+            .get(&gtfs_id)
+            .and_then(|route_data| {
+                route_data.by_stop.get(&stop_code)?.first().and_then(|&i| {
+                    route_data.mappings.get(i).cloned()
+                })
+            });
+
+        Ok((stop, first_mapping))
     }
 
     pub async fn get_stops_by_ids(
