@@ -24,6 +24,11 @@ pub struct LimitQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DirectionQuery {
+    direction: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct GetAllRoutesByIdsRequest {
     #[serde(rename = "gtfsId")]
     pub gtfs_id: String,
@@ -172,11 +177,16 @@ async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<
 async fn get_route_stop_mapping_by_route(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    query: Query<DirectionQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_code) = path.into_inner();
     let mappings = app_state
         .gtfs_service
-        .get_route_stop_mapping_by_route(&gtfs_id, &route_code)
+        .get_route_stop_mapping_by_route_with_direction(
+            &gtfs_id,
+            &route_code,
+            query.direction.as_deref(),
+        )
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
 }
@@ -184,11 +194,16 @@ async fn get_route_stop_mapping_by_route(
 async fn get_route_stop_mapping_by_stop(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    query: Query<DirectionQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
     let mappings = app_state
         .gtfs_service
-        .get_route_stop_mapping_by_stop(&gtfs_id, &stop_code)
+        .get_route_stop_mapping_by_stop_with_direction(
+            &gtfs_id,
+            &stop_code,
+            query.direction.as_deref(),
+        )
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
 }
@@ -259,6 +274,7 @@ pub fn merge_stop_and_mapping(
         sequence_num: 0,
         hindi_name: stop.hindi_name,
         regional_name: stop.regional_name,
+        platform: mapping_ref.and_then(|m| m.platform.clone()),
     }
 }
 

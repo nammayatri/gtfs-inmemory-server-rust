@@ -137,6 +137,8 @@ pub struct RouteStopMapping {
     pub hindi_name: Option<String>,
     #[serde(rename = "regionalName")]
     pub regional_name: Option<String>,
+    #[serde(rename = "platform")]
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +224,7 @@ pub struct GTFSData {
     pub stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>>,
     pub provider_stop_code_mapping: HashMap<String, HashMap<String, String>>,
     pub stop_regional_names_by_gtfs: HashMap<String, HashMap<String, StopRegionalNameRecord>>,
+    pub suburban_stop_info_by_gtfs: HashMap<String, HashMap<String, SuburbanStopInfo>>,
 }
 
 impl GTFSData {
@@ -238,6 +241,7 @@ impl GTFSData {
         self.stop_geojsons_by_gtfs = new_data.stop_geojsons_by_gtfs;
         self.provider_stop_code_mapping = new_data.provider_stop_code_mapping;
         self.stop_regional_names_by_gtfs = new_data.stop_regional_names_by_gtfs;
+        self.suburban_stop_info_by_gtfs = new_data.suburban_stop_info_by_gtfs;
     }
 }
 
@@ -248,6 +252,28 @@ pub struct StopRegionalNameRecord {
     pub stop_name: String,
     pub hindi_name: String,
     pub regional_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuburbanStopInfoRecord {
+    pub gtfs_id: String,
+    pub stop_id: String,
+    #[serde(rename = "Location Name")]
+    pub location_name: String,
+    pub platforms: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformInfo {
+    pub platforms: String,
+    pub direction: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuburbanStopInfo {
+    pub stop_id: String,
+    pub location_name: String,
+    pub platforms: Vec<PlatformInfo>,
 }
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {

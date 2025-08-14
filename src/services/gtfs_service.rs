@@ -1,9 +1,9 @@
 use crate::environment::AppConfig;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
-    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes,
+    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
     ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
-    StopRegionalNameRecord,
+    StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
@@ -128,6 +128,13 @@ impl GTFSService {
             stop_regional_names_by_gtfs.len()
         );
 
+        // Read suburban stop info CSV file
+        let suburban_stop_info_by_gtfs = self.read_suburban_stop_info_csv().await?;
+        info!(
+            "Loaded suburban stop info for {} GTFS IDs from CSV",
+            suburban_stop_info_by_gtfs.len()
+        );
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -145,6 +152,7 @@ impl GTFSService {
             &stop_geojsons_by_gtfs,
             &provider_stop_code_mapping,
             &stop_regional_names_by_gtfs,
+            &suburban_stop_info_by_gtfs,
         );
 
         // Build stops data
@@ -168,6 +176,7 @@ impl GTFSService {
         temp_data.stop_geojsons_by_gtfs = stop_geojsons_by_gtfs;
         temp_data.provider_stop_code_mapping = provider_stop_code_mapping;
         temp_data.stop_regional_names_by_gtfs = stop_regional_names_by_gtfs;
+        temp_data.suburban_stop_info_by_gtfs = suburban_stop_info_by_gtfs;
 
         Ok(temp_data)
     }
@@ -300,6 +309,75 @@ impl GTFSService {
             }
         }
         Ok(stop_regional_names_by_gtfs)
+    }
+
+    async fn read_suburban_stop_info_csv(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, SuburbanStopInfo>>> {
+        let file_path = "./assets/suburban_stop_info.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("suburban_stop_info.csv file not found, proceeding without suburban stop info data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        // Use standard CSV reader since the file is now properly formatted
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut suburban_stop_info_by_gtfs = HashMap::new();
+
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let csv_record: SuburbanStopInfoRecord = record;
+
+                    // Parse the platforms JSON string
+                    let platforms: Vec<PlatformInfo> = if csv_record.platforms == "[]" {
+                        Vec::new()
+                    } else {
+                        match serde_json::from_str(&csv_record.platforms) {
+                            Ok(platforms) => platforms,
+                            Err(e) => {
+                                error!(
+                                    "Error parsing platforms JSON for stop {}: {}",
+                                    csv_record.stop_id, e
+                                );
+                                Vec::new()
+                            }
+                        }
+                    };
+
+                    let suburban_stop_info = SuburbanStopInfo {
+                        stop_id: csv_record.stop_id.clone(),
+                        location_name: csv_record.location_name,
+                        platforms,
+                    };
+
+                    // Use the gtfs_id from the CSV record
+                    let gtfs_id = csv_record.gtfs_id.clone();
+
+                    let inner = suburban_stop_info_by_gtfs
+                        .entry(gtfs_id)
+                        .or_insert_with(HashMap::new);
+                    inner.insert(csv_record.stop_id, suburban_stop_info);
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+        Ok(suburban_stop_info_by_gtfs)
     }
 
     async fn fetch_pattern_details_batch(
@@ -473,6 +551,7 @@ impl GTFSService {
         stop_geojsons_by_gtfs: &HashMap<String, HashMap<String, StopGeojson>>,
         provider_stop_code_mapping: &HashMap<String, HashMap<String, String>>,
         stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
+        suburban_stop_info_by_gtfs: &HashMap<String, HashMap<String, SuburbanStopInfo>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
@@ -530,6 +609,19 @@ impl GTFSService {
                             .map(|(provider_stop_code, _)| provider_stop_code.clone())
                     });
 
+                // Get platform from suburban stop info if available
+                let platform = suburban_stop_info_by_gtfs
+                    .get(gtfs_id)
+                    .and_then(|stops| stops.get(&stop.code))
+                    .and_then(|suburban_stop| {
+                        // For now, we'll use the first platform's platform number
+                        // You might want to implement more sophisticated logic based on your needs
+                        suburban_stop
+                            .platforms
+                            .first()
+                            .map(|platform_info| platform_info.platforms.clone())
+                    });
+
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
                     provider_code: provider_stop_code.unwrap_or("GTFS".to_string()),
@@ -552,6 +644,7 @@ impl GTFSService {
                         .get(gtfs_id)
                         .and_then(|m| m.get(&stop.code))
                         .map(|r| r.regional_name.clone()),
+                    platform,
                 });
                 let hash = get_sha256_hash(&mapping);
                 if visited_mapping.contains_key(&hash) {
@@ -848,16 +941,71 @@ impl GTFSService {
         gtfs_id: &str,
         route_code: &str,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+        self.get_route_stop_mapping_by_route_with_direction(gtfs_id, route_code, None)
+            .await
+    }
+
+    pub async fn get_route_stop_mapping_by_route_with_direction(
+        &self,
+        gtfs_id: &str,
+        route_code: &str,
+        direction: Option<&str>,
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let route_code = clean_identifier(route_code);
 
         if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
             if let Some(indices) = route_data.by_route.get(&route_code) {
-                return Ok(indices
-                    .iter()
-                    .filter_map(|&i| route_data.mappings.get(i).cloned())
-                    .collect());
+                let mut mappings = Vec::new();
+                let mut found_direction_match = false;
+
+                for &i in indices {
+                    if let Some(mapping) = route_data.mappings.get(i) {
+                        // If direction is specified, check if it matches
+                        if let Some(direction_filter) = direction {
+                            // Check if any platform in suburban stop info matches the direction
+                            if let Some(suburban_stop_info) =
+                                data.suburban_stop_info_by_gtfs.get(&gtfs_id)
+                            {
+                                if let Some(stop_info) = suburban_stop_info.get(&mapping.stop_code)
+                                {
+                                    let has_matching_direction = stop_info
+                                        .platforms
+                                        .iter()
+                                        .any(|platform| platform.direction == direction_filter);
+                                    if has_matching_direction {
+                                        mappings.push(mapping.clone());
+                                        found_direction_match = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            // If no direction specified, include all mappings
+                            mappings.push(mapping.clone());
+                        }
+                    }
+                }
+
+                // If direction was specified but no matches found, return all mappings with platform set to null
+                if let Some(_direction_filter) = direction {
+                    if !found_direction_match {
+                        // Return all mappings for this route but with platform set to null
+                        let mut all_mappings = Vec::new();
+                        for &i in indices {
+                            if let Some(mapping) = route_data.mappings.get(i) {
+                                let mut modified_mapping = (**mapping).clone();
+                                modified_mapping.platform = None;
+                                all_mappings.push(Arc::new(modified_mapping));
+                            }
+                        }
+                        return Ok(all_mappings);
+                    }
+                }
+
+                if !mappings.is_empty() {
+                    return Ok(mappings);
+                }
             }
         }
         Err(AppError::NotFound("Route not found".to_string()))
@@ -868,16 +1016,71 @@ impl GTFSService {
         gtfs_id: &str,
         stop_code: &str,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+        self.get_route_stop_mapping_by_stop_with_direction(gtfs_id, stop_code, None)
+            .await
+    }
+
+    pub async fn get_route_stop_mapping_by_stop_with_direction(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+        direction: Option<&str>,
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.read().await;
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
 
         if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
             if let Some(indices) = route_data.by_stop.get(&stop_code) {
-                return Ok(indices
-                    .iter()
-                    .filter_map(|&i| route_data.mappings.get(i).cloned())
-                    .collect());
+                let mut mappings = Vec::new();
+                let mut found_direction_match = false;
+
+                for &i in indices {
+                    if let Some(mapping) = route_data.mappings.get(i) {
+                        // If direction is specified, check if it matches
+                        if let Some(direction_filter) = direction {
+                            // Check if any platform in suburban stop info matches the direction
+                            if let Some(suburban_stop_info) =
+                                data.suburban_stop_info_by_gtfs.get(&gtfs_id)
+                            {
+                                if let Some(stop_info) = suburban_stop_info.get(&mapping.stop_code)
+                                {
+                                    let has_matching_direction = stop_info
+                                        .platforms
+                                        .iter()
+                                        .any(|platform| platform.direction == direction_filter);
+                                    if has_matching_direction {
+                                        mappings.push(mapping.clone());
+                                        found_direction_match = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            // If no direction specified, include all mappings
+                            mappings.push(mapping.clone());
+                        }
+                    }
+                }
+
+                // If direction was specified but no matches found, return all mappings with platform set to null
+                if let Some(_direction_filter) = direction {
+                    if !found_direction_match {
+                        // Return all mappings for this stop but with platform set to null
+                        let mut all_mappings = Vec::new();
+                        for &i in indices {
+                            if let Some(mapping) = route_data.mappings.get(i) {
+                                let mut modified_mapping = (**mapping).clone();
+                                modified_mapping.platform = None;
+                                all_mappings.push(Arc::new(modified_mapping));
+                            }
+                        }
+                        return Ok(all_mappings);
+                    }
+                }
+
+                if !mappings.is_empty() {
+                    return Ok(mappings);
+                }
             }
         }
         Err(AppError::NotFound("Stop not found".to_string()))
@@ -942,9 +1145,11 @@ impl GTFSService {
             .route_data_by_gtfs
             .get(&gtfs_id)
             .and_then(|route_data| {
-                route_data.by_stop.get(&stop_code)?.first().and_then(|&i| {
-                    route_data.mappings.get(i).cloned()
-                })
+                route_data
+                    .by_stop
+                    .get(&stop_code)?
+                    .first()
+                    .and_then(|&i| route_data.mappings.get(i).cloned())
             });
 
         Ok((stop, first_mapping))

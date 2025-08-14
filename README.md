@@ -79,8 +79,8 @@ cargo run --release
 
 ### Route-Stop Mappings
 
-- `GET /route-stop-mapping/{gtfs_id}/route/{route_code}` - Get stops for a route
-- `GET /route-stop-mapping/{gtfs_id}/stop/{stop_code}` - Get routes for a stop
+- `GET /route-stop-mapping/{gtfs_id}/route/{route_code}?direction={direction}` - Get stops for a route (with optional direction filter)
+- `GET /route-stop-mapping/{gtfs_id}/stop/{stop_code}?direction={direction}` - Get routes for a stop (with optional direction filter)
 
 ### Stops
 
@@ -99,6 +99,12 @@ cargo run --release
 ### Version
 
 - `GET /version/{gtfs_id}` - Get data version hash
+
+## Suburban Stop Info Integration
+
+The system now supports direction-based filtering for route stop mappings using data from the `suburban_stop_info.csv` file. This feature allows you to filter route stop mappings by direction (e.g., "MSB", "CGL") when querying the API.
+
+For detailed information about this feature, see [Suburban Stop Info Documentation](docs/SUBURBAN_STOP_INFO.md).
 
 ## Example Usage
 
@@ -123,13 +129,21 @@ curl "http://localhost:8000/routes/chennai_data/fuzzy/bus?limit=10"
 ### Get stops for a route
 
 ```bash
+# Get all stops for a route
 curl http://localhost:8000/route-stop-mapping/chennai_data/route/12345
+
+# Get stops for a route with direction filter
+curl "http://localhost:8000/route-stop-mapping/chennai_data/route/12345?direction=MSB"
 ```
 
 ### Get routes for a stop
 
 ```bash
+# Get all routes for a stop
 curl http://localhost:8000/route-stop-mapping/chennai_data/stop/STOP001
+
+# Get routes for a stop with direction filter
+curl "http://localhost:8000/route-stop-mapping/chennai_data/stop/STOP001?direction=MSB"
 ```
 
 ### Get stop code from provider stop code
