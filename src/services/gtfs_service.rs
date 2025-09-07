@@ -145,6 +145,10 @@ impl GTFSService {
         let mut routes_by_gtfs =
             self.build_routes_by_gtfs(all_routes, &route_trip_counts, &route_stop_counts);
 
+        // Build stops data first (needed by route data for parent_stop_code lookup)
+        let stops_by_gtfs =
+            self.build_stops_by_gtfs(all_stops.clone(), &stop_regional_names_by_gtfs);
+
         // Build route data
         let route_data_by_gtfs = self.build_route_data(
             &all_pattern_details,
@@ -153,11 +157,8 @@ impl GTFSService {
             &provider_stop_code_mapping,
             &stop_regional_names_by_gtfs,
             &suburban_stop_info_by_gtfs,
+            &stops_by_gtfs,
         );
-
-        // Build stops data
-        let stops_by_gtfs =
-            self.build_stops_by_gtfs(all_stops.clone(), &stop_regional_names_by_gtfs);
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
@@ -552,6 +553,7 @@ impl GTFSService {
         provider_stop_code_mapping: &HashMap<String, HashMap<String, String>>,
         stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
         suburban_stop_info_by_gtfs: &HashMap<String, HashMap<String, SuburbanStopInfo>>,
+        stops_by_gtfs: &HashMap<String, GTFSStopData>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
@@ -633,6 +635,13 @@ impl GTFSService {
                         lat: stop.lat,
                         lon: stop.lon,
                     },
+                    parent_stop_code: stops_by_gtfs
+                        .get(gtfs_id)
+                        .and_then(|stops_data| stops_data.stops.get(&stop.code))
+                        .and_then(|gtfs_stop| gtfs_stop.station_id.as_ref())
+                        .and_then(|station_id| station_id.split(':').last())
+                        .filter(|s| !s.is_empty())
+                        .map(|parent_code| parent_code.to_string()),
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),

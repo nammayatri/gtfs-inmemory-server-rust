@@ -275,6 +275,11 @@ pub fn merge_stop_and_mapping(
         hindi_name: stop.hindi_name,
         regional_name: stop.regional_name,
         platform: mapping_ref.and_then(|m| m.platform.clone()),
+        parent_stop_code: stop.station_id
+            .as_ref()
+            .and_then(|station_id| station_id.split(':').last())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
     }
 }
 

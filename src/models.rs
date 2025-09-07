@@ -139,6 +139,8 @@ pub struct RouteStopMapping {
     pub regional_name: Option<String>,
     #[serde(rename = "platform")]
     pub platform: Option<String>,
+    #[serde(rename = "parentStopCode")]
+    pub parent_stop_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
