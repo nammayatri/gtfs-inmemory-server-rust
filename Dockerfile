@@ -31,7 +31,7 @@ COPY assets ./assets
 RUN cargo build --release
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -48,7 +48,10 @@ WORKDIR /app
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
 COPY --from=builder /app/assets /app/assets
-COPY --from=builder /app/log-processor /app/log-processor
+COPY --from=builder /app/log-processor /usr/sbin/log-processor
+
+# Set proper permissions
+RUN chmod +x /usr/sbin/log-processor
 
 # Expose port
 EXPOSE 8000
