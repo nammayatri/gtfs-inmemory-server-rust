@@ -152,6 +152,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getAllVehiclesByIds",
                 actix_web::web::post().to(get_all_vehicles_by_ids),
+            )
+            .route(
+                "/getRoutesByIds/{gtfs_id}",
+                actix_web::web::post().to(get_routes_by_ids),
             ),
     );
 }
@@ -166,6 +170,20 @@ async fn get_route(
         .get_route(&gtfs_id, &route_id)
         .await?;
     Ok(HttpResponse::Ok().json(route))
+}
+
+async fn get_routes_by_ids(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<Vec<String>>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let route_ids = body.into_inner();
+    let routes = app_state
+        .gtfs_service
+        .get_routes_by_ids(&gtfs_id, route_ids)
+        .await?;
+    Ok(HttpResponse::Ok().json(routes))
 }
 
 async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
@@ -275,7 +293,8 @@ pub fn merge_stop_and_mapping(
         hindi_name: stop.hindi_name,
         regional_name: stop.regional_name,
         platform: mapping_ref.and_then(|m| m.platform.clone()),
-        parent_stop_code: stop.station_id
+        parent_stop_code: stop
+            .station_id
             .as_ref()
             .and_then(|station_id| station_id.split(':').last())
             .filter(|s| !s.is_empty())

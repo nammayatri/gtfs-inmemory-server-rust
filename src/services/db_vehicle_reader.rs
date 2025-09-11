@@ -13,7 +13,10 @@ use crate::tools::error::{AppError, AppResult};
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicle_data(&self, vehicle_no: &str) -> AppResult<VehicleDataWithRouteId>;
-    async fn get_vehicles_by_ids(&self, vehicle_nos: Vec<String>) -> AppResult<Vec<VehicleDataWithRouteId>>;
+    async fn get_vehicles_by_ids(
+        &self,
+        vehicle_nos: Vec<String>,
+    ) -> AppResult<Vec<VehicleDataWithRouteId>>;
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicles_by_service_type(&self, service_type: &str)
         -> AppResult<Vec<VehicleData>>;
@@ -38,7 +41,10 @@ impl VehicleDataReader for MockDBVehicleReader {
         ))
     }
 
-    async fn get_vehicles_by_ids(&self, _vehicle_nos: Vec<String>) -> AppResult<Vec<VehicleDataWithRouteId>> {
+    async fn get_vehicles_by_ids(
+        &self,
+        _vehicle_nos: Vec<String>,
+    ) -> AppResult<Vec<VehicleDataWithRouteId>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -226,7 +232,10 @@ impl VehicleDataReader for DBVehicleReader {
             .map_err(|e| AppError::DbError(e.to_string()))
     }
 
-    async fn get_vehicles_by_ids(&self, vehicle_nos: Vec<String>) -> AppResult<Vec<VehicleDataWithRouteId>> {
+    async fn get_vehicles_by_ids(
+        &self,
+        vehicle_nos: Vec<String>,
+    ) -> AppResult<Vec<VehicleDataWithRouteId>> {
         if vehicle_nos.is_empty() {
             return Ok(Vec::new());
         }
@@ -234,7 +243,7 @@ impl VehicleDataReader for DBVehicleReader {
         // Check cache first for any cached vehicles
         let mut found_vehicles = Vec::new();
         let mut uncached_vehicle_nos = Vec::new();
-        
+
         for vehicle_no in &vehicle_nos {
             if let Some(cached_data) = self.get_cached_vehicle_data(vehicle_no).await {
                 found_vehicles.push(cached_data);

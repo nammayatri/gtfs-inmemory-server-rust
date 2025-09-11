@@ -1,0 +1,26 @@
+# Rustfmt configuration for GTFS in-memory server
+# Optimized for performance and readability (stable features only)
+
+# Line width and formatting
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+
+# Import formatting (stable features)
+reorder_imports = true
+
+# Function and struct formatting
+fn_params_layout = "Tall"
+
+# Array formatting
+array_width = 60
+
+# Chain formatting
+chain_width = 60
+single_line_if_else_max_width = 50
+
+# Trait bounds
+force_explicit_abi = true
+
+# Performance optimizations
+edition = "2021"
