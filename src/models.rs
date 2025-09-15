@@ -233,18 +233,6 @@ impl GTFSData {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub fn update_data(&mut self, new_data: GTFSData) {
-        self.routes_by_gtfs = new_data.routes_by_gtfs;
-        self.route_data_by_gtfs = new_data.route_data_by_gtfs;
-        self.stops_by_gtfs = new_data.stops_by_gtfs;
-        self.children_by_parent = new_data.children_by_parent;
-        self.data_hash = new_data.data_hash;
-        self.stop_geojsons_by_gtfs = new_data.stop_geojsons_by_gtfs;
-        self.provider_stop_code_mapping = new_data.provider_stop_code_mapping;
-        self.stop_regional_names_by_gtfs = new_data.stop_regional_names_by_gtfs;
-        self.suburban_stop_info_by_gtfs = new_data.suburban_stop_info_by_gtfs;
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

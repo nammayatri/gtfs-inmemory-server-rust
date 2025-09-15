@@ -24,6 +24,7 @@ in {
   port = 8000,
   
   -- GTFS configuration
+  polling_enabled = True,
   polling_interval = 60,
   process_batch_size = 100,
   gc_interval = 300,

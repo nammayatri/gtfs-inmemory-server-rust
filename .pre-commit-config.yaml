@@ -1,0 +1,56 @@
+# Pre-commit configuration for Rust project
+# Install with: pip install pre-commit
+# Then run: pre-commit install
+
+repos:
+  # Rust formatting and linting
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        name: rustfmt
+        description: Format Rust code
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        args: [--check]
+        
+      - id: clippy
+        name: clippy
+        description: Lint Rust code
+        entry: cargo clippy --all-targets --all-features --
+        language: system
+        types: [rust]
+        args: [--, -D, warnings]
+        
+      - id: cargo-check
+        name: cargo check
+        description: Check Rust code
+        entry: cargo check --all-targets --all-features
+        language: system
+        types: [rust]
+        
+      - id: cargo-test
+        name: cargo test
+        description: Run Rust tests
+        entry: cargo test --all-targets --all-features
+        language: system
+        types: [rust]
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+        description: Remove trailing whitespace
+      - id: end-of-file-fixer
+        description: Ensure files end with newline
+      - id: check-yaml
+        description: Check YAML syntax
+      - id: check-json
+        description: Check JSON syntax
+      - id: check-merge-conflict
+        description: Check for merge conflict markers
+      - id: check-added-large-files
+        description: Check for large files
+        args: ['--maxkb=1000']

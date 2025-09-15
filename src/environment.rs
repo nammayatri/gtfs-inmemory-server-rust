@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub db_max_lifetime: u64,
     pub cache_duration: u64,
     pub otp_instances: OtpConfig,
+    pub polling_enabled: bool,
     pub polling_interval: u64,
     pub process_batch_size: usize,
     pub port: u16,

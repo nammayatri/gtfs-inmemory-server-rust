@@ -72,7 +72,7 @@ impl GTFSService {
         let temp_data = self.fetch_and_process_data().await?;
 
         let mut data = self.data.write().await;
-        data.update_data(temp_data);
+        *data = temp_data; // Atomic replacement instead of field-by-field assignment
 
         let mut is_ready = self.is_ready.write().await;
         *is_ready = true;
@@ -756,20 +756,25 @@ impl GTFSService {
         match self.fetch_and_process_data().await {
             Ok(new_data) => {
                 if self.check_for_changes(&new_data).await? {
-                    info!("Changes detected, updating data...");
-                    let mut data = self.data.write().await;
-                    data.update_data(new_data);
+                    info!("Changes detected, performing atomic update...");
 
+                    // Hold write lock for the entire update process
+                    // This blocks ALL read operations during the update
+                    let mut data = self.data.write().await;
+                    *data = new_data; // Atomic replacement of entire GTFSData structure
+
+                    // Update metadata while still holding the write lock
                     let mut last_update = self.last_update.write().await;
                     *last_update = Utc::now();
                     let duration = start_time.elapsed();
-                    info!("Data updated successfully in {:?}", duration);
+                    info!("Data updated atomically in {:?}", duration);
 
                     let mut is_ready = self.is_ready.write().await;
                     if !*is_ready {
                         *is_ready = true;
                         info!("Service is now ready.");
                     }
+                    // Write lock is released here - now reads can proceed with new data
                 } else {
                     info!("No changes in GTFS data detected. Skipping update.");
                 }
