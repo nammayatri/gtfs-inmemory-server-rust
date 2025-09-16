@@ -850,7 +850,10 @@ impl GTFSService {
                     } else {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
-                        error!("HTTP request failed with status {}: {}", status, body);
+                        error!(
+                            "HTTP request to URL {}/{} failed with status {}: {}",
+                            host, service, status, body
+                        );
                         call_external_api!(
                             method,
                             host.as_str(),

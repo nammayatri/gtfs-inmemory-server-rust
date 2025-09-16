@@ -20,6 +20,7 @@ pub struct VehicleData {
     pub schedule_no: String,
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<String>,
+    pub schedule_trip_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -36,10 +37,7 @@ pub struct VehicleDataWithRouteId {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct BusSchedule {
     pub schedule_number: String,
-    pub schedule_id: String,
     pub route_id: String,
-    pub deleted: bool,
-    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

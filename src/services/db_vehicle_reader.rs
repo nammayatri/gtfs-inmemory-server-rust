@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
 use crate::models::{BusSchedule, VehicleData, VehicleDataWithRouteId};
@@ -137,17 +137,16 @@ impl VehicleDataReader for DBVehicleReader {
             return Ok(cached_data);
         }
 
-        let query = "
-            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
+        let waybill_query =
+            "
+            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, schedule_trip_id::text
             FROM waybills
             WHERE vehicle_no = $1
             ORDER BY updated_at DESC
             LIMIT 1
         ";
 
-        let schedule_query = "select schedule_number, schedule_id::text, route_id::text, deleted, status from bus_schedule where schedule_number = $1 and deleted = false limit 1";
-
-        let result = sqlx::query_as::<_, VehicleData>(query)
+        let result = sqlx::query_as::<_, VehicleData>(waybill_query)
             .bind(vehicle_no)
             .fetch_optional(&self.pool)
             .await
@@ -155,11 +154,29 @@ impl VehicleDataReader for DBVehicleReader {
 
         match result {
             Some(vehicle_data) => {
-                let schedule_result = sqlx::query_as::<_, BusSchedule>(schedule_query)
-                    .bind(vehicle_data.schedule_no.clone())
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| AppError::DbError(e.to_string()))?;
+                let bus_schedule_trip_detail_query = "select route_number_id::text as route_id, schedule_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true limit 1";
+                let bus_schedule_query = "select route_id::text, schedule_number from bus_schedule where schedule_number = $1 and deleted = false limit 1";
+
+                let schedule_result = match (async || {
+                    if let Some(schedule_trip_id) = vehicle_data.schedule_trip_id {
+                        sqlx::query_as::<_, BusSchedule>(bus_schedule_trip_detail_query)
+                            .bind(schedule_trip_id)
+                            .fetch_optional(&self.pool)
+                            .await
+                    } else {
+                        Ok(None)
+                    }
+                })()
+                .await
+                {
+                    Ok(Some(data)) => Some(data),
+                    Ok(None) | Err(_) => sqlx::query_as::<_, BusSchedule>(bus_schedule_query)
+                        .bind(vehicle_data.schedule_no.clone())
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| AppError::DbError(e.to_string()))?,
+                };
+
                 let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                     waybill_id: vehicle_data.waybill_id,
                     service_type: vehicle_data.service_type,
@@ -170,7 +187,7 @@ impl VehicleDataReader for DBVehicleReader {
                     route_id: None,
                 };
                 if let Some(schedule) = schedule_result {
-                    vehicle_data_with_route_id.route_id = Some(schedule.route_id);
+                    vehicle_data_with_route_id.route_id = Some(schedule.route_id.to_owned());
                 }
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
