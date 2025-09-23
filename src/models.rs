@@ -39,6 +39,7 @@ pub struct VehicleDataWithRouteId {
 pub struct BusSchedule {
     pub schedule_number: String,
     pub route_id: String,
+    pub org_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

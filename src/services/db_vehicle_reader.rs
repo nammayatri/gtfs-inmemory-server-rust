@@ -171,7 +171,7 @@ impl VehicleDataReader for DBVehicleReader {
                                 .fetch_optional(&self.pool)
                                 .await
                         } else {
-                            None
+                            Ok(None)
                         }
                     }
                 })()
@@ -197,7 +197,7 @@ impl VehicleDataReader for DBVehicleReader {
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.route_id = Some(schedule.route_id.to_owned());
-                    vehicle_data_with_route_id.depot = Some(schedule.org_name.to_owned());
+                    vehicle_data_with_route_id.depot = schedule.org_name.to_owned();
                 }
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
@@ -362,7 +362,7 @@ impl VehicleDataReader for DBVehicleReader {
 
             if let Some(schedule) = schedule_map.get(&vehicle_data_with_route_id.schedule_no) {
                 vehicle_data_with_route_id.route_id = Some(schedule.route_id.clone());
-                vehicle_data_with_route_id.depot = Some(schedule.org_name.clone());
+                vehicle_data_with_route_id.depot = schedule.org_name.clone();
             }
 
             self.cache_vehicle_data(&vehicle_data_with_route_id).await;
