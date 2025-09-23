@@ -142,7 +142,7 @@ impl VehicleDataReader for DBVehicleReader {
             SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, schedule_trip_id::text
             FROM waybills
             WHERE vehicle_no = $1
-            ORDER BY updated_at DESC
+            and status = 'Online'
             LIMIT 1
         ";
 
@@ -154,7 +154,8 @@ impl VehicleDataReader for DBVehicleReader {
 
         match result {
             Some(vehicle_data) => {
-                let bus_schedule_trip_detail_query = "select route_number_id::text as route_id, schedule_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true limit 1";
+                let bus_schedule_trip_detail_query = "select route_number_id::text as route_id, schedule_number, org_name from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true limit 1";
+                let bus_schedule_trip_flexi_query = "select route_number_id::text as route_id, schedule_number, org_name from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and is_active_trip = true limit 1";
                 let bus_schedule_query = "select route_id::text, schedule_number from bus_schedule where schedule_number = $1 and deleted = false limit 1";
 
                 let schedule_result = match (async || {
@@ -164,7 +165,14 @@ impl VehicleDataReader for DBVehicleReader {
                             .fetch_optional(&self.pool)
                             .await
                     } else {
-                        Ok(None)
+                        if let Some(schedule_trip_id) = vehicle_data.schedule_trip_id {
+                            sqlx::query_as::<_, BusSchedule>(bus_schedule_trip_flexi_query)
+                                .bind(schedule_trip_id)
+                                .fetch_optional(&self.pool)
+                                .await
+                        } else {
+                            None
+                        }
                     }
                 })()
                 .await
@@ -185,9 +193,11 @@ impl VehicleDataReader for DBVehicleReader {
                     last_updated: vehicle_data.last_updated,
                     duty_date: vehicle_data.duty_date,
                     route_id: None,
+                    depot: None,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.route_id = Some(schedule.route_id.to_owned());
+                    vehicle_data_with_route_id.depot = Some(schedule.org_name.to_owned());
                 }
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
@@ -347,10 +357,12 @@ impl VehicleDataReader for DBVehicleReader {
                 last_updated: vehicle_data.last_updated,
                 duty_date: vehicle_data.duty_date,
                 route_id: None,
+                depot: None,
             };
 
             if let Some(schedule) = schedule_map.get(&vehicle_data_with_route_id.schedule_no) {
                 vehicle_data_with_route_id.route_id = Some(schedule.route_id.clone());
+                vehicle_data_with_route_id.depot = Some(schedule.org_name.clone());
             }
 
             self.cache_vehicle_data(&vehicle_data_with_route_id).await;

@@ -32,6 +32,7 @@ pub struct VehicleDataWithRouteId {
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<String>,
     pub route_id: Option<String>,
+    pub depot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
