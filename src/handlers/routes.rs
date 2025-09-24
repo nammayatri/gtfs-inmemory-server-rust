@@ -1,6 +1,6 @@
 use actix_web::{
-    web::{Data, Json, Path, Query},
-    HttpResponse,
+    web::{self, Data, Json, Path, Query},
+    HttpRequest, HttpResponse,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -386,14 +386,20 @@ async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppResult
     Ok(HttpResponse::Ok().json(version))
 }
 
+#[derive(Deserialize)]
+struct TripQuery {
+    trip_number: Option<i32>,
+}
+
 async fn get_service_type_by_vehicle(
     app_state: Data<AppState>,
     path: Path<String>,
+    params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let vehicle_no = path.into_inner();
     let vehicle_data = app_state
         .db_vehicle_reader
-        .get_vehicle_data(&vehicle_no)
+        .get_vehicle_data(&vehicle_no, params.trip_number)
         .await?;
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
@@ -402,6 +408,8 @@ async fn get_service_type_by_vehicle(
         schedule_no: Some(vehicle_data.schedule_no),
         last_updated: vehicle_data.last_updated,
         route_id: vehicle_data.route_id,
+        is_active_trip: vehicle_data.is_active_trip,
+        trip_number: vehicle_data.trip_number,
     }))
 }
 

@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     let dhall_config_path = env::var("DHALL_CONFIG")
         .unwrap_or_else(|_| "./dhall-configs/dev/gtfs_in_memory_server_rust.dhall".to_string());
     let app_config = environment::read_dhall_config(&dhall_config_path).unwrap_or_else(|err| {
-        error!("Dhall Config Reading Error: {}", err);
+        println!("Dhall Config Reading Error: {}", err);
         std::process::exit(1);
     });
     info!("Configuration loaded successfully from Dhall");

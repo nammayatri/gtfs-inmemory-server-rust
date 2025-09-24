@@ -1,3 +1,5 @@
+let secrets = ../secrets/gtfs_in_memory_server_rust.dhall
+
 let LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
 
 let logger_cfg = {
@@ -10,7 +12,7 @@ in {
   logger_cfg = logger_cfg,
   
   -- Database configuration
-  database_url = None Text,
+  database_url = secrets.database_url,
   db_max_connections = 20,
   db_min_connections = 5,
   db_acquire_timeout = 5,
@@ -25,7 +27,7 @@ in {
   
   -- GTFS configuration
   polling_enabled = True,
-  polling_interval = 60,
+  polling_interval = 10,
   process_batch_size = 100,
   gc_interval = 300,
   max_retries = 3,
@@ -43,9 +45,9 @@ in {
   -- OTP configuration
   otp_instances = {
     city_based_instances = [
-      { url = "http://localhost:8090", identifier = "city1" }
+      { url = secrets.otp_url, identifier = "city1" }
     ],
     gtfs_id_based_instances = [] : List { identifier : Text, url : Text },
-    default_instance = { url = "http://localhost:8090", identifier = "default" }
+    default_instance = { url = secrets.otp_url, identifier = "default" }
   }
 }
