@@ -1,5 +1,3 @@
-let secrets = ../secrets/gtfs_in_memory_server_rust.dhall
-
 let LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
 
 let logger_cfg = {
@@ -12,9 +10,9 @@ in {
   logger_cfg = logger_cfg,
 
   -- Database configuration
-  database_url = secrets.database_url,
+  database_url = Some "psql://mtc_root_user:C%40uM7a%242025@13.234.6.205:5432/mtc_master_prod",
   db_max_connections = 20,
-  db_min_connections = 5,
+  db_min_connections = 1,
   db_acquire_timeout = 5,
   db_idle_timeout = 600,
   db_max_lifetime = 3600,
@@ -45,9 +43,9 @@ in {
   -- OTP configuration
   otp_instances = {
     city_based_instances = [
-      { url = secrets.otp_url, identifier = "city1" }
+      { url = "https://api.sandbox.moving.tech/nandi", identifier = "city1" }
     ],
     gtfs_id_based_instances = [] : List { identifier : Text, url : Text },
-    default_instance = { url = secrets.otp_url, identifier = "default" }
+    default_instance = { url = "https://api.sandbox.moving.tech/nandi", identifier = "default" }
   }
 }
