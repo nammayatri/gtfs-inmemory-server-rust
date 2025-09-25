@@ -15,7 +15,7 @@ query TipPlan($trip_id: String!, $service_date: String!) {
         code
         name
         lat
-        lon  
+        lon
       }
       stopPosition
       realtimeArrival

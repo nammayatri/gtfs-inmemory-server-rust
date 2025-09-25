@@ -100,10 +100,10 @@ GTFS_RATE_LIMIT_DELAY=0.05
   ```sql
   -- Increase max_connections
   max_connections = 200
-  
+
   -- Optimize shared_buffers
   shared_buffers = 256MB
-  
+
   -- Enable connection reuse
   tcp_keepalives_idle = 60
   tcp_keepalives_interval = 10
@@ -211,4 +211,4 @@ if let Some(cached) = cache.get(&cache_key).await {
 
 ## Conclusion
 
-These optimizations should significantly reduce your TCP connection overhead and bring latency down from 10-15ms to 1-3ms in production environments. Monitor the metrics and adjust the configuration values based on your specific load patterns and infrastructure. 
+These optimizations should significantly reduce your TCP connection overhead and bring latency down from 10-15ms to 1-3ms in production environments. Monitor the metrics and adjust the configuration values based on your specific load patterns and infrastructure.

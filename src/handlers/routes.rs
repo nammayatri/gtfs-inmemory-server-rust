@@ -296,7 +296,7 @@ pub fn merge_stop_and_mapping(
         parent_stop_code: stop
             .station_id
             .as_ref()
-            .and_then(|station_id| station_id.split(':').last())
+            .and_then(|station_id| station_id.split(':').next_back())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
     }

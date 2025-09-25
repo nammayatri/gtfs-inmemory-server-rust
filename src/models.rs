@@ -286,7 +286,11 @@ pub fn clean_identifier(identifier: &str) -> String {
     let decoded = urlencoding::decode(identifier).unwrap_or_else(|_| identifier.to_string().into());
 
     // Remove GTFS ID prefix if present (format: gtfs_id:code)
-    decoded.split(':').last().unwrap_or(&decoded).to_string()
+    decoded
+        .split(':')
+        .next_back()
+        .unwrap_or(&decoded)
+        .to_string()
 }
 
 pub fn deserialize_gates_from_json_str<'de, D>(

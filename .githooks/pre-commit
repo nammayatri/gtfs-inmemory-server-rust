@@ -60,4 +60,4 @@ if ! cargo check --quiet --message-format=short; then
     exit 1
 fi
 
-echo "✅ Pre-commit hook completed successfully!" 
+echo "✅ Pre-commit hook completed successfully!"

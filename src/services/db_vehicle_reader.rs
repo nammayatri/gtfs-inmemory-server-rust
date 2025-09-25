@@ -31,6 +31,12 @@ pub trait VehicleDataReader: Send + Sync {
 // Mock implementation for local testing without a database
 pub struct MockDBVehicleReader;
 
+impl Default for MockDBVehicleReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockDBVehicleReader {
     pub fn new() -> Self {
         Self
@@ -211,8 +217,7 @@ impl VehicleDataReader for DBVehicleReader {
                                         .map_err(|e| {
                                             AppError::DbError(format!(
                                                 "Query: {} | Error: {}",
-                                                bus_schedule_query,
-                                                e.to_string()
+                                                bus_schedule_query, e
                                             ))
                                         })?;
                                     (data, false)
@@ -236,8 +241,7 @@ impl VehicleDataReader for DBVehicleReader {
                                         .map_err(|e| {
                                             AppError::DbError(format!(
                                                 "Query: {} | Error: {}",
-                                                bus_schedule_query,
-                                                e.to_string()
+                                                bus_schedule_query, e
                                             ))
                                         })?;
                                     (data, false)
@@ -399,8 +403,8 @@ impl VehicleDataReader for DBVehicleReader {
             let schedule_placeholders_str = schedule_placeholders.join(",");
 
             let schedule_query = format!(
-                "SELECT schedule_number, route_id::text as route_id, NULL::text as org_name 
-                 FROM bus_schedule 
+                "SELECT schedule_number, route_id::text as route_id, NULL::text as org_name
+                 FROM bus_schedule
                  WHERE schedule_number IN ({}) AND deleted = false",
                 schedule_placeholders_str
             );

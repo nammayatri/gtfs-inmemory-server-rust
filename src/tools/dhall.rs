@@ -24,7 +24,6 @@ use crate::environment::AppConfig;
 ///     Err(err) => eprintln!("Failed to read config: {}", err),
 /// }
 /// ```
-
 pub fn read_dhall_config(config_path: &str) -> Result<AppConfig, String> {
     let config = serde_dhall::from_file(config_path).parse::<AppConfig>();
     match config {

@@ -414,7 +414,7 @@ impl GTFSService {
             let route_code = details
                 .route_id
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap_or(&details.route_id);
             *counts.entry(route_code.to_string()).or_insert(0) += details.trips.len() as i32;
         }
@@ -545,6 +545,7 @@ impl GTFSService {
         stops_by_gtfs
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_route_data(
         &self,
         pattern_details: &[NandiPatternDetails],
@@ -599,7 +600,7 @@ impl GTFSService {
                 let stop_geojson = stop_geojsons_by_gtfs
                     .get(gtfs_id)
                     .and_then(|g| g.get(&stop.code))
-                    .map(|geojson| geojson.clone());
+                    .cloned();
 
                 // Find provider stop code for this stop code
                 let provider_stop_code =
@@ -639,7 +640,7 @@ impl GTFSService {
                         .get(gtfs_id)
                         .and_then(|stops_data| stops_data.stops.get(&stop.code))
                         .and_then(|gtfs_stop| gtfs_stop.station_id.as_ref())
-                        .and_then(|station_id| station_id.split(':').last())
+                        .and_then(|station_id| station_id.split(':').next_back())
                         .filter(|s| !s.is_empty())
                         .map(|parent_code| parent_code.to_string()),
                     vehicle_type: vehicle_type.clone(),
@@ -714,8 +715,8 @@ impl GTFSService {
         for stop in stops {
             if let Some(station_id) = &stop.station_id {
                 let gtfs_id = stop.id.split(':').next().unwrap_or_default();
-                let stop_code = stop.id.split(':').last().unwrap_or_default();
-                let parent_code = station_id.split(':').last().unwrap_or_default();
+                let stop_code = stop.id.split(':').next_back().unwrap_or_default();
+                let parent_code = station_id.split(':').next_back().unwrap_or_default();
                 if !gtfs_id.is_empty() && !stop_code.is_empty() && !parent_code.is_empty() {
                     children_by_parent
                         .entry(gtfs_id.to_string())
