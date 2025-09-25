@@ -1,6 +1,6 @@
 use actix_web::{
     web::{self, Data, Json, Path, Query},
-    HttpRequest, HttpResponse,
+    HttpResponse,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -410,6 +410,7 @@ async fn get_service_type_by_vehicle(
         route_id: vehicle_data.route_id,
         is_active_trip: vehicle_data.is_active_trip,
         trip_number: vehicle_data.trip_number,
+        depot_no: vehicle_data.depot,
     }))
 }
 

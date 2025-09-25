@@ -55,6 +55,8 @@ pub struct VehicleServiceTypeResponse {
     pub route_id: Option<String>,
     pub is_active_trip: bool,
     pub trip_number: Option<i32>,
+    #[serde(rename = "depotNo")]
+    pub depot_no: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
