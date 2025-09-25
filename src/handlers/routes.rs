@@ -407,12 +407,10 @@ async fn get_service_type_by_vehicle(
 
 async fn get_service_type_by_vehicle_by_gtfs_id(
     app_state: Data<AppState>,
-    gtfs_id: Path<String>,
-    path: Path<String>,
+    path: Path<(String, String)>,
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
-    let gtfs_id_string = gtfs_id.into_inner();
-    let vehicle_no = path.into_inner().replace("\"", "");
+    let (gtfs_id_string, vehicle_no) = path.into_inner();
     get_service_type_by_vehicle_impl(app_state, Some(gtfs_id_string.as_str()), &vehicle_no, params).await
 }
 
