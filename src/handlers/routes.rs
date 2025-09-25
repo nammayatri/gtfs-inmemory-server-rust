@@ -108,6 +108,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/vehicle/{vehicle_no}/service-type",
                 actix_web::web::get().to(get_service_type_by_vehicle),
+            ) // deprecate above API after migration
+            .route(
+                "/vehicle/{gtfs_id}/service-type/{vehicle_no}",
+                actix_web::web::get().to(get_service_type_by_vehicle_by_gtfs_id),
             )
             .route("/memory-stats", actix_web::web::get().to(get_memory_stats))
             .route(
@@ -397,10 +401,57 @@ async fn get_service_type_by_vehicle(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let vehicle_no = path.into_inner();
-    let vehicle_data = app_state
+    get_service_type_by_vehicle_impl(app_state, None, &vehicle_no, params).await
+}
+
+async fn get_service_type_by_vehicle_by_gtfs_id(
+    app_state: Data<AppState>,
+    gtfs_id: Path<String>,
+    path: Path<String>,
+    params: web::Query<TripQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id_string = gtfs_id.into_inner();
+    let vehicle_no = path.into_inner();
+    get_service_type_by_vehicle_impl(app_state, Some(gtfs_id_string.as_str()), &vehicle_no, params).await
+}
+
+async fn get_service_type_by_vehicle_impl(
+    app_state: Data<AppState>,
+    gtfs_id: Option<&str>,
+    path: &str,
+    params: web::Query<TripQuery>,
+) -> AppResult<HttpResponse> {
+    let vehicle_no = path;
+    let mut vehicle_data = app_state
         .db_vehicle_reader
-        .get_vehicle_data(&vehicle_no, params.trip_number)
+        .get_vehicle_data(vehicle_no, params.trip_number)
         .await?;
+    let gtfs_id = gtfs_id.unwrap_or("chennai_bus"); // todo: remove this once API is migrated
+
+    // Populate stops_count for each route in remaining_trip_details using its own route_number
+    if let Some(ref mut details) = vehicle_data.remaining_trip_details {
+        for d in details.iter_mut() {
+            let route_code = d.route_id.as_str();
+            let stops_len: i32 = match app_state
+                .gtfs_service
+                .get_route_stop_mapping_by_route(&gtfs_id, route_code)
+                .await
+            {
+                Ok(mappings) => mappings.len() as i32,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch route stop mapping for gtfs_id={} route_code={}: {}",
+                        gtfs_id,
+                        route_code,
+                        e
+                    );
+                    0
+                }
+            };
+            d.stops_count = Some(stops_len);
+        }
+    }
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type: vehicle_data.service_type,
@@ -408,9 +459,11 @@ async fn get_service_type_by_vehicle(
         schedule_no: Some(vehicle_data.schedule_no),
         last_updated: vehicle_data.last_updated,
         route_id: vehicle_data.route_id,
+        route_number: vehicle_data.route_number,
         is_active_trip: vehicle_data.is_active_trip,
         trip_number: vehicle_data.trip_number,
         depot_no: vehicle_data.depot,
+        remaining_trip_details: vehicle_data.remaining_trip_details,
     }))
 }
 
