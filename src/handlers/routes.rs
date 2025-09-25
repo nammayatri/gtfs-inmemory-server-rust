@@ -395,12 +395,13 @@ struct TripQuery {
     trip_number: Option<i32>,
 }
 
+
 async fn get_service_type_by_vehicle(
     app_state: Data<AppState>,
     path: Path<String>,
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
-    let vehicle_no = path.into_inner();
+    let vehicle_no = path.into_inner().replace("\"", "");
     get_service_type_by_vehicle_impl(app_state, None, &vehicle_no, params).await
 }
 
@@ -411,7 +412,7 @@ async fn get_service_type_by_vehicle_by_gtfs_id(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let gtfs_id_string = gtfs_id.into_inner();
-    let vehicle_no = path.into_inner();
+    let vehicle_no = path.into_inner().replace("\"", "");
     get_service_type_by_vehicle_impl(app_state, Some(gtfs_id_string.as_str()), &vehicle_no, params).await
 }
 
