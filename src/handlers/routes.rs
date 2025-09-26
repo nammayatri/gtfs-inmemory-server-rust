@@ -456,6 +456,7 @@ async fn get_service_type_by_vehicle_impl(
         vehicle_no: vehicle_data.vehicle_no,
         service_type: vehicle_data.service_type,
         waybill_id: Some(vehicle_data.waybill_id),
+        waybill_no: vehicle_data.waybill_no,
         schedule_no: Some(vehicle_data.schedule_no),
         last_updated: vehicle_data.last_updated,
         route_id: vehicle_data.route_id,

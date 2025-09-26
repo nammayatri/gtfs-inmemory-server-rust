@@ -211,7 +211,7 @@ impl VehicleDataReader for DBVehicleReader {
 
         let waybill_query =
             "
-            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, schedule_trip_id::text
+            SELECT waybill_id::text, waybill_no::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, schedule_trip_id::text
             FROM waybills
             WHERE vehicle_no = $1
             and status = 'Online'
@@ -346,6 +346,7 @@ impl VehicleDataReader for DBVehicleReader {
 
                 let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                     waybill_id: vehicle_data.waybill_id,
+                    waybill_no: vehicle_data.waybill_no,
                     service_type: vehicle_data.service_type,
                     vehicle_no: vehicle_data.vehicle_no,
                     schedule_no: vehicle_data.schedule_no,
@@ -519,6 +520,7 @@ impl VehicleDataReader for DBVehicleReader {
         for vehicle_data in vehicle_results {
             let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                 waybill_id: vehicle_data.waybill_id,
+                waybill_no: None,
                 service_type: vehicle_data.service_type,
                 vehicle_no: vehicle_data.vehicle_no,
                 schedule_no: vehicle_data.schedule_no,
