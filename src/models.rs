@@ -15,6 +15,7 @@ pub struct Gate {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleData {
     pub waybill_id: String,
+    pub waybill_no: Option<String>,
     pub service_type: String,
     pub vehicle_no: String,
     pub schedule_no: String,
@@ -26,6 +27,7 @@ pub struct VehicleData {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleDataWithRouteId {
     pub waybill_id: String,
+    pub waybill_no: Option<String>,
     pub service_type: String,
     pub vehicle_no: String,
     pub schedule_no: String,
@@ -58,6 +60,7 @@ pub struct VehicleServiceTypeResponse {
     pub vehicle_no: String,
     pub service_type: String,
     pub waybill_id: Option<String>,
+    pub waybill_no: Option<String>,
     pub schedule_no: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub route_id: Option<String>,
