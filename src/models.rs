@@ -64,7 +64,7 @@ pub struct VehicleServiceTypeResponse {
     pub route_number: Option<String>,
     pub is_active_trip: bool,
     pub trip_number: Option<i32>,
-    #[serde(rename = "depotNo")]
+    #[serde(rename = "depot")]
     pub depot_no: Option<String>,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
 }

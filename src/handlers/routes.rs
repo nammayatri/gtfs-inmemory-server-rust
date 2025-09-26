@@ -395,7 +395,6 @@ struct TripQuery {
     trip_number: Option<i32>,
 }
 
-
 async fn get_service_type_by_vehicle(
     app_state: Data<AppState>,
     path: Path<String>,
@@ -411,7 +410,13 @@ async fn get_service_type_by_vehicle_by_gtfs_id(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id_string, vehicle_no) = path.into_inner();
-    get_service_type_by_vehicle_impl(app_state, Some(gtfs_id_string.as_str()), &vehicle_no, params).await
+    get_service_type_by_vehicle_impl(
+        app_state,
+        Some(gtfs_id_string.as_str()),
+        &vehicle_no,
+        params,
+    )
+    .await
 }
 
 async fn get_service_type_by_vehicle_impl(
@@ -433,7 +438,7 @@ async fn get_service_type_by_vehicle_impl(
             let route_code = d.route_id.as_str();
             let stops_len: i32 = match app_state
                 .gtfs_service
-                .get_route_stop_mapping_by_route(&gtfs_id, route_code)
+                .get_route_stop_mapping_by_route(gtfs_id, route_code)
                 .await
             {
                 Ok(mappings) => mappings.len() as i32,
