@@ -224,12 +224,12 @@ impl VehicleDataReader for DBVehicleReader {
                 {
                     format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
                 } else {
-                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true) order by trip_number asc".to_string()
+                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
                 };
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
                     format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
                 } else {
-                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= (select trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and is_active_trip = true) order by trip_number asc".to_string()
+                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
                 };
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
