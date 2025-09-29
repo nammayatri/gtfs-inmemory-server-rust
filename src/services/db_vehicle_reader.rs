@@ -208,10 +208,11 @@ impl VehicleDataReader for DBVehicleReader {
 
         let waybill_query =
             "
-            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, schedule_trip_id::text
-            FROM waybills
-            WHERE vehicle_no = $1
-            and status = 'Online'
+            SELECT w.waybill_id::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, v.entity_id
+            FROM waybills w
+            join vehicles v on v.fleet_no = w.vehicle_no
+            WHERE w.vehicle_no = $1
+            and w.status = 'Online'
             LIMIT 1
         ";
 
@@ -386,6 +387,7 @@ impl VehicleDataReader for DBVehicleReader {
                     trip_number: None,
                     is_active_trip,
                     remaining_trip_details,
+                    entity_id: vehicle_data.entity_id,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -410,6 +412,7 @@ impl VehicleDataReader for DBVehicleReader {
                     trip_number: None,
                     is_active_trip: false,
                     remaining_trip_details: None,
+                    entity_id: None,
                 };
                 Ok(vehicle_data_with_route_id)
             }
@@ -596,6 +599,7 @@ impl VehicleDataReader for DBVehicleReader {
                 trip_number: None,
                 is_active_trip: false,
                 remaining_trip_details: None,
+                entity_id: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {

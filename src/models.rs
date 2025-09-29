@@ -21,6 +21,7 @@ pub struct VehicleData {
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<String>,
     pub schedule_trip_id: Option<String>,
+    pub entity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -37,6 +38,7 @@ pub struct VehicleDataWithRouteId {
     pub trip_number: Option<i32>,
     pub is_active_trip: bool,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
+    pub entity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -245,6 +247,7 @@ pub struct GTFSData {
     pub stop_regional_names_by_gtfs: HashMap<String, HashMap<String, StopRegionalNameRecord>>,
     pub suburban_stop_info_by_gtfs: HashMap<String, HashMap<String, SuburbanStopInfo>>,
     pub static_fleet_info_by_gtfs: HashMap<String, HashMap<String, StaticFleetInfo>>,
+    pub entity_id_name_mapping: HashMap<String, String>,
 }
 
 impl GTFSData {
@@ -306,6 +309,12 @@ pub struct StaticFleetInfo {
     pub capacity: Option<i32>,
     pub depot: Option<String>,
     pub service_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityIdNameRecord {
+    pub entity_id: String,
+    pub name: String,
 }
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
