@@ -2,8 +2,8 @@ use crate::environment::AppConfig;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteStopMapping, StopGeojson, StopGeojsonRecord,
-    StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
+    ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
+    StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
@@ -135,6 +135,17 @@ impl GTFSService {
             suburban_stop_info_by_gtfs.len()
         );
 
+        // Read static fleet info CSV file (optional)
+        let static_fleet_info_by_gtfs = self.read_static_fleet_info_csv().await?;
+        if !static_fleet_info_by_gtfs.is_empty() {
+            info!(
+                "Loaded static fleet info for {} GTFS IDs from CSV",
+                static_fleet_info_by_gtfs.len()
+            );
+        } else {
+            info!("No static fleet info loaded from CSV");
+        }
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -178,6 +189,7 @@ impl GTFSService {
         temp_data.provider_stop_code_mapping = provider_stop_code_mapping;
         temp_data.stop_regional_names_by_gtfs = stop_regional_names_by_gtfs;
         temp_data.suburban_stop_info_by_gtfs = suburban_stop_info_by_gtfs;
+        temp_data.static_fleet_info_by_gtfs = static_fleet_info_by_gtfs;
 
         Ok(temp_data)
     }
@@ -379,6 +391,57 @@ impl GTFSService {
             }
         }
         Ok(suburban_stop_info_by_gtfs)
+    }
+
+    async fn read_static_fleet_info_csv(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, StaticFleetInfo>>> {
+        let file_path = "./assets/static_fleet_info.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!(
+                    "static_fleet_info.csv file not found, proceeding without fleet info data"
+                );
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut static_fleet_info_by_gtfs = HashMap::new();
+
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let csv_record: StaticFleetInfoRecord = record;
+                    let fleet_info = StaticFleetInfo {
+                        fleet_id: csv_record.fleet_id.clone(),
+                        vehicle_type: csv_record.vehicle_type,
+                        capacity: csv_record.capacity,
+                        depot: csv_record.depot,
+                        service_type: csv_record.service_type,
+                    };
+                    let inner = static_fleet_info_by_gtfs
+                        .entry(csv_record.gtfs_id)
+                        .or_insert_with(HashMap::new);
+                    inner.insert(fleet_info.fleet_id.clone(), fleet_info);
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+        Ok(static_fleet_info_by_gtfs)
     }
 
     async fn fetch_pattern_details_batch(
@@ -1331,6 +1394,18 @@ impl GTFSService {
         stats.insert("total_stops".to_string(), total_stops);
 
         stats
+    }
+
+    pub async fn get_fleet_service_type(
+        &self,
+        gtfs_id: &str,
+        vehicle_no: &str,
+    ) -> Option<String> {
+        let data = self.data.read().await;
+        data.static_fleet_info_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+            .and_then(|m| m.get(clean_identifier(vehicle_no).as_str()))
+            .and_then(|info| info.service_type.clone())
     }
 
     pub async fn get_all_cached_data(&self) -> CachedDataResponse {

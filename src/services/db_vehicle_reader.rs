@@ -175,10 +175,13 @@ impl DBVehicleReader {
             query_builder = query_builder.bind(id);
         }
 
-        let mappings = query_builder
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        let mappings = match query_builder.fetch_all(&self.pool).await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to fetch route numbers: {}", e);
+                return Ok(());
+            }
+        };
 
         let map: std::collections::HashMap<String, Option<String>> = mappings.into_iter().collect();
 
@@ -212,11 +215,17 @@ impl VehicleDataReader for DBVehicleReader {
             LIMIT 1
         ";
 
-        let result = sqlx::query_as::<_, VehicleData>(waybill_query)
+        let result = match sqlx::query_as::<_, VehicleData>(waybill_query)
             .bind(vehicle_no)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Waybill query failed for {}: {}", vehicle_no, e);
+                None
+            }
+        };
 
         match result {
             Some(vehicle_data) => {
@@ -266,17 +275,22 @@ impl VehicleDataReader for DBVehicleReader {
                                     }
                                     Ok(_) | Err(_) => {
                                         // Third try: bus_schedule_query
-                                        let mut rows =
-                                            sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
-                                                .bind(vehicle_data.schedule_no.clone())
-                                                .fetch_all(&self.pool)
-                                                .await
-                                                .map_err(|e| {
-                                                    AppError::DbError(format!(
-                                                        "Query: {} | Error: {}",
-                                                        bus_schedule_query, e
-                                                    ))
-                                                })?;
+                                        let mut rows = match sqlx::query_as::<_, BusSchedule>(
+                                            &bus_schedule_query,
+                                        )
+                                        .bind(vehicle_data.schedule_no.clone())
+                                        .fetch_all(&self.pool)
+                                        .await
+                                        {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                error!(
+                                                    "Query failed (bus_schedule): {} | {}",
+                                                    bus_schedule_query, e
+                                                );
+                                                Vec::new()
+                                            }
+                                        };
                                         if !rows.is_empty() {
                                             self.enrich_route_numbers(&mut rows).await?;
                                             let first = rows.remove(0);
@@ -307,17 +321,22 @@ impl VehicleDataReader for DBVehicleReader {
                                     }
                                     Ok(_) | Err(_) => {
                                         // Third try: bus_schedule_query
-                                        let mut rows =
-                                            sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
-                                                .bind(vehicle_data.schedule_no.clone())
-                                                .fetch_all(&self.pool)
-                                                .await
-                                                .map_err(|e| {
-                                                    AppError::DbError(format!(
-                                                        "Query: {} | Error: {}",
-                                                        bus_schedule_query, e
-                                                    ))
-                                                })?;
+                                        let mut rows = match sqlx::query_as::<_, BusSchedule>(
+                                            &bus_schedule_query,
+                                        )
+                                        .bind(vehicle_data.schedule_no.clone())
+                                        .fetch_all(&self.pool)
+                                        .await
+                                        {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                error!(
+                                                    "Query failed (bus_schedule): {} | {}",
+                                                    bus_schedule_query, e
+                                                );
+                                                Vec::new()
+                                            }
+                                        };
                                         if !rows.is_empty() {
                                             self.enrich_route_numbers(&mut rows).await?;
                                             let first = rows.remove(0);
@@ -333,11 +352,17 @@ impl VehicleDataReader for DBVehicleReader {
                         }
                     } else {
                         // If no schedule_trip_id, directly try bus_schedule_query
-                        let mut rows = sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
+                        let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
                             .bind(vehicle_data.schedule_no.clone())
                             .fetch_all(&self.pool)
                             .await
-                            .map_err(|e| AppError::DbError(e.to_string()))?;
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("Query failed (bus_schedule direct): {}", e);
+                                Vec::new()
+                            }
+                        };
                         if !rows.is_empty() {
                             self.enrich_route_numbers(&mut rows).await?;
                             let first = rows.remove(0);
@@ -349,10 +374,10 @@ impl VehicleDataReader for DBVehicleReader {
                     };
 
                 let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
-                    waybill_id: vehicle_data.waybill_id,
-                    service_type: vehicle_data.service_type,
+                    waybill_id: Some(vehicle_data.waybill_id),
+                    service_type: Some(vehicle_data.service_type),
                     vehicle_no: vehicle_data.vehicle_no,
-                    schedule_no: vehicle_data.schedule_no,
+                    schedule_no: Some(vehicle_data.schedule_no),
                     last_updated: vehicle_data.last_updated,
                     duty_date: vehicle_data.duty_date,
                     route_number: None,
@@ -371,10 +396,23 @@ impl VehicleDataReader for DBVehicleReader {
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
             }
-            None => Err(AppError::NotFound(format!(
-                "Vehicle not found: {}",
-                vehicle_no
-            ))),
+            None => {
+                let vehicle_data_with_route_id = VehicleDataWithRouteId {
+                    waybill_id: None,
+                    service_type: None,
+                    vehicle_no: vehicle_no.to_string(),
+                    schedule_no: None,
+                    last_updated: None,
+                    duty_date: None,
+                    route_id: None,
+                    route_number: None,
+                    depot: None,
+                    trip_number: None,
+                    is_active_trip: false,
+                    remaining_trip_details: None,
+                };
+                Ok(vehicle_data_with_route_id)
+            }
         }
     }
 
@@ -386,10 +424,16 @@ impl VehicleDataReader for DBVehicleReader {
             ORDER BY vehicle_no, updated_at DESC
         ";
 
-        sqlx::query_as::<_, VehicleData>(query)
+        match sqlx::query_as::<_, VehicleData>(query)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                error!("get_all_vehicles query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
     }
 
     async fn get_vehicles_by_service_type(
@@ -404,11 +448,17 @@ impl VehicleDataReader for DBVehicleReader {
             ORDER BY vehicle_no, updated_at DESC
         ";
 
-        sqlx::query_as::<_, VehicleData>(query)
+        match sqlx::query_as::<_, VehicleData>(query)
             .bind(service_type)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                error!("get_vehicles_by_service_type query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
     }
 
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>> {
@@ -421,11 +471,17 @@ impl VehicleDataReader for DBVehicleReader {
             ORDER BY vehicle_no, updated_at DESC
         ";
 
-        sqlx::query_as::<_, VehicleData>(query_sql)
+        match sqlx::query_as::<_, VehicleData>(query_sql)
             .bind(&search_pattern)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                error!("search_vehicles query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
     }
 
     async fn get_vehicles_by_ids(
@@ -473,10 +529,13 @@ impl VehicleDataReader for DBVehicleReader {
             query_builder = query_builder.bind(vehicle_no);
         }
 
-        let vehicle_results = query_builder
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        let vehicle_results = match query_builder.fetch_all(&self.pool).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("get_vehicles_by_ids batch query failed: {}", e);
+                Vec::new()
+            }
+        };
 
         // Get all unique schedule numbers
         let schedule_numbers: Vec<String> = vehicle_results
@@ -506,10 +565,13 @@ impl VehicleDataReader for DBVehicleReader {
                 schedule_query_builder = schedule_query_builder.bind(schedule_no);
             }
 
-            let mut schedule_results = schedule_query_builder
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            let mut schedule_results = match schedule_query_builder.fetch_all(&self.pool).await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("schedule batch query failed: {}", e);
+                    Vec::new()
+                }
+            };
 
             // Enrich route_number for these schedules
             self.enrich_route_numbers(&mut schedule_results).await?;
@@ -522,10 +584,10 @@ impl VehicleDataReader for DBVehicleReader {
         // Build the final result
         for vehicle_data in vehicle_results {
             let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
-                waybill_id: vehicle_data.waybill_id,
-                service_type: vehicle_data.service_type,
+                waybill_id: Some(vehicle_data.waybill_id),
+                service_type: Some(vehicle_data.service_type),
                 vehicle_no: vehicle_data.vehicle_no,
-                schedule_no: vehicle_data.schedule_no,
+                schedule_no: Some(vehicle_data.schedule_no),
                 last_updated: vehicle_data.last_updated,
                 duty_date: vehicle_data.duty_date,
                 route_id: None,
@@ -536,10 +598,12 @@ impl VehicleDataReader for DBVehicleReader {
                 remaining_trip_details: None,
             };
 
-            if let Some(schedule) = schedule_map.get(&vehicle_data_with_route_id.schedule_no) {
+            if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {
+                if let Some(schedule) = schedule_map.get(schedule_no) {
                 vehicle_data_with_route_id.route_id = Some(schedule.route_id.clone());
                 vehicle_data_with_route_id.depot = schedule.org_name.clone();
                 vehicle_data_with_route_id.route_number = schedule.route_number.clone();
+                }
             }
 
             self.cache_vehicle_data(&vehicle_data_with_route_id).await;
@@ -550,11 +614,17 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_vehicle_count(&self) -> AppResult<i64> {
-        let row =
-            sqlx::query_as::<_, (i64,)>("SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
-        Ok(row.0)
+        match sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills",
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok(row) => Ok(row.0),
+            Err(e) => {
+                error!("get_vehicle_count query failed: {}", e);
+                Ok(0)
+            }
+        }
     }
 }

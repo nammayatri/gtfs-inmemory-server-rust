@@ -25,10 +25,10 @@ pub struct VehicleData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleDataWithRouteId {
-    pub waybill_id: String,
-    pub service_type: String,
+    pub waybill_id: Option<String>,
+    pub service_type: Option<String>,
     pub vehicle_no: String,
-    pub schedule_no: String,
+    pub schedule_no: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<String>,
     pub route_id: Option<String>,
@@ -56,7 +56,7 @@ pub struct BusSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleServiceTypeResponse {
     pub vehicle_no: String,
-    pub service_type: String,
+    pub service_type: Option<String>,
     pub waybill_id: Option<String>,
     pub schedule_no: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
@@ -244,6 +244,7 @@ pub struct GTFSData {
     pub provider_stop_code_mapping: HashMap<String, HashMap<String, String>>,
     pub stop_regional_names_by_gtfs: HashMap<String, HashMap<String, StopRegionalNameRecord>>,
     pub suburban_stop_info_by_gtfs: HashMap<String, HashMap<String, SuburbanStopInfo>>,
+    pub static_fleet_info_by_gtfs: HashMap<String, HashMap<String, StaticFleetInfo>>,
 }
 
 impl GTFSData {
@@ -281,6 +282,30 @@ pub struct SuburbanStopInfo {
     pub stop_id: String,
     pub location_name: String,
     pub platforms: Vec<PlatformInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticFleetInfoRecord {
+    pub gtfs_id: String,
+    #[serde(alias = "vehicle_no", alias = "vehicleId", alias = "fleetId")]
+    pub fleet_id: String,
+    #[serde(default)]
+    pub vehicle_type: Option<String>,
+    #[serde(default)]
+    pub capacity: Option<i32>,
+    #[serde(default)]
+    pub depot: Option<String>,
+    #[serde(default)]
+    pub service_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticFleetInfo {
+    pub fleet_id: String,
+    pub vehicle_type: Option<String>,
+    pub capacity: Option<i32>,
+    pub depot: Option<String>,
+    pub service_type: Option<String>,
 }
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {

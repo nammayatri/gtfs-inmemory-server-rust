@@ -456,11 +456,19 @@ async fn get_service_type_by_vehicle_impl(
         }
     }
 
+    let service_type = match vehicle_data.service_type.clone() {
+        Some(s) => Some(s),
+        None => app_state
+            .gtfs_service
+            .get_fleet_service_type(gtfs_id, &vehicle_data.vehicle_no)
+            .await,
+    };
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
-        service_type: vehicle_data.service_type,
-        waybill_id: Some(vehicle_data.waybill_id),
-        schedule_no: Some(vehicle_data.schedule_no),
+        service_type,
+        waybill_id: vehicle_data.waybill_id,
+        schedule_no: vehicle_data.schedule_no,
         last_updated: vehicle_data.last_updated,
         route_id: vehicle_data.route_id,
         route_number: vehicle_data.route_number,
