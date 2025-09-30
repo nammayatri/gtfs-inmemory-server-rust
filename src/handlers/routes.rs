@@ -410,6 +410,7 @@ async fn get_service_type_by_vehicle_by_gtfs_id(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id_string, vehicle_no) = path.into_inner();
+    let vehicle_no = vehicle_no.replace("\"", "");
     get_service_type_by_vehicle_impl(
         app_state,
         Some(gtfs_id_string.as_str()),
@@ -464,6 +465,16 @@ async fn get_service_type_by_vehicle_impl(
             .await,
     };
 
+    // Convert entity_id to depot name, fallback to existing depot if no entity_id
+    let depot_no = if let Some(ref entity_id) = vehicle_data.entity_id {
+        // Get entity_id_name mapping from GTFS service
+        let entity_mapping = app_state.gtfs_service.get_entity_id_name_mapping().await;
+        entity_mapping.get(entity_id).cloned().or(vehicle_data.depot.clone())
+    } else {
+        // Fallback to existing depot name if no entity_id
+        vehicle_data.depot.clone()
+    };
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
@@ -474,7 +485,7 @@ async fn get_service_type_by_vehicle_impl(
         route_number: vehicle_data.route_number,
         is_active_trip: vehicle_data.is_active_trip,
         trip_number: vehicle_data.trip_number,
-        depot_no: vehicle_data.depot,
+        depot_no,
         remaining_trip_details: vehicle_data.remaining_trip_details,
     }))
 }
