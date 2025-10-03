@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
-use crate::models::{BusSchedule, VehicleData, VehicleDataWithRouteId};
+use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId};
 use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
@@ -206,24 +206,24 @@ impl VehicleDataReader for DBVehicleReader {
             return Ok(cached_data);
         }
 
-        let waybill_query =
+        let waybill_online_query =
             "
             SELECT w.waybill_id::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, v.entity_id
             FROM waybills w
-            join vehicles v on v.fleet_no = w.vehicle_no
+            left join vehicles v on v.fleet_no = w.vehicle_no
             WHERE w.vehicle_no = $1
             and w.status = 'Online'
             LIMIT 1
         ";
 
-        let result = match sqlx::query_as::<_, VehicleData>(waybill_query)
+        let result = match sqlx::query_as::<_, VehicleData>(waybill_online_query)
             .bind(vehicle_no)
             .fetch_optional(&self.pool)
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                error!("Waybill query failed for {}: {}", vehicle_no, e);
+                error!("Waybill Online query failed for {}: {}", vehicle_no, e);
                 None
             }
         };
@@ -399,21 +399,65 @@ impl VehicleDataReader for DBVehicleReader {
                 Ok(vehicle_data_with_route_id)
             }
             None => {
-                let vehicle_data_with_route_id = VehicleDataWithRouteId {
-                    waybill_id: None,
-                    service_type: None,
-                    vehicle_no: vehicle_no.to_string(),
-                    schedule_no: None,
-                    last_updated: None,
-                    duty_date: None,
-                    route_id: None,
-                    route_number: None,
-                    depot: None,
-                    trip_number: None,
-                    is_active_trip: false,
-                    remaining_trip_details: None,
-                    entity_id: None,
-                };
+                let waybill_status_agnostic_query = "
+                    SELECT w.vehicle_no, w.service_type
+                    FROM waybills w
+                    WHERE w.vehicle_no = $1            
+                    ORDER BY w.updated_at DESC
+                    LIMIT 1
+                ";
+
+                let minimal_vehicle_data =
+                    match sqlx::query_as::<_, MinimalVehicleData>(waybill_status_agnostic_query)
+                        .bind(vehicle_no)
+                        .fetch_optional(&self.pool)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!(
+                                "Waybill Status Agnostic query failed for {}: {}",
+                                vehicle_no, e
+                            );
+                            None
+                        }
+                    };
+
+                let vehicle_data_with_route_id =
+                    if let Some(minimal_vehicle_data) = minimal_vehicle_data {
+                        VehicleDataWithRouteId {
+                            waybill_id: None,
+                            service_type: Some(minimal_vehicle_data.service_type),
+                            vehicle_no: minimal_vehicle_data.vehicle_no.to_string(),
+                            schedule_no: None,
+                            last_updated: None,
+                            duty_date: None,
+                            route_id: None,
+                            route_number: None,
+                            depot: None,
+                            trip_number: None,
+                            is_active_trip: false,
+                            remaining_trip_details: None,
+                            entity_id: None,
+                        }
+                    } else {
+                        VehicleDataWithRouteId {
+                            waybill_id: None,
+                            service_type: None,
+                            vehicle_no: vehicle_no.to_string(),
+                            schedule_no: None,
+                            last_updated: None,
+                            duty_date: None,
+                            route_id: None,
+                            route_number: None,
+                            depot: None,
+                            trip_number: None,
+                            is_active_trip: false,
+                            remaining_trip_details: None,
+                            entity_id: None,
+                        }
+                    };
+
                 Ok(vehicle_data_with_route_id)
             }
         }
@@ -604,9 +648,9 @@ impl VehicleDataReader for DBVehicleReader {
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {
                 if let Some(schedule) = schedule_map.get(schedule_no) {
-                vehicle_data_with_route_id.route_id = Some(schedule.route_id.clone());
-                vehicle_data_with_route_id.depot = schedule.org_name.clone();
-                vehicle_data_with_route_id.route_number = schedule.route_number.clone();
+                    vehicle_data_with_route_id.route_id = Some(schedule.route_id.clone());
+                    vehicle_data_with_route_id.depot = schedule.org_name.clone();
+                    vehicle_data_with_route_id.route_number = schedule.route_number.clone();
                 }
             }
 
