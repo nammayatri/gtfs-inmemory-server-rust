@@ -31,12 +31,6 @@ pub struct MinimalVehicleData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct MinimalVehicleData {
-    pub service_type: String,
-    pub vehicle_no: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleDataWithRouteId {
     pub waybill_id: Option<String>,
     pub service_type: Option<String>,
