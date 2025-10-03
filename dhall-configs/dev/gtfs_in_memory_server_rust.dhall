@@ -43,7 +43,7 @@ in {
   -- OTP configuration
   otp_instances = {
     city_based_instances = [
-      { url = "https://api.sandbox.moving.tech/nandi", identifier = "city1" }
+      { url = "https://api.sandbox.moving.tech/nandi", identifier = "chennai_bus" }
     ],
     gtfs_id_based_instances = [] : List { identifier : Text, url : Text },
     default_instance = { url = "https://api.sandbox.moving.tech/nandi", identifier = "default" }

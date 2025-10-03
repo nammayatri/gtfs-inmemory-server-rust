@@ -5,6 +5,7 @@ use crate::models::{
     ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
     StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
+use crate::models::TripDetails;
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
@@ -178,6 +179,9 @@ impl GTFSService {
             &stops_by_gtfs,
         );
 
+        // Fetch example trip mapping per route for all GTFS feeds
+        let route_example_trip_by_gtfs = self.fetch_route_example_trip_for_all_feeds().await?;
+
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
 
@@ -198,6 +202,7 @@ impl GTFSService {
         temp_data.suburban_stop_info_by_gtfs = suburban_stop_info_by_gtfs;
         temp_data.static_fleet_info_by_gtfs = static_fleet_info_by_gtfs;
         temp_data.entity_id_name_mapping = entity_id_name_mapping;
+        temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
 
         Ok(temp_data)
     }
@@ -1467,6 +1472,103 @@ impl GTFSService {
         data.entity_id_name_mapping.clone()
     }
 
+    pub async fn get_example_trip(
+        &self,
+        gtfs_id: &str,
+        route_code: &str,
+    ) -> AppResult<TripDetails> {
+        let data = self.data.read().await;
+        if let Some(cached) = data
+            .route_example_trip_details_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+            .and_then(|m| m.get(clean_identifier(route_code).as_str()))
+        {
+            return Ok(cached.clone());
+        }
+
+        let trip_feed = data
+            .route_example_trip_by_gtfs
+            .get(clean_identifier(gtfs_id).as_str())
+            .and_then(|m| m.get(clean_identifier(route_code).as_str()))
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("Example trip not found".to_string()))?;
+
+        drop(data);
+
+        // Query trip details by trip_feed
+        let query = "query Trip($id: String!) { trip(id: $id) { gtfsId stoptimes { stop { id lat lon code platformCode name } scheduledArrival scheduledDeparture headsign stopPosition } } }";
+        let variables = serde_json::json!({ "id": format!("{}:{}", clean_identifier(gtfs_id), trip_feed) });
+        let resp = self
+            .execute_graphql_query("default", query, Some(variables), None, None)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to fetch trip details: {}", e)))?;
+
+        let mut stops: Vec<crate::models::TripStopDetail> = Vec::new();
+        if let Some(stoptimes) = resp
+            .get("data")
+            .and_then(|d| d.get("trip"))
+            .and_then(|t| t.get("stoptimes"))
+            .and_then(|s| s.as_array())
+        {
+            for st in stoptimes {
+                let stop_obj = st.get("stop").cloned().unwrap_or(serde_json::Value::Null);
+                let stop_code = stop_obj.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let stop_id = stop_obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let stop_name = stop_obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let platform_code = stop_obj.get("platformCode").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let lat = stop_obj.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let lon = stop_obj.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let scheduled_arrival = st
+                    .get("scheduledArrival")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                let scheduled_departure = st
+                    .get("scheduledDeparture")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                let headsign = st.get("headsign").cloned().unwrap_or(serde_json::Value::Null);
+                let stop_position = st
+                    .get("stopPosition")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                if stop_code.is_empty() || stop_id.is_empty() {
+                    continue;
+                }
+                stops.push(crate::models::TripStopDetail {
+                    stop_id,
+                    stop_code,
+                    stop_name,
+                    platform_code,
+                    lat,
+                    lon,
+                    scheduled_arrival,
+                    scheduled_departure,
+                    headsign,
+                    stop_position,
+                });
+            }
+        }
+
+        let details = TripDetails { trip_id: trip_feed.clone(), stops };
+
+        // Cache results
+        let mut data_w = self.data.write().await;
+        data_w
+            .route_example_trip_details_by_gtfs
+            .entry(clean_identifier(gtfs_id))
+            .or_default()
+            .insert(clean_identifier(route_code), details.clone());
+
+        Ok(details)
+    }
+
+    pub async fn get_route_example_trip_map(
+        &self,
+    ) -> HashMap<String, HashMap<String, String>> {
+        let data = self.data.read().await;
+        data.route_example_trip_by_gtfs.clone()
+    }
+
     // GraphQL query execution
     pub async fn force_refresh_data(&self) -> AppResult<()> {
         info!("Force refresh triggered - checking for GTFS data updates...");
@@ -1533,5 +1635,96 @@ impl GTFSService {
         )
         .await
         .map_err(|e| AppError::Internal(format!("Failed to call API: {}", e)))
+    }
+
+    async fn fetch_route_example_trip_for_all_feeds(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, String>>> {
+        // GraphQL: trips(feeds:["<gtfs>"]){ gtfsId id route{ id } }
+        let query = "query Trips($feeds: [String!]) { trips(feeds: $feeds) { gtfsId route { gtfsId } } }";
+
+        let mut mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        let mut gtfs_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for inst in self.config.otp_instances.get_all_instances() {
+            gtfs_ids.insert(inst.identifier.clone());
+        }
+
+        info!(count = gtfs_ids.len(), "Collecting example trips for feeds");
+        debug!(feeds = ?gtfs_ids, "Feeds discovered for example trip fetch");
+
+        for feed_id in gtfs_ids {
+            info!(feed = %feed_id, "Fetching example trips via GraphQL");
+            let variables = serde_json::json!({ "feeds": [feed_id] });
+            let resp = match self
+                .execute_graphql_query("default", query, Some(variables), None, None)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(feed = %feed_id, error = %e, "GraphQL trips fetch failed");
+                    return Err(e);
+                }
+            };
+
+            if let Some(trips) = resp
+                .get("data")
+                .and_then(|d| d.get("trips"))
+                .and_then(|t| t.as_array())
+            {
+                debug!(feed = %feed_id, trips = trips.len(), "Trips array extracted");
+                for trip in trips {
+                    let route_feed = trip
+                        .get("route")
+                        .and_then(|r| r.get("gtfsId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let trip_feed = trip
+                        .get("gtfsId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if route_feed.is_empty() || trip_feed.is_empty() {
+                        warn!(feed = %feed_id, trip = ?trip, "Missing route.gtfsId or trip gtfsId in trip entry");
+                        continue;
+                    }
+                    let clean_route_code = clean_identifier(route_feed);
+                    let clean_trip_code = clean_identifier(trip_feed);
+                    debug!(
+                        feed = %feed_id,
+                        route_feed = %route_feed,
+                        route_code = %clean_route_code,
+                        trip_feed = %trip_feed,
+                        trip_code = %clean_trip_code,
+                        "Cleaned route/trip feed IDs"
+                    );
+                    if clean_route_code.is_empty() || clean_trip_code.is_empty() {
+                        warn!(
+                            feed = %feed_id,
+                            route_feed = %route_feed,
+                            trip_feed = %trip_feed,
+                            "Cleaned codes are empty, skipping"
+                        );
+                        continue;
+                    }
+                    mapping
+                        .entry(feed_id.to_string())
+                        .or_default()
+                        .entry(clean_route_code)
+                        .or_insert(clean_trip_code);
+                }
+                let inserted = mapping
+                    .get(&feed_id)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                info!(feed = %feed_id, routes = inserted, "Example trips mapped for feed");
+            }
+            else {
+                warn!(feed = %feed_id, response = %resp, "GraphQL response missing data.trips array");
+            }
+        }
+
+        let total_routes: usize = mapping.values().map(|m| m.len()).sum();
+        info!(feeds = mapping.len(), total_routes = total_routes, "Finished building example trip map");
+        Ok(mapping)
     }
 }

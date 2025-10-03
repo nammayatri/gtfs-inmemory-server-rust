@@ -160,8 +160,32 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getRoutesByIds/{gtfs_id}",
                 actix_web::web::post().to(get_routes_by_ids),
+            )
+            .route(
+                "/example-trip/{gtfs_id}/{route_code}",
+                actix_web::web::get().to(get_example_trip),
+            )
+            .route(
+                "/example-trip-map",
+                actix_web::web::get().to(get_example_trip_map),
             ),
     );
+}
+async fn get_example_trip(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_code) = path.into_inner();
+    let details = app_state
+        .gtfs_service
+        .get_example_trip(&gtfs_id, &route_code)
+        .await?;
+    Ok(HttpResponse::Ok().json(details))
+}
+
+async fn get_example_trip_map(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    let map = app_state.gtfs_service.get_route_example_trip_map().await;
+    Ok(HttpResponse::Ok().json(map))
 }
 
 async fn get_route(

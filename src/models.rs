@@ -252,8 +252,10 @@ pub struct GTFSData {
     pub provider_stop_code_mapping: HashMap<String, HashMap<String, String>>,
     pub stop_regional_names_by_gtfs: HashMap<String, HashMap<String, StopRegionalNameRecord>>,
     pub suburban_stop_info_by_gtfs: HashMap<String, HashMap<String, SuburbanStopInfo>>,
+    pub route_example_trip_by_gtfs: HashMap<String, HashMap<String, String>>,
     pub static_fleet_info_by_gtfs: HashMap<String, HashMap<String, StaticFleetInfo>>,
     pub entity_id_name_mapping: HashMap<String, String>,
+    pub route_example_trip_details_by_gtfs: HashMap<String, HashMap<String, TripDetails>>,
 }
 
 impl GTFSData {
@@ -291,6 +293,35 @@ pub struct SuburbanStopInfo {
     pub stop_id: String,
     pub location_name: String,
     pub platforms: Vec<PlatformInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TripStopDetail {
+    #[serde(rename = "stopId")]
+    pub stop_id: String,
+    #[serde(rename = "stopCode")]
+    pub stop_code: String,
+    #[serde(rename = "stopName")]
+    pub stop_name: Option<String>,
+    #[serde(rename = "platformCode")]
+    pub platform_code: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(rename = "scheduledArrival")]
+    pub scheduled_arrival: i32,
+    #[serde(rename = "scheduledDeparture")]
+    pub scheduled_departure: i32,
+    #[serde(rename = "headsign")]
+    pub headsign: serde_json::Value,
+    #[serde(rename = "stopPosition")]
+    pub stop_position: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TripDetails {
+    #[serde(rename = "tripId")]
+    pub trip_id: String,
+    pub stops: Vec<TripStopDetail>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
