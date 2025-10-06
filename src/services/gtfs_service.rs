@@ -1,11 +1,12 @@
 use crate::environment::AppConfig;
-use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, EntityIdNameRecord, GTFSData, GTFSRouteData, GTFSStop,
-    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
-    StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
-};
 use crate::models::TripDetails;
+use crate::models::{
+    cast_vehicle_type, clean_identifier, CachedDataResponse, EntityIdNameRecord, GTFSData,
+    GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern, NandiPatternDetails,
+    NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo,
+    StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
+    SuburbanStopInfo, SuburbanStopInfoRecord,
+};
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
@@ -415,9 +416,7 @@ impl GTFSService {
         let mut file = match File::open(file_path).await {
             Ok(file) => file,
             Err(_) => {
-                warn!(
-                    "static_fleet_info.csv file not found, proceeding without fleet info data"
-                );
+                warn!("static_fleet_info.csv file not found, proceeding without fleet info data");
                 return Ok(HashMap::new());
             }
         };
@@ -464,7 +463,9 @@ impl GTFSService {
         let mut file = match File::open(file_path).await {
             Ok(file) => file,
             Err(_) => {
-                warn!("entity_id_name.csv file not found, proceeding without entity ID name mapping");
+                warn!(
+                    "entity_id_name.csv file not found, proceeding without entity ID name mapping"
+                );
                 return Ok(HashMap::new());
             }
         };
@@ -1446,11 +1447,7 @@ impl GTFSService {
         stats
     }
 
-    pub async fn get_fleet_service_type(
-        &self,
-        gtfs_id: &str,
-        vehicle_no: &str,
-    ) -> Option<String> {
+    pub async fn get_fleet_service_type(&self, gtfs_id: &str, vehicle_no: &str) -> Option<String> {
         let data = self.data.read().await;
         data.static_fleet_info_by_gtfs
             .get(clean_identifier(gtfs_id).as_str())
@@ -1497,7 +1494,8 @@ impl GTFSService {
 
         // Query trip details by trip_feed
         let query = "query Trip($id: String!) { trip(id: $id) { gtfsId stoptimes { stop { id lat lon code platformCode name } scheduledArrival scheduledDeparture headsign stopPosition } } }";
-        let variables = serde_json::json!({ "id": format!("{}:{}", clean_identifier(gtfs_id), trip_feed) });
+        let variables =
+            serde_json::json!({ "id": format!("{}:{}", clean_identifier(gtfs_id), trip_feed) });
         let resp = self
             .execute_graphql_query("default", query, Some(variables), None, None)
             .await
@@ -1512,10 +1510,24 @@ impl GTFSService {
         {
             for st in stoptimes {
                 let stop_obj = st.get("stop").cloned().unwrap_or(serde_json::Value::Null);
-                let stop_code = stop_obj.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let stop_id = stop_obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let stop_name = stop_obj.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let platform_code = stop_obj.get("platformCode").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let stop_code = stop_obj
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stop_id = stop_obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stop_name = stop_obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let platform_code = stop_obj
+                    .get("platformCode")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let lat = stop_obj.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let lon = stop_obj.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let scheduled_arrival = st
@@ -1526,11 +1538,12 @@ impl GTFSService {
                     .get("scheduledDeparture")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0) as i32;
-                let headsign = st.get("headsign").cloned().unwrap_or(serde_json::Value::Null);
-                let stop_position = st
-                    .get("stopPosition")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
+                let headsign = st
+                    .get("headsign")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let stop_position =
+                    st.get("stopPosition").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 if stop_code.is_empty() || stop_id.is_empty() {
                     continue;
                 }
@@ -1549,7 +1562,10 @@ impl GTFSService {
             }
         }
 
-        let details = TripDetails { trip_id: trip_feed.clone(), stops };
+        let details = TripDetails {
+            trip_id: trip_feed.clone(),
+            stops,
+        };
 
         // Cache results
         let mut data_w = self.data.write().await;
@@ -1562,9 +1578,7 @@ impl GTFSService {
         Ok(details)
     }
 
-    pub async fn get_route_example_trip_map(
-        &self,
-    ) -> HashMap<String, HashMap<String, String>> {
+    pub async fn get_route_example_trip_map(&self) -> HashMap<String, HashMap<String, String>> {
         let data = self.data.read().await;
         data.route_example_trip_by_gtfs.clone()
     }
@@ -1641,28 +1655,63 @@ impl GTFSService {
         &self,
     ) -> AppResult<HashMap<String, HashMap<String, String>>> {
         // GraphQL: trips(feeds:["<gtfs>"]){ gtfsId id route{ id } }
-        let query = "query Trips($feeds: [String!]) { trips(feeds: $feeds) { gtfsId route { gtfsId } } }";
+        let query =
+            "query Trips($feeds: [String!]) { trips(feeds: $feeds) { gtfsId route { gtfsId } } }";
+        let feed_query = "query Feed { feeds { feedId } }";
 
         let mut mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut feed_to_instance: HashMap<String, String> = HashMap::new();
 
-        let mut gtfs_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for inst in self.config.otp_instances.get_all_instances() {
-            gtfs_ids.insert(inst.identifier.clone());
-        }
+        // Iterate over all OTP instances to collect feeds and map them to their instances
+        for otp_instance in self.config.otp_instances.get_all_instances() {
+            info!(instance = %otp_instance.identifier, url = %otp_instance.url, "Fetching feeds from OTP instance");
 
-        info!(count = gtfs_ids.len(), "Collecting example trips for feeds");
-        debug!(feeds = ?gtfs_ids, "Feeds discovered for example trip fetch");
-
-        for feed_id in gtfs_ids {
-            info!(feed = %feed_id, "Fetching example trips via GraphQL");
-            let variables = serde_json::json!({ "feeds": [feed_id] });
             let resp = match self
-                .execute_graphql_query("default", query, Some(variables), None, None)
+                .execute_graphql_query(&otp_instance.identifier, feed_query, None, None, None)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    error!(feed = %feed_id, error = %e, "GraphQL trips fetch failed");
+                    error!(instance = %otp_instance.identifier, error = %e, "GraphQL feeds fetch failed for instance");
+                    return Err(e);
+                }
+            };
+
+            if let Some(feeds_array) = resp
+                .get("data")
+                .and_then(|d| d.get("feeds"))
+                .and_then(|f| f.as_array())
+            {
+                for feed in feeds_array {
+                    if let Some(feed_id) = feed.get("feedId").and_then(|v| v.as_str()) {
+                        feed_to_instance
+                            .insert(feed_id.to_string(), otp_instance.identifier.clone());
+                    }
+                }
+                info!(instance = %otp_instance.identifier, feeds = feeds_array.len(), "Collected feeds from instance");
+            } else {
+                warn!(instance = %otp_instance.identifier, "No feeds found in response from instance");
+            }
+        }
+
+        info!(
+            total_feeds = feed_to_instance.len(),
+            "Collected feeds from all OTP instances"
+        );
+        debug!(feeds = ?feed_to_instance, "Feed to instance mapping created");
+
+        // Now fetch example trips for each feed from its specific instance
+        for (feed_id, instance_identifier) in feed_to_instance {
+            info!(feed = %feed_id, instance = %instance_identifier, "Fetching example trips from specific instance");
+            let variables = serde_json::json!({ "feeds": [feed_id] });
+
+            let resp = match self
+                .execute_graphql_query(&instance_identifier, query, Some(variables), None, None)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(instance = %instance_identifier, feed = %feed_id, error = %e, "GraphQL trips fetch failed for feed");
                     return Err(e);
                 }
             };
@@ -1672,17 +1721,14 @@ impl GTFSService {
                 .and_then(|d| d.get("trips"))
                 .and_then(|t| t.as_array())
             {
-                debug!(feed = %feed_id, trips = trips.len(), "Trips array extracted");
+                debug!(feed = %feed_id, instance = %instance_identifier, trips = trips.len(), "Trips array extracted from instance");
                 for trip in trips {
                     let route_feed = trip
                         .get("route")
                         .and_then(|r| r.get("gtfsId"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let trip_feed = trip
-                        .get("gtfsId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let trip_feed = trip.get("gtfsId").and_then(|v| v.as_str()).unwrap_or("");
                     if route_feed.is_empty() || trip_feed.is_empty() {
                         warn!(feed = %feed_id, trip = ?trip, "Missing route.gtfsId or trip gtfsId in trip entry");
                         continue;
@@ -1712,19 +1758,19 @@ impl GTFSService {
                         .entry(clean_route_code)
                         .or_insert(clean_trip_code);
                 }
-                let inserted = mapping
-                    .get(&feed_id)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                info!(feed = %feed_id, routes = inserted, "Example trips mapped for feed");
-            }
-            else {
-                warn!(feed = %feed_id, response = %resp, "GraphQL response missing data.trips array");
+                let inserted = mapping.get(&feed_id).map(|m| m.len()).unwrap_or(0);
+                info!(feed = %feed_id, instance = %instance_identifier, routes = inserted, "Example trips mapped for feed");
+            } else {
+                warn!(feed = %feed_id, instance = %instance_identifier, "No trips found for feed in instance");
             }
         }
 
         let total_routes: usize = mapping.values().map(|m| m.len()).sum();
-        info!(feeds = mapping.len(), total_routes = total_routes, "Finished building example trip map");
+        info!(
+            feeds = mapping.len(),
+            total_routes = total_routes,
+            "Finished building example trip map"
+        );
         Ok(mapping)
     }
 }
