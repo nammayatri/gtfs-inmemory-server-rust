@@ -15,13 +15,14 @@ pub struct Gate {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleData {
     pub waybill_id: String,
+    pub waybill_no: String,
     pub service_type: String,
     pub vehicle_no: String,
     pub schedule_no: String,
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<String>,
     pub schedule_trip_id: Option<String>,
-    pub entity_id: Option<i64>,
+    pub entity_remark: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -33,6 +34,7 @@ pub struct MinimalVehicleData {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleDataWithRouteId {
     pub waybill_id: Option<String>,
+    pub waybill_no: Option<String>,
     pub service_type: Option<String>,
     pub vehicle_no: String,
     pub schedule_no: Option<String>,
@@ -44,7 +46,7 @@ pub struct VehicleDataWithRouteId {
     pub trip_number: Option<i32>,
     pub is_active_trip: bool,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
-    pub entity_id: Option<i64>,
+    pub entity_remark: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -348,11 +350,6 @@ pub struct StaticFleetInfo {
     pub service_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntityIdNameRecord {
-    pub entity_id: String,
-    pub name: String,
-}
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {

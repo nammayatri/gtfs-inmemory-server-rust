@@ -1,11 +1,10 @@
 use crate::environment::AppConfig;
 use crate::models::TripDetails;
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, EntityIdNameRecord, GTFSData,
-    GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern, NandiPatternDetails,
-    NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo,
-    StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
-    SuburbanStopInfo, SuburbanStopInfoRecord,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
+    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
+    ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
+    StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
@@ -137,12 +136,6 @@ impl GTFSService {
             suburban_stop_info_by_gtfs.len()
         );
 
-        // Read entity ID name mapping CSV file
-        let entity_id_name_mapping = self.read_entity_id_name_csv().await?;
-        info!(
-            "Loaded {} entity ID name mappings from CSV",
-            entity_id_name_mapping.len()
-        );
 
         // Read static fleet info CSV file (optional)
         let static_fleet_info_by_gtfs = self.read_static_fleet_info_csv().await?;
@@ -202,7 +195,6 @@ impl GTFSService {
         temp_data.stop_regional_names_by_gtfs = stop_regional_names_by_gtfs;
         temp_data.suburban_stop_info_by_gtfs = suburban_stop_info_by_gtfs;
         temp_data.static_fleet_info_by_gtfs = static_fleet_info_by_gtfs;
-        temp_data.entity_id_name_mapping = entity_id_name_mapping;
         temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
 
         Ok(temp_data)
@@ -456,44 +448,7 @@ impl GTFSService {
         Ok(static_fleet_info_by_gtfs)
     }
 
-    async fn read_entity_id_name_csv(&self) -> AppResult<HashMap<String, String>> {
-        let file_path = "./assets/entity_id_name.csv";
 
-        // Check if file exists, if not return empty HashMap
-        let mut file = match File::open(file_path).await {
-            Ok(file) => file,
-            Err(_) => {
-                warn!(
-                    "entity_id_name.csv file not found, proceeding without entity ID name mapping"
-                );
-                return Ok(HashMap::new());
-            }
-        };
-
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
-
-        let mut reader = ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(contents.as_bytes());
-
-        let mut entity_id_name_mapping = HashMap::new();
-
-        for result in reader.deserialize() {
-            match result {
-                Ok(record) => {
-                    let csv_record: EntityIdNameRecord = record;
-                    entity_id_name_mapping.insert(csv_record.entity_id, csv_record.name);
-                }
-                Err(e) => {
-                    error!("Error parsing CSV row: {}", e);
-                }
-            }
-        }
-        Ok(entity_id_name_mapping)
-    }
 
     async fn fetch_pattern_details_batch(
         &self,
@@ -1464,10 +1419,6 @@ impl GTFSService {
         }
     }
 
-    pub async fn get_entity_id_name_mapping(&self) -> HashMap<String, String> {
-        let data = self.data.read().await;
-        data.entity_id_name_mapping.clone()
-    }
 
     pub async fn get_example_trip(
         &self,
