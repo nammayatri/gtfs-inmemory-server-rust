@@ -491,23 +491,12 @@ async fn get_service_type_by_vehicle_impl(
         }
     };
 
-    // Convert entity_id to depot name, fallback to existing depot if no entity_id
-    let depot_no = if let Some(ref entity_id) = vehicle_data.entity_id {
-        // Get entity_id_name mapping from GTFS service
-        let entity_mapping = app_state.gtfs_service.get_entity_id_name_mapping().await;
-        entity_mapping
-            .get(entity_id.to_string().as_str())
-            .cloned()
-            .or(vehicle_data.depot.clone())
-    } else {
-        // Fallback to existing depot name if no entity_id
-        vehicle_data.depot.clone()
-    };
+    let depot_no = vehicle_data.entity_remark.or(vehicle_data.depot);
 
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
-        waybill_id: vehicle_data.waybill_id,
+        waybill_id: vehicle_data.waybill_no,
         schedule_no: vehicle_data.schedule_no,
         last_updated: vehicle_data.last_updated,
         route_id: vehicle_data.route_id,

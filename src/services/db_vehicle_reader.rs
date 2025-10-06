@@ -208,9 +208,10 @@ impl VehicleDataReader for DBVehicleReader {
 
         let waybill_online_query =
             "
-            SELECT w.waybill_id::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, v.entity_id
+            SELECT w.waybill_id::text, w.waybill_no::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, e.entity_remark
             FROM waybills w
             left join vehicles v on v.fleet_no = w.vehicle_no
+            left join entities e on e.entity_id = v.entity_id
             WHERE w.vehicle_no = $1
             and w.status = 'Online'
             LIMIT 1
@@ -376,6 +377,7 @@ impl VehicleDataReader for DBVehicleReader {
 
                 let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                     waybill_id: Some(vehicle_data.waybill_id),
+                    waybill_no: Some(vehicle_data.waybill_no),
                     service_type: Some(vehicle_data.service_type),
                     vehicle_no: vehicle_data.vehicle_no,
                     schedule_no: Some(vehicle_data.schedule_no),
@@ -387,7 +389,7 @@ impl VehicleDataReader for DBVehicleReader {
                     trip_number: None,
                     is_active_trip,
                     remaining_trip_details,
-                    entity_id: vehicle_data.entity_id,
+                    entity_remark: vehicle_data.entity_remark,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -427,6 +429,7 @@ impl VehicleDataReader for DBVehicleReader {
                     if let Some(minimal_vehicle_data) = minimal_vehicle_data {
                         VehicleDataWithRouteId {
                             waybill_id: None,
+                            waybill_no: None,
                             service_type: Some(minimal_vehicle_data.service_type),
                             vehicle_no: minimal_vehicle_data.vehicle_no.to_string(),
                             schedule_no: None,
@@ -438,11 +441,12 @@ impl VehicleDataReader for DBVehicleReader {
                             trip_number: None,
                             is_active_trip: false,
                             remaining_trip_details: None,
-                            entity_id: None,
+                            entity_remark: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
                             waybill_id: None,
+                            waybill_no: None,
                             service_type: None,
                             vehicle_no: vehicle_no.to_string(),
                             schedule_no: None,
@@ -454,7 +458,7 @@ impl VehicleDataReader for DBVehicleReader {
                             trip_number: None,
                             is_active_trip: false,
                             remaining_trip_details: None,
-                            entity_id: None,
+                            entity_remark: None,
                         }
                     };
 
@@ -632,6 +636,7 @@ impl VehicleDataReader for DBVehicleReader {
         for vehicle_data in vehicle_results {
             let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                 waybill_id: Some(vehicle_data.waybill_id),
+                waybill_no: Some(vehicle_data.waybill_no),
                 service_type: Some(vehicle_data.service_type),
                 vehicle_no: vehicle_data.vehicle_no,
                 schedule_no: Some(vehicle_data.schedule_no),
@@ -643,7 +648,7 @@ impl VehicleDataReader for DBVehicleReader {
                 trip_number: None,
                 is_active_trip: false,
                 remaining_trip_details: None,
-                entity_id: None,
+                entity_remark: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {
