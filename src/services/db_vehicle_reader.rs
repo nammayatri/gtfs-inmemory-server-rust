@@ -349,6 +349,7 @@ impl VehicleDataReader for DBVehicleReader {
 
         match result {
             Some(vehicle_data) => {
+                info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
                 let bus_schedule_trip_detail_query: String = if let Some(trip_number) = trip_number
                 {
                     format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
