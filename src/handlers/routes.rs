@@ -491,8 +491,10 @@ async fn get_service_type_by_vehicle_impl(
         }
     };
 
+    info!("Using depot for depot_no: {:?}", vehicle_data.depot);
+    info!("Using entity_remark for depot_no: {:?}", vehicle_data.entity_remark);
     let depot_no = vehicle_data.entity_remark.or(vehicle_data.depot);
-
+ 
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
