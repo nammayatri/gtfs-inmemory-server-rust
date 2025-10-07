@@ -61,6 +61,8 @@ pub struct BusSchedule {
     pub route_number: Option<String>,
     #[sqlx(default)]
     pub stops_count: Option<i32>,
+    #[sqlx(default)]
+    pub is_active_trip: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,7 +10,7 @@ in {
   logger_cfg = logger_cfg,
 
   -- Database configuration
-  database_url = Some "psql://mtc_root_user:C%40uM7a%242025@13.234.6.205:5432/mtc_master_prod",
+  database_url = Some "psql://mtc_root_user:C%40uM7a%242025@13.234.6.205:5432/mtc_master_prod_new",
   db_max_connections = 20,
   db_min_connections = 1,
   db_acquire_timeout = 5,

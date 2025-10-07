@@ -193,6 +193,124 @@ impl DBVehicleReader {
 
         Ok(())
     }
+
+    fn log_trip_rows(&self, source: &str, rows: &[BusSchedule]) {
+        info!(
+            source = source,
+            count = rows.len(),
+            "Trip rows fetched from table"
+        );
+        // Print a small table of up to 10 rows for readability
+        info!(
+            source = source,
+            "{:<16} | {:<16} | {:<6} | {:<5} | {}",
+            "schedule_no",
+            "route_id",
+            "trip#",
+            "active",
+            "org_name"
+        );
+        for r in rows.iter().take(10) {
+            info!(
+                source = source,
+                "{:<16} | {:<16} | {:<6} | {:<5} | {}",
+                r.schedule_number,
+                r.route_id,
+                r.trip_number.unwrap_or_default(),
+                if r.is_active_trip.unwrap_or(false) { "true" } else { "false" },
+                r.org_name.as_deref().unwrap_or("")
+            );
+        }
+        if rows.len() > 10 {
+            info!(source = source, remaining = rows.len() - 10, "... more rows omitted");
+        }
+    }
+
+    async fn fetch_trip_rows_for_schedule(
+        &self,
+        schedule_trip_id: &str,
+        detail_query: &str,
+        flexi_query: &str,
+    ) -> Vec<BusSchedule> {
+        // Fetch from detailed trips first
+        let mut detail_rows = match sqlx::query_as::<_, BusSchedule>(detail_query)
+            .bind(schedule_trip_id)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!(
+                    "fetch_trip_rows_for_schedule: detail query failed. query={} error={}",
+                    detail_query, e
+                );
+                Vec::new()
+            }
+        };
+        self.log_trip_rows("bus_schedule_trip_detail", &detail_rows);
+
+        // Only fetch from flexi trips if no active trip is present in detail rows
+        let detail_has_active = detail_rows
+            .iter()
+            .any(|row| row.is_active_trip.unwrap_or(false));
+
+        let mut flexi_rows: Vec<BusSchedule> = Vec::new();
+        if !detail_has_active {
+            flexi_rows = match sqlx::query_as::<_, BusSchedule>(flexi_query)
+                .bind(schedule_trip_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    error!(
+                        "fetch_trip_rows_for_schedule: flexi query failed. query={} error={}",
+                        flexi_query, e
+                    );
+                    Vec::new()
+                }
+            };
+            self.log_trip_rows("bus_schedule_trip_flexi", &flexi_rows);
+        } else {
+            info!(
+                schedule_trip_id = schedule_trip_id,
+                "Skipping flexi fetch: active trip found in detail table"
+            );
+        }
+
+        // Combine (flexi_rows may be empty if skipped)
+        detail_rows.append(&mut flexi_rows);
+
+        // Stable partition to bring active trip to front if present
+        if let Some(idx) = detail_rows
+            .iter()
+            .position(|row| row.is_active_trip.unwrap_or(false))
+        {
+            if idx != 0 {
+                detail_rows.swap(0, idx);
+            }
+        }
+
+        // Sort by trip_number if available, but keep index 0 if it is active trip
+        let has_active_front = detail_rows.get(0).map(|r| r.is_active_trip.unwrap_or(false)).unwrap_or(false);
+        detail_rows.sort_by(|a, b| {
+            let at = a.trip_number.unwrap_or(i32::MAX);
+            let bt = b.trip_number.unwrap_or(i32::MAX);
+            at.cmp(&bt)
+        });
+        if has_active_front {
+            if let Some(pos) = detail_rows
+                .iter()
+                .position(|row| row.is_active_trip.unwrap_or(false))
+            {
+                if pos != 0 {
+                    detail_rows.swap(0, pos);
+                }
+            }
+        }
+
+        detail_rows
+    }
 }
 
 #[async_trait]
@@ -240,116 +358,48 @@ impl VehicleDataReader for DBVehicleReader {
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
                     format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
                 } else {
-                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
+                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1 AND is_active_trip = TRUE ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1 AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') ORDER BY f.trip_number ASC".to_string()
                 };
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
                 let (schedule_result, is_active_trip, remaining_trip_details) =
                     if let Some(schedule_trip_id) = &vehicle_data.schedule_trip_id {
-                        error!("schedule_trip_id: {}", bus_schedule_trip_detail_query);
-                        // First try: bus_schedule_trip_detail_query (fetch all rows)
-                        match sqlx::query_as::<_, BusSchedule>(&bus_schedule_trip_detail_query)
-                            .bind(schedule_trip_id)
-                            .fetch_all(&self.pool)
-                            .await
-                        {
-                            Ok(mut rows) if !rows.is_empty() => {
+                        // Always fetch from BOTH detail and flexi tables
+                        let mut rows = self
+                            .fetch_trip_rows_for_schedule(
+                                schedule_trip_id,
+                                &bus_schedule_trip_detail_query,
+                                &bus_schedule_trip_flexi_query,
+                            )
+                            .await;
+                        if !rows.is_empty() {
+                            self.enrich_route_numbers(&mut rows).await?;
+                            let first = rows.remove(0);
+                            let remaining = if rows.is_empty() { None } else { Some(rows) };
+                            (Some(first), true, remaining)
+                        } else {
+                            // Fallback to bus_schedule
+                            let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
+                                .bind(vehicle_data.schedule_no.clone())
+                                .fetch_all(&self.pool)
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!(
+                                        "Query failed (bus_schedule): {} | {}",
+                                        bus_schedule_query, e
+                                    );
+                                    Vec::new()
+                                }
+                            };
+                            if !rows.is_empty() {
                                 self.enrich_route_numbers(&mut rows).await?;
                                 let first = rows.remove(0);
                                 let remaining = if rows.is_empty() { None } else { Some(rows) };
-                                (Some(first), true, remaining)
-                            }
-                            Ok(_) => {
-                                // Second try: bus_schedule_trip_flexi_query
-                                match sqlx::query_as::<_, BusSchedule>(
-                                    &bus_schedule_trip_flexi_query,
-                                )
-                                .bind(schedule_trip_id)
-                                .fetch_all(&self.pool)
-                                .await
-                                {
-                                    Ok(mut rows) if !rows.is_empty() => {
-                                        self.enrich_route_numbers(&mut rows).await?;
-                                        let first = rows.remove(0);
-                                        let remaining =
-                                            if rows.is_empty() { None } else { Some(rows) };
-                                        (Some(first), true, remaining)
-                                    }
-                                    Ok(_) | Err(_) => {
-                                        // Third try: bus_schedule_query
-                                        let mut rows = match sqlx::query_as::<_, BusSchedule>(
-                                            &bus_schedule_query,
-                                        )
-                                        .bind(vehicle_data.schedule_no.clone())
-                                        .fetch_all(&self.pool)
-                                        .await
-                                        {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                error!(
-                                                    "Query failed (bus_schedule): {} | {}",
-                                                    bus_schedule_query, e
-                                                );
-                                                Vec::new()
-                                            }
-                                        };
-                                        if !rows.is_empty() {
-                                            self.enrich_route_numbers(&mut rows).await?;
-                                            let first = rows.remove(0);
-                                            let remaining =
-                                                if rows.is_empty() { None } else { Some(rows) };
-                                            (Some(first), false, remaining)
-                                        } else {
-                                            (None, false, None)
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // If first query fails, try second query
-                                match sqlx::query_as::<_, BusSchedule>(
-                                    &bus_schedule_trip_flexi_query,
-                                )
-                                .bind(schedule_trip_id)
-                                .fetch_all(&self.pool)
-                                .await
-                                {
-                                    Ok(mut rows) if !rows.is_empty() => {
-                                        self.enrich_route_numbers(&mut rows).await?;
-                                        let first = rows.remove(0);
-                                        let remaining =
-                                            if rows.is_empty() { None } else { Some(rows) };
-                                        (Some(first), true, remaining)
-                                    }
-                                    Ok(_) | Err(_) => {
-                                        // Third try: bus_schedule_query
-                                        let mut rows = match sqlx::query_as::<_, BusSchedule>(
-                                            &bus_schedule_query,
-                                        )
-                                        .bind(vehicle_data.schedule_no.clone())
-                                        .fetch_all(&self.pool)
-                                        .await
-                                        {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                error!(
-                                                    "Query failed (bus_schedule): {} | {}",
-                                                    bus_schedule_query, e
-                                                );
-                                                Vec::new()
-                                            }
-                                        };
-                                        if !rows.is_empty() {
-                                            self.enrich_route_numbers(&mut rows).await?;
-                                            let first = rows.remove(0);
-                                            let remaining =
-                                                if rows.is_empty() { None } else { Some(rows) };
-                                            (Some(first), false, remaining)
-                                        } else {
-                                            (None, false, None)
-                                        }
-                                    }
-                                }
+                                (Some(first), false, remaining)
+                            } else {
+                                (None, false, None)
                             }
                         }
                     } else {
