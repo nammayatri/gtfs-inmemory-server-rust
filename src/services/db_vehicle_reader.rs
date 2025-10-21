@@ -229,6 +229,7 @@ impl DBVehicleReader {
     async fn fetch_trip_rows_for_schedule(
         &self,
         schedule_trip_id: &str,
+        vehicle_no: &str,
         detail_query: &str,
         flexi_query: &str,
     ) -> Vec<BusSchedule> {
@@ -257,7 +258,7 @@ impl DBVehicleReader {
         let mut flexi_rows: Vec<BusSchedule> = Vec::new();
         if !detail_has_active {
             flexi_rows = match sqlx::query_as::<_, BusSchedule>(flexi_query)
-                .bind(schedule_trip_id)
+                .bind(vehicle_no)
                 .fetch_all(&self.pool)
                 .await
             {
@@ -278,8 +279,23 @@ impl DBVehicleReader {
             );
         }
 
-        // Combine (flexi_rows may be empty if skipped)
-        detail_rows.append(&mut flexi_rows);
+        // Check if flexi has active trips
+        let flexi_has_active = flexi_rows
+            .iter()
+            .any(|row| row.is_active_trip.unwrap_or(false));
+
+        // If flexi has active trips, prioritize flexi results and ditch detail results
+        if flexi_has_active {
+            info!(
+                schedule_trip_id = schedule_trip_id,
+                "Flexi table has active trips, prioritizing flexi results over detail results"
+            );
+            // Use only flexi results when flexi has active trips
+            detail_rows = flexi_rows;
+        } else {
+            // Combine (flexi_rows may be empty if skipped)
+            detail_rows.append(&mut flexi_rows);
+        }
 
         // Stable partition to bring active trip to front if present
         if let Some(idx) = detail_rows
@@ -332,8 +348,10 @@ impl VehicleDataReader for DBVehicleReader {
             left join entities e on e.entity_id = v.entity_id
             WHERE w.vehicle_no = $1
             and w.status = 'Online'
+            and w.duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text
             LIMIT 1
         ";
+        info!("waybill_online_query: {}", waybill_online_query);
 
         let result = match sqlx::query_as::<_, VehicleData>(waybill_online_query)
             .bind(vehicle_no)
@@ -357,9 +375,9 @@ impl VehicleDataReader for DBVehicleReader {
                     "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
                 };
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
+                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number, f.is_active_trip from bus_schedule_trip_flexi f join waybills w on f.waybill_id = w.waybill_id where w.vehicle_no = $1 and f.trip_number >= {} and w.duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text order by f.trip_number asc", trip_number)
                 } else {
-                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1::bigint AND is_active_trip = TRUE ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1::bigint AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') ORDER BY f.trip_number ASC".to_string()
+                    "SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number, f.is_active_trip FROM bus_schedule_trip_flexi f JOIN waybills w ON f.waybill_id = w.waybill_id WHERE w.vehicle_no = $1 AND w.duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text ORDER BY f.trip_number ASC".to_string()
                 };
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
@@ -369,6 +387,7 @@ impl VehicleDataReader for DBVehicleReader {
                         let mut rows = self
                             .fetch_trip_rows_for_schedule(
                                 schedule_trip_id,
+                                &vehicle_data.vehicle_no,
                                 &bus_schedule_trip_detail_query,
                                 &bus_schedule_trip_flexi_query,
                             )
@@ -377,7 +396,9 @@ impl VehicleDataReader for DBVehicleReader {
                             self.enrich_route_numbers(&mut rows).await?;
                             let first = rows.remove(0);
                             let remaining = if rows.is_empty() { None } else { Some(rows) };
-                            (Some(first), true, remaining)
+                            // Check if the first row is actually active (from flexi or detail)
+                            let is_active = first.is_active_trip.unwrap_or(false);
+                            (Some(first), is_active, remaining)
                         } else {
                             // Fallback to bus_schedule
                             let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
@@ -455,7 +476,8 @@ impl VehicleDataReader for DBVehicleReader {
                 let waybill_status_agnostic_query = "
                     SELECT w.vehicle_no, w.service_type
                     FROM waybills w
-                    WHERE w.vehicle_no = $1            
+                    WHERE w.vehicle_no = $1
+                    and w.duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text
                     ORDER BY w.updated_at DESC
                     LIMIT 1
                 ";
@@ -523,6 +545,7 @@ impl VehicleDataReader for DBVehicleReader {
             SELECT DISTINCT ON (vehicle_no)
               waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
+            WHERE duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text
             ORDER BY vehicle_no, updated_at DESC
         ";
 
@@ -547,6 +570,7 @@ impl VehicleDataReader for DBVehicleReader {
               waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE service_type = $1
+            AND duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text
             ORDER BY vehicle_no, updated_at DESC
         ";
 
@@ -569,7 +593,8 @@ impl VehicleDataReader for DBVehicleReader {
             SELECT DISTINCT ON (vehicle_no)
               waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
-            WHERE vehicle_no ILIKE $1 OR waybill_id::text ILIKE $1 OR schedule_no ILIKE $1
+            WHERE (vehicle_no ILIKE $1 OR waybill_id::text ILIKE $1 OR schedule_no ILIKE $1)
+            AND duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text
             ORDER BY vehicle_no, updated_at DESC
         ";
 
@@ -621,6 +646,7 @@ impl VehicleDataReader for DBVehicleReader {
             "SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
              FROM waybills
              WHERE vehicle_no IN ({})
+             AND duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text
              ORDER BY updated_at DESC",
             placeholders_str
         );
@@ -719,7 +745,7 @@ impl VehicleDataReader for DBVehicleReader {
 
     async fn get_vehicle_count(&self) -> AppResult<i64> {
         match sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills",
+            "SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills WHERE duty_date = (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata')::date::text",
         )
         .fetch_one(&self.pool)
         .await
