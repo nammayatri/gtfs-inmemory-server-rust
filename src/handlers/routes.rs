@@ -113,6 +113,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/vehicle/{gtfs_id}/service-type/{vehicle_no}",
                 actix_web::web::get().to(get_service_type_by_vehicle_by_gtfs_id),
             )
+            .route(
+                "/vehicle/{gtfs_id}/{vehicle_no}/info",
+                actix_web::web::get().to(get_vehicle_info),
+            )
             .route("/memory-stats", actix_web::web::get().to(get_memory_stats))
             .route(
                 "/cached-data",
@@ -508,6 +512,45 @@ async fn get_service_type_by_vehicle_impl(
         depot_no,
         remaining_trip_details: vehicle_data.remaining_trip_details,
     }))
+}
+
+#[derive(serde::Serialize)]
+struct VehicleInfoResponse {
+    #[serde(rename = "driverCode")]
+    driver_code: Option<String>,
+    #[serde(rename = "conductorCode")]
+    conductor_code: Option<String>,
+    #[serde(rename = "waybillNo")]
+    waybill_no: Option<String>,
+    #[serde(rename = "depotName")]
+    depot_name: Option<String>,
+    #[serde(rename = "scheduleNo")]
+    schedule_no: Option<String>,
+}
+
+async fn get_vehicle_info(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (_gtfs_id, vehicle_no) = path.into_inner();
+    let vehicle_no = vehicle_no.replace("\"", "");
+
+    let vehicle_data = app_state
+        .db_vehicle_reader
+        .get_vehicle_data(&vehicle_no, None)
+        .await?;
+
+    let depot_name = vehicle_data.entity_remark.or(vehicle_data.depot);
+
+    let resp = VehicleInfoResponse {
+        driver_code: vehicle_data.driver_code,
+        conductor_code: vehicle_data.conductor_code,
+        waybill_no: vehicle_data.waybill_no,
+        depot_name,
+        schedule_no: vehicle_data.schedule_no,
+    };
+
+    Ok(HttpResponse::Ok().json(resp))
 }
 
 async fn get_memory_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {

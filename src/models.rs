@@ -23,6 +23,8 @@ pub struct VehicleData {
     pub duty_date: Option<String>,
     pub schedule_trip_id: Option<String>,
     pub entity_remark: Option<String>,
+    pub driver_code: Option<String>,
+    pub conductor_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -47,6 +49,8 @@ pub struct VehicleDataWithRouteId {
     pub is_active_trip: bool,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
     pub entity_remark: Option<String>,
+    pub driver_code: Option<String>,
+    pub conductor_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

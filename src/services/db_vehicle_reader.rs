@@ -326,7 +326,7 @@ impl VehicleDataReader for DBVehicleReader {
 
         let waybill_online_query =
             "
-            SELECT w.waybill_id::text, w.waybill_no::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, e.entity_remark::text as entity_remark
+            SELECT w.waybill_id::text, w.waybill_no::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, e.entity_remark::text as entity_remark, w.driver_token_no::text as driver_code, w.conductor_token_no::text as conductor_code
             FROM waybills w
             left join vehicles v on v.fleet_no = w.vehicle_no
             left join entities e on e.entity_id = v.entity_id
@@ -441,6 +441,8 @@ impl VehicleDataReader for DBVehicleReader {
                     is_active_trip,
                     remaining_trip_details,
                     entity_remark: vehicle_data.entity_remark,
+                    driver_code: vehicle_data.driver_code,
+                    conductor_code: vehicle_data.conductor_code,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -493,6 +495,8 @@ impl VehicleDataReader for DBVehicleReader {
                             is_active_trip: false,
                             remaining_trip_details: None,
                             entity_remark: None,
+                            driver_code: None,
+                            conductor_code: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -510,6 +514,8 @@ impl VehicleDataReader for DBVehicleReader {
                             is_active_trip: false,
                             remaining_trip_details: None,
                             entity_remark: None,
+                            driver_code: None,
+                            conductor_code: None,
                         }
                     };
 
@@ -521,7 +527,7 @@ impl VehicleDataReader for DBVehicleReader {
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
             FROM waybills
             ORDER BY vehicle_no, updated_at DESC
         ";
@@ -544,7 +550,7 @@ impl VehicleDataReader for DBVehicleReader {
     ) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
             FROM waybills
             WHERE service_type = $1
             ORDER BY vehicle_no, updated_at DESC
@@ -567,7 +573,7 @@ impl VehicleDataReader for DBVehicleReader {
         let search_pattern = format!("%{}%", query);
         let query_sql = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
             FROM waybills
             WHERE vehicle_no ILIKE $1 OR waybill_id::text ILIKE $1 OR schedule_no ILIKE $1
             ORDER BY vehicle_no, updated_at DESC
@@ -618,7 +624,7 @@ impl VehicleDataReader for DBVehicleReader {
         let placeholders_str = placeholders.join(",");
 
         let query = format!(
-            "SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
+            "SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
              FROM waybills
              WHERE vehicle_no IN ({})
              ORDER BY updated_at DESC",
@@ -700,6 +706,8 @@ impl VehicleDataReader for DBVehicleReader {
                 is_active_trip: false,
                 remaining_trip_details: None,
                 entity_remark: None,
+                driver_code: vehicle_data.driver_code,
+                conductor_code: vehicle_data.conductor_code,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {
