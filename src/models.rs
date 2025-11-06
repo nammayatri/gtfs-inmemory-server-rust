@@ -356,6 +356,14 @@ pub struct StaticFleetInfo {
     pub service_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MinimalEmployee {
+    pub token_no: Option<String>,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub mobile_no: Option<String>,
+    pub depot_name: Option<String>,
+}
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {

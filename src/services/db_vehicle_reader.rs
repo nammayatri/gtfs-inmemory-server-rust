@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -99,28 +99,12 @@ pub struct DBVehicleReader {
 }
 
 impl DBVehicleReader {
-    pub async fn new(config: &AppConfig) -> AppResult<Self> {
-        let db_url = config
-            .database_url
-            .as_ref()
-            .ok_or_else(|| AppError::Internal("DATABASE_URL is not set".to_string()))?;
-        let pool = PgPoolOptions::new()
-            .max_connections(config.db_max_connections)
-            .min_connections(config.db_min_connections)
-            .acquire_timeout(Duration::from_secs(config.db_acquire_timeout))
-            .idle_timeout(Duration::from_secs(config.db_idle_timeout))
-            .max_lifetime(Duration::from_secs(config.db_max_lifetime))
-            .connect(db_url)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
-
-        info!("Database connection pool created successfully.");
-
-        Ok(Self {
+    pub fn new(pool: PgPool, config: &AppConfig) -> Self {
+        Self {
             pool,
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_duration: Duration::from_secs(config.cache_duration),
-        })
+        }
     }
 
     async fn get_cached_vehicle_data(&self, vehicle_no: &str) -> Option<VehicleDataWithRouteId> {
