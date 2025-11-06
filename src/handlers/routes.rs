@@ -172,6 +172,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/example-trip-map",
                 actix_web::web::get().to(get_example_trip_map),
+            )
+            .route(
+                "/getConductor/byNumber/{phoneNumber}",
+                actix_web::web::get().to(get_conductor_by_phone_number),
             ),
     );
 }
@@ -216,6 +220,24 @@ async fn get_routes_by_ids(
         .get_routes_by_ids(&gtfs_id, route_ids)
         .await?;
     Ok(HttpResponse::Ok().json(routes))
+}
+
+async fn get_conductor_by_phone_number(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let phone_number = path.into_inner();
+    let employee_data = app_state
+        .db_employee_reader
+        .get_employee_by_phone(&phone_number)
+        .await?;
+    match employee_data {
+        Some(emp) => Ok(HttpResponse::Ok().json(emp)),
+        None => {
+            Ok(HttpResponse::NotFound()
+                .body(format!("No employee found for phone: {}", phone_number)))
+        }
+    }
 }
 
 async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
@@ -496,9 +518,12 @@ async fn get_service_type_by_vehicle_impl(
     };
 
     info!("Using depot for depot_no: {:?}", vehicle_data.depot);
-    info!("Using entity_remark for depot_no: {:?}", vehicle_data.entity_remark);
+    info!(
+        "Using entity_remark for depot_no: {:?}",
+        vehicle_data.entity_remark
+    );
     let depot_no = vehicle_data.entity_remark.or(vehicle_data.depot);
- 
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,

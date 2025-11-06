@@ -1,13 +1,17 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::services::{
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
+    db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     gtfs_service::GTFSService,
     trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
+use crate::tools::error::AppError;
 use shared::tools::logger::LoggerConfig;
 use tracing::{error, info};
 
@@ -81,10 +85,31 @@ pub fn read_dhall_config(dhall_config_path: &str) -> Result<AppConfig> {
         .map_err(|e| anyhow::anyhow!("Failed to read Dhall config: {}", e))
 }
 
+async fn create_database_pool(config: &AppConfig) -> Result<PgPool, AppError> {
+    let db_url = config
+        .database_url
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("DATABASE_URL is not set".to_string()))?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(config.db_max_connections)
+        .min_connections(config.db_min_connections)
+        .acquire_timeout(Duration::from_secs(config.db_acquire_timeout))
+        .idle_timeout(Duration::from_secs(config.db_idle_timeout))
+        .max_lifetime(Duration::from_secs(config.db_max_lifetime))
+        .connect(db_url)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
+
+    info!("Database connection pool created successfully.");
+    Ok(pool)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
+    pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub trip_service: Arc<TripService>,
     pub config: AppConfig,
 }
@@ -94,38 +119,44 @@ impl AppState {
         // Initialize services
         let gtfs_service = Arc::new(GTFSService::new(app_config.clone()).await?);
 
-        let db_vehicle_reader: Arc<dyn VehicleDataReader> = if let Some(db_url) =
-            &app_config.database_url
-        {
-            if db_url.contains("localhost") {
-                // For local development, fall back to mock reader on connection failure
-                match DBVehicleReader::new(&app_config).await {
-                    Ok(reader) => {
-                        info!("Successfully connected to the local database.");
-                        Arc::new(reader)
+        // Create shared database pool or use mock readers
+        let (db_vehicle_reader, db_employee_reader): (Arc<dyn VehicleDataReader>, Arc<dyn EmployeeReader>) = 
+            if let Some(db_url) = &app_config.database_url {
+                if db_url.contains("localhost") {
+                    // For local development, fall back to mock readers on connection failure
+                    match create_database_pool(&app_config).await {
+                        Ok(pool) => {
+                            info!("Successfully connected to the local database.");
+                            let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
+                            let employee_reader = Arc::new(DBEmployeeReader::new(pool, &app_config));
+                            (vehicle_reader, employee_reader)
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to the local database: {}. Falling back to mock DB readers.", e);
+                            (Arc::new(MockDBVehicleReader::new()), Arc::new(MockEmployeeReader::new()))
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to connect to the local database: {}. Falling back to mock DB reader.", e);
-                        Arc::new(MockDBVehicleReader::new())
-                    }
+                } else {
+                    // For non-local (production) environments, require a valid DB connection
+                    info!("Connecting to production database...");
+                    let pool = create_database_pool(&app_config).await
+                        .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
+                    let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
+                    let employee_reader = Arc::new(DBEmployeeReader::new(pool, &app_config));
+                    (vehicle_reader, employee_reader)
                 }
             } else {
-                // For non-local (production) environments, require a valid DB connection
-                info!("Connecting to production database...");
-                let reader = DBVehicleReader::new(&app_config).await?;
-                Arc::new(reader)
-            }
-        } else {
-            // If no DATABASE_URL is provided, use the mock reader
-            info!("No DATABASE_URL found, using mock DB reader");
-            Arc::new(MockDBVehicleReader::new())
-        };
+                // If no DATABASE_URL is provided, use the mock readers
+                info!("No DATABASE_URL found, using mock DB readers");
+                (Arc::new(MockDBVehicleReader::new()), Arc::new(MockEmployeeReader::new()))
+            };
 
         let trip_service = Arc::new(TripService::new(gtfs_service.clone()));
 
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
+            db_employee_reader,
             trip_service,
             config: app_config,
         };
