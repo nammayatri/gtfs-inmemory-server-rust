@@ -328,8 +328,7 @@ impl VehicleDataReader for DBVehicleReader {
             "
             SELECT w.waybill_id::text, w.waybill_no::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, e.entity_remark::text as entity_remark, w.driver_token_no::text as driver_code, w.conductor_token_no::text as conductor_code
             FROM waybills w
-            left join vehicles v on v.fleet_no = w.vehicle_no
-            left join entities e on e.entity_id = v.entity_id
+            left join entities e on e.entity_id = w.entity_id
             WHERE w.vehicle_no = $1
             and w.status = 'Online'
             LIMIT 1
