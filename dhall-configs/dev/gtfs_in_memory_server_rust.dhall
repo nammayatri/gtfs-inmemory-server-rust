@@ -10,7 +10,7 @@ in {
   logger_cfg = logger_cfg,
 
   -- Database configuration
-  database_url = Some "psql://mtc_root_user:C%40uM7a%242025@13.234.6.205:5432/mtc_master_prod_new",
+  database_url = None Text
   db_max_connections = 20,
   db_min_connections = 1,
   db_acquire_timeout = 5,
@@ -18,13 +18,16 @@ in {
   db_max_lifetime = 3600,
 
   -- Cache configuration
-  cache_duration = 300,
+  cache_duration = 3600,
+
+  -- Trip filtering configuration
+  ignored_trip_ids = ["t203"] : List Text,
 
   -- API configuration
   port = 8000,
 
   -- GTFS configuration
-  polling_enabled = True,
+  polling_enabled = False,
   polling_interval = 10,
   process_batch_size = 100,
   gc_interval = 300,

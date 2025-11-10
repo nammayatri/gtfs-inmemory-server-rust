@@ -22,15 +22,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Create application state
     let port = app_config.port;
+    let polling_enabled = app_config.polling_enabled;
     let app_state = environment::AppState::new(app_config).await?;
 
-    // Start background polling task
-    let gtfs_service_clone = app_state.gtfs_service.clone();
-    tokio::spawn(async move {
-        if let Err(e) = gtfs_service_clone.start_polling().await {
-            error!("Polling task failed: {}", e);
-        }
-    });
+    // Start background polling task if enabled
+    if polling_enabled {
+        let gtfs_service_clone = app_state.gtfs_service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = gtfs_service_clone.start_polling().await {
+                error!("Polling task failed: {}", e);
+            }
+        });
+    }
 
     let prometheus = prometheus_metrics();
 

@@ -17,6 +17,68 @@ A high-performance GTFS (General Transit Feed Specification) in memory service w
 
 - Rust 1.70+ (install via [rustup](https://rustup.rs/))
 - GTFS data source (OTP server or similar)
+- Python 3.6+ (for pre-commit hooks)
+
+## Development Setup
+
+### Pre-commit Hooks Setup
+
+This project uses pre-commit hooks for code quality. To set them up:
+
+**Quick Setup (Recommended):**
+```bash
+./setup-dev.sh
+```
+
+**Manual Setup:**
+1. **Install pre-commit** (if not already installed):
+   ```bash
+   # Using pip
+   pip install pre-commit
+
+   # Or using brew (macOS)
+   brew install pre-commit
+
+   # Or using conda
+   conda install -c conda-forge pre-commit
+   ```
+
+2. **Install the hooks**:
+   ```bash
+   pre-commit install
+   ```
+
+3. **Verify installation**:
+   ```bash
+   pre-commit run --all-files
+   ```
+
+The hooks will now run automatically on every commit and include:
+- Code formatting (rustfmt)
+- Compilation checks (cargo check)
+- Secret detection (gitleaks)
+- File quality checks (trailing whitespace, etc.)
+
+**⚠️ IMPORTANT: Code quality checks are MANDATORY for this project!**
+- All commits must pass pre-commit checks
+- GitHub Actions will reject commits that don't meet quality standards
+- The CI pipeline runs on every push and pull request
+- Run `pre-commit run --all-files` before pushing to verify your code
+
+### GitHub Actions CI/CD
+
+This project uses GitHub Actions for continuous integration. The workflow includes:
+
+- **Pre-commit hooks validation** - Ensures all code quality checks pass
+- **Rust formatting check** - Verifies code is properly formatted
+- **Clippy linting** - Catches common Rust issues and enforces best practices
+- **Test execution** - Runs all tests to ensure functionality
+
+The CI pipeline runs automatically on:
+- Every push to `main` or `develop` branches
+- Every pull request targeting `main` or `develop` branches
+
+**Failed checks will block merging** until issues are resolved.
 
 ## Installation
 

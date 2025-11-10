@@ -136,7 +136,6 @@ impl GTFSService {
             suburban_stop_info_by_gtfs.len()
         );
 
-
         // Read static fleet info CSV file (optional)
         let static_fleet_info_by_gtfs = self.read_static_fleet_info_csv().await?;
         if !static_fleet_info_by_gtfs.is_empty() {
@@ -447,8 +446,6 @@ impl GTFSService {
         }
         Ok(static_fleet_info_by_gtfs)
     }
-
-
 
     async fn fetch_pattern_details_batch(
         &self,
@@ -1419,7 +1416,6 @@ impl GTFSService {
         }
     }
 
-
     pub async fn get_example_trip(
         &self,
         gtfs_id: &str,
@@ -1440,6 +1436,15 @@ impl GTFSService {
             .and_then(|m| m.get(clean_identifier(route_code).as_str()))
             .cloned()
             .ok_or_else(|| AppError::NotFound("Example trip not found".to_string()))?;
+
+        // Check if trip is in ignored list
+        if self.config.ignored_trip_ids.contains(&trip_feed) {
+            warn!("Trip {} is in ignored list, returning not found", trip_feed);
+            return Err(AppError::NotFound(format!(
+                "Example trip not found for route {}",
+                route_code
+            )));
+        }
 
         drop(data);
 
@@ -1703,6 +1708,17 @@ impl GTFSService {
                         );
                         continue;
                     }
+
+                    // Skip trips that are in the ignored list
+                    if self.config.ignored_trip_ids.contains(&clean_trip_code) {
+                        debug!(
+                            feed = %feed_id,
+                            trip_code = %clean_trip_code,
+                            "Trip is in ignored list, skipping"
+                        );
+                        continue;
+                    }
+
                     mapping
                         .entry(feed_id.to_string())
                         .or_default()
