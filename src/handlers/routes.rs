@@ -477,11 +477,75 @@ async fn get_service_type_by_vehicle_impl(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let vehicle_no = path;
+    let gtfs_id = gtfs_id.unwrap_or("chennai_bus"); // todo: remove this once API is migrated
+
+    // Check if this is bhubaneshwar_bus and use cache instead of DB
+    if gtfs_id == "bhubaneshwar_bus" {
+        if let Some(cached_data) = app_state
+            .bhubaneswar_vehicle_cache
+            .get_vehicle_data(vehicle_no)
+            .await
+        {
+            // Populate stops_count for route if route_id is available
+            let mut remaining_trip_details = None;
+            if let Some(ref route_id) = cached_data.route_id {
+                let stops_len: i32 = match app_state
+                    .gtfs_service
+                    .get_route_stop_mapping_by_route(gtfs_id, route_id)
+                    .await
+                {
+                    Ok(mappings) => mappings.len() as i32,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to fetch route stop mapping for gtfs_id={} route_code={}: {}",
+                            gtfs_id,
+                            route_id,
+                            e
+                        );
+                        0
+                    }
+                };
+
+                // Create a BusSchedule entry for the route
+                remaining_trip_details = Some(vec![crate::models::BusSchedule {
+                    schedule_number: cached_data.schedule_no.clone().unwrap_or_default(),
+                    route_id: route_id.clone(),
+                    route_name: None,
+                    org_name: None,
+                    trip_number: cached_data.trip_number,
+                    route_number: cached_data.route_number.clone(),
+                    stops_count: Some(stops_len),
+                    is_active_trip: Some(cached_data.is_active_trip),
+                }]);
+            }
+
+            return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
+                vehicle_no: cached_data.vehicle_no,
+                service_type: cached_data.service_type,
+                waybill_id: cached_data.waybill_no,
+                schedule_no: cached_data.schedule_no,
+                last_updated: cached_data.last_updated,
+                route_id: cached_data.route_id,
+                route_number: cached_data.route_number,
+                is_active_trip: cached_data.is_active_trip,
+                trip_number: cached_data.trip_number,
+                depot_no: cached_data.depot,
+                remaining_trip_details,
+            }));
+        } else {
+            // Vehicle not found in cache, return not found
+            return Err(crate::tools::error::AppError::NotFound(format!(
+                "Vehicle {} not found in cache",
+                vehicle_no
+            )));
+        }
+    }
+
+    // For other gtfs_id, use the existing DB logic
     let mut vehicle_data = app_state
         .db_vehicle_reader
         .get_vehicle_data(vehicle_no, params.trip_number)
         .await?;
-    let gtfs_id = gtfs_id.unwrap_or("chennai_bus"); // todo: remove this once API is migrated
 
     // Populate stops_count for each route in remaining_trip_details using its own route_number
     if let Some(ref mut details) = vehicle_data.remaining_trip_details {

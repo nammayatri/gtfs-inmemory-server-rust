@@ -35,6 +35,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Start background task to update Bhubaneswar vehicle cache every 10 seconds
+    let bhubaneswar_cache_clone = app_state.bhubaneswar_vehicle_cache.clone();
+    tokio::spawn(async move {
+        bhubaneswar_cache_clone.start_background_update_task().await;
+    });
+
     let prometheus = prometheus_metrics();
 
     // Create and run the web server with performance optimizations

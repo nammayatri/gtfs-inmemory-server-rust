@@ -50,5 +50,8 @@ in {
     ],
     gtfs_id_based_instances = [] : List { identifier : Text, url : Text },
     default_instance = { url = "https://api.sandbox.moving.tech/nandi", identifier = "default" }
-  }
+  },
+
+  -- Bhubaneswar vehicle cache configuration
+  bhubaneswar_cache_update_interval = 10,
 }
