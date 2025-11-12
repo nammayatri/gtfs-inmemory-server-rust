@@ -10,7 +10,7 @@ in {
   logger_cfg = logger_cfg,
 
   -- Database configuration
-  database_url = None Text
+  database_url = None Text,
   db_max_connections = 20,
   db_min_connections = 1,
   db_acquire_timeout = 5,
@@ -53,5 +53,5 @@ in {
   },
 
   -- Bhubaneswar vehicle cache configuration
-  bhubaneswar_cache_update_interval = 10,
+  bhubaneswar_cache_update_interval = 10
 }

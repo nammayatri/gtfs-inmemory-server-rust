@@ -173,7 +173,6 @@ impl AppState {
         )?;
         bhubaneswar_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
         let bhubaneswar_vehicle_cache = Arc::new(bhubaneswar_vehicle_cache);
-        bhubaneswar_vehicle_cache.initialize().await?;
 
         let app_state = AppState {
             gtfs_service,
