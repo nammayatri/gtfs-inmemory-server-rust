@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::{
+    bhubaneswar_vehicle_cache::BhubaneswarVehicleCache,
     db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
     gtfs_service::GTFSService,
@@ -54,6 +55,8 @@ pub struct AppConfig {
     pub dns_ttl: u64,
     pub memory_threshold: u64,
     pub ignored_trip_ids: Vec<String>,
+    pub bhubaneswar_cache_update_interval: u64,
+    pub bhubaneswar_external_auth: Option<String>,
 }
 
 impl OtpConfig {
@@ -112,6 +115,7 @@ pub struct AppState {
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
     pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub trip_service: Arc<TripService>,
+    pub bhubaneswar_vehicle_cache: Arc<BhubaneswarVehicleCache>,
     pub config: AppConfig,
 }
 
@@ -164,11 +168,19 @@ impl AppState {
 
         let trip_service = Arc::new(TripService::new(gtfs_service.clone()));
 
+        let mut bhubaneswar_vehicle_cache = BhubaneswarVehicleCache::new(
+            app_config.bhubaneswar_external_auth.clone(),
+        )?;
+        bhubaneswar_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
+        let bhubaneswar_vehicle_cache = Arc::new(bhubaneswar_vehicle_cache);
+        bhubaneswar_vehicle_cache.initialize().await?;
+
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
             db_employee_reader,
             trip_service,
+            bhubaneswar_vehicle_cache,
             config: app_config,
         };
 
