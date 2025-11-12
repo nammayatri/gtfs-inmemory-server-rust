@@ -13,6 +13,8 @@ use crate::models::{
     GTFSStop, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
     VehicleServiceTypeResponse,
 };
+// alias for query param map (string->string)
+type MapStringString = std::collections::HashMap<String, String>;
 use crate::{
     models::LatLong,
     tools::error::{AppError, AppResult},
@@ -65,6 +67,7 @@ pub struct GetAllVehiclesByIdsRequest {
     #[serde(rename = "vehicleIds")]
     pub vehicle_ids: Vec<String>,
 }
+
 
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
@@ -176,6 +179,18 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getConductor/byNumber/{phoneNumber}",
                 actix_web::web::get().to(get_conductor_by_phone_number),
+            )
+            .route(
+                "/getVehiclesFrom",
+                actix_web::web::get().to(get_vehicles_by_depot_query),
+            )
+            .route(
+                "/depotNames",
+                actix_web::web::get().to(get_depot_names)
+            )
+            .route(
+                "/depotIds",
+                actix_web::web::get().to(get_depot_ids)
             ),
     );
 }
@@ -244,6 +259,64 @@ async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<
     let gtfs_id = path.into_inner();
     let routes = app_state.gtfs_service.get_routes(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(routes))
+}
+
+async fn get_vehicles_by_depot_query(
+    app_state: Data<AppState>,
+    query: Query<MapStringString>,
+) -> AppResult<HttpResponse> {
+    // Accept raw query map so we can sanitize values (clients sometimes send quoted strings)
+    let q = query.into_inner();
+
+    // Helper to strip surrounding double quotes if present
+    fn strip_surrounding_quotes(s: &str) -> String {
+        s.trim()
+            .trim_start_matches('"')
+            .trim_end_matches('"')
+            .to_string()
+    }
+
+    if let Some(depot_name_raw) = q.get("depotName") {
+        let depot_name = strip_surrounding_quotes(depot_name_raw);
+        info!("getVehiclesFrom depotName='{}' (raw='{}')", depot_name, depot_name_raw);
+        let vehicles = app_state
+            .db_vehicle_reader
+            .get_vehicles_by_depot_name(&depot_name)
+            .await?;
+        info!("handler received {} vehicles for depotName='{}'", vehicles.len(), depot_name);
+        return Ok(HttpResponse::Ok().json(vehicles));
+    }
+
+    if let Some(depot_id_raw) = q.get("depotId") {
+        let depot_id_str = strip_surrounding_quotes(depot_id_raw);
+        info!("getVehiclesFrom depotId_raw='{}' depotId_str='{}'", depot_id_raw, depot_id_str);
+        match depot_id_str.parse::<i64>() {
+            Ok(depot_id) => {
+                let vehicles = app_state
+                    .db_vehicle_reader
+                    .get_vehicles_by_depot_id(depot_id)
+                    .await?;
+                info!("handler received {} vehicles for depotId={}", vehicles.len(), depot_id);
+                return Ok(HttpResponse::Ok().json(vehicles));
+            }
+            Err(_) => {
+                return Ok(HttpResponse::BadRequest()
+                    .body("depotId must be an integer (quotes will be stripped if present)"));
+            }
+        }
+    }
+
+    Ok(HttpResponse::BadRequest().body("Please provide depotName or depotId as query parameter"))
+}
+
+async fn get_depot_names(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    let names = app_state.db_vehicle_reader.get_depot_names().await?;
+    Ok(HttpResponse::Ok().json(names))
+}
+
+async fn get_depot_ids(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    let ids = app_state.db_vehicle_reader.get_depot_ids().await?;
+    Ok(HttpResponse::Ok().json(ids))
 }
 
 async fn get_route_stop_mapping_by_route(
