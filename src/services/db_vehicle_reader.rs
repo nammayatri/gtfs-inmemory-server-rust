@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
-use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId};
+use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary};
 use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
@@ -26,6 +26,10 @@ pub trait VehicleDataReader: Send + Sync {
         -> AppResult<Vec<VehicleData>>;
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicle_count(&self) -> AppResult<i64>;
+    async fn get_vehicles_by_depot_name(&self, depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>>;
+    async fn get_vehicles_by_depot_id(&self, depot_id: i64) -> AppResult<Vec<DepotVehicleSummary>>;
+    async fn get_depot_names(&self) -> AppResult<Vec<String>>;
+    async fn get_depot_ids(&self) -> AppResult<Vec<i64>>;
 }
 
 // Mock implementation for local testing without a database
@@ -86,6 +90,30 @@ impl VehicleDataReader for MockDBVehicleReader {
     }
 
     async fn get_vehicle_count(&self) -> AppResult<i64> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_vehicles_by_depot_name(&self, _depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_vehicles_by_depot_id(&self, _depot_id: i64) -> AppResult<Vec<DepotVehicleSummary>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_depot_names(&self) -> AppResult<Vec<String>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_depot_ids(&self) -> AppResult<Vec<i64>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -1138,6 +1166,67 @@ impl VehicleDataReader for DBVehicleReader {
             Err(e) => {
                 error!("get_vehicle_count query failed: {}", e);
                 Ok(0)
+            }
+        }
+    }
+
+    async fn get_vehicles_by_depot_name(&self, depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+        let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles LEFT JOIN entities AS Entities ON vehicles.entity_id = Entities.entity_id WHERE Entities.entity_name = $1 AND fleet_no <> '' LIMIT 1048575"#;
+
+        match sqlx::query_as::<_, DepotVehicleSummary>(query)
+            .bind(depot_name)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(v) => {
+                info!("get_vehicles_by_depot_name rows={}", v.len());
+                Ok(v)
+            }
+            Err(e) => {
+                error!("get_vehicles_by_depot_name query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
+    }
+    
+    async fn get_vehicles_by_depot_id(&self, depot_id: i64) -> AppResult<Vec<DepotVehicleSummary>> {
+        // Keep columns and aliasing the same as get_vehicles_by_depot_name
+        let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles WHERE vehicles.entity_id = $1 AND fleet_no <> '' LIMIT 1048575"#;
+        info!("get_vehicles_by_depot_id query: {}", query);
+        match sqlx::query_as::<_, DepotVehicleSummary>(query)
+            .bind(depot_id)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(v) => {
+                info!("get_vehicles_by_depot_id rows={}", v.len());
+                Ok(v)
+            }
+            Err(e) => {
+                error!("get_vehicles_by_depot_id query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn get_depot_names(&self) -> AppResult<Vec<String>> {
+        let query = "SELECT DISTINCT entity_name FROM entities LIMIT 1048575";
+        match sqlx::query_as::<_, (Option<String>,)>(query).fetch_all(&self.pool).await {
+            Ok(rows) => Ok(rows.into_iter().filter_map(|r| r.0).collect()),
+            Err(e) => {
+                error!("get_depot_names query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn get_depot_ids(&self) -> AppResult<Vec<i64>> {
+        let query = "SELECT DISTINCT entity_id FROM entities LIMIT 1048575";
+        match sqlx::query_as::<_, (Option<i64>,)>(query).fetch_all(&self.pool).await {
+            Ok(rows) => Ok(rows.into_iter().filter_map(|r| r.0).collect()),
+            Err(e) => {
+                error!("get_depot_ids query failed: {}", e);
+                Ok(Vec::new())
             }
         }
     }

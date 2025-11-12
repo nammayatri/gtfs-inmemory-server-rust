@@ -54,6 +54,13 @@ pub struct VehicleDataWithRouteId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DepotVehicleSummary {
+    pub fleet_no: String,
+    pub status: Option<String>,
+    pub vehicle_no: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct BusSchedule {
     pub schedule_number: String,
     pub route_id: String,
