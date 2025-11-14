@@ -47,6 +47,14 @@ pub struct GetAllStopsByIdsRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct GetBusScheduleDetailsRequest {
+    #[serde(rename = "scheduleTripIds")]
+    pub schedule_trip_ids: Vec<i64>,
+    #[serde(rename = "batchsize")]
+    pub batchsize: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct GetAllRouteStopMappingsByRouteCodesRequest {
     #[serde(rename = "gtfsId")]
     pub gtfs_id: String,
@@ -143,6 +151,14 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/refresh-data",
                 actix_web::web::post().to(force_refresh_data),
+            )
+            .route(
+                "/getOnlineWaybills",
+                actix_web::web::get().to(get_online_waybills),
+            )
+            .route(
+                "/getBusScheduleDetailsByIds",
+                actix_web::web::post().to(get_bus_schedule_details_by_ids),
             )
             .route(
                 "/getAllRoutesByIds",
@@ -864,6 +880,28 @@ async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse
         "message": "GTFS data refresh initiated in background",
         "status": "started"
     })))
+}
+
+async fn get_online_waybills(
+    app_state: Data<AppState>,
+) -> AppResult<HttpResponse> {
+    let waybills = app_state
+        .db_vehicle_reader
+        .get_online_waybills()
+        .await?;
+    Ok(HttpResponse::Ok().json(waybills))
+}
+
+async fn get_bus_schedule_details_by_ids(
+    app_state: Data<AppState>,
+    payload: Json<GetBusScheduleDetailsRequest>,
+) -> AppResult<HttpResponse> {
+    let payload = payload.into_inner();
+    let schedules = app_state
+        .db_vehicle_reader
+        .get_bus_schedule_details_by_ids(payload.schedule_trip_ids, payload.batchsize)
+        .await?;
+    Ok(HttpResponse::Ok().json(schedules))
 }
 
 async fn get_all_routes_by_ids(

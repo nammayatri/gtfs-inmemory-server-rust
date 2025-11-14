@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use sqlx::postgres::{PgPool};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc};
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::environment::AppConfig;
-use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary};
+use crate::models::{BusSchedule, MinimalVehicleData, WaybillData, BusScheduleTripDetail, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary};
 use crate::tools::error::{AppError, AppResult};
 
 // Depot cache structure
@@ -41,6 +41,8 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
     async fn clear_depot_cache(&self) -> AppResult<()>;
+    async fn get_online_waybills(&self) -> AppResult<Vec<WaybillData>>;
+    async fn get_bus_schedule_details_by_ids(&self, schedule_trip_ids: Vec<i64>, batchsize: Option<usize>) -> AppResult<HashMap<i64, Vec<BusScheduleTripDetail>>>;
 }
 
 // Mock implementation for local testing without a database
@@ -138,6 +140,16 @@ impl VehicleDataReader for MockDBVehicleReader {
 
     async fn clear_depot_cache(&self) -> AppResult<()> {
         Ok(())
+    }
+    async fn get_online_waybills(&self) -> AppResult<Vec<WaybillData>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+    async fn get_bus_schedule_details_by_ids(&self, _schedule_trip_ids: Vec<i64>, _batchsize: Option<usize>) -> AppResult<HashMap<i64, Vec<BusScheduleTripDetail>>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 }
 
@@ -295,7 +307,7 @@ impl DBVehicleReader {
         });
     }
 
-    async fn fetch_vehicle_data_impl(
+    async fn _fetch_vehicle_data_impl(
         &self,
         vehicle_no: &str,
         trip_number: Option<i32>,
@@ -1381,5 +1393,83 @@ impl VehicleDataReader for DBVehicleReader {
         cache.vehicles_by_depot_id.clear();
         info!("Depot cache cleared successfully");
         Ok(())
+    }
+
+    async fn get_online_waybills(&self) -> AppResult<Vec<WaybillData>> {
+        let waybills_query = r#"
+                    SELECT waybill_id, schedule_trip_id, duty_date, vehicle_no, deleted, status, updated_at
+                    FROM waybills 
+                    WHERE deleted = false AND status = 'Online'
+                    ORDER BY updated_at DESC
+                    LIMIT 5000
+                "#;
+        let waybills = match sqlx::query_as::<_, WaybillData>(waybills_query)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    error!("get_vehicles_by_service_type query failed: {}", e);
+                    Ok(Vec::new())
+                }
+            };
+        waybills            
+    }
+
+    async fn get_bus_schedule_details_by_ids(
+        &self,
+        schedule_trip_ids: Vec<i64>,
+        batchsize: Option<usize>,
+    ) -> AppResult<HashMap<i64, Vec<BusScheduleTripDetail>>> {
+        let mut schedule_map: HashMap<i64, Vec<BusScheduleTripDetail>> = HashMap::new();
+        let batch_size = match batchsize {
+            Some(size) => size,
+            None => 500,
+        };
+        for batch in schedule_trip_ids.chunks(batch_size) {
+            let trip_ids_array: Vec<i64> = batch.to_vec();
+            let bus_schedule_batch_query = r#"
+                SELECT schedule_trip_id, route_number_id::TEXT, trip_start_time, trip_end_time, deleted, schedule_number, is_active_trip, trip_order
+                FROM bus_schedule_trip_detail
+                WHERE deleted = false AND schedule_trip_id = ANY($1::bigint[])
+            "#;
+            let bus_schedule_flexi_batch_query = r#"
+                SELECT schedule_trip_id, route_number_id::TEXT, trip_start_time, trip_end_time, deleted, schedule_number, is_active_trip, trip_order
+                FROM bus_schedule_trip_flexi
+                WHERE deleted = false AND schedule_trip_id = ANY($1::bigint[])
+            "#;
+            let mut rows: Vec<BusScheduleTripDetail> = match sqlx::query_as::<_, BusScheduleTripDetail>(bus_schedule_batch_query)
+                .bind(&trip_ids_array)
+                .fetch_all(&self.pool)
+                .await 
+            {
+                Ok(batch) => batch,
+                Err(e) => {
+                    warn!("Failed to fetch bus_schedule_trip_detail batch: {}", e);
+                    Vec::new()
+                }
+            };
+
+            let rows2: Vec<BusScheduleTripDetail> = match sqlx::query_as::<_, BusScheduleTripDetail>(bus_schedule_flexi_batch_query)
+                .bind(&trip_ids_array)
+                .fetch_all(&self.pool)
+                .await 
+            {
+                Ok(batch) => batch,
+                Err(e) => {
+                    warn!("Failed to fetch bus_schedule_trip_flexi batch: {}", e);
+                    Vec::new()
+                }
+            };
+
+            rows.extend(rows2);
+
+            for row in rows.into_iter() {
+                schedule_map.entry(row.schedule_trip_id)
+                    .or_insert_with(Vec::new)
+                    .push(row);
+            }
+        }
+        Ok(schedule_map)
     }
 }

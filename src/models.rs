@@ -12,6 +12,40 @@ pub struct Gate {
     pub lat: f64,
     pub lon: f64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WaybillData {
+    #[serde(rename = "waybillId")]
+    pub waybill_id: i64,
+    #[serde(rename = "scheduleTripId")]
+    pub schedule_trip_id: i64,
+    #[serde(rename = "dutyDate")]
+    pub duty_date: String,
+    #[serde(rename = "vehicleNo")]
+    pub vehicle_no: String,
+    pub deleted: bool,
+    pub status: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct BusScheduleTripDetail {
+    #[serde(rename = "scheduleTripId")]
+    pub schedule_trip_id: i64,
+    #[serde(rename = "routeNumberId")]
+    pub route_number_id: i64,
+    #[serde(rename = "startTime")]
+    pub start_time: Option<String>,
+    #[serde(rename = "endTime")]
+    pub end_time: Option<String>,
+    pub deleted: bool,    
+    #[serde(rename = "scheduleNumber")]
+    pub schedule_number: String,
+    #[serde(rename = "isActiveTrip")]
+    pub is_active_trip: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleData {
     pub waybill_id: String,
