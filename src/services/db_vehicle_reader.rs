@@ -1421,6 +1421,7 @@ impl VehicleDataReader for DBVehicleReader {
         schedule_trip_ids: Vec<i64>,
         batchsize: Option<usize>,
     ) -> AppResult<HashMap<i64, Vec<BusScheduleTripDetail>>> {
+        info!("get_bus_schedule_details_by_ids schedule_trip_ids={:?}, batchsize={:?}", schedule_trip_ids, batchsize);
         let mut schedule_map: HashMap<i64, Vec<BusScheduleTripDetail>> = HashMap::new();
         let batch_size = match batchsize {
             Some(size) => size,
@@ -1429,12 +1430,12 @@ impl VehicleDataReader for DBVehicleReader {
         for batch in schedule_trip_ids.chunks(batch_size) {
             let trip_ids_array: Vec<i64> = batch.to_vec();
             let bus_schedule_batch_query = r#"
-                SELECT schedule_trip_id, route_number_id::TEXT, trip_start_time, trip_end_time, deleted, schedule_number, is_active_trip, trip_order
+                SELECT schedule_trip_id, route_number_id, trip_start_time as start_time, trip_end_time as end_time, deleted, schedule_number, is_active_trip, trip_order
                 FROM bus_schedule_trip_detail
                 WHERE deleted = false AND schedule_trip_id = ANY($1::bigint[])
             "#;
             let bus_schedule_flexi_batch_query = r#"
-                SELECT schedule_trip_id, route_number_id::TEXT, trip_start_time, trip_end_time, deleted, schedule_number, is_active_trip, trip_order
+                SELECT schedule_trip_id, route_number_id, trip_start_time as start_time, trip_end_time as end_time, deleted, schedule_number, is_active_trip, trip_order
                 FROM bus_schedule_trip_flexi
                 WHERE deleted = false AND schedule_trip_id = ANY($1::bigint[])
             "#;
