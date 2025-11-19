@@ -10,6 +10,15 @@ use crate::environment::AppConfig;
 use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary};
 use crate::tools::error::{AppError, AppResult};
 
+// Depot cache structure
+struct DepotCache {
+    depot_names: Option<(Vec<String>, SystemTime)>,
+    depot_ids: Option<(Vec<String>, SystemTime)>,
+    depot_name_by_id: HashMap<String, (String, SystemTime)>,
+    vehicles_by_depot_name: HashMap<String, (Vec<DepotVehicleSummary>, SystemTime)>,
+    vehicles_by_depot_id: HashMap<String, (Vec<DepotVehicleSummary>, SystemTime)>,
+}
+
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicle_data(
@@ -31,6 +40,7 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_depot_names(&self) -> AppResult<Vec<String>>;
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
+    async fn clear_depot_cache(&self) -> AppResult<()>;
 }
 
 // Mock implementation for local testing without a database
@@ -125,6 +135,10 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn clear_depot_cache(&self) -> AppResult<()> {
+        Ok(())
+    }
 }
 
 pub struct DBVehicleReader {
@@ -132,6 +146,8 @@ pub struct DBVehicleReader {
     cache: Arc<RwLock<HashMap<String, (VehicleDataWithRouteId, SystemTime)>>>,
     cache_duration: Duration,
     refresh_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>>,
+    depot_cache: Arc<RwLock<DepotCache>>,
+    depot_cache_duration: Duration,
 }
 
 impl DBVehicleReader {
@@ -141,7 +157,20 @@ impl DBVehicleReader {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_duration: Duration::from_secs(config.cache_duration),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
+            depot_cache: Arc::new(RwLock::new(DepotCache {
+                depot_names: None,
+                depot_ids: None,
+                depot_name_by_id: HashMap::new(),
+                vehicles_by_depot_name: HashMap::new(),
+                vehicles_by_depot_id: HashMap::new(),
+            })),
+            depot_cache_duration: Duration::from_secs(7200), // 2 hours TTL
         }
+    }
+
+    fn is_depot_cache_expired(&self, timestamp: SystemTime) -> bool {
+        let elapsed = timestamp.elapsed().unwrap_or_default();
+        elapsed >= self.depot_cache_duration
     }
 
     async fn get_cached_vehicle_data(&self, vehicle_no: &str, trip_number: Option<i32>) -> Option<(VehicleDataWithRouteId, SystemTime)> {
@@ -1178,6 +1207,18 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_vehicles_by_depot_name(&self, depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+        // Check cache first
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((vehicles, timestamp)) = cache.vehicles_by_depot_name.get(depot_name) {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!("Depot cache HIT for depot_name: {}", depot_name);
+                    return Ok(vehicles.clone());
+                }
+            }
+        }
+
+        debug!("Depot cache MISS for depot_name: {}", depot_name);
         let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles LEFT JOIN entities AS Entities ON vehicles.entity_id = Entities.entity_id WHERE Entities.entity_name = $1 AND fleet_no <> '' LIMIT 1048575"#;
 
         match sqlx::query_as::<_, DepotVehicleSummary>(query)
@@ -1187,6 +1228,9 @@ impl VehicleDataReader for DBVehicleReader {
         {
             Ok(v) => {
                 info!("get_vehicles_by_depot_name rows={}", v.len());
+                // Update cache
+                let mut cache = self.depot_cache.write().await;
+                cache.vehicles_by_depot_name.insert(depot_name.to_string(), (v.clone(), SystemTime::now()));
                 Ok(v)
             }
             Err(e) => {
@@ -1197,6 +1241,18 @@ impl VehicleDataReader for DBVehicleReader {
     }
     
     async fn get_vehicles_by_depot_id(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+        // Check cache first
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((vehicles, timestamp)) = cache.vehicles_by_depot_id.get(depot_id) {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!("Depot cache HIT for depot_id: {}", depot_id);
+                    return Ok(vehicles.clone());
+                }
+            }
+        }
+
+        debug!("Depot cache MISS for depot_id: {}", depot_id);
         let depot_id_int = depot_id.parse::<i64>()
             .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
         
@@ -1210,6 +1266,9 @@ impl VehicleDataReader for DBVehicleReader {
         {
             Ok(v) => {
                 info!("get_vehicles_by_depot_id rows={}", v.len());
+                // Update cache
+                let mut cache = self.depot_cache.write().await;
+                cache.vehicles_by_depot_id.insert(depot_id.to_string(), (v.clone(), SystemTime::now()));
                 Ok(v)
             }
             Err(e) => {
@@ -1220,9 +1279,27 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_depot_names(&self) -> AppResult<Vec<String>> {
+        // Check cache first
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((names, timestamp)) = &cache.depot_names {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!("Depot cache HIT for depot_names");
+                    return Ok(names.clone());
+                }
+            }
+        }
+
+        debug!("Depot cache MISS for depot_names");
         let query = "SELECT DISTINCT entity_name FROM entities LIMIT 1048575";
         match sqlx::query_as::<_, (Option<String>,)>(query).fetch_all(&self.pool).await {
-            Ok(rows) => Ok(rows.into_iter().filter_map(|r| r.0).collect()),
+            Ok(rows) => {
+                let names: Vec<String> = rows.into_iter().filter_map(|r| r.0).collect();
+                // Update cache
+                let mut cache = self.depot_cache.write().await;
+                cache.depot_names = Some((names.clone(), SystemTime::now()));
+                Ok(names)
+            }
             Err(e) => {
                 error!("get_depot_names query failed: {}", e);
                 Ok(Vec::new())
@@ -1231,9 +1308,27 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_depot_ids(&self) -> AppResult<Vec<String>> {
+        // Check cache first
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((ids, timestamp)) = &cache.depot_ids {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!("Depot cache HIT for depot_ids");
+                    return Ok(ids.clone());
+                }
+            }
+        }
+
+        debug!("Depot cache MISS for depot_ids");
         let query = "SELECT DISTINCT entity_id FROM entities LIMIT 1048575";
         match sqlx::query_as::<_, (Option<i64>,)>(query).fetch_all(&self.pool).await {
-            Ok(rows) => Ok(rows.into_iter().filter_map(|r| r.0.map(|id| id.to_string())).collect()),
+            Ok(rows) => {
+                let ids: Vec<String> = rows.into_iter().filter_map(|r| r.0.map(|id| id.to_string())).collect();
+                // Update cache
+                let mut cache = self.depot_cache.write().await;
+                cache.depot_ids = Some((ids.clone(), SystemTime::now()));
+                Ok(ids)
+            }
             Err(e) => {
                 error!("get_depot_ids query failed: {}", e);
                 Ok(Vec::new())
@@ -1242,6 +1337,18 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String> {
+        // Check cache first
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((name, timestamp)) = cache.depot_name_by_id.get(&depot_id) {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!("Depot cache HIT for depot_name_by_id: {}", depot_id);
+                    return Ok(name.clone());
+                }
+            }
+        }
+
+        debug!("Depot cache MISS for depot_name_by_id: {}", depot_id);
         let depot_id_int = depot_id.parse::<i32>()
             .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
         
@@ -1253,6 +1360,9 @@ impl VehicleDataReader for DBVehicleReader {
         {
             Ok((depot_name,)) => {
                 info!("get_depot_name_by_id: depot_id={}, depot_name={}", depot_id, depot_name);
+                // Update cache
+                let mut cache = self.depot_cache.write().await;
+                cache.depot_name_by_id.insert(depot_id.clone(), (depot_name.clone(), SystemTime::now()));
                 Ok(depot_name)
             }
             Err(e) => {
@@ -1260,5 +1370,16 @@ impl VehicleDataReader for DBVehicleReader {
                 Err(AppError::NotFound(format!("Depot with id {} not found", depot_id)))
             }
         }
+    }
+
+    async fn clear_depot_cache(&self) -> AppResult<()> {
+        let mut cache = self.depot_cache.write().await;
+        cache.depot_names = None;
+        cache.depot_ids = None;
+        cache.depot_name_by_id.clear();
+        cache.vehicles_by_depot_name.clear();
+        cache.vehicles_by_depot_id.clear();
+        info!("Depot cache cleared successfully");
+        Ok(())
     }
 }
