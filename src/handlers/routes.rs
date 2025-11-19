@@ -195,6 +195,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getDepotNameById/{depot_id}",
                 actix_web::web::get().to(get_depot_name_by_id)
+            )
+            .route(
+                "/depotDataCache/clear",
+                actix_web::web::post().to(clear_depot_cache)
             ),
     );
 }
@@ -323,6 +327,13 @@ async fn get_depot_name_by_id(
     let depot_id: String = strip_surrounding_quotes(&depot_id_str).to_string();
     let depot_name = app_state.db_vehicle_reader.get_depot_name_by_id(depot_id).await?;
     Ok(HttpResponse::Ok().json(depot_name))
+}
+
+async fn clear_depot_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    app_state.db_vehicle_reader.clear_depot_cache().await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Depot cache cleared successfully"
+    })))
 }
 
 async fn get_route_stop_mapping_by_route(
