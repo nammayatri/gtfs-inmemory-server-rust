@@ -27,9 +27,10 @@ pub trait VehicleDataReader: Send + Sync {
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicle_count(&self) -> AppResult<i64>;
     async fn get_vehicles_by_depot_name(&self, depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>>;
-    async fn get_vehicles_by_depot_id(&self, depot_id: i64) -> AppResult<Vec<DepotVehicleSummary>>;
+    async fn get_vehicles_by_depot_id(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>>;
     async fn get_depot_names(&self) -> AppResult<Vec<String>>;
-    async fn get_depot_ids(&self) -> AppResult<Vec<i64>>;
+    async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
+    async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
 }
 
 // Mock implementation for local testing without a database
@@ -101,7 +102,7 @@ impl VehicleDataReader for MockDBVehicleReader {
         ))
     }
 
-    async fn get_vehicles_by_depot_id(&self, _depot_id: i64) -> AppResult<Vec<DepotVehicleSummary>> {
+    async fn get_vehicles_by_depot_id(&self, _depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -113,7 +114,13 @@ impl VehicleDataReader for MockDBVehicleReader {
         ))
     }
 
-    async fn get_depot_ids(&self) -> AppResult<Vec<i64>> {
+    async fn get_depot_ids(&self) -> AppResult<Vec<String>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_depot_name_by_id(&self, _depot_id: String) -> AppResult<String> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -1189,12 +1196,15 @@ impl VehicleDataReader for DBVehicleReader {
         }
     }
     
-    async fn get_vehicles_by_depot_id(&self, depot_id: i64) -> AppResult<Vec<DepotVehicleSummary>> {
+    async fn get_vehicles_by_depot_id(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+        let depot_id_int = depot_id.parse::<i64>()
+            .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
+        
         // Keep columns and aliasing the same as get_vehicles_by_depot_name
         let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles WHERE vehicles.entity_id = $1 AND fleet_no <> '' LIMIT 1048575"#;
         info!("get_vehicles_by_depot_id query: {}", query);
         match sqlx::query_as::<_, DepotVehicleSummary>(query)
-            .bind(depot_id)
+            .bind(depot_id_int)
             .fetch_all(&self.pool)
             .await
         {
@@ -1220,13 +1230,34 @@ impl VehicleDataReader for DBVehicleReader {
         }
     }
 
-    async fn get_depot_ids(&self) -> AppResult<Vec<i64>> {
+    async fn get_depot_ids(&self) -> AppResult<Vec<String>> {
         let query = "SELECT DISTINCT entity_id FROM entities LIMIT 1048575";
         match sqlx::query_as::<_, (Option<i64>,)>(query).fetch_all(&self.pool).await {
-            Ok(rows) => Ok(rows.into_iter().filter_map(|r| r.0).collect()),
+            Ok(rows) => Ok(rows.into_iter().filter_map(|r| r.0.map(|id| id.to_string())).collect()),
             Err(e) => {
                 error!("get_depot_ids query failed: {}", e);
                 Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String> {
+        let depot_id_int = depot_id.parse::<i32>()
+            .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
+        
+        let query = r#"SELECT entity_name FROM entities WHERE entity_id = $1"#;
+        match sqlx::query_as::<_, (String,)>(query)
+            .bind(depot_id_int)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok((depot_name,)) => {
+                info!("get_depot_name_by_id: depot_id={}, depot_name={}", depot_id, depot_name);
+                Ok(depot_name)
+            }
+            Err(e) => {
+                error!("get_depot_name_by_id query failed for depot_id {}: {}", depot_id, e);
+                Err(AppError::NotFound(format!("Depot with id {} not found", depot_id)))
             }
         }
     }
