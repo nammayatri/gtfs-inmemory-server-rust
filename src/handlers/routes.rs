@@ -191,6 +191,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/depotIds",
                 actix_web::web::get().to(get_depot_ids)
+            )
+            .route(
+                "/getDepotNameById/{depot_id}",
+                actix_web::web::get().to(get_depot_name_by_id)
             ),
     );
 }
@@ -261,20 +265,20 @@ async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<
     Ok(HttpResponse::Ok().json(routes))
 }
 
+// Helper to strip surrounding double quotes if present
+fn strip_surrounding_quotes(s: &str) -> String {
+    s.trim()
+        .trim_start_matches('"')
+        .trim_end_matches('"')
+        .to_string()
+}
+
 async fn get_vehicles_by_depot_query(
     app_state: Data<AppState>,
     query: Query<MapStringString>,
 ) -> AppResult<HttpResponse> {
     // Accept raw query map so we can sanitize values (clients sometimes send quoted strings)
     let q = query.into_inner();
-
-    // Helper to strip surrounding double quotes if present
-    fn strip_surrounding_quotes(s: &str) -> String {
-        s.trim()
-            .trim_start_matches('"')
-            .trim_end_matches('"')
-            .to_string()
-    }
 
     if let Some(depot_name_raw) = q.get("depotName") {
         let depot_name = strip_surrounding_quotes(depot_name_raw);
@@ -290,20 +294,12 @@ async fn get_vehicles_by_depot_query(
     if let Some(depot_id_raw) = q.get("depotId") {
         let depot_id_str = strip_surrounding_quotes(depot_id_raw);
         info!("getVehiclesFrom depotId_raw='{}' depotId_str='{}'", depot_id_raw, depot_id_str);
-        match depot_id_str.parse::<i64>() {
-            Ok(depot_id) => {
-                let vehicles = app_state
-                    .db_vehicle_reader
-                    .get_vehicles_by_depot_id(depot_id)
-                    .await?;
-                info!("handler received {} vehicles for depotId={}", vehicles.len(), depot_id);
-                return Ok(HttpResponse::Ok().json(vehicles));
-            }
-            Err(_) => {
-                return Ok(HttpResponse::BadRequest()
-                    .body("depotId must be an integer (quotes will be stripped if present)"));
-            }
-        }
+        let vehicles = app_state
+            .db_vehicle_reader
+            .get_vehicles_by_depot_id(&depot_id_str)
+            .await?;
+        info!("handler received {} vehicles for depotId={}", vehicles.len(), depot_id_str);
+        return Ok(HttpResponse::Ok().json(vehicles));
     }
 
     Ok(HttpResponse::BadRequest().body("Please provide depotName or depotId as query parameter"))
@@ -317,6 +313,16 @@ async fn get_depot_names(app_state: Data<AppState>) -> AppResult<HttpResponse> {
 async fn get_depot_ids(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let ids = app_state.db_vehicle_reader.get_depot_ids().await?;
     Ok(HttpResponse::Ok().json(ids))
+}
+
+async fn get_depot_name_by_id(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let depot_id_str = path.into_inner();
+    let depot_id: String = strip_surrounding_quotes(&depot_id_str).to_string();
+    let depot_name = app_state.db_vehicle_reader.get_depot_name_by_id(depot_id).await?;
+    Ok(HttpResponse::Ok().json(depot_name))
 }
 
 async fn get_route_stop_mapping_by_route(
