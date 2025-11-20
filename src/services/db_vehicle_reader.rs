@@ -1473,4 +1473,24 @@ impl VehicleDataReader for DBVehicleReader {
         }
         Ok(schedule_map)
     }
+    async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String> {
+        let depot_id_int = depot_id.parse::<i32>()
+            .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
+        
+        let query = r#"SELECT entity_name FROM entities WHERE entity_id = $1"#;
+        match sqlx::query_as::<_, (String,)>(query)
+            .bind(depot_id_int)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok((depot_name,)) => {
+                info!("get_depot_name_by_id: depot_id={}, depot_name={}", depot_id, depot_name);
+                Ok(depot_name)
+            }
+            Err(e) => {
+                error!("get_depot_name_by_id query failed for depot_id {}: {}", depot_id, e);
+                Err(AppError::NotFound(format!("Depot with id {} not found", depot_id)))
+            }
+        }
+    }
 }
