@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool};
+use sqlx::postgres::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -7,7 +7,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
-use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary, VehicleOperationData};
+use crate::models::{
+    BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary, VehicleOperationData
+};
 use crate::tools::error::{AppError, AppResult};
 
 // Depot cache structure
@@ -35,8 +37,12 @@ pub trait VehicleDataReader: Send + Sync {
         -> AppResult<Vec<VehicleData>>;
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicle_count(&self) -> AppResult<i64>;
-    async fn get_vehicles_by_depot_name(&self, depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>>;
-    async fn get_vehicles_by_depot_id(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>>;
+    async fn get_vehicles_by_depot_name(
+        &self,
+        depot_name: &str,
+    ) -> AppResult<Vec<DepotVehicleSummary>>;
+    async fn get_vehicles_by_depot_id(&self, depot_id: &str)
+        -> AppResult<Vec<DepotVehicleSummary>>;
     async fn get_depot_names(&self) -> AppResult<Vec<String>>;
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
@@ -107,13 +113,19 @@ impl VehicleDataReader for MockDBVehicleReader {
         ))
     }
 
-    async fn get_vehicles_by_depot_name(&self, _depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+    async fn get_vehicles_by_depot_name(
+        &self,
+        _depot_name: &str,
+    ) -> AppResult<Vec<DepotVehicleSummary>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
 
-    async fn get_vehicles_by_depot_id(&self, _depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+    async fn get_vehicles_by_depot_id(
+        &self,
+        _depot_id: &str,
+    ) -> AppResult<Vec<DepotVehicleSummary>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -179,7 +191,11 @@ impl DBVehicleReader {
         elapsed >= self.depot_cache_duration
     }
 
-    async fn get_cached_vehicle_data(&self, vehicle_no: &str, trip_number: Option<i32>) -> Option<(VehicleDataWithRouteId, SystemTime)> {
+    async fn get_cached_vehicle_data(
+        &self,
+        vehicle_no: &str,
+        trip_number: Option<i32>,
+    ) -> Option<(VehicleDataWithRouteId, SystemTime)> {
         let cache_key = self.get_cache_key(vehicle_no, trip_number);
         let cache = self.cache.read().await;
         if let Some((data, timestamp)) = cache.get(&cache_key) {
@@ -206,10 +222,7 @@ impl DBVehicleReader {
     async fn cache_vehicle_data(&self, vehicle_data: &VehicleDataWithRouteId) {
         let cache_key = self.get_cache_key(&vehicle_data.vehicle_no, vehicle_data.trip_number);
         let mut cache = self.cache.write().await;
-        cache.insert(
-            cache_key,
-            (vehicle_data.clone(), SystemTime::now()),
-        );
+        cache.insert(cache_key, (vehicle_data.clone(), SystemTime::now()));
     }
 
     async fn get_or_create_refresh_lock(&self, cache_key: &str) -> Arc<tokio::sync::Mutex<bool>> {
@@ -246,14 +259,20 @@ impl DBVehicleReader {
         let mut lock_guard = match lock.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                debug!("Another thread is already refreshing vehicle {}", vehicle_no);
+                debug!(
+                    "Another thread is already refreshing vehicle {}",
+                    vehicle_no
+                );
                 return;
             }
         };
 
         // Check if already refreshing
         if *lock_guard {
-            debug!("Another thread is already refreshing vehicle {}", vehicle_no);
+            debug!(
+                "Another thread is already refreshing vehicle {}",
+                vehicle_no
+            );
             return;
         }
 
@@ -268,30 +287,34 @@ impl DBVehicleReader {
         let vehicle_no_clone = vehicle_no.clone();
         let trip_number_clone = trip_number;
         let lock_clone = lock.clone();
-        
+
         tokio::spawn(async move {
-            debug!("Starting background refresh for vehicle {}", vehicle_no_clone);
-            
+            debug!(
+                "Starting background refresh for vehicle {}",
+                vehicle_no_clone
+            );
+
             // Perform the actual database query (same logic as get_vehicle_data)
             // We'll call a helper that works with just the pool
-            let result = Self::fetch_vehicle_data_with_pool(
-                &pool,
-                &vehicle_no_clone,
-                trip_number_clone,
-            ).await;
+            let result =
+                Self::fetch_vehicle_data_with_pool(&pool, &vehicle_no_clone, trip_number_clone)
+                    .await;
 
             match result {
                 Ok(vehicle_data) => {
                     // Update cache
                     let mut cache_write = cache.write().await;
-                    cache_write.insert(
-                        cache_key_clone,
-                        (vehicle_data, SystemTime::now()),
+                    cache_write.insert(cache_key_clone, (vehicle_data, SystemTime::now()));
+                    debug!(
+                        "Background refresh completed for vehicle {}",
+                        vehicle_no_clone
                     );
-                    debug!("Background refresh completed for vehicle {}", vehicle_no_clone);
                 }
                 Err(e) => {
-                    error!("Background refresh failed for vehicle {}: {:?}", vehicle_no_clone, e);
+                    error!(
+                        "Background refresh failed for vehicle {}: {:?}",
+                        vehicle_no_clone, e
+                    );
                 }
             }
 
@@ -314,16 +337,28 @@ impl DBVehicleReader {
         vehicle_no: &str,
         trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId> {
-        let waybill_online_query =
-            "
-            SELECT w.waybill_id::text, w.waybill_no::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, e.entity_remark::text as entity_remark, w.driver_token_no::text as driver_code, w.conductor_token_no::text as conductor_code
+        let waybill_online_query = r#"
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                e.entity_remark::text AS entity_remark,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted AS deleted,
+                w.status AS status,
             FROM waybills w
-            left join entities e on e.entity_id = w.entity_id
+            LEFT JOIN entities e
+                ON e.entity_id = w.entity_id
             WHERE w.vehicle_no = $1
-            and w.status = 'Online'
-            LIMIT 1
-        ";
-
+              AND w.status = 'Online'
+            LIMIT 1;
+        "#;
         let result = match sqlx::query_as::<_, VehicleData>(waybill_online_query)
             .bind(vehicle_no)
             .fetch_optional(pool)
@@ -353,100 +388,92 @@ impl DBVehicleReader {
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
                 // Fetch trip rows (simplified version without instance methods)
-                let (schedule_result, is_active_trip, remaining_trip_details) =
-                    if let Some(schedule_trip_id) = &vehicle_data.schedule_trip_id {
-                        // Fetch from detailed trips first
-                        let mut detail_rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_trip_detail_query)
-                            .bind(schedule_trip_id)
-                            .fetch_all(pool)
-                            .await
+                let (schedule_result, is_active_trip, remaining_trip_details) = if let Some(
+                    schedule_trip_id,
+                ) =
+                    &vehicle_data.schedule_trip_id
+                {
+                    // Fetch from detailed trips first
+                    let mut detail_rows = match sqlx::query_as::<_, BusSchedule>(
+                        &bus_schedule_trip_detail_query,
+                    )
+                    .bind(schedule_trip_id)
+                    .fetch_all(pool)
+                    .await
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            error!("fetch_trip_rows_for_schedule: detail query failed. query={} error={}", bus_schedule_trip_detail_query, e);
+                            Vec::new()
+                        }
+                    };
+
+                    let detail_has_active = detail_rows
+                        .iter()
+                        .any(|row| row.is_active_trip.unwrap_or(false));
+
+                    let mut flexi_rows: Vec<BusSchedule> = Vec::new();
+                    if !detail_has_active {
+                        flexi_rows = match sqlx::query_as::<_, BusSchedule>(
+                            &bus_schedule_trip_flexi_query,
+                        )
+                        .bind(schedule_trip_id)
+                        .fetch_all(pool)
+                        .await
                         {
                             Ok(rows) => rows,
                             Err(e) => {
-                                error!("fetch_trip_rows_for_schedule: detail query failed. query={} error={}", bus_schedule_trip_detail_query, e);
+                                error!("fetch_trip_rows_for_schedule: flexi query failed. query={} error={}", bus_schedule_trip_flexi_query, e);
                                 Vec::new()
                             }
                         };
+                    }
 
-                        let detail_has_active = detail_rows
-                            .iter()
-                            .any(|row| row.is_active_trip.unwrap_or(false));
+                    detail_rows.append(&mut flexi_rows);
 
-                        let mut flexi_rows: Vec<BusSchedule> = Vec::new();
-                        if !detail_has_active {
-                            flexi_rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_trip_flexi_query)
-                                .bind(schedule_trip_id)
-                                .fetch_all(pool)
-                                .await
-                            {
-                                Ok(rows) => rows,
-                                Err(e) => {
-                                    error!("fetch_trip_rows_for_schedule: flexi query failed. query={} error={}", bus_schedule_trip_flexi_query, e);
-                                    Vec::new()
-                                }
-                            };
+                    // Stable partition to bring active trip to front if present
+                    if let Some(idx) = detail_rows
+                        .iter()
+                        .position(|row| row.is_active_trip.unwrap_or(false))
+                    {
+                        if idx != 0 {
+                            detail_rows.swap(0, idx);
                         }
+                    }
 
-                        detail_rows.append(&mut flexi_rows);
-
-                        // Stable partition to bring active trip to front if present
-                        if let Some(idx) = detail_rows
+                    // Sort by trip_number if available, but keep index 0 if it is active trip
+                    let has_active_front = detail_rows
+                        .get(0)
+                        .map(|r| r.is_active_trip.unwrap_or(false))
+                        .unwrap_or(false);
+                    detail_rows.sort_by(|a, b| {
+                        let at = a.trip_number.unwrap_or(i32::MAX);
+                        let bt = b.trip_number.unwrap_or(i32::MAX);
+                        at.cmp(&bt)
+                    });
+                    if has_active_front {
+                        if let Some(pos) = detail_rows
                             .iter()
                             .position(|row| row.is_active_trip.unwrap_or(false))
                         {
-                            if idx != 0 {
-                                detail_rows.swap(0, idx);
+                            if pos != 0 {
+                                detail_rows.swap(0, pos);
                             }
                         }
+                    }
 
-                        // Sort by trip_number if available, but keep index 0 if it is active trip
-                        let has_active_front = detail_rows.get(0).map(|r| r.is_active_trip.unwrap_or(false)).unwrap_or(false);
-                        detail_rows.sort_by(|a, b| {
-                            let at = a.trip_number.unwrap_or(i32::MAX);
-                            let bt = b.trip_number.unwrap_or(i32::MAX);
-                            at.cmp(&bt)
-                        });
-                        if has_active_front {
-                            if let Some(pos) = detail_rows
-                                .iter()
-                                .position(|row| row.is_active_trip.unwrap_or(false))
-                            {
-                                if pos != 0 {
-                                    detail_rows.swap(0, pos);
-                                }
-                            }
-                        }
-
-                        if !detail_rows.is_empty() {
-                            // Enrich route numbers
-                            Self::enrich_route_numbers_with_pool(pool, &mut detail_rows).await?;
-                            let first = detail_rows.remove(0);
-                            let remaining = if detail_rows.is_empty() { None } else { Some(detail_rows) };
-                            (Some(first), true, remaining)
+                    if !detail_rows.is_empty() {
+                        // Enrich route numbers
+                        Self::enrich_route_numbers_with_pool(pool, &mut detail_rows).await?;
+                        let first = detail_rows.remove(0);
+                        let remaining = if detail_rows.is_empty() {
+                            None
                         } else {
-                            // Fallback to bus_schedule
-                            let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
-                                .bind(vehicle_data.schedule_no.clone())
-                                .fetch_all(pool)
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    error!("Query failed (bus_schedule): {} | {}", bus_schedule_query, e);
-                                    Vec::new()
-                                }
-                            };
-                            if !rows.is_empty() {
-                                Self::enrich_route_numbers_with_pool(pool, &mut rows).await?;
-                                let first = rows.remove(0);
-                                let remaining = if rows.is_empty() { None } else { Some(rows) };
-                                (Some(first), false, remaining)
-                            } else {
-                                (None, false, None)
-                            }
-                        }
+                            Some(detail_rows)
+                        };
+                        (Some(first), true, remaining)
                     } else {
-                        // If no schedule_trip_id, directly try bus_schedule_query
+                        // Fallback to bus_schedule
                         let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
                             .bind(vehicle_data.schedule_no.clone())
                             .fetch_all(pool)
@@ -454,7 +481,10 @@ impl DBVehicleReader {
                         {
                             Ok(r) => r,
                             Err(e) => {
-                                error!("Query failed (bus_schedule direct): {}", e);
+                                error!(
+                                    "Query failed (bus_schedule): {} | {}",
+                                    bus_schedule_query, e
+                                );
                                 Vec::new()
                             }
                         };
@@ -466,7 +496,29 @@ impl DBVehicleReader {
                         } else {
                             (None, false, None)
                         }
+                    }
+                } else {
+                    // If no schedule_trip_id, directly try bus_schedule_query
+                    let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
+                        .bind(vehicle_data.schedule_no.clone())
+                        .fetch_all(pool)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Query failed (bus_schedule direct): {}", e);
+                            Vec::new()
+                        }
                     };
+                    if !rows.is_empty() {
+                        Self::enrich_route_numbers_with_pool(pool, &mut rows).await?;
+                        let first = rows.remove(0);
+                        let remaining = if rows.is_empty() { None } else { Some(rows) };
+                        (Some(first), false, remaining)
+                    } else {
+                        (None, false, None)
+                    }
+                };
 
                 let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                     waybill_id: Some(vehicle_data.waybill_id),
@@ -485,6 +537,9 @@ impl DBVehicleReader {
                     entity_remark: vehicle_data.entity_remark,
                     driver_code: vehicle_data.driver_code,
                     conductor_code: vehicle_data.conductor_code,
+                    deleted: vehicle_data.deleted,
+                    status: vehicle_data.status,
+                    schedule_details: None,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -538,6 +593,9 @@ impl DBVehicleReader {
                             entity_remark: None,
                             driver_code: None,
                             conductor_code: None,
+                            deleted: None,
+                            status: None,
+                            schedule_details: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -557,6 +615,9 @@ impl DBVehicleReader {
                             entity_remark: None,
                             driver_code: None,
                             conductor_code: None,
+                            deleted: None,
+                            status: None,
+                            schedule_details: None,
                         }
                     };
 
@@ -681,12 +742,20 @@ impl DBVehicleReader {
                 r.schedule_number,
                 r.route_id,
                 r.trip_number.unwrap_or_default(),
-                if r.is_active_trip.unwrap_or(false) { "true" } else { "false" },
+                if r.is_active_trip.unwrap_or(false) {
+                    "true"
+                } else {
+                    "false"
+                },
                 r.org_name.as_deref().unwrap_or("")
             );
         }
         if rows.len() > 10 {
-            info!(source = source, remaining = rows.len() - 10, "... more rows omitted");
+            info!(
+                source = source,
+                remaining = rows.len() - 10,
+                "... more rows omitted"
+            );
         }
     }
 
@@ -756,7 +825,10 @@ impl DBVehicleReader {
         }
 
         // Sort by trip_number if available, but keep index 0 if it is active trip
-        let has_active_front = detail_rows.get(0).map(|r| r.is_active_trip.unwrap_or(false)).unwrap_or(false);
+        let has_active_front = detail_rows
+            .get(0)
+            .map(|r| r.is_active_trip.unwrap_or(false))
+            .unwrap_or(false);
         detail_rows.sort_by(|a, b| {
             let at = a.trip_number.unwrap_or(i32::MAX);
             let bt = b.trip_number.unwrap_or(i32::MAX);
@@ -785,26 +857,44 @@ impl VehicleDataReader for DBVehicleReader {
         trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId> {
         // Check cache (including stale data)
-        if let Some((cached_data, timestamp)) = self.get_cached_vehicle_data(vehicle_no, trip_number).await {
+        if let Some((cached_data, timestamp)) =
+            self.get_cached_vehicle_data(vehicle_no, trip_number).await
+        {
             // Check if cache is expired and trigger background refresh if needed
             if self.is_cache_expired(timestamp) {
-                debug!("Cache expired for vehicle {}, triggering background refresh", vehicle_no);
+                debug!(
+                    "Cache expired for vehicle {}, triggering background refresh",
+                    vehicle_no
+                );
                 // Trigger background refresh (non-blocking)
-                self.refresh_vehicle_data_in_background(vehicle_no.to_string(), trip_number).await;
+                self.refresh_vehicle_data_in_background(vehicle_no.to_string(), trip_number)
+                    .await;
             }
             // Return cached data (even if stale) - background refresh will update it
             return Ok(cached_data);
         }
 
-        let waybill_online_query =
-            "
-            SELECT w.waybill_id::text, w.waybill_no::text, w.service_type, w.vehicle_no, w.schedule_no, w.updated_at::timestamptz as last_updated, w.duty_date, w.schedule_trip_id::text, e.entity_remark::text as entity_remark, w.driver_token_no::text as driver_code, w.conductor_token_no::text as conductor_code
+        let waybill_online_query = r#"
+            SELECT 
+                w.waybill_id::text, 
+                w.waybill_no::text, 
+                w.service_type, 
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                e.entity_remark::text AS entity_remark,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted AS deleted,
+                w.status AS status
             FROM waybills w
-            left join entities e on e.entity_id = w.entity_id
+            LEFT JOIN entities e on e.entity_id = w.entity_id
             WHERE w.vehicle_no = $1
-            and w.status = 'Online'
+                AND w.status = 'Online'
             LIMIT 1
-        ";
+        "#;
 
         let result = match sqlx::query_as::<_, VehicleData>(waybill_online_query)
             .bind(vehicle_no)
@@ -818,19 +908,108 @@ impl VehicleDataReader for DBVehicleReader {
             }
         };
 
+        let mut schedule_map: HashMap<i64, Vec<BusSchedule>> = HashMap::new();
         match result {
             Some(vehicle_data) => {
                 info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
                 let bus_schedule_trip_detail_query: String = if let Some(trip_number) = trip_number
                 {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
+                    format!(
+                        r#"
+                        SELECT 
+                            NULL::int AS stops_count, 
+                            route_number_id::text AS route_id, 
+                            schedule_number, 
+                            org_name::text AS org_name, 
+                            trip_number,
+                            schedule_trip_id,
+                            trip_start_time AS start_time,
+                            trip_end_time AS end_time,
+                            deleted,
+                            is_active_trip,
+                            trip_order
+                        FROM bus_schedule_trip_detail 
+                        WHERE schedule_trip_id = $1::bigint 
+                            AND trip_number >= {} 
+                        ORDER BY trip_number ASC"#,
+                        trip_number
+                    )
                 } else {
-                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
+                    r#"
+                    SELECT 
+                        NULL::int AS stops_count, 
+                        route_number_id::text AS route_id,
+                        schedule_number,
+                        org_name::text AS org_name, 
+                        trip_number,
+                        schedule_trip_id,
+                        trip_start_time AS start_time,
+                        trip_end_time AS end_time,
+                        deleted,
+                        is_active_trip,
+                        trip_order
+                    FROM bus_schedule_trip_detail 
+                    WHERE schedule_trip_id = $1::bigint 
+                        AND trip_number >= 
+                            (SELECT COALESCE(
+                                    (SELECT trip_number 
+                                     FROM bus_schedule_trip_detail 
+                                     WHERE schedule_trip_id = $1::bigint AND is_active_trip = true), 1)) 
+                    ORDER BY trip_number ASC"#.to_string()
                 };
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
+                    format!(
+                        r#"
+                        SELECT
+                            NULL::int AS stops_count,
+                            route_number_id::text AS route_id,
+                            schedule_number,
+                            org_name::text AS org_name,
+                            trip_number,
+                            schedule_trip_id,
+                            trip_start_time AS start_time,
+                            trip_end_time AS end_time,
+                            deleted,
+                            is_active_trip,
+                            trip_order
+                        FROM bus_schedule_trip_flexi
+                        WHERE schedule_trip_id = $1::bigint
+                          AND trip_number >= {trip_number}
+                        ORDER BY trip_number ASC
+                        "#
+                    )
                 } else {
-                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1::bigint AND is_active_trip = TRUE ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1::bigint AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') ORDER BY f.trip_number ASC".to_string()
+                    r#"
+                    WITH latest AS (
+                        SELECT
+                            trip_number AS active_trip_number,
+                            created_at AS active_created_at
+                        FROM bus_schedule_trip_flexi
+                        WHERE schedule_trip_id = $1::bigint
+                          AND is_active_trip = TRUE
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    SELECT
+                        NULL::int AS stops_count,
+                        f.route_number_id::text AS route_id,
+                        f.schedule_number,
+                        f.org_name::text AS org_name,
+                        f.trip_number,
+                        f.schedule_trip_id,
+                        f.trip_start_time AS start_time,
+                        f.trip_end_time AS end_time,
+                        f.deleted,
+                        f.is_active_trip,
+                        f.trip_order
+                    FROM bus_schedule_trip_flexi f
+                    LEFT JOIN latest l ON TRUE
+                    WHERE f.schedule_trip_id = $1::bigint
+                      AND f.trip_number >= COALESCE(l.active_trip_number, 1)
+                      AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day')
+                    ORDER BY f.trip_number ASC
+                    "#
+                    .to_string()
                 };
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
@@ -845,26 +1024,35 @@ impl VehicleDataReader for DBVehicleReader {
                             )
                             .await;
                         if !rows.is_empty() {
+                            for row in rows.iter_mut() {
+                                if let Some(key) = row.schedule_trip_id {
+                                    schedule_map
+                                        .entry(key)
+                                        .or_insert_with(Vec::new)
+                                        .push(row.clone());
+                                }
+                            }
                             self.enrich_route_numbers(&mut rows).await?;
                             let first = rows.remove(0);
                             let remaining = if rows.is_empty() { None } else { Some(rows) };
                             (Some(first), true, remaining)
                         } else {
                             // Fallback to bus_schedule
-                            let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
-                                .bind(vehicle_data.schedule_no.clone())
-                                .fetch_all(&self.pool)
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    error!(
-                                        "Query failed (bus_schedule): {} | {}",
-                                        bus_schedule_query, e
-                                    );
-                                    Vec::new()
-                                }
-                            };
+                            let mut rows =
+                                match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
+                                    .bind(vehicle_data.schedule_no.clone())
+                                    .fetch_all(&self.pool)
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        error!(
+                                            "Query failed (bus_schedule): {} | {}",
+                                            bus_schedule_query, e
+                                        );
+                                        Vec::new()
+                                    }
+                                };
                             if !rows.is_empty() {
                                 self.enrich_route_numbers(&mut rows).await?;
                                 let first = rows.remove(0);
@@ -914,6 +1102,9 @@ impl VehicleDataReader for DBVehicleReader {
                     entity_remark: vehicle_data.entity_remark,
                     driver_code: vehicle_data.driver_code,
                     conductor_code: vehicle_data.conductor_code,
+                    deleted: vehicle_data.deleted,
+                    status: vehicle_data.status,
+                    schedule_details: Some(schedule_map),
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -968,6 +1159,9 @@ impl VehicleDataReader for DBVehicleReader {
                             entity_remark: None,
                             driver_code: None,
                             conductor_code: None,
+                            deleted: None,
+                            status: None,
+                            schedule_details: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -987,6 +1181,9 @@ impl VehicleDataReader for DBVehicleReader {
                             entity_remark: None,
                             driver_code: None,
                             conductor_code: None,
+                            deleted: None,
+                            schedule_details: None,
+                            status: None,
                         }
                     };
 
@@ -996,12 +1193,21 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>> {
-        let query = "
+        let query = r#"
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
+                waybill_id::text,
+                service_type,
+                vehicle_no,
+                schedule_no,
+                updated_at::timestamptz AS last_updated,
+                duty_date,
+                driver_token_no::text AS driver_code,
+                conductor_token_no::text AS conductor_code,
+                deleted,
+                status,
             FROM waybills
-            ORDER BY vehicle_no, updated_at DESC
-        ";
+            ORDER BY vehicle_no, updated_at DESC;
+        "#;
 
         match sqlx::query_as::<_, VehicleData>(query)
             .fetch_all(&self.pool)
@@ -1019,13 +1225,22 @@ impl VehicleDataReader for DBVehicleReader {
         &self,
         service_type: &str,
     ) -> AppResult<Vec<VehicleData>> {
-        let query = "
+        let query = r#"
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
+                waybill_id::text,
+                service_type,
+                vehicle_no,
+                schedule_no,
+                updated_at::timestamptz AS last_updated,
+                duty_date,
+                driver_token_no::text AS driver_code,
+                conductor_token_no::text AS conductor_code,
+                deleted,
+                status
             FROM waybills
             WHERE service_type = $1
-            ORDER BY vehicle_no, updated_at DESC
-        ";
+            ORDER BY vehicle_no, updated_at DESC;
+        "#;
 
         match sqlx::query_as::<_, VehicleData>(query)
             .bind(service_type)
@@ -1042,13 +1257,25 @@ impl VehicleDataReader for DBVehicleReader {
 
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>> {
         let search_pattern = format!("%{}%", query);
-        let query_sql = "
+        let query_sql = r#"
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
+                waybill_id::text,
+                service_type,
+                vehicle_no,
+                schedule_no,
+                updated_at::timestamptz AS last_updated,
+                duty_date,
+                driver_token_no::text AS driver_code,
+                conductor_token_no::text AS conductor_code,
+                deleted,
+                status
             FROM waybills
-            WHERE vehicle_no ILIKE $1 OR waybill_id::text ILIKE $1 OR schedule_no ILIKE $1
-            ORDER BY vehicle_no, updated_at DESC
-        ";
+            WHERE
+                vehicle_no ILIKE $1
+                OR waybill_id::text ILIKE $1
+                OR schedule_no ILIKE $1
+            ORDER BY vehicle_no, updated_at DESC;
+        "#;
 
         match sqlx::query_as::<_, VehicleData>(query_sql)
             .bind(&search_pattern)
@@ -1077,7 +1304,9 @@ impl VehicleDataReader for DBVehicleReader {
 
         for vehicle_no in &vehicle_nos {
             // For get_vehicles_by_ids, we don't have trip_number, so use None
-            if let Some((cached_data, _timestamp)) = self.get_cached_vehicle_data(vehicle_no, None).await {
+            if let Some((cached_data, _timestamp)) =
+                self.get_cached_vehicle_data(vehicle_no, None).await
+            {
                 found_vehicles.push(cached_data);
             } else {
                 uncached_vehicle_nos.push(vehicle_no.clone());
@@ -1096,13 +1325,24 @@ impl VehicleDataReader for DBVehicleReader {
         let placeholders_str = placeholders.join(",");
 
         let query = format!(
-            "SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date, driver_token_no::text as driver_code, conductor_token_no::text as conductor_code
-             FROM waybills
-             WHERE vehicle_no IN ({})
-             ORDER BY updated_at DESC",
+            r#"
+            SELECT
+                waybill_id::text,
+                service_type,
+                vehicle_no,
+                schedule_no,
+                updated_at::timestamptz AS last_updated,
+                duty_date,
+                driver_token_no::text AS driver_code,
+                conductor_token_no::text AS conductor_code,
+                deleted,
+                status
+            FROM waybills
+            WHERE vehicle_no IN ({})
+            ORDER BY updated_at DESC
+            "#,
             placeholders_str
         );
-
         // Execute the batch query
         let mut query_builder = sqlx::query_as::<_, VehicleData>(&query);
         for vehicle_no in &uncached_vehicle_nos {
@@ -1180,6 +1420,9 @@ impl VehicleDataReader for DBVehicleReader {
                 entity_remark: None,
                 driver_code: vehicle_data.driver_code,
                 conductor_code: vehicle_data.conductor_code,
+                deleted: vehicle_data.deleted,
+                status: vehicle_data.status,
+                schedule_details: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {
@@ -1212,7 +1455,10 @@ impl VehicleDataReader for DBVehicleReader {
         }
     }
 
-    async fn get_vehicles_by_depot_name(&self, depot_name: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+    async fn get_vehicles_by_depot_name(
+        &self,
+        depot_name: &str,
+    ) -> AppResult<Vec<DepotVehicleSummary>> {
         // Check cache first
         {
             let cache = self.depot_cache.read().await;
@@ -1236,7 +1482,9 @@ impl VehicleDataReader for DBVehicleReader {
                 info!("get_vehicles_by_depot_name rows={}", v.len());
                 // Update cache
                 let mut cache = self.depot_cache.write().await;
-                cache.vehicles_by_depot_name.insert(depot_name.to_string(), (v.clone(), SystemTime::now()));
+                cache
+                    .vehicles_by_depot_name
+                    .insert(depot_name.to_string(), (v.clone(), SystemTime::now()));
                 Ok(v)
             }
             Err(e) => {
@@ -1245,8 +1493,11 @@ impl VehicleDataReader for DBVehicleReader {
             }
         }
     }
-    
-    async fn get_vehicles_by_depot_id(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleSummary>> {
+
+    async fn get_vehicles_by_depot_id(
+        &self,
+        depot_id: &str,
+    ) -> AppResult<Vec<DepotVehicleSummary>> {
         // Check cache first
         {
             let cache = self.depot_cache.read().await;
@@ -1259,9 +1510,10 @@ impl VehicleDataReader for DBVehicleReader {
         }
 
         debug!("Depot cache MISS for depot_id: {}", depot_id);
-        let depot_id_int = depot_id.parse::<i64>()
+        let depot_id_int = depot_id
+            .parse::<i64>()
             .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
-        
+
         // Keep columns and aliasing the same as get_vehicles_by_depot_name
         let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles WHERE vehicles.entity_id = $1 AND fleet_no <> '' LIMIT 1048575"#;
         info!("get_vehicles_by_depot_id query: {}", query);
@@ -1274,7 +1526,9 @@ impl VehicleDataReader for DBVehicleReader {
                 info!("get_vehicles_by_depot_id rows={}", v.len());
                 // Update cache
                 let mut cache = self.depot_cache.write().await;
-                cache.vehicles_by_depot_id.insert(depot_id.to_string(), (v.clone(), SystemTime::now()));
+                cache
+                    .vehicles_by_depot_id
+                    .insert(depot_id.to_string(), (v.clone(), SystemTime::now()));
                 Ok(v)
             }
             Err(e) => {
@@ -1298,7 +1552,10 @@ impl VehicleDataReader for DBVehicleReader {
 
         debug!("Depot cache MISS for depot_names");
         let query = "SELECT DISTINCT entity_name FROM entities LIMIT 1048575";
-        match sqlx::query_as::<_, (Option<String>,)>(query).fetch_all(&self.pool).await {
+        match sqlx::query_as::<_, (Option<String>,)>(query)
+            .fetch_all(&self.pool)
+            .await
+        {
             Ok(rows) => {
                 let names: Vec<String> = rows.into_iter().filter_map(|r| r.0).collect();
                 // Update cache
@@ -1327,9 +1584,15 @@ impl VehicleDataReader for DBVehicleReader {
 
         debug!("Depot cache MISS for depot_ids");
         let query = "SELECT DISTINCT entity_id FROM entities LIMIT 1048575";
-        match sqlx::query_as::<_, (Option<i64>,)>(query).fetch_all(&self.pool).await {
+        match sqlx::query_as::<_, (Option<i64>,)>(query)
+            .fetch_all(&self.pool)
+            .await
+        {
             Ok(rows) => {
-                let ids: Vec<String> = rows.into_iter().filter_map(|r| r.0.map(|id| id.to_string())).collect();
+                let ids: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|r| r.0.map(|id| id.to_string()))
+                    .collect();
                 // Update cache
                 let mut cache = self.depot_cache.write().await;
                 cache.depot_ids = Some((ids.clone(), SystemTime::now()));
@@ -1355,9 +1618,10 @@ impl VehicleDataReader for DBVehicleReader {
         }
 
         debug!("Depot cache MISS for depot_name_by_id: {}", depot_id);
-        let depot_id_int = depot_id.parse::<i32>()
+        let depot_id_int = depot_id
+            .parse::<i32>()
             .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
-        
+
         let query = r#"SELECT entity_name FROM entities WHERE entity_id = $1"#;
         match sqlx::query_as::<_, (String,)>(query)
             .bind(depot_id_int)
@@ -1365,15 +1629,26 @@ impl VehicleDataReader for DBVehicleReader {
             .await
         {
             Ok((depot_name,)) => {
-                info!("get_depot_name_by_id: depot_id={}, depot_name={}", depot_id, depot_name);
+                info!(
+                    "get_depot_name_by_id: depot_id={}, depot_name={}",
+                    depot_id, depot_name
+                );
                 // Update cache
                 let mut cache = self.depot_cache.write().await;
-                cache.depot_name_by_id.insert(depot_id.clone(), (depot_name.clone(), SystemTime::now()));
+                cache
+                    .depot_name_by_id
+                    .insert(depot_id.clone(), (depot_name.clone(), SystemTime::now()));
                 Ok(depot_name)
             }
             Err(e) => {
-                error!("get_depot_name_by_id query failed for depot_id {}: {}", depot_id, e);
-                Err(AppError::NotFound(format!("Depot with id {} not found", depot_id)))
+                error!(
+                    "get_depot_name_by_id query failed for depot_id {}: {}",
+                    depot_id, e
+                );
+                Err(AppError::NotFound(format!(
+                    "Depot with id {} not found",
+                    depot_id
+                )))
             }
         }
     }

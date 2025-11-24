@@ -68,7 +68,6 @@ pub struct GetAllVehiclesByIdsRequest {
     pub vehicle_ids: Vec<String>,
 }
 
-
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
         actix_web::web::scope("")
@@ -184,25 +183,23 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/getVehiclesFrom",
                 actix_web::web::get().to(get_vehicles_by_depot_query),
             )
-            .route(
-                "/depotNames",
-                actix_web::web::get().to(get_depot_names)
-            )
-            .route(
-                "/depotIds",
-                actix_web::web::get().to(get_depot_ids)
-            )
+            .route("/depotNames", actix_web::web::get().to(get_depot_names))
+            .route("/depotIds", actix_web::web::get().to(get_depot_ids))
             .route(
                 "/getDepotNameById/{depot_id}",
-                actix_web::web::get().to(get_depot_name_by_id)
+                actix_web::web::get().to(get_depot_name_by_id),
             )
             .route(
                 "/depotDataCache/clear",
-                actix_web::web::post().to(clear_depot_cache)
+                actix_web::web::post().to(clear_depot_cache),
             )
             .route(
                 "/vehicle-operation-data/{fleet_no}",
-                actix_web::web::get().to(get_vehicle_operation_data)
+                actix_web::web::get().to(get_vehicle_operation_data),
+            )
+            .route(
+                "/getVehicle/{vehicle_no}",
+                actix_web::web::get().to(get_vehicle_data_eta),
             ),
     );
 }
@@ -249,6 +246,20 @@ async fn get_routes_by_ids(
     Ok(HttpResponse::Ok().json(routes))
 }
 
+async fn get_vehicle_data_eta(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let vehicle_no = path.into_inner();
+
+    let vehicle_data = app_state
+        .db_vehicle_reader
+        .get_vehicle_data(&vehicle_no, None)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(vehicle_data))
+}
+
 async fn get_conductor_by_phone_number(
     app_state: Data<AppState>,
     path: Path<String>,
@@ -290,23 +301,37 @@ async fn get_vehicles_by_depot_query(
 
     if let Some(depot_name_raw) = q.get("depotName") {
         let depot_name = strip_surrounding_quotes(depot_name_raw);
-        info!("getVehiclesFrom depotName='{}' (raw='{}')", depot_name, depot_name_raw);
+        info!(
+            "getVehiclesFrom depotName='{}' (raw='{}')",
+            depot_name, depot_name_raw
+        );
         let vehicles = app_state
             .db_vehicle_reader
             .get_vehicles_by_depot_name(&depot_name)
             .await?;
-        info!("handler received {} vehicles for depotName='{}'", vehicles.len(), depot_name);
+        info!(
+            "handler received {} vehicles for depotName='{}'",
+            vehicles.len(),
+            depot_name
+        );
         return Ok(HttpResponse::Ok().json(vehicles));
     }
 
     if let Some(depot_id_raw) = q.get("depotId") {
         let depot_id_str = strip_surrounding_quotes(depot_id_raw);
-        info!("getVehiclesFrom depotId_raw='{}' depotId_str='{}'", depot_id_raw, depot_id_str);
+        info!(
+            "getVehiclesFrom depotId_raw='{}' depotId_str='{}'",
+            depot_id_raw, depot_id_str
+        );
         let vehicles = app_state
             .db_vehicle_reader
             .get_vehicles_by_depot_id(&depot_id_str)
             .await?;
-        info!("handler received {} vehicles for depotId={}", vehicles.len(), depot_id_str);
+        info!(
+            "handler received {} vehicles for depotId={}",
+            vehicles.len(),
+            depot_id_str
+        );
         return Ok(HttpResponse::Ok().json(vehicles));
     }
 
@@ -329,7 +354,10 @@ async fn get_depot_name_by_id(
 ) -> AppResult<HttpResponse> {
     let depot_id_str = path.into_inner();
     let depot_id: String = strip_surrounding_quotes(&depot_id_str).to_string();
-    let depot_name = app_state.db_vehicle_reader.get_depot_name_by_id(depot_id).await?;
+    let depot_name = app_state
+        .db_vehicle_reader
+        .get_depot_name_by_id(depot_id)
+        .await?;
     Ok(HttpResponse::Ok().json(depot_name))
 }
 
@@ -345,7 +373,10 @@ async fn get_vehicle_operation_data(
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
     let fleet_no = path.into_inner();
-    let operation_data = app_state.db_vehicle_reader.get_vehicle_operation_data(&fleet_no).await?;
+    let operation_data = app_state
+        .db_vehicle_reader
+        .get_vehicle_operation_data(&fleet_no)
+        .await?;
     Ok(HttpResponse::Ok().json(operation_data))
 }
 
@@ -580,11 +611,14 @@ async fn get_service_type_by_vehicle_impl(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let gtfs_id = gtfs_id.unwrap_or("chennai_bus"); // todo: remove this once API is migrated
-    
+
     // First, try to get vehicle_no from bus registration mapping using gtfs_id and short_name (path)
     let vehicle_no = if let Some(gtfs_mapping) = app_state.bus_registration_mapping.get(gtfs_id) {
         if let Some(mapped_vehicle_no) = gtfs_mapping.get(path) {
-            info!("Found vehicle_no {} for gtfs_id {} and short_name {} in mapping", mapped_vehicle_no, gtfs_id, path);
+            info!(
+                "Found vehicle_no {} for gtfs_id {} and short_name {} in mapping",
+                mapped_vehicle_no, gtfs_id, path
+            );
             mapped_vehicle_no.as_str()
         } else {
             // Not found in mapping, use path as vehicle_no (existing behavior)
@@ -632,6 +666,11 @@ async fn get_service_type_by_vehicle_impl(
                     route_number: cached_data.route_number.clone(),
                     stops_count: Some(stops_len),
                     is_active_trip: Some(cached_data.is_active_trip),
+                    schedule_trip_id: cached_data.schedule_trip_id,
+                    start_time: cached_data.start_time,
+                    end_time: cached_data.end_time,
+                    deleted: cached_data.deleted,
+                    trip_order: cached_data.trip_order,
                 }]);
             }
 

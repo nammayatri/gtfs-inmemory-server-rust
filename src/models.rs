@@ -12,6 +12,7 @@ pub struct Gate {
     pub lat: f64,
     pub lon: f64,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VehicleData {
     pub waybill_id: String,
@@ -25,6 +26,8 @@ pub struct VehicleData {
     pub entity_remark: Option<String>,
     pub driver_code: Option<String>,
     pub conductor_code: Option<String>,
+    pub deleted: Option<bool>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -51,6 +54,9 @@ pub struct VehicleDataWithRouteId {
     pub entity_remark: Option<String>,
     pub driver_code: Option<String>,
     pub conductor_code: Option<String>,
+    pub deleted: Option<bool>,
+    pub status: Option<String>,
+    pub schedule_details: Option<HashMap<i64, Vec<BusSchedule>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -85,6 +91,15 @@ pub struct BusSchedule {
     pub stops_count: Option<i32>,
     #[sqlx(default)]
     pub is_active_trip: Option<bool>,
+    #[serde(rename = "scheduleTripId")]
+    pub schedule_trip_id: Option<i64>,
+    #[serde(rename = "startTime")]
+    pub start_time: Option<String>,
+    #[serde(rename = "endTime")]
+    pub end_time: Option<String>,
+    pub deleted: Option<bool>,
+    #[serde(rename = "tripOrder")]
+    pub trip_order: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
