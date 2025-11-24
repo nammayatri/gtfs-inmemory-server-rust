@@ -48,6 +48,11 @@ pub struct CachedVehicleData {
     pub depot: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub service_type: Option<String>,
+    pub schedule_trip_id: Option<i64>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub deleted: Option<bool>,
+    pub trip_order: Option<i32>,
 }
 
 pub struct BhubaneswarVehicleCache {
@@ -87,32 +92,26 @@ impl BhubaneswarVehicleCache {
         Ok(())
     }
 
-    pub async fn get_vehicle_data(
-        &self,
-        vehicle_no: &str,
-    ) -> Option<CachedVehicleData> {
+    pub async fn get_vehicle_data(&self, vehicle_no: &str) -> Option<CachedVehicleData> {
         let cache = self.cache.read().await;
         cache.get(vehicle_no).cloned()
     }
 
     pub async fn update_cache(&self) -> AppResult<()> {
         info!("Updating Bhubaneswar vehicle cache from external API...");
-        
+
         let mut request = self.http_client.get(&self.external_api_url);
-        
+
         if let Some(ref auth_header) = self.external_auth_header {
             request = request.header("externalauth", auth_header);
         } else {
             warn!("No external auth header configured for Bhubaneswar vehicle cache");
         }
-        
-        let response = request
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch data from external API: {}", e);
-                AppError::Internal(format!("Failed to fetch data from external API: {}", e))
-            })?;
+
+        let response = request.send().await.map_err(|e| {
+            error!("Failed to fetch data from external API: {}", e);
+            AppError::Internal(format!("Failed to fetch data from external API: {}", e))
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -124,19 +123,17 @@ impl BhubaneswarVehicleCache {
         }
 
         // The API returns a direct array
-        let vehicles: Vec<ExternalApiVehicle> = response
-            .json()
-            .await
-            .map_err(|e| {
-                error!("Failed to parse external API response: {}", e);
-                AppError::Internal(format!("Failed to parse external API response: {}", e))
-            })?;
-        
+        let vehicles: Vec<ExternalApiVehicle> = response.json().await.map_err(|e| {
+            error!("Failed to parse external API response: {}", e);
+            AppError::Internal(format!("Failed to parse external API response: {}", e))
+        })?;
+
         info!("Fetched {} vehicles from external API", vehicles.len());
-        
+
         // Log a sample vehicle for debugging
         if let Some(sample_vehicle) = vehicles.first() {
-            info!("Sample vehicle data: vehicle_no={}, route_id={}, route_name={}, waybill={}", 
+            info!(
+                "Sample vehicle data: vehicle_no={}, route_id={}, route_name={}, waybill={}",
                 sample_vehicle.vehicle_no,
                 sample_vehicle.route_id,
                 sample_vehicle.route_name,
@@ -153,7 +150,7 @@ impl BhubaneswarVehicleCache {
         for vehicle in vehicles {
             // Get service_type from route_service_tier_mapping.csv based on route_id
             let service_type = route_mapping.get(&vehicle.route_id).cloned();
-            
+
             // Derive schedule_no from service_type
             // AC -> starts with "Z-", NON_AC -> starts with "OS-"
             let schedule_no = service_type.as_ref().map(|st| {
@@ -170,11 +167,16 @@ impl BhubaneswarVehicleCache {
                 route_number: Some(vehicle.route_name.clone()),
                 waybill_no,
                 schedule_no,
-                trip_number: None, // Optional, not provided by API
-                is_active_trip: true, // API only returns active trips
-                depot: None, // Not provided by API
+                trip_number: None,              // Optional, not provided by API
+                is_active_trip: true,           // API only returns active trips
+                depot: None,                    // Not provided by API
                 last_updated: Some(Utc::now()), // Use current time since API doesn't provide it
                 service_type,
+                schedule_trip_id: None,
+                start_time: None,
+                end_time: None,
+                deleted: None,
+                trip_order: None,
             };
 
             cache.insert(vehicle.vehicle_no, cached_data);
@@ -222,7 +224,10 @@ impl BhubaneswarVehicleCache {
     pub async fn start_background_update_task(self: Arc<Self>) {
         let interval_secs = self.update_interval_secs;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        info!("Starting Bhubaneswar vehicle cache background update task with interval: {} seconds", interval_secs);
+        info!(
+            "Starting Bhubaneswar vehicle cache background update task with interval: {} seconds",
+            interval_secs
+        );
         loop {
             interval.tick().await;
             if let Err(e) = self.update_cache().await {
@@ -231,5 +236,3 @@ impl BhubaneswarVehicleCache {
         }
     }
 }
-
-
