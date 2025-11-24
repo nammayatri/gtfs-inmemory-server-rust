@@ -566,8 +566,21 @@ async fn get_service_type_by_vehicle_impl(
     path: &str,
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
-    let vehicle_no = path;
     let gtfs_id = gtfs_id.unwrap_or("chennai_bus"); // todo: remove this once API is migrated
+    
+    // First, try to get vehicle_no from bus registration mapping using gtfs_id and short_name (path)
+    let vehicle_no = if let Some(gtfs_mapping) = app_state.bus_registration_mapping.get(gtfs_id) {
+        if let Some(mapped_vehicle_no) = gtfs_mapping.get(path) {
+            info!("Found vehicle_no {} for gtfs_id {} and short_name {} in mapping", mapped_vehicle_no, gtfs_id, path);
+            mapped_vehicle_no.as_str()
+        } else {
+            // Not found in mapping, use path as vehicle_no (existing behavior)
+            path
+        }
+    } else {
+        // No mapping for this gtfs_id, use path as vehicle_no (existing behavior)
+        path
+    };
 
     // Check if this is bhubaneshwar_bus and use cache instead of DB
     if gtfs_id == "bhubaneshwar_bus" {

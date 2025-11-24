@@ -372,6 +372,13 @@ pub struct MinimalEmployee {
     pub depot_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusRegistrationMappingRecord {
+    pub gtfs_id: String,
+    pub vehicle_no: String,
+    pub short_name: String,
+}
+
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {
         "METRO".to_string()

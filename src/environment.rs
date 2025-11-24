@@ -1,8 +1,12 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use csv::ReaderBuilder;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 
 use crate::services::{
     bhubaneswar_vehicle_cache::BhubaneswarVehicleCache,
@@ -117,6 +121,7 @@ pub struct AppState {
     pub trip_service: Arc<TripService>,
     pub bhubaneswar_vehicle_cache: Arc<BhubaneswarVehicleCache>,
     pub config: AppConfig,
+    pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -174,6 +179,9 @@ impl AppState {
         bhubaneswar_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
         let bhubaneswar_vehicle_cache = Arc::new(bhubaneswar_vehicle_cache);
 
+        // Load bus registration mapping from CSV
+        let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
+
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
@@ -181,8 +189,55 @@ impl AppState {
             trip_service,
             bhubaneswar_vehicle_cache,
             config: app_config,
+            bus_registration_mapping,
         };
 
         Ok(app_state)
+    }
+
+    async fn load_bus_registration_mapping() -> Result<HashMap<String, HashMap<String, String>>> {
+        use crate::models::BusRegistrationMappingRecord;
+        
+        let file_path = "./assets/bus_registration_mapping.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                info!("bus_registration_mapping.csv file not found, proceeding without bus registration mapping data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read CSV file: {}", e))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let record: BusRegistrationMappingRecord = record;
+                    mapping
+                        .entry(record.gtfs_id)
+                        .or_insert_with(HashMap::new)
+                        .insert(record.short_name, record.vehicle_no);
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+
+        info!(
+            "Loaded bus registration mapping for {} GTFS IDs from CSV",
+            mapping.len()
+        );
+        Ok(mapping)
     }
 }
