@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
-use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary};
+use crate::models::{BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary, VehicleOperationData};
 use crate::tools::error::{AppError, AppResult};
 
 // Depot cache structure
@@ -41,6 +41,7 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
     async fn clear_depot_cache(&self) -> AppResult<()>;
+    async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
 }
 
 // Mock implementation for local testing without a database
@@ -135,9 +136,14 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
-
     async fn clear_depot_cache(&self) -> AppResult<()> {
         Ok(())
+    }
+
+    async fn get_vehicle_operation_data(&self, _fleet_no: &str) -> AppResult<VehicleOperationData> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 }
 
@@ -1381,5 +1387,49 @@ impl VehicleDataReader for DBVehicleReader {
         cache.vehicles_by_depot_id.clear();
         info!("Depot cache cleared successfully");
         Ok(())
+    }
+
+    async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData> {
+        // First try to get data from waybills with status = 'Online'
+        let waybill_query = r#"SELECT w.waybill_id::text, w.waybill_no::text, w.entity_id::text AS depot_id, e.entity_name AS depot_name, w.conductor_token_no::text AS conductor_code, w.driver_token_no::text AS driver_code, w.schedule_no FROM waybills w LEFT JOIN entities e ON e.entity_id = w.entity_id WHERE w.vehicle_no = $1 AND w.status = 'Online' LIMIT 1"#;
+
+        match sqlx::query_as::<_, VehicleOperationData>(waybill_query)
+            .bind(fleet_no)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(data)) => {
+                info!("get_vehicle_operation_data: Found online waybill for fleet_no={}", fleet_no);
+                return Ok(data);
+            }
+            Ok(None) => {
+                debug!("get_vehicle_operation_data: No online waybill found for fleet_no={}, checking vehicles table", fleet_no);
+            }
+            Err(e) => {
+                error!("get_vehicle_operation_data: waybill query failed for fleet_no={}: {}", fleet_no, e);
+            }
+        }
+
+        // Fallback to vehicles table if waybill not found or query failed
+        let vehicles_query = r#"SELECT NULL::text AS waybill_id, NULL::text AS waybill_no, v.entity_id::text AS depot_id, e.entity_name AS depot_name, NULL::text AS conductor_code, NULL::text AS driver_code, NULL::text as schedule_no FROM vehicles v LEFT JOIN entities e ON e.entity_id = v.entity_id WHERE v.fleet_no = $1 LIMIT 1;"#;
+
+        match sqlx::query_as::<_, VehicleOperationData>(vehicles_query)
+            .bind(fleet_no)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(data)) => {
+                info!("get_vehicle_operation_data: Found vehicle data for fleet_no={}", fleet_no);
+                Ok(data)
+            }
+            Ok(None) => {
+                error!("get_vehicle_operation_data: No data found for fleet_no={}", fleet_no);
+                Err(AppError::NotFound(format!("No operation data found for fleet_no: {}", fleet_no)))
+            }
+            Err(e) => {
+                error!("get_vehicle_operation_data: vehicles query failed for fleet_no={}: {}", fleet_no, e);
+                Err(AppError::Internal(format!("Database query failed: {}", e)))
+            }
+        }
     }
 }
