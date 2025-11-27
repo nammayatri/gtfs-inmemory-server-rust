@@ -23,6 +23,8 @@ pub struct VehicleData {
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<String>,
     pub schedule_trip_id: Option<String>,
+    #[sqlx(default)]
+    pub is_flexi: Option<bool>,
     pub entity_remark: Option<String>,
     pub driver_code: Option<String>,
     pub conductor_code: Option<String>,
