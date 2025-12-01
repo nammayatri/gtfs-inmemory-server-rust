@@ -371,13 +371,61 @@ impl DBVehicleReader {
             }
         };
 
-        match result {
-            Some(vehicle_data) => {
-                info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
-                let bus_schedule_trip_detail_query: String = if let Some(trip_number) = trip_number
+        let vehicle_data = match result {
+            Some(vehicle_data) => vehicle_data,
+            None => {
+                // Try to find waybill with status 'Processed' or 'New' (priority to 'Processed')
+                let waybill_fallback_query = r#"
+                    SELECT 
+                        w.waybill_id::text, 
+                        w.waybill_no::text, 
+                        w.service_type, 
+                        w.vehicle_no,
+                        w.schedule_no,
+                        w.updated_at::timestamptz AS last_updated,
+                        w.duty_date,
+                        w.schedule_trip_id::text,
+                        e.entity_remark::text AS entity_remark,
+                        w.driver_token_no::text AS driver_code,
+                        w.conductor_token_no::text AS conductor_code,
+                        w.deleted AS deleted,
+                        w.status AS status
+                    FROM waybills w
+                    LEFT JOIN entities e on e.entity_id = w.entity_id
+                    WHERE w.vehicle_no = $1
+                        AND w.status IN ('Processed', 'New')
+                    ORDER BY 
+                        CASE WHEN w.status = 'Processed' THEN 1 ELSE 2 END,
+                        w.updated_at DESC
+                    LIMIT 1
+                "#;
+
+                match sqlx::query_as::<_, VehicleData>(waybill_fallback_query)
+                    .bind(vehicle_no)
+                    .fetch_optional(pool)
+                    .await
                 {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
-                } else {
+                    Ok(Some(fallback_data)) => fallback_data,
+                    Ok(None) | Err(_) => {
+                        return Err(AppError::NotFound(format!(
+                            "No waybill found for vehicle: {}",
+                            vehicle_no
+                        )));
+                    }
+                }
+            }
+        };
+        
+        info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
+        
+        // For fallback waybills (Processed/New), always get the first trip
+        let use_first_trip = vehicle_data.status.as_ref().map_or(false, |s| s == "Processed" || s == "New");
+        
+        let bus_schedule_trip_detail_query: String = if use_first_trip {
+            "SELECT NULL::int AS stops_count, route_number_id::text AS route_id, schedule_number, org_name::text AS org_name, trip_number FROM bus_schedule_trip_detail WHERE schedule_trip_id = $1::bigint ORDER BY trip_number ASC LIMIT 1".to_string()
+        } else if let Some(trip_number) = trip_number {
+            format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
+        } else {
                     "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
                 };
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
@@ -548,82 +596,6 @@ impl DBVehicleReader {
                     vehicle_data_with_route_id.route_number = schedule.route_number.clone();
                 }
                 Ok(vehicle_data_with_route_id)
-            }
-            None => {
-                let waybill_status_agnostic_query = "
-                    SELECT w.vehicle_no, w.service_type
-                    FROM waybills w
-                    WHERE w.vehicle_no = $1            
-                    ORDER BY w.updated_at DESC
-                    LIMIT 1
-                ";
-
-                let minimal_vehicle_data =
-                    match sqlx::query_as::<_, MinimalVehicleData>(waybill_status_agnostic_query)
-                        .bind(vehicle_no)
-                        .fetch_optional(pool)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!(
-                                "Waybill Status Agnostic query failed for {}: {}",
-                                vehicle_no, e
-                            );
-                            None
-                        }
-                    };
-
-                let vehicle_data_with_route_id =
-                    if let Some(minimal_vehicle_data) = minimal_vehicle_data {
-                        VehicleDataWithRouteId {
-                            waybill_id: None,
-                            waybill_no: None,
-                            service_type: Some(minimal_vehicle_data.service_type),
-                            vehicle_no: minimal_vehicle_data.vehicle_no.to_string(),
-                            schedule_no: None,
-                            last_updated: None,
-                            duty_date: None,
-                            route_id: None,
-                            route_number: None,
-                            depot: None,
-                            trip_number: None,
-                            is_active_trip: false,
-                            remaining_trip_details: None,
-                            entity_remark: None,
-                            driver_code: None,
-                            conductor_code: None,
-                            deleted: None,
-                            status: None,
-                            schedule_details: None,
-                        }
-                    } else {
-                        VehicleDataWithRouteId {
-                            waybill_id: None,
-                            waybill_no: None,
-                            service_type: None,
-                            vehicle_no: vehicle_no.to_string(),
-                            schedule_no: None,
-                            last_updated: None,
-                            duty_date: None,
-                            route_id: None,
-                            route_number: None,
-                            depot: None,
-                            trip_number: None,
-                            is_active_trip: false,
-                            remaining_trip_details: None,
-                            entity_remark: None,
-                            driver_code: None,
-                            conductor_code: None,
-                            deleted: None,
-                            status: None,
-                            schedule_details: None,
-                        }
-                    };
-
-                Ok(vehicle_data_with_route_id)
-            }
-        }
     }
 
     async fn enrich_route_numbers_with_pool(
@@ -909,11 +881,144 @@ impl VehicleDataReader for DBVehicleReader {
         };
 
         let mut schedule_map: HashMap<i64, Vec<BusSchedule>> = HashMap::new();
-        match result {
-            Some(vehicle_data) => {
-                info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
-                let bus_schedule_trip_detail_query: String = if let Some(trip_number) = trip_number
+        let vehicle_data = match result {
+            Some(vehicle_data) => vehicle_data,
+            None => {
+                // Try to find waybill with status 'Processed' or 'New' (priority to 'Processed')
+                let waybill_fallback_query = r#"
+                    SELECT 
+                        w.waybill_id::text, 
+                        w.waybill_no::text, 
+                        w.service_type, 
+                        w.vehicle_no,
+                        w.schedule_no,
+                        w.updated_at::timestamptz AS last_updated,
+                        w.duty_date,
+                        w.schedule_trip_id::text,
+                        e.entity_remark::text AS entity_remark,
+                        w.driver_token_no::text AS driver_code,
+                        w.conductor_token_no::text AS conductor_code,
+                        w.deleted AS deleted,
+                        w.status AS status
+                    FROM waybills w
+                    LEFT JOIN entities e on e.entity_id = w.entity_id
+                    WHERE w.vehicle_no = $1
+                        AND w.status IN ('Processed', 'New')
+                    ORDER BY 
+                        CASE WHEN w.status = 'Processed' THEN 1 ELSE 2 END,
+                        w.updated_at DESC
+                    LIMIT 1
+                "#;
+
+                match sqlx::query_as::<_, VehicleData>(waybill_fallback_query)
+                    .bind(vehicle_no)
+                    .fetch_optional(&self.pool)
+                    .await
                 {
+                    Ok(Some(fallback_data)) => fallback_data,
+                    Ok(None) | Err(_) => {
+                        // No waybill found with any of the desired statuses or query failed
+                        // Proceed with existing fallback logic
+                        let waybill_status_agnostic_query = "
+                            SELECT w.vehicle_no, w.service_type
+                            FROM waybills w
+                            WHERE w.vehicle_no = $1            
+                            ORDER BY w.updated_at DESC
+                            LIMIT 1
+                        ";
+
+                        let minimal_vehicle_data =
+                            match sqlx::query_as::<_, MinimalVehicleData>(waybill_status_agnostic_query)
+                                .bind(vehicle_no)
+                                .fetch_optional(&self.pool)
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!(
+                                        "Waybill Status Agnostic query failed for {}: {}",
+                                        vehicle_no, e
+                                    );
+                                    None
+                                }
+                            };
+
+                        let vehicle_data_with_route_id =
+                            if let Some(minimal_vehicle_data) = minimal_vehicle_data {
+                                VehicleDataWithRouteId {
+                                    waybill_id: None,
+                                    waybill_no: None,
+                                    service_type: Some(minimal_vehicle_data.service_type),
+                                    vehicle_no: minimal_vehicle_data.vehicle_no.to_string(),
+                                    schedule_no: None,
+                                    last_updated: None,
+                                    duty_date: None,
+                                    route_id: None,
+                                    route_number: None,
+                                    depot: None,
+                                    trip_number: None,
+                                    is_active_trip: false,
+                                    remaining_trip_details: None,
+                                    entity_remark: None,
+                                    driver_code: None,
+                                    conductor_code: None,
+                                    deleted: None,
+                                    status: None,
+                                    schedule_details: None,
+                                }
+                            } else {
+                                VehicleDataWithRouteId {
+                                    waybill_id: None,
+                                    waybill_no: None,
+                                    service_type: None,
+                                    vehicle_no: vehicle_no.to_string(),
+                                    schedule_no: None,
+                                    last_updated: None,
+                                    duty_date: None,
+                                    route_id: None,
+                                    route_number: None,
+                                    depot: None,
+                                    trip_number: None,
+                                    is_active_trip: false,
+                                    remaining_trip_details: None,
+                                    entity_remark: None,
+                                    driver_code: None,
+                                    conductor_code: None,
+                                    deleted: None,
+                                    schedule_details: None,
+                                    status: None,
+                                }
+                            };
+
+                        return Ok(vehicle_data_with_route_id);
+                    }
+                }
+            }
+        };
+        
+        info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
+        // For fallback waybills (Processed/New), always get the first trip
+        let use_first_trip = vehicle_data.status.as_ref().map_or(false, |s| s == "Processed" || s == "New");
+        
+        let bus_schedule_trip_detail_query: String = if use_first_trip {
+                    r#"
+                    SELECT 
+                        NULL::int AS stops_count, 
+                        route_number_id::text AS route_id,
+                        schedule_number,
+                        org_name::text AS org_name, 
+                        trip_number,
+                        schedule_trip_id,
+                        trip_start_time AS start_time,
+                        trip_end_time AS end_time,
+                        deleted,
+                        is_active_trip,
+                        trip_order
+                    FROM bus_schedule_trip_detail 
+                    WHERE schedule_trip_id = $1::bigint
+                    ORDER BY trip_number ASC
+                    LIMIT 1"#.to_string()
+                } else if let Some(trip_number) = trip_number {
                     format!(
                         r#"
                         SELECT 
@@ -957,7 +1062,26 @@ impl VehicleDataReader for DBVehicleReader {
                                      WHERE schedule_trip_id = $1::bigint AND is_active_trip = true), 1)) 
                     ORDER BY trip_number ASC"#.to_string()
                 };
-                let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
+                let bus_schedule_trip_flexi_query: String = if use_first_trip {
+                    r#"
+                    SELECT
+                        NULL::int AS stops_count,
+                        route_number_id::text AS route_id,
+                        schedule_number,
+                        org_name::text AS org_name,
+                        trip_number,
+                        schedule_trip_id,
+                        trip_start_time AS start_time,
+                        trip_end_time AS end_time,
+                        deleted,
+                        is_active_trip,
+                        trip_order
+                    FROM bus_schedule_trip_flexi
+                    WHERE schedule_trip_id = $1::bigint
+                    ORDER BY trip_number ASC
+                    LIMIT 1
+                    "#.to_string()
+                } else if let Some(trip_number) = trip_number {
                     format!(
                         r#"
                         SELECT
@@ -1114,82 +1238,6 @@ impl VehicleDataReader for DBVehicleReader {
                 }
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
-            }
-            None => {
-                let waybill_status_agnostic_query = "
-                    SELECT w.vehicle_no, w.service_type
-                    FROM waybills w
-                    WHERE w.vehicle_no = $1            
-                    ORDER BY w.updated_at DESC
-                    LIMIT 1
-                ";
-
-                let minimal_vehicle_data =
-                    match sqlx::query_as::<_, MinimalVehicleData>(waybill_status_agnostic_query)
-                        .bind(vehicle_no)
-                        .fetch_optional(&self.pool)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!(
-                                "Waybill Status Agnostic query failed for {}: {}",
-                                vehicle_no, e
-                            );
-                            None
-                        }
-                    };
-
-                let vehicle_data_with_route_id =
-                    if let Some(minimal_vehicle_data) = minimal_vehicle_data {
-                        VehicleDataWithRouteId {
-                            waybill_id: None,
-                            waybill_no: None,
-                            service_type: Some(minimal_vehicle_data.service_type),
-                            vehicle_no: minimal_vehicle_data.vehicle_no.to_string(),
-                            schedule_no: None,
-                            last_updated: None,
-                            duty_date: None,
-                            route_id: None,
-                            route_number: None,
-                            depot: None,
-                            trip_number: None,
-                            is_active_trip: false,
-                            remaining_trip_details: None,
-                            entity_remark: None,
-                            driver_code: None,
-                            conductor_code: None,
-                            deleted: None,
-                            status: None,
-                            schedule_details: None,
-                        }
-                    } else {
-                        VehicleDataWithRouteId {
-                            waybill_id: None,
-                            waybill_no: None,
-                            service_type: None,
-                            vehicle_no: vehicle_no.to_string(),
-                            schedule_no: None,
-                            last_updated: None,
-                            duty_date: None,
-                            route_id: None,
-                            route_number: None,
-                            depot: None,
-                            trip_number: None,
-                            is_active_trip: false,
-                            remaining_trip_details: None,
-                            entity_remark: None,
-                            driver_code: None,
-                            conductor_code: None,
-                            deleted: None,
-                            schedule_details: None,
-                            status: None,
-                        }
-                    };
-
-                Ok(vehicle_data_with_route_id)
-            }
-        }
     }
 
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>> {
@@ -1678,14 +1726,34 @@ impl VehicleDataReader for DBVehicleReader {
                 return Ok(data);
             }
             Ok(None) => {
-                debug!("get_vehicle_operation_data: No online waybill found for fleet_no={}, checking vehicles table", fleet_no);
+                debug!("get_vehicle_operation_data: No online waybill found for fleet_no={}, trying Processed/New waybills", fleet_no);
             }
             Err(e) => {
                 error!("get_vehicle_operation_data: waybill query failed for fleet_no={}: {}", fleet_no, e);
             }
         }
 
-        // Fallback to vehicles table if waybill not found or query failed
+        // Try to find waybill with status 'Processed' or 'New' (priority to 'Processed')
+        let waybill_fallback_query = r#"SELECT w.waybill_id::text, w.waybill_no::text, w.entity_id::text AS depot_id, e.entity_name AS depot_name, w.conductor_token_no::text AS conductor_code, w.driver_token_no::text AS driver_code, w.schedule_no FROM waybills w LEFT JOIN entities e ON e.entity_id = w.entity_id WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New') ORDER BY CASE WHEN w.status = 'Processed' THEN 1 ELSE 2 END, w.updated_at DESC LIMIT 1"#;
+
+        match sqlx::query_as::<_, VehicleOperationData>(waybill_fallback_query)
+            .bind(fleet_no)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(data)) => {
+                info!("get_vehicle_operation_data: Found Processed/New waybill for fleet_no={}", fleet_no);
+                return Ok(data);
+            }
+            Ok(None) => {
+                debug!("get_vehicle_operation_data: No Processed/New waybill found for fleet_no={}, checking vehicles table", fleet_no);
+            }
+            Err(e) => {
+                error!("get_vehicle_operation_data: waybill fallback query failed for fleet_no={}: {}", fleet_no, e);
+            }
+        }
+
+        // Final fallback to vehicles table if no waybill found
         let vehicles_query = r#"SELECT NULL::text AS waybill_id, NULL::text AS waybill_no, v.entity_id::text AS depot_id, e.entity_name AS depot_name, NULL::text AS conductor_code, NULL::text AS driver_code, NULL::text as schedule_no FROM vehicles v LEFT JOIN entities e ON e.entity_id = v.entity_id WHERE v.fleet_no = $1 LIMIT 1;"#;
 
         match sqlx::query_as::<_, VehicleOperationData>(vehicles_query)
