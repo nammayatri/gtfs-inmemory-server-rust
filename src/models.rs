@@ -28,6 +28,7 @@ pub struct VehicleData {
     pub conductor_code: Option<String>,
     pub deleted: Option<bool>,
     pub status: Option<String>,
+    pub is_flexi: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -116,6 +117,13 @@ pub struct VehicleServiceTypeResponse {
     #[serde(rename = "depot")]
     pub depot_no: Option<String>,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WaybillStatus {
+    Online,
+    ProcessedOrNew,
+    NotFound,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
