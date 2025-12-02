@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
 use crate::models::{
-    BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary, VehicleOperationData
+    BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary, VehicleOperationData, WaybillStatus
 };
 use crate::tools::error::{AppError, AppResult};
 
@@ -759,6 +759,326 @@ impl DBVehicleReader {
         }
     }
 
+    /// Query for Online waybills 
+    async fn get_online_waybill(&self, vehicle_no: &str) -> AppResult<Option<VehicleData>> {
+        let online_query = r#"
+            SELECT 
+                w.waybill_id::text, 
+                w.waybill_no::text, 
+                w.service_type, 
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                w.is_flexi,
+                e.entity_remark::text AS entity_remark,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted AS deleted,
+                w.status AS status
+            FROM waybills w
+            LEFT JOIN entities e ON e.entity_id = w.entity_id
+            WHERE w.vehicle_no = $1 AND w.status = 'Online' AND w.deleted = false
+            ORDER BY w.updated_at DESC
+            LIMIT 1
+        "#;
+
+        match sqlx::query_as::<_, VehicleData>(online_query)
+            .bind(vehicle_no)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                error!("Online waybill query failed for {}: {}", vehicle_no, e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Query for Processed/New waybills 
+    async fn get_processed_new_waybill(&self, vehicle_no: &str) -> AppResult<Option<VehicleData>> {
+        let fallback_query = r#"
+            SELECT 
+                w.waybill_id::text, 
+                w.waybill_no::text, 
+                w.service_type, 
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                w.is_flexi,
+                e.entity_remark::text AS entity_remark,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted AS deleted,
+                w.status AS status
+            FROM waybills w
+            LEFT JOIN entities e ON e.entity_id = w.entity_id
+            WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New') AND w.deleted = false
+            ORDER BY CASE 
+                WHEN w.status = 'Processed' THEN 1 
+                WHEN w.status = 'New' THEN 2 
+            END, w.updated_at DESC
+            LIMIT 1
+        "#;
+
+        match sqlx::query_as::<_, VehicleData>(fallback_query)
+            .bind(vehicle_no)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                error!("Processed/New waybill query failed for {}: {}", vehicle_no, e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Split waybill query strategy with priority: Online first, then Processed/New
+    async fn get_waybill_with_priority(&self, vehicle_no: &str) -> AppResult<(Option<VehicleData>, WaybillStatus)> {
+        // Priority 1: Online waybills 
+        if let Some(online_waybill) = self.get_online_waybill(vehicle_no).await? {
+            return Ok((Some(online_waybill), WaybillStatus::Online));
+        }
+        
+        // Priority 2: Processed/New waybills
+        if let Some(processed_waybill) = self.get_processed_new_waybill(vehicle_no).await? {
+            return Ok((Some(processed_waybill), WaybillStatus::ProcessedOrNew));
+        }
+        
+        // No waybill found
+        Ok((None, WaybillStatus::NotFound))
+    }
+
+    /// Handle flexi trips using waybill_id binding
+    async fn handle_flexi_trips(&self, waybill_data: &VehicleData, trip_number: Option<i32>) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+        let flexi_query = if let Some(trip_num) = trip_number {
+            format!(r#"
+                SELECT 
+                    NULL::int AS stops_count, 
+                    route_number_id::text AS route_id,
+                    schedule_number, 
+                    org_name::text AS org_name, 
+                    trip_number,
+                    schedule_trip_id,
+                    trip_start_time AS start_time,
+                    trip_end_time AS end_time,
+                    deleted,
+                    is_active_trip,
+                    trip_order
+                FROM bus_schedule_trip_flexi
+                WHERE waybill_id = $1::bigint AND trip_number >= {}
+                ORDER BY trip_number ASC
+            "#, trip_num)
+        } else {
+            r#"
+                SELECT 
+                    NULL::int AS stops_count, 
+                    route_number_id::text AS route_id,
+                    schedule_number, 
+                    org_name::text AS org_name, 
+                    trip_number,
+                    schedule_trip_id,
+                    trip_start_time AS start_time,
+                    trip_end_time AS end_time,
+                    deleted,
+                    is_active_trip,
+                    trip_order
+                FROM bus_schedule_trip_flexi
+                WHERE waybill_id = $1::bigint
+                ORDER BY trip_number ASC
+            "#.to_string()
+        };
+        
+        let flexi_rows = match sqlx::query_as::<_, BusSchedule>(&flexi_query)
+            .bind(waybill_data.waybill_id.parse::<i64>().unwrap_or(0))
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("Flexi query failed for waybill_id {}: {}", waybill_data.waybill_id, e);
+                Vec::new()
+            }
+        };
+        
+        if !flexi_rows.is_empty() {
+            return self.process_trip_rows(flexi_rows, false).await;
+        }
+        
+        // Fallback to detail trips if no flexi rows
+        self.handle_detail_trips(waybill_data, false, trip_number).await
+    }
+
+    /// Handle detail trips using schedule_trip_id binding
+    async fn handle_detail_trips(&self, waybill_data: &VehicleData, force_first_active: bool, trip_number: Option<i32>) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+        let detail_query = if let Some(trip_num) = trip_number {
+            format!(r#"
+                SELECT 
+                    NULL::int AS stops_count, 
+                    route_number_id::text AS route_id,
+                    schedule_number, 
+                    org_name::text AS org_name, 
+                    trip_number,
+                    schedule_trip_id,
+                    trip_start_time AS start_time,
+                    trip_end_time AS end_time,
+                    deleted,
+                    is_active_trip,
+                    trip_order
+                FROM bus_schedule_trip_detail
+                WHERE schedule_trip_id = $1::bigint AND trip_number >= {}
+                ORDER BY trip_number ASC
+            "#, trip_num)
+        } else {
+            r#"
+                SELECT 
+                    NULL::int AS stops_count, 
+                    route_number_id::text AS route_id,
+                    schedule_number, 
+                    org_name::text AS org_name, 
+                    trip_number,
+                    schedule_trip_id,
+                    trip_start_time AS start_time,
+                    trip_end_time AS end_time,
+                    deleted,
+                    is_active_trip,
+                    trip_order
+                FROM bus_schedule_trip_detail
+                WHERE schedule_trip_id = $1::bigint 
+                    AND trip_number >= (SELECT COALESCE(
+                        (SELECT trip_number FROM bus_schedule_trip_detail 
+                         WHERE schedule_trip_id = $1::bigint AND is_active_trip = true), 1))
+                ORDER BY trip_number ASC
+            "#.to_string()
+        };
+        
+        let detail_rows = match sqlx::query_as::<_, BusSchedule>(&detail_query)
+            .bind(&waybill_data.schedule_trip_id)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("Detail query failed for schedule_trip_id {:?}: {}", waybill_data.schedule_trip_id, e);
+                Vec::new()
+            }
+        };
+        
+        if !detail_rows.is_empty() {
+            return self.process_trip_rows(detail_rows, force_first_active).await;
+        }
+        
+        // Final fallback to bus_schedule table
+        self.handle_schedule_fallback(&waybill_data.schedule_no).await
+    }
+
+    /// Process trip rows with consistent active trip + remaining trips logic
+    async fn process_trip_rows(&self, mut rows: Vec<BusSchedule>, force_first_active: bool) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+        if rows.is_empty() {
+            return Ok((None, false, None));
+        }
+        
+        // Enrich with route numbers
+        self.enrich_route_numbers(&mut rows).await?;
+        
+        if force_first_active {
+            // For Processed/New: First trip becomes active, remaining are only FUTURE trips
+            let first = rows.remove(0);
+            let remaining = if rows.is_empty() { None } else { Some(rows) };
+            Ok((Some(first), true, remaining))
+        } else {
+            // For Online: Respect is_active_trip flags
+            if let Some(active_idx) = rows.iter().position(|r| r.is_active_trip.unwrap_or(false)) {
+                // Remove active trip from list
+                let active_trip = rows.remove(active_idx);
+                
+                // Remaining trips = only trips that come AFTER the active trip (by trip_number)
+                let active_trip_num = active_trip.trip_number.unwrap_or(0);
+                let remaining_trips: Vec<BusSchedule> = rows
+                    .into_iter()
+                    .filter(|trip| trip.trip_number.unwrap_or(0) > active_trip_num)
+                    .collect();
+                
+                let remaining = if remaining_trips.is_empty() { None } else { Some(remaining_trips) };
+                Ok((Some(active_trip), true, remaining))
+            } else {
+                // No active trip, use first and remaining are FUTURE trips
+                let first = rows.remove(0);
+                let remaining = if rows.is_empty() { None } else { Some(rows) };
+                Ok((Some(first), false, remaining))
+            }
+        }
+    }
+
+    /// Handle bus_schedule fallback
+    async fn handle_schedule_fallback(&self, schedule_no: &str) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+        let bus_schedule_query = r#"
+            SELECT 
+                NULL::int AS stops_count, 
+                route_id::text AS route_id, 
+                schedule_number, 
+                NULL::text AS org_name, 
+                NULL::int AS trip_number,
+                NULL::bigint AS schedule_trip_id,
+                NULL::text AS start_time,
+                NULL::text AS end_time,
+                FALSE AS deleted,
+                FALSE AS is_active_trip,
+                NULL::int AS trip_order
+            FROM bus_schedule 
+            WHERE schedule_number = $1 AND deleted = false
+        "#;
+        
+        let mut rows = match sqlx::query_as::<_, BusSchedule>(bus_schedule_query)
+            .bind(schedule_no)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Bus schedule fallback query failed for {}: {}", schedule_no, e);
+                Vec::new()
+            }
+        };
+        
+        if !rows.is_empty() {
+            self.enrich_route_numbers(&mut rows).await?;
+            let first = rows.remove(0);
+            let remaining = if rows.is_empty() { None } else { Some(rows) };
+            Ok((Some(first), false, remaining))
+        } else {
+            Ok((None, false, None))
+        }
+    }
+
+    /// Resolve trip data based on waybill status and is_flexi flag
+    async fn resolve_trip_data(&self, waybill_data: VehicleData, status: WaybillStatus, trip_number: Option<i32>) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+        match status {
+            WaybillStatus::Online => {
+                if waybill_data.is_flexi == Some(true) {
+                    // Flexi branch: Use waybill_id binding
+                    self.handle_flexi_trips(&waybill_data, trip_number).await
+                } else {
+                    // Detail branch: Use schedule_trip_id binding  
+                    self.handle_detail_trips(&waybill_data, false, trip_number).await
+                }
+            }
+            WaybillStatus::ProcessedOrNew => {
+                // Always use detail trips, force first as active
+                self.handle_detail_trips(&waybill_data, true, trip_number).await
+            }
+            WaybillStatus::NotFound => {
+                // This shouldn't happen in this context
+                Ok((None, false, None))
+            }
+        }
+    }
+
     async fn fetch_trip_rows_for_schedule(
         &self,
         schedule_trip_id: &str,
@@ -874,216 +1194,37 @@ impl VehicleDataReader for DBVehicleReader {
             return Ok(cached_data);
         }
 
-        let waybill_online_query = r#"
-            SELECT 
-                w.waybill_id::text, 
-                w.waybill_no::text, 
-                w.service_type, 
-                w.vehicle_no,
-                w.schedule_no,
-                w.updated_at::timestamptz AS last_updated,
-                w.duty_date,
-                w.schedule_trip_id::text,
-                e.entity_remark::text AS entity_remark,
-                w.driver_token_no::text AS driver_code,
-                w.conductor_token_no::text AS conductor_code,
-                w.deleted AS deleted,
-                w.status AS status
-            FROM waybills w
-            LEFT JOIN entities e on e.entity_id = w.entity_id
-            WHERE w.vehicle_no = $1
-                AND w.status = 'Online'
-            LIMIT 1
-        "#;
-
-        let result = match sqlx::query_as::<_, VehicleData>(waybill_online_query)
-            .bind(vehicle_no)
-            .fetch_optional(&self.pool)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Waybill Online query failed for {}: {}", vehicle_no, e);
-                None
-            }
-        };
-
+        // Enhanced flow: Split waybill query with priority (Online -> Processed/New)
+        let (waybill_result, waybill_status) = self.get_waybill_with_priority(vehicle_no).await?;
+        
         let mut schedule_map: HashMap<i64, Vec<BusSchedule>> = HashMap::new();
-        match result {
+        match waybill_result {
             Some(vehicle_data) => {
-                info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
-                let bus_schedule_trip_detail_query: String = if let Some(trip_number) = trip_number
-                {
-                    format!(
-                        r#"
-                        SELECT 
-                            NULL::int AS stops_count, 
-                            route_number_id::text AS route_id, 
-                            schedule_number, 
-                            org_name::text AS org_name, 
-                            trip_number,
-                            schedule_trip_id,
-                            trip_start_time AS start_time,
-                            trip_end_time AS end_time,
-                            deleted,
-                            is_active_trip,
-                            trip_order
-                        FROM bus_schedule_trip_detail 
-                        WHERE schedule_trip_id = $1::bigint 
-                            AND trip_number >= {} 
-                        ORDER BY trip_number ASC"#,
-                        trip_number
-                    )
-                } else {
-                    r#"
-                    SELECT 
-                        NULL::int AS stops_count, 
-                        route_number_id::text AS route_id,
-                        schedule_number,
-                        org_name::text AS org_name, 
-                        trip_number,
-                        schedule_trip_id,
-                        trip_start_time AS start_time,
-                        trip_end_time AS end_time,
-                        deleted,
-                        is_active_trip,
-                        trip_order
-                    FROM bus_schedule_trip_detail 
-                    WHERE schedule_trip_id = $1::bigint 
-                        AND trip_number >= 
-                            (SELECT COALESCE(
-                                    (SELECT trip_number 
-                                     FROM bus_schedule_trip_detail 
-                                     WHERE schedule_trip_id = $1::bigint AND is_active_trip = true), 1)) 
-                    ORDER BY trip_number ASC"#.to_string()
-                };
-                let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
-                    format!(
-                        r#"
-                        SELECT
-                            NULL::int AS stops_count,
-                            route_number_id::text AS route_id,
-                            schedule_number,
-                            org_name::text AS org_name,
-                            trip_number,
-                            schedule_trip_id,
-                            trip_start_time AS start_time,
-                            trip_end_time AS end_time,
-                            deleted,
-                            is_active_trip,
-                            trip_order
-                        FROM bus_schedule_trip_flexi
-                        WHERE schedule_trip_id = $1::bigint
-                          AND trip_number >= {trip_number}
-                        ORDER BY trip_number ASC
-                        "#
-                    )
-                } else {
-                    r#"
-                    WITH latest AS (
-                        SELECT
-                            trip_number AS active_trip_number,
-                            created_at AS active_created_at
-                        FROM bus_schedule_trip_flexi
-                        WHERE schedule_trip_id = $1::bigint
-                          AND is_active_trip = TRUE
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                    )
-                    SELECT
-                        NULL::int AS stops_count,
-                        f.route_number_id::text AS route_id,
-                        f.schedule_number,
-                        f.org_name::text AS org_name,
-                        f.trip_number,
-                        f.schedule_trip_id,
-                        f.trip_start_time AS start_time,
-                        f.trip_end_time AS end_time,
-                        f.deleted,
-                        f.is_active_trip,
-                        f.trip_order
-                    FROM bus_schedule_trip_flexi f
-                    LEFT JOIN latest l ON TRUE
-                    WHERE f.schedule_trip_id = $1::bigint
-                      AND f.trip_number >= COALESCE(l.active_trip_number, 1)
-                      AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day')
-                    ORDER BY f.trip_number ASC
-                    "#
-                    .to_string()
-                };
-                let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
-
-                let (schedule_result, is_active_trip, remaining_trip_details) =
-                    if let Some(schedule_trip_id) = &vehicle_data.schedule_trip_id {
-                        // Always fetch from BOTH detail and flexi tables
-                        let mut rows = self
-                            .fetch_trip_rows_for_schedule(
-                                schedule_trip_id,
-                                &bus_schedule_trip_detail_query,
-                                &bus_schedule_trip_flexi_query,
-                            )
-                            .await;
-                        if !rows.is_empty() {
-                            for row in rows.iter_mut() {
-                                if let Some(key) = row.schedule_trip_id {
-                                    schedule_map
-                                        .entry(key)
-                                        .or_insert_with(Vec::new)
-                                        .push(row.clone());
-                                }
-                            }
-                            self.enrich_route_numbers(&mut rows).await?;
-                            let first = rows.remove(0);
-                            let remaining = if rows.is_empty() { None } else { Some(rows) };
-                            (Some(first), true, remaining)
-                        } else {
-                            // Fallback to bus_schedule
-                            let mut rows =
-                                match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
-                                    .bind(vehicle_data.schedule_no.clone())
-                                    .fetch_all(&self.pool)
-                                    .await
-                                {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        error!(
-                                            "Query failed (bus_schedule): {} | {}",
-                                            bus_schedule_query, e
-                                        );
-                                        Vec::new()
-                                    }
-                                };
-                            if !rows.is_empty() {
-                                self.enrich_route_numbers(&mut rows).await?;
-                                let first = rows.remove(0);
-                                let remaining = if rows.is_empty() { None } else { Some(rows) };
-                                (Some(first), false, remaining)
-                            } else {
-                                (None, false, None)
-                            }
+                info!("Enhanced flow - vehicle_data: {:?}, status: {:?}", vehicle_data, waybill_status);
+                
+                // Resolve trip data based on waybill status and is_flexi flag
+                let (schedule_result, is_active_trip, remaining_trip_details) = 
+                    self.resolve_trip_data(vehicle_data.clone(), waybill_status, trip_number).await?;
+                
+                // Populate schedule_map for backward compatibility
+                if let Some(ref remaining) = remaining_trip_details {
+                    for row in remaining.iter() {
+                        if let Some(key) = row.schedule_trip_id {
+                            schedule_map
+                                .entry(key)
+                                .or_insert_with(Vec::new)
+                                .push(row.clone());
                         }
-                    } else {
-                        // If no schedule_trip_id, directly try bus_schedule_query
-                        let mut rows = match sqlx::query_as::<_, BusSchedule>(&bus_schedule_query)
-                            .bind(vehicle_data.schedule_no.clone())
-                            .fetch_all(&self.pool)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Query failed (bus_schedule direct): {}", e);
-                                Vec::new()
-                            }
-                        };
-                        if !rows.is_empty() {
-                            self.enrich_route_numbers(&mut rows).await?;
-                            let first = rows.remove(0);
-                            let remaining = if rows.is_empty() { None } else { Some(rows) };
-                            (Some(first), false, remaining)
-                        } else {
-                            (None, false, None)
-                        }
-                    };
+                    }
+                }
+                if let Some(ref schedule) = schedule_result {
+                    if let Some(key) = schedule.schedule_trip_id {
+                        schedule_map
+                            .entry(key)
+                            .or_insert_with(Vec::new)
+                            .insert(0, schedule.clone()); // Insert active trip at front
+                    }
+                }
 
                 let mut vehicle_data_with_route_id = VehicleDataWithRouteId {
                     waybill_id: Some(vehicle_data.waybill_id),
@@ -1106,16 +1247,20 @@ impl VehicleDataReader for DBVehicleReader {
                     status: vehicle_data.status,
                     schedule_details: Some(schedule_map),
                 };
+                
+                // Set route and trip details from active schedule
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
                     vehicle_data_with_route_id.route_id = Some(schedule.route_id.to_owned());
                     vehicle_data_with_route_id.depot = schedule.org_name.clone();
                     vehicle_data_with_route_id.route_number = schedule.route_number.clone();
                 }
+                
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
             }
             None => {
+                // No waybill found - fallback to minimal data
                 let waybill_status_agnostic_query = "
                     SELECT w.vehicle_no, w.service_type
                     FROM waybills w
