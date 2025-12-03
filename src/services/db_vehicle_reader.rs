@@ -376,14 +376,14 @@ impl DBVehicleReader {
                 info!("vehicle_data in db_vehicle_readers {:?}", vehicle_data);
                 let bus_schedule_trip_detail_query: String = if let Some(trip_number) = trip_number
                 {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
+                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= {} and trip_type != 'dead-trip' order by trip_number asc", trip_number)
                 } else {
-                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true), 1)) order by trip_number asc".to_string()
+                    "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true and trip_type != 'dead-trip'), 1)) and trip_type != 'dead-trip' order by trip_number asc".to_string()
                 };
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} order by trip_number asc", trip_number)
+                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} and trip_type != 'dead-trip' order by trip_number asc", trip_number)
                 } else {
-                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1::bigint AND is_active_trip = TRUE ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1::bigint AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') ORDER BY f.trip_number ASC".to_string()
+                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1::bigint AND is_active_trip = TRUE AND trip_type != 'dead-trip' ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1::bigint AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') AND f.trip_type != 'dead-trip' ORDER BY f.trip_number ASC".to_string()
                 };
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
@@ -871,7 +871,7 @@ impl DBVehicleReader {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_flexi
-                WHERE waybill_id = $1::bigint AND trip_number >= {}
+                WHERE waybill_id = $1::bigint AND trip_number >= {} AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#, trip_num)
         } else {
@@ -889,7 +889,7 @@ impl DBVehicleReader {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_flexi
-                WHERE waybill_id = $1::bigint
+                WHERE waybill_id = $1::bigint AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#.to_string()
         };
@@ -931,7 +931,7 @@ impl DBVehicleReader {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_detail
-                WHERE schedule_trip_id = $1::bigint AND trip_number >= {}
+                WHERE schedule_trip_id = $1::bigint AND trip_number >= {} AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#, trip_num)
         } else {
@@ -952,7 +952,8 @@ impl DBVehicleReader {
                 WHERE schedule_trip_id = $1::bigint 
                     AND trip_number >= (SELECT COALESCE(
                         (SELECT trip_number FROM bus_schedule_trip_detail 
-                         WHERE schedule_trip_id = $1::bigint AND is_active_trip = true), 1))
+                         WHERE schedule_trip_id = $1::bigint AND is_active_trip = true AND trip_type != 'dead-trip'), 1))
+                    AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#.to_string()
         };
