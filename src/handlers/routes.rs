@@ -577,6 +577,8 @@ async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppResult
 #[derive(Deserialize)]
 struct TripQuery {
     trip_number: Option<i32>,
+    #[serde(rename = "passVerifyReq")]
+    pass_verify_req: Option<bool>,
 }
 
 async fn get_service_type_by_vehicle(
@@ -611,6 +613,7 @@ async fn get_service_type_by_vehicle_impl(
     params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let gtfs_id = gtfs_id.unwrap_or("chennai_bus"); // todo: remove this once API is migrated
+    let pass_verify_req = params.pass_verify_req.unwrap_or(false);
 
     // First, try to get vehicle_no from bus registration mapping using gtfs_id and short_name (path)
     let vehicle_no = if let Some(gtfs_mapping) = app_state.bus_registration_mapping.get(gtfs_id) {
@@ -627,6 +630,13 @@ async fn get_service_type_by_vehicle_impl(
     } else {
         // No mapping for this gtfs_id, use path as vehicle_no (existing behavior)
         path
+    };
+
+    // Get vehicle verification if requested
+    let is_valid = if pass_verify_req {
+        app_state.db_vehicle_reader.verify_vehicle(vehicle_no).await?
+    } else {
+        false // Default value when verification is not requested
     };
 
     // Check if this is bhubaneshwar_bus and use cache instead of DB
@@ -726,7 +736,7 @@ async fn get_service_type_by_vehicle_impl(
         }
     }
 
-    let service_type = match vehicle_data.service_type.clone() {
+    let mut service_type = match vehicle_data.service_type.clone() {
         Some(s) => Some(s),
         None => {
             app_state
@@ -735,6 +745,13 @@ async fn get_service_type_by_vehicle_impl(
                 .await
         }
     };
+
+    // Apply service tier fallback logic when passVerifyReq is true
+    if pass_verify_req && service_type.is_none() {
+        if is_valid {
+            service_type = Some("Ordinary".to_string());
+        }
+    }
 
     info!("Using depot for depot_no: {:?}", vehicle_data.depot);
     info!(

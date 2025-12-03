@@ -21,6 +21,11 @@ struct DepotCache {
     vehicles_by_depot_id: HashMap<String, (Vec<DepotVehicleSummary>, SystemTime)>,
 }
 
+// Vehicle pool cache structure
+struct VehiclePoolCache {
+    all_vehicles: Option<(std::collections::HashSet<String>, SystemTime)>,
+}
+
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicle_data(
@@ -48,6 +53,7 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
+    async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
 }
 
 // Mock implementation for local testing without a database
@@ -157,6 +163,12 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn verify_vehicle(&self, _vehicle_no: &str) -> AppResult<bool> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
 }
 
 pub struct DBVehicleReader {
@@ -166,6 +178,8 @@ pub struct DBVehicleReader {
     refresh_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>>,
     depot_cache: Arc<RwLock<DepotCache>>,
     depot_cache_duration: Duration,
+    vehicle_pool_cache: Arc<RwLock<VehiclePoolCache>>,
+    vehicle_pool_cache_duration: Duration,
 }
 
 impl DBVehicleReader {
@@ -183,12 +197,85 @@ impl DBVehicleReader {
                 vehicles_by_depot_id: HashMap::new(),
             })),
             depot_cache_duration: Duration::from_secs(7200), // 2 hours TTL
+            vehicle_pool_cache: Arc::new(RwLock::new(VehiclePoolCache {
+                all_vehicles: None,
+            })),
+            vehicle_pool_cache_duration: Duration::from_secs(10800), // 3 hours TTL
         }
     }
 
     fn is_depot_cache_expired(&self, timestamp: SystemTime) -> bool {
         let elapsed = timestamp.elapsed().unwrap_or_default();
         elapsed >= self.depot_cache_duration
+    }
+
+    fn is_vehicle_pool_cache_expired(&self, timestamp: SystemTime) -> bool {
+        let elapsed = timestamp.elapsed().unwrap_or_default();
+        elapsed >= self.vehicle_pool_cache_duration
+    }
+
+
+
+    async fn get_all_vehicles_pool(&self) -> AppResult<std::collections::HashSet<String>> {
+        // Check cache first
+        {
+            let cache = self.vehicle_pool_cache.read().await;
+            if let Some((vehicles, timestamp)) = &cache.all_vehicles {
+                if !self.is_vehicle_pool_cache_expired(*timestamp) {
+                    info!("All vehicles pool cache HIT");
+                    return Ok(vehicles.clone());
+                }
+            }
+        }
+
+        info!("All vehicles pool cache MISS");
+        let waybill_query = r#"
+            SELECT DISTINCT ON (vehicle_no)
+                vehicle_no
+            FROM public.waybills
+            ORDER BY vehicle_no;
+        "#;
+
+        let fleet_query = r#"
+            SELECT fleet_no from vehicles
+        "#;
+
+        let mut all_vehicles = std::collections::HashSet::new();
+
+        // Get vehicles from waybills
+        match sqlx::query_as::<_, (String,)>(waybill_query)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => {
+                for (vehicle_no,) in rows {
+                    all_vehicles.insert(vehicle_no);
+                }
+            }
+            Err(e) => {
+                error!("All vehicles pool query failed: {}", e);
+            }
+        }
+
+        // Get vehicles from fleet
+        match sqlx::query_as::<_, (String,)>(fleet_query)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => {
+                for (fleet_no,) in rows {
+                    all_vehicles.insert(fleet_no);
+                }
+            }
+            Err(e) => {
+                error!("Fleet vehicles query failed: {}", e);
+            }
+        }
+
+        // Update cache
+        let mut cache = self.vehicle_pool_cache.write().await;
+        cache.all_vehicles = Some((all_vehicles.clone(), SystemTime::now()));
+        Ok(all_vehicles)
     }
 
     async fn get_cached_vehicle_data(
@@ -1852,5 +1939,18 @@ impl VehicleDataReader for DBVehicleReader {
                 Err(AppError::Internal(format!("Database query failed: {}", e)))
             }
         }
+    }
+
+    async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool> {
+        let all_pool = self.get_all_vehicles_pool().await?;
+        
+        let is_valid = all_pool.contains(vehicle_no);
+        
+        info!(
+            "Vehicle verification for {}: is_valid={}, all_pool_size={}",
+            vehicle_no, is_valid, all_pool.len()
+        );
+        
+        Ok(is_valid)
     }
 }
