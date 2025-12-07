@@ -16,12 +16,27 @@ use actix_web::{
     Error, HttpRequest,
 };
 use futures::future::LocalBoxFuture;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use tokio::time::Instant;
 use tracing::Span;
 use tracing::{error, info};
 use tracing_actix_web::{DefaultRootSpanBuilder, RootSpanBuilder};
 use uuid::Uuid;
+
+// Static regex patterns for path normalization (compiled once, reused on every request)
+static UUID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+        .unwrap()
+});
+
+static TRIP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/.+/trip/[^/]+/[^/]+$").unwrap());
+
+static VEHICLE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/vehicle/[^/]+/service-type/[^/]+$").unwrap());
+
+static VEHICLE_PREFIXED_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/.+/vehicle/[^/]+/service-type/[^/]+$").unwrap());
 
 /// Responsible for building and managing root spans in the domain.
 ///
@@ -145,26 +160,55 @@ where
 /// # Returns
 /// * `String` - The path string with placeholders for matched info.
 fn get_path(request: &HttpRequest) -> String {
+    // Step 1: decode path
     let mut path = urlencoding::decode(request.path())
         .ok()
         .map(|s| s.to_string())
-        .unwrap_or(request.path().to_string());
+        .unwrap_or_else(|| request.path().to_string());
 
-    request
-        .match_info()
-        .iter()
-        .for_each(|(path_name, path_val)| {
-            path = path.replace(path_val, format!(":{path_name}").as_str());
-        });
+    // Step 2: replace Actix match_info (still works for static routes)
+    request.match_info().iter().for_each(|(name, val)| {
+        path = path.replace(val, &format!(":{}", name));
+    });
 
-    if let Ok(re) =
-        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-    {
-        path = re.replace_all(&path, ":id").to_string()
+    // Step 3: normalize UUIDs
+    path = UUID_RE.replace_all(&path, ":id").to_string();
+
+    // -------------------------
+    // Step 4: GTFS-specific normalization (FIX)
+    // -------------------------
+
+    // Normalize: /trip/<gtfs_id>/<trip_number>
+    if let Some(stripped) = path.strip_prefix("/trip/") {
+        if stripped.split('/').count() == 2 {
+            return "/trip/{gtfs_id}/{trip_number}".to_string();
+        }
     }
 
+    // Normalize: /<prefix>/trip/<gtfs_id>/<trip_number>
+    if TRIP_RE.is_match(&path) {
+        // keep prefix dynamic (e.g., /gtfs-inmem)
+        let prefix = path.split("/trip/").next().unwrap_or("");
+        return format!("{}/trip/{{gtfs_id}}/{{trip_number}}", prefix);
+    }
+
+    // Normalize: /vehicle/<gtfs_id>/service-type/<vehicle_no>
+    if VEHICLE_RE.is_match(&path) {
+        return "/vehicle/{gtfs_id}/service-type/{vehicle_no}".to_string();
+    }
+
+    // Normalize: /<prefix>/vehicle/<gtfs_id>/service-type/<vehicle_no>
+    if VEHICLE_PREFIXED_RE.is_match(&path) {
+        let prefix = path.split("/vehicle/").next().unwrap_or("");
+        return format!("{}/vehicle/{{gtfs_id}}/service-type/{{vehicle_no}}", prefix);
+    }
+
+    // -------------------------
+    // Step 5: return unchanged if nothing matches
+    // -------------------------
     path
 }
+
 
 /// Get the method from the HTTP request.
 ///
