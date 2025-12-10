@@ -1416,6 +1416,11 @@ impl GTFSService {
         }
     }
 
+    pub async fn get_feeds_in_memory(&self) -> Vec<String> {
+        let data = self.data.read().await;
+        data.route_data_by_gtfs.keys().cloned().collect()
+    }
+
     pub async fn get_example_trip(
         &self,
         gtfs_id: &str,
