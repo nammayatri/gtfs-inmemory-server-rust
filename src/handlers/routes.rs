@@ -828,7 +828,15 @@ async fn get_all_cached_data(app_state: Data<AppState>) -> AppResult<HttpRespons
 }
 
 async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
-    Ok(HttpResponse::Ok().json(app_state.config.clone()))
+    // Get feeds loaded in memory from routes
+    let feeds_in_memory = app_state.gtfs_service.get_feeds_in_memory().await;
+
+    let response = serde_json::json!({
+        "config": app_state.config.clone(),
+        "feeds_loaded": feeds_in_memory
+    });
+
+    Ok(HttpResponse::Ok().json(response))
 }
 
 #[derive(Debug, serde::Deserialize)]
