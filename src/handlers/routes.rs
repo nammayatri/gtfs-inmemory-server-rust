@@ -698,7 +698,28 @@ async fn get_service_type_by_vehicle_impl(
                 remaining_trip_details,
             }));
         } else {
-            // Vehicle not found in cache, return not found
+            // Vehicle not found in cache, try to get service type from fleet
+            if let Some(service_type) = app_state
+                .gtfs_service
+                .get_fleet_service_type(gtfs_id, &vehicle_no)
+                .await
+            {
+                // Return response with service type from fleet
+                return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
+                    vehicle_no: vehicle_no.to_string(),
+                    service_type: Some(service_type),
+                    waybill_id: None,
+                    schedule_no: None,
+                    last_updated: None,
+                    route_id: None,
+                    route_number: None,
+                    is_active_trip: false,
+                    trip_number: None,
+                    depot_no: None,
+                    remaining_trip_details: None,
+                }));
+            }
+            // Vehicle not found in cache and no service type from fleet, return not found
             return Err(crate::tools::error::AppError::NotFound(format!(
                 "Vehicle {} not found in cache",
                 vehicle_no
