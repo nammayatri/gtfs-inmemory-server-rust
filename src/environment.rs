@@ -175,6 +175,7 @@ impl AppState {
 
         let mut bhubaneswar_vehicle_cache = BhubaneswarVehicleCache::new(
             app_config.bhubaneswar_external_auth.clone(),
+            gtfs_service.clone(),
         )?;
         bhubaneswar_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
         let bhubaneswar_vehicle_cache = Arc::new(bhubaneswar_vehicle_cache);
