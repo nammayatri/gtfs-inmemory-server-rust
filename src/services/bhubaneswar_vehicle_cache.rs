@@ -1,4 +1,5 @@
 use crate::tools::error::{AppError, AppResult};
+use crate::services::gtfs_service::GTFSService;
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use reqwest::Client;
@@ -61,10 +62,11 @@ pub struct BhubaneswarVehicleCache {
     external_api_url: String,
     external_auth_header: Option<String>,
     update_interval_secs: u64,
+    gtfs_service: Arc<GTFSService>,
 }
 
 impl BhubaneswarVehicleCache {
-    pub fn new(external_auth: Option<String>) -> AppResult<Self> {
+    pub fn new(external_auth: Option<String>, gtfs_service: Arc<GTFSService>) -> AppResult<Self> {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -78,6 +80,7 @@ impl BhubaneswarVehicleCache {
             external_api_url: "https://external.chalo.com/dashboard/operator-app/bhubaneswar/crut/liveTripsData?mode=bus".to_string(),
             external_auth_header: external_auth,
             update_interval_secs: 10, // Default, will be set from config
+            gtfs_service,
         })
     }
 
@@ -149,7 +152,14 @@ impl BhubaneswarVehicleCache {
 
         for vehicle in vehicles {
             // Get service_type from route_service_tier_mapping.csv based on route_id
-            let service_type = route_mapping.get(&vehicle.route_id).cloned();
+            let mut service_type: Option<String> = route_mapping.get(&vehicle.route_id).cloned();
+            
+            // Fallback: if not found, try to get from static_fleet_info via GTFS service by vehicle number
+            if service_type.is_none() {
+                service_type = self.gtfs_service
+                    .get_fleet_service_type("bhubaneshwar_bus", &vehicle.vehicle_no)
+                    .await;
+            }
 
             // Derive schedule_no from service_type
             // AC -> starts with "Z-", NON_AC -> starts with "OS-"
