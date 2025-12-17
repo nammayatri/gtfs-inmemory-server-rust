@@ -696,6 +696,7 @@ async fn get_service_type_by_vehicle_impl(
                 trip_number: cached_data.trip_number,
                 depot_no: cached_data.depot,
                 remaining_trip_details,
+                is_actually_valid: None,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -717,6 +718,7 @@ async fn get_service_type_by_vehicle_impl(
                     trip_number: None,
                     depot_no: None,
                     remaining_trip_details: None,
+                    is_actually_valid: None,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -766,11 +768,17 @@ async fn get_service_type_by_vehicle_impl(
                 .await
         }
     };
+    
+    let mut is_actually_valid = None;
 
     // Apply service tier fallback logic when passVerifyReq is true
     if pass_verify_req && service_type.is_none() {
         if is_valid {
             service_type = Some("Ordinary".to_string());
+        }
+        else {
+            service_type = Some("Ordinary".to_string());
+            is_actually_valid = Some(false);
         }
     }
 
@@ -793,6 +801,7 @@ async fn get_service_type_by_vehicle_impl(
         trip_number: vehicle_data.trip_number,
         depot_no,
         remaining_trip_details: vehicle_data.remaining_trip_details,
+        is_actually_valid,
     }))
 }
 
