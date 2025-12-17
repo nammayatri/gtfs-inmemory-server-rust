@@ -33,6 +33,10 @@ struct ExternalApiVehicle {
     end_stop_name: Option<String>,
     #[serde(rename = "tripStartTime", default)]
     trip_start_time: Option<i64>,
+    #[serde(rename = "driverId", default)]
+    driver_id: Option<String>,
+    #[serde(rename = "conductorId", default)]
+    conductor_id: Option<String>
 }
 
 // The API returns a direct array, not wrapped
@@ -54,6 +58,8 @@ pub struct CachedVehicleData {
     pub end_time: Option<String>,
     pub deleted: Option<bool>,
     pub trip_order: Option<i32>,
+    pub driver_id: Option<String>,
+    pub conductor_id: Option<String>
 }
 
 pub struct BhubaneswarVehicleCache {
@@ -187,6 +193,8 @@ impl BhubaneswarVehicleCache {
                 end_time: None,
                 deleted: None,
                 trip_order: None,
+                driver_id: vehicle.driver_id,
+                conductor_id: vehicle.conductor_id,
             };
 
             cache.insert(vehicle.vehicle_no, cached_data);

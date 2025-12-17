@@ -118,6 +118,8 @@ pub struct VehicleServiceTypeResponse {
     pub depot_no: Option<String>,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
     pub is_actually_valid: Option<bool>,
+    pub driver_id: Option<String>,
+    pub conductor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
