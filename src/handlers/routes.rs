@@ -69,6 +69,11 @@ pub struct GetAllVehiclesByIdsRequest {
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
         actix_web::web::scope("")
+            // Put the more specific service-tier route before the generic route path to avoid shadowing.
+            .route(
+                "/route/{route_id}/service-tier",
+                actix_web::web::get().to(get_route_service_tier),
+            )
             .route(
                 "/route/{gtfs_id}/{route_id}",
                 actix_web::web::get().to(get_route),
@@ -512,6 +517,18 @@ async fn get_service_type_by_vehicle_impl(
         depot_no,
         remaining_trip_details: vehicle_data.remaining_trip_details,
     }))
+}
+
+async fn get_route_service_tier(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let route_id = path.into_inner();
+    let service_tier = app_state.gtfs_service.get_route_service_tier(&route_id).await;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "route_id": route_id,
+        "service_tier": service_tier
+    })))
 }
 
 #[derive(serde::Serialize)]

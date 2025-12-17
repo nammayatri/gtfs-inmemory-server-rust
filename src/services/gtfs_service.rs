@@ -3,7 +3,7 @@ use crate::models::TripDetails;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
+    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
     StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::tools::error::{AppError, AppResult};
@@ -148,6 +148,13 @@ impl GTFSService {
             info!("No static fleet info loaded from CSV");
         }
 
+        // Read route service tiers CSV file
+        let route_service_tiers = self.read_route_service_tiers_csv().await?;
+        info!(
+            "Loaded {} route service tiers from CSV",
+            route_service_tiers.len()
+        );
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -196,6 +203,7 @@ impl GTFSService {
         temp_data.suburban_stop_info_by_gtfs = suburban_stop_info_by_gtfs;
         temp_data.static_fleet_info_by_gtfs = static_fleet_info_by_gtfs;
         temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
+        temp_data.route_service_tiers = route_service_tiers;
 
         Ok(temp_data)
     }
@@ -449,6 +457,42 @@ impl GTFSService {
     }
 
 
+
+    async fn read_route_service_tiers_csv(&self) -> AppResult<HashMap<String, String>> {
+        let file_path = "./assets/route_service_tiers.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("route_service_tiers.csv file not found, proceeding without route service tier data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut route_service_tiers = HashMap::new();
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let record: RouteServiceTierRecord = record;
+                    route_service_tiers.insert(record.route_id, record.service_tier_type);
+                }
+                Err(e) => {
+                    error!("Error parsing CSV row: {}", e);
+                }
+            }
+        }
+        Ok(route_service_tiers)
+    }
 
     async fn fetch_pattern_details_batch(
         &self,
@@ -1408,6 +1452,11 @@ impl GTFSService {
             .get(clean_identifier(gtfs_id).as_str())
             .and_then(|m| m.get(clean_identifier(vehicle_no).as_str()))
             .and_then(|info| info.service_type.clone())
+    }
+
+    pub async fn get_route_service_tier(&self, route_id: &str) -> Option<String> {
+        let data = self.data.read().await;
+        data.route_service_tiers.get(clean_identifier(route_id).as_str()).cloned()
     }
 
     pub async fn get_all_cached_data(&self) -> CachedDataResponse {

@@ -264,6 +264,7 @@ pub struct GTFSData {
     pub static_fleet_info_by_gtfs: HashMap<String, HashMap<String, StaticFleetInfo>>,
     pub entity_id_name_mapping: HashMap<String, String>,
     pub route_example_trip_details_by_gtfs: HashMap<String, HashMap<String, TripDetails>>,
+    pub route_service_tiers: HashMap<String, String>,
 }
 
 impl GTFSData {
@@ -345,6 +346,12 @@ pub struct StaticFleetInfoRecord {
     pub depot: Option<String>,
     #[serde(default)]
     pub service_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteServiceTierRecord {
+    pub route_id: String,
+    pub service_tier_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
