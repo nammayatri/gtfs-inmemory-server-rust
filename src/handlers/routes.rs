@@ -696,6 +696,8 @@ async fn get_service_type_by_vehicle_impl(
                 trip_number: cached_data.trip_number,
                 depot_no: cached_data.depot,
                 remaining_trip_details,
+                driver_id: cached_data.driver_id,
+                conductor_id: cached_data.conductor_id,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -717,6 +719,8 @@ async fn get_service_type_by_vehicle_impl(
                     trip_number: None,
                     depot_no: None,
                     remaining_trip_details: None,
+                    driver_id: None,
+                    conductor_id: None,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -793,6 +797,8 @@ async fn get_service_type_by_vehicle_impl(
         trip_number: vehicle_data.trip_number,
         depot_no,
         remaining_trip_details: vehicle_data.remaining_trip_details,
+        driver_id: vehicle_data.driver_code,
+        conductor_id: vehicle_data.conductor_code,
     }))
 }
 

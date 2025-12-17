@@ -117,6 +117,8 @@ pub struct VehicleServiceTypeResponse {
     #[serde(rename = "depot")]
     pub depot_no: Option<String>,
     pub remaining_trip_details: Option<Vec<BusSchedule>>,
+    pub driver_id: Option<String>,
+    pub conductor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
