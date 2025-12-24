@@ -416,6 +416,27 @@ pub struct BusRegistrationMappingRecord {
     pub short_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusStopETA {
+    #[serde(rename = "stopCode")]
+    pub stop_code: String,
+    #[serde(rename = "arrivalTime")]
+    pub arrival_time: chrono::DateTime<chrono::Utc>,
+    #[serde(rename = "etaSeconds")]
+    pub eta_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusScheduleDetail {
+    pub eta: Vec<BusStopETA>,
+    #[serde(rename = "vehicle_no")]
+    pub vehicle_no: String,
+    #[serde(rename = "service_tier")]
+    pub service_tier: String,
+}
+
+pub type BusScheduleDetails = Vec<BusScheduleDetail>;
+
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {
         "METRO".to_string()

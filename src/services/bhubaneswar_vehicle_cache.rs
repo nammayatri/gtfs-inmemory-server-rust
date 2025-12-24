@@ -106,6 +106,20 @@ impl BhubaneswarVehicleCache {
         cache.get(vehicle_no).cloned()
     }
 
+    pub async fn get_vehicles_by_route_id(&self, route_id: &str) -> Vec<CachedVehicleData> {
+        let cache = self.cache.read().await;
+        cache
+            .iter()
+            .filter_map(|(_, data)| {
+                if data.route_id.as_ref().map(|r| r.as_str()) == Some(route_id) {
+                    Some(data.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub async fn update_cache(&self) -> AppResult<()> {
         info!("Updating Bhubaneswar vehicle cache from external API...");
 

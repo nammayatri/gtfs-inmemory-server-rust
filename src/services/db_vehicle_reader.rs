@@ -26,6 +26,11 @@ struct VehiclePoolCache {
     all_vehicles: Option<(std::collections::HashSet<String>, SystemTime)>,
 }
 
+// Waybills by route cache structure
+struct WaybillsByRouteCache {
+    waybills_by_route: HashMap<String, (Vec<VehicleData>, SystemTime)>,
+}
+
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicle_data(
@@ -54,6 +59,7 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
+    async fn get_waybills_by_route_id(&self, gtfs_id: &str, route_id: &str) -> AppResult<Vec<VehicleData>>;
 }
 
 // Mock implementation for local testing without a database
@@ -169,6 +175,12 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn get_waybills_by_route_id(&self, _gtfs_id: &str, _route_id: &str) -> AppResult<Vec<VehicleData>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
 }
 
 pub struct DBVehicleReader {
@@ -180,6 +192,8 @@ pub struct DBVehicleReader {
     depot_cache_duration: Duration,
     vehicle_pool_cache: Arc<RwLock<VehiclePoolCache>>,
     vehicle_pool_cache_duration: Duration,
+    waybills_by_route_cache: Arc<RwLock<WaybillsByRouteCache>>,
+    waybills_by_route_cache_duration: Duration,
 }
 
 impl DBVehicleReader {
@@ -201,6 +215,10 @@ impl DBVehicleReader {
                 all_vehicles: None,
             })),
             vehicle_pool_cache_duration: Duration::from_secs(10800), // 3 hours TTL
+            waybills_by_route_cache: Arc::new(RwLock::new(WaybillsByRouteCache {
+                waybills_by_route: HashMap::new(),
+            })),
+            waybills_by_route_cache_duration: Duration::from_secs(3600), // 60 minutes TTL
         }
     }
 
@@ -212,6 +230,15 @@ impl DBVehicleReader {
     fn is_vehicle_pool_cache_expired(&self, timestamp: SystemTime) -> bool {
         let elapsed = timestamp.elapsed().unwrap_or_default();
         elapsed >= self.vehicle_pool_cache_duration
+    }
+
+    fn is_waybills_by_route_cache_expired(&self, timestamp: SystemTime) -> bool {
+        let elapsed = timestamp.elapsed().unwrap_or_default();
+        elapsed >= self.waybills_by_route_cache_duration
+    }
+
+    fn get_waybills_by_route_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
+        format!("{}:{}", gtfs_id, route_id)
     }
 
 
@@ -1952,5 +1979,84 @@ impl VehicleDataReader for DBVehicleReader {
         );
         
         Ok(is_valid)
+    }
+
+    async fn get_waybills_by_route_id(&self, gtfs_id: &str, route_id: &str) -> AppResult<Vec<VehicleData>> {
+        let cache_key = self.get_waybills_by_route_cache_key(gtfs_id, route_id);
+        
+        // Check cache first
+        {
+            let cache = self.waybills_by_route_cache.read().await;
+            if let Some((waybills, timestamp)) = cache.waybills_by_route.get(&cache_key) {
+                if !self.is_waybills_by_route_cache_expired(*timestamp) {
+                    info!("Waybills by route cache HIT for gtfs_id={}, route_id={}", gtfs_id, route_id);
+                    return Ok(waybills.clone());
+                }
+            }
+        }
+        
+        info!("Waybills by route cache MISS for gtfs_id={}, route_id={}", gtfs_id, route_id);
+        
+        // Query waybills by joining with bus_schedule_trip_detail and bus_schedule_trip_flexi
+        // to find waybills that have trips on the given route_id (route_number_id)
+        let query = r#"
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                e.entity_remark::text AS entity_remark,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted AS deleted,
+                w.status AS status,
+                w.is_flexi
+            FROM waybills w
+            LEFT JOIN entities e ON e.entity_id = w.entity_id
+            WHERE w.status = 'Online'
+                AND w.deleted = false
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM bus_schedule_trip_detail bstd
+                        WHERE bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                            AND bstd.route_number_id::text = $1
+                            AND bstd.trip_type != 'dead-trip'
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM bus_schedule_trip_flexi bstf
+                        WHERE bstf.schedule_trip_id = w.schedule_trip_id::bigint
+                            AND bstf.route_number_id::text = $1
+                            AND bstf.trip_type != 'dead-trip'
+                    )
+                )
+            ORDER BY w.updated_at DESC
+        "#;
+
+        let waybills = match sqlx::query_as::<_, VehicleData>(query)
+            .bind(route_id)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(waybills) => {
+                info!("Found {} waybills for gtfs_id={}, route_id={}", waybills.len(), gtfs_id, route_id);
+                waybills
+            }
+            Err(e) => {
+                error!("Failed to query waybills by route_id {}: {}", route_id, e);
+                return Err(AppError::Internal(format!("Database query failed: {}", e)));
+            }
+        };
+        
+        // Cache the results
+        {
+            let mut cache = self.waybills_by_route_cache.write().await;
+            cache.waybills_by_route.insert(cache_key, (waybills.clone(), SystemTime::now()));
+        }
+        
+        Ok(waybills)
     }
 }

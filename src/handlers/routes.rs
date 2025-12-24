@@ -10,7 +10,7 @@ use tracing::{error, info};
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
-    GTFSStop, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
+    BusScheduleDetails, GTFSStop, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
     VehicleServiceTypeResponse,
 };
 // alias for query param map (string->string)
@@ -71,6 +71,10 @@ pub struct GetAllVehiclesByIdsRequest {
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
         actix_web::web::scope("")
+            .route(
+                "/bus-route-schedule/{gtfs_id}/{route_id}",
+                actix_web::web::get().to(get_bus_route_schedule),
+            )
             .route(
                 "/route/{gtfs_id}/{route_id}",
                 actix_web::web::get().to(get_route),
@@ -959,6 +963,163 @@ async fn get_trip_data(
         .await?;
 
     Ok(HttpResponse::Ok().json(trip_data))
+}
+
+async fn get_bus_route_schedule(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_id) = path.into_inner();
+    
+    // For bhubaneswar_bus, try to use in-memory cache first
+    let waybills = if gtfs_id == "bhubaneshwar_bus" {
+        // Get vehicles from cache filtered by route_id
+        let cached_vehicles = app_state
+            .bhubaneswar_vehicle_cache
+            .get_vehicles_by_route_id(&route_id)
+            .await;
+        
+        if !cached_vehicles.is_empty() {
+            info!("Found {} waybills for bhubaneshwar_bus route_id={} from cache", cached_vehicles.len(), route_id);
+            // Convert CachedVehicleData to VehicleData
+            cached_vehicles
+                .into_iter()
+                .map(|cached_data| crate::models::VehicleData {
+                    waybill_id: cached_data.waybill_no.clone().unwrap_or_default(),
+                    waybill_no: cached_data.waybill_no.clone().unwrap_or_default(),
+                    service_type: cached_data.service_type.clone().unwrap_or_default(),
+                    vehicle_no: cached_data.vehicle_no.clone(),
+                    schedule_no: cached_data.schedule_no.clone().unwrap_or_default(),
+                    last_updated: cached_data.last_updated,
+                    duty_date: None,
+                    schedule_trip_id: cached_data.schedule_trip_id.map(|id| id.to_string()),
+                    entity_remark: cached_data.depot.clone(),
+                    driver_code: None,
+                    conductor_code: None,
+                    deleted: cached_data.deleted,
+                    status: Some("Online".to_string()),
+                    is_flexi: None,
+                })
+                .collect()
+        } else {
+            // Fallback to database query
+            app_state
+                .db_vehicle_reader
+                .get_waybills_by_route_id(&gtfs_id, &route_id)
+                .await?
+        }
+    } else {
+        // For other gtfs_ids, query database
+        app_state
+            .db_vehicle_reader
+            .get_waybills_by_route_id(&gtfs_id, &route_id)
+            .await?
+    };
+    
+    let mut schedule_details: BusScheduleDetails = Vec::new();
+    
+    // Get route stop mapping to get stops for this route
+    let route_stop_mappings = app_state
+        .gtfs_service
+        .get_route_stop_mapping_by_route(&gtfs_id, &route_id)
+        .await
+        .unwrap_or_default();
+    
+    for waybill in waybills {
+        // Get trip details for this waybill
+        let vehicle_data = app_state
+            .db_vehicle_reader
+            .get_vehicle_data(&waybill.vehicle_no, None)
+            .await;
+        
+        let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
+        
+        // Find the trip that matches the required route_id
+        if let Ok(vehicle_data) = vehicle_data {
+            // First, try to find trip in remaining_trip_details that matches route_id
+            let matching_trip = vehicle_data
+                .remaining_trip_details
+                .as_ref()
+                .and_then(|trip_details| {
+                    trip_details.iter().find(|trip| trip.route_id == route_id)
+                });
+            
+            // If not found in remaining_trip_details, check schedule_details
+            let matching_trip = matching_trip.or_else(|| {
+                vehicle_data
+                    .schedule_details
+                    .as_ref()
+                    .and_then(|details| {
+                        details.values().flatten().find(|trip| trip.route_id == route_id)
+                    })
+            });
+            
+            // Get trip start time from the matching trip
+            let trip_start_time = matching_trip
+                .and_then(|trip| trip.start_time.as_ref())
+                .and_then(|s| {
+                    // Parse time string (format might be HH:MM:SS or similar)
+                    chrono::NaiveTime::parse_from_str(s, "%H:%M:%S")
+                        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M"))
+                        .ok()
+                });
+            
+            // Build ETAs from route stop mappings
+            for (idx, mapping) in route_stop_mappings.iter().enumerate() {
+                // Calculate arrival time based on trip start time and estimated travel time
+                let arrival_time = if let Some(start_time) = trip_start_time {
+                    // Get cumulative travel time up to this stop
+                    let cumulative_time: i32 = route_stop_mappings[..=idx]
+                        .iter()
+                        .map(|m| m.estimated_travel_time_from_previous_stop.unwrap_or(0))
+                        .sum();
+                    
+                    // Calculate arrival time
+                    let today = chrono::Utc::now().date_naive();
+                    let arrival_naive = start_time + chrono::Duration::seconds(cumulative_time as i64);
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                        today.and_time(arrival_naive),
+                        chrono::Utc
+                    )
+                } else {
+                    // Fallback to current time if no start time found
+                    chrono::Utc::now()
+                };
+                
+                // Calculate ETA in seconds (time until arrival)
+                let eta_seconds = if arrival_time > chrono::Utc::now() {
+                    Some((arrival_time - chrono::Utc::now()).num_seconds())
+                } else {
+                    None
+                };
+                
+                bus_stop_etas.push(crate::models::BusStopETA {
+                    stop_code: mapping.stop_code.clone(),
+                    arrival_time,
+                    eta_seconds,
+                });
+            }
+        }
+        
+        // If no trip details, create empty ETAs from route stop mapping
+        if bus_stop_etas.is_empty() {
+            for mapping in &route_stop_mappings {
+                bus_stop_etas.push(crate::models::BusStopETA {
+                    stop_code: mapping.stop_code.clone(),
+                    arrival_time: chrono::Utc::now(),
+                    eta_seconds: None,
+                });
+            }
+        }
+        
+        schedule_details.push(crate::models::BusScheduleDetail {
+            eta: bus_stop_etas,
+            vehicle_no: waybill.vehicle_no.clone(),
+            service_tier: waybill.service_type.clone(),
+        });
+    }
+    
+    Ok(HttpResponse::Ok().json(schedule_details))
 }
 
 async fn get_trip_cache_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
