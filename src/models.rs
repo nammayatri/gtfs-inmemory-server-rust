@@ -418,11 +418,11 @@ pub struct BusRegistrationMappingRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusStopETA {
-    #[serde(rename = "stopCode")]
+    #[serde(rename = "stop_id")]
     pub stop_code: String,
-    #[serde(rename = "arrivalTime")]
-    pub arrival_time: chrono::DateTime<chrono::Utc>,
-    #[serde(rename = "etaSeconds")]
+    #[serde(rename = "arrival_time")]
+    pub arrival_time: i64, // Epoch timestamp in seconds
+    #[serde(rename = "eta_seconds")]
     pub eta_seconds: Option<i64>,
 }
 

@@ -1087,6 +1087,7 @@ async fn get_bus_route_schedule(
                 };
                 
                 // Calculate ETA in seconds (time until arrival)
+                let arrival_epoch = arrival_time.timestamp();
                 let eta_seconds = if arrival_time > chrono::Utc::now() {
                     Some((arrival_time - chrono::Utc::now()).num_seconds())
                 } else {
@@ -1095,7 +1096,7 @@ async fn get_bus_route_schedule(
                 
                 bus_stop_etas.push(crate::models::BusStopETA {
                     stop_code: mapping.stop_code.clone(),
-                    arrival_time,
+                    arrival_time: arrival_epoch,
                     eta_seconds,
                 });
             }
@@ -1106,7 +1107,7 @@ async fn get_bus_route_schedule(
             for mapping in &route_stop_mappings {
                 bus_stop_etas.push(crate::models::BusStopETA {
                     stop_code: mapping.stop_code.clone(),
-                    arrival_time: chrono::Utc::now(),
+                    arrival_time: chrono::Utc::now().timestamp(),
                     eta_seconds: None,
                 });
             }
