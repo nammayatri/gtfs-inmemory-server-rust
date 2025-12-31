@@ -204,7 +204,11 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getVehicle/{vehicle_no}",
                 actix_web::web::get().to(get_vehicle_data_eta),
-            ),
+            )
+            .route(
+                "/vehicles/{gtfs_id}/list/service-tier/{serviceTier}",
+                actix_web::web::get().to(get_vehicles_by_service_tier),
+            )
     );
 }
 async fn get_example_trip(
@@ -1209,6 +1213,19 @@ async fn get_all_vehicles_by_ids(
     let vehicles = app_state
         .db_vehicle_reader
         .get_vehicles_by_ids(payload.vehicle_ids.clone())
+        .await?;
+
+    Ok(HttpResponse::Ok().json(vehicles))
+}
+
+async fn get_vehicles_by_service_tier(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, service_tier) = path.into_inner();
+    let vehicles = app_state
+        .db_vehicle_reader
+        .get_vehicles_by_service_tier(&gtfs_id, &service_tier)
         .await?;
 
     Ok(HttpResponse::Ok().json(vehicles))

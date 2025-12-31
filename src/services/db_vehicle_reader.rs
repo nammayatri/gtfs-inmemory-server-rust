@@ -45,6 +45,7 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicles_by_service_type(&self, service_type: &str)
         -> AppResult<Vec<VehicleData>>;
+    async fn get_vehicles_by_service_tier(&self, gtfs_id: &str, service_tier: &str) -> AppResult<Vec<String>>;
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicle_count(&self) -> AppResult<i64>;
     async fn get_vehicles_by_depot_name(
@@ -181,6 +182,22 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+    async fn get_vehicles_by_service_tier(&self, _gtfs_id: &str, _service_tier: &str) -> AppResult<Vec<String>> {
+        // Mock returns empty list for now
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_get_vehicles_by_service_tier_returns_empty() {
+        let reader = MockDBVehicleReader::new();
+        let res = reader.get_vehicles_by_service_tier("any", "any").await.unwrap();
+        assert!(res.is_empty());
+    }
 }
 
 pub struct DBVehicleReader {
@@ -194,6 +211,7 @@ pub struct DBVehicleReader {
     vehicle_pool_cache_duration: Duration,
     waybills_by_route_cache: Arc<RwLock<WaybillsByRouteCache>>,
     waybills_by_route_cache_duration: Duration,
+
 }
 
 impl DBVehicleReader {
@@ -2058,5 +2076,34 @@ impl VehicleDataReader for DBVehicleReader {
         }
         
         Ok(waybills)
+    }
+
+    async fn get_vehicles_by_service_tier(&self, gtfs_id: &str, service_tier: &str) -> AppResult<Vec<String>> {
+        if gtfs_id == "chennai_bus" && service_tier.eq_ignore_ascii_case("AC") {
+            let query = r#"
+                SELECT vehicle_no
+                FROM (
+                    SELECT DISTINCT ON (vehicle_no)
+                        vehicle_no,
+                        schedule_no,
+                        created_at
+                    FROM public.waybills
+                    WHERE vehicle_no IS NOT NULL
+                    ORDER BY vehicle_no, created_at DESC
+                ) t
+                 WHERE schedule_no LIKE 'Z%';
+            "#;
+
+            match sqlx::query_as::<_, (String,)>(query).fetch_all(&self.pool).await {
+                Ok(rows) => Ok(rows.into_iter().map(|(v,)| v).collect::<Vec<String>>()),
+                Err(e) => {
+                    error!("get_vehicles_by_service_tier query failed for gtfs_id={}, service_tier={}: {}", gtfs_id, service_tier, e);
+                    Ok(Vec::new())
+                }
+            }
+        } else {
+            // For other gtfs_id/service_tier combinations, return empty list 
+            Ok(Vec::new())
+        }
     }
 }
