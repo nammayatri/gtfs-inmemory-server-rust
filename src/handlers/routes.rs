@@ -969,6 +969,83 @@ async fn get_trip_data(
     Ok(HttpResponse::Ok().json(trip_data))
 }
 
+/// Calculate arrival time and ETA based on haversine distance between stops
+/// Assumes constant speed of 25 km/hr
+fn calculate_eta_from_haversine_distance(
+    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
+    trip_start_time: Option<chrono::NaiveTime>,
+) -> Vec<crate::models::BusStopETA> {
+    const SPEED_KM_PER_HOUR: f64 = 25.0;
+    const EARTH_RADIUS_KM: f64 = 6371.0; // Earth radius in kilometers
+    
+    // Haversine formula to calculate distance between two points
+    fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        let d_lat = (lat2 - lat1).to_radians();
+        let d_lon = (lon2 - lon1).to_radians();
+        
+        let a = (d_lat / 2.0).sin().powi(2)
+            + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().asin();
+        
+        EARTH_RADIUS_KM * c
+    }
+    
+    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
+    let now = chrono::Utc::now();
+    
+    // Calculate cumulative travel time to each stop
+    let mut cumulative_time_seconds: f64 = 0.0;
+    
+    for (idx, mapping) in route_stop_mappings.iter().enumerate() {
+        if idx > 0 {
+            // Calculate distance from previous stop to current stop
+            let prev_mapping = &route_stop_mappings[idx - 1];
+            let distance_km = haversine_distance(
+                prev_mapping.stop_point.lat,
+                prev_mapping.stop_point.lon,
+                mapping.stop_point.lat,
+                mapping.stop_point.lon,
+            );
+            
+            // Calculate time to travel this distance at 25 km/hr
+            let time_hours = distance_km / SPEED_KM_PER_HOUR;
+            let time_seconds = time_hours * 3600.0;
+            cumulative_time_seconds += time_seconds;
+        }
+        
+        // Calculate arrival time
+        let arrival_time = if let Some(start_time) = trip_start_time {
+            // Calculate arrival time from trip start time
+            let today = now.date_naive();
+            let arrival_naive = start_time + chrono::Duration::seconds(cumulative_time_seconds as i64);
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                today.and_time(arrival_naive),
+                chrono::Utc,
+            )
+        } else {
+            // If no start time, use current time + cumulative time
+            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
+        };
+        
+        let arrival_epoch = arrival_time.timestamp();
+        
+        // Calculate ETA in seconds (time until arrival)
+        let eta_seconds = if arrival_time > now {
+            Some((arrival_time - now).num_seconds())
+        } else {
+            None
+        };
+        
+        bus_stop_etas.push(crate::models::BusStopETA {
+            stop_code: mapping.stop_code.clone(),
+            arrival_time: arrival_epoch,
+            eta_seconds,
+        });
+    }
+    
+    bus_stop_etas
+}
+
 async fn get_bus_route_schedule(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
@@ -1068,53 +1145,13 @@ async fn get_bus_route_schedule(
                         .ok()
                 });
             
-            // Build ETAs from route stop mappings
-            for (idx, mapping) in route_stop_mappings.iter().enumerate() {
-                // Calculate arrival time based on trip start time and estimated travel time
-                let arrival_time = if let Some(start_time) = trip_start_time {
-                    // Get cumulative travel time up to this stop
-                    let cumulative_time: i32 = route_stop_mappings[..=idx]
-                        .iter()
-                        .map(|m| m.estimated_travel_time_from_previous_stop.unwrap_or(0))
-                        .sum();
-                    
-                    // Calculate arrival time
-                    let today = chrono::Utc::now().date_naive();
-                    let arrival_naive = start_time + chrono::Duration::seconds(cumulative_time as i64);
-                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                        today.and_time(arrival_naive),
-                        chrono::Utc
-                    )
-                } else {
-                    // Fallback to current time if no start time found
-                    chrono::Utc::now()
-                };
-                
-                // Calculate ETA in seconds (time until arrival)
-                let arrival_epoch = arrival_time.timestamp();
-                let eta_seconds = if arrival_time > chrono::Utc::now() {
-                    Some((arrival_time - chrono::Utc::now()).num_seconds())
-                } else {
-                    None
-                };
-                
-                bus_stop_etas.push(crate::models::BusStopETA {
-                    stop_code: mapping.stop_code.clone(),
-                    arrival_time: arrival_epoch,
-                    eta_seconds,
-                });
-            }
+            // Calculate ETAs using haversine distance function
+            bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
         }
         
-        // If no trip details, create empty ETAs from route stop mapping
+        // If no trip details, calculate ETAs using haversine distance without start time
         if bus_stop_etas.is_empty() {
-            for mapping in &route_stop_mappings {
-                bus_stop_etas.push(crate::models::BusStopETA {
-                    stop_code: mapping.stop_code.clone(),
-                    arrival_time: chrono::Utc::now().timestamp(),
-                    eta_seconds: None,
-                });
-            }
+            bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
         }
         
         schedule_details.push(crate::models::BusScheduleDetail {
