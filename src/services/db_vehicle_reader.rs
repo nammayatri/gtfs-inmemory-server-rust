@@ -456,14 +456,14 @@ impl DBVehicleReader {
         });
     }
 
-    async fn fetch_vehicle_data_impl(
-        &self,
-        vehicle_no: &str,
-        trip_number: Option<i32>,
-    ) -> AppResult<VehicleDataWithRouteId> {
-        Self::fetch_vehicle_data_with_pool(&self.pool, vehicle_no, trip_number).await
-    }
-
+    // async fn fetch_vehicle_data_impl(
+    //     &self,
+    //     vehicle_no: &str,
+    //     trip_number: Option<i32>,
+    // ) -> AppResult<VehicleDataWithRouteId> {
+    //     Self::fetch_vehicle_data_with_pool(&self.pool, vehicle_no, trip_number).await
+    // }
+    //
     async fn fetch_vehicle_data_with_pool(
         pool: &PgPool,
         vehicle_no: &str,
@@ -851,45 +851,45 @@ impl DBVehicleReader {
         Ok(())
     }
 
-    fn log_trip_rows(&self, source: &str, rows: &[BusSchedule]) {
-        info!(
-            source = source,
-            count = rows.len(),
-            "Trip rows fetched from table"
-        );
-        // Print a small table of up to 10 rows for readability
-        info!(
-            source = source,
-            "{:<16} | {:<16} | {:<6} | {:<5} | {}",
-            "schedule_no",
-            "route_id",
-            "trip#",
-            "active",
-            "org_name"
-        );
-        for r in rows.iter().take(10) {
-            info!(
-                source = source,
-                "{:<16} | {:<16} | {:<6} | {:<5} | {}",
-                r.schedule_number,
-                r.route_id,
-                r.trip_number.unwrap_or_default(),
-                if r.is_active_trip.unwrap_or(false) {
-                    "true"
-                } else {
-                    "false"
-                },
-                r.org_name.as_deref().unwrap_or("")
-            );
-        }
-        if rows.len() > 10 {
-            info!(
-                source = source,
-                remaining = rows.len() - 10,
-                "... more rows omitted"
-            );
-        }
-    }
+    // fn log_trip_rows(&self, source: &str, rows: &[BusSchedule]) {
+    //     info!(
+    //         source = source,
+    //         count = rows.len(),
+    //         "Trip rows fetched from table"
+    //     );
+    //     // Print a small table of up to 10 rows for readability
+    //     info!(
+    //         source = source,
+    //         "{:<16} | {:<16} | {:<6} | {:<5} | {}",
+    //         "schedule_no",
+    //         "route_id",
+    //         "trip#",
+    //         "active",
+    //         "org_name"
+    //     );
+    //     for r in rows.iter().take(10) {
+    //         info!(
+    //             source = source,
+    //             "{:<16} | {:<16} | {:<6} | {:<5} | {}",
+    //             r.schedule_number,
+    //             r.route_id,
+    //             r.trip_number.unwrap_or_default(),
+    //             if r.is_active_trip.unwrap_or(false) {
+    //                 "true"
+    //             } else {
+    //                 "false"
+    //             },
+    //             r.org_name.as_deref().unwrap_or("")
+    //         );
+    //     }
+    //     if rows.len() > 10 {
+    //         info!(
+    //             source = source,
+    //             remaining = rows.len() - 10,
+    //             "... more rows omitted"
+    //         );
+    //     }
+    // }
 
     /// Query for Online waybills 
     async fn get_online_waybill(&self, vehicle_no: &str) -> AppResult<Option<VehicleData>> {
@@ -1212,94 +1212,94 @@ impl DBVehicleReader {
         }
     }
 
-    async fn fetch_trip_rows_for_schedule(
-        &self,
-        schedule_trip_id: &str,
-        detail_query: &str,
-        flexi_query: &str,
-    ) -> Vec<BusSchedule> {
-        // Fetch from detailed trips first
-        let mut detail_rows = match sqlx::query_as::<_, BusSchedule>(detail_query)
-            .bind(schedule_trip_id)
-            .fetch_all(&self.pool)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!(
-                    "fetch_trip_rows_for_schedule: detail query failed. query={} error={}",
-                    detail_query, e
-                );
-                Vec::new()
-            }
-        };
-        self.log_trip_rows("bus_schedule_trip_detail", &detail_rows);
-
-        // Only fetch from flexi trips if no active trip is present in detail rows
-        let detail_has_active = detail_rows
-            .iter()
-            .any(|row| row.is_active_trip.unwrap_or(false));
-
-        let mut flexi_rows: Vec<BusSchedule> = Vec::new();
-        if !detail_has_active {
-            flexi_rows = match sqlx::query_as::<_, BusSchedule>(flexi_query)
-                .bind(schedule_trip_id)
-                .fetch_all(&self.pool)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    error!(
-                        "fetch_trip_rows_for_schedule: flexi query failed. query={} error={}",
-                        flexi_query, e
-                    );
-                    Vec::new()
-                }
-            };
-            self.log_trip_rows("bus_schedule_trip_flexi", &flexi_rows);
-        } else {
-            info!(
-                schedule_trip_id = schedule_trip_id,
-                "Skipping flexi fetch: active trip found in detail table"
-            );
-        }
-
-        // Combine (flexi_rows may be empty if skipped)
-        detail_rows.append(&mut flexi_rows);
-
-        // Stable partition to bring active trip to front if present
-        if let Some(idx) = detail_rows
-            .iter()
-            .position(|row| row.is_active_trip.unwrap_or(false))
-        {
-            if idx != 0 {
-                detail_rows.swap(0, idx);
-            }
-        }
-
-        // Sort by trip_number if available, but keep index 0 if it is active trip
-        let has_active_front = detail_rows
-            .get(0)
-            .map(|r| r.is_active_trip.unwrap_or(false))
-            .unwrap_or(false);
-        detail_rows.sort_by(|a, b| {
-            let at = a.trip_number.unwrap_or(i32::MAX);
-            let bt = b.trip_number.unwrap_or(i32::MAX);
-            at.cmp(&bt)
-        });
-        if has_active_front {
-            if let Some(pos) = detail_rows
-                .iter()
-                .position(|row| row.is_active_trip.unwrap_or(false))
-            {
-                if pos != 0 {
-                    detail_rows.swap(0, pos);
-                }
-            }
-        }
-
-        detail_rows
-    }
+    // async fn fetch_trip_rows_for_schedule(
+    //     &self,
+    //     schedule_trip_id: &str,
+    //     detail_query: &str,
+    //     flexi_query: &str,
+    // ) -> Vec<BusSchedule> {
+    //     // Fetch from detailed trips first
+    //     let mut detail_rows = match sqlx::query_as::<_, BusSchedule>(detail_query)
+    //         .bind(schedule_trip_id)
+    //         .fetch_all(&self.pool)
+    //         .await
+    //     {
+    //         Ok(rows) => rows,
+    //         Err(e) => {
+    //             error!(
+    //                 "fetch_trip_rows_for_schedule: detail query failed. query={} error={}",
+    //                 detail_query, e
+    //             );
+    //             Vec::new()
+    //         }
+    //     };
+    //     self.log_trip_rows("bus_schedule_trip_detail", &detail_rows);
+    //
+    //     // Only fetch from flexi trips if no active trip is present in detail rows
+    //     let detail_has_active = detail_rows
+    //         .iter()
+    //         .any(|row| row.is_active_trip.unwrap_or(false));
+    //
+    //     let mut flexi_rows: Vec<BusSchedule> = Vec::new();
+    //     if !detail_has_active {
+    //         flexi_rows = match sqlx::query_as::<_, BusSchedule>(flexi_query)
+    //             .bind(schedule_trip_id)
+    //             .fetch_all(&self.pool)
+    //             .await
+    //         {
+    //             Ok(rows) => rows,
+    //             Err(e) => {
+    //                 error!(
+    //                     "fetch_trip_rows_for_schedule: flexi query failed. query={} error={}",
+    //                     flexi_query, e
+    //                 );
+    //                 Vec::new()
+    //             }
+    //         };
+    //         self.log_trip_rows("bus_schedule_trip_flexi", &flexi_rows);
+    //     } else {
+    //         info!(
+    //             schedule_trip_id = schedule_trip_id,
+    //             "Skipping flexi fetch: active trip found in detail table"
+    //         );
+    //     }
+    //
+    //     // Combine (flexi_rows may be empty if skipped)
+    //     detail_rows.append(&mut flexi_rows);
+    //
+    //     // Stable partition to bring active trip to front if present
+    //     if let Some(idx) = detail_rows
+    //         .iter()
+    //         .position(|row| row.is_active_trip.unwrap_or(false))
+    //     {
+    //         if idx != 0 {
+    //             detail_rows.swap(0, idx);
+    //         }
+    //     }
+    //
+    //     // Sort by trip_number if available, but keep index 0 if it is active trip
+    //     let has_active_front = detail_rows
+    //         .get(0)
+    //         .map(|r| r.is_active_trip.unwrap_or(false))
+    //         .unwrap_or(false);
+    //     detail_rows.sort_by(|a, b| {
+    //         let at = a.trip_number.unwrap_or(i32::MAX);
+    //         let bt = b.trip_number.unwrap_or(i32::MAX);
+    //         at.cmp(&bt)
+    //     });
+    //     if has_active_front {
+    //         if let Some(pos) = detail_rows
+    //             .iter()
+    //             .position(|row| row.is_active_trip.unwrap_or(false))
+    //         {
+    //             if pos != 0 {
+    //                 detail_rows.swap(0, pos);
+    //             }
+    //         }
+    //     }
+    //
+    //     detail_rows
+    // }
 }
 
 #[async_trait]
