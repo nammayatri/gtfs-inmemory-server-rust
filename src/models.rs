@@ -274,6 +274,12 @@ pub struct GTFSStopData {
     pub stops: HashMap<String, GTFSStop>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GTFSAlternateStopData {
+    pub alternate_stops: HashMap<String, Vec<GTFSStop>>,
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStopCodeRecord {
     pub gtfs_id: String,
@@ -308,6 +314,7 @@ pub struct GTFSData {
     pub static_fleet_info_by_gtfs: HashMap<String, HashMap<String, StaticFleetInfo>>,
     pub entity_id_name_mapping: HashMap<String, String>,
     pub route_example_trip_details_by_gtfs: HashMap<String, HashMap<String, TripDetails>>,
+    pub alternate_stop_by_gtfs: HashMap<String, GTFSAlternateStopData>,
 }
 
 impl GTFSData {

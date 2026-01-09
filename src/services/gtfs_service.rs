@@ -1,11 +1,11 @@
 use crate::environment::AppConfig;
-use crate::models::TripDetails;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
     ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
     StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
+use crate::models::{GTFSAlternateStopData, TripDetails};
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
@@ -161,6 +161,8 @@ impl GTFSService {
         let stops_by_gtfs =
             self.build_stops_by_gtfs(all_stops.clone(), &stop_regional_names_by_gtfs);
 
+        let alternate_stops_by_gtfs = self.build_alternate_stops_by_gtfs(all_stops.clone());
+
         // Build route data
         let route_data_by_gtfs = self.build_route_data(
             &all_pattern_details,
@@ -195,6 +197,7 @@ impl GTFSService {
         temp_data.suburban_stop_info_by_gtfs = suburban_stop_info_by_gtfs;
         temp_data.static_fleet_info_by_gtfs = static_fleet_info_by_gtfs;
         temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
+        temp_data.alternate_stop_by_gtfs = alternate_stops_by_gtfs;
 
         Ok(temp_data)
     }
@@ -554,6 +557,69 @@ impl GTFSService {
                 .insert(route_code.to_string(), route_res);
         }
         routes_by_gtfs
+    }
+
+    fn build_alternate_stops_by_gtfs(
+        &self,
+        stops: Vec<GTFSStop>,
+    ) -> HashMap<String, GTFSAlternateStopData> {
+        let mut alternate_stops_by_gtfs: HashMap<String, GTFSAlternateStopData> = HashMap::new();
+
+        // Step 1: group stops by (gtfs_id, stop_name)
+        let mut by_gtfs_and_name: HashMap<String, HashMap<String, Vec<GTFSStop>>> = HashMap::new();
+
+        for stop in stops {
+            let parts: Vec<&str> = stop.id.split(':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let gtfs_id = parts[0].to_string();
+
+            by_gtfs_and_name
+                .entry(gtfs_id)
+                .or_default()
+                .entry(stop.name.clone())
+                .or_default()
+                .push(stop);
+        }
+
+        // Step 2: build stop_id → alternates (GTFS scoped)
+        for (gtfs_id, by_name) in by_gtfs_and_name {
+            let gtfs_data = alternate_stops_by_gtfs.entry(gtfs_id).or_default();
+
+            for (_name, stops_with_same_name) in by_name {
+                if stops_with_same_name.len() < 2 {
+                    continue;
+                }
+
+                for stop in &stops_with_same_name {
+                    let stop_id = match stop.id.split(':').nth(1) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let alternates = stops_with_same_name
+                        .iter()
+                        .filter(|other| {
+                            other
+                                .id
+                                .split(':')
+                                .nth(1)
+                                .map(|id| id != stop_id)
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    gtfs_data
+                        .alternate_stops
+                        .insert(stop_id.to_string(), alternates);
+                }
+            }
+        }
+
+        alternate_stops_by_gtfs
     }
 
     fn build_stops_by_gtfs(
@@ -1195,6 +1261,26 @@ impl GTFSService {
             return Ok(stops);
         }
         Err(AppError::NotFound("GTFS ID not found".to_string()))
+    }
+
+    pub async fn get_alternate_stops(
+        &self,
+        gtfs_id: &str,
+        stop_id: &str,
+    ) -> AppResult<Vec<Arc<GTFSStop>>> {
+        let data = self.data.read().await;
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_id = clean_identifier(stop_id);
+
+        let alternate_stops = data
+            .alternate_stop_by_gtfs
+            .get(&gtfs_id)
+            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))?
+            .alternate_stops
+            .get(&stop_id)
+            .ok_or_else(|| AppError::NotFound("Alternate stops not found".to_string()))?;
+        let stops = alternate_stops.iter().cloned().map(Arc::new).collect();
+        Ok(stops)
     }
 
     pub async fn get_stop(
