@@ -103,6 +103,12 @@ pub struct BusSchedule {
     pub trip_order: Option<i32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BusTag {
+    #[serde(rename = "ullaPass")]
+    UllaPass,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleServiceTypeResponse {
     pub vehicle_no: String,
@@ -120,6 +126,8 @@ pub struct VehicleServiceTypeResponse {
     pub is_actually_valid: Option<bool>,
     pub driver_id: Option<String>,
     pub conductor_id: Option<String>,
+    #[serde(rename = "busTag")]
+    pub bus_tag: Option<BusTag>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,7 +286,6 @@ pub struct GTFSStopData {
 pub struct GTFSAlternateStopData {
     pub alternate_stops: HashMap<String, Vec<String>>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStopCodeRecord {

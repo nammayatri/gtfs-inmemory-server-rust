@@ -1,5 +1,5 @@
-use crate::tools::error::{AppError, AppResult};
 use crate::services::gtfs_service::GTFSService;
+use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use reqwest::Client;
@@ -36,7 +36,7 @@ struct ExternalApiVehicle {
     #[serde(rename = "driverId", default)]
     driver_id: Option<String>,
     #[serde(rename = "conductorId", default)]
-    conductor_id: Option<String>
+    conductor_id: Option<String>,
 }
 
 // The API returns a direct array, not wrapped
@@ -59,7 +59,7 @@ pub struct CachedVehicleData {
     pub deleted: Option<bool>,
     pub trip_order: Option<i32>,
     pub driver_id: Option<String>,
-    pub conductor_id: Option<String>
+    pub conductor_id: Option<String>,
 }
 
 pub struct BhubaneswarVehicleCache {
@@ -173,10 +173,11 @@ impl BhubaneswarVehicleCache {
         for vehicle in vehicles {
             // Get service_type from route_service_tier_mapping.csv based on route_id
             let mut service_type: Option<String> = route_mapping.get(&vehicle.route_id).cloned();
-            
+
             // Fallback: if not found, try to get from static_fleet_info via GTFS service by vehicle number
             if service_type.is_none() {
-                service_type = self.gtfs_service
+                service_type = self
+                    .gtfs_service
                     .get_fleet_service_type("bhubaneshwar_bus", &vehicle.vehicle_no)
                     .await;
             }

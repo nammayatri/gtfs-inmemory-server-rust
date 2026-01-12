@@ -700,6 +700,8 @@ async fn get_service_type_by_vehicle_impl(
                 }]);
             }
 
+            let bus_tag = app_state.fleet_list.get(&cached_data.vehicle_no).cloned();
+
             return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
                 vehicle_no: cached_data.vehicle_no,
                 service_type: cached_data.service_type,
@@ -715,6 +717,7 @@ async fn get_service_type_by_vehicle_impl(
                 is_actually_valid: None,
                 driver_id: cached_data.driver_id,
                 conductor_id: cached_data.conductor_id,
+                bus_tag,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -739,6 +742,7 @@ async fn get_service_type_by_vehicle_impl(
                     is_actually_valid: None,
                     driver_id: None,
                     conductor_id: None,
+                    bus_tag: app_state.fleet_list.get(vehicle_no).cloned(),
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -808,6 +812,8 @@ async fn get_service_type_by_vehicle_impl(
     );
     let depot_no = vehicle_data.entity_remark.or(vehicle_data.depot);
 
+    let bus_tag = app_state.fleet_list.get(&vehicle_data.vehicle_no).cloned();
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
@@ -823,6 +829,7 @@ async fn get_service_type_by_vehicle_impl(
         is_actually_valid,
         driver_id: vehicle_data.driver_code,
         conductor_id: vehicle_data.conductor_code,
+        bus_tag,
     }))
 }
 
