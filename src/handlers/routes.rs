@@ -987,7 +987,7 @@ async fn get_trip_data(
 /// Assumes constant speed of 25 km/hr
 fn calculate_eta_from_haversine_distance(
     route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
-    trip_start_time: Option<chrono::NaiveTime>,
+    trip_start_time: Option<i64>,
 ) -> Vec<crate::models::BusStopETA> {
     const SPEED_KM_PER_HOUR: f64 = 25.0;
     const EARTH_RADIUS_KM: f64 = 6371.0; // Earth radius in kilometers
@@ -1028,15 +1028,11 @@ fn calculate_eta_from_haversine_distance(
         }
 
         // Calculate arrival time
-        let arrival_time = if let Some(start_time) = trip_start_time {
+        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
             // Calculate arrival time from trip start time
-            let today = now.date_naive();
-            let arrival_naive =
-                start_time + chrono::Duration::seconds(cumulative_time_seconds as i64);
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                today.and_time(arrival_naive),
-                chrono::Utc,
-            )
+            let start_utc =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
+            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64)
         } else {
             // If no start time, use current time + cumulative time
             now + chrono::Duration::seconds(cumulative_time_seconds as i64)
@@ -1055,6 +1051,7 @@ fn calculate_eta_from_haversine_distance(
             stop_code: mapping.stop_code.clone(),
             arrival_time: arrival_epoch,
             eta_seconds,
+            stop_name: Some(mapping.stop_name.clone()),
         });
     }
 
@@ -1156,14 +1153,9 @@ async fn get_bus_route_schedule(
             });
 
             // Get trip start time from the matching trip
-            let trip_start_time = matching_trip
+            let trip_start_time: Option<i64> = matching_trip
                 .and_then(|trip| trip.start_time.as_ref())
-                .and_then(|s| {
-                    // Parse time string (format might be HH:MM:SS or similar)
-                    chrono::NaiveTime::parse_from_str(s, "%H:%M:%S")
-                        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M"))
-                        .ok()
-                });
+                .and_then(|s| s.parse::<i64>().ok());
 
             // Calculate ETAs using haversine distance function
             bus_stop_etas =
