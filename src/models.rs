@@ -438,6 +438,8 @@ pub struct BusStopETA {
     pub arrival_time: i64, // Epoch timestamp in seconds
     #[serde(rename = "eta_seconds")]
     pub eta_seconds: Option<i64>,
+    #[serde(rename = "stop_name")]
+    pub stop_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
