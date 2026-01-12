@@ -1,10 +1,10 @@
 use anyhow::Result;
+use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use csv::ReaderBuilder;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
@@ -122,6 +122,7 @@ pub struct AppState {
     pub bhubaneswar_vehicle_cache: Arc<BhubaneswarVehicleCache>,
     pub config: AppConfig,
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
+    pub fleet_list: Arc<HashMap<String, crate::models::BusTag>>,
 }
 
 impl AppState {
@@ -191,14 +192,68 @@ impl AppState {
             bhubaneswar_vehicle_cache,
             config: app_config,
             bus_registration_mapping,
+            fleet_list: Arc::new(Self::load_fleet_list().await?),
         };
 
         Ok(app_state)
     }
 
+    async fn load_fleet_list() -> Result<HashMap<String, crate::models::BusTag>> {
+        let file_path = "./assets/fleet_list.csv";
+
+        // Check if file exists, if not return empty HashMap
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                info!("fleet_list.csv file not found, proceeding without fleet list data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read fleet_list.csv: {}", e))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut fleet_map = HashMap::new();
+        for result in reader.records() {
+            match result {
+                Ok(record) => {
+                    // Assuming columns: vehicle_no, tag
+                    if let (Some(vehicle_no), Some(tag_str)) = (record.get(0), record.get(1)) {
+                        // Parse tag string to BusTag enum manually or use serde if record deserialization was used.
+                        // Simple string matching for now to keep it robust against slightly different casing if needed,
+                        // or precise. "ullaPass" -> BusTag::UllaPass.
+                        let tag = match tag_str.trim() {
+                            "ullaPass" => Some(crate::models::BusTag::UllaPass),
+                            _ => {
+                                info!("Unknown bus tag '{}' for vehicle {}", tag_str, vehicle_no);
+                                None
+                            }
+                        };
+
+                        if let Some(t) = tag {
+                            fleet_map.insert(vehicle_no.trim().to_string(), t);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error parsing fleet_list CSV row: {}", e);
+                }
+            }
+        }
+
+        info!("Loaded {} tags from fleet_list.csv", fleet_map.len());
+        Ok(fleet_map)
+    }
+
     async fn load_bus_registration_mapping() -> Result<HashMap<String, HashMap<String, String>>> {
         use crate::models::BusRegistrationMappingRecord;
-        
+
         let file_path = "./assets/bus_registration_mapping.csv";
 
         // Check if file exists, if not return empty HashMap

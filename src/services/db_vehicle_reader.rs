@@ -8,7 +8,8 @@ use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
 use crate::models::{
-    BusSchedule, MinimalVehicleData, VehicleData, VehicleDataWithRouteId, DepotVehicleSummary, VehicleOperationData, WaybillStatus
+    BusSchedule, DepotVehicleSummary, MinimalVehicleData, VehicleData, VehicleDataWithRouteId,
+    VehicleOperationData, WaybillStatus,
 };
 use crate::tools::error::{AppError, AppResult};
 
@@ -45,7 +46,11 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicles_by_service_type(&self, service_type: &str)
         -> AppResult<Vec<VehicleData>>;
-    async fn get_vehicles_by_service_tier(&self, gtfs_id: &str, service_tier: &str) -> AppResult<Vec<String>>;
+    async fn get_vehicles_by_service_tier(
+        &self,
+        gtfs_id: &str,
+        service_tier: &str,
+    ) -> AppResult<Vec<String>>;
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>>;
     async fn get_vehicle_count(&self) -> AppResult<i64>;
     async fn get_vehicles_by_depot_name(
@@ -60,7 +65,11 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
-    async fn get_waybills_by_route_id(&self, gtfs_id: &str, route_id: &str) -> AppResult<Vec<VehicleData>>;
+    async fn get_waybills_by_route_id(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<Vec<VehicleData>>;
 }
 
 // Mock implementation for local testing without a database
@@ -177,12 +186,20 @@ impl VehicleDataReader for MockDBVehicleReader {
         ))
     }
 
-    async fn get_waybills_by_route_id(&self, _gtfs_id: &str, _route_id: &str) -> AppResult<Vec<VehicleData>> {
+    async fn get_waybills_by_route_id(
+        &self,
+        _gtfs_id: &str,
+        _route_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
-    async fn get_vehicles_by_service_tier(&self, _gtfs_id: &str, _service_tier: &str) -> AppResult<Vec<String>> {
+    async fn get_vehicles_by_service_tier(
+        &self,
+        _gtfs_id: &str,
+        _service_tier: &str,
+    ) -> AppResult<Vec<String>> {
         // Mock returns empty list for now
         Ok(Vec::new())
     }
@@ -195,7 +212,10 @@ mod tests {
     #[tokio::test]
     async fn mock_get_vehicles_by_service_tier_returns_empty() {
         let reader = MockDBVehicleReader::new();
-        let res = reader.get_vehicles_by_service_tier("any", "any").await.unwrap();
+        let res = reader
+            .get_vehicles_by_service_tier("any", "any")
+            .await
+            .unwrap();
         assert!(res.is_empty());
     }
 }
@@ -211,7 +231,6 @@ pub struct DBVehicleReader {
     vehicle_pool_cache_duration: Duration,
     waybills_by_route_cache: Arc<RwLock<WaybillsByRouteCache>>,
     waybills_by_route_cache_duration: Duration,
-
 }
 
 impl DBVehicleReader {
@@ -229,9 +248,7 @@ impl DBVehicleReader {
                 vehicles_by_depot_id: HashMap::new(),
             })),
             depot_cache_duration: Duration::from_secs(7200), // 2 hours TTL
-            vehicle_pool_cache: Arc::new(RwLock::new(VehiclePoolCache {
-                all_vehicles: None,
-            })),
+            vehicle_pool_cache: Arc::new(RwLock::new(VehiclePoolCache { all_vehicles: None })),
             vehicle_pool_cache_duration: Duration::from_secs(10800), // 3 hours TTL
             waybills_by_route_cache: Arc::new(RwLock::new(WaybillsByRouteCache {
                 waybills_by_route: HashMap::new(),
@@ -258,8 +275,6 @@ impl DBVehicleReader {
     fn get_waybills_by_route_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
         format!("{}:{}", gtfs_id, route_id)
     }
-
-
 
     async fn get_all_vehicles_pool(&self) -> AppResult<std::collections::HashSet<String>> {
         // Check cache first
@@ -685,7 +700,7 @@ impl DBVehicleReader {
                 let waybill_status_agnostic_query = "
                     SELECT w.vehicle_no, w.service_type
                     FROM waybills w
-                    WHERE w.vehicle_no = $1            
+                    WHERE w.vehicle_no = $1
                     ORDER BY w.updated_at DESC
                     LIMIT 1
                 ";
@@ -891,13 +906,13 @@ impl DBVehicleReader {
     //     }
     // }
 
-    /// Query for Online waybills 
+    /// Query for Online waybills
     async fn get_online_waybill(&self, vehicle_no: &str) -> AppResult<Option<VehicleData>> {
         let online_query = r#"
-            SELECT 
-                w.waybill_id::text, 
-                w.waybill_no::text, 
-                w.service_type, 
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
                 w.vehicle_no,
                 w.schedule_no,
                 w.updated_at::timestamptz AS last_updated,
@@ -929,13 +944,13 @@ impl DBVehicleReader {
         }
     }
 
-    /// Query for Processed/New waybills 
+    /// Query for Processed/New waybills
     async fn get_processed_new_waybill(&self, vehicle_no: &str) -> AppResult<Option<VehicleData>> {
         let fallback_query = r#"
-            SELECT 
-                w.waybill_id::text, 
-                w.waybill_no::text, 
-                w.service_type, 
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
                 w.vehicle_no,
                 w.schedule_no,
                 w.updated_at::timestamptz AS last_updated,
@@ -950,9 +965,9 @@ impl DBVehicleReader {
             FROM waybills w
             LEFT JOIN entities e ON e.entity_id = w.entity_id
             WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New') AND w.deleted = false
-            ORDER BY CASE 
-                WHEN w.status = 'Processed' THEN 1 
-                WHEN w.status = 'New' THEN 2 
+            ORDER BY CASE
+                WHEN w.status = 'Processed' THEN 1
+                WHEN w.status = 'New' THEN 2
             END, w.updated_at DESC
             LIMIT 1
         "#;
@@ -964,37 +979,48 @@ impl DBVehicleReader {
         {
             Ok(result) => Ok(result),
             Err(e) => {
-                error!("Processed/New waybill query failed for {}: {}", vehicle_no, e);
+                error!(
+                    "Processed/New waybill query failed for {}: {}",
+                    vehicle_no, e
+                );
                 Ok(None)
             }
         }
     }
 
     /// Split waybill query strategy with priority: Online first, then Processed/New
-    async fn get_waybill_with_priority(&self, vehicle_no: &str) -> AppResult<(Option<VehicleData>, WaybillStatus)> {
-        // Priority 1: Online waybills 
+    async fn get_waybill_with_priority(
+        &self,
+        vehicle_no: &str,
+    ) -> AppResult<(Option<VehicleData>, WaybillStatus)> {
+        // Priority 1: Online waybills
         if let Some(online_waybill) = self.get_online_waybill(vehicle_no).await? {
             return Ok((Some(online_waybill), WaybillStatus::Online));
         }
-        
+
         // Priority 2: Processed/New waybills
         if let Some(processed_waybill) = self.get_processed_new_waybill(vehicle_no).await? {
             return Ok((Some(processed_waybill), WaybillStatus::ProcessedOrNew));
         }
-        
+
         // No waybill found
         Ok((None, WaybillStatus::NotFound))
     }
 
     /// Handle flexi trips using waybill_id binding
-    async fn handle_flexi_trips(&self, waybill_data: &VehicleData, trip_number: Option<i32>) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+    async fn handle_flexi_trips(
+        &self,
+        waybill_data: &VehicleData,
+        trip_number: Option<i32>,
+    ) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
         let flexi_query = if let Some(trip_num) = trip_number {
-            format!(r#"
-                SELECT 
-                    NULL::int AS stops_count, 
+            format!(
+                r#"
+                SELECT
+                    NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number, 
-                    org_name::text AS org_name, 
+                    schedule_number,
+                    org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
                     trip_start_time AS start_time,
@@ -1005,14 +1031,16 @@ impl DBVehicleReader {
                 FROM bus_schedule_trip_flexi
                 WHERE waybill_id = $1::bigint AND trip_number >= {} AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
-            "#, trip_num)
+            "#,
+                trip_num
+            )
         } else {
             r#"
-                SELECT 
-                    NULL::int AS stops_count, 
+                SELECT
+                    NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number, 
-                    org_name::text AS org_name, 
+                    schedule_number,
+                    org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
                     trip_start_time AS start_time,
@@ -1023,9 +1051,10 @@ impl DBVehicleReader {
                 FROM bus_schedule_trip_flexi
                 WHERE waybill_id = $1::bigint AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
-            "#.to_string()
+            "#
+            .to_string()
         };
-        
+
         let flexi_rows = match sqlx::query_as::<_, BusSchedule>(&flexi_query)
             .bind(waybill_data.waybill_id.parse::<i64>().unwrap_or(0))
             .fetch_all(&self.pool)
@@ -1033,28 +1062,38 @@ impl DBVehicleReader {
         {
             Ok(rows) => rows,
             Err(e) => {
-                error!("Flexi query failed for waybill_id {}: {}", waybill_data.waybill_id, e);
+                error!(
+                    "Flexi query failed for waybill_id {}: {}",
+                    waybill_data.waybill_id, e
+                );
                 Vec::new()
             }
         };
-        
+
         if !flexi_rows.is_empty() {
             return self.process_trip_rows(flexi_rows, false).await;
         }
-        
+
         // Fallback to detail trips if no flexi rows
-        self.handle_detail_trips(waybill_data, false, trip_number).await
+        self.handle_detail_trips(waybill_data, false, trip_number)
+            .await
     }
 
     /// Handle detail trips using schedule_trip_id binding
-    async fn handle_detail_trips(&self, waybill_data: &VehicleData, force_first_active: bool, trip_number: Option<i32>) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+    async fn handle_detail_trips(
+        &self,
+        waybill_data: &VehicleData,
+        force_first_active: bool,
+        trip_number: Option<i32>,
+    ) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
         let detail_query = if let Some(trip_num) = trip_number {
-            format!(r#"
-                SELECT 
-                    NULL::int AS stops_count, 
+            format!(
+                r#"
+                SELECT
+                    NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number, 
-                    org_name::text AS org_name, 
+                    schedule_number,
+                    org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
                     trip_start_time AS start_time,
@@ -1065,14 +1104,16 @@ impl DBVehicleReader {
                 FROM bus_schedule_trip_detail
                 WHERE schedule_trip_id = $1::bigint AND trip_number >= {} AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
-            "#, trip_num)
+            "#,
+                trip_num
+            )
         } else {
             r#"
-                SELECT 
-                    NULL::int AS stops_count, 
+                SELECT
+                    NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number, 
-                    org_name::text AS org_name, 
+                    schedule_number,
+                    org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
                     trip_start_time AS start_time,
@@ -1081,15 +1122,15 @@ impl DBVehicleReader {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_detail
-                WHERE schedule_trip_id = $1::bigint 
+                WHERE schedule_trip_id = $1::bigint
                     AND trip_number >= (SELECT COALESCE(
-                        (SELECT trip_number FROM bus_schedule_trip_detail 
+                        (SELECT trip_number FROM bus_schedule_trip_detail
                          WHERE schedule_trip_id = $1::bigint AND is_active_trip = true AND trip_type != 'dead-trip'), 1))
                     AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#.to_string()
         };
-        
+
         let detail_rows = match sqlx::query_as::<_, BusSchedule>(&detail_query)
             .bind(&waybill_data.schedule_trip_id)
             .fetch_all(&self.pool)
@@ -1097,28 +1138,38 @@ impl DBVehicleReader {
         {
             Ok(rows) => rows,
             Err(e) => {
-                error!("Detail query failed for schedule_trip_id {:?}: {}", waybill_data.schedule_trip_id, e);
+                error!(
+                    "Detail query failed for schedule_trip_id {:?}: {}",
+                    waybill_data.schedule_trip_id, e
+                );
                 Vec::new()
             }
         };
-        
+
         if !detail_rows.is_empty() {
-            return self.process_trip_rows(detail_rows, force_first_active).await;
+            return self
+                .process_trip_rows(detail_rows, force_first_active)
+                .await;
         }
-        
+
         // Final fallback to bus_schedule table
-        self.handle_schedule_fallback(&waybill_data.schedule_no).await
+        self.handle_schedule_fallback(&waybill_data.schedule_no)
+            .await
     }
 
     /// Process trip rows with consistent active trip + remaining trips logic
-    async fn process_trip_rows(&self, mut rows: Vec<BusSchedule>, force_first_active: bool) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+    async fn process_trip_rows(
+        &self,
+        mut rows: Vec<BusSchedule>,
+        force_first_active: bool,
+    ) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
         if rows.is_empty() {
             return Ok((None, false, None));
         }
-        
+
         // Enrich with route numbers
         self.enrich_route_numbers(&mut rows).await?;
-        
+
         if force_first_active {
             // For Processed/New: First trip becomes active, remaining are only FUTURE trips
             let first = rows.remove(0);
@@ -1129,15 +1180,19 @@ impl DBVehicleReader {
             if let Some(active_idx) = rows.iter().position(|r| r.is_active_trip.unwrap_or(false)) {
                 // Remove active trip from list
                 let active_trip = rows.remove(active_idx);
-                
+
                 // Remaining trips = only trips that come AFTER the active trip (by trip_number)
                 let active_trip_num = active_trip.trip_number.unwrap_or(0);
                 let remaining_trips: Vec<BusSchedule> = rows
                     .into_iter()
                     .filter(|trip| trip.trip_number.unwrap_or(0) > active_trip_num)
                     .collect();
-                
-                let remaining = if remaining_trips.is_empty() { None } else { Some(remaining_trips) };
+
+                let remaining = if remaining_trips.is_empty() {
+                    None
+                } else {
+                    Some(remaining_trips)
+                };
                 Ok((Some(active_trip), true, remaining))
             } else {
                 // No active trip, use first and remaining are FUTURE trips
@@ -1149,13 +1204,16 @@ impl DBVehicleReader {
     }
 
     /// Handle bus_schedule fallback
-    async fn handle_schedule_fallback(&self, schedule_no: &str) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+    async fn handle_schedule_fallback(
+        &self,
+        schedule_no: &str,
+    ) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
         let bus_schedule_query = r#"
-            SELECT 
-                NULL::int AS stops_count, 
-                route_id::text AS route_id, 
-                schedule_number, 
-                NULL::text AS org_name, 
+            SELECT
+                NULL::int AS stops_count,
+                route_id::text AS route_id,
+                schedule_number,
+                NULL::text AS org_name,
                 NULL::int AS trip_number,
                 NULL::bigint AS schedule_trip_id,
                 NULL::text AS start_time,
@@ -1163,10 +1221,10 @@ impl DBVehicleReader {
                 FALSE AS deleted,
                 FALSE AS is_active_trip,
                 NULL::int AS trip_order
-            FROM bus_schedule 
+            FROM bus_schedule
             WHERE schedule_number = $1 AND deleted = false
         "#;
-        
+
         let mut rows = match sqlx::query_as::<_, BusSchedule>(bus_schedule_query)
             .bind(schedule_no)
             .fetch_all(&self.pool)
@@ -1174,11 +1232,14 @@ impl DBVehicleReader {
         {
             Ok(r) => r,
             Err(e) => {
-                error!("Bus schedule fallback query failed for {}: {}", schedule_no, e);
+                error!(
+                    "Bus schedule fallback query failed for {}: {}",
+                    schedule_no, e
+                );
                 Vec::new()
             }
         };
-        
+
         if !rows.is_empty() {
             self.enrich_route_numbers(&mut rows).await?;
             let first = rows.remove(0);
@@ -1190,20 +1251,27 @@ impl DBVehicleReader {
     }
 
     /// Resolve trip data based on waybill status and is_flexi flag
-    async fn resolve_trip_data(&self, waybill_data: VehicleData, status: WaybillStatus, trip_number: Option<i32>) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
+    async fn resolve_trip_data(
+        &self,
+        waybill_data: VehicleData,
+        status: WaybillStatus,
+        trip_number: Option<i32>,
+    ) -> AppResult<(Option<BusSchedule>, bool, Option<Vec<BusSchedule>>)> {
         match status {
             WaybillStatus::Online => {
                 if waybill_data.is_flexi == Some(true) {
                     // Flexi branch: Use waybill_id binding
                     self.handle_flexi_trips(&waybill_data, trip_number).await
                 } else {
-                    // Detail branch: Use schedule_trip_id binding  
-                    self.handle_detail_trips(&waybill_data, false, trip_number).await
+                    // Detail branch: Use schedule_trip_id binding
+                    self.handle_detail_trips(&waybill_data, false, trip_number)
+                        .await
                 }
             }
             WaybillStatus::ProcessedOrNew => {
                 // Always use detail trips, force first as active
-                self.handle_detail_trips(&waybill_data, true, trip_number).await
+                self.handle_detail_trips(&waybill_data, true, trip_number)
+                    .await
             }
             WaybillStatus::NotFound => {
                 // This shouldn't happen in this context
@@ -1329,16 +1397,20 @@ impl VehicleDataReader for DBVehicleReader {
 
         // Enhanced flow: Split waybill query with priority (Online -> Processed/New)
         let (waybill_result, waybill_status) = self.get_waybill_with_priority(vehicle_no).await?;
-        
+
         let mut schedule_map: HashMap<i64, Vec<BusSchedule>> = HashMap::new();
         match waybill_result {
             Some(vehicle_data) => {
-                info!("Enhanced flow - vehicle_data: {:?}, status: {:?}", vehicle_data, waybill_status);
-                
+                info!(
+                    "Enhanced flow - vehicle_data: {:?}, status: {:?}",
+                    vehicle_data, waybill_status
+                );
+
                 // Resolve trip data based on waybill status and is_flexi flag
-                let (schedule_result, is_active_trip, remaining_trip_details) = 
-                    self.resolve_trip_data(vehicle_data.clone(), waybill_status, trip_number).await?;
-                
+                let (schedule_result, is_active_trip, remaining_trip_details) = self
+                    .resolve_trip_data(vehicle_data.clone(), waybill_status, trip_number)
+                    .await?;
+
                 // Populate schedule_map for backward compatibility
                 if let Some(ref remaining) = remaining_trip_details {
                     for row in remaining.iter() {
@@ -1380,7 +1452,7 @@ impl VehicleDataReader for DBVehicleReader {
                     status: vehicle_data.status,
                     schedule_details: Some(schedule_map),
                 };
-                
+
                 // Set route and trip details from active schedule
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -1388,7 +1460,7 @@ impl VehicleDataReader for DBVehicleReader {
                     vehicle_data_with_route_id.depot = schedule.org_name.clone();
                     vehicle_data_with_route_id.route_number = schedule.route_number.clone();
                 }
-                
+
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
             }
@@ -1397,7 +1469,7 @@ impl VehicleDataReader for DBVehicleReader {
                 let waybill_status_agnostic_query = "
                     SELECT w.vehicle_no, w.service_type
                     FROM waybills w
-                    WHERE w.vehicle_no = $1            
+                    WHERE w.vehicle_no = $1
                     ORDER BY w.updated_at DESC
                     LIMIT 1
                 ";
@@ -1952,14 +2024,20 @@ impl VehicleDataReader for DBVehicleReader {
             .await
         {
             Ok(Some(data)) => {
-                info!("get_vehicle_operation_data: Found online waybill for fleet_no={}", fleet_no);
+                info!(
+                    "get_vehicle_operation_data: Found online waybill for fleet_no={}",
+                    fleet_no
+                );
                 return Ok(data);
             }
             Ok(None) => {
                 debug!("get_vehicle_operation_data: No online waybill found for fleet_no={}, checking vehicles table", fleet_no);
             }
             Err(e) => {
-                error!("get_vehicle_operation_data: waybill query failed for fleet_no={}: {}", fleet_no, e);
+                error!(
+                    "get_vehicle_operation_data: waybill query failed for fleet_no={}: {}",
+                    fleet_no, e
+                );
             }
         }
 
@@ -1972,15 +2050,27 @@ impl VehicleDataReader for DBVehicleReader {
             .await
         {
             Ok(Some(data)) => {
-                info!("get_vehicle_operation_data: Found vehicle data for fleet_no={}", fleet_no);
+                info!(
+                    "get_vehicle_operation_data: Found vehicle data for fleet_no={}",
+                    fleet_no
+                );
                 Ok(data)
             }
             Ok(None) => {
-                error!("get_vehicle_operation_data: No data found for fleet_no={}", fleet_no);
-                Err(AppError::NotFound(format!("No operation data found for fleet_no: {}", fleet_no)))
+                error!(
+                    "get_vehicle_operation_data: No data found for fleet_no={}",
+                    fleet_no
+                );
+                Err(AppError::NotFound(format!(
+                    "No operation data found for fleet_no: {}",
+                    fleet_no
+                )))
             }
             Err(e) => {
-                error!("get_vehicle_operation_data: vehicles query failed for fleet_no={}: {}", fleet_no, e);
+                error!(
+                    "get_vehicle_operation_data: vehicles query failed for fleet_no={}: {}",
+                    fleet_no, e
+                );
                 Err(AppError::Internal(format!("Database query failed: {}", e)))
             }
         }
@@ -1988,33 +2078,45 @@ impl VehicleDataReader for DBVehicleReader {
 
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool> {
         let all_pool = self.get_all_vehicles_pool().await?;
-        
+
         let is_valid = all_pool.contains(vehicle_no);
-        
+
         info!(
             "Vehicle verification for {}: is_valid={}, all_pool_size={}",
-            vehicle_no, is_valid, all_pool.len()
+            vehicle_no,
+            is_valid,
+            all_pool.len()
         );
-        
+
         Ok(is_valid)
     }
 
-    async fn get_waybills_by_route_id(&self, gtfs_id: &str, route_id: &str) -> AppResult<Vec<VehicleData>> {
+    async fn get_waybills_by_route_id(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
         let cache_key = self.get_waybills_by_route_cache_key(gtfs_id, route_id);
-        
+
         // Check cache first
         {
             let cache = self.waybills_by_route_cache.read().await;
             if let Some((waybills, timestamp)) = cache.waybills_by_route.get(&cache_key) {
                 if !self.is_waybills_by_route_cache_expired(*timestamp) {
-                    info!("Waybills by route cache HIT for gtfs_id={}, route_id={}", gtfs_id, route_id);
+                    info!(
+                        "Waybills by route cache HIT for gtfs_id={}, route_id={}",
+                        gtfs_id, route_id
+                    );
                     return Ok(waybills.clone());
                 }
             }
         }
-        
-        info!("Waybills by route cache MISS for gtfs_id={}, route_id={}", gtfs_id, route_id);
-        
+
+        info!(
+            "Waybills by route cache MISS for gtfs_id={}, route_id={}",
+            gtfs_id, route_id
+        );
+
         // Query waybills by joining with bus_schedule_trip_detail and bus_schedule_trip_flexi
         // to find waybills that have trips on the given route_id (route_number_id)
         let query = r#"
@@ -2060,7 +2162,12 @@ impl VehicleDataReader for DBVehicleReader {
             .await
         {
             Ok(waybills) => {
-                info!("Found {} waybills for gtfs_id={}, route_id={}", waybills.len(), gtfs_id, route_id);
+                info!(
+                    "Found {} waybills for gtfs_id={}, route_id={}",
+                    waybills.len(),
+                    gtfs_id,
+                    route_id
+                );
                 waybills
             }
             Err(e) => {
@@ -2068,17 +2175,23 @@ impl VehicleDataReader for DBVehicleReader {
                 return Err(AppError::Internal(format!("Database query failed: {}", e)));
             }
         };
-        
+
         // Cache the results
         {
             let mut cache = self.waybills_by_route_cache.write().await;
-            cache.waybills_by_route.insert(cache_key, (waybills.clone(), SystemTime::now()));
+            cache
+                .waybills_by_route
+                .insert(cache_key, (waybills.clone(), SystemTime::now()));
         }
-        
+
         Ok(waybills)
     }
 
-    async fn get_vehicles_by_service_tier(&self, gtfs_id: &str, service_tier: &str) -> AppResult<Vec<String>> {
+    async fn get_vehicles_by_service_tier(
+        &self,
+        gtfs_id: &str,
+        service_tier: &str,
+    ) -> AppResult<Vec<String>> {
         if gtfs_id == "chennai_bus" && service_tier.eq_ignore_ascii_case("AC") {
             let query = r#"
                 SELECT vehicle_no
@@ -2094,7 +2207,10 @@ impl VehicleDataReader for DBVehicleReader {
                  WHERE schedule_no LIKE 'Z%';
             "#;
 
-            match sqlx::query_as::<_, (String,)>(query).fetch_all(&self.pool).await {
+            match sqlx::query_as::<_, (String,)>(query)
+                .fetch_all(&self.pool)
+                .await
+            {
                 Ok(rows) => Ok(rows.into_iter().map(|(v,)| v).collect::<Vec<String>>()),
                 Err(e) => {
                     error!("get_vehicles_by_service_tier query failed for gtfs_id={}, service_tier={}: {}", gtfs_id, service_tier, e);
@@ -2102,7 +2218,7 @@ impl VehicleDataReader for DBVehicleReader {
                 }
             }
         } else {
-            // For other gtfs_id/service_tier combinations, return empty list 
+            // For other gtfs_id/service_tier combinations, return empty list
             Ok(Vec::new())
         }
     }
