@@ -1,1 +1,6 @@
-vehicle_no,tag
+gtfs_id,vehicle_no,eligible_pass_ids
+chennai_bus,J0859,ulla-unlimited-1day
+chennai_bus,J0860,ulla-unlimited-1day
+chennai_bus,J0861,ulla-unlimited-1day
+chennai_bus,J0862,ulla-unlimited-1day
+chennai_bus,J0863,ulla-unlimited-1day
