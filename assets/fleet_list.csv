@@ -1,1 +1,2 @@
-vehicle_no,tag
+gtfs_id,vehicle_no,eligible_pass_ids
+chennai_bus,K5404,ulla|day_pass
