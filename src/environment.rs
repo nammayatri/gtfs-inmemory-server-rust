@@ -2,7 +2,7 @@ use anyhow::Result;
 use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
@@ -122,7 +122,7 @@ pub struct AppState {
     pub bhubaneswar_vehicle_cache: Arc<BhubaneswarVehicleCache>,
     pub config: AppConfig,
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
-    pub fleet_list: Arc<HashMap<String, crate::models::BusTag>>,
+    pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
 }
 
 impl AppState {
@@ -198,10 +198,9 @@ impl AppState {
         Ok(app_state)
     }
 
-    async fn load_fleet_list() -> Result<HashMap<String, crate::models::BusTag>> {
+    async fn load_fleet_list() -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
         let file_path = "./assets/fleet_list.csv";
 
-        // Check if file exists, if not return empty HashMap
         let mut file = match File::open(file_path).await {
             Ok(file) => file,
             Err(_) => {
@@ -219,27 +218,34 @@ impl AppState {
             .has_headers(true)
             .from_reader(contents.as_bytes());
 
-        let mut fleet_map = HashMap::new();
+        // gtfs_id -> vehicle_no -> eligible_pass_ids
+        let mut fleet_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
         for result in reader.records() {
             match result {
                 Ok(record) => {
-                    // Assuming columns: vehicle_no, tag
-                    if let (Some(vehicle_no), Some(tag_str)) = (record.get(0), record.get(1)) {
-                        // Parse tag string to BusTag enum manually or use serde if record deserialization was used.
-                        // Simple string matching for now to keep it robust against slightly different casing if needed,
-                        // or precise. "ullaPass" -> BusTag::UllaPass.
-                        let tag = match tag_str.trim() {
-                            "ullaPass" => Some(crate::models::BusTag::UllaPass),
-                            _ => {
-                                info!("Unknown bus tag '{}' for vehicle {}", tag_str, vehicle_no);
-                                None
-                            }
-                        };
+                    // Expected columns: gtfs_id, vehicle_no, eligible_pass_ids
+                    let (Some(gtfs_id), Some(vehicle_no), Some(ids_str)) =
+                        (record.get(0), record.get(1), record.get(2))
+                    else {
+                        continue;
+                    };
 
-                        if let Some(t) = tag {
-                            fleet_map.insert(vehicle_no.trim().to_string(), t);
-                        }
+                    let ids_list: Vec<String> = ids_str
+                        .split('|')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    if ids_list.is_empty() {
+                        continue;
                     }
+
+                    let by_gtfs = fleet_map
+                        .entry(gtfs_id.trim().to_string())
+                        .or_insert_with(HashMap::new);
+
+                    by_gtfs.insert(vehicle_no.trim().to_string(), ids_list);
                 }
                 Err(e) => {
                     error!("Error parsing fleet_list CSV row: {}", e);
@@ -247,7 +253,11 @@ impl AppState {
             }
         }
 
-        info!("Loaded {} tags from fleet_list.csv", fleet_map.len());
+        info!(
+            "Loaded fleet pass configurations for {} GTFS feeds",
+            fleet_map.len()
+        );
+
         Ok(fleet_map)
     }
 
