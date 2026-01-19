@@ -33,6 +33,16 @@ fn get_sha256_hash<T: Serialize>(val: &T) -> String {
     hasher.update(json);
     format!("{:x}", hasher.finalize())
 }
+
+fn normalize_stop_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 pub struct GTFSService {
     config: AppConfig,
     data: Arc<RwLock<GTFSData>>,
@@ -571,8 +581,10 @@ impl GTFSService {
                 None => continue,
             };
 
+            let normalized_name = normalize_stop_name(&stop.name);
+
             grouped
-                .entry((gtfs_id.to_string(), stop.name.clone()))
+                .entry((gtfs_id.to_string(), normalized_name))
                 .or_default()
                 .push(stop_id.to_string());
         }
