@@ -9,7 +9,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
 use crate::services::{
-    bhubaneswar_vehicle_cache::BhubaneswarVehicleCache,
+    chalo_vehicle_cache::ChaloVehicleCache,
     db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
     gtfs_service::GTFSService,
@@ -119,7 +119,7 @@ pub struct AppState {
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
     pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub trip_service: Arc<TripService>,
-    pub bhubaneswar_vehicle_cache: Arc<BhubaneswarVehicleCache>,
+    pub chalo_vehicle_cache: Arc<ChaloVehicleCache>,
     pub config: AppConfig,
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
@@ -174,12 +174,12 @@ impl AppState {
 
         let trip_service = Arc::new(TripService::new(gtfs_service.clone()));
 
-        let mut bhubaneswar_vehicle_cache = BhubaneswarVehicleCache::new(
+        let mut chalo_vehicle_cache = ChaloVehicleCache::new(
             app_config.bhubaneswar_external_auth.clone(),
             gtfs_service.clone(),
         )?;
-        bhubaneswar_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
-        let bhubaneswar_vehicle_cache = Arc::new(bhubaneswar_vehicle_cache);
+        chalo_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
+        let chalo_vehicle_cache = Arc::new(chalo_vehicle_cache);
 
         // Load bus registration mapping from CSV
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
@@ -189,7 +189,7 @@ impl AppState {
             db_vehicle_reader,
             db_employee_reader,
             trip_service,
-            bhubaneswar_vehicle_cache,
+            chalo_vehicle_cache,
             config: app_config,
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),

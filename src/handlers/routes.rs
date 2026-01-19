@@ -655,11 +655,12 @@ async fn get_service_type_by_vehicle_impl(
         false // Default value when verification is not requested
     };
 
-    // Check if this is bhubaneshwar_bus and use cache instead of DB
-    if gtfs_id == "bhubaneshwar_bus" {
+    // Check if this is a CHALO-based city and use cache instead of DB
+    let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
+    if chalo_gtfs_ids.contains(&gtfs_id) {
         if let Some(cached_data) = app_state
-            .bhubaneswar_vehicle_cache
-            .get_vehicle_data(vehicle_no)
+            .chalo_vehicle_cache
+            .get_vehicle_data(gtfs_id, vehicle_no)
             .await
         {
             // Populate stops_count for route if route_id is available
@@ -1076,12 +1077,13 @@ async fn get_bus_route_schedule(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
 
-    // For bhubaneswar_bus, try to use in-memory cache first
-    let waybills = if gtfs_id == "bhubaneshwar_bus" {
+    // For CHALO-based cities, try to use in-memory cache first
+    let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
+    let waybills = if chalo_gtfs_ids.contains(&gtfs_id.as_str()) {
         // Get vehicles from cache filtered by route_id
         let cached_vehicles = app_state
-            .bhubaneswar_vehicle_cache
-            .get_vehicles_by_route_id(&route_id)
+            .chalo_vehicle_cache
+            .get_vehicles_by_route_id(&gtfs_id, &route_id)
             .await;
 
         if !cached_vehicles.is_empty() {
