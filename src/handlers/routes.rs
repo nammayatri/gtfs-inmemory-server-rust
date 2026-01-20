@@ -212,6 +212,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/alternateStops/{gtfs_id}/{stop_code}",
                 actix_web::web::get().to(get_alternate_stops),
+            )
+            .route(
+                "/cache-data/{gtfs_id}",
+                actix_web::web::get().to(get_cache_data_by_gtfs_id),
             ),
     );
 }
@@ -657,7 +661,9 @@ async fn get_service_type_by_vehicle_impl(
 
     // Check if this is a CHALO-based city and use cache instead of DB
     let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
+    info!("chalo_gtfs_ids: {:?}, gtfs_id: {:?}, contains: {:?}", chalo_gtfs_ids, gtfs_id, chalo_gtfs_ids.contains(&gtfs_id));
     if chalo_gtfs_ids.contains(&gtfs_id) {
+        info!("Using CHALO vehicle cache for gtfs_id={}, vehicle_no={}", gtfs_id, vehicle_no);
         if let Some(cached_data) = app_state
             .chalo_vehicle_cache
             .get_vehicle_data(gtfs_id, vehicle_no)
@@ -1310,4 +1316,17 @@ async fn get_alternate_stops(
         .collect();
 
     Ok(HttpResponse::Ok().json(merged_stops))
+}
+
+async fn get_cache_data_by_gtfs_id(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let cached_vehicles = app_state
+        .chalo_vehicle_cache
+        .get_all_vehicles_by_gtfs_id(&gtfs_id)
+        .await;
+    
+    Ok(HttpResponse::Ok().json(cached_vehicles))
 }

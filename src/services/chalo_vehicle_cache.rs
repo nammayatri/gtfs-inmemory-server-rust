@@ -41,7 +41,7 @@ struct ExternalApiVehicle {
 
 // The API returns a direct array, not wrapped
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CachedVehicleData {
     pub vehicle_no: String,
     pub route_id: Option<String>,
@@ -152,6 +152,19 @@ impl ChaloVehicleCache {
                             None
                         }
                     })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn get_all_vehicles_by_gtfs_id(&self, gtfs_id: &str) -> Vec<CachedVehicleData> {
+        let cache = self.cache.read().await;
+        cache
+            .get(gtfs_id)
+            .map(|city_cache| {
+                city_cache
+                    .values()
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default()
