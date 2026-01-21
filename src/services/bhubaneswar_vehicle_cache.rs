@@ -26,7 +26,7 @@ struct ExternalApiVehicle {
     #[serde(rename = "waybill")]
     waybill: String,
     #[serde(rename = "routeName")]
-    route_name: String,
+    route_name: Option<String>,
     #[serde(rename = "startStopName", default)]
     start_stop_name: Option<String>,
     #[serde(rename = "endStopName", default)]
@@ -159,7 +159,7 @@ impl BhubaneswarVehicleCache {
                 "Sample vehicle data: vehicle_no={}, route_id={}, route_name={}, waybill={}",
                 sample_vehicle.vehicle_no,
                 sample_vehicle.route_id,
-                sample_vehicle.route_name,
+                sample_vehicle.route_name.as_ref().unwrap_or(&"".to_string()),
                 sample_vehicle.waybill
             );
         }
@@ -185,7 +185,7 @@ impl BhubaneswarVehicleCache {
             // AC -> starts with "Z-", NON_AC -> starts with "OS-"
             let schedule_no = service_type.as_ref().map(|st| {
                 let prefix = if st == "AC" { "Z-" } else { "OS-" };
-                format!("{}{}", prefix, vehicle.route_name)
+                format!("{}{}", prefix, vehicle.route_name.as_ref().unwrap_or(&"".to_string()))
             });
 
             // Parse waybill - it's in format "25543126:3", extract the number part
@@ -194,7 +194,7 @@ impl BhubaneswarVehicleCache {
             let cached_data = CachedVehicleData {
                 vehicle_no: vehicle.vehicle_no.clone(),
                 route_id: Some(vehicle.route_id.clone()),
-                route_number: Some(vehicle.route_name.clone()),
+                route_number: vehicle.route_name.clone(),
                 waybill_no,
                 schedule_no,
                 trip_number: None,              // Optional, not provided by API
