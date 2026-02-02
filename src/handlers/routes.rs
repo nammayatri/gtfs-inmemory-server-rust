@@ -661,9 +661,17 @@ async fn get_service_type_by_vehicle_impl(
 
     // Check if this is a CHALO-based city and use cache instead of DB
     let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
-    info!("chalo_gtfs_ids: {:?}, gtfs_id: {:?}, contains: {:?}", chalo_gtfs_ids, gtfs_id, chalo_gtfs_ids.contains(&gtfs_id));
+    info!(
+        "chalo_gtfs_ids: {:?}, gtfs_id: {:?}, contains: {:?}",
+        chalo_gtfs_ids,
+        gtfs_id,
+        chalo_gtfs_ids.contains(&gtfs_id)
+    );
     if chalo_gtfs_ids.contains(&gtfs_id) {
-        info!("Using CHALO vehicle cache for gtfs_id={}, vehicle_no={}", gtfs_id, vehicle_no);
+        info!(
+            "Using CHALO vehicle cache for gtfs_id={}, vehicle_no={}",
+            gtfs_id, vehicle_no
+        );
         if let Some(cached_data) = app_state
             .chalo_vehicle_cache
             .get_vehicle_data(gtfs_id, vehicle_no)
@@ -704,6 +712,8 @@ async fn get_service_type_by_vehicle_impl(
                     end_time: cached_data.end_time,
                     deleted: cached_data.deleted,
                     trip_order: cached_data.trip_order,
+                    db_start_time: cached_data.db_start_time.clone(),
+                    db_end_time: cached_data.db_end_time.clone(),
                 }]);
             }
 
@@ -1173,9 +1183,32 @@ async fn get_bus_route_schedule(
             });
 
             // Get trip start time from the matching trip
-            let trip_start_time: Option<i64> = matching_trip
-                .and_then(|trip| trip.start_time.as_ref())
-                .and_then(|s| s.parse::<i64>().ok());
+            let trip_start_time: Option<i64> = matching_trip.and_then(|trip| {
+                // Try to construct time from db_start_time and waybill duty_date
+                if let (Some(db_start_time), Some(duty_date)) =
+                    (&trip.db_start_time, &vehicle_data.duty_date)
+                {
+                    // Parse duty_date (YYYY-MM-DD)
+                    let date = chrono::NaiveDate::parse_from_str(duty_date, "%Y-%m-%d").ok();
+
+                    // Parse db_start_time (HH:MM)
+                    let time = chrono::NaiveTime::parse_from_str(db_start_time, "%H:%M").ok();
+
+                    if let (Some(date), Some(time)) = (date, time) {
+                        let dt = chrono::NaiveDateTime::new(date, time);
+                        // Assume IST (UTC+5:30)
+                        if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
+                            use chrono::TimeZone;
+                            if let Some(dt_with_tz) = offset.from_local_datetime(&dt).single() {
+                                return Some(dt_with_tz.timestamp_millis());
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to existing start_time logic
+                trip.start_time.as_ref().and_then(|s| s.parse::<i64>().ok())
+            });
 
             // Calculate ETAs using haversine distance function
             bus_stop_etas =
@@ -1327,6 +1360,6 @@ async fn get_cache_data_by_gtfs_id(
         .chalo_vehicle_cache
         .get_all_vehicles_by_gtfs_id(&gtfs_id)
         .await;
-    
+
     Ok(HttpResponse::Ok().json(cached_vehicles))
 }

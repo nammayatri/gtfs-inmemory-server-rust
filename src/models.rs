@@ -58,6 +58,8 @@ pub struct VehicleDataWithRouteId {
     pub deleted: Option<bool>,
     pub status: Option<String>,
     pub schedule_details: Option<HashMap<i64, Vec<BusSchedule>>>,
+    pub db_start_time: Option<String>,
+    pub db_end_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -101,6 +103,10 @@ pub struct BusSchedule {
     pub deleted: Option<bool>,
     #[serde(rename = "tripOrder")]
     pub trip_order: Option<i32>,
+    #[serde(rename = "dbStartTime")]
+    pub db_start_time: Option<String>,
+    #[serde(rename = "dbEndTime")]
+    pub db_end_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
