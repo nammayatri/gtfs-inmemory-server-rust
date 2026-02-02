@@ -713,6 +713,12 @@ async fn get_service_type_by_vehicle_impl(
                 .and_then(|by_vehicle| by_vehicle.get(&cached_data.vehicle_no))
                 .cloned();
 
+            let service_sub_types = app_state
+                .vehicle_service_sub_types
+                .get(gtfs_id)
+                .and_then(|by_vehicle| by_vehicle.get(&cached_data.vehicle_no))
+                .cloned();
+
             return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
                 vehicle_no: cached_data.vehicle_no,
                 service_type: cached_data.service_type,
@@ -729,6 +735,7 @@ async fn get_service_type_by_vehicle_impl(
                 driver_id: cached_data.driver_id,
                 conductor_id: cached_data.conductor_id,
                 eligible_pass_ids,
+                service_sub_types,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -738,6 +745,12 @@ async fn get_service_type_by_vehicle_impl(
                 .await
             {
                 // Return response with service type from fleet
+                let service_sub_types = app_state
+                    .vehicle_service_sub_types
+                    .get(gtfs_id)
+                    .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
+                    .cloned();
+
                 return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
                     vehicle_no: vehicle_no.to_string(),
                     service_type: Some(service_type),
@@ -758,6 +771,7 @@ async fn get_service_type_by_vehicle_impl(
                         .get(gtfs_id)
                         .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
                         .cloned(),
+                    service_sub_types,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -833,6 +847,12 @@ async fn get_service_type_by_vehicle_impl(
         .and_then(|by_vehicle| by_vehicle.get(&vehicle_data.vehicle_no))
         .cloned();
 
+    let service_sub_types = app_state
+        .vehicle_service_sub_types
+        .get(gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(&vehicle_data.vehicle_no))
+        .cloned();
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
@@ -849,6 +869,7 @@ async fn get_service_type_by_vehicle_impl(
         driver_id: vehicle_data.driver_code,
         conductor_id: vehicle_data.conductor_code,
         eligible_pass_ids,
+        service_sub_types,
     }))
 }
 

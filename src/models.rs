@@ -121,6 +121,7 @@ pub struct VehicleServiceTypeResponse {
     pub driver_id: Option<String>,
     pub conductor_id: Option<String>,
     pub eligible_pass_ids: Option<Vec<String>>,
+    pub service_sub_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

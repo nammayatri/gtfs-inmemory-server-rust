@@ -1,6 +1,7 @@
 use anyhow::Result;
 use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -123,6 +124,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
+    pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
 }
 
 impl AppState {
@@ -193,6 +195,7 @@ impl AppState {
             config: app_config,
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),
+            vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
         };
 
         Ok(app_state)
@@ -305,5 +308,66 @@ impl AppState {
             mapping.len()
         );
         Ok(mapping)
+    }
+
+    async fn load_vehicle_service_sub_types() -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+        let file_path = "./assets/vehicle_service_sub_types.csv";
+
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                info!("vehicle_service_sub_types.csv file not found, proceeding without vehicle service sub types data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read vehicle_service_sub_types.csv: {}", e))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        // gtfs_id -> vehicle_no -> service_sub_types
+        let mut sub_types_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
+        for result in reader.records() {
+            match result {
+                Ok(record) => {
+                    // Expected columns: gtfs_id, vehicle_no, service_sub_types
+                    let (Some(gtfs_id), Some(vehicle_no), Some(sub_types_str)) =
+                        (record.get(0), record.get(1), record.get(2))
+                    else {
+                        continue;
+                    };
+
+                    let sub_types: Vec<String> = match serde_json::from_str(sub_types_str) {
+                        Ok(vec) => vec,
+                        Err(e) => {
+                            error!("Error parsing service_sub_types JSON for vehicle {}: {}", vehicle_no, e);
+                            continue;
+                        }
+                    };
+
+                    let by_gtfs = sub_types_map
+                        .entry(gtfs_id.trim().to_string())
+                        .or_insert_with(HashMap::new);
+
+                    by_gtfs.insert(vehicle_no.trim().to_string(), sub_types);
+                }
+                Err(e) => {
+                    error!("Error parsing vehicle_service_sub_types CSV row: {}", e);
+                }
+            }
+        }
+
+        info!(
+            "Loaded vehicle service sub types for {} GTFS feeds",
+            sub_types_map.len()
+        );
+
+        Ok(sub_types_map)
     }
 }
