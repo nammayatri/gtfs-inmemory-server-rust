@@ -60,6 +60,8 @@ pub struct CachedVehicleData {
     pub trip_order: Option<i32>,
     pub driver_id: Option<String>,
     pub conductor_id: Option<String>,
+    pub db_start_time: Option<String>,
+    pub db_end_time: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +115,9 @@ impl ChaloVehicleCache {
     }
 
     fn get_city_config(&self, gtfs_id: &str) -> Option<&CityConfig> {
-        self.city_configs.iter().find(|config| config.gtfs_id == gtfs_id)
+        self.city_configs
+            .iter()
+            .find(|config| config.gtfs_id == gtfs_id)
     }
 
     pub fn set_update_interval(&mut self, interval_secs: u64) {
@@ -121,16 +125,26 @@ impl ChaloVehicleCache {
     }
 
     pub async fn initialize(&self) -> AppResult<()> {
-        info!("Initializing CHALO vehicle cache for {} cities...", self.city_configs.len());
+        info!(
+            "Initializing CHALO vehicle cache for {} cities...",
+            self.city_configs.len()
+        );
         for config in &self.city_configs {
-            info!("Initializing cache for {} (gtfs_id: {})", config.city_name, config.gtfs_id);
+            info!(
+                "Initializing cache for {} (gtfs_id: {})",
+                config.city_name, config.gtfs_id
+            );
             self.update_cache_for_city(config.gtfs_id.as_str()).await?;
         }
         info!("CHALO vehicle cache initialized successfully");
         Ok(())
     }
 
-    pub async fn get_vehicle_data(&self, gtfs_id: &str, vehicle_no: &str) -> Option<CachedVehicleData> {
+    pub async fn get_vehicle_data(
+        &self,
+        gtfs_id: &str,
+        vehicle_no: &str,
+    ) -> Option<CachedVehicleData> {
         let cache = self.cache.read().await;
         cache
             .get(gtfs_id)
@@ -138,7 +152,11 @@ impl ChaloVehicleCache {
             .cloned()
     }
 
-    pub async fn get_vehicles_by_route_id(&self, gtfs_id: &str, route_id: &str) -> Vec<CachedVehicleData> {
+    pub async fn get_vehicles_by_route_id(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> Vec<CachedVehicleData> {
         let cache = self.cache.read().await;
         cache
             .get(gtfs_id)
@@ -161,30 +179,31 @@ impl ChaloVehicleCache {
         let cache = self.cache.read().await;
         cache
             .get(gtfs_id)
-            .map(|city_cache| {
-                city_cache
-                    .values()
-                    .cloned()
-                    .collect()
-            })
+            .map(|city_cache| city_cache.values().cloned().collect())
             .unwrap_or_default()
     }
 
     pub async fn update_cache(&self) -> AppResult<()> {
         for config in &self.city_configs {
             if let Err(e) = self.update_cache_for_city(&config.gtfs_id).await {
-                error!("Failed to update cache for {} ({}): {}", config.city_name, config.gtfs_id, e);
+                error!(
+                    "Failed to update cache for {} ({}): {}",
+                    config.city_name, config.gtfs_id, e
+                );
             }
         }
         Ok(())
     }
 
     async fn update_cache_for_city(&self, gtfs_id: &str) -> AppResult<()> {
-        let city_config = self.get_city_config(gtfs_id)
-            .ok_or_else(|| AppError::Internal(format!("No configuration found for gtfs_id: {}", gtfs_id)))?;
+        let city_config = self.get_city_config(gtfs_id).ok_or_else(|| {
+            AppError::Internal(format!("No configuration found for gtfs_id: {}", gtfs_id))
+        })?;
 
-        info!("Updating CHALO vehicle cache for {} (gtfs_id: {}) from external API...", 
-              city_config.city_name, gtfs_id);
+        info!(
+            "Updating CHALO vehicle cache for {} (gtfs_id: {}) from external API...",
+            city_config.city_name, gtfs_id
+        );
 
         let mut request = self.http_client.get(&city_config.api_url);
 
@@ -195,13 +214,22 @@ impl ChaloVehicleCache {
         }
 
         let response = request.send().await.map_err(|e| {
-            error!("Failed to fetch data from external API for {}: {}", city_config.city_name, e);
-            AppError::Internal(format!("Failed to fetch data from external API for {}: {}", city_config.city_name, e))
+            error!(
+                "Failed to fetch data from external API for {}: {}",
+                city_config.city_name, e
+            );
+            AppError::Internal(format!(
+                "Failed to fetch data from external API for {}: {}",
+                city_config.city_name, e
+            ))
         })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            error!("External API returned error status for {}: {}", city_config.city_name, status);
+            error!(
+                "External API returned error status for {}: {}",
+                city_config.city_name, status
+            );
             return Err(AppError::Internal(format!(
                 "External API returned error status for {}: {}",
                 city_config.city_name, status
@@ -210,11 +238,21 @@ impl ChaloVehicleCache {
 
         // The API returns a direct array
         let vehicles: Vec<ExternalApiVehicle> = response.json().await.map_err(|e| {
-            error!("Failed to parse external API response for {}: {}", city_config.city_name, e);
-            AppError::Internal(format!("Failed to parse external API response for {}: {}", city_config.city_name, e))
+            error!(
+                "Failed to parse external API response for {}: {}",
+                city_config.city_name, e
+            );
+            AppError::Internal(format!(
+                "Failed to parse external API response for {}: {}",
+                city_config.city_name, e
+            ))
         })?;
 
-        info!("Fetched {} vehicles from external API for {}", vehicles.len(), city_config.city_name);
+        info!(
+            "Fetched {} vehicles from external API for {}",
+            vehicles.len(),
+            city_config.city_name
+        );
 
         // Log a sample vehicle for debugging
         if let Some(sample_vehicle) = vehicles.first() {
@@ -229,10 +267,14 @@ impl ChaloVehicleCache {
         }
 
         // Load route service tier mapping
-        let route_mapping = self.load_route_service_tier_mapping_internal(gtfs_id).await?;
+        let route_mapping = self
+            .load_route_service_tier_mapping_internal(gtfs_id)
+            .await?;
 
         let mut cache = self.cache.write().await;
-        let city_cache = cache.entry(gtfs_id.to_string()).or_insert_with(HashMap::new);
+        let city_cache = cache
+            .entry(gtfs_id.to_string())
+            .or_insert_with(HashMap::new);
         city_cache.clear();
 
         for vehicle in vehicles {
@@ -277,16 +319,25 @@ impl ChaloVehicleCache {
                 trip_order: None,
                 driver_id: vehicle.driver_id,
                 conductor_id: vehicle.conductor_id,
+                db_start_time: None,
+                db_end_time: None,
             };
 
             city_cache.insert(vehicle.vehicle_no, cached_data);
         }
 
-        info!("Updated cache for {} with {} vehicles", city_config.city_name, city_cache.len());
+        info!(
+            "Updated cache for {} with {} vehicles",
+            city_config.city_name,
+            city_cache.len()
+        );
         Ok(())
     }
 
-    async fn load_route_service_tier_mapping_internal(&self, _gtfs_id: &str) -> AppResult<HashMap<String, String>> {
+    async fn load_route_service_tier_mapping_internal(
+        &self,
+        _gtfs_id: &str,
+    ) -> AppResult<HashMap<String, String>> {
         let file_path = "./assets/route_service_tier_mapping.csv";
         let mut file = match File::open(file_path).await {
             Ok(file) => file,

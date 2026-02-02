@@ -528,9 +528,9 @@ impl DBVehicleReader {
                     "select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and trip_number >= (SELECT COALESCE((select trip_number from bus_schedule_trip_detail where schedule_trip_id = $1::bigint and is_active_trip = true and trip_type != 'dead-trip'), 1)) and trip_type != 'dead-trip' order by trip_number asc".to_string()
                 };
                 let bus_schedule_trip_flexi_query: String = if let Some(trip_number) = trip_number {
-                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} and trip_type != 'dead-trip' order by trip_number asc", trip_number)
+                    format!("select NULL::int as stops_count, route_number_id::text as route_id, schedule_number, org_name::text as org_name, trip_number, start_time as db_start_time, end_time as db_end_time from bus_schedule_trip_flexi where schedule_trip_id = $1::bigint and trip_number >= {} and trip_type != 'dead-trip' order by trip_number asc", trip_number)
                 } else {
-                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1::bigint AND is_active_trip = TRUE AND trip_type != 'dead-trip' ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1::bigint AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') AND f.trip_type != 'dead-trip' ORDER BY f.trip_number ASC".to_string()
+                    "WITH latest AS ( SELECT trip_number AS active_trip_number, created_at AS active_created_at FROM bus_schedule_trip_flexi WHERE schedule_trip_id = $1::bigint AND is_active_trip = TRUE AND trip_type != 'dead-trip' ORDER BY created_at DESC LIMIT 1 ) SELECT NULL::int AS stops_count, f.route_number_id::text AS route_id, f.schedule_number, f.org_name::text AS org_name, f.trip_number, f.start_time as db_start_time, f.end_time as db_end_time FROM bus_schedule_trip_flexi f LEFT JOIN latest l ON TRUE WHERE f.schedule_trip_id = $1::bigint AND f.trip_number >= COALESCE(l.active_trip_number, 1) AND f.created_at > COALESCE(l.active_created_at, now() - INTERVAL '1 day') AND f.trip_type != 'dead-trip' ORDER BY f.trip_number ASC".to_string()
                 };
                 let bus_schedule_query: String = "select NULL::int as stops_count, route_id::text as route_id, schedule_number, NULL::text as org_name, NULL::int as trip_number from bus_schedule where schedule_number = $1 and deleted = false".to_string();
 
@@ -687,12 +687,16 @@ impl DBVehicleReader {
                     deleted: vehicle_data.deleted,
                     status: vehicle_data.status,
                     schedule_details: None,
+                    db_start_time: None,
+                    db_end_time: None,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
                     vehicle_data_with_route_id.route_id = Some(schedule.route_id.to_owned());
                     vehicle_data_with_route_id.depot = schedule.org_name.clone();
                     vehicle_data_with_route_id.route_number = schedule.route_number.clone();
+                    vehicle_data_with_route_id.db_start_time = schedule.db_start_time.clone();
+                    vehicle_data_with_route_id.db_end_time = schedule.db_end_time.clone();
                 }
                 Ok(vehicle_data_with_route_id)
             }
@@ -743,6 +747,8 @@ impl DBVehicleReader {
                             deleted: None,
                             status: None,
                             schedule_details: None,
+                            db_start_time: None,
+                            db_end_time: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -765,6 +771,8 @@ impl DBVehicleReader {
                             deleted: None,
                             status: None,
                             schedule_details: None,
+                            db_start_time: None,
+                            db_end_time: None,
                         }
                     };
 
@@ -1027,7 +1035,12 @@ impl DBVehicleReader {
                     trip_end_time AS end_time,
                     deleted,
                     is_active_trip,
-                    trip_order
+                    trip_end_time AS end_time,
+                    deleted,
+                    is_active_trip,
+                    trip_order,
+                    start_time AS db_start_time,
+                    end_time AS db_end_time
                 FROM bus_schedule_trip_flexi
                 WHERE waybill_id = $1::bigint AND trip_number >= {} AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
@@ -1047,7 +1060,12 @@ impl DBVehicleReader {
                     trip_end_time AS end_time,
                     deleted,
                     is_active_trip,
-                    trip_order
+                    trip_end_time AS end_time,
+                    deleted,
+                    is_active_trip,
+                    trip_order,
+                    start_time AS db_start_time,
+                    end_time AS db_end_time
                 FROM bus_schedule_trip_flexi
                 WHERE waybill_id = $1::bigint AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
@@ -1098,6 +1116,8 @@ impl DBVehicleReader {
                     schedule_trip_id,
                     trip_start_time AS start_time,
                     trip_end_time AS end_time,
+                    start_time AS db_start_time,
+                    end_time AS db_end_time,
                     deleted,
                     is_active_trip,
                     trip_order
@@ -1118,6 +1138,8 @@ impl DBVehicleReader {
                     schedule_trip_id,
                     trip_start_time AS start_time,
                     trip_end_time AS end_time,
+                    start_time AS db_start_time,
+                    end_time AS db_end_time,
                     deleted,
                     is_active_trip,
                     trip_order
@@ -1220,7 +1242,10 @@ impl DBVehicleReader {
                 NULL::text AS end_time,
                 FALSE AS deleted,
                 FALSE AS is_active_trip,
-                NULL::int AS trip_order
+                FALSE AS is_active_trip,
+                NULL::int AS trip_order,
+                NULL::text AS db_start_time,
+                NULL::text AS db_end_time
             FROM bus_schedule
             WHERE schedule_number = $1 AND deleted = false
         "#;
@@ -1451,6 +1476,8 @@ impl VehicleDataReader for DBVehicleReader {
                     deleted: vehicle_data.deleted,
                     status: vehicle_data.status,
                     schedule_details: Some(schedule_map),
+                    db_start_time: None,
+                    db_end_time: None,
                 };
 
                 // Set route and trip details from active schedule
@@ -1459,6 +1486,8 @@ impl VehicleDataReader for DBVehicleReader {
                     vehicle_data_with_route_id.route_id = Some(schedule.route_id.to_owned());
                     vehicle_data_with_route_id.depot = schedule.org_name.clone();
                     vehicle_data_with_route_id.route_number = schedule.route_number.clone();
+                    vehicle_data_with_route_id.db_start_time = schedule.db_start_time.clone();
+                    vehicle_data_with_route_id.db_end_time = schedule.db_end_time.clone();
                 }
 
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
@@ -1512,6 +1541,8 @@ impl VehicleDataReader for DBVehicleReader {
                             deleted: None,
                             status: None,
                             schedule_details: None,
+                            db_start_time: None,
+                            db_end_time: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -1534,6 +1565,8 @@ impl VehicleDataReader for DBVehicleReader {
                             deleted: None,
                             schedule_details: None,
                             status: None,
+                            db_start_time: None,
+                            db_end_time: None,
                         }
                     };
 
@@ -1773,6 +1806,8 @@ impl VehicleDataReader for DBVehicleReader {
                 deleted: vehicle_data.deleted,
                 status: vehicle_data.status,
                 schedule_details: None,
+                db_start_time: None,
+                db_end_time: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {
