@@ -5,6 +5,7 @@ use actix_web::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use chrono::Utc;
 use tracing::{error, info};
 
 use crate::environment::AppState;
@@ -12,6 +13,7 @@ use crate::graphql::TripQueryParams;
 use crate::models::{
     BusScheduleDetails, GTFSStop, NandiRoutesRes, RouteStopMapping,
     StopCodeFromProviderStopCodeResponse, VehicleServiceTypeResponse,
+    EmptyTripInfo,
 };
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -66,6 +68,15 @@ pub struct GetAllRouteStopMappingsByStopCodesRequest {
 pub struct GetAllVehiclesByIdsRequest {
     #[serde(rename = "vehicleIds")]
     pub vehicle_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+/// Query parameters for empty trip cache, using Unix epoch timestamps in seconds.
+pub struct EmptyTripCacheParams {
+    /// Inclusive start time as a Unix timestamp in seconds.
+    pub start_timestamp: Option<i64>,
+    /// Inclusive end time as a Unix timestamp in seconds.
+    pub end_timestamp: Option<i64>,
 }
 
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
@@ -216,6 +227,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/cache-data/{gtfs_id}",
                 actix_web::web::get().to(get_cache_data_by_gtfs_id),
+            )
+            .route(
+                "/internal/empty-trip-cache",
+                actix_web::web::get().to(get_empty_trip_cache),
             ),
     );
 }
@@ -797,6 +812,54 @@ async fn get_service_type_by_vehicle_impl(
         .db_vehicle_reader
         .get_vehicle_data(vehicle_no, params.trip_number)
         .await?;
+
+    if vehicle_data.remaining_trip_details.is_none()
+        || vehicle_data
+            .remaining_trip_details
+            .as_ref()
+            .unwrap()
+            .is_empty()
+    {
+        let cached_depot = app_state.vehicle_depot_cache.read().await.get(vehicle_no).cloned();
+        let depot_info = if let Some(info) = cached_depot {
+            Some(info)
+        } else if let Ok(vehicle_op_data) = app_state
+            .db_vehicle_reader
+            .get_vehicle_operation_data(vehicle_no)
+            .await
+        {
+            let info = (vehicle_op_data.depot_id.clone(), vehicle_op_data.depot_name.clone());
+            let mut cache = app_state.vehicle_depot_cache.write().await;
+            cache.insert(vehicle_no.to_string(), info.clone());
+            // Cap global cache size to 10,000 vehicles
+            if cache.len() > 10000 {
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(&first_key);
+                }
+            }
+            Some(info)
+        } else {
+            None
+        };
+
+        if let Some((d_id, d_name)) = depot_info {
+            let empty_trip_info = EmptyTripInfo {
+                gtfs_id: gtfs_id.to_string(),
+                vehicle_no: vehicle_no.to_string(),
+                depot_id: Some(d_id),
+                depot_name: Some(d_name),
+                timestamp_ist: Utc::now().timestamp(),
+            };
+            let key = format!("{}::{}", gtfs_id, vehicle_no);
+            let mut cache = app_state.empty_trip_cache.write().await;
+            let entries = cache.entry(key).or_default();
+            entries.push(empty_trip_info);
+            // Cap to last 100 entries per vehicle to prevent unbounded growth
+            if entries.len() > 100 {
+                entries.remove(0);
+            }
+        }
+    }
 
     // Populate stops_count for each route in remaining_trip_details using its own route_number
     if let Some(ref mut details) = vehicle_data.remaining_trip_details {
@@ -1383,4 +1446,75 @@ async fn get_cache_data_by_gtfs_id(
         .await;
 
     Ok(HttpResponse::Ok().json(cached_vehicles))
+}
+
+async fn get_empty_trip_cache(
+    app_state: Data<AppState>,
+    params: Query<EmptyTripCacheParams>,
+) -> AppResult<HttpResponse> {
+    info!("Received request for empty trip cache with params: {:?}", params);
+    
+    let start_bound = params.start_timestamp;
+    let end_bound = params.end_timestamp;
+
+    let cache_guard = app_state.empty_trip_cache.read().await;
+    let mut filtered_entries: Vec<EmptyTripInfo> = cache_guard
+        .values()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| {
+            let is_after_start = start_bound.map_or(true, |start| entry.timestamp_ist >= start);
+            let is_before_end = end_bound.map_or(true, |end| entry.timestamp_ist <= end);
+            is_after_start && is_before_end
+        })
+        .cloned()
+        .collect();
+    drop(cache_guard);
+
+    let mut local_depot_name_cache: HashMap<String, String> = HashMap::new();
+
+    for entry in filtered_entries.iter_mut() {
+        // 1. If both ID and Name are present, we're done
+        if entry.depot_id.is_some() && entry.depot_name.is_some() {
+            continue;
+        }
+
+        // 2. Resolve depot_id if missing
+        if entry.depot_id.is_none() {
+            let vehicle_no = &entry.vehicle_no;
+            let cached_depot = app_state.vehicle_depot_cache.read().await.get(vehicle_no).cloned();
+            if let Some((d_id, d_name)) = cached_depot {
+                entry.depot_id = Some(d_id);
+                entry.depot_name = Some(d_name);
+            } else if let Ok(v_data) = app_state.db_vehicle_reader.get_vehicle_operation_data(vehicle_no).await {
+                let d_id = v_data.depot_id;
+                let d_name = v_data.depot_name;
+                app_state.vehicle_depot_cache.write().await.insert(vehicle_no.clone(), (d_id.clone(), d_name.clone()));
+                entry.depot_id = Some(d_id);
+                entry.depot_name = Some(d_name);
+            }
+        }
+
+        // 3. Resolve depot_name if still missing but we have an ID
+        if let Some(ref d_id) = entry.depot_id {
+            if entry.depot_name.is_none() {
+                if let Some(name) = local_depot_name_cache.get(d_id) {
+                    entry.depot_name = Some(name.clone());
+                } else {
+                    let cached_name = app_state.entity_cache.read().await.get(d_id).cloned();
+                    if let Some(d_name) = cached_name {
+                        local_depot_name_cache.insert(d_id.clone(), d_name.clone());
+                        entry.depot_name = Some(d_name);
+                    } else if let Ok(d_name) = app_state.db_vehicle_reader.get_depot_name_by_id(d_id.clone()).await {
+                        app_state.entity_cache.write().await.insert(d_id.clone(), d_name.clone());
+                        local_depot_name_cache.insert(d_id.clone(), d_name.clone());
+                        entry.depot_name = Some(d_name);
+                    }
+                }
+            }
+        }
+    }
+
+    filtered_entries.sort_by_key(|k| k.timestamp_ist);
+
+    Ok(HttpResponse::Ok().json(filtered_entries))
 }

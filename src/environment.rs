@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::sync::RwLock;
+use crate::models::EmptyTripInfo;
 
 use crate::services::{
     chalo_vehicle_cache::ChaloVehicleCache,
@@ -121,6 +123,9 @@ pub struct AppState {
     pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub trip_service: Arc<TripService>,
     pub chalo_vehicle_cache: Arc<ChaloVehicleCache>,
+    pub empty_trip_cache: Arc<RwLock<HashMap<String, Vec<EmptyTripInfo>>>>,
+    pub entity_cache: Arc<RwLock<HashMap<String, String>>>,
+    pub vehicle_depot_cache: Arc<RwLock<HashMap<String, (String, String)>>>,
     pub config: AppConfig,
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
@@ -192,6 +197,9 @@ impl AppState {
             db_employee_reader,
             trip_service,
             chalo_vehicle_cache,
+            empty_trip_cache: Arc::new(RwLock::new(HashMap::new())),
+            entity_cache: Arc::new(RwLock::new(HashMap::new())),
+            vehicle_depot_cache: Arc::new(RwLock::new(HashMap::new())),
             config: app_config,
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),

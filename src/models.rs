@@ -130,6 +130,15 @@ pub struct VehicleServiceTypeResponse {
     pub service_sub_types: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmptyTripInfo {
+    pub gtfs_id: String,
+    pub vehicle_no: String,
+    pub depot_id: Option<String>,
+    pub depot_name: Option<String>,
+    pub timestamp_ist: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WaybillStatus {
     Online,
