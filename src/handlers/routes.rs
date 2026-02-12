@@ -2,9 +2,11 @@ use actix_web::{
     web::{self, Data, Json, Path, Query},
     HttpResponse,
 };
+use chrono::{Timelike, Utc};
+use once_cell::sync::Lazy;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
 use crate::environment::AppState;
@@ -20,6 +22,32 @@ use crate::{
     tools::error::{AppError, AppResult},
 };
 
+static FAILED_TRIP_LOGS: Lazy<Mutex<HashMap<u32, (i64, HashSet<String>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn record_failure(gtfs_id: &str, vehicle_no: &str) {
+    if gtfs_id != "chennai_bus" {
+        return;
+    }
+    let now = Utc::now();
+    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
+        .expect("Valid IST offset");
+    let ist_now = now.with_timezone(&ist_offset);
+
+    let hour = ist_now.hour();
+    // Use the IST-adjusted timestamp for day calculation to ensure local day boundaries
+    let day = (now.timestamp() + 19800) / 86400;
+
+    if let Ok(mut logs) = FAILED_TRIP_LOGS.lock() {
+        let entry = logs.entry(hour).or_insert((day, HashSet::new()));
+        if entry.0 != day {
+            entry.1.clear();
+            entry.0 = day;
+        }
+        entry.1.insert(vehicle_no.to_string());
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
     limit: Option<i32>,
@@ -28,6 +56,40 @@ pub struct LimitQuery {
 #[derive(Debug, Deserialize)]
 pub struct DirectionQuery {
     direction: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FailedTripsQuery {
+    pub hour: Option<u32>,
+}
+
+pub async fn get_failed_trips(query: web::Query<FailedTripsQuery>) -> HttpResponse {
+    let logs = match FAILED_TRIP_LOGS.lock() {
+        Ok(l) => l,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let now = Utc::now();
+    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
+        .expect("Valid IST offset");
+    let ist_now = now.with_timezone(&ist_offset);
+    let current_day = (now.timestamp() + 19800) / 86400; // IST day
+    let current_hour = ist_now.hour();
+
+    let mut result = HashMap::new();
+    for (&hour, (day, vehicles)) in logs.iter() {
+        if let Some(h) = query.hour {
+            if h != hour {
+                continue;
+            }
+        }
+        // 24h TTL check using IST boundaries
+        if *day == current_day || (*day == current_day - 1 && hour > current_hour) {
+            if !vehicles.is_empty() {
+                result.insert(hour, vehicles.clone());
+            }
+        }
+    }
+    HttpResponse::Ok().json(result)
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +171,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/station-children/{gtfs_id}/{stop_code}",
                 actix_web::web::get().to(get_station_children),
             )
+            .route("chennai_bus/failed-trips", actix_web::web::get().to(get_failed_trips))
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
             .route(
@@ -785,6 +848,7 @@ async fn get_service_type_by_vehicle_impl(
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
+            record_failure(gtfs_id, vehicle_no);
             return Err(crate::tools::error::AppError::NotFound(format!(
                 "Vehicle {} not found in cache",
                 vehicle_no
@@ -797,6 +861,14 @@ async fn get_service_type_by_vehicle_impl(
         .db_vehicle_reader
         .get_vehicle_data(vehicle_no, params.trip_number)
         .await?;
+
+    if vehicle_data
+        .remaining_trip_details
+        .as_ref()
+        .map_or(true, |v| v.is_empty())
+    {
+        record_failure(gtfs_id, vehicle_no);
+    }
 
     // Populate stops_count for each route in remaining_trip_details using its own route_number
     if let Some(ref mut details) = vehicle_data.remaining_trip_details {
