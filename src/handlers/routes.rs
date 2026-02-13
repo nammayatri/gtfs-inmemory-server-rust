@@ -25,13 +25,13 @@ use crate::{
 static FAILED_TRIP_LOGS: Lazy<Mutex<HashMap<u32, (i64, HashSet<String>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn record_failure(gtfs_id: &str, vehicle_no: &str) {
-    if gtfs_id != "chennai_bus" {
+fn record_failure(gtfs_id: &str, vehicle_no: &str, service_type: &Option<String>) {
+    if gtfs_id != "chennai_bus" || service_type.is_none() {
         return;
     }
     let now = Utc::now();
-    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-        .expect("Valid IST offset");
+    let ist_offset =
+        chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("Valid IST offset");
     let ist_now = now.with_timezone(&ist_offset);
 
     let hour = ist_now.hour();
@@ -90,6 +90,17 @@ pub async fn get_failed_trips(query: web::Query<FailedTripsQuery>) -> HttpRespon
         }
     }
     HttpResponse::Ok().json(result)
+}
+
+pub async fn clear_failed_trips_cache() -> HttpResponse {
+    if let Ok(mut logs) = FAILED_TRIP_LOGS.lock() {
+        logs.clear();
+        HttpResponse::Ok().json(serde_json::json!({
+            "message": "Failed trip logs cleared successfully"
+        }))
+    } else {
+        HttpResponse::InternalServerError().finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +182,14 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/station-children/{gtfs_id}/{stop_code}",
                 actix_web::web::get().to(get_station_children),
             )
-            .route("chennai_bus/failed-trips", actix_web::web::get().to(get_failed_trips))
+            .route(
+                "/chennai_bus/failed-trips", 
+                actix_web::web::get().to(get_failed_trips),
+            )
+            .route(
+                "/chennai_bus/failed-trips/clear", 
+                actix_web::web::post().to(clear_failed_trips_cache),
+            )
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
             .route(
@@ -848,7 +866,6 @@ async fn get_service_type_by_vehicle_impl(
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
-            record_failure(gtfs_id, vehicle_no);
             return Err(crate::tools::error::AppError::NotFound(format!(
                 "Vehicle {} not found in cache",
                 vehicle_no
@@ -863,11 +880,16 @@ async fn get_service_type_by_vehicle_impl(
         .await?;
 
     if vehicle_data
-        .remaining_trip_details
+        .waybill_id
         .as_ref()
         .map_or(true, |v| v.is_empty())
     {
-        record_failure(gtfs_id, vehicle_no);
+        let g = gtfs_id.to_string();
+        let v = vehicle_no.to_string();
+        let st = vehicle_data.service_type.clone();
+        tokio::spawn(async move {
+            record_failure(&g, &v, &st);
+        });
     }
 
     // Populate stops_count for each route in remaining_trip_details using its own route_number
