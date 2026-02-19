@@ -282,6 +282,13 @@ async fn get_conductor_by_phone_number(
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
     let phone_number = path.into_inner();
+
+    // First check static CSV data (faster O(1) lookup)
+    if let Some(emp) = app_state.conductor_details.get(&phone_number) {
+        return Ok(HttpResponse::Ok().json(emp));
+    }
+
+    // Fallback to DB lookup
     let employee_data = app_state
         .db_employee_reader
         .get_employee_by_phone(&phone_number)

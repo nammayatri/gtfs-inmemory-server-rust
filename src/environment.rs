@@ -125,6 +125,7 @@ pub struct AppState {
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
+    pub conductor_details: Arc<HashMap<String, crate::models::MinimalEmployee>>,
 }
 
 impl AppState {
@@ -186,6 +187,9 @@ impl AppState {
         // Load bus registration mapping from CSV
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
 
+        // Load conductor details from CSV
+        let conductor_details = Arc::new(Self::load_conductor_details().await?);
+
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
@@ -196,6 +200,7 @@ impl AppState {
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
+            conductor_details,
         };
 
         Ok(app_state)
@@ -369,5 +374,80 @@ impl AppState {
         );
 
         Ok(sub_types_map)
+    }
+
+    async fn load_conductor_details() -> Result<HashMap<String, crate::models::MinimalEmployee>> {
+        use crate::models::MinimalEmployee;
+        let file_path = "./assets/conductor_details.csv";
+
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                info!("conductor_details.csv file not found, proceeding without conductor details data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read conductor_details.csv: {}", e))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut phone_to_employee: HashMap<String, MinimalEmployee> = HashMap::new();
+
+        for result in reader.records() {
+            match result {
+                Ok(record) => {
+                    // CSV columns: S. No.(0), Token No(1), Name(2), Depot Name(3), Phone Number(4), UPI ID(5), VPA(6)
+                    let (Some(token_no), Some(name), Some(depot_name), Some(phone_number)) = (
+                        record.get(1),
+                        record.get(2),
+                        record.get(3),
+                        record.get(4),
+                    ) else {
+                        continue;
+                    };
+
+                    let phone = phone_number.trim().to_string();
+                    let token = token_no.trim().to_string();
+                    let full_name = name.trim();
+                    let depot = depot_name.trim().to_string();
+
+                    if phone.is_empty() || token.is_empty() {
+                        continue;
+                    }
+
+                    // Split name into first and last
+                    let (first_name, last_name) = match full_name.split_once(' ') {
+                        Some((first, last)) => (first.to_string(), Some(last.to_string())),
+                        None => (full_name.to_string(), None),
+                    };
+
+                    let employee = MinimalEmployee {
+                        token_no: Some(token),
+                        first_name,
+                        last_name,
+                        mobile_no: Some(phone.clone()),
+                        depot_name: Some(depot),
+                    };
+
+                    phone_to_employee.insert(phone, employee);
+                }
+                Err(e) => {
+                    error!("Error parsing conductor_details CSV row: {}", e);
+                }
+            }
+        }
+
+        info!(
+            "Loaded conductor details for {} conductors",
+            phone_to_employee.len()
+        );
+
+        Ok(phone_to_employee)
     }
 }
