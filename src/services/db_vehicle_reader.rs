@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{FixedOffset, NaiveTime, TimeZone, Utc, Timelike};
 use sqlx::postgres::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,6 +32,8 @@ struct VehiclePoolCache {
 struct WaybillsByRouteCache {
     waybills_by_route: HashMap<String, (Vec<VehicleData>, SystemTime)>,
 }
+
+const DB_ACTIVE_TRIP_STALE_HOURS: i64 = 36; // If active trip started more than 36 hours ago, consider it stale
 
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
@@ -1207,12 +1210,8 @@ impl DBVehicleReader {
                 // Remove active trip from list
                 let active_trip = rows.remove(active_idx);
 
-                // Remaining trips = only trips that come AFTER the active trip (by trip_number)
-                let active_trip_num = active_trip.trip_number.unwrap_or(0);
-                let remaining_trips: Vec<BusSchedule> = rows
-                    .into_iter()
-                    .filter(|trip| trip.trip_number.unwrap_or(0) > active_trip_num)
-                    .collect();
+                // Remaining trips = preserve all fetched rows except the active trip
+                let remaining_trips: Vec<BusSchedule> = rows.into_iter().collect();
 
                 let remaining = if remaining_trips.is_empty() {
                     None
@@ -1399,6 +1398,131 @@ impl DBVehicleReader {
     // }
 }
 
+/// HACK: If the first trip's `startTime` (trip_start_time) is stale check DB_ACTIVE_TRIP_STALE_HOURS and if so,
+//  re-derive the active trip using IST clock time, even if the DB already
+/// set `is_active_trip = true` on a row.  Whichever trip's `dbStartTime`..`dbEndTime`
+/// window contains the current IST time becomes the active trip.
+/// If the data is fresh or no window matches, the response is left unchanged.
+fn apply_ist_active_trip_hack(vehicle_data: &mut VehicleDataWithRouteId) {
+    // Collect all trips from schedule_details into one sorted vec
+    let all_trips: Vec<BusSchedule> = {
+        let Some(ref schedule_details) = vehicle_data.schedule_details else {
+            return;
+        };
+        let mut trips: Vec<BusSchedule> = schedule_details
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        if trips.is_empty() {
+            return;
+        }
+        trips.sort_by_key(|t| t.trip_number.unwrap_or(i32::MAX));
+        trips
+    };
+
+    // Check staleness: only apply the hack if the first trip's start_time is old.
+    // start_time is trip_start_time from the DB, which is always epoch milliseconds or NULL.
+    let start_time_utc = match &all_trips[0].start_time {
+        Some(s) if !s.is_empty() => match s.parse::<i64>() {
+            Ok(epoch_ms) => Utc.timestamp_millis_opt(epoch_ms).single(),
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    let Some(start_time_utc) = start_time_utc else {
+        return; // no valid timestamp – bail out
+    };
+    let now_utc = Utc::now();
+    if now_utc.signed_duration_since(start_time_utc).num_hours() < DB_ACTIVE_TRIP_STALE_HOURS {
+        return; // Data is fresh; no hack needed
+    }
+    let ist_offset = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    let now_ist = now_utc.with_timezone(&ist_offset);
+
+    // Use `last_updated` as the base date for anchoring db_start_time values.
+    let base_date = vehicle_data
+        .last_updated
+        .map(|dt| dt.with_timezone(&ist_offset).date_naive())
+        .unwrap_or_else(|| now_ist.date_naive());
+
+    // Reconstruct per-trip start datetimes by walking trips in order and bumping the
+    // date when the clock time goes backwards (midnight cross).
+    let mut current_date = base_date;
+    let mut prev_seconds: Option<u32> = None;
+    let mut trip_start_datetimes: Vec<(Option<i32>, chrono::DateTime<FixedOffset>)> = Vec::new();
+    for trip in &all_trips {
+        let db_start = trip.db_start_time.as_deref().unwrap_or("");
+        if db_start.is_empty() {
+            continue;
+        }
+        let Ok(time) = NaiveTime::parse_from_str(db_start, "%H:%M") else {
+            continue;
+        };
+
+        if let Some(prev) = prev_seconds {
+            if time.num_seconds_from_midnight() < prev {
+                current_date = current_date.succ_opt().unwrap_or(current_date);
+            }
+        }
+        prev_seconds = Some(time.num_seconds_from_midnight());
+
+        let naive_dt = current_date.and_time(time);
+        if let Some(final_dt) = ist_offset.from_local_datetime(&naive_dt).single() {
+            trip_start_datetimes.push((trip.trip_number, final_dt));
+        }
+    }
+
+    // Pick the latest trip whose reconstructed start datetime is <= now_ist
+    let matched_trip_num = trip_start_datetimes
+        .into_iter()
+        .filter(|(_, start_dt)| *start_dt <= now_ist)
+        .max_by_key(|(_, start_dt)| *start_dt)
+        .map(|(trip_num, _)| trip_num);
+
+    let Some(new_trip_num) = matched_trip_num else {
+        return; // No window matched – return as-is
+    };
+
+    // Nothing to do if the current active trip already matches
+    if new_trip_num == vehicle_data.trip_number && vehicle_data.is_active_trip {
+        return;
+    }
+
+    let Some(new_active) = all_trips.iter().find(|t| t.trip_number == new_trip_num) else {
+        return;
+    };
+
+    info!(
+        "IST hack: shifting active trip from {:?} -> {:?} (db_start={:?} db_end={:?}) for vehicle {}",
+        vehicle_data.trip_number,
+        new_active.trip_number,
+        new_active.db_start_time,
+        new_active.db_end_time,
+        vehicle_data.vehicle_no
+    );
+
+    // Update the top-level active-trip fields
+    vehicle_data.trip_number = new_active.trip_number;
+    vehicle_data.route_id = Some(new_active.route_id.clone());
+    vehicle_data.route_number = new_active.route_number.clone();
+    vehicle_data.depot = new_active.org_name.clone();
+    vehicle_data.db_start_time = new_active.db_start_time.clone();
+    vehicle_data.db_end_time = new_active.db_end_time.clone();
+    vehicle_data.is_active_trip = true;
+
+    // Rebuild remaining_trip_details: include all trips except the newly activated one
+    let remaining: Vec<BusSchedule> = all_trips
+        .into_iter()
+        .filter(|t| t.trip_number != new_trip_num)
+        .collect();
+    vehicle_data.remaining_trip_details = if remaining.is_empty() {
+        None
+    } else {
+        Some(remaining)
+    };
+}
+
 #[async_trait]
 impl VehicleDataReader for DBVehicleReader {
     async fn get_vehicle_data(
@@ -1494,6 +1618,10 @@ impl VehicleDataReader for DBVehicleReader {
                     vehicle_data_with_route_id.db_start_time = schedule.db_start_time.clone();
                     vehicle_data_with_route_id.db_end_time = schedule.db_end_time.clone();
                 }
+
+                // HACK: if trip timestamps are stale, re-derive the active trip
+                // from the current IST clock time vs each trip's dbStartTime/dbEndTime window.
+                apply_ist_active_trip_hack(&mut vehicle_data_with_route_id);
 
                 self.cache_vehicle_data(&vehicle_data_with_route_id).await;
                 Ok(vehicle_data_with_route_id)
