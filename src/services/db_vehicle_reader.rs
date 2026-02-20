@@ -1152,9 +1152,6 @@ impl DBVehicleReader {
                     trip_order
                 FROM bus_schedule_trip_detail
                 WHERE schedule_trip_id = $1::bigint
-                    AND trip_number >= (SELECT COALESCE(
-                        (SELECT trip_number FROM bus_schedule_trip_detail
-                         WHERE schedule_trip_id = $1::bigint AND is_active_trip = true AND trip_type != 'dead-trip'), 1))
                     AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#.to_string()
