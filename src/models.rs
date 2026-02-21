@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -11,6 +11,98 @@ pub struct Gate {
     pub stop_code: String,
     pub lat: f64,
     pub lon: f64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Default)]
+pub enum ServiceTierType {
+    #[default]
+    Ordinary,
+    Ac,
+    NonAc,
+    Express,
+    Special,
+    Executive,
+    FirstClass,
+    SecondClass,
+    ThirdClass,
+    AshokLeylandAc,
+    MidiAc,
+    VolvoAc,
+    ElectricV,
+    ElectricVPmi,
+    AcEmuFirstClass,
+    Premium,
+}
+
+impl Serialize for ServiceTierType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = match self {
+            ServiceTierType::Ordinary => "ORDINARY",
+            ServiceTierType::Ac => "AC",
+            ServiceTierType::NonAc => "NON_AC",
+            ServiceTierType::Express => "EXPRESS",
+            ServiceTierType::Special => "SPECIAL",
+            ServiceTierType::Executive => "EXECUTIVE",
+            ServiceTierType::FirstClass => "FIRST_CLASS",
+            ServiceTierType::SecondClass => "SECOND_CLASS",
+            ServiceTierType::ThirdClass => "THIRD_CLASS",
+            ServiceTierType::AshokLeylandAc => "ASHOK_LEYLAND_AC",
+            ServiceTierType::MidiAc => "MIDI_AC",
+            ServiceTierType::VolvoAc => "VOLVO_AC",
+            ServiceTierType::ElectricV => "ELECTRIC_V",
+            ServiceTierType::ElectricVPmi => "ELECTRIC_V_PMI",
+            ServiceTierType::AcEmuFirstClass => "AC_EMU_FIRST_CLASS",
+            ServiceTierType::Premium => "PREMIUM",
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServiceTierType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: String = Deserialize::deserialize(deserializer)?;
+        match s.trim() {
+            "Deluxe EV" => Ok(ServiceTierType::Executive),
+            "Small Bus Express" => Ok(ServiceTierType::Express),
+            "Small Bus Ordinary" => Ok(ServiceTierType::NonAc),
+            "A/C" | "A/C EV" | "AC" => Ok(ServiceTierType::Ac),
+            "Ordinary" | "ORDINARY" => Ok(ServiceTierType::Ordinary),
+            "Express" | "EXPRESS" => Ok(ServiceTierType::Express),
+            "Deluxe" | "EXECUTIVE" => Ok(ServiceTierType::Executive),
+            "NON_AC" => Ok(ServiceTierType::NonAc),
+            "SPECIAL" => Ok(ServiceTierType::Special),
+            "FIRST_CLASS" => Ok(ServiceTierType::FirstClass),
+            "SECOND_CLASS" => Ok(ServiceTierType::SecondClass),
+            "THIRD_CLASS" => Ok(ServiceTierType::ThirdClass),
+            "ASHOK_LEYLAND_AC" => Ok(ServiceTierType::AshokLeylandAc),
+            "MIDI_AC" => Ok(ServiceTierType::MidiAc),
+            "VOLVO_AC" => Ok(ServiceTierType::VolvoAc),
+            "ELECTRIC_V" => Ok(ServiceTierType::ElectricV),
+            "ELECTRIC_V_PMI" => Ok(ServiceTierType::ElectricVPmi),
+            "AC_EMU_FIRST_CLASS" => Ok(ServiceTierType::AcEmuFirstClass),
+            "PREMIUM" | "Premium" => Ok(ServiceTierType::Premium),
+            _ => {
+                // Return Ordinary as default if parsing fails like some lenient setups or log warning? Let's just fail
+                Err(serde::de::Error::custom(format!(
+                    "Invalid Service Tier Type: {}",
+                    s
+                )))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteServiceTierRecord {
+    pub gtfs_id: String,
+    pub route_id: String,
+    pub servicetier: ServiceTierType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -194,6 +286,8 @@ pub struct NandiRoutesRes {
     pub start_point: Option<LatLong>,
     #[serde(rename = "endPoint")]
     pub end_point: Option<LatLong>,
+    #[serde(rename = "serviceTier")]
+    pub service_tier: Option<ServiceTierType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +416,7 @@ pub struct GTFSData {
     pub entity_id_name_mapping: HashMap<String, String>,
     pub route_example_trip_details_by_gtfs: HashMap<String, HashMap<String, TripDetails>>,
     pub alternate_stop_by_gtfs: HashMap<String, GTFSAlternateStopData>,
+    pub route_service_tiers_by_gtfs: HashMap<String, HashMap<String, ServiceTierType>>,
 }
 
 impl GTFSData {
