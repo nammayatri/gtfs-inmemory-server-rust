@@ -1,0 +1,838 @@
+use async_trait::async_trait;
+use serde_json::Value;
+use sqlx::postgres::PgPool;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
+use tracing::info;
+
+use crate::tools::error::{AppError, AppResult};
+
+pub fn shift_types() -> Vec<&'static str> {
+    vec![
+        "am",
+        "pm",
+        "full-shift",
+        "pm-night",
+        "pm-am",
+        "night-halt",
+        "general-shift",
+    ]
+}
+
+pub fn day_types() -> Vec<&'static str> {
+    vec!["weekdays", "weekend", "alldays"]
+}
+
+pub fn trip_types() -> Vec<&'static str> {
+    vec!["cut-trip", "regular-trip", "dead-trip"]
+}
+
+pub fn break_types() -> Vec<&'static str> {
+    vec!["no-break", "food-break", "tea-break"]
+}
+
+pub fn waybill_statuses() -> Vec<&'static str> {
+    vec!["online", "upcoming", "new", "processed", "audited", "closed"]
+}
+
+pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &[
+    "chennai_bus",
+];
+
+pub const MAX_QUERY_LIMIT: i64 = 1000;
+
+pub fn table_pk(table: &str) -> Option<&'static str> {
+    match table {
+        "route_internal"                     => Some("route_id"),
+        "route_point_internal"               => Some("route_points_id"),
+        "bus_schedule_internal"              => Some("schedule_id"),
+        "bus_schedule_trip_internal"         => Some("schedule_trip_id"),
+        "bus_schedule_trip_detail_internal"  => Some("schedule_trip_detail_id"),
+        "bus_schedule_trip_flexi_internal"   => Some("schedule_trip_flexi_id"),
+        "service_type_internal"              => Some("service_type_id"),
+        "stop_internal"                      => Some("bus_stop_id"),
+        "designations_internal"              => Some("designation_id"),
+        "employees_internal"                 => Some("emp_id"),
+        "entities_internal"                  => Some("entity_id"),
+        "vehicles_internal"                  => Some("vehicle_id"),
+        "waybill_device_internal"            => Some("waybill_device_id"),
+        "fleet_etm_mapping_internal"         => Some("fleet_etm_mapping_id"),
+        "fleet_obu_mapping_internal"         => Some("fleet_obu_mapping_id"),
+        "waybills_internal"                  => Some("waybill_id"),
+        _ => None,
+    }
+}
+
+fn allowed_tables() -> &'static [&'static str] {
+    &[
+        "route_internal",
+        "route_point_internal",
+        "bus_schedule_internal",
+        "bus_schedule_trip_internal",
+        "bus_schedule_trip_detail_internal",
+        "bus_schedule_trip_flexi_internal",
+        "service_type_internal",
+        "stop_internal",
+        "designations_internal",
+        "employees_internal",
+        "entities_internal",
+        "vehicles_internal",
+        "waybill_device_internal",
+        "fleet_etm_mapping_internal",
+        "fleet_obu_mapping_internal",
+        "waybills_internal",
+    ]
+}
+
+fn validate_column_name(col: &str) -> AppResult<()> {
+    if col.is_empty() || col.len() > 64 {
+        return Err(AppError::BadRequest(format!("Invalid column name: {}", col)));
+    }
+    let mut chars = col.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(AppError::BadRequest(format!("Invalid column name: {}", col)));
+    }
+    for c in chars {
+        if !c.is_ascii_alphanumeric() && c != '_' {
+            return Err(AppError::BadRequest(format!("Invalid column name: {}", col)));
+        }
+    }
+    Ok(())
+}
+
+fn validate_table(table: &str) -> AppResult<()> {
+    if allowed_tables().contains(&table) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!("Unknown table: {}", table)))
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct ServiceTypeRow {
+    pub service_type_id: i64,
+    pub service_type_code: Option<String>,
+    pub service_type_name: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct RouteRow {
+    pub route_id: i64,
+    pub route_number: Option<String>,
+    pub route_direction: Option<String>,
+    pub start_point_id: i64,
+    pub end_point_id: i64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct DepotRow {
+    pub entity_id: i64,
+    pub entity_name: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct ScheduleNumberRow {
+    pub schedule_id: i64,
+    pub schedule_number: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct FleetRow {
+    pub vehicle_id: i64,
+    pub vehicle_no: Option<String>,
+    pub fleet_no: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct EmployeeRow {
+    pub emp_id: i64,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub token_no: Option<String>,
+    pub mobile_no: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct TripDetailRow {
+    pub schedule_trip_detail_id: i64,
+    pub trip_number: i32,
+    pub trip_order: i32,
+    pub trip_type: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub break_time: Option<String>,
+    pub break_type: Option<String>,
+    pub shift_type: Option<String>,
+    pub distance: f32,
+    pub route_id: i64,
+    pub schedule_trip_id: i64,
+    pub is_active_trip: bool,
+    pub entity_name: Option<String>,
+}
+
+#[async_trait]
+pub trait OperatorService: Send + Sync {
+    async fn get_one_row(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        query_params: HashMap<String, String>,
+    ) -> AppResult<Option<Value>>;
+
+    async fn get_all_rows(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<Vec<Value>>;
+
+    async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64>;
+
+    async fn upsert_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<Value>;
+
+    async fn get_service_types_list(&self, gtfs_id: &str) -> AppResult<Vec<ServiceTypeRow>>;
+    async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>>;
+    async fn get_depot_names_and_ids(&self, gtfs_id: &str) -> AppResult<Vec<DepotRow>>;
+
+    async fn get_schedule_numbers(&self, gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>>;
+
+    async fn get_schedule_trip_details_by_schedule_number(&self, gtfs_id: &str, schedule_number: &str,) -> AppResult<Vec<TripDetailRow>>;
+
+    async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>>;
+
+    async fn get_conductor_data(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>>;
+    async fn get_driver_info(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>>;
+
+    async fn get_device_ids(&self, gtfs_id: &str) -> AppResult<Vec<String>>;
+    async fn get_tablet_ids(&self, gtfs_id: &str) -> AppResult<Vec<String>>;
+
+    async fn get_operators(&self, gtfs_id: &str, role: &str) -> AppResult<Vec<EmployeeRow>>;
+
+    async fn update_waybill_status(&self, gtfs_id: &str, waybill_id: i64, status: &str) -> AppResult<u64>;
+    async fn update_waybill_fleet_number(&self, gtfs_id: &str, waybill_id: i64, fleet_no: &str) -> AppResult<u64>;
+    async fn update_waybill_tablet_id(&self, gtfs_id: &str, waybill_id: i64, tablet_id: &str) -> AppResult<u64>;
+
+    async fn get_waybills(&self, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<Value>>;
+}
+
+pub struct MockOperatorService;
+
+impl Default for MockOperatorService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockOperatorService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+macro_rules! mock_err {
+    () => {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    };
+}
+
+#[async_trait]
+impl OperatorService for MockOperatorService {
+    async fn get_one_row(&self, _t: &str, _g: &str, _q: HashMap<String, String>) -> AppResult<Option<Value>> { mock_err!() }
+    async fn get_all_rows(&self, _t: &str, _g: &str, _l: i64, _o: i64) -> AppResult<Vec<Value>> { mock_err!() }
+    async fn delete_one_row(&self, _t: &str, _g: &str, _d: Value) -> AppResult<u64> { mock_err!() }
+    async fn upsert_one_row(&self, _t: &str, _g: &str, _d: Value) -> AppResult<Value> { mock_err!() }
+    async fn get_service_types_list(&self, _gtfs_id: &str) -> AppResult<Vec<ServiceTypeRow>> { mock_err!() }
+    async fn get_routes_list(&self, _gtfs_id: &str) -> AppResult<Vec<RouteRow>> { mock_err!() }
+    async fn get_depot_names_and_ids(&self, _gtfs_id: &str) -> AppResult<Vec<DepotRow>> { mock_err!() }
+    async fn get_schedule_numbers(&self, _gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>> { mock_err!() }
+    async fn get_schedule_trip_details_by_schedule_number(&self, _gtfs_id: &str, _s: &str) -> AppResult<Vec<TripDetailRow>> { mock_err!() }
+    async fn get_fleets(&self, _gtfs_id: &str) -> AppResult<Vec<FleetRow>> { mock_err!() }
+    async fn get_conductor_data(&self, _gtfs_id: &str, _t: &str) -> AppResult<Option<EmployeeRow>> { mock_err!() }
+    async fn get_driver_info(&self, _gtfs_id: &str, _t: &str) -> AppResult<Option<EmployeeRow>> { mock_err!() }
+    async fn get_device_ids(&self, _gtfs_id: &str) -> AppResult<Vec<String>> { mock_err!() }
+    async fn get_tablet_ids(&self, _gtfs_id: &str) -> AppResult<Vec<String>> { mock_err!() }
+    async fn get_operators(&self, _gtfs_id: &str, _r: &str) -> AppResult<Vec<EmployeeRow>> { mock_err!() }
+    async fn update_waybill_status(&self, _gtfs_id: &str, _id: i64, _s: &str) -> AppResult<u64> { mock_err!() }
+    async fn update_waybill_fleet_number(&self, _gtfs_id: &str, _id: i64, _f: &str) -> AppResult<u64> { mock_err!() }
+    async fn update_waybill_tablet_id(&self, _gtfs_id: &str, _id: i64, _t: &str) -> AppResult<u64> { mock_err!() }
+    async fn get_waybills(&self, _gtfs_id: &str, _l: i64, _o: i64) -> AppResult<Vec<Value>> { mock_err!() }
+}
+
+struct DeviceIdsCache {
+    etm_ids: HashMap<String, (Vec<String>, SystemTime)>,
+}
+
+struct TabletIdsCache {
+    tablet_ids: HashMap<String, (Vec<String>, SystemTime)>,
+}
+
+// Designation cache: name (lowercase) → id
+struct DesignationCache {
+    map: Option<HashMap<String, i64>>,
+}
+
+const DEVICE_CACHE_SECS: u64 = 3600; // 1 hour
+
+pub struct DBOperatorService {
+    pool: PgPool,
+    device_ids_cache: Arc<RwLock<DeviceIdsCache>>,
+    tablet_ids_cache: Arc<RwLock<TabletIdsCache>>,
+    designation_cache: Arc<RwLock<DesignationCache>>,
+}
+
+impl DBOperatorService {
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            device_ids_cache: Arc::new(RwLock::new(DeviceIdsCache { etm_ids: HashMap::new() })),
+            tablet_ids_cache: Arc::new(RwLock::new(TabletIdsCache { tablet_ids: HashMap::new() })),
+            designation_cache: Arc::new(RwLock::new(DesignationCache { map: None })),
+        }
+    }
+
+    fn cache_expired(ts: SystemTime, secs: u64) -> bool {
+        ts.elapsed().unwrap_or_default() >= Duration::from_secs(secs)
+    }
+
+    /// Load designation name→id map if not already loaded (infinite TTL).
+    async fn ensure_designation_cache(&self) -> AppResult<()> {
+        {
+            let cache = self.designation_cache.read().await;
+            if cache.map.is_some() {
+                return Ok(());
+            }
+        }
+
+        info!("Loading designation cache from DB");
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT designation_id, LOWER(designation_name) FROM designations_internal WHERE deleted = false",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("designation cache load: {}", e)))?;
+
+        let map: HashMap<String, i64> = rows.into_iter().map(|(id, name)| (name, id)).collect();
+        info!("Designation cache loaded with {} entries", map.len());
+
+        let mut cache = self.designation_cache.write().await;
+        cache.map = Some(map);
+        Ok(())
+    }
+
+    async fn designation_id_for(&self, role: &str) -> AppResult<i64> {
+        self.ensure_designation_cache().await?;
+        let cache = self.designation_cache.read().await;
+        let map = cache.map.as_ref().unwrap();
+        // role could be "conductors" or "drivers"; strip trailing 's' for matching
+        let search = role.trim_end_matches('s').to_lowercase();
+        // Find partial match (e.g. "conductor" matches "conductor", "driver" matches "driver")
+        map.iter()
+            .find(|(name, _)| name.contains(&search))
+            .map(|(_, id)| *id)
+            .ok_or_else(|| AppError::NotFound(format!("No designation found for role: {}", role)))
+    }
+}
+
+#[async_trait]
+impl OperatorService for DBOperatorService {
+
+    async fn get_one_row(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        query_params: HashMap<String, String>,
+    ) -> AppResult<Option<Value>> {
+        validate_table(table)?;
+
+        if query_params.is_empty() {
+            return Err(AppError::BadRequest(
+                "At least one query param required".to_string(),
+            ));
+        }
+
+        for col in query_params.keys() {
+            validate_column_name(col)?;
+        }
+
+        // Build WHERE clause dynamically; gtfs_id is always $1
+        let cols: Vec<&str> = query_params.keys().map(|s| s.as_str()).collect();
+        let vals: Vec<&str> = query_params.values().map(|s| s.as_str()).collect();
+
+        let extra_clause: String = cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("{} = ${}", col, i + 2))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let sql = format!(
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND {} AND deleted = false LIMIT 1) t",
+            table, extra_clause
+        );
+
+        let mut q = sqlx::query_scalar::<_, Value>(&sql);
+        q = q.bind(gtfs_id);
+        for val in &vals {
+            q = q.bind(val);
+        }
+
+        q.fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("get_one_row {}: {}", table, e)))
+    }
+
+    async fn get_all_rows(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<Vec<Value>> {
+        validate_table(table)?;
+
+        let sql = format!(
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY 1 LIMIT $2 OFFSET $3) t",
+            table
+        );
+
+        sqlx::query_scalar::<_, Value>(&sql)
+            .bind(gtfs_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("get_all_rows {}: {}", table, e)))
+    }
+
+    async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64> {
+        validate_table(table)?;
+        let pk = table_pk(table)
+            .ok_or_else(|| AppError::Internal(format!("No PK for table: {}", table)))?;
+
+        let obj = data
+            .as_object()
+            .ok_or_else(|| AppError::BadRequest("Body must be a JSON object".to_string()))?;
+
+        let pk_value = obj.get(pk)
+            .ok_or_else(|| AppError::BadRequest(format!("Body must contain the primary key: {}", pk)))?;
+
+        let id = match pk_value {
+            Value::Number(n) => n.as_i64().ok_or_else(|| AppError::BadRequest("ID must be an integer".to_string()))?,
+            Value::String(s) => s.parse::<i64>().map_err(|_| AppError::BadRequest("ID must be an integer string".to_string()))?,
+            _ => return Err(AppError::BadRequest("ID must be an integer".to_string())),
+        };
+
+        let sql = format!(
+            "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {} = $1 AND gtfs_id = $2 AND deleted = false",
+            table, pk
+        );
+
+        let result = sqlx::query(&sql)
+            .bind(id)
+            .bind(gtfs_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("delete_one_row {}: {}", table, e)))?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn upsert_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<Value> {
+        validate_table(table)?;
+        let pk = table_pk(table)
+            .ok_or_else(|| AppError::Internal(format!("No PK for table: {}", table)))?;
+
+        let is_array = data.is_array();
+        let arr = if let Some(a) = data.as_array() {
+            a.clone()
+        } else if data.is_object() {
+            vec![data.clone()]
+        } else {
+            return Err(AppError::BadRequest("Body must be a JSON object or array of objects".to_string()));
+        };
+
+        if arr.is_empty() {
+            return Err(AppError::BadRequest("Body is empty".to_string()));
+        }
+
+        let first_obj = arr[0]
+            .as_object()
+            .ok_or_else(|| AppError::BadRequest("Array must contain JSON objects".to_string()))?;
+
+        if first_obj.is_empty() {
+            return Err(AppError::BadRequest("First object is empty".to_string()));
+        }
+
+        // Build column list from caller's keys, excluding gtfs_id (we inject it ourselves)
+        let mut cols: Vec<&str> = first_obj.keys()
+            .filter(|k| k.as_str() != "gtfs_id")
+            .map(|s| s.as_str())
+            .collect();
+        cols.push("gtfs_id"); // gtfs_id always last
+
+        let update_set: Vec<String> = cols
+            .iter()
+            .map(|c| format!("{} = EXCLUDED.{}", c, c))
+            .collect();
+
+        let mut placeholders = Vec::new();
+        let mut bind_index = 1;
+
+        for _ in 0..arr.len() {
+            let row_placeholders: Vec<String> = (0..cols.len())
+                .map(|_| {
+                    let s = format!("${}", bind_index);
+                    bind_index += 1;
+                    s
+                })
+                .collect();
+            placeholders.push(format!("({})", row_placeholders.join(", ")));
+        }
+
+        let sql = format!(
+            "INSERT INTO public.{} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} RETURNING row_to_json({}) AS result",
+            table,
+            cols.join(", "),
+            placeholders.join(", "),
+            pk,
+            update_set.join(", "),
+            table
+        );
+
+        let mut q = sqlx::query_scalar::<_, Value>(&sql);
+
+        for val in &arr {
+            let obj = val.as_object().ok_or_else(|| AppError::BadRequest("Array must contain JSON objects".to_string()))?;
+            // bind all cols except gtfs_id first
+            for col in cols.iter().filter(|c| **c != "gtfs_id") {
+                let col_val = obj.get(*col).unwrap_or(&Value::Null);
+                match col_val {
+                    Value::String(s) => q = q.bind(s.as_str()),
+                    Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            q = q.bind(i);
+                        } else if let Some(f) = n.as_f64() {
+                            q = q.bind(f);
+                        }
+                    }
+                    Value::Bool(b) => q = q.bind(b),
+                    Value::Null => q = q.bind(Option::<String>::None),
+                    _ => {
+                        return Err(AppError::BadRequest(
+                            "Unsupported JSON value type for key".to_string()
+                        ))
+                    }
+                }
+            }
+            // inject gtfs_id last
+            q = q.bind(gtfs_id);
+        }
+
+        let results = q.fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("upsert_one_row {}: {}", table, e)))?;
+
+        let ret = if is_array {
+            Value::Array(results)
+        } else {
+            results.into_iter().next().unwrap_or(Value::Null)
+        };
+        Ok(ret)
+    }
+
+    async fn get_service_types_list(&self, gtfs_id: &str) -> AppResult<Vec<ServiceTypeRow>> {
+        sqlx::query_as::<_, ServiceTypeRow>(
+            "SELECT service_type_id, service_type_code, service_type_name
+             FROM public.service_type_internal
+             WHERE deleted = false AND gtfs_id = $1
+             ORDER BY service_type_name",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_service_types_list: {}", e)))
+    }
+
+    async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>> {
+        sqlx::query_as::<_, RouteRow>(
+            "SELECT route_id, route_number, route_direction, start_point_id, end_point_id
+             FROM public.route_internal
+             WHERE deleted = false AND gtfs_id = $1
+             ORDER BY route_number",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_routes_list: {}", e)))
+    }
+
+    async fn get_depot_names_and_ids(&self, gtfs_id: &str) -> AppResult<Vec<DepotRow>> {
+        sqlx::query_as::<_, DepotRow>(
+            "SELECT entity_id, entity_name
+             FROM public.entities_internal
+             WHERE deleted = false AND gtfs_id = $1
+             ORDER BY entity_name",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_depot_names_and_ids: {}", e)))
+    }
+
+    async fn get_schedule_numbers(&self, gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>> {
+        sqlx::query_as::<_, ScheduleNumberRow>(
+            "SELECT schedule_id, schedule_number
+             FROM public.bus_schedule_internal
+             WHERE deleted = false AND gtfs_id = $1
+             ORDER BY schedule_number",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_schedule_numbers: {}", e)))
+    }
+
+    async fn get_schedule_trip_details_by_schedule_number(
+        &self,
+        gtfs_id: &str,
+        schedule_number: &str,
+    ) -> AppResult<Vec<TripDetailRow>> {
+        sqlx::query_as::<_, TripDetailRow>(
+            r#"
+            SELECT
+                d.schedule_trip_detail_id,
+                d.trip_number,
+                d.trip_order,
+                d.trip_type,
+                d.start_time,
+                d.end_time,
+                d.break_time,
+                d.break_type,
+                d.shift_type,
+                d.distance,
+                d.route_id,
+                d.schedule_trip_id,
+                d.is_active_trip,
+                d.entity_name
+            FROM public.bus_schedule_trip_detail_internal d
+            JOIN public.bus_schedule_trip_internal t USING (schedule_trip_id)
+            JOIN public.bus_schedule_internal s USING (schedule_id)
+            WHERE s.schedule_number = $1
+              AND d.deleted = false
+              AND d.gtfs_id = $2
+            ORDER BY d.trip_order
+            "#,
+        )
+        .bind(schedule_number)
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_schedule_trip_details: {}", e)))
+    }
+
+    async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
+        sqlx::query_as::<_, FleetRow>(
+            "SELECT vehicle_id, vehicle_no, fleet_no
+             FROM public.vehicles_internal
+             WHERE deleted = false AND gtfs_id = $1
+             ORDER BY vehicle_no",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_fleets: {}", e)))
+    }
+
+    async fn get_conductor_data(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>> {
+        self.ensure_designation_cache().await?;
+        let designation_id = self.designation_id_for("conductors").await?;
+
+        sqlx::query_as::<_, EmployeeRow>(
+            "SELECT emp_id, first_name, last_name, token_no, mobile_no
+             FROM public.employees_internal
+             WHERE token_no = $1
+               AND designation_id = $2
+               AND deleted = false
+               AND gtfs_id = $3
+             LIMIT 1",
+        )
+        .bind(token)
+        .bind(designation_id)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_conductor_data: {}", e)))
+    }
+
+    async fn get_driver_info(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>> {
+        self.ensure_designation_cache().await?;
+        let designation_id = self.designation_id_for("drivers").await?;
+
+        sqlx::query_as::<_, EmployeeRow>(
+            "SELECT emp_id, first_name, last_name, token_no, mobile_no
+             FROM public.employees_internal
+             WHERE token_no = $1
+               AND designation_id = $2
+               AND deleted = false
+               AND gtfs_id = $3
+             LIMIT 1",
+        )
+        .bind(token)
+        .bind(designation_id)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_driver_info: {}", e)))
+    }
+
+    async fn get_device_ids(&self, gtfs_id: &str) -> AppResult<Vec<String>> {
+        {
+            let cache = self.device_ids_cache.read().await;
+            if let Some((ids, ts)) = cache.etm_ids.get(gtfs_id) {
+                if !Self::cache_expired(*ts, DEVICE_CACHE_SECS) {
+                    info!("device_ids cache HIT");
+                    return Ok(ids.clone());
+                }
+            }
+        }
+
+        info!("device_ids cache MISS");
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT etm_serial_no
+             FROM public.fleet_etm_mapping_internal
+             WHERE deleted = false AND etm_serial_no IS NOT NULL AND gtfs_id = $1
+             ORDER BY etm_serial_no",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_device_ids: {}", e)))?;
+
+        let ids: Vec<String> = rows.into_iter().map(|(s,)| s).collect();
+
+        let mut cache = self.device_ids_cache.write().await;
+        cache.etm_ids.insert(gtfs_id.to_string(), (ids.clone(), SystemTime::now()));
+        Ok(ids)
+    }
+
+    async fn get_tablet_ids(&self, gtfs_id: &str) -> AppResult<Vec<String>> {
+        {
+            let cache = self.tablet_ids_cache.read().await;
+            if let Some((ids, ts)) = cache.tablet_ids.get(gtfs_id) {
+                if !Self::cache_expired(*ts, DEVICE_CACHE_SECS) {
+                    info!("tablet_ids cache HIT");
+                    return Ok(ids.clone());
+                }
+            }
+        }
+
+        info!("tablet_ids cache MISS");
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT obu_id
+             FROM public.fleet_obu_mapping_internal
+             WHERE deleted = false AND obu_id IS NOT NULL AND gtfs_id = $1
+             ORDER BY obu_id",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_tablet_ids: {}", e)))?;
+
+        let ids: Vec<String> = rows.into_iter().map(|(s,)| s).collect();
+
+        let mut cache = self.tablet_ids_cache.write().await;
+        cache.tablet_ids.insert(gtfs_id.to_string(), (ids.clone(), SystemTime::now()));
+        Ok(ids)
+    }
+
+    async fn get_operators(&self, gtfs_id: &str, role: &str) -> AppResult<Vec<EmployeeRow>> {
+        let designation_id = self.designation_id_for(role).await?;
+
+        sqlx::query_as::<_, EmployeeRow>(
+            "SELECT emp_id, first_name, last_name, token_no, mobile_no
+             FROM public.employees_internal
+             WHERE designation_id = $1
+               AND deleted = false
+               AND gtfs_id = $2
+             ORDER BY first_name",
+        )
+        .bind(designation_id)
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_operators: {}", e)))
+    }
+
+    async fn update_waybill_status(&self, gtfs_id: &str, waybill_id: i64, status: &str) -> AppResult<u64> {
+        if !waybill_statuses().contains(&status) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid status '{}'. Valid: {:?}",
+                status,
+                waybill_statuses()
+            )));
+        }
+
+        let result = sqlx::query(
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
+        )
+        .bind(status)
+        .bind(waybill_id)
+        .bind(gtfs_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn update_waybill_fleet_number(&self, gtfs_id: &str, waybill_id: i64, fleet_no: &str) -> AppResult<u64> {
+        let result = sqlx::query(
+            "UPDATE public.waybills_internal SET vehicle_no = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
+        )
+        .bind(fleet_no)
+        .bind(waybill_id)
+        .bind(gtfs_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("update_waybill_fleet_number: {}", e)))?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn update_waybill_tablet_id(&self, gtfs_id: &str, waybill_id: i64, tablet_id: &str) -> AppResult<u64> {
+        let result = sqlx::query(
+            "UPDATE public.waybills_internal SET tablet_id = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
+        )
+        .bind(tablet_id)
+        .bind(waybill_id)
+        .bind(gtfs_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("update_waybill_tablet_id: {}", e)))?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn get_waybills(&self, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<Value>> {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT row_to_json(t) FROM (
+                SELECT * FROM public.waybills_internal
+                WHERE gtfs_id = $1
+                ORDER BY waybill_id DESC
+                LIMIT $2 OFFSET $3
+             ) t",
+        )
+        .bind(gtfs_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_waybills: {}", e)))
+    }
+}
