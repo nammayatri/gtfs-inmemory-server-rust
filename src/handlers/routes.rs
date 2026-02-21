@@ -3,6 +3,9 @@ use actix_web::{
     HttpResponse,
 };
 use serde::Deserialize;
+use serde_json::{json, Value};
+use crate::services::operator::{break_types, day_types, shift_types, trip_types, waybill_statuses, SUPPORTED_OPERATOR_GTFS_IDS};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -71,6 +74,32 @@ pub struct GetAllVehiclesByIdsRequest {
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
         actix_web::web::scope("")
+            .service(
+                web::scope("/internal/operator/{gtfs_id}")
+                    .route("/crud/{table}", web::get().to(get_one_row))
+                    .route("/crud/{table}/all", web::get().to(get_all_rows))
+                    .route("/crud/{table}/delete", web::post().to(delete_one_row))
+                    .route("/crud/{table}/upsert", web::post().to(upsert_one_row))
+                    .route("/service-types", web::get().to(get_service_types))
+                    .route("/routes", web::get().to(get_operator_routes))
+                    .route("/depots", web::get().to(get_depots))
+                    .route("/shift-types", web::get().to(get_shift_types))
+                    .route("/schedule-numbers", web::get().to(get_schedule_numbers))
+                    .route("/day-types", web::get().to(get_day_types))
+                    .route("/trip-types", web::get().to(get_trip_types))
+                    .route("/break-types", web::get().to(get_break_types_handler))
+                    .route("/trip-details", web::get().to(get_trip_details))
+                    .route("/fleets", web::get().to(get_fleets))
+                    .route("/conductors", web::get().to(get_conductor_data))
+                    .route("/drivers", web::get().to(get_driver_info))
+                    .route("/device-ids", web::get().to(get_device_ids))
+                    .route("/tablet-ids", web::get().to(get_tablet_ids))
+                    .route("/operators", web::get().to(get_operators))
+                    .route("/waybill/status", web::post().to(update_waybill_status))
+                    .route("/waybill/fleet", web::post().to(update_waybill_fleet))
+                    .route("/waybill/tablet", web::post().to(update_waybill_tablet))
+                    .route("/waybills", web::get().to(get_waybills))
+            )
             .route(
                 "/bus-route-schedule/{gtfs_id}/{route_id}",
                 actix_web::web::get().to(get_bus_route_schedule),
@@ -1448,6 +1477,382 @@ async fn get_cache_data_by_gtfs_id(
         .await;
 
     Ok(HttpResponse::Ok().json(cached_vehicles))
+}
+
+fn check_gtfs_id(gtfs_id: &str) -> AppResult<()> {
+    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "gtfs_id '{}' is not supported for operator APIs. Supported: {:?}",
+            gtfs_id, SUPPORTED_OPERATOR_GTFS_IDS
+        )))
+    }
+}
+
+#[derive(Deserialize)]
+struct PaginationQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct ScheduleNumberQuery {
+    #[serde(rename = "scheduleNumber")]
+    schedule_number: String,
+}
+
+#[derive(Deserialize)]
+struct RoleQuery {
+    role: String,
+}
+
+// ─── POST body structs ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct UpdateWaybillStatusBody {
+    waybill_id: i64,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateWaybillFleetBody {
+    waybill_id: i64,
+    fleet_no: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateWaybillTabletBody {
+    waybill_id: i64,
+    tablet_id: String,
+}
+
+
+
+async fn get_one_row(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<HashMap<String, String>>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, table) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let result = app_state
+        .operator_service
+        .get_one_row(&table, &gtfs_id, query.into_inner())
+        .await?;
+
+    match result {
+        Some(row) => Ok(HttpResponse::Ok().json(row)),
+        None => Ok(HttpResponse::NotFound().json(json!({"error": "Row not found"}))),
+    }
+}
+
+async fn get_all_rows(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<PaginationQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, table) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let limit = query.limit.unwrap_or(15);
+    let offset = query.offset.unwrap_or(0);
+
+    let rows = app_state
+        .operator_service
+        .get_all_rows(&table, &gtfs_id, limit, offset)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+async fn delete_one_row(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    body: Json<Value>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, table) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows_affected = app_state
+        .operator_service
+        .delete_one_row(&table, &gtfs_id, body.into_inner())
+        .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "Row deleted successfully",
+        "rows_affected": rows_affected
+    })))
+}
+
+async fn upsert_one_row(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    body: Json<Value>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, table) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let result = app_state
+        .operator_service
+        .upsert_one_row(&table, &gtfs_id, body.into_inner())
+        .await?;
+
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ─── §2 — Schedule creation helpers ─────────────────────────────────────────
+
+async fn get_service_types(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let list = app_state.operator_service.get_service_types_list(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(list))
+}
+
+async fn get_operator_routes(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let list = app_state.operator_service.get_routes_list(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(list))
+}
+
+async fn get_depots(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let list = app_state.operator_service.get_depot_names_and_ids(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(list))
+}
+
+async fn get_shift_types(path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    Ok(HttpResponse::Ok().json(shift_types()))
+}
+
+// ─── §3 — Trip creation helpers ──────────────────────────────────────────────
+
+async fn get_schedule_numbers(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let list = app_state.operator_service.get_schedule_numbers(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(list))
+}
+
+async fn get_day_types(path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    Ok(HttpResponse::Ok().json(day_types()))
+}
+
+// ─── §4 — Trip detail creation helpers ───────────────────────────────────────
+
+async fn get_trip_types(path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    Ok(HttpResponse::Ok().json(trip_types()))
+}
+
+async fn get_break_types_handler(path: Path<String>) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    Ok(HttpResponse::Ok().json(break_types()))
+}
+
+// ─── §5 — Waybill creation helpers ───────────────────────────────────────────
+
+async fn get_trip_details(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<ScheduleNumberQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let details = app_state
+        .operator_service
+        .get_schedule_trip_details_by_schedule_number(&gtfs_id, &query.schedule_number)
+        .await?;
+    Ok(HttpResponse::Ok().json(details))
+}
+
+async fn get_fleets(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let list = app_state.operator_service.get_fleets(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(list))
+}
+
+async fn get_conductor_data(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<TokenQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let emp = app_state
+        .operator_service
+        .get_conductor_data(&gtfs_id, &query.token)
+        .await?;
+    match emp {
+        Some(e) => Ok(HttpResponse::Ok().json(e)),
+        None => Ok(HttpResponse::NotFound().json(json!({"error": "Conductor not found"}))),
+    }
+}
+
+async fn get_driver_info(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<TokenQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let emp = app_state
+        .operator_service
+        .get_driver_info(&gtfs_id, &query.token)
+        .await?;
+    match emp {
+        Some(e) => Ok(HttpResponse::Ok().json(e)),
+        None => Ok(HttpResponse::NotFound().json(json!({"error": "Driver not found"}))),
+    }
+}
+
+async fn get_device_ids(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let ids = app_state.operator_service.get_device_ids(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(ids))
+}
+
+async fn get_tablet_ids(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let ids = app_state.operator_service.get_tablet_ids(&gtfs_id).await?;
+    Ok(HttpResponse::Ok().json(ids))
+}
+
+async fn get_operators(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<RoleQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let role = query.role.as_str();
+    if role != "drivers" && role != "conductors" {
+        return Err(AppError::BadRequest(
+            "role must be 'drivers' or 'conductors'".to_string(),
+        ));
+    }
+
+    let list = app_state.operator_service.get_operators(&gtfs_id, role).await?;
+    Ok(HttpResponse::Ok().json(list))
+}
+
+async fn update_waybill_status(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<UpdateWaybillStatusBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows = app_state
+        .operator_service
+        .update_waybill_status(&gtfs_id, body.waybill_id, &body.status)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "waybill status updated",
+        "rows_affected": rows,
+        "valid_statuses": waybill_statuses()
+    })))
+}
+
+async fn update_waybill_fleet(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<UpdateWaybillFleetBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows = app_state
+        .operator_service
+        .update_waybill_fleet_number(&gtfs_id, body.waybill_id, &body.fleet_no)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "waybill fleet number updated",
+        "rows_affected": rows
+    })))
+}
+
+async fn update_waybill_tablet(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<UpdateWaybillTabletBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows = app_state
+        .operator_service
+        .update_waybill_tablet_id(&gtfs_id, body.waybill_id, &body.tablet_id)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "waybill tablet id updated",
+        "rows_affected": rows
+    })))
+}
+
+async fn get_waybills(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<PaginationQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let limit = query.limit.unwrap_or(15);
+    let offset = query.offset.unwrap_or(0);
+
+    if limit < 0 || offset < 0 || limit > 1000 || offset > 1000 {
+        return Ok(HttpResponse::BadRequest().json(json!({
+            "error": "limit and offset must be non-negative and less than 1000"
+        })));
+    }
+
+    let rows = app_state.operator_service.get_waybills(&gtfs_id, limit, offset).await?;
+    Ok(HttpResponse::Ok().json(rows))
 }
 
 async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
