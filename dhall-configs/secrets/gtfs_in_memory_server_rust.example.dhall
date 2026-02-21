@@ -4,5 +4,7 @@
   otp_url = "OTP_URL",
   bhubaneswar_external_auth = Some "TEXT",
   phone_number_hash_key = Some "TEXT",
-  enable_schedule_reconciliation = False
+  enable_schedule_reconciliation = False,
+  webhook_secret = Some "TEXT",
+  conductor_sheet_url = Some "TEXT"
 }

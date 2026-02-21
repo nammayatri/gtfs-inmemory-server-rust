@@ -72,6 +72,8 @@ pub struct AppConfig {
     pub phone_number_hash_key: String,
     /// Enable schedule-based active trip reconciliation (default: false)
     pub enable_schedule_reconciliation: bool,
+    pub webhook_secret: Option<String>,
+    pub conductor_sheet_url: Option<String>,
 }
 
 impl OtpConfig {
@@ -141,7 +143,7 @@ pub struct AppState {
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
-    pub conductor_details: Arc<HashMap<String, crate::models::MinimalEmployee>>,
+    pub conductor_details: Arc<RwLock<HashMap<String, crate::models::MinimalEmployee>>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
@@ -303,7 +305,7 @@ impl AppState {
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
 
         // Load conductor details from CSV
-        let conductor_details = Arc::new(Self::load_conductor_details().await?);
+        let conductor_details = Arc::new(RwLock::new(Self::load_conductor_details().await?));
 
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
@@ -532,6 +534,10 @@ impl AppState {
                                 "Error parsing service_sub_types JSON for vehicle {}: {}",
                                 vehicle_no, e
                             );
+                            error!(
+                                "Error parsing service_sub_types JSON for vehicle {}: {}",
+                                vehicle_no, e
+                            );
                             continue;
                         }
                     };
@@ -555,7 +561,6 @@ impl AppState {
     }
 
     async fn load_conductor_details() -> Result<HashMap<String, crate::models::MinimalEmployee>> {
-        use crate::models::MinimalEmployee;
         let file_path = "./assets/conductor_details.csv";
 
         let mut file = match File::open(file_path).await {
@@ -571,31 +576,88 @@ impl AppState {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read conductor_details.csv: {}", e))?;
 
-        let mut reader = ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(contents.as_bytes());
+        parse_conductor_csv(&contents)
+    }
+}
 
-        let mut phone_to_employee: HashMap<String, MinimalEmployee> = HashMap::new();
+/// Parse conductor CSV text into a phone→employee map.
+pub fn parse_conductor_csv(
+    csv_text: &str,
+) -> Result<HashMap<String, crate::models::MinimalEmployee>> {
+    use crate::models::MinimalEmployee;
 
-        for result in reader.records() {
-            match result {
-                Ok(record) => {
-                    // CSV columns: Token No(0), Phone Number(1), UPI ID(2), Depot Name(3), Name(4)
-                    let (Some(token_no), Some(phone_number), Some(depot_name), Some(name)) =
-                        (record.get(0), record.get(1), record.get(3), record.get(4))
-                    else {
-                        continue;
-                    };
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(csv_text.as_bytes());
+
+    let mut phone_to_employee: HashMap<String, MinimalEmployee> = HashMap::new();
+    let mut skipped_truncated = 0u32;
+    let mut skipped_bad_phone = 0u32;
+    let mut skipped_empty_fields = 0u32;
+
+    // Resolve column indices by header name so column order doesn't matter.
+    let headers = match reader.headers() {
+        Ok(h) => h,
+        Err(e) => return Err(anyhow::anyhow!("Failed to read CSV headers: {}", e)),
+    };
+
+    let mut token_idx = None;
+    let mut name_idx = None;
+    let mut depot_idx = None;
+    let mut phone_idx = None;
+
+    for (i, raw_header) in headers.iter().enumerate() {
+        let h = raw_header.trim().to_lowercase();
+        if h == "token no" {
+            token_idx = Some(i);
+        } else if h == "name" {
+            name_idx = Some(i);
+        } else if h == "depot name" {
+            depot_idx = Some(i);
+        } else if h == "phone number" {
+            phone_idx = Some(i);
+        }
+    }
+
+    let (Some(t_idx), Some(n_idx), Some(d_idx), Some(p_idx)) =
+        (token_idx, name_idx, depot_idx, phone_idx)
+    else {
+        return Err(anyhow::anyhow!(
+            "Missing required CSV headers (Token No, Name, Depot Name, Phone Number). Found: {:?}",
+            headers
+        ));
+    };
+
+    for result in reader.records() {
+        match result {
+            Ok(record) => {
+                let (Some(token_str), Some(name_str), Some(depot_str), Some(phone_str)) = (
+                    record.get(t_idx),
+                    record.get(n_idx),
+                    record.get(d_idx),
+                    record.get(p_idx),
+                ) else {
+                    skipped_truncated += 1;
+                    continue;
+                };
 
                     // CSV stores pre-computed HMAC-SHA256 hash of the phone number
-                    let phone_hash = phone_number.trim().to_string();
-                    let token = token_no.trim().to_string();
-                    let full_name = name.trim();
-                    let depot = depot_name.trim().to_string();
+                let phone_hash = phone_str.trim().to_string();
+                let token = token_str.trim().to_string();
+                let full_name = name_str.trim();
+                let depot = depot_str.trim().to_string();
 
-                    if phone_hash.is_empty() || token.is_empty() {
-                        continue;
-                    }
+                if phone_hash.is_empty() || token.is_empty() {
+                    skipped_empty_fields += 1;
+                    continue;
+                }
+
+                if !is_valid_phone_number(&phone) {
+                    error!("Invalid phone '{}' for token '{}' — skipping", phone, token);
+                    skipped_bad_phone += 1;
+                    continue;
+                }
 
                     let depot_opt = if depot.is_empty() || depot == "nan" {
                         None
@@ -603,35 +665,44 @@ impl AppState {
                         Some(depot)
                     };
 
-                    // Split name into first and last
-                    let (first_name, last_name) = match full_name.split_once(' ') {
-                        Some((first, last)) => (first.to_string(), Some(last.to_string())),
-                        None => (full_name.to_string(), None),
-                    };
+                let (first_name, last_name) = match full_name.split_once(' ') {
+                    Some((first, last)) => (first.to_string(), Some(last.to_string())),
+                    None => (full_name.to_string(), None),
+                };
 
-                    let employee = MinimalEmployee {
-                        token_no: Some(token),
-                        first_name,
-                        last_name,
-                        mobile_no: None,
-                        depot_name: depot_opt,
-                    };
+                let employee = MinimalEmployee {
+                    token_no: Some(token),
+                    first_name,
+                    last_name,
+                    mobile_no: None,
+                    depot_name: depot_opt,
+                };
 
-                    phone_to_employee.insert(phone_hash, employee);
-                }
-                Err(e) => {
-                    error!("Error parsing conductor_details CSV row: {}", e);
-                }
+                phone_to_employee.insert(phone_hash, employee);
+            }
+            Err(e) => {
+                error!("Skipping malformed CSV row: {}", e);
             }
         }
-
-        info!(
-            "Loaded conductor details for {} conductors",
-            phone_to_employee.len()
-        );
-
-        Ok(phone_to_employee)
     }
+
+    if skipped_truncated > 0 || skipped_bad_phone > 0 || skipped_empty_fields > 0 {
+        tracing::warn!(
+            "CSV parse summary: loaded={}, skipped_truncated={}, skipped_bad_phone={}, skipped_empty_fields={}",
+            phone_to_employee.len(),
+            skipped_truncated,
+            skipped_bad_phone,
+            skipped_empty_fields
+        );
+    }
+
+    info!(
+        "Loaded conductor details for {} conductors",
+        phone_to_employee.len()
+    );
+
+    Ok(phone_to_employee)
+}
 
     async fn load_depot_manager_details(
     ) -> Result<HashMap<String, crate::models::DepotManagerDetails>> {
@@ -698,4 +769,89 @@ impl AppState {
 
         Ok(phone_to_manager)
     }
+
+fn is_valid_phone_number(s: &str) -> bool {
+    s.chars().filter(|c| c.is_ascii_digit()).count() == 10
+}
+
+const MAX_SHEET_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Fetch conductor details from a Google Sheets CSV export URL.
+/// Returns Err (leaving in-memory state untouched) on network errors, non-2xx status,
+/// oversized responses, or invalid UTF-8. Bad rows are skipped and logged.
+pub async fn fetch_conductor_details_from_sheets(
+    client: &reqwest::Client,
+    sheet_url: &str,
+) -> Result<HashMap<String, crate::models::MinimalEmployee>> {
+    let response =
+        client.get(sheet_url).send().await.map_err(|e| {
+            anyhow::anyhow!("Failed to reach conductor sheet (network error): {}", e)
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "Conductor sheet returned non-2xx status: {} — treating as unreachable",
+            status
+        ));
+    }
+
+    // Early bail if Content-Length already tells us the body is too large.
+    if let Some(len) = response.content_length() {
+        if len as usize > MAX_SHEET_BYTES {
+            return Err(anyhow::anyhow!(
+                "Conductor sheet too large ({} bytes, limit {})",
+                len,
+                MAX_SHEET_BYTES
+            ));
+        }
+    }
+
+    let body_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read conductor sheet response body: {}", e))?;
+
+    if body_bytes.len() > MAX_SHEET_BYTES {
+        return Err(anyhow::anyhow!(
+            "Conductor sheet body too large ({} bytes, limit {})",
+            body_bytes.len(),
+            MAX_SHEET_BYTES
+        ));
+    }
+
+    let csv_text = String::from_utf8(body_bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("Conductor sheet response is not valid UTF-8: {}", e))?;
+
+    parse_conductor_csv(&csv_text)
+}
+
+/// Hot-reload conductor data from Sheets, atomically swapping the in-memory map.
+/// On any error the existing map is left unchanged.
+pub async fn reload_conductor_data(
+    conductor_map: &Arc<RwLock<HashMap<String, crate::models::MinimalEmployee>>>,
+    client: &reqwest::Client,
+    sheet_url: &str,
+) -> Result<()> {
+    let new_data = fetch_conductor_details_from_sheets(client, sheet_url).await?;
+    let new_count = new_data.len();
+
+    if new_count == 0 {
+        return Err(anyhow::anyhow!(
+            "Conductor sheet returned 0 entries — reload rejected (were all rows deleted?)"
+        ));
+    }
+
+    let prev_count = {
+        let mut write_guard = conductor_map.write().await;
+        let prev = write_guard.len();
+        *write_guard = new_data;
+        prev
+    };
+
+    info!(
+        "Conductor data reloaded from Sheets: {} entries (previously {})",
+        new_count, prev_count
+    );
+    Ok(())
 }

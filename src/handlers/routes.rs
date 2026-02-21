@@ -295,6 +295,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/routes-served-today",
                 actix_web::web::get().to(get_routes_served_today),
+            )
+            .route(
+                "/webhook/conductor-reload",
+                actix_web::web::post().to(crate::handlers::webhook::conductor_reload_webhook),
             ),
     );
 }
@@ -418,9 +422,13 @@ pub async fn get_conductor_by_phone_number(
     let hash_key = &app_state.config.phone_number_hash_key;
     let phone_hash = crate::tools::hash::hash_phone_number(&phone_number, hash_key);
 
-    if let Some(emp) = app_state.conductor_details.get(&phone_hash) {
+    // First check static CSV data (faster O(1) lookup) — acquire read lock
+    let conductor_data = app_state.conductor_details.read().await;
+    if let Some(emp) = conductor_data.get(&phone_hash) {
         return Ok(HttpResponse::Ok().json(emp));
     }
+    // Drop the read lock before the DB call
+    drop(conductor_data);
 
     // Fallback to DB lookup (plain number for DB query)
     let employee_data = app_state

@@ -55,5 +55,9 @@ in {
 
   -- Bhubaneswar vehicle cache configuration
   bhubaneswar_cache_update_interval = 10,
-  phone_number_hash_key = "HASH_KEY"
+  phone_number_hash_key = "HASH_KEY",
+
+  -- Webhook configuration
+  webhook_secret = Some "SECRET_KEY",
+  conductor_sheet_url = Some "URL_HERE"
 }
