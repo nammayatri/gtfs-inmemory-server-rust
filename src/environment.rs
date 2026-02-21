@@ -315,7 +315,8 @@ impl AppState {
         Ok(mapping)
     }
 
-    async fn load_vehicle_service_sub_types() -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+    async fn load_vehicle_service_sub_types(
+    ) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
         let file_path = "./assets/vehicle_service_sub_types.csv";
 
         let mut file = match File::open(file_path).await {
@@ -351,7 +352,10 @@ impl AppState {
                     let sub_types: Vec<String> = match serde_json::from_str(sub_types_str) {
                         Ok(vec) => vec,
                         Err(e) => {
-                            error!("Error parsing service_sub_types JSON for vehicle {}: {}", vehicle_no, e);
+                            error!(
+                                "Error parsing service_sub_types JSON for vehicle {}: {}",
+                                vehicle_no, e
+                            );
                             continue;
                         }
                     };
@@ -403,12 +407,9 @@ impl AppState {
             match result {
                 Ok(record) => {
                     // CSV columns: S. No.(0), Token No(1), Name(2), Depot Name(3), Phone Number(4), UPI ID(5), VPA(6)
-                    let (Some(token_no), Some(name), Some(depot_name), Some(phone_number)) = (
-                        record.get(1),
-                        record.get(2),
-                        record.get(3),
-                        record.get(4),
-                    ) else {
+                    let (Some(token_no), Some(name), Some(depot_name), Some(phone_number)) =
+                        (record.get(1), record.get(2), record.get(3), record.get(4))
+                    else {
                         continue;
                     };
 

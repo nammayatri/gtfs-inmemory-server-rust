@@ -2,8 +2,9 @@ use crate::environment::AppConfig;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteStopMapping, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
-    StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
+    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, ServiceTierType,
+    StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
+    SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails};
 use crate::tools::error::{AppError, AppResult};
@@ -157,6 +158,12 @@ impl GTFSService {
             info!("No static fleet info loaded from CSV");
         }
 
+        let route_service_tiers_by_gtfs = self.read_route_service_tiers_csv().await?;
+        info!(
+            "Loaded route service tiers for {} GTFS IDs from CSV",
+            route_service_tiers_by_gtfs.len()
+        );
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -164,8 +171,12 @@ impl GTFSService {
         let route_stop_counts = self.calculate_stop_counts(&all_pattern_details);
 
         // Fetch routes
-        let mut routes_by_gtfs =
-            self.build_routes_by_gtfs(all_routes, &route_trip_counts, &route_stop_counts);
+        let mut routes_by_gtfs = self.build_routes_by_gtfs(
+            all_routes,
+            &route_trip_counts,
+            &route_stop_counts,
+            &route_service_tiers_by_gtfs,
+        );
 
         // Build stops data first (needed by route data for parent_stop_code lookup)
         let stops_by_gtfs =
@@ -208,6 +219,7 @@ impl GTFSService {
         temp_data.static_fleet_info_by_gtfs = static_fleet_info_by_gtfs;
         temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
         temp_data.alternate_stop_by_gtfs = alternate_stops_by_gtfs;
+        temp_data.route_service_tiers_by_gtfs = route_service_tiers_by_gtfs;
 
         Ok(temp_data)
     }
@@ -453,11 +465,52 @@ impl GTFSService {
                     inner.insert(fleet_info.fleet_id.clone(), fleet_info);
                 }
                 Err(e) => {
-                    error!("Error parsing CSV row: {}", e);
+                    error!("Error parsing static fleet info CSV row: {}", e);
                 }
             }
         }
         Ok(static_fleet_info_by_gtfs)
+    }
+
+    async fn read_route_service_tiers_csv(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, ServiceTierType>>> {
+        let file_path = "./assets/route_service_tiers.csv";
+
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("route_service_tiers.csv file not found, proceeding without route service tiers");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut route_service_tiers_by_gtfs = HashMap::new();
+
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let csv_record: RouteServiceTierRecord = record;
+                    let inner = route_service_tiers_by_gtfs
+                        .entry(csv_record.gtfs_id)
+                        .or_insert_with(HashMap::new);
+                    inner.insert(csv_record.route_id, csv_record.servicetier);
+                }
+                Err(e) => {
+                    error!("Error parsing route service tiers CSV row: {}", e);
+                }
+            }
+        }
+        Ok(route_service_tiers_by_gtfs)
     }
 
     async fn fetch_pattern_details_batch(
@@ -536,6 +589,7 @@ impl GTFSService {
         routes: Vec<NandiRoutesRes>,
         trip_counts: &HashMap<String, i32>,
         stop_counts: &HashMap<String, HashMap<String, usize>>,
+        route_service_tiers: &HashMap<String, HashMap<String, ServiceTierType>>,
     ) -> HashMap<String, HashMap<String, NandiRoutesRes>> {
         let mut routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>> = HashMap::new();
         for route in routes {
@@ -545,6 +599,11 @@ impl GTFSService {
             }
             let gtfs_id = parts[0];
             let route_code = parts[1];
+
+            let service_tier = route_service_tiers
+                .get(gtfs_id)
+                .and_then(|m| m.get(route_code))
+                .cloned();
 
             let route_res = NandiRoutesRes {
                 id: route_code.to_string(),
@@ -560,6 +619,7 @@ impl GTFSService {
                     .map(|c| c as i32),
                 start_point: None,
                 end_point: None,
+                service_tier,
             };
             routes_by_gtfs
                 .entry(gtfs_id.to_string())
