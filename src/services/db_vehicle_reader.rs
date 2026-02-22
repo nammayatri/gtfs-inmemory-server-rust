@@ -689,6 +689,7 @@ impl DBVehicleReader {
                     schedule_details: None,
                     db_start_time: None,
                     db_end_time: None,
+                    seat_layout_id: None,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -749,6 +750,7 @@ impl DBVehicleReader {
                             schedule_details: None,
                             db_start_time: None,
                             db_end_time: None,
+                            seat_layout_id: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -773,6 +775,7 @@ impl DBVehicleReader {
                             schedule_details: None,
                             db_start_time: None,
                             db_end_time: None,
+                            seat_layout_id: None,
                         }
                     };
 
@@ -1479,6 +1482,7 @@ impl VehicleDataReader for DBVehicleReader {
                     schedule_details: Some(schedule_map),
                     db_start_time: None,
                     db_end_time: None,
+                    seat_layout_id: None,
                 };
 
                 // Set route and trip details from active schedule
@@ -1544,6 +1548,7 @@ impl VehicleDataReader for DBVehicleReader {
                             schedule_details: None,
                             db_start_time: None,
                             db_end_time: None,
+                            seat_layout_id: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -1568,6 +1573,7 @@ impl VehicleDataReader for DBVehicleReader {
                             status: None,
                             db_start_time: None,
                             db_end_time: None,
+                            seat_layout_id: None,
                         }
                     };
 
@@ -1809,6 +1815,7 @@ impl VehicleDataReader for DBVehicleReader {
                 schedule_details: None,
                 db_start_time: None,
                 db_end_time: None,
+                seat_layout_id: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {

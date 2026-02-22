@@ -2,9 +2,9 @@ use crate::environment::AppConfig;
 use crate::models::{
     cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
     GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, ServiceTierType,
-    StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
-    SuburbanStopInfo, SuburbanStopInfoRecord,
+    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, SeatLayoutMappingRecord,
+    ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord,
+    StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails};
 use crate::tools::error::{AppError, AppResult};
@@ -164,6 +164,12 @@ impl GTFSService {
             route_service_tiers_by_gtfs.len()
         );
 
+        let seat_layout_mapping_by_gtfs = self.read_seat_layout_mapping_csv().await?;
+        info!(
+            "Loaded seat layout mappings for {} GTFS IDs from CSV",
+            seat_layout_mapping_by_gtfs.len()
+        );
+
         // Calculate trip counts
         let route_trip_counts = self.calculate_trip_counts(&all_pattern_details);
 
@@ -220,6 +226,7 @@ impl GTFSService {
         temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
         temp_data.alternate_stop_by_gtfs = alternate_stops_by_gtfs;
         temp_data.route_service_tiers_by_gtfs = route_service_tiers_by_gtfs;
+        temp_data.seat_layout_mapping_by_gtfs = seat_layout_mapping_by_gtfs;
 
         Ok(temp_data)
     }
@@ -511,6 +518,47 @@ impl GTFSService {
             }
         }
         Ok(route_service_tiers_by_gtfs)
+    }
+
+    async fn read_seat_layout_mapping_csv(
+        &self,
+    ) -> AppResult<HashMap<String, HashMap<String, String>>> {
+        let file_path = "./assets/seat_layout_mapping.csv";
+
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                warn!("seat_layout_mapping.csv file not found, proceeding without seat layout mapping data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        let mut seat_layout_mapping_by_gtfs = HashMap::new();
+
+        for result in reader.deserialize() {
+            match result {
+                Ok(record) => {
+                    let csv_record: SeatLayoutMappingRecord = record;
+                    let inner = seat_layout_mapping_by_gtfs
+                        .entry(csv_record.gtfs_id)
+                        .or_insert_with(HashMap::new);
+                    inner.insert(csv_record.fleet_id, csv_record.seat_layout_id);
+                }
+                Err(e) => {
+                    error!("Error parsing seat layout mapping CSV row: {}", e);
+                }
+            }
+        }
+        Ok(seat_layout_mapping_by_gtfs)
     }
 
     async fn fetch_pattern_details_batch(
@@ -1890,5 +1938,23 @@ impl GTFSService {
             "Finished building example trip map"
         );
         Ok(mapping)
+    }
+
+    pub async fn get_seat_layout_id(&self, gtfs_id: &str, fleet_id: &str) -> Option<String> {
+        let data = self.data.read().await;
+        data.seat_layout_mapping_by_gtfs
+            .get(gtfs_id)
+            .and_then(|m| m.get(fleet_id))
+            .cloned()
+    }
+
+    pub async fn get_seat_layout_id_by_fleet_id(&self, fleet_id: &str) -> Option<String> {
+        let data = self.data.read().await;
+        for (_, mapping) in &data.seat_layout_mapping_by_gtfs {
+            if let Some(seat_layout_id) = mapping.get(fleet_id) {
+                return Some(seat_layout_id.clone());
+            }
+        }
+        None
     }
 }
