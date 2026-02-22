@@ -152,6 +152,9 @@ pub struct VehicleDataWithRouteId {
     pub schedule_details: Option<HashMap<i64, Vec<BusSchedule>>>,
     pub db_start_time: Option<String>,
     pub db_end_time: Option<String>,
+    #[sqlx(default)]
+    #[serde(rename = "seatLayoutId")]
+    pub seat_layout_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -220,6 +223,8 @@ pub struct VehicleServiceTypeResponse {
     pub conductor_id: Option<String>,
     pub eligible_pass_ids: Option<Vec<String>>,
     pub service_sub_types: Option<Vec<String>>,
+    #[serde(rename = "seatLayoutId")]
+    pub seat_layout_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -417,6 +422,7 @@ pub struct GTFSData {
     pub route_example_trip_details_by_gtfs: HashMap<String, HashMap<String, TripDetails>>,
     pub alternate_stop_by_gtfs: HashMap<String, GTFSAlternateStopData>,
     pub route_service_tiers_by_gtfs: HashMap<String, HashMap<String, ServiceTierType>>,
+    pub seat_layout_mapping_by_gtfs: HashMap<String, HashMap<String, String>>,
 }
 
 impl GTFSData {
@@ -581,4 +587,11 @@ where
             .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeatLayoutMappingRecord {
+    pub fleet_id: String,
+    pub gtfs_id: String,
+    pub seat_layout_id: String,
 }

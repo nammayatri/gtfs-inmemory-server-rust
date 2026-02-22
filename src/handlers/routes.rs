@@ -269,10 +269,16 @@ async fn get_vehicle_data_eta(
 ) -> AppResult<HttpResponse> {
     let vehicle_no = path.into_inner();
 
-    let vehicle_data = app_state
+    let mut vehicle_data = app_state
         .db_vehicle_reader
         .get_vehicle_data(&vehicle_no, None)
         .await?;
+
+    let seat_layout_id = app_state
+        .gtfs_service
+        .get_seat_layout_id_by_fleet_id(&vehicle_no)
+        .await;
+    vehicle_data.seat_layout_id = seat_layout_id;
 
     Ok(HttpResponse::Ok().json(vehicle_data))
 }
@@ -736,6 +742,11 @@ async fn get_service_type_by_vehicle_impl(
                 .and_then(|by_vehicle| by_vehicle.get(&cached_data.vehicle_no))
                 .cloned();
 
+            let seat_layout_id = app_state
+                .gtfs_service
+                .get_seat_layout_id(gtfs_id, &cached_data.vehicle_no)
+                .await;
+
             return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
                 vehicle_no: cached_data.vehicle_no,
                 service_type: cached_data.service_type,
@@ -753,6 +764,7 @@ async fn get_service_type_by_vehicle_impl(
                 conductor_id: cached_data.conductor_id,
                 eligible_pass_ids,
                 service_sub_types,
+                seat_layout_id,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -767,6 +779,11 @@ async fn get_service_type_by_vehicle_impl(
                     .get(gtfs_id)
                     .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
                     .cloned();
+
+                let seat_layout_id = app_state
+                    .gtfs_service
+                    .get_seat_layout_id(gtfs_id, vehicle_no)
+                    .await;
 
                 return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
                     vehicle_no: vehicle_no.to_string(),
@@ -789,6 +806,7 @@ async fn get_service_type_by_vehicle_impl(
                         .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
                         .cloned(),
                     service_sub_types,
+                    seat_layout_id,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -870,6 +888,11 @@ async fn get_service_type_by_vehicle_impl(
         .and_then(|by_vehicle| by_vehicle.get(&vehicle_data.vehicle_no))
         .cloned();
 
+    let seat_layout_id = app_state
+        .gtfs_service
+        .get_seat_layout_id(gtfs_id, &vehicle_data.vehicle_no)
+        .await;
+
     Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
@@ -887,6 +910,7 @@ async fn get_service_type_by_vehicle_impl(
         conductor_id: vehicle_data.conductor_code,
         eligible_pass_ids,
         service_sub_types,
+        seat_layout_id,
     }))
 }
 
@@ -902,6 +926,8 @@ struct VehicleInfoResponse {
     depot_name: Option<String>,
     #[serde(rename = "scheduleNo")]
     schedule_no: Option<String>,
+    #[serde(rename = "seatLayoutId")]
+    seat_layout_id: Option<String>,
 }
 
 async fn get_vehicle_info(
@@ -918,12 +944,18 @@ async fn get_vehicle_info(
 
     let depot_name = vehicle_data.entity_remark.or(vehicle_data.depot);
 
+    let seat_layout_id = app_state
+        .gtfs_service
+        .get_seat_layout_id_by_fleet_id(&vehicle_no)
+        .await;
+
     let resp = VehicleInfoResponse {
         driver_code: vehicle_data.driver_code,
         conductor_code: vehicle_data.conductor_code,
         waybill_no: vehicle_data.waybill_no,
         depot_name,
         schedule_no: vehicle_data.schedule_no,
+        seat_layout_id,
     };
 
     Ok(HttpResponse::Ok().json(resp))
