@@ -648,7 +648,7 @@ impl GTFSService {
             let gtfs_id = parts[0];
             let route_code = parts[1];
 
-            let service_tier = route_service_tiers
+            let service_tier_type = route_service_tiers
                 .get(gtfs_id)
                 .and_then(|m| m.get(route_code))
                 .cloned();
@@ -667,7 +667,7 @@ impl GTFSService {
                     .map(|c| c as i32),
                 start_point: None,
                 end_point: None,
-                service_tier,
+                service_tier_type,
             };
             routes_by_gtfs
                 .entry(gtfs_id.to_string())
