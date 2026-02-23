@@ -31,7 +31,7 @@ pub enum ServiceTierType {
     ElectricV,
     ElectricVPmi,
     AcEmuFirstClass,
-    Premium,
+    PREMIUM,
 }
 
 impl Serialize for ServiceTierType {
@@ -55,7 +55,7 @@ impl Serialize for ServiceTierType {
             ServiceTierType::ElectricV => "ELECTRIC_V",
             ServiceTierType::ElectricVPmi => "ELECTRIC_V_PMI",
             ServiceTierType::AcEmuFirstClass => "AC_EMU_FIRST_CLASS",
-            ServiceTierType::Premium => "PREMIUM",
+            ServiceTierType::PREMIUM => "PREMIUM",
         };
         serializer.serialize_str(s)
     }
@@ -86,7 +86,7 @@ impl<'de> Deserialize<'de> for ServiceTierType {
             "ELECTRIC_V" => Ok(ServiceTierType::ElectricV),
             "ELECTRIC_V_PMI" => Ok(ServiceTierType::ElectricVPmi),
             "AC_EMU_FIRST_CLASS" => Ok(ServiceTierType::AcEmuFirstClass),
-            "PREMIUM" | "Premium" => Ok(ServiceTierType::Premium),
+            "PREMIUM" | "Premium" => Ok(ServiceTierType::PREMIUM),
             _ => {
                 // Return Ordinary as default if parsing fails like some lenient setups or log warning? Let's just fail
                 Err(serde::de::Error::custom(format!(
@@ -291,8 +291,8 @@ pub struct NandiRoutesRes {
     pub start_point: Option<LatLong>,
     #[serde(rename = "endPoint")]
     pub end_point: Option<LatLong>,
-    #[serde(rename = "serviceTier")]
-    pub service_tier: Option<ServiceTierType>,
+    #[serde(rename = "serviceTierType")]
+    pub service_tier_type: Option<ServiceTierType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
