@@ -75,6 +75,10 @@ pub trait VehicleDataReader: Send + Sync {
         gtfs_id: &str,
         route_id: &str,
     ) -> AppResult<Vec<VehicleData>>;
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        route_id: &str,
+    ) -> AppResult<Vec<VehicleData>>;
     async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>>;
 }
 
@@ -195,6 +199,14 @@ impl VehicleDataReader for MockDBVehicleReader {
     async fn get_waybills_by_route_id(
         &self,
         _gtfs_id: &str,
+        _route_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+    async fn get_chennai_waybills_by_route_id(
+        &self,
         _route_id: &str,
     ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
@@ -2243,6 +2255,76 @@ impl VehicleDataReader for DBVehicleReader {
         }
 
         Ok(waybills)
+    }
+
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        route_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        let query = r#"
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                e.entity_remark::text AS entity_remark,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted,
+                w.status,
+                w.is_flexi,
+                COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
+                COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
+                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
+            FROM waybills w
+            LEFT JOIN entities e
+                ON e.entity_id = w.entity_id
+            LEFT JOIN bus_schedule_trip_detail bstd
+                ON  w.is_flexi = false
+                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                AND bstd.route_number_id::text = $1
+                AND bstd.trip_type <> 'dead-trip'
+            LEFT JOIN bus_schedule_trip_flexi bstf
+                ON  w.is_flexi = true
+                AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
+                AND bstf.route_number_id::text = $1
+                AND bstf.trip_type <> 'dead-trip'
+            WHERE
+                w.status = 'Online'
+                AND w.deleted = false
+                AND (
+                    (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                    OR
+                    (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                )
+            ORDER BY w.updated_at DESC
+        "#;
+
+        match sqlx::query_as::<_, VehicleData>(query)
+            .bind(route_id)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => {
+                info!(
+                    "Chennai direct query: found {} waybills for route_id={}",
+                    rows.len(),
+                    route_id
+                );
+                Ok(rows)
+            }
+            Err(e) => {
+                error!(
+                    "Chennai get_waybills_by_route_id failed for route_id={}: {}",
+                    route_id, e
+                );
+                Err(AppError::Internal(format!("Database query failed: {}", e)))
+            }
+        }
     }
 
     async fn get_vehicles_by_service_tier(
