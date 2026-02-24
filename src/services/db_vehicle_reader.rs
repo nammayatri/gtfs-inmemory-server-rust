@@ -33,7 +33,7 @@ struct WaybillsByRouteCache {
     waybills_by_route: HashMap<String, (Vec<VehicleData>, SystemTime)>,
 }
 
-const DB_ACTIVE_TRIP_STALE_HOURS: i64 = 36; // If active trip started more than 36 hours ago, consider it stale
+const DB_ACTIVE_TRIP_STALE_HOURS: i64 = 2; // If active trip started more than 36 hours ago, consider it stale
 
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
@@ -1417,23 +1417,39 @@ fn apply_ist_active_trip_hack(vehicle_data: &mut VehicleDataWithRouteId) {
         trips.sort_by_key(|t| t.trip_number.unwrap_or(i32::MAX));
         trips
     };
+    let max_start_ms = all_trips
+        .iter()
+        .filter_map(|t| t.start_time.as_deref())
+        .filter(|s| !s.is_empty() && *s != "0")
+        .filter_map(|s| s.parse::<i64>().ok())
+        .filter(|&ms| ms > 0)
+        .max();
 
-    // Check staleness: only apply the hack if the first trip's start_time is old.
-    // start_time is trip_start_time from the DB, which is always epoch milliseconds or NULL.
-    let start_time_utc = match &all_trips[0].start_time {
-        Some(s) if !s.is_empty() => match s.parse::<i64>() {
-            Ok(epoch_ms) => Utc.timestamp_millis_opt(epoch_ms).single(),
-            Err(_) => None,
-        },
-        _ => None,
-    };
-    let Some(start_time_utc) = start_time_utc else {
-        return; // no valid timestamp – bail out
-    };
+    let max_start_time_utc =
+        max_start_ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+
     let now_utc = Utc::now();
-    if now_utc.signed_duration_since(start_time_utc).num_hours() < DB_ACTIVE_TRIP_STALE_HOURS {
-        return; // Data is fresh; no hack needed
+    let should_trigger_hack = match max_start_time_utc {
+        None => true, // all were NULL / "" / 0 / junk → subscriber probably stale
+        Some(max_ts) => {
+            now_utc
+                .signed_duration_since(max_ts)
+                .num_hours() >= DB_ACTIVE_TRIP_STALE_HOURS
+        }
+    };
+
+    if !should_trigger_hack {
+        info!(
+            "No IST hack needed for vehicle {}: max db_start_time is {:?} UTC, now is {:?} UTC",
+            vehicle_data.vehicle_no, max_start_time_utc, now_utc
+        );
+        return; // data fresh enough
     }
+    info!(
+        "Applying IST active trip hack for vehicle {}: max db_start_time is {:?} UTC, now is {:?} UTC",
+        vehicle_data.vehicle_no, max_start_time_utc, now_utc
+    );
+
     let ist_offset = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
     let now_ist = now_utc.with_timezone(&ist_offset);
 
