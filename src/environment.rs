@@ -13,6 +13,7 @@ use crate::services::{
     chalo_vehicle_cache::ChaloVehicleCache,
     db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
+    db_vehicle_reader_internal::DBVehicleReaderInternal,
     gtfs_service::GTFSService,
     trip_service::TripService,
 };
@@ -118,6 +119,7 @@ async fn create_database_pool(config: &AppConfig) -> Result<PgPool, AppError> {
 pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
+    pub db_vehicle_reader_internal: Arc<DBVehicleReaderInternal>,
     pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub trip_service: Arc<TripService>,
     pub chalo_vehicle_cache: Arc<ChaloVehicleCache>,
@@ -134,9 +136,10 @@ impl AppState {
         let gtfs_service = Arc::new(GTFSService::new(app_config.clone()).await?);
 
         // Create shared database pool or use mock readers
-        let (db_vehicle_reader, db_employee_reader): (
+        let (db_vehicle_reader, db_employee_reader, db_vehicle_reader_internal): (
             Arc<dyn VehicleDataReader>,
             Arc<dyn EmployeeReader>,
+            Arc<DBVehicleReaderInternal>,
         ) = if let Some(db_url) = &app_config.database_url {
             if db_url.contains("localhost") {
                 // For local development, fall back to mock readers on connection failure
@@ -145,14 +148,18 @@ impl AppState {
                         info!("Successfully connected to the local database.");
                         let vehicle_reader =
                             Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                        let employee_reader = Arc::new(DBEmployeeReader::new(pool, &app_config));
-                        (vehicle_reader, employee_reader)
+                        let employee_reader =
+                            Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
+                        let internal_reader =
+                            Arc::new(DBVehicleReaderInternal::new(pool));
+                        (vehicle_reader, employee_reader, internal_reader)
                     }
                     Err(e) => {
                         error!("Failed to connect to the local database: {}. Falling back to mock DB readers.", e);
                         (
                             Arc::new(MockDBVehicleReader::new()),
                             Arc::new(MockEmployeeReader::new()),
+                            Arc::new(DBVehicleReaderInternal::new_disconnected()),
                         )
                     }
                 }
@@ -163,8 +170,9 @@ impl AppState {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
                 let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                let employee_reader = Arc::new(DBEmployeeReader::new(pool, &app_config));
-                (vehicle_reader, employee_reader)
+                let employee_reader = Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
+                let internal_reader = Arc::new(DBVehicleReaderInternal::new(pool));
+                (vehicle_reader, employee_reader, internal_reader)
             }
         } else {
             // If no DATABASE_URL is provided, use the mock readers
@@ -172,6 +180,7 @@ impl AppState {
             (
                 Arc::new(MockDBVehicleReader::new()),
                 Arc::new(MockEmployeeReader::new()),
+                Arc::new(DBVehicleReaderInternal::new_disconnected()),
             )
         };
 
@@ -193,6 +202,7 @@ impl AppState {
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
+            db_vehicle_reader_internal,
             db_employee_reader,
             trip_service,
             chalo_vehicle_cache,
