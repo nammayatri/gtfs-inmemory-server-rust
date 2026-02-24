@@ -165,12 +165,11 @@ pub struct TripDetailRow {
     pub end_time: Option<String>,
     pub break_time: Option<String>,
     pub break_type: Option<String>,
-    pub shift_type: Option<String>,
+    pub shift_type_name: Option<String>,
     pub distance: f32,
-    pub route_id: i64,
     pub schedule_trip_id: i64,
     pub is_active_trip: bool,
-    pub entity_name: Option<String>,
+    pub route_id: i32,
 }
 
 #[async_trait]
@@ -513,7 +512,19 @@ impl OperatorService for DBOperatorService {
             for col in cols.iter().filter(|c| **c != "gtfs_id") {
                 let col_val = obj.get(*col).unwrap_or(&Value::Null);
                 match col_val {
-                    Value::String(s) => q = q.bind(s.as_str()),
+                    Value::String(s) => {
+                        if col.ends_with("_at") || col.starts_with("effective_") {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                                q = q.bind(dt.with_timezone(&chrono::Utc));
+                            } else if let Ok(dt) = s.parse::<chrono::DateTime<chrono::Utc>>() {
+                                q = q.bind(dt);
+                            } else {
+                                q = q.bind(s.as_str());
+                            }
+                        } else {
+                            q = q.bind(s.as_str());
+                        }
+                    },
                     Value::Number(n) => {
                         if let Some(i) = n.as_i64() {
                             q = q.bind(i);
@@ -614,12 +625,11 @@ impl OperatorService for DBOperatorService {
                 d.end_time,
                 d.break_time,
                 d.break_type,
-                d.shift_type,
+                d.shift_type_name,
                 d.distance,
-                d.route_id,
+                d.route_number_id::int as route_id,
                 d.schedule_trip_id,
-                d.is_active_trip,
-                d.entity_name
+                d.is_active_trip
             FROM public.bus_schedule_trip_detail_internal d
             JOIN public.bus_schedule_trip_internal t USING (schedule_trip_id)
             JOIN public.bus_schedule_internal s USING (schedule_id)
@@ -629,7 +639,7 @@ impl OperatorService for DBOperatorService {
             ORDER BY d.trip_order
             "#,
         )
-        .bind(schedule_number)
+        .bind(schedule_number.rsplitn(3, '-').nth(2).unwrap_or(schedule_number))
         .bind(gtfs_id)
         .fetch_all(&self.pool)
         .await
