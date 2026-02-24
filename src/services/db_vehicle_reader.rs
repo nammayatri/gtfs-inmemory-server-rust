@@ -70,11 +70,6 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
-    async fn get_waybills_by_route_id(
-        &self,
-        gtfs_id: &str,
-        route_id: &str,
-    ) -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybills_by_route_id(
         &self,
         route_id: &str,
@@ -191,16 +186,6 @@ impl VehicleDataReader for MockDBVehicleReader {
     }
 
     async fn verify_vehicle(&self, _vehicle_no: &str) -> AppResult<bool> {
-        Err(AppError::NotFound(
-            "Database is not connected in local testing mode.".to_string(),
-        ))
-    }
-
-    async fn get_waybills_by_route_id(
-        &self,
-        _gtfs_id: &str,
-        _route_id: &str,
-    ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -2161,147 +2146,80 @@ impl VehicleDataReader for DBVehicleReader {
         Ok(is_valid)
     }
 
-    async fn get_waybills_by_route_id(
-        &self,
-        gtfs_id: &str,
-        route_id: &str,
-    ) -> AppResult<Vec<VehicleData>> {
-        let cache_key = self.get_waybills_by_route_cache_key(gtfs_id, route_id);
-
-        // Check cache first
-        {
-            let cache = self.waybills_by_route_cache.read().await;
-            if let Some((waybills, timestamp)) = cache.waybills_by_route.get(&cache_key) {
-                if !self.is_waybills_by_route_cache_expired(*timestamp) {
-                    info!(
-                        "Waybills by route cache HIT for gtfs_id={}, route_id={}",
-                        gtfs_id, route_id
-                    );
-                    return Ok(waybills.clone());
-                }
-            }
-        }
-
-        info!(
-            "Waybills by route cache MISS for gtfs_id={}, route_id={}",
-            gtfs_id, route_id
-        );
-
-        // Query waybills by joining with bus_schedule_trip_detail and bus_schedule_trip_flexi
-        // to find waybills that have trips on the given route_id (route_number_id)
-        let query = r#"
-            SELECT
-                w.waybill_id::text,
-                w.waybill_no::text,
-                w.service_type,
-                w.vehicle_no,
-                w.schedule_no,
-                w.updated_at::timestamptz AS last_updated,
-                w.duty_date,
-                w.schedule_trip_id::text,
-                e.entity_remark::text AS entity_remark,
-                w.driver_token_no::text AS driver_code,
-                w.conductor_token_no::text AS conductor_code,
-                w.deleted AS deleted,
-                w.status AS status,
-                w.is_flexi
-            FROM waybills w
-            LEFT JOIN entities e ON e.entity_id = w.entity_id
-            WHERE w.status = 'Online'
-                AND w.deleted = false
-                AND (
-                    EXISTS (
-                        SELECT 1 FROM bus_schedule_trip_detail bstd
-                        WHERE bstd.schedule_trip_id = w.schedule_trip_id::bigint
-                            AND bstd.route_number_id::text = $1
-                            AND bstd.trip_type != 'dead-trip'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM bus_schedule_trip_flexi bstf
-                        WHERE bstf.schedule_trip_id = w.schedule_trip_id::bigint
-                            AND bstf.route_number_id::text = $1
-                            AND bstf.trip_type != 'dead-trip'
-                    )
-                )
-            ORDER BY w.updated_at DESC
-        "#;
-
-        let waybills = match sqlx::query_as::<_, VehicleData>(query)
-            .bind(route_id)
-            .fetch_all(&self.pool)
-            .await
-        {
-            Ok(waybills) => {
-                info!(
-                    "Found {} waybills for gtfs_id={}, route_id={}",
-                    waybills.len(),
-                    gtfs_id,
-                    route_id
-                );
-                waybills
-            }
-            Err(e) => {
-                error!("Failed to query waybills by route_id {}: {}", route_id, e);
-                return Err(AppError::Internal(format!("Database query failed: {}", e)));
-            }
-        };
-
-        // Cache the results
-        {
-            let mut cache = self.waybills_by_route_cache.write().await;
-            cache
-                .waybills_by_route
-                .insert(cache_key, (waybills.clone(), SystemTime::now()));
-        }
-
-        Ok(waybills)
-    }
-
     async fn get_chennai_waybills_by_route_id(
         &self,
         route_id: &str,
     ) -> AppResult<Vec<VehicleData>> {
+        let cache_key = self.get_waybills_by_route_cache_key("chennai_bus", route_id);
+
+        // Check cache first
+        {
+            let cache = self.waybills_by_route_cache.read().await;
+            if let Some((data, ts)) = cache.waybills_by_route.get(&cache_key) {
+                if !self.is_waybills_by_route_cache_expired(*ts) {
+                    info!("get_chennai_waybills_by_route_id cache HIT for route_id={}", route_id);
+                    return Ok(data.clone());
+                }
+            }
+        }
+
         let query = r#"
-            SELECT
-                w.waybill_id::text,
-                w.waybill_no::text,
-                w.service_type,
-                w.vehicle_no,
-                w.schedule_no,
-                w.updated_at::timestamptz AS last_updated,
-                w.duty_date,
-                w.schedule_trip_id::text,
-                e.entity_remark::text AS entity_remark,
-                w.driver_token_no::text AS driver_code,
-                w.conductor_token_no::text AS conductor_code,
-                w.deleted,
-                w.status,
-                w.is_flexi,
-                COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
-                COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
-                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
-            FROM waybills w
-            LEFT JOIN entities e
-                ON e.entity_id = w.entity_id
-            LEFT JOIN bus_schedule_trip_detail bstd
-                ON  w.is_flexi = false
-                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
-                AND bstd.route_number_id::text = $1
-                AND bstd.trip_type <> 'dead-trip'
-            LEFT JOIN bus_schedule_trip_flexi bstf
-                ON  w.is_flexi = true
-                AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
-                AND bstf.route_number_id::text = $1
-                AND bstf.trip_type <> 'dead-trip'
-            WHERE
-                w.status = 'Online'
-                AND w.deleted = false
-                AND (
-                    (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
-                    OR
-                    (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
-                )
-            ORDER BY w.updated_at DESC
+            WITH base AS (
+                SELECT
+                    w.waybill_id::text,
+                    w.waybill_no::text,
+                    w.service_type,
+                    w.vehicle_no,
+                    w.schedule_no,
+                    w.updated_at::timestamptz AS last_updated,
+                    w.duty_date,
+                    w.schedule_trip_id::text,
+                    e.entity_remark::text,
+                    w.driver_token_no::text AS driver_code,
+                    w.conductor_token_no::text AS conductor_code,
+                    w.deleted,
+                    w.status,
+                    w.is_flexi,
+                    COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
+                    COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
+                    COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
+                    COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
+                FROM waybills w
+                LEFT JOIN entities e
+                    ON e.entity_id = w.entity_id
+                LEFT JOIN bus_schedule_trip_detail bstd
+                    ON w.is_flexi = false
+                    AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                    AND bstd.route_number_id::text = $1
+                    AND bstd.trip_type <> 'dead-trip'
+                LEFT JOIN bus_schedule_trip_flexi bstf
+                    ON w.is_flexi = true
+                    AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
+                    AND bstf.route_number_id::text = $1
+                    AND bstf.trip_type <> 'dead-trip'
+                WHERE
+                    w.status = 'Online'
+                    AND w.deleted = false
+                    AND (
+                        (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                        OR
+                        (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                    )
+            )
+
+            SELECT *
+            FROM (
+                SELECT *,
+                    MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
+                    OVER (
+                        PARTITION BY waybill_no
+                        ORDER BY trip_number
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS seen_active
+                FROM base
+            ) t
+            WHERE seen_active = 1
+            ORDER BY waybill_no, trip_number;
         "#;
 
         match sqlx::query_as::<_, VehicleData>(query)
@@ -2315,6 +2233,13 @@ impl VehicleDataReader for DBVehicleReader {
                     rows.len(),
                     route_id
                 );
+
+                // Update cache
+                {
+                    let mut cache = self.waybills_by_route_cache.write().await;
+                    cache.waybills_by_route.insert(cache_key, (rows.clone(), SystemTime::now()));
+                }
+
                 Ok(rows)
             }
             Err(e) => {

@@ -13,6 +13,7 @@ use crate::services::{
     chalo_vehicle_cache::ChaloVehicleCache,
     db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
+    db_vehicle_reader_internal::DBVehicleReaderInternal,
     gtfs_service::GTFSService,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
     trip_service::TripService,
@@ -119,6 +120,7 @@ async fn create_database_pool(config: &AppConfig) -> Result<PgPool, AppError> {
 pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
+    pub db_vehicle_reader_internal: Arc<DBVehicleReaderInternal>,
     pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub operator_service: Arc<dyn OperatorService>,
     pub trip_service: Arc<TripService>,
@@ -136,10 +138,11 @@ impl AppState {
         let gtfs_service = Arc::new(GTFSService::new(app_config.clone()).await?);
 
         // Create shared database pool or use mock readers
-        let (db_vehicle_reader, db_employee_reader, operator_service): (
+        let (db_vehicle_reader, db_employee_reader, operator_service, db_vehicle_reader_internal): (
             Arc<dyn VehicleDataReader>,
             Arc<dyn EmployeeReader>,
             Arc<dyn OperatorService>,
+            Arc<DBVehicleReaderInternal>,
         ) = if let Some(db_url) = &app_config.database_url {
             if db_url.contains("localhost") {
                 // For local development, fall back to mock readers on connection failure
@@ -149,8 +152,9 @@ impl AppState {
                         let vehicle_reader =
                             Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
                         let employee_reader = Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
-                        let operator_svc = Arc::new(DBOperatorService::new(pool));
-                        (vehicle_reader, employee_reader, operator_svc)
+                        let operator_svc = Arc::new(DBOperatorService::new(pool.clone()));
+                        let vehicle_reader_internal = Arc::new(DBVehicleReaderInternal::new(pool.clone()));
+                        (vehicle_reader, employee_reader, operator_svc, vehicle_reader_internal)
                     }
                     Err(e) => {
                         error!("Failed to connect to the local database: {}. Falling back to mock DB readers.", e);
@@ -158,6 +162,7 @@ impl AppState {
                             Arc::new(MockDBVehicleReader::new()),
                             Arc::new(MockEmployeeReader::new()),
                             Arc::new(MockOperatorService::new()),
+                            Arc::new(DBVehicleReaderInternal::new_disconnected()),
                         )
                     }
                 }
@@ -169,8 +174,9 @@ impl AppState {
                     .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
                 let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
                 let employee_reader = Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
-                let operator_svc = Arc::new(DBOperatorService::new(pool));
-                (vehicle_reader, employee_reader, operator_svc)
+                let operator_svc = Arc::new(DBOperatorService::new(pool.clone()));
+                let vehicle_reader_internal = Arc::new(DBVehicleReaderInternal::new(pool.clone()));
+                (vehicle_reader, employee_reader, operator_svc, vehicle_reader_internal)
             }
         } else {
             // If no DATABASE_URL is provided, use the mock readers
@@ -179,6 +185,7 @@ impl AppState {
                 Arc::new(MockDBVehicleReader::new()),
                 Arc::new(MockEmployeeReader::new()),
                 Arc::new(MockOperatorService::new()),
+                Arc::new(DBVehicleReaderInternal::new_disconnected()),
             )
         };
 
@@ -200,6 +207,7 @@ impl AppState {
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
+            db_vehicle_reader_internal,
             db_employee_reader,
             operator_service,
             trip_service,

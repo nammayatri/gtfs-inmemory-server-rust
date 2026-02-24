@@ -850,6 +850,106 @@ async fn get_service_type_by_vehicle_impl(
         }
     }
 
+    // ── Internal-table check ─────────────────────────────────────────────────
+    // If vehicle_no exists in vehicles_internal for this gtfs_id, use the
+    // _internal tables instead of the standard reader.
+    if app_state
+        .db_vehicle_reader_internal
+        .is_vehicle_in_internal(vehicle_no, gtfs_id)
+        .await
+    {
+        info!(
+            "vehicle_no={} found in vehicles_internal, using internal reader (gtfs_id={})",
+            vehicle_no, gtfs_id
+        );
+
+        let mut vehicle_data = app_state
+            .db_vehicle_reader_internal
+            .get_vehicle_data(vehicle_no, gtfs_id, params.trip_number)
+            .await?;
+
+        // Populate stops_count on each remaining trip
+        if let Some(ref mut details) = vehicle_data.remaining_trip_details {
+            for d in details.iter_mut() {
+                let route_code = d.route_id.as_str();
+                let stops_len: i32 = match app_state
+                    .gtfs_service
+                    .get_route_stop_mapping_by_route(gtfs_id, route_code)
+                    .await
+                {
+                    Ok(mappings) => mappings.len() as i32,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Internal: failed to fetch stop mapping gtfs_id={} route={}: {}",
+                            gtfs_id, route_code, e
+                        );
+                        0
+                    }
+                };
+                d.stops_count = Some(stops_len);
+            }
+        }
+
+        let mut service_type = match vehicle_data.service_type.clone() {
+            Some(s) => Some(s),
+            None => {
+                app_state
+                    .gtfs_service
+                    .get_fleet_service_type(gtfs_id, &vehicle_data.vehicle_no)
+                    .await
+            }
+        };
+
+        let mut is_actually_valid = None;
+        if pass_verify_req && service_type.is_none() {
+            if is_valid {
+                service_type = Some("Ordinary".to_string());
+            } else {
+                service_type = Some("Ordinary".to_string());
+                is_actually_valid = Some(false);
+            }
+        }
+
+        let depot_no = vehicle_data.entity_remark.or(vehicle_data.depot);
+
+        let eligible_pass_ids = app_state
+            .fleet_list
+            .get(gtfs_id)
+            .and_then(|by_vehicle| by_vehicle.get(&vehicle_data.vehicle_no))
+            .cloned();
+
+        let service_sub_types = app_state
+            .vehicle_service_sub_types
+            .get(gtfs_id)
+            .and_then(|by_vehicle| by_vehicle.get(&vehicle_data.vehicle_no))
+            .cloned();
+
+        let seat_layout_id = app_state
+            .gtfs_service
+            .get_seat_layout_id(gtfs_id, &vehicle_data.vehicle_no)
+            .await;
+
+        return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
+            vehicle_no: vehicle_data.vehicle_no,
+            service_type,
+            waybill_id: vehicle_data.waybill_no,
+            schedule_no: vehicle_data.schedule_no,
+            last_updated: vehicle_data.last_updated,
+            route_id: vehicle_data.route_id,
+            route_number: vehicle_data.route_number,
+            is_active_trip: vehicle_data.is_active_trip,
+            trip_number: vehicle_data.trip_number,
+            depot_no,
+            remaining_trip_details: vehicle_data.remaining_trip_details,
+            is_actually_valid,
+            driver_id: vehicle_data.driver_code,
+            conductor_id: vehicle_data.conductor_code,
+            eligible_pass_ids,
+            service_sub_types,
+            seat_layout_id,
+        }));
+    }
+
     // For other gtfs_id, use the existing DB logic
     let mut vehicle_data = app_state
         .db_vehicle_reader
@@ -1180,9 +1280,18 @@ fn calculate_eta_from_haversine_distance(
     bus_stop_etas
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct BusRouteScheduleQuery {
+    #[serde(rename = "justInternal")]
+    pub just_internal: Option<bool>,
+    #[serde(rename = "justExternal")]
+    pub just_external: Option<bool>,
+}
+
 async fn get_bus_route_schedule(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    query: web::Query<BusRouteScheduleQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
 
@@ -1190,18 +1299,36 @@ async fn get_bus_route_schedule(
     // Single join query returns waybills + trip (bstd & bstf) times
     // No per-vehicle get_vehicle_data call req
     if gtfs_id == "chennai_bus" {
+        let just_internal = query.just_internal.unwrap_or(false);
+        let just_external = query.just_external.unwrap_or(false);
+
         let route_stop_mappings = app_state
             .gtfs_service
             .get_route_stop_mapping_by_route(&gtfs_id, &route_id)
             .await
             .unwrap_or_default();
 
-        let rows = app_state
-            .db_vehicle_reader
-            .get_chennai_waybills_by_route_id(&route_id)
-            .await?;
+        let mut all_rows = Vec::new();
 
-        let schedule_details: BusScheduleDetails = rows
+        // 1. Fetch from external (existing) tables unless justInternal is strictly true
+        if !just_internal {
+            let mut ext_rows = app_state
+                .db_vehicle_reader
+                .get_chennai_waybills_by_route_id(&route_id)
+                .await?;
+            all_rows.append(&mut ext_rows);
+        }
+
+        // 2. Fetch from internal (_internal) tables unless justExternal is strictly true
+        if !just_external {
+            let mut int_rows = app_state
+                .db_vehicle_reader_internal
+                .get_chennai_waybills_by_route_id(&route_id, &gtfs_id)
+                .await?;
+            all_rows.append(&mut int_rows);
+        }
+
+        let schedule_details: BusScheduleDetails = all_rows
             .into_iter()
             .map(|row| {
                 // Resolve trip start time from (db_start_time HH:MM + duty_date) or
@@ -1252,7 +1379,6 @@ async fn get_bus_route_schedule(
         return Ok(HttpResponse::Ok().json(schedule_details));
     }
 
-    // ── CHALO-based cities ───────────────────────────────────────────────────
     let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
     let waybills = if chalo_gtfs_ids.contains(&gtfs_id.as_str()) {
         // Get vehicles from cache filtered by route_id
@@ -1291,18 +1417,12 @@ async fn get_bus_route_schedule(
                 })
                 .collect()
         } else {
-            // Fallback to database query
-            app_state
-                .db_vehicle_reader
-                .get_waybills_by_route_id(&gtfs_id, &route_id)
-                .await?
+            // return null
+            Vec::new()
         }
     } else {
-        // For other gtfs_ids, query database
-        app_state
-            .db_vehicle_reader
-            .get_waybills_by_route_id(&gtfs_id, &route_id)
-            .await?
+        //return null
+        Vec::new()
     };
 
     let mut schedule_details: BusScheduleDetails = Vec::new();
@@ -1561,8 +1681,6 @@ struct RoleQuery {
     role: String,
 }
 
-// ─── POST body structs ───────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct UpdateWaybillStatusBody {
     waybill_id: i64,
@@ -1656,8 +1774,6 @@ async fn upsert_one_row(
     Ok(HttpResponse::Ok().json(result))
 }
 
-// ─── §2 — Schedule creation helpers ─────────────────────────────────────────
-
 async fn get_service_types(
     app_state: Data<AppState>,
     path: Path<String>,
@@ -1694,8 +1810,6 @@ async fn get_shift_types(path: Path<String>) -> AppResult<HttpResponse> {
     Ok(HttpResponse::Ok().json(shift_types()))
 }
 
-// ─── §3 — Trip creation helpers ──────────────────────────────────────────────
-
 async fn get_schedule_numbers(
     app_state: Data<AppState>,
     path: Path<String>,
@@ -1712,8 +1826,6 @@ async fn get_day_types(path: Path<String>) -> AppResult<HttpResponse> {
     Ok(HttpResponse::Ok().json(day_types()))
 }
 
-// ─── §4 — Trip detail creation helpers ───────────────────────────────────────
-
 async fn get_trip_types(path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
@@ -1725,8 +1837,6 @@ async fn get_break_types_handler(path: Path<String>) -> AppResult<HttpResponse> 
     check_gtfs_id(&gtfs_id)?;
     Ok(HttpResponse::Ok().json(break_types()))
 }
-
-// ─── §5 — Waybill creation helpers ───────────────────────────────────────────
 
 async fn get_trip_details(
     app_state: Data<AppState>,
