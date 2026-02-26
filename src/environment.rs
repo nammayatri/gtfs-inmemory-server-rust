@@ -406,9 +406,9 @@ impl AppState {
         for result in reader.records() {
             match result {
                 Ok(record) => {
-                    // CSV columns: S. No.(0), Token No(1), Name(2), Depot Name(3), Phone Number(4), UPI ID(5), VPA(6)
-                    let (Some(token_no), Some(name), Some(depot_name), Some(phone_number)) =
-                        (record.get(1), record.get(2), record.get(3), record.get(4))
+                    // CSV columns: Token No(0), Phone Number(1), UPI ID(2), Depot Name(3), Name(4)
+                    let (Some(token_no), Some(phone_number), Some(depot_name), Some(name)) =
+                        (record.get(0), record.get(1), record.get(3), record.get(4))
                     else {
                         continue;
                     };
@@ -418,9 +418,15 @@ impl AppState {
                     let full_name = name.trim();
                     let depot = depot_name.trim().to_string();
 
-                    if phone.is_empty() || token.is_empty() {
+                    if phone.is_empty() || token.is_empty() || full_name.is_empty() {
                         continue;
                     }
+
+                    let depot_opt = if depot.is_empty() || depot == "nan" {
+                        None
+                    } else {
+                        Some(depot)
+                    };
 
                     // Split name into first and last
                     let (first_name, last_name) = match full_name.split_once(' ') {
@@ -433,7 +439,7 @@ impl AppState {
                         first_name,
                         last_name,
                         mobile_no: Some(phone.clone()),
-                        depot_name: Some(depot),
+                        depot_name: depot_opt,
                     };
 
                     phone_to_employee.insert(phone, employee);
