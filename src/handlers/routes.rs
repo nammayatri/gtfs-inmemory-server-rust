@@ -763,6 +763,7 @@ async fn get_service_type_by_vehicle_impl(
                 driver_id: cached_data.driver_id,
                 conductor_id: cached_data.conductor_id,
                 eligible_pass_ids,
+                waybill_status: None,
                 service_sub_types,
                 seat_layout_id,
             }));
@@ -805,6 +806,7 @@ async fn get_service_type_by_vehicle_impl(
                         .get(gtfs_id)
                         .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
                         .cloned(),
+                    waybill_status: None,
                     service_sub_types,
                     seat_layout_id,
                 }));
@@ -909,6 +911,7 @@ async fn get_service_type_by_vehicle_impl(
         driver_id: vehicle_data.driver_code,
         conductor_id: vehicle_data.conductor_code,
         eligible_pass_ids,
+        waybill_status: vehicle_data.waybill_status,
         service_sub_types,
         seat_layout_id,
     }))
