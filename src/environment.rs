@@ -418,7 +418,7 @@ impl AppState {
                     let full_name = name.trim();
                     let depot = depot_name.trim().to_string();
 
-                    if phone.is_empty() || token.is_empty() || full_name.is_empty() {
+                    if phone.is_empty() || token.is_empty() {
                         continue;
                     }
 
