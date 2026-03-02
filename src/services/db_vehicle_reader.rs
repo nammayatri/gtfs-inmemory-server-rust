@@ -33,7 +33,7 @@ struct WaybillsByRouteCache {
     waybills_by_route: HashMap<String, (Vec<VehicleData>, SystemTime)>,
 }
 
-const DB_ACTIVE_TRIP_STALE_HOURS: i64 = 2; // If active trip started more than 36 hours ago, consider it stale
+const DB_ACTIVE_TRIP_STALE_HOURS: i64 = 2; // If active trip started more than 2 hours ago, consider it stale
 
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
@@ -978,11 +978,10 @@ impl DBVehicleReader {
                 w.status AS status
             FROM waybills w
             LEFT JOIN entities e ON e.entity_id = w.entity_id
-            WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New', 'Closed') AND w.deleted = false
+            WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New') AND w.deleted = false
             ORDER BY CASE
                 WHEN w.status = 'Processed' THEN 1
                 WHEN w.status = 'New' THEN 2
-                WHEN w.status = 'Closed' THEN 3
             END, w.updated_at DESC
             LIMIT 1
         "#;
