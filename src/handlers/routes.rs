@@ -1153,72 +1153,6 @@ async fn get_bus_route_schedule(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
 
-    // chennai_bus guy
-    // Single join query returns waybills + trip (bstd & bstf) times
-    // No per-vehicle get_vehicle_data call req
-    if gtfs_id == "chennai_bus" {
-        let route_stop_mappings = app_state
-            .gtfs_service
-            .get_route_stop_mapping_by_route(&gtfs_id, &route_id)
-            .await
-            .unwrap_or_default();
-
-        let all = app_state
-            .db_vehicle_reader
-            .get_chennai_waybills_by_route_id(&route_id)
-            .await?;
-
-        let schedule_details: BusScheduleDetails = all
-            .into_iter()
-            .map(|row: crate::models::VehicleData| {
-                // Resolve trip start time from (db_start_time HH:MM + duty_date) or
-                // fall back to the stored epoch-millis in start_time_epoch.
-                let trip_start_time: Option<i64> =
-                    if let (Some(hhmm), Some(duty)) =
-                        (row.db_start_time.as_deref(), row.duty_date.as_deref())
-                    {
-                        let date =
-                            chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
-                        let time =
-                            chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
-                        if let (Some(d), Some(t)) = (date, time) {
-                            let dt = chrono::NaiveDateTime::new(d, t);
-                            if let Some(offset) =
-                                chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-                            {
-                                use chrono::TimeZone;
-                                offset
-                                    .from_local_datetime(&dt)
-                                    .single()
-                                    .map(|dt_tz| dt_tz.timestamp_millis())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        row.start_time_epoch
-                            .as_deref()
-                            .and_then(|s| s.parse::<i64>().ok())
-                    };
-
-                let bus_stop_etas =
-                    calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
-
-                crate::models::BusScheduleDetail {
-                    eta: bus_stop_etas,
-                    vehicle_no: row.vehicle_no,
-                    service_tier: row.service_type,
-                    trip_number: row.trip_number,
-                    waybill_no: Some(row.waybill_no),
-                }
-            })
-            .collect();
-
-        return Ok(HttpResponse::Ok().json(schedule_details));
-    }
-
     // For CHALO-based cities, try to use in-memory cache first
     let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
     let waybills = if chalo_gtfs_ids.contains(&gtfs_id.as_str()) {
@@ -1252,18 +1186,21 @@ async fn get_bus_route_schedule(
                     deleted: cached_data.deleted,
                     status: Some("Online".to_string()),
                     is_flexi: None,
-                    db_start_time: None,
-                    start_time_epoch: None,
-                    trip_number: None,
                 })
                 .collect()
         } else {
-            // Return null
-            Vec::new()
+            // Fallback to database query
+            app_state
+                .db_vehicle_reader
+                .get_waybills_by_route_id(&gtfs_id, &route_id)
+                .await?
         }
     } else {
-        // Return null
-        Vec::new()
+        // For other gtfs_ids, query database
+        app_state
+            .db_vehicle_reader
+            .get_waybills_by_route_id(&gtfs_id, &route_id)
+            .await?
     };
 
     let mut schedule_details: BusScheduleDetails = Vec::new();
@@ -1347,8 +1284,6 @@ async fn get_bus_route_schedule(
             eta: bus_stop_etas,
             vehicle_no: waybill.vehicle_no.clone(),
             service_tier: waybill.service_type.clone(),
-            trip_number: None,
-            waybill_no: None,
         });
     }
 
