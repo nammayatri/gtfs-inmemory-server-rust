@@ -554,6 +554,14 @@ pub struct BusScheduleDetail {
 
 pub type BusScheduleDetails = Vec<BusScheduleDetail>;
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RouteLastScheduleTime {
+    #[serde(rename = "routeId")]
+    pub route_id: String,
+    #[serde(rename = "lastScheduleTime")]
+    pub last_schedule_time: Option<String>,
+}
+
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {
     if vehicle_type == "RAIL" {
         "METRO".to_string()

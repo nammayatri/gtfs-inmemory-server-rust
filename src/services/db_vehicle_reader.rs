@@ -8,8 +8,8 @@ use tracing::{debug, error, info};
 
 use crate::environment::AppConfig;
 use crate::models::{
-    BusSchedule, DepotVehicleSummary, MinimalVehicleData, VehicleData, VehicleDataWithRouteId,
-    VehicleOperationData, WaybillStatus,
+    BusSchedule, DepotVehicleSummary, MinimalVehicleData, RouteLastScheduleTime, VehicleData,
+    VehicleDataWithRouteId, VehicleOperationData, WaybillStatus,
 };
 use crate::tools::error::{AppError, AppResult};
 
@@ -30,6 +30,11 @@ struct VehiclePoolCache {
 // Waybills by route cache structure
 struct WaybillsByRouteCache {
     waybills_by_route: HashMap<String, (Vec<VehicleData>, SystemTime)>,
+}
+
+// Routes served today cache structure (30 min TTL)
+struct RoutesServedTodayCache {
+    data: Option<(Vec<RouteLastScheduleTime>, SystemTime)>,
 }
 
 #[async_trait]
@@ -70,6 +75,7 @@ pub trait VehicleDataReader: Send + Sync {
         gtfs_id: &str,
         route_id: &str,
     ) -> AppResult<Vec<VehicleData>>;
+    async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>>;
 }
 
 // Mock implementation for local testing without a database
@@ -195,6 +201,9 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+    async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>> {
+        Ok(Vec::new())
+    }
     async fn get_vehicles_by_service_tier(
         &self,
         _gtfs_id: &str,
@@ -231,6 +240,8 @@ pub struct DBVehicleReader {
     vehicle_pool_cache_duration: Duration,
     waybills_by_route_cache: Arc<RwLock<WaybillsByRouteCache>>,
     waybills_by_route_cache_duration: Duration,
+    routes_served_today_cache: Arc<RwLock<RoutesServedTodayCache>>,
+    routes_served_today_cache_duration: Duration,
 }
 
 impl DBVehicleReader {
@@ -254,6 +265,10 @@ impl DBVehicleReader {
                 waybills_by_route: HashMap::new(),
             })),
             waybills_by_route_cache_duration: Duration::from_secs(3600), // 60 minutes TTL
+            routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache {
+                data: None,
+            })),
+            routes_served_today_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
         }
     }
 
@@ -2264,5 +2279,71 @@ impl VehicleDataReader for DBVehicleReader {
             // For other gtfs_id/service_tier combinations, return empty list
             Ok(Vec::new())
         }
+    }
+
+    async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>> {
+        // Check cache (30 min TTL)
+        {
+            let cache = self.routes_served_today_cache.read().await;
+            if let Some((data, timestamp)) = &cache.data {
+                if timestamp.elapsed().unwrap_or_default() < self.routes_served_today_cache_duration {
+                    info!("Routes served today cache HIT");
+                    return Ok(data.clone());
+                }
+            }
+        }
+
+        let today_ist = {
+            let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+            chrono::Utc::now().with_timezone(&ist).format("%Y-%m-%d").to_string()
+        };
+
+        info!("Routes served today cache MISS, querying for date={}", today_ist);
+
+        let query = r#"
+            SELECT
+                route_number_id::text AS route_id,
+                MAX(end_time) AS last_schedule_time
+            FROM (
+                SELECT bstd.route_number_id, bstd.end_time
+                FROM bus_schedule_trip_detail bstd
+                INNER JOIN waybills w ON w.schedule_trip_id::bigint = bstd.schedule_trip_id
+                WHERE w.duty_date = $1
+                    AND w.deleted = false
+                    AND bstd.trip_type != 'dead-trip'
+                UNION ALL
+                SELECT bstf.route_number_id, bstf.end_time
+                FROM bus_schedule_trip_flexi bstf
+                INNER JOIN waybills w ON w.schedule_trip_id::bigint = bstf.schedule_trip_id
+                WHERE w.duty_date = $1
+                    AND w.deleted = false
+                    AND bstf.trip_type != 'dead-trip'
+            ) combined
+            GROUP BY route_number_id
+            ORDER BY route_number_id
+        "#;
+
+        let routes = match sqlx::query_as::<_, RouteLastScheduleTime>(query)
+            .bind(&today_ist)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => {
+                info!("Found {} routes served today ({})", rows.len(), today_ist);
+                rows
+            }
+            Err(e) => {
+                error!("Failed to query routes served today: {}", e);
+                return Err(AppError::Internal(format!("Database query failed: {}", e)));
+            }
+        };
+
+        // Cache with 30 min TTL
+        {
+            let mut cache = self.routes_served_today_cache.write().await;
+            cache.data = Some((routes.clone(), SystemTime::now()));
+        }
+
+        Ok(routes)
     }
 }

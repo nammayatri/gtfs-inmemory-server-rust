@@ -216,6 +216,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/cache-data/{gtfs_id}",
                 actix_web::web::get().to(get_cache_data_by_gtfs_id),
+            )
+            .route(
+                "/routes-served-today",
+                actix_web::web::get().to(get_routes_served_today),
             ),
     );
 }
@@ -1422,4 +1426,9 @@ async fn get_cache_data_by_gtfs_id(
         .await;
 
     Ok(HttpResponse::Ok().json(cached_vehicles))
+}
+
+async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+    let routes = app_state.db_vehicle_reader.get_routes_served_today().await?;
+    Ok(HttpResponse::Ok().json(routes))
 }
