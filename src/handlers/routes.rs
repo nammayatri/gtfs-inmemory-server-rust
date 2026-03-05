@@ -184,6 +184,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 actix_web::web::get().to(get_conductor_by_phone_number),
             )
             .route(
+                "/getManager/byNumber/{phoneNumber}",
+                actix_web::web::get().to(get_manager_by_phone_number),
+            )
+            .route(
                 "/getVehiclesFrom",
                 actix_web::web::get().to(get_vehicles_by_depot_query),
             )
@@ -292,13 +296,14 @@ async fn get_conductor_by_phone_number(
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
     let phone_number = path.into_inner();
+    let hash_key = &app_state.config.phone_number_hash_key;
+    let phone_hash = crate::tools::hash::hash_phone_number(&phone_number, hash_key);
 
-    // First check static CSV data (faster O(1) lookup)
-    if let Some(emp) = app_state.conductor_details.get(&phone_number) {
+    if let Some(emp) = app_state.conductor_details.get(&phone_hash) {
         return Ok(HttpResponse::Ok().json(emp));
     }
 
-    // Fallback to DB lookup
+    // Fallback to DB lookup (plain number for DB query)
     let employee_data = app_state
         .db_employee_reader
         .get_employee_by_phone(&phone_number)
@@ -309,6 +314,23 @@ async fn get_conductor_by_phone_number(
             Ok(HttpResponse::NotFound()
                 .body(format!("No employee found for phone: {}", phone_number)))
         }
+    }
+}
+
+async fn get_manager_by_phone_number(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let phone_number = path.into_inner();
+    let hash_key = &app_state.config.phone_number_hash_key;
+    let phone_hash = crate::tools::hash::hash_phone_number(&phone_number, hash_key);
+
+    match app_state.depot_manager_details.get(&phone_hash) {
+        Some(manager) => Ok(HttpResponse::Ok().json(manager)),
+        None => Ok(HttpResponse::NotFound().body(format!(
+            "No depot manager found for phone: {}",
+            phone_number
+        ))),
     }
 }
 

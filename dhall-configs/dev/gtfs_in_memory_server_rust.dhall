@@ -53,5 +53,6 @@ in {
   },
 
   -- Bhubaneswar vehicle cache configuration
-  bhubaneswar_cache_update_interval = 10
+  bhubaneswar_cache_update_interval = 10,
+  phone_number_hash_key = "HASH_KEY"
 }
