@@ -42,6 +42,111 @@ pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &[
 ];
 
 pub const MAX_QUERY_LIMIT: i64 = 1000;
+pub const MAX_QUERY_FILTERS: usize = 5;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct QueryBody {
+    pub filters: Vec<Vec<String>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
+    match table {
+        "route_internal" => Some(&[
+            "route_id", "created_at", "description", "route_direction", "route_group",
+            "route_name", "route_number", "route_string", "route_type_id", "status",
+            "updated_at", "via", "bus_service_type_id", "end_point_id", "start_point_id",
+            "route_distance", "gtfs_id",
+        ]),
+        "route_point_internal" => Some(&[
+            "route_points_id", "created_at", "deleted", "fare_stage", "point_status",
+            "route_order", "stage_no", "sub_stage", "travel_distance", "travel_time",
+            "updated_at", "bus_stop_id", "route_id", "gtfs_id",
+        ]),
+        "bus_schedule_internal" => Some(&[
+            "schedule_id", "created_at", "deleted", "effective_from", "effective_till",
+            "route_code", "schedule_number", "service_code", "service_type_code",
+            "schedule_type_code", "status", "updated_at", "entity_id", "route_id",
+            "service_type_id", "schedule_type_id", "gtfs_id",
+        ]),
+        "bus_schedule_trip_internal" => Some(&[
+            "schedule_trip_id", "created_at", "deleted", "effective_end_date",
+            "effective_start_date", "no_trip", "schedule_number_name", "start_time",
+            "status", "updated_at", "calendar_id", "schedule_id", "gtfs_id",
+        ]),
+        "bus_schedule_trip_detail_internal" => Some(&[
+            "schedule_trip_detail_id", "break_time", "break_type", "created_at", "deleted",
+            "distance", "end_time", "org_name", "running_time", "schedule_number",
+            "shift_day_name", "shift_type_name", "start_time", "trip_number", "trip_order",
+            "trip_type", "updated_at", "calendar_id", "route_number_id", "schedule_trip_id",
+            "is_active_trip", "trip_end_time", "trip_start_time", "sync_end_time",
+            "sync_start_time", "gtfs_id",
+        ]),
+        "bus_schedule_trip_flexi_internal" => Some(&[
+            "schedule_trip_flexi_id", "break_time", "break_type", "created_at", "deleted",
+            "distance", "end_time", "org_name", "running_time", "schedule_number",
+            "shift_day_name", "shift_type_name", "start_time", "trip_number", "trip_order",
+            "trip_type", "updated_at", "calendar_id", "route_number_id", "schedule_trip_id",
+            "waybill_id", "is_active_trip", "trip_end_time", "trip_start_time",
+            "sync_end_time", "sync_start_time", "gtfs_id",
+        ]),
+        "service_type_internal" => Some(&[
+            "service_type_id", "abbreviation", "created_at", "deleted", "service_type_code",
+            "service_type_name", "status", "ticket_footer", "ticket_footer_local_lang",
+            "updated_at", "gtfs_id",
+        ]),
+        "stop_internal" => Some(&[
+            "bus_stop_id", "bus_stop_code", "bus_stop_name", "bus_stop_name_local_lang",
+            "created_at", "deleted", "description", "fare_stage", "landmark",
+            "latitude_current", "longitude_current", "route_status", "status",
+            "stop_direction", "stop_group_id", "stop_type_id", "sub_stage", "toll_fee",
+            "toll_zone", "updated_at", "gtfs_id",
+        ]),
+        "designations_internal" => Some(&[
+            "designation_id", "created_at", "deleted", "designation_name",
+            "designation_remark", "designation_status", "is_default", "updated_at", "gtfs_id",
+        ]),
+        "employees_internal" => Some(&[
+            "emp_id", "address", "basic_amount", "created_at", "da_amount", "dob", "deleted",
+            "driving_license_expiry", "driving_license_number", "email", "father_name",
+            "first_name", "gender", "last_name", "mobile_no", "status", "token_no",
+            "updated_at", "week_off", "department_id", "designation_id", "entity_id",
+            "organization_id", "gtfs_id",
+        ]),
+        "entities_internal" => Some(&[
+            "entity_id", "created_at", "deleted", "entity_address", "entity_contact",
+            "entity_email", "entity_name", "entity_name_local_lang", "entity_remark",
+            "entity_status", "updated_at", "organization_id", "gtfs_id",
+        ]),
+        "vehicles_internal" => Some(&[
+            "vehicle_id", "created_at", "deleted", "fleet_no", "status", "updated_at",
+            "vehicle_no", "bus_service_type_id", "entity_id", "organization_id", "gtfs_id",
+        ]),
+        "waybill_device_internal" => Some(&[
+            "waybill_device_id", "created_at", "deleted", "device_serial_no", "is_audited",
+            "is_primary", "is_uploaded", "updated_at", "waybill_id", "gtfs_id",
+        ]),
+        "fleet_etm_mapping_internal" => Some(&[
+            "fleet_etm_mapping_id", "vehicle_no", "gtfs_id", "etm_serial_no",
+            "created_at", "updated_at", "deleted",
+        ]),
+        "fleet_obu_mapping_internal" => Some(&[
+            "fleet_obu_mapping_id", "vehicle_no", "gtfs_id", "obu_id",
+            "created_at", "updated_at", "deleted",
+        ]),
+        "waybills_internal" => Some(&[
+            "waybill_id", "audited_date", "bag_master", "challan_no", "conductor_name",
+            "conductor_token_no", "created_at", "dc_name", "dc_token_no", "deleted",
+            "driver_name", "driver_token_no", "duty_date", "device_serial_number",
+            "is_flexi", "no_of_device", "schedule_id", "schedule_no", "schedule_trip_name",
+            "schedule_type", "service_type", "schedule_start_time", "status", "updated_at",
+            "vehicle_no", "waybill_no", "entity_id", "schedule_trip_id", "service_type_id",
+            "shift_type_id", "tablet_id", "gtfs_id",
+        ]),
+        _ => None,
+    }
+}
 
 pub fn table_pk(table: &str) -> Option<&'static str> {
     match table {
@@ -500,22 +605,44 @@ pub enum InternalRow {
     WaybillsInternal(WaybillsInternal),
 }
 
+/// Deserialize a raw `row_to_json` value into the correct `InternalRow` variant
+/// for the given table name.  Using `serde_json::from_value::<InternalRow>`
+/// directly is wrong because the enum is `#[serde(untagged)]` and serde would
+/// pick the first variant whose fields happen to match – almost always wrong.
+fn row_from_value(table: &str, v: serde_json::Value) -> AppResult<InternalRow> {
+    macro_rules! parse {
+        ($variant:ident, $ty:ty) => {{
+            serde_json::from_value::<$ty>(v)
+                .map(InternalRow::$variant)
+                .map_err(|e| AppError::Internal(format!("Failed to parse row: {}", e)))
+        }};
+    }
+    match table {
+        "route_internal"                      => parse!(RouteInternal, RouteInternal),
+        "route_point_internal"                => parse!(RoutePointInternal, RoutePointInternal),
+        "bus_schedule_internal"               => parse!(BusScheduleInternal, BusScheduleInternal),
+        "bus_schedule_trip_internal"          => parse!(BusScheduleTripInternal, BusScheduleTripInternal),
+        "bus_schedule_trip_detail_internal"   => parse!(BusScheduleTripDetailInternal, BusScheduleTripDetailInternal),
+        "bus_schedule_trip_flexi_internal"    => parse!(BusScheduleTripFlexiInternal, BusScheduleTripFlexiInternal),
+        "service_type_internal"               => parse!(ServiceTypeInternal, ServiceTypeInternal),
+        "stop_internal"                       => parse!(StopInternal, StopInternal),
+        "designations_internal"               => parse!(DesignationsInternal, DesignationsInternal),
+        "employees_internal"                  => parse!(EmployeesInternal, EmployeesInternal),
+        "entities_internal"                   => parse!(EntitiesInternal, EntitiesInternal),
+        "vehicles_internal"                   => parse!(VehiclesInternal, VehiclesInternal),
+        "waybill_device_internal"             => parse!(WaybillDeviceInternal, WaybillDeviceInternal),
+        "fleet_etm_mapping_internal"          => parse!(FleetEtmMappingInternal, FleetEtmMappingInternal),
+        "fleet_obu_mapping_internal"          => parse!(FleetObuMappingInternal, FleetObuMappingInternal),
+        "waybills_internal"                   => parse!(WaybillsInternal, WaybillsInternal),
+        other => Err(AppError::Internal(format!("Unknown table: {}", other))),
+    }
+}
+
 #[async_trait]
 pub trait OperatorService: Send + Sync {
-    async fn get_one_row(
-        &self,
-        table: &str,
-        gtfs_id: &str,
-        query_params: HashMap<String, String>,
-    ) -> AppResult<Option<InternalRow>>;
+    async fn get_one_row(&self, table: &str, gtfs_id: &str, query_params: HashMap<String, String>) -> AppResult<Option<InternalRow>>;
 
-    async fn get_all_rows(
-        &self,
-        table: &str,
-        gtfs_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> AppResult<Vec<InternalRow>>;
+    async fn get_all_rows(&self, table: &str, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<InternalRow>>;
 
     async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64>;
 
@@ -544,6 +671,8 @@ pub trait OperatorService: Send + Sync {
     async fn update_waybill_tablet_id(&self, gtfs_id: &str, waybill_id: i64, tablet_id: &str) -> AppResult<u64>;
 
     async fn get_waybills(&self, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<WaybillsInternal>>;
+
+    async fn query_rows(&self, table: &str, gtfs_id: &str, body: QueryBody) -> AppResult<Vec<InternalRow>>;
 }
 
 pub struct MockOperatorService;
@@ -589,6 +718,7 @@ impl OperatorService for MockOperatorService {
     async fn update_waybill_fleet_number(&self, _gtfs_id: &str, _id: i64, _f: &str) -> AppResult<u64> { mock_err!() }
     async fn update_waybill_tablet_id(&self, _gtfs_id: &str, _id: i64, _t: &str) -> AppResult<u64> { mock_err!() }
     async fn get_waybills(&self, _gtfs_id: &str, _l: i64, _o: i64) -> AppResult<Vec<WaybillsInternal>> { mock_err!() }
+    async fn query_rows(&self, _t: &str, _g: &str, _b: QueryBody) -> AppResult<Vec<InternalRow>> { mock_err!() }
 }
 
 struct DeviceIdsCache {
@@ -714,7 +844,7 @@ impl OperatorService for DBOperatorService {
             .map_err(|e| AppError::DbError(format!("get_one_row {}: {}", table, e)))?;
             
         match val {
-            Some(v) => Ok(Some(serde_json::from_value(v).map_err(|e| AppError::Internal(format!("Failed to parse row: {}", e)))?)),
+            Some(v) => Ok(Some(row_from_value(table, v)?)),
             None => Ok(None)
         }
     }
@@ -742,7 +872,121 @@ impl OperatorService for DBOperatorService {
             .map_err(|e| AppError::DbError(format!("get_all_rows {}: {}", table, e)))?;
 
         vals.into_iter()
-            .map(|v| serde_json::from_value(v).map_err(|e| AppError::Internal(format!("Failed to parse row: {}", e))))
+            .map(|v| row_from_value(table, v))
+            .collect()
+    }
+
+    async fn query_rows(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        body: QueryBody,
+    ) -> AppResult<Vec<InternalRow>> {
+        validate_table(table)?;
+
+        if body.filters.len() > MAX_QUERY_FILTERS {
+            return Err(AppError::BadRequest(format!(
+                "Too many filters: max {} allowed",
+                MAX_QUERY_FILTERS
+            )));
+        }
+
+        let known_cols: std::collections::HashSet<&str> = table_columns(table)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .collect();
+
+        // Validated filters: (col, sql_op, val1)
+        struct Filter {
+            col: String,
+            sql_op: &'static str,
+            val1: String,
+        }
+
+        let mut valid_filters: Vec<Filter> = Vec::new();
+
+        for f in &body.filters {
+            if f.len() < 3 {
+                return Err(AppError::BadRequest(
+                    "Each filter must have at least 3 elements: [column, operator, value]".to_string(),
+                ));
+            }
+
+            let col = &f[0];
+            let op  = f[1].as_str();
+
+            let sql_op: &'static str = match op {
+                "eq"    => "=",
+                "noteq" => "!=",
+                "gt"    => ">",
+                "lt"    => "<",
+                "like"  => "ILIKE",
+                _ => return Err(AppError::BadRequest(format!(
+                    "Unknown operator '{}'. Valid: eq, noteq, gt, lt, like", op
+                ))),
+            };
+
+            // Automatically wrap the value with % wildcards for ILIKE
+            let val1 = if op == "like" {
+                format!("%{}%", f[2])
+            } else {
+                f[2].clone()
+            };
+
+            validate_column_name(col)?;
+
+            if !known_cols.contains(col.as_str()) {
+                return Err(AppError::BadRequest(format!(
+                    "Unknown column '{}' for table '{}'", col, table
+                )));
+            }
+
+            valid_filters.push(Filter { col: col.clone(), sql_op, val1 });
+        }
+
+        if valid_filters.is_empty() {
+            return Err(AppError::BadRequest(
+                "At least one filter is required".to_string(),
+            ));
+        }
+
+        // Build WHERE clause; gtfs_id = $1, filter params start at $2
+        let mut param_idx: usize = 2;
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bind_vals: Vec<String> = Vec::new();
+
+        for f in &valid_filters {
+            where_parts.push(format!("{} {} ${}", f.col, f.sql_op, param_idx));
+            bind_vals.push(f.val1.clone());
+            param_idx += 1;
+        }
+
+        let limit  = body.limit.unwrap_or(15).min(MAX_QUERY_LIMIT);
+        let offset = body.offset.unwrap_or(0);
+
+        let sql = format!(
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY 1 LIMIT ${} OFFSET ${}) t",
+            table,
+            where_parts.join(" AND "),
+            param_idx,
+            param_idx + 1,
+        );
+
+        let mut q = sqlx::query_scalar::<_, Value>(&sql);
+        q = q.bind(gtfs_id);
+        for v in &bind_vals {
+            q = q.bind(v.as_str());
+        }
+        q = q.bind(limit).bind(offset);
+
+        let vals: Vec<Value> = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("query_rows {}: {}", table, e)))?;
+
+        vals.into_iter()
+            .map(|v| row_from_value(table, v))
             .collect()
     }
 
