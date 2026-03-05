@@ -76,6 +76,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 actix_web::web::get().to(get_bus_route_schedule),
             )
             .route(
+                "/bus-trip-schedule/{gtfs_id}/{waybill_no}/{trip_number}/{route_id}",
+                actix_web::web::get().to(get_bus_trip_schedule),
+            )
+            .route(
                 "/route/{gtfs_id}/{route_id}",
                 actix_web::web::get().to(get_route),
             )
@@ -1147,6 +1151,67 @@ fn calculate_eta_from_haversine_distance(
     bus_stop_etas
 }
 
+async fn get_bus_trip_schedule(
+    app_state: Data<AppState>,
+    path: Path<(String, String, i32, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, waybill_no, trip_number, route_id) = path.into_inner();
+
+    let route_stop_mappings = app_state
+        .gtfs_service
+        .get_route_stop_mapping_by_route(&gtfs_id, &route_id)
+        .await
+        .unwrap_or_default();
+
+    let all = app_state
+        .db_vehicle_reader
+        .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number)
+        .await?;
+
+    let schedule_details: BusScheduleDetails = all
+        .into_iter()
+        .map(|row: crate::models::VehicleData| {
+            let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
+                (row.db_start_time.as_deref(), row.duty_date.as_deref())
+            {
+                let date = chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
+                let time = chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
+                if let (Some(d), Some(t)) = (date, time) {
+                    let dt = chrono::NaiveDateTime::new(d, t);
+                    if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
+                        use chrono::TimeZone;
+                        offset
+                            .from_local_datetime(&dt)
+                            .single()
+                            .map(|dt_tz| dt_tz.timestamp_millis())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                row.start_time_epoch
+                    .as_deref()
+                    .and_then(|s| s.parse::<i64>().ok())
+            };
+
+            let bus_stop_etas =
+                calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
+
+            crate::models::BusScheduleDetail {
+                eta: bus_stop_etas,
+                vehicle_no: row.vehicle_no,
+                service_tier: row.service_type,
+                trip_number: row.trip_number,
+                waybill_no: Some(row.waybill_no),
+            }
+        })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(schedule_details))
+}
+
 async fn get_bus_route_schedule(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
@@ -1173,35 +1238,30 @@ async fn get_bus_route_schedule(
             .map(|row: crate::models::VehicleData| {
                 // Resolve trip start time from (db_start_time HH:MM + duty_date) or
                 // fall back to the stored epoch-millis in start_time_epoch.
-                let trip_start_time: Option<i64> =
-                    if let (Some(hhmm), Some(duty)) =
-                        (row.db_start_time.as_deref(), row.duty_date.as_deref())
-                    {
-                        let date =
-                            chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
-                        let time =
-                            chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
-                        if let (Some(d), Some(t)) = (date, time) {
-                            let dt = chrono::NaiveDateTime::new(d, t);
-                            if let Some(offset) =
-                                chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-                            {
-                                use chrono::TimeZone;
-                                offset
-                                    .from_local_datetime(&dt)
-                                    .single()
-                                    .map(|dt_tz| dt_tz.timestamp_millis())
-                            } else {
-                                None
-                            }
+                let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
+                    (row.db_start_time.as_deref(), row.duty_date.as_deref())
+                {
+                    let date = chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
+                    let time = chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
+                    if let (Some(d), Some(t)) = (date, time) {
+                        let dt = chrono::NaiveDateTime::new(d, t);
+                        if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
+                            use chrono::TimeZone;
+                            offset
+                                .from_local_datetime(&dt)
+                                .single()
+                                .map(|dt_tz| dt_tz.timestamp_millis())
                         } else {
                             None
                         }
                     } else {
-                        row.start_time_epoch
-                            .as_deref()
-                            .and_then(|s| s.parse::<i64>().ok())
-                    };
+                        None
+                    }
+                } else {
+                    row.start_time_epoch
+                        .as_deref()
+                        .and_then(|s| s.parse::<i64>().ok())
+                };
 
                 let bus_stop_etas =
                     calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
