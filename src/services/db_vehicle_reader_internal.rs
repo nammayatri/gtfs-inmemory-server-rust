@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -8,6 +9,78 @@ use tracing::{error, info};
 
 use crate::models::{BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillStatus};
 use crate::tools::error::{AppError, AppResult};
+
+#[async_trait]
+pub trait VehicleDataReaderInternal: Send + Sync {
+    async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool;
+    async fn get_vehicle_data(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+        trip_number: Option<i32>,
+    ) -> AppResult<VehicleDataWithRouteId>;
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        route_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>>;
+    async fn get_chennai_waybill_by_waybill_and_trip(
+        &self,
+        waybill_no: &str,
+        trip_number: i32,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>>;
+}
+
+// Mock implementation for local testing without a database
+pub struct MockDBVehicleReaderInternal;
+
+impl MockDBVehicleReaderInternal {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MockDBVehicleReaderInternal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
+    async fn is_vehicle_in_internal(&self, _vehicle_no: &str, _gtfs_id: &str) -> bool {
+        false
+    }
+
+    async fn get_vehicle_data(
+        &self,
+        _vehicle_no: &str,
+        _gtfs_id: &str,
+        _trip_number: Option<i32>,
+    ) -> AppResult<VehicleDataWithRouteId> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        _route_id: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_chennai_waybill_by_waybill_and_trip(
+        &self,
+        _waybill_no: &str,
+        _trip_number: i32,
+        _gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        Ok(Vec::new())
+    }
+}
 
 pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
@@ -50,7 +123,7 @@ impl DBVehicleReaderInternal {
 
     /// Returns true if vehicle_no exists in vehicles_internal for the given gtfs_id.
     /// Any DB error is treated as "not found" so the caller falls back gracefully.
-    pub async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
+    async fn is_vehicle_in_internal_impl(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
         let pool = match &self.pool {
             Some(p) => p,
             None => return false,
@@ -90,7 +163,7 @@ impl DBVehicleReaderInternal {
     }
 
     /// Full vehicle data fetch against _internal tables, mirroring DBVehicleReader::get_vehicle_data.
-    pub async fn get_vehicle_data(
+    async fn get_vehicle_data_impl(
         &self,
         vehicle_no: &str,
         gtfs_id: &str,
@@ -293,7 +366,7 @@ impl DBVehicleReaderInternal {
             LEFT JOIN entities_internal e
                    ON e.entity_id = w.entity_id AND e.gtfs_id = $2
             WHERE w.vehicle_no = $1
-              AND w.status     = 'Online'
+              AND w.status     = 'online'
               AND w.deleted    = false
               AND w.gtfs_id   = $2
             ORDER BY w.updated_at DESC
@@ -701,7 +774,7 @@ impl DBVehicleReaderInternal {
         Ok(())
     }
 
-    pub async fn get_chennai_waybills_by_route_id(
+    async fn get_chennai_waybills_by_route_id_impl(
         &self,
         route_id: &str,
         gtfs_id: &str,
@@ -764,7 +837,7 @@ impl DBVehicleReaderInternal {
                     AND bstf.gtfs_id = $2
                     AND bstf.trip_type <> 'dead-trip'
                 WHERE
-                    w.status = 'Online'
+                    w.status = 'online'
                     AND w.deleted = false
                     AND w.gtfs_id = $2
                     AND (
@@ -819,5 +892,127 @@ impl DBVehicleReaderInternal {
                 Ok(Vec::new())
             }
         }
+    }
+
+    async fn get_chennai_waybill_by_waybill_and_trip_impl(
+        &self,
+        waybill_no: &str,
+        trip_number: i32,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => {
+                return Ok(Vec::new()); // No pool available (mock mode)
+            }
+        };
+
+        let query = r#"
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                e.entity_remark::text,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted,
+                w.status,
+                w.is_flexi,
+                COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
+                COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
+                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
+            FROM waybills_internal w
+            LEFT JOIN entities_internal e
+                ON e.entity_id = w.entity_id
+                AND e.gtfs_id = $3
+            LEFT JOIN bus_schedule_trip_detail_internal bstd
+                ON w.is_flexi = false
+                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                AND bstd.trip_number = $2
+                AND bstd.gtfs_id = $3
+                AND bstd.trip_type <> 'dead-trip'
+            LEFT JOIN bus_schedule_trip_flexi_internal bstf
+                ON w.is_flexi = true
+                AND bstf.waybill_id = w.waybill_id::bigint
+                AND bstf.trip_number = $2
+                AND bstf.gtfs_id = $3
+                AND bstf.trip_type <> 'dead-trip'
+            WHERE
+                w.waybill_no::text = $1
+                AND w.gtfs_id = $3
+                AND w.status = 'online'
+                AND w.deleted = false
+                AND (
+                    (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                    OR
+                    (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                )
+            ORDER BY w.waybill_no, trip_number;
+        "#;
+
+        match sqlx::query_as::<_, VehicleData>(query)
+            .bind(waybill_no)
+            .bind(trip_number)
+            .bind(gtfs_id)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                info!(
+                    "Internal Chennai waybill+trip query: found {} rows for waybill_no={}, trip_number={}, gtfs_id={}",
+                    rows.len(),
+                    waybill_no,
+                    trip_number,
+                    gtfs_id
+                );
+                Ok(rows)
+            }
+            Err(e) => {
+                error!(
+                    "Internal get_chennai_waybill_by_waybill_and_trip failed for waybill_no={}, trip_number={}, gtfs_id={}: {}",
+                    waybill_no, trip_number, gtfs_id, e
+                );
+                // Fail gracefully so external results are still returned
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl VehicleDataReaderInternal for DBVehicleReaderInternal {
+    async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
+        self.is_vehicle_in_internal_impl(vehicle_no, gtfs_id).await
+    }
+
+    async fn get_vehicle_data(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+        trip_number: Option<i32>,
+    ) -> AppResult<VehicleDataWithRouteId> {
+        self.get_vehicle_data_impl(vehicle_no, gtfs_id, trip_number).await
+    }
+
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        route_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id).await
+    }
+
+    async fn get_chennai_waybill_by_waybill_and_trip(
+        &self,
+        waybill_no: &str,
+        trip_number: i32,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        self.get_chennai_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id).await
     }
 }
