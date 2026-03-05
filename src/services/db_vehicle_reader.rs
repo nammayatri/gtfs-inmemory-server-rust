@@ -74,6 +74,11 @@ pub trait VehicleDataReader: Send + Sync {
         &self,
         route_id: &str,
     ) -> AppResult<Vec<VehicleData>>;
+    async fn get_chennai_waybill_by_waybill_and_trip(
+        &self,
+        waybill_no: &str,
+        trip_number: i32,
+    ) -> AppResult<Vec<VehicleData>>;
     async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>>;
 }
 
@@ -193,6 +198,15 @@ impl VehicleDataReader for MockDBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         _route_id: &str,
+    ) -> AppResult<Vec<VehicleData>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+    async fn get_chennai_waybill_by_waybill_and_trip(
+        &self,
+        _waybill_no: &str,
+        _trip_number: i32,
     ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -2246,6 +2260,80 @@ impl VehicleDataReader for DBVehicleReader {
                 error!(
                     "Chennai get_waybills_by_route_id failed for route_id={}: {}",
                     route_id, e
+                );
+                Err(AppError::Internal(format!("Database query failed: {}", e)))
+            }
+        }
+    }
+
+    async fn get_chennai_waybill_by_waybill_and_trip(
+        &self,
+        waybill_no: &str,
+        trip_number: i32,
+    ) -> AppResult<Vec<VehicleData>> {
+        let query = r#"
+            SELECT
+                w.waybill_id::text,
+                w.waybill_no::text,
+                w.service_type,
+                w.vehicle_no,
+                w.schedule_no,
+                w.updated_at::timestamptz AS last_updated,
+                w.duty_date,
+                w.schedule_trip_id::text,
+                e.entity_remark::text,
+                w.driver_token_no::text AS driver_code,
+                w.conductor_token_no::text AS conductor_code,
+                w.deleted,
+                w.status,
+                w.is_flexi,
+                COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
+                COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
+                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
+            FROM waybills w
+            LEFT JOIN entities e
+                ON e.entity_id = w.entity_id
+            LEFT JOIN bus_schedule_trip_detail bstd
+                ON w.is_flexi = false
+                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                AND bstd.trip_number = $2
+                AND bstd.trip_type <> 'dead-trip'
+            LEFT JOIN bus_schedule_trip_flexi bstf
+                ON w.is_flexi = true
+                AND bstf.waybill_id = w.waybill_id::bigint
+                AND bstf.trip_number = $2
+                AND bstf.trip_type <> 'dead-trip'
+            WHERE
+                w.waybill_no::text = $1
+                AND w.status = 'Online'
+                AND w.deleted = false
+                AND (
+                    (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                    OR
+                    (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                )
+            ORDER BY w.waybill_no, trip_number;
+        "#;
+
+        match sqlx::query_as::<_, VehicleData>(query)
+            .bind(waybill_no)
+            .bind(trip_number)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => {
+                info!(
+                    "Chennai waybill+trip query: found {} rows for waybill_no={}, trip_number={}",
+                    rows.len(),
+                    waybill_no,
+                    trip_number
+                );
+                Ok(rows)
+            }
+            Err(e) => {
+                error!(
+                    "get_chennai_waybill_by_waybill_and_trip failed for waybill_no={}, trip_number={}: {}",
+                    waybill_no, trip_number, e
                 );
                 Err(AppError::Internal(format!("Database query failed: {}", e)))
             }
