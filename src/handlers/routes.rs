@@ -4,7 +4,7 @@ use actix_web::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::services::operator::{break_types, day_types, shift_types, trip_types, waybill_statuses, SUPPORTED_OPERATOR_GTFS_IDS};
+use crate::services::operator::{break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody, SUPPORTED_OPERATOR_GTFS_IDS};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,6 +78,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 web::scope("/internal/operator/{gtfs_id}")
                     .route("/crud/{table}", web::get().to(get_one_row))
                     .route("/crud/{table}/all", web::get().to(get_all_rows))
+                    .route("/crud/{table}/query", web::post().to(query_rows_handler))
                     .route("/crud/{table}/delete", web::post().to(delete_one_row))
                     .route("/crud/{table}/upsert", web::post().to(upsert_one_row))
                     .route("/service-types", web::get().to(get_service_types))
@@ -1734,6 +1735,22 @@ async fn get_all_rows(
     let rows = app_state
         .operator_service
         .get_all_rows(&table, &gtfs_id, limit, offset)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+async fn query_rows_handler(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    body: Json<QueryBody>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, table) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows = app_state
+        .operator_service
+        .query_rows(&table, &gtfs_id, body.into_inner())
         .await?;
 
     Ok(HttpResponse::Ok().json(rows))
