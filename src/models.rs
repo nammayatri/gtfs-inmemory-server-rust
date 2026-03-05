@@ -525,6 +525,16 @@ pub struct MinimalEmployee {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepotManagerDetails {
+    #[serde(rename = "depotCode")]
+    pub depot_code: String,
+    #[serde(rename = "depotName")]
+    pub depot_name: String,
+    #[serde(skip)]
+    pub phone_number: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusRegistrationMappingRecord {
     pub gtfs_id: String,
     pub vehicle_no: String,

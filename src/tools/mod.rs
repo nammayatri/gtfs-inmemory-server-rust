@@ -8,4 +8,5 @@
 
 pub mod dhall;
 pub mod error;
+pub mod hash;
 pub mod prometheus;

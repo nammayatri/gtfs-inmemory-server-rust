@@ -49,6 +49,8 @@ urlencoding = "2.1"
 
 # Hash computation
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 
 # System information
 sysinfo = "0.30"

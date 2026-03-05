@@ -62,6 +62,7 @@ pub struct AppConfig {
     pub ignored_trip_ids: Vec<String>,
     pub bhubaneswar_cache_update_interval: u64,
     pub bhubaneswar_external_auth: Option<String>,
+    pub phone_number_hash_key: String,
 }
 
 impl OtpConfig {
@@ -126,6 +127,7 @@ pub struct AppState {
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub conductor_details: Arc<HashMap<String, crate::models::MinimalEmployee>>,
+    pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
 }
 
 impl AppState {
@@ -190,6 +192,9 @@ impl AppState {
         // Load conductor details from CSV
         let conductor_details = Arc::new(Self::load_conductor_details().await?);
 
+        // Load depot manager details from CSV
+        let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
+
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
@@ -201,6 +206,7 @@ impl AppState {
             fleet_list: Arc::new(Self::load_fleet_list().await?),
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
             conductor_details,
+            depot_manager_details,
         };
 
         Ok(app_state)
@@ -413,12 +419,13 @@ impl AppState {
                         continue;
                     };
 
-                    let phone = phone_number.trim().to_string();
+                    // CSV stores pre-computed HMAC-SHA256 hash of the phone number
+                    let phone_hash = phone_number.trim().to_string();
                     let token = token_no.trim().to_string();
                     let full_name = name.trim();
                     let depot = depot_name.trim().to_string();
 
-                    if phone.is_empty() || token.is_empty() {
+                    if phone_hash.is_empty() || token.is_empty() {
                         continue;
                     }
 
@@ -438,11 +445,11 @@ impl AppState {
                         token_no: Some(token),
                         first_name,
                         last_name,
-                        mobile_no: Some(phone.clone()),
+                        mobile_no: None,
                         depot_name: depot_opt,
                     };
 
-                    phone_to_employee.insert(phone, employee);
+                    phone_to_employee.insert(phone_hash, employee);
                 }
                 Err(e) => {
                     error!("Error parsing conductor_details CSV row: {}", e);
@@ -456,5 +463,71 @@ impl AppState {
         );
 
         Ok(phone_to_employee)
+    }
+
+    async fn load_depot_manager_details(
+    ) -> Result<HashMap<String, crate::models::DepotManagerDetails>> {
+        use crate::models::DepotManagerDetails;
+        let file_path = "./assets/depot_manager_details.csv";
+
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                info!("depot_manager_details.csv file not found, proceeding without depot manager data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read depot_manager_details.csv: {}", e))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        // phone_number -> DepotManagerDetails
+        let mut phone_to_manager: HashMap<String, DepotManagerDetails> = HashMap::new();
+
+        for result in reader.records() {
+            match result {
+                Ok(record) => {
+                    // CSV columns: S. No.(0), Depot Code(1), Depot Name(2), Phone Number(3)
+                    let (Some(depot_code), Some(depot_name), Some(phone_number)) =
+                        (record.get(1), record.get(2), record.get(3))
+                    else {
+                        continue;
+                    };
+
+                    // CSV stores pre-computed HMAC-SHA256 hash of the phone number
+                    let phone_hash = phone_number.trim().to_string();
+                    let code = depot_code.trim().to_string();
+                    let name = depot_name.trim().to_string();
+
+                    if phone_hash.is_empty() || code.is_empty() || name.is_empty() {
+                        continue;
+                    }
+
+                    let manager = DepotManagerDetails {
+                        depot_code: code,
+                        depot_name: name,
+                        phone_number: phone_hash.clone(),
+                    };
+
+                    phone_to_manager.insert(phone_hash, manager);
+                }
+                Err(e) => {
+                    error!("Error parsing depot_manager_details CSV row: {}", e);
+                }
+            }
+        }
+
+        info!(
+            "Loaded depot manager details for {} managers",
+            phone_to_manager.len()
+        );
+
+        Ok(phone_to_manager)
     }
 }
