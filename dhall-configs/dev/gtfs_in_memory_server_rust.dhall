@@ -11,6 +11,7 @@ in {
 
   -- Database configuration
   database_url = None Text,
+  internal_database_url = None Text,
   db_max_connections = 20,
   db_min_connections = 1,
   db_acquire_timeout = 5,
