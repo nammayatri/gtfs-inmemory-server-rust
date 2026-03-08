@@ -415,14 +415,14 @@ impl DBVehicleReaderInternal {
             LEFT JOIN entities_internal e
                    ON e.entity_id = w.entity_id AND e.gtfs_id = $2
             WHERE w.vehicle_no = $1
-              AND w.status IN ('Processed', 'New', 'Closed')
+              AND w.status IN ('processed', 'new', 'closed')
               AND w.deleted    = false
               AND w.gtfs_id   = $2
             ORDER BY
                 CASE
-                    WHEN w.status = 'Processed' THEN 1
-                    WHEN w.status = 'New'       THEN 2
-                    WHEN w.status = 'Closed'    THEN 3
+                    WHEN w.status = 'processed' THEN 1
+                    WHEN w.status = 'new'       THEN 2
+                    WHEN w.status = 'closed'    THEN 3
                 END,
                 w.updated_at DESC
             LIMIT 1

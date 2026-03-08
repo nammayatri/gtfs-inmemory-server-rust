@@ -4,6 +4,7 @@ use actix_web::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use crate::handlers::fleet_operator;
 use crate::services::operator::{break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody, SUPPORTED_OPERATOR_GTFS_IDS};
 
 use std::collections::HashMap;
@@ -100,6 +101,13 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/waybill/fleet", web::post().to(update_waybill_fleet))
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
                     .route("/waybills", web::get().to(get_waybills))
+            )
+            .service(
+                web::scope("internal/fleet-operator/{gtfs_id}")
+                    .route("/currentOperation", web::post().to(fleet_operator::current_operation))
+                    .route("/tripAction", web::post().to(fleet_operator::trip_action))
+                    .route("/currentTripDetails", web::post().to(fleet_operator::current_trip_details))
+                    .route("/verify", web::post().to(fleet_operator::verify)),
             )
             .route(
                 "/bus-route-schedule/{gtfs_id}/{route_id}",
