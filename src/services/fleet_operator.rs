@@ -785,10 +785,11 @@ impl FleetOperatorService for DBFleetOperatorService {
                 is_active_trip,
             };
 
-            if trip_number < previous_trip_number {
-                history.push(trip_data);
-            } else if trip_number == previous_trip_number && is_active_trip {
+
+            if trip_number == previous_trip_number && is_active_trip {
                 current = Some(trip_data);
+            } else if trip_number <= previous_trip_number {
+                history.push(trip_data);
             } else {
                 upcoming.push(trip_data);
             }

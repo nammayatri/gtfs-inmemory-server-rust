@@ -1142,8 +1142,11 @@ impl OperatorService for DBOperatorService {
         }
 
         // Build column list from caller's keys, excluding gtfs_id (we inject it ourselves)
+        // Also exclude keys whose value is JSON null — omit-null semantics so that a partial
+        // update (e.g. just {waybill_id, duty_date}) never triggers NOT NULL violations on
+        // columns the caller didn't intend to touch.
         let mut cols: Vec<&str> = first_obj.keys()
-            .filter(|k| k.as_str() != "gtfs_id")
+            .filter(|k| k.as_str() != "gtfs_id" && !first_obj[k.as_str()].is_null())
             .map(|s| s.as_str())
             .collect();
         cols.push("gtfs_id"); // gtfs_id always last
