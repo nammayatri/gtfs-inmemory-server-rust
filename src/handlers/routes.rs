@@ -1883,9 +1883,25 @@ async fn upsert_one_row(
     let (gtfs_id, table) = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
 
+    // Extract to_regen from request body if present
+    let mut body_value = body.into_inner();
+    let to_regen = body_value
+        .get("to_regen")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        });
+
+    // Remove to_regen from body before passing to service
+    if body_value.get("to_regen").is_some() {
+        body_value.as_object_mut().map(|obj| obj.remove("to_regen"));
+    }
+
     let result = app_state
         .operator_service
-        .upsert_one_row(&table, &gtfs_id, body.into_inner())
+        .upsert_one_row(&table, &gtfs_id, body_value, to_regen)
         .await?;
 
     Ok(HttpResponse::Ok().json(result))

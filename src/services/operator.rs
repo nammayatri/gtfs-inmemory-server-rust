@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::services::field_generator;
 use crate::tools::error::{AppError, AppResult};
 
 pub fn shift_types() -> Vec<&'static str> {
@@ -646,7 +647,13 @@ pub trait OperatorService: Send + Sync {
 
     async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64>;
 
-    async fn upsert_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<Value>;
+    async fn upsert_one_row(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        data: Value,
+        to_regen: Option<Vec<String>>,
+    ) -> AppResult<Value>;
 
     async fn get_service_types_list(&self, gtfs_id: &str) -> AppResult<Vec<ServiceTypeRow>>;
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>>;
@@ -699,26 +706,91 @@ macro_rules! mock_err {
 
 #[async_trait]
 impl OperatorService for MockOperatorService {
-    async fn get_one_row(&self, _t: &str, _g: &str, _q: HashMap<String, String>) -> AppResult<Option<InternalRow>> { mock_err!() }
-    async fn get_all_rows(&self, _t: &str, _g: &str, _l: i64, _o: i64) -> AppResult<Vec<InternalRow>> { mock_err!() }
-    async fn delete_one_row(&self, _t: &str, _g: &str, _d: Value) -> AppResult<u64> { mock_err!() }
-    async fn upsert_one_row(&self, _t: &str, _g: &str, _d: Value) -> AppResult<Value> { mock_err!() }
-    async fn get_service_types_list(&self, _gtfs_id: &str) -> AppResult<Vec<ServiceTypeRow>> { mock_err!() }
-    async fn get_routes_list(&self, _gtfs_id: &str) -> AppResult<Vec<RouteRow>> { mock_err!() }
-    async fn get_depot_names_and_ids(&self, _gtfs_id: &str) -> AppResult<Vec<DepotRow>> { mock_err!() }
-    async fn get_schedule_numbers(&self, _gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>> { mock_err!() }
-    async fn get_schedule_trip_details_by_schedule_number(&self, _gtfs_id: &str, _s: &str) -> AppResult<Vec<TripDetailRow>> { mock_err!() }
-    async fn get_fleets(&self, _gtfs_id: &str) -> AppResult<Vec<FleetRow>> { mock_err!() }
-    async fn get_conductor_data(&self, _gtfs_id: &str, _t: &str) -> AppResult<Option<EmployeeRow>> { mock_err!() }
-    async fn get_driver_info(&self, _gtfs_id: &str, _t: &str) -> AppResult<Option<EmployeeRow>> { mock_err!() }
-    async fn get_device_ids(&self, _gtfs_id: &str) -> AppResult<Vec<String>> { mock_err!() }
-    async fn get_tablet_ids(&self, _gtfs_id: &str) -> AppResult<Vec<String>> { mock_err!() }
-    async fn get_operators(&self, _gtfs_id: &str, _r: &str) -> AppResult<Vec<EmployeeRow>> { mock_err!() }
-    async fn update_waybill_status(&self, _gtfs_id: &str, _id: i64, _s: &str) -> AppResult<u64> { mock_err!() }
-    async fn update_waybill_fleet_number(&self, _gtfs_id: &str, _id: i64, _f: &str) -> AppResult<u64> { mock_err!() }
-    async fn update_waybill_tablet_id(&self, _gtfs_id: &str, _id: i64, _t: &str) -> AppResult<u64> { mock_err!() }
-    async fn get_waybills(&self, _gtfs_id: &str, _l: i64, _o: i64) -> AppResult<Vec<WaybillsInternal>> { mock_err!() }
-    async fn query_rows(&self, _t: &str, _g: &str, _b: QueryBody) -> AppResult<Vec<InternalRow>> { mock_err!() }
+    async fn get_one_row(&self, _table: &str, _gtfs_id: &str, _query_params: HashMap<String, String>) -> AppResult<Option<InternalRow>> {
+        mock_err!()
+    }
+
+    async fn get_all_rows(&self, _table: &str, _gtfs_id: &str, _limit: i64, _offset: i64) -> AppResult<Vec<InternalRow>> {
+        mock_err!()
+    }
+
+    async fn delete_one_row(&self, _table: &str, _gtfs_id: &str, _data: Value) -> AppResult<u64> {
+        mock_err!()
+    }
+
+    async fn upsert_one_row(
+        &self,
+        _table: &str,
+        _gtfs_id: &str,
+        _data: Value,
+        _to_regen: Option<Vec<String>>,
+    ) -> AppResult<Value> {
+        mock_err!()
+    }
+
+    async fn get_service_types_list(&self, _gtfs_id: &str) -> AppResult<Vec<ServiceTypeRow>> {
+        mock_err!()
+    }
+
+    async fn get_routes_list(&self, _gtfs_id: &str) -> AppResult<Vec<RouteRow>> {
+        mock_err!()
+    }
+
+    async fn get_depot_names_and_ids(&self, _gtfs_id: &str) -> AppResult<Vec<DepotRow>> {
+        mock_err!()
+    }
+
+    async fn get_schedule_numbers(&self, _gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>> {
+        mock_err!()
+    }
+
+    async fn get_schedule_trip_details_by_schedule_number(&self, _gtfs_id: &str, _schedule_number: &str) -> AppResult<Vec<TripDetailRow>> {
+        mock_err!()
+    }
+
+    async fn get_fleets(&self, _gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
+        mock_err!()
+    }
+
+    async fn get_conductor_data(&self, _gtfs_id: &str, _token: &str) -> AppResult<Option<EmployeeRow>> {
+        mock_err!()
+    }
+
+    async fn get_driver_info(&self, _gtfs_id: &str, _token: &str) -> AppResult<Option<EmployeeRow>> {
+        mock_err!()
+    }
+
+    async fn get_device_ids(&self, _gtfs_id: &str) -> AppResult<Vec<String>> {
+        mock_err!()
+    }
+
+    async fn get_tablet_ids(&self, _gtfs_id: &str) -> AppResult<Vec<String>> {
+        mock_err!()
+    }
+
+    async fn get_operators(&self, _gtfs_id: &str, _role: &str) -> AppResult<Vec<EmployeeRow>> {
+        mock_err!()
+    }
+
+    async fn update_waybill_status(&self, _gtfs_id: &str, _waybill_id: i64, _status: &str) -> AppResult<u64> {
+        mock_err!()
+    }
+
+    async fn update_waybill_fleet_number(&self, _gtfs_id: &str, _waybill_id: i64, _fleet_no: &str) -> AppResult<u64> {
+        mock_err!()
+    }
+
+    async fn update_waybill_tablet_id(&self, _gtfs_id: &str, _waybill_id: i64, _tablet_id: &str) -> AppResult<u64> {
+        mock_err!()
+    }
+
+    async fn get_waybills(&self, _gtfs_id: &str, _limit: i64, _offset: i64) -> AppResult<Vec<WaybillsInternal>> {
+        mock_err!()
+    }
+
+    async fn query_rows(&self, _table: &str, _gtfs_id: &str, _body: QueryBody) -> AppResult<Vec<InternalRow>> {
+        mock_err!()
+    }
 }
 
 struct DeviceIdsCache {
@@ -1023,22 +1095,42 @@ impl OperatorService for DBOperatorService {
         Ok(result.rows_affected())
     }
 
-    async fn upsert_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<Value> {
+    async fn upsert_one_row(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        mut data: Value,
+        to_regen: Option<Vec<String>>,
+    ) -> AppResult<Value> {
         validate_table(table)?;
         let pk = table_pk(table)
             .ok_or_else(|| AppError::Internal(format!("No PK for table: {}", table)))?;
 
         let is_array = data.is_array();
-        let arr = if let Some(a) = data.as_array() {
-            a.clone()
+        let mut arr = if let Some(a) = data.as_array_mut() {
+            std::mem::take(a)
         } else if data.is_object() {
-            vec![data.clone()]
+            vec![data]
         } else {
-            return Err(AppError::BadRequest("Body must be a JSON object or array of objects".to_string()));
+            return Err(AppError::BadRequest(
+                "Body must be a JSON object or array of objects".to_string(),
+            ));
         };
 
         if arr.is_empty() {
             return Err(AppError::BadRequest("Body is empty".to_string()));
+        }
+
+        // Apply field regeneration if requested
+        if let Some(ref regen_fields) = to_regen {
+            if let Some(columns) = table_columns(table) {
+                field_generator::apply_regeneration(&mut arr, regen_fields, columns)?;
+            } else {
+                return Err(AppError::BadRequest(format!(
+                    "Cannot regenerate fields: unknown table '{}'",
+                    table
+                )));
+            }
         }
 
         let first_obj = arr[0]
