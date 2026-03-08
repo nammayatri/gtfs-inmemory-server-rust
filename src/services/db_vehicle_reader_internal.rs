@@ -837,7 +837,7 @@ impl DBVehicleReaderInternal {
                     AND bstf.gtfs_id = $2
                     AND bstf.trip_type <> 'dead-trip'
                 WHERE
-                    w.status = 'online'
+                    w.status in ('online', 'upcoming')
                     AND w.deleted = false
                     AND w.gtfs_id = $2
                     AND (
@@ -851,14 +851,14 @@ impl DBVehicleReaderInternal {
             FROM (
                 SELECT *,
                     MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
-                    OVER (
-                        PARTITION BY waybill_no
-                        ORDER BY trip_number
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS seen_active
+                    OVER (PARTITION BY waybill_no) AS has_active,
+                    MAX(CASE WHEN is_active_trip THEN trip_number END)
+                    OVER (PARTITION BY waybill_no) AS active_trip_number
                 FROM base
             ) t
-            WHERE seen_active = 1
+            WHERE
+                has_active = 0
+                OR trip_number >= active_trip_number
             ORDER BY waybill_no, trip_number;
         "#;
 
@@ -945,7 +945,7 @@ impl DBVehicleReaderInternal {
             WHERE
                 w.waybill_no::text = $1
                 AND w.gtfs_id = $3
-                AND w.status = 'online'
+                AND w.status in ('online', 'upcoming')
                 AND w.deleted = false
                 AND (
                     (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)

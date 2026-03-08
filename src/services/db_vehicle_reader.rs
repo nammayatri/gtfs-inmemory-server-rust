@@ -2225,14 +2225,14 @@ impl VehicleDataReader for DBVehicleReader {
             FROM (
                 SELECT *,
                     MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
-                    OVER (
-                        PARTITION BY waybill_no
-                        ORDER BY trip_number
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS seen_active
+                    OVER (PARTITION BY waybill_no) AS has_active,
+                    MAX(CASE WHEN is_active_trip THEN trip_number END)
+                    OVER (PARTITION BY waybill_no) AS active_trip_number
                 FROM base
             ) t
-            WHERE seen_active = 1
+            WHERE
+                has_active = 0
+                OR trip_number >= active_trip_number
             ORDER BY waybill_no, trip_number;
         "#;
 
