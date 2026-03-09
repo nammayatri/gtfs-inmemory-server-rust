@@ -128,6 +128,7 @@ pub struct AppState {
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub conductor_details: Arc<HashMap<String, crate::models::MinimalEmployee>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
+    pub premium_bus_schedules: Arc<HashMap<String, Vec<i32>>>,
 }
 
 impl AppState {
@@ -195,6 +196,9 @@ impl AppState {
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
 
+        // Load premium bus schedules from CSV
+        let premium_bus_schedules = Arc::new(Self::load_premium_bus_schedules().await?);
+
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
@@ -207,9 +211,76 @@ impl AppState {
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
             conductor_details,
             depot_manager_details,
+            premium_bus_schedules,
         };
 
         Ok(app_state)
+    }
+
+    async fn load_premium_bus_schedules() -> Result<HashMap<String, Vec<i32>>> {
+        let file_path = "./assets/premium_bus_schedules.csv";
+
+        let mut file = match File::open(file_path).await {
+            Ok(file) => file,
+            Err(_) => {
+                info!("premium_bus_schedules.csv file not found, proceeding without premium bus schedule data");
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read premium_bus_schedules.csv: {}", e))?;
+
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(contents.as_bytes());
+
+        // route_number_id -> Vec<eta_in_mins> ordered by sequence_number
+        let mut schedules_map: HashMap<String, std::collections::BTreeMap<i32, i32>> = HashMap::new();
+
+        for result in reader.records() {
+            match result {
+                Ok(record) => {
+                    // CSV headers: sequence_number,route_number_id,route_short_name,bus_stop_name,timings,ETA_in_mins
+                    let (Some(seq_num_str), Some(route_id), Some(eta_str)) =
+                        (record.get(0), record.get(1), record.get(5))
+                    else {
+                        continue;
+                    };
+
+                    let seq_num = seq_num_str.trim().parse::<i32>().unwrap_or(0);
+                    let eta = eta_str.trim().parse::<i32>().unwrap_or(0);
+
+                    schedules_map
+                        .entry(route_id.trim().to_string())
+                        .or_default()
+                        .insert(seq_num, eta);
+                }
+                Err(e) => {
+                    error!("Error parsing premium_bus_schedules CSV row: {}", e);
+                }
+            }
+        }
+
+        let schedules_map_len = schedules_map.len();
+
+        // Convert the BTreeMap (which inherently sorts by sequence_number) into a flat Vec
+        let final_map = schedules_map
+            .into_iter()
+            .map(|(route_id, eta_map)| {
+                let etas: Vec<i32> = eta_map.into_values().collect();
+                (route_id, etas)
+            })
+            .collect();
+
+        info!(
+            "Loaded premium bus schedules for {} routes",
+            schedules_map_len
+        );
+
+        Ok(final_map)
     }
 
     async fn load_fleet_list() -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
