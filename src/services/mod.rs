@@ -1,5 +1,9 @@
 pub mod chalo_vehicle_cache;
 pub mod db_employee_reader;
 pub mod db_vehicle_reader;
+pub mod db_vehicle_reader_internal;
+pub mod fleet_operator;
+pub mod field_generator;
 pub mod gtfs_service;
+pub mod operator;
 pub mod trip_service;

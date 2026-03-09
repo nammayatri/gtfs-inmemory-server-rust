@@ -13,7 +13,10 @@ use crate::services::{
     chalo_vehicle_cache::ChaloVehicleCache,
     db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
+    db_vehicle_reader_internal::{DBVehicleReaderInternal, MockDBVehicleReaderInternal, VehicleDataReaderInternal},
+    fleet_operator::{DBFleetOperatorService, FleetOperatorService, MockFleetOperatorService},
     gtfs_service::GTFSService,
+    operator::{DBOperatorService, MockOperatorService, OperatorService},
     trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
@@ -38,6 +41,7 @@ pub struct OtpConfig {
 pub struct AppConfig {
     pub logger_cfg: LoggerConfig,
     pub database_url: Option<String>,
+    pub internal_database_url: Option<String>,
     pub db_max_connections: u32,
     pub db_min_connections: u32,
     pub db_acquire_timeout: u64,
@@ -100,7 +104,10 @@ async fn create_database_pool(config: &AppConfig) -> Result<PgPool, AppError> {
         .database_url
         .as_ref()
         .ok_or_else(|| AppError::Internal("DATABASE_URL is not set".to_string()))?;
+    create_pool_from_url(db_url, config).await
+}
 
+async fn create_pool_from_url(db_url: &str, config: &AppConfig) -> Result<PgPool, AppError> {
     let pool = PgPoolOptions::new()
         .max_connections(config.db_max_connections)
         .min_connections(config.db_min_connections)
@@ -119,7 +126,10 @@ async fn create_database_pool(config: &AppConfig) -> Result<PgPool, AppError> {
 pub struct AppState {
     pub gtfs_service: Arc<GTFSService>,
     pub db_vehicle_reader: Arc<dyn VehicleDataReader>,
+    pub db_vehicle_reader_internal: Arc<dyn VehicleDataReaderInternal>,
     pub db_employee_reader: Arc<dyn EmployeeReader>,
+    pub operator_service: Arc<dyn OperatorService>,
+    pub fleet_operator_service: Arc<dyn FleetOperatorService>,
     pub trip_service: Arc<TripService>,
     pub chalo_vehicle_cache: Arc<ChaloVehicleCache>,
     pub config: AppConfig,
@@ -136,9 +146,12 @@ impl AppState {
         let gtfs_service = Arc::new(GTFSService::new(app_config.clone()).await?);
 
         // Create shared database pool or use mock readers
-        let (db_vehicle_reader, db_employee_reader): (
+        let (db_vehicle_reader, db_employee_reader, operator_service, db_vehicle_reader_internal, fleet_operator_service): (
             Arc<dyn VehicleDataReader>,
             Arc<dyn EmployeeReader>,
+            Arc<dyn OperatorService>,
+            Arc<dyn VehicleDataReaderInternal>,
+            Arc<dyn FleetOperatorService>,
         ) = if let Some(db_url) = &app_config.database_url {
             if db_url.contains("localhost") {
                 // For local development, fall back to mock readers on connection failure
@@ -147,14 +160,47 @@ impl AppState {
                         info!("Successfully connected to the local database.");
                         let vehicle_reader =
                             Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                        let employee_reader = Arc::new(DBEmployeeReader::new(pool, &app_config));
-                        (vehicle_reader, employee_reader)
+                        let employee_reader = Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
+                        // operator and internal reader use ONLY the internal pool
+                        let (operator_svc, vehicle_reader_internal, fleet_op_svc): (Arc<dyn OperatorService>, Arc<dyn VehicleDataReaderInternal>, Arc<dyn FleetOperatorService>) =
+                            if let Some(internal_url) = &app_config.internal_database_url {
+                                info!("Connecting to internal database (local)...");
+                                match create_pool_from_url(internal_url, &app_config).await {
+                                    Ok(internal_pool) => {
+                                        info!("Internal database pool created successfully.");
+                                        (
+                                            Arc::new(DBOperatorService::new(internal_pool.clone())),
+                                            Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
+                                            Arc::new(DBFleetOperatorService::new(internal_pool)),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to connect to internal database: {}. Using mock internal services.", e);
+                                        (
+                                            Arc::new(MockOperatorService::new()),
+                                            Arc::new(MockDBVehicleReaderInternal::new()) as Arc<dyn VehicleDataReaderInternal>,
+                                            Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
+                                        )
+                                    }
+                                }
+                            } else {
+                                info!("No internal_database_url set; using mock internal services.");
+                                (
+                                    Arc::new(MockOperatorService::new()),
+                                    Arc::new(MockDBVehicleReaderInternal::new()) as Arc<dyn VehicleDataReaderInternal>,
+                                    Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
+                                )
+                            };
+                        (vehicle_reader, employee_reader, operator_svc, vehicle_reader_internal, fleet_op_svc)
                     }
                     Err(e) => {
                         error!("Failed to connect to the local database: {}. Falling back to mock DB readers.", e);
                         (
                             Arc::new(MockDBVehicleReader::new()),
                             Arc::new(MockEmployeeReader::new()),
+                            Arc::new(MockOperatorService::new()),
+                            Arc::new(MockDBVehicleReaderInternal::new()) as Arc<dyn VehicleDataReaderInternal>,
+                            Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
                         )
                     }
                 }
@@ -165,8 +211,28 @@ impl AppState {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
                 let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                let employee_reader = Arc::new(DBEmployeeReader::new(pool, &app_config));
-                (vehicle_reader, employee_reader)
+                let employee_reader = Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
+                // operator and internal reader use ONLY the internal pool
+                let (operator_svc, vehicle_reader_internal, fleet_op_svc): (Arc<dyn OperatorService>, Arc<dyn VehicleDataReaderInternal>, Arc<dyn FleetOperatorService>) =
+                    if let Some(internal_url) = &app_config.internal_database_url {
+                        info!("Connecting to internal database (production)...");
+                        let internal_pool = create_pool_from_url(internal_url, &app_config)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to create internal database pool: {}", e))?;
+                        (
+                            Arc::new(DBOperatorService::new(internal_pool.clone())),
+                            Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
+                            Arc::new(DBFleetOperatorService::new(internal_pool)),
+                        )
+                    } else {
+                        info!("No internal_database_url set; using mock internal services.");
+                        (
+                            Arc::new(MockOperatorService::new()),
+                            Arc::new(MockDBVehicleReaderInternal::new()) as Arc<dyn VehicleDataReaderInternal>,
+                            Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
+                        )
+                    };
+                (vehicle_reader, employee_reader, operator_svc, vehicle_reader_internal, fleet_op_svc)
             }
         } else {
             // If no DATABASE_URL is provided, use the mock readers
@@ -174,6 +240,9 @@ impl AppState {
             (
                 Arc::new(MockDBVehicleReader::new()),
                 Arc::new(MockEmployeeReader::new()),
+                Arc::new(MockOperatorService::new()),
+                Arc::new(MockDBVehicleReaderInternal::new()) as Arc<dyn VehicleDataReaderInternal>,
+                Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
             )
         };
 
@@ -198,7 +267,10 @@ impl AppState {
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
+            db_vehicle_reader_internal,
             db_employee_reader,
+            operator_service,
+            fleet_operator_service,
             trip_service,
             chalo_vehicle_cache,
             config: app_config,
