@@ -1097,6 +1097,61 @@ async fn get_trip_data(
 
     Ok(HttpResponse::Ok().json(trip_data))
 }
+fn calculate_eta_from_csv(
+    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
+    trip_start_time: Option<i64>,
+    csv_etas: &[i32],
+) -> Vec<crate::models::BusStopETA> {
+    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
+    let now = chrono::Utc::now();
+
+    // Calculate cumulative travel time to each stop
+    let mut cumulative_time_seconds: f64 = 0.0;
+
+    for (idx, mapping) in route_stop_mappings.iter().enumerate() {
+        if idx > 0 {
+            // Get ETA for this sequence from CSV
+            // If the CSV array is shorter than mapping, we fallback to 2 mins as safe default
+            let eta_mins = if idx < csv_etas.len() {
+                csv_etas[idx] as f64
+            } else {
+                2.0
+            };
+            cumulative_time_seconds += eta_mins * 60.0;
+        }
+
+        // Calculate arrival time
+        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
+            // Calculate arrival time from trip start time
+            // Subtract 10 minutes for premium buses to show arrival 10 mins prior to schedule
+            let start_utc =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
+            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64) - chrono::Duration::minutes(10)
+        } else {
+            // If no start time, use current time + cumulative time
+            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
+        };
+
+        let arrival_epoch = arrival_time.timestamp();
+
+        // Calculate ETA in seconds (time until arrival)
+        let eta_seconds = if arrival_time > now {
+            Some((arrival_time - now).num_seconds())
+        } else {
+            None
+        };
+
+        bus_stop_etas.push(crate::models::BusStopETA {
+            stop_code: mapping.stop_code.clone(),
+            arrival_time: arrival_epoch,
+            eta_seconds,
+            stop_name: Some(mapping.stop_name.clone()),
+        });
+    }
+
+    bus_stop_etas
+}
+
 
 /// Calculate arrival time and ETA based on haversine distance between stops
 /// Assumes constant speed of 25 km/hr
@@ -1296,14 +1351,29 @@ async fn get_bus_route_schedule(
                 trip.start_time.as_ref().and_then(|s| s.parse::<i64>().ok())
             });
 
-            // Calculate ETAs using haversine distance function
-            bus_stop_etas =
-                calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
+            // Calculate ETAs
+            if waybill.service_type.eq_ignore_ascii_case("PREMIUM") {
+                if let Some(csv_etas) = app_state.premium_bus_schedules.get(&route_id) {
+                    bus_stop_etas = calculate_eta_from_csv(&route_stop_mappings, trip_start_time, csv_etas);
+                } else {
+                    bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
+                }
+            } else {
+                bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
+            }
         }
 
-        // If no trip details, calculate ETAs using haversine distance without start time
+        // If no trip details, calculate ETAs without start time
         if bus_stop_etas.is_empty() {
-            bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
+            if waybill.service_type.eq_ignore_ascii_case("PREMIUM") {
+                if let Some(csv_etas) = app_state.premium_bus_schedules.get(&route_id) {
+                    bus_stop_etas = calculate_eta_from_csv(&route_stop_mappings, None, csv_etas);
+                } else {
+                    bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
+                }
+            } else {
+                bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
+            }
         }
 
         schedule_details.push(crate::models::BusScheduleDetail {
