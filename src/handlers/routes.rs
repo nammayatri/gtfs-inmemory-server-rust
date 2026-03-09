@@ -4,8 +4,8 @@ use actix_web::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::handlers::fleet_operator;
 use crate::services::operator::{break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody, SUPPORTED_OPERATOR_GTFS_IDS};
+use crate::services::fleet_operator::{TripAction, WaybillAnchor};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,10 +104,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             )
             .service(
                 web::scope("internal/fleet-operator/{gtfs_id}")
-                    .route("/currentOperation", web::post().to(fleet_operator::current_operation))
-                    .route("/tripAction", web::post().to(fleet_operator::trip_action))
-                    .route("/currentTripDetails", web::post().to(fleet_operator::current_trip_details))
-                    .route("/verify", web::post().to(fleet_operator::verify)),
+                    .route("/currentOperation", web::post().to(fleet_operator_current_operation))
+                    .route("/tripAction", web::post().to(fleet_operator_trip_action))
+                    .route("/currentTripDetails", web::post().to(fleet_operator_current_trip_details))
+                    .route("/verify", web::post().to(fleet_operator_verify)),
             )
             .route(
                 "/bus-route-schedule/{gtfs_id}/{route_id}",
@@ -2158,4 +2158,157 @@ async fn get_waybills(
 async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let routes = app_state.db_vehicle_reader.get_routes_served_today().await?;
     Ok(HttpResponse::Ok().json(routes))
+}
+
+// ─── Fleet operator ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct FleetAnchorRequest {
+    conductor_token: Option<String>,
+    driver_token: Option<String>,
+    vehicle_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetTripActionRequest {
+    action: String,
+    trip_number: i32,
+    timestamp: Option<i64>,
+    conductor_token: Option<String>,
+    driver_token: Option<String>,
+    vehicle_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetCurrentTripDetailsRequest {
+    previous_trip_number: i32,
+    conductor_token: Option<String>,
+    driver_token: Option<String>,
+    vehicle_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetVerifyRequest {
+    driver_token: Option<String>,
+    conductor_token: Option<String>,
+    obu_serial_no: Option<String>,
+    etm_serial_no: Option<String>,
+}
+
+fn parse_fleet_anchor(
+    conductor_token: Option<String>,
+    driver_token: Option<String>,
+    vehicle_number: Option<String>,
+) -> AppResult<WaybillAnchor> {
+    let anchors_provided = conductor_token.is_some() as u8
+        + driver_token.is_some() as u8
+        + vehicle_number.is_some() as u8;
+
+    if anchors_provided != 1 {
+        return Err(AppError::BadRequest(
+            "Exactly one of conductor_token, driver_token, or vehicle_number must be provided."
+                .to_string(),
+        ));
+    }
+
+    if let Some(token) = conductor_token {
+        return Ok(WaybillAnchor::ConductorToken(token));
+    }
+    if let Some(token) = driver_token {
+        return Ok(WaybillAnchor::DriverToken(token));
+    }
+    Ok(WaybillAnchor::VehicleNumber(vehicle_number.unwrap()))
+}
+
+async fn fleet_operator_current_operation(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<FleetAnchorRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+    let anchor = parse_fleet_anchor(req.conductor_token, req.driver_token, req.vehicle_number)?;
+    let response = app_state
+        .fleet_operator_service
+        .current_operation(&gtfs_id, anchor)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+async fn fleet_operator_trip_action(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<FleetTripActionRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+
+    let action = match req.action.as_str() {
+        "start" => TripAction::Start,
+        "end" => TripAction::End,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Invalid action '{}'. Must be 'start' or 'end'.",
+                other
+            )))
+        }
+    };
+
+    let anchor = parse_fleet_anchor(req.conductor_token, req.driver_token, req.vehicle_number)?;
+    let response = app_state
+        .fleet_operator_service
+        .trip_action(&gtfs_id, anchor, action, req.trip_number, req.timestamp)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+async fn fleet_operator_current_trip_details(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<FleetCurrentTripDetailsRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+    let anchor = parse_fleet_anchor(req.conductor_token, req.driver_token, req.vehicle_number)?;
+    let response = app_state
+        .fleet_operator_service
+        .current_trip_details(&gtfs_id, anchor, req.previous_trip_number)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+async fn fleet_operator_verify(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<FleetVerifyRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+
+    let token_count = req.driver_token.is_some() as u8 + req.conductor_token.is_some() as u8;
+    if token_count != 1 {
+        return Err(AppError::BadRequest(
+            "Exactly one of driver_token or conductor_token must be provided.".to_string(),
+        ));
+    }
+
+    let device_count = req.obu_serial_no.is_some() as u8 + req.etm_serial_no.is_some() as u8;
+    if device_count != 1 {
+        return Err(AppError::BadRequest(
+            "Exactly one of obu_serial_no or etm_serial_no must be provided.".to_string(),
+        ));
+    }
+
+    let token = req.driver_token.or(req.conductor_token).unwrap();
+    let (device_serial_no, is_obu) = if let Some(obu) = req.obu_serial_no {
+        (obu, true)
+    } else {
+        (req.etm_serial_no.unwrap(), false)
+    };
+
+    let response = app_state
+        .fleet_operator_service
+        .verify(&gtfs_id, &token, &device_serial_no, is_obu)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
 }
