@@ -228,6 +228,7 @@ pub struct ServiceTypeRow {
 pub struct RouteRow {
     pub route_id: i64,
     pub route_number: Option<String>,
+    pub route_name: Option<String>,
     pub route_direction: Option<String>,
     pub start_point_id: i64,
     pub end_point_id: i64,
@@ -1248,7 +1249,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>> {
         sqlx::query_as::<_, RouteRow>(
-            "SELECT route_id, route_number, route_direction, start_point_id, end_point_id
+            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id
              FROM public.route_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY route_number",
