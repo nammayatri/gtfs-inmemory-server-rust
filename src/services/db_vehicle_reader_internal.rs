@@ -497,13 +497,13 @@ impl DBVehicleReaderInternal {
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
-                    trip_start_time AS start_time,
-                    trip_end_time AS end_time,
+                    trip_start_time::text AS start_time,
+                    trip_end_time::text AS end_time,
                     deleted,
                     is_active_trip,
                     trip_order,
-                    start_time AS db_start_time,
-                    end_time AS db_end_time
+                    start_time::text AS db_start_time,
+                    end_time::text AS db_end_time
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id = $1::bigint
                   AND trip_number >= {}
@@ -521,13 +521,13 @@ impl DBVehicleReaderInternal {
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
-                    trip_start_time AS start_time,
-                    trip_end_time AS end_time,
+                    trip_start_time::text AS start_time,
+                    trip_end_time::text AS end_time,
                     deleted,
                     is_active_trip,
                     trip_order,
-                    start_time AS db_start_time,
-                    end_time AS db_end_time
+                    start_time::text AS db_start_time,
+                    end_time::text AS db_end_time
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id = $1::bigint
                   AND trip_type != 'dead-trip'
@@ -575,10 +575,10 @@ impl DBVehicleReaderInternal {
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
-                    trip_start_time AS start_time,
-                    trip_end_time AS end_time,
-                    start_time AS db_start_time,
-                    end_time AS db_end_time,
+                    trip_start_time::text AS start_time,
+                    trip_end_time::text AS end_time,
+                    start_time::text AS db_start_time,
+                    end_time::text AS db_end_time,
                     deleted,
                     is_active_trip,
                     trip_order
@@ -599,10 +599,10 @@ impl DBVehicleReaderInternal {
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
-                    trip_start_time AS start_time,
-                    trip_end_time AS end_time,
-                    start_time AS db_start_time,
-                    end_time AS db_end_time,
+                    trip_start_time::text AS start_time,
+                    trip_end_time::text AS end_time,
+                    start_time::text AS db_start_time,
+                    end_time::text AS db_end_time,
                     deleted,
                     is_active_trip,
                     trip_order
