@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::models::{BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillStatus};
 use crate::tools::error::{AppError, AppResult};
@@ -30,6 +30,16 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         trip_number: i32,
         gtfs_id: &str,
     ) -> AppResult<Vec<VehicleData>>;
+
+    async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>>;
+
+    async fn upsert_station_eta(
+        &self,
+        gtfs_id: &str,
+        source_station_code: &str,
+        destination_station_code: &str,
+        eta_in_seconds: i32,
+    ) -> AppResult<()>;
 }
 
 // Mock implementation for local testing without a database
@@ -80,20 +90,37 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
     ) -> AppResult<Vec<VehicleData>> {
         Ok(Vec::new())
     }
+
+    async fn get_station_etas(&self, _gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
+        Ok(HashMap::new())
+    }
+
+    async fn upsert_station_eta(
+        &self,
+        _gtfs_id: &str,
+        _source_station_code: &str,
+        _destination_station_code: &str,
+        _eta_in_seconds: i32,
+    ) -> AppResult<()> {
+        Ok(())
+    }
 }
 
 pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
+    station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 300;
+const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
         Self { 
             pool: Some(pool),
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
+            station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -103,6 +130,7 @@ impl DBVehicleReaderInternal {
         Self { 
             pool: None,
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
+            station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -117,8 +145,17 @@ impl DBVehicleReaderInternal {
         elapsed >= Duration::from_secs(WAYBILL_ROUTE_CACHE_DURATION)
     }
 
+    fn is_station_eta_cache_expired(&self, timestamp: SystemTime) -> bool {
+        let elapsed = timestamp.elapsed().unwrap_or_default();
+        elapsed >= Duration::from_secs(STATION_ETA_CACHE_DURATION)
+    }
+
     fn get_waybills_by_route_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
         format!("{}_{}", gtfs_id, route_id)
+    }
+
+    fn get_station_eta_cache_key(&self, gtfs_id: &str) -> String {
+        format!("eta_map_{}", gtfs_id)
     }
 
     /// Returns true if vehicle_no exists in vehicles_internal for the given gtfs_id.
@@ -160,6 +197,55 @@ impl DBVehicleReaderInternal {
                 false
             }
         }
+    }
+
+    pub async fn get_station_etas_impl(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
+        let cache_key = self.get_station_eta_cache_key(gtfs_id);
+
+        // Check cache
+        {
+            let cache = self.station_eta_cache.read().await;
+            if let Some((etas, timestamp)) = cache.get(&cache_key) {
+                if !self.is_station_eta_cache_expired(*timestamp) {
+                    debug!("station_eta_cache HIT for gtfs_id={}", gtfs_id);
+                    return Ok(etas.clone());
+                }
+            }
+        }
+
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(HashMap::new()),
+        };
+
+        let query = r#"
+            SELECT source_station_code, destination_station_code, eta_in_seconds
+            FROM station_eta
+            WHERE gtfs_id = $1
+        "#;
+
+        let rows = sqlx::query(query)
+            .bind(gtfs_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        let mut eta_map = HashMap::new();
+        for row in rows {
+            use sqlx::Row;
+            let src: String = row.get::<String, &str>("source_station_code");
+            let dst: String = row.get::<String, &str>("destination_station_code");
+            let secs: i32 = row.get::<i32, &str>("eta_in_seconds");
+            eta_map.insert((src, dst), secs);
+        }
+
+        // Update cache
+        {
+            let mut cache = self.station_eta_cache.write().await;
+            cache.insert(cache_key, (eta_map.clone(), SystemTime::now()));
+        }
+
+        Ok(eta_map)
     }
 
     /// Full vehicle data fetch against _internal tables, mirroring DBVehicleReader::get_vehicle_data.
@@ -982,6 +1068,53 @@ impl DBVehicleReaderInternal {
             }
         }
     }
+
+    async fn upsert_station_eta_impl(
+        &self,
+        gtfs_id: &str,
+        source_station_code: &str,
+        destination_station_code: &str,
+        eta_in_seconds: i32,
+    ) -> AppResult<()> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| AppError::DbError("Internal Database pool is not active".into()))?;
+
+        let query = r#"
+            INSERT INTO station_eta (gtfs_id, source_station_code, destination_station_code, eta_in_seconds)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (gtfs_id, source_station_code, destination_station_code)
+            DO UPDATE SET
+                eta_in_seconds = EXCLUDED.eta_in_seconds,
+                updated_at = CURRENT_TIMESTAMP
+        "#;
+
+        sqlx::query(query)
+            .bind(gtfs_id)
+            .bind(source_station_code)
+            .bind(destination_station_code)
+            .bind(eta_in_seconds)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to upsert station_eta for gtfs_id={}: {}", gtfs_id, e);
+                AppError::DbError(e.to_string())
+            })?;
+
+        // Invalidate cache
+        {
+            let mut cache = self.station_eta_cache.write().await;
+            cache.remove(gtfs_id);
+        }
+
+        info!(
+            "Successfully upserted station_eta for gtfs_id={} src={} dst={}",
+            gtfs_id, source_station_code, destination_station_code
+        );
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1014,5 +1147,19 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         gtfs_id: &str,
     ) -> AppResult<Vec<VehicleData>> {
         self.get_chennai_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id).await
+    }
+
+    async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
+        self.get_station_etas_impl(gtfs_id).await
+    }
+
+    async fn upsert_station_eta(
+        &self,
+        gtfs_id: &str,
+        source_station_code: &str,
+        destination_station_code: &str,
+        eta_in_seconds: i32,
+    ) -> AppResult<()> {
+        self.upsert_station_eta_impl(gtfs_id, source_station_code, destination_station_code, eta_in_seconds).await
     }
 }

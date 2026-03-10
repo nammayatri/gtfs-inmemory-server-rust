@@ -72,6 +72,16 @@ pub struct GetAllVehiclesByIdsRequest {
     pub vehicle_ids: Vec<String>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct StationEtaUpsertRequest {
+    #[serde(rename = "sourceStationCode")]
+    pub source_station_code: String,
+    #[serde(rename = "destinationStationCode")]
+    pub destination_station_code: String,
+    #[serde(rename = "etaInSeconds")]
+    pub eta_in_seconds: i32,
+}
+
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(
         actix_web::web::scope("")
@@ -101,6 +111,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/waybill/fleet", web::post().to(update_waybill_fleet))
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
                     .route("/waybills", web::get().to(get_waybills))
+                    .route("/station-eta/upsert", web::post().to(upsert_station_eta)),
             )
             .service(
                 web::scope("internal/fleet-operator/{gtfs_id}")
@@ -1239,6 +1250,93 @@ async fn get_trip_data(
 
     Ok(HttpResponse::Ok().json(trip_data))
 }
+const SPEED_KM_PER_HOUR: f64 = 25.0;
+const EARTH_RADIUS_KM: f64 = 6371.0; // Earth radius in kilometers
+
+// Haversine formula to calculate distance between two points
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let d_lat = (lat2 - lat1).to_radians();
+    let d_lon = (lon2 - lon1).to_radians();
+
+    let a = (d_lat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+
+    EARTH_RADIUS_KM * c
+}
+
+fn calculate_eta_from_db(
+    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
+    trip_start_time: Option<i64>,
+    db_etas: &HashMap<(String, String), i32>,
+) -> Vec<crate::models::BusStopETA> {
+
+    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
+    let now = chrono::Utc::now();
+
+    // Calculate cumulative travel time to each stop
+    let mut cumulative_time_seconds: f64 = 0.0;
+
+    for (idx, mapping) in route_stop_mappings.iter().enumerate() {
+        if idx > 0 {
+            let prev_mapping = &route_stop_mappings[idx - 1];
+            let pair = (prev_mapping.stop_code.clone(), mapping.stop_code.clone());
+
+            let time_seconds = if let Some(&eta_secs) = db_etas.get(&pair) {
+                // Get ETA for this consecutive pair from DB (value is already in seconds)
+                let prev_eta = eta_secs as f64;
+                info!("calculate_eta_from_db - using DB pair ({}, {}): {} secs", prev_mapping.stop_code, mapping.stop_code, eta_secs);
+                prev_eta
+            } else {
+                // If not found (new stop inserted), calculate distance from previous stop to current stop
+                let distance_km = haversine_distance(
+                    prev_mapping.stop_point.lat,
+                    prev_mapping.stop_point.lon,
+                    mapping.stop_point.lat,
+                    mapping.stop_point.lon,
+                );
+
+                // Calculate time to travel this distance at 25 km/hr
+                let time_hours = distance_km / SPEED_KM_PER_HOUR;
+                let haversine_eta = time_hours * 3600.0;
+                info!("calculate_eta_from_db - fallback haversine pair ({}, {}): {} km -> {} secs", prev_mapping.stop_code, mapping.stop_code, distance_km, haversine_eta);
+                haversine_eta
+            };
+
+            cumulative_time_seconds += time_seconds;
+        }
+
+        // Calculate arrival time
+        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
+            // Calculate arrival time from trip start time
+            let start_utc =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
+            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64)
+        } else {
+            // If no start time, use current time + cumulative time
+            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
+        };
+
+        let arrival_epoch = arrival_time.timestamp();
+
+        // Calculate ETA in seconds (time until arrival)
+        let eta_seconds = if arrival_time > now {
+            Some((arrival_time - now).num_seconds())
+        } else {
+            None
+        };
+
+        bus_stop_etas.push(crate::models::BusStopETA {
+            stop_code: mapping.stop_code.clone(),
+            arrival_time: arrival_epoch,
+            eta_seconds,
+            stop_name: Some(mapping.stop_name.clone()),
+        });
+    }
+
+    bus_stop_etas
+}
+
 
 /// Calculate arrival time and ETA based on haversine distance between stops
 /// Assumes constant speed of 25 km/hr
@@ -1246,20 +1344,6 @@ fn calculate_eta_from_haversine_distance(
     route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
     trip_start_time: Option<i64>,
 ) -> Vec<crate::models::BusStopETA> {
-    const SPEED_KM_PER_HOUR: f64 = 25.0;
-    const EARTH_RADIUS_KM: f64 = 6371.0; // Earth radius in kilometers
-
-    // Haversine formula to calculate distance between two points
-    fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-        let d_lat = (lat2 - lat1).to_radians();
-        let d_lon = (lon2 - lon1).to_radians();
-
-        let a = (d_lat / 2.0).sin().powi(2)
-            + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
-        let c = 2.0 * a.sqrt().asin();
-
-        EARTH_RADIUS_KM * c
-    }
 
     let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
     let now = chrono::Utc::now();
@@ -1353,46 +1437,51 @@ async fn get_bus_trip_schedule(
         .chain(internal_rows.into_iter())
         .collect();
 
-    let schedule_details: BusScheduleDetails = all
-        .into_iter()
-        .map(|row: crate::models::VehicleData| {
-            let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
-                (row.db_start_time.as_deref(), row.duty_date.as_deref())
-            {
-                let date = chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
-                let time = chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
-                if let (Some(d), Some(t)) = (date, time) {
-                    let dt = chrono::NaiveDateTime::new(d, t);
-                    if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
-                        use chrono::TimeZone;
-                        offset
-                            .from_local_datetime(&dt)
-                            .single()
-                            .map(|dt_tz| dt_tz.timestamp_millis())
-                    } else {
-                        None
-                    }
+    let mut schedule_details: BusScheduleDetails = Vec::new();
+    for row in all {
+        let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
+            (row.db_start_time.as_deref(), row.duty_date.as_deref())
+        {
+            let date = chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
+            let time = chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
+            if let (Some(d), Some(t)) = (date, time) {
+                let dt = chrono::NaiveDateTime::new(d, t);
+                if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
+                    use chrono::TimeZone;
+                    offset
+                        .from_local_datetime(&dt)
+                        .single()
+                        .map(|dt_tz| dt_tz.timestamp_millis())
                 } else {
                     None
                 }
             } else {
-                row.start_time_epoch
-                    .as_deref()
-                    .and_then(|s| s.parse::<i64>().ok())
-            };
-
-            let bus_stop_etas =
-                calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
-
-            crate::models::BusScheduleDetail {
-                eta: bus_stop_etas,
-                vehicle_no: row.vehicle_no,
-                service_tier: row.service_type,
-                trip_number: row.trip_number,
-                waybill_no: Some(row.waybill_no),
+                None
             }
-        })
-        .collect();
+        } else {
+            row.start_time_epoch
+                .as_deref()
+                .and_then(|s| s.parse::<i64>().ok())
+        };
+
+        // Calculate ETAs
+        let adjusted_start_time = trip_start_time.map(|t| t - 600_000); // 10 minutes in milliseconds
+
+        let bus_stop_etas = match app_state.db_vehicle_reader_internal.get_station_etas(&gtfs_id).await {
+            Ok(db_etas) if !db_etas.is_empty() => {
+                calculate_eta_from_db(&route_stop_mappings, adjusted_start_time, &db_etas)
+            }
+            _ => calculate_eta_from_haversine_distance(&route_stop_mappings, adjusted_start_time),
+        };
+
+        schedule_details.push(crate::models::BusScheduleDetail {
+            eta: bus_stop_etas,
+            vehicle_no: row.vehicle_no,
+            service_tier: row.service_type,
+            trip_number: row.trip_number,
+            waybill_no: Some(row.waybill_no),
+        });
+    }
 
     Ok(HttpResponse::Ok().json(schedule_details))
 }
@@ -1437,53 +1526,57 @@ async fn get_bus_route_schedule(
             all_rows.append(&mut int_rows);
         }
 
-        let schedule_details: BusScheduleDetails = all_rows
-            .into_iter()
-            .map(|row| {
-                // Resolve trip start time from (db_start_time HH:MM + duty_date) or
-                // fall back to the stored epoch-millis in start_time_epoch.
-                let trip_start_time: Option<i64> =
-                    if let (Some(hhmm), Some(duty)) =
-                        (row.db_start_time.as_deref(), row.duty_date.as_deref())
-                    {
-                        let date =
-                            chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
-                        let time =
-                            chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
-                        if let (Some(d), Some(t)) = (date, time) {
-                            let dt = chrono::NaiveDateTime::new(d, t);
-                            if let Some(offset) =
-                                chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-                            {
-                                use chrono::TimeZone;
-                                offset
-                                    .from_local_datetime(&dt)
-                                    .single()
-                                    .map(|dt_tz| dt_tz.timestamp_millis())
-                            } else {
-                                None
-                            }
+        let mut schedule_details: BusScheduleDetails = Vec::new();
+        for row in all_rows {
+            // Resolve trip start time from (db_start_time HH:MM + duty_date) or
+            // fall back to the stored epoch-millis in start_time_epoch.
+            let trip_start_time: Option<i64> =
+                if let (Some(hhmm), Some(duty)) =
+                    (row.db_start_time.as_deref(), row.duty_date.as_deref())
+                {
+                    let date =
+                        chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
+                    let time =
+                        chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
+                    if let (Some(d), Some(t)) = (date, time) {
+                        let dt = chrono::NaiveDateTime::new(d, t);
+                        if let Some(offset) =
+                            chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
+                        {
+                            use chrono::TimeZone;
+                            offset
+                                .from_local_datetime(&dt)
+                                .single()
+                                .map(|dt_tz| dt_tz.timestamp_millis())
                         } else {
                             None
                         }
                     } else {
-                        row.start_time_epoch
-                            .as_deref()
-                            .and_then(|s| s.parse::<i64>().ok())
-                    };
+                        None
+                    }
+                } else {
+                    row.start_time_epoch
+                        .as_deref()
+                        .and_then(|s| s.parse::<i64>().ok())
+                };
 
-                let bus_stop_etas =
-                    calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
+            let adjusted_start_time = trip_start_time.map(|t| t - 600_000); // 10 minutes in milliseconds
 
-                crate::models::BusScheduleDetail {
-                    eta: bus_stop_etas,
-                    vehicle_no: row.vehicle_no,
-                    service_tier: row.service_type,
-                    trip_number: row.trip_number,
-                    waybill_no: Some(row.waybill_no),
+            let bus_stop_etas = match app_state.db_vehicle_reader_internal.get_station_etas(&gtfs_id).await {
+                Ok(db_etas) if !db_etas.is_empty() => {
+                    calculate_eta_from_db(&route_stop_mappings, adjusted_start_time, &db_etas)
                 }
-            })
-            .collect();
+                _ => calculate_eta_from_haversine_distance(&route_stop_mappings, adjusted_start_time),
+            };
+
+            schedule_details.push(crate::models::BusScheduleDetail {
+                eta: bus_stop_etas,
+                vehicle_no: row.vehicle_no,
+                service_tier: row.service_type,
+                trip_number: row.trip_number,
+                waybill_no: Some(row.waybill_no),
+            });
+        }
 
         return Ok(HttpResponse::Ok().json(schedule_details));
     }
@@ -2158,6 +2251,30 @@ async fn get_waybills(
 async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let routes = app_state.db_vehicle_reader.get_routes_served_today().await?;
     Ok(HttpResponse::Ok().json(routes))
+}
+
+pub async fn upsert_station_eta(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    req: web::Json<StationEtaUpsertRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let body = req.into_inner();
+
+    app_state
+        .db_vehicle_reader_internal
+        .upsert_station_eta(
+            &gtfs_id,
+            &body.source_station_code,
+            &body.destination_station_code,
+            body.eta_in_seconds,
+        )
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "success",
+        "message": "Station ETA successfully upserted.",
+    })))
 }
 
 // ─── Fleet operator ────────────────────────────────────────────────────────────
