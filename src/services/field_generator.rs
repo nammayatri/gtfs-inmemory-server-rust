@@ -13,9 +13,17 @@ pub fn generate_waybill_number() -> String {
     format!("T{}{}", timestamp, random_suffix)
 }
 
+pub fn generate_schedule_trip_detail_id() -> String {
+    let timestamp = chrono::Utc::now().timestamp_millis() as u32;
+    let random_component = Uuid::new_v4().as_u128() as u32;
+    let id = timestamp.wrapping_add(random_component);
+    id.to_string()
+}
+
 pub fn regenerate_field(field_name: &str) -> AppResult<Value> {
     match field_name {
         "waybill_no" => Ok(Value::String(generate_waybill_number())),
+        "schedule_trip_detail_id" => Ok(Value::String(generate_schedule_trip_detail_id())),
         _ => Err(AppError::BadRequest(format!(
             "Unknown regenerable field: '{}'",
             field_name
