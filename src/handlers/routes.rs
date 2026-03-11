@@ -2189,10 +2189,8 @@ struct FleetCurrentTripDetailsRequest {
 
 #[derive(Debug, Deserialize)]
 struct FleetVerifyRequest {
-    driver_token: Option<String>,
-    conductor_token: Option<String>,
-    obu_serial_no: Option<String>,
-    etm_serial_no: Option<String>,
+    operator_badge_token: String,
+    device_serial_number: String,
 }
 
 fn parse_fleet_anchor(
@@ -2285,30 +2283,9 @@ async fn fleet_operator_verify(
     let gtfs_id = path.into_inner();
     let req = body.into_inner();
 
-    let token_count = req.driver_token.is_some() as u8 + req.conductor_token.is_some() as u8;
-    if token_count != 1 {
-        return Err(AppError::BadRequest(
-            "Exactly one of driver_token or conductor_token must be provided.".to_string(),
-        ));
-    }
-
-    let device_count = req.obu_serial_no.is_some() as u8 + req.etm_serial_no.is_some() as u8;
-    if device_count != 1 {
-        return Err(AppError::BadRequest(
-            "Exactly one of obu_serial_no or etm_serial_no must be provided.".to_string(),
-        ));
-    }
-
-    let token = req.driver_token.or(req.conductor_token).unwrap();
-    let (device_serial_no, is_obu) = if let Some(obu) = req.obu_serial_no {
-        (obu, true)
-    } else {
-        (req.etm_serial_no.unwrap(), false)
-    };
-
     let response = app_state
         .fleet_operator_service
-        .verify(&gtfs_id, &token, &device_serial_no, is_obu)
+        .verify(&gtfs_id, &req.operator_badge_token, &req.device_serial_number)
         .await?;
     Ok(HttpResponse::Ok().json(response))
 }
