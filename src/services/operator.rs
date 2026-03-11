@@ -1316,7 +1316,7 @@ impl OperatorService for DBOperatorService {
             ORDER BY d.trip_order
             "#,
         )
-        .bind(schedule_number.rsplitn(3, '-').nth(2).unwrap_or(schedule_number))
+        .bind(schedule_number)
         .bind(gtfs_id)
         .fetch_all(&self.pool)
         .await

@@ -111,7 +111,6 @@ pub trait FleetOperatorService: Send + Sync {
         gtfs_id: &str,
         token: &str,
         device_serial_no: &str,
-        is_obu: bool,
     ) -> AppResult<VerifyResponse>;
 }
 
@@ -172,7 +171,6 @@ impl FleetOperatorService for MockFleetOperatorService {
         _gtfs_id: &str,
         _token: &str,
         _device_serial_no: &str,
-        _is_obu: bool,
     ) -> AppResult<VerifyResponse> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -811,9 +809,8 @@ impl FleetOperatorService for DBFleetOperatorService {
         gtfs_id: &str,
         token: &str,
         device_serial_no: &str,
-        is_obu: bool,
     ) -> AppResult<VerifyResponse> {
-        // Check employee exists by token_no
+        // Check employee exists by token_no in employees_internal (covers both operators and drivers)
         let employee_ok: bool = sqlx::query_scalar(
             r#"
             SELECT 1
@@ -839,51 +836,53 @@ impl FleetOperatorService for DBFleetOperatorService {
             return Ok(VerifyResponse { verified: false });
         }
 
-        // Check device exists
-        let device_ok: bool = if is_obu {
-            sqlx::query_scalar(
-                r#"
-                SELECT 1
-                FROM fleet_obu_mapping_internal
-                WHERE obu_id  = $1
-                  AND gtfs_id = $2
-                  AND deleted = false
-                LIMIT 1
-                "#,
-            )
-            .bind(device_serial_no)
-            .bind(gtfs_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| {
-                error!("verify OBU check failed for obu_id={} gtfs_id={}: {}", device_serial_no, gtfs_id, e);
-                AppError::Internal(e.to_string())
-            })?
-            .map(|_: i32| true)
-            .unwrap_or(false)
-        } else {
-            sqlx::query_scalar(
-                r#"
-                SELECT 1
-                FROM fleet_etm_mapping_internal
-                WHERE etm_serial_no = $1
-                  AND gtfs_id       = $2
-                  AND deleted       = false
-                LIMIT 1
-                "#,
-            )
-            .bind(device_serial_no)
-            .bind(gtfs_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| {
-                error!("verify ETM check failed for etm_serial_no={} gtfs_id={}: {}", device_serial_no, gtfs_id, e);
-                AppError::Internal(e.to_string())
-            })?
-            .map(|_: i32| true)
-            .unwrap_or(false)
-        };
+        // Check device against both OBU and ETM tables
+        let obu_ok: bool = sqlx::query_scalar(
+            r#"
+            SELECT 1
+            FROM fleet_obu_mapping_internal
+            WHERE obu_id  = $1
+              AND gtfs_id = $2
+              AND deleted = false
+            LIMIT 1
+            "#,
+        )
+        .bind(device_serial_no)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!("verify OBU check failed for device={} gtfs_id={}: {}", device_serial_no, gtfs_id, e);
+            AppError::Internal(e.to_string())
+        })?
+        .map(|_: i32| true)
+        .unwrap_or(false);
 
-        Ok(VerifyResponse { verified: device_ok })
+        if obu_ok {
+            return Ok(VerifyResponse { verified: true });
+        }
+
+        let etm_ok: bool = sqlx::query_scalar(
+            r#"
+            SELECT 1
+            FROM fleet_etm_mapping_internal
+            WHERE etm_serial_no = $1
+              AND gtfs_id       = $2
+              AND deleted       = false
+            LIMIT 1
+            "#,
+        )
+        .bind(device_serial_no)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!("verify ETM check failed for device={} gtfs_id={}: {}", device_serial_no, gtfs_id, e);
+            AppError::Internal(e.to_string())
+        })?
+        .map(|_: i32| true)
+        .unwrap_or(false);
+
+        Ok(VerifyResponse { verified: etm_ok })
     }
 }
