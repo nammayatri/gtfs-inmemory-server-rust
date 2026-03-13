@@ -22,6 +22,7 @@ use crate::models::{
 };
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
+use super::schedule;
 use crate::{
     models::LatLong,
     tools::error::{AppError, AppResult},
@@ -286,6 +287,29 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/routes-served-today",
                 actix_web::web::get().to(get_routes_served_today),
+            )
+            .service(
+                web::scope("/schedule")
+                    .route(
+                        "/departures/{gtfs_id}/{stop_code}",
+                        web::get().to(schedule::get_departures_at_stop),
+                    )
+                    .route(
+                        "/arrivals/{gtfs_id}/{stop_code}",
+                        web::get().to(schedule::get_arrivals_at_stop),
+                    )
+                    .route(
+                        "/trips-between/{gtfs_id}",
+                        web::post().to(schedule::get_trips_between_stops),
+                    )
+                    .route(
+                        "/next-services/{gtfs_id}",
+                        web::post().to(schedule::get_next_services),
+                    ),
+            )
+            .route(
+                "/internal/gtfs/{gtfs_id}/quality-report",
+                web::get().to(schedule::get_quality_report),
             ),
     );
 }

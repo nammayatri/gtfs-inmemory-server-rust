@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{NaiveTime, Utc};
-use tracing::{error, info};
+use chrono::{NaiveTime, Timelike, Utc};
+use tracing::info;
 
 use crate::models::{
     clean_identifier, GtfsDataQualityReport, ScheduledArrival, ScheduledDeparture, ScheduledTrip,
-    TripDetails,
 };
 use crate::services::gtfs_service::GTFSService;
 use crate::tools::error::{AppError, AppResult};
