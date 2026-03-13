@@ -1806,6 +1806,17 @@ impl OperatorService for DBOperatorService {
             )));
         }
 
+        // First, get the schedule_trip_id for this waybill
+        let schedule_trip_id: Option<i64> = sqlx::query_scalar(
+            "SELECT schedule_trip_id FROM public.waybills_internal WHERE waybill_id = $1 AND gtfs_id = $2",
+        )
+        .bind(waybill_id)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("Failed to get schedule_trip_id: {}", e)))?;
+
+        // Update the waybill status
         let result = sqlx::query(
             "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
         )
@@ -1815,6 +1826,19 @@ impl OperatorService for DBOperatorService {
         .execute(&self.pool)
         .await
         .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
+
+        // If status is 'closed' or 'audited' and we have a schedule_trip_id, 
+        // set all is_active_trip to false in bus_schedule_trip_detail_internal
+        if (status == "closed" || status == "audited") && schedule_trip_id.is_some() {
+            sqlx::query(
+                "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false WHERE schedule_trip_id = $1 AND gtfs_id = $2",
+            )
+            .bind(schedule_trip_id)
+            .bind(gtfs_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("Failed to update is_active_trip: {}", e)))?;
+        }
 
         Ok(result.rows_affected())
     }
