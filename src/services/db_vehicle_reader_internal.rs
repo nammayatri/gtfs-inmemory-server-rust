@@ -117,7 +117,7 @@ const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
-        Self { 
+        Self {
             pool: Some(pool),
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -127,7 +127,7 @@ impl DBVehicleReaderInternal {
     /// Used when no DB is available (local mock / no DATABASE_URL).
     /// is_vehicle_in_internal will always return false, so get_vehicle_data is never reached.
     pub fn new_disconnected() -> Self {
-        Self { 
+        Self {
             pool: None,
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -199,7 +199,10 @@ impl DBVehicleReaderInternal {
         }
     }
 
-    pub async fn get_station_etas_impl(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
+    pub async fn get_station_etas_impl(
+        &self,
+        gtfs_id: &str,
+    ) -> AppResult<HashMap<(String, String), i32>> {
         let cache_key = self.get_station_eta_cache_key(gtfs_id);
 
         // Check cache
@@ -723,11 +726,14 @@ impl DBVehicleReaderInternal {
         };
 
         if !detail_rows.is_empty() {
-            return self.process_trip_rows(detail_rows, force_first_active).await;
+            return self
+                .process_trip_rows(detail_rows, force_first_active)
+                .await;
         }
 
         // Final fallback: bus_schedule_internal
-        self.handle_schedule_fallback(&waybill_data.schedule_no).await
+        self.handle_schedule_fallback(&waybill_data.schedule_no)
+            .await
     }
 
     async fn handle_schedule_fallback(
@@ -828,8 +834,7 @@ impl DBVehicleReaderInternal {
             return Ok(());
         }
 
-        let placeholders: Vec<String> =
-            (1..=route_ids.len()).map(|i| format!("${}", i)).collect();
+        let placeholders: Vec<String> = (1..=route_ids.len()).map(|i| format!("${}", i)).collect();
         let placeholders_str = placeholders.join(",");
 
         let query = format!(
@@ -879,7 +884,10 @@ impl DBVehicleReaderInternal {
             let cache = self.waybills_by_route_cache.read().await;
             if let Some((data, ts)) = cache.get(&cache_key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
-                    info!("internal get_chennai_waybills_by_route_id cache HIT for route_id={}", route_id);
+                    info!(
+                        "internal get_chennai_waybills_by_route_id cache HIT for route_id={}",
+                        route_id
+                    );
                     return Ok(data.clone());
                 }
             }
@@ -1095,7 +1103,10 @@ impl DBVehicleReaderInternal {
             .execute(pool)
             .await
             .map_err(|e| {
-                error!("Failed to upsert station_eta for gtfs_id={}: {}", gtfs_id, e);
+                error!(
+                    "Failed to upsert station_eta for gtfs_id={}: {}",
+                    gtfs_id, e
+                );
                 AppError::DbError(e.to_string())
             })?;
 
@@ -1126,7 +1137,8 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         gtfs_id: &str,
         trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId> {
-        self.get_vehicle_data_impl(vehicle_no, gtfs_id, trip_number).await
+        self.get_vehicle_data_impl(vehicle_no, gtfs_id, trip_number)
+            .await
     }
 
     async fn get_chennai_waybills_by_route_id(
@@ -1134,7 +1146,8 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         route_id: &str,
         gtfs_id: &str,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id).await
+        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id)
+            .await
     }
 
     async fn get_chennai_waybill_by_waybill_and_trip(
@@ -1143,7 +1156,8 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         trip_number: i32,
         gtfs_id: &str,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id).await
+        self.get_chennai_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id)
+            .await
     }
 
     async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
@@ -1157,6 +1171,12 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         destination_station_code: &str,
         eta_in_seconds: i32,
     ) -> AppResult<()> {
-        self.upsert_station_eta_impl(gtfs_id, source_station_code, destination_station_code, eta_in_seconds).await
+        self.upsert_station_eta_impl(
+            gtfs_id,
+            source_station_code,
+            destination_station_code,
+            eta_in_seconds,
+        )
+        .await
     }
 }

@@ -70,10 +70,8 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
-    async fn get_chennai_waybills_by_route_id(
-        &self,
-        route_id: &str,
-    ) -> AppResult<Vec<VehicleData>>;
+    async fn get_chennai_waybills_by_route_id(&self, route_id: &str)
+        -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybill_by_waybill_and_trip(
         &self,
         waybill_no: &str,
@@ -276,9 +274,7 @@ impl DBVehicleReader {
                 waybills_by_route: HashMap::new(),
             })),
             waybills_by_route_cache_duration: Duration::from_secs(3600), // 60 minutes TTL
-            routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache {
-                data: None,
-            })),
+            routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache { data: None })),
             routes_served_today_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
         }
     }
@@ -2170,7 +2166,10 @@ impl VehicleDataReader for DBVehicleReader {
             let cache = self.waybills_by_route_cache.read().await;
             if let Some((data, ts)) = cache.waybills_by_route.get(&cache_key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
-                    info!("get_chennai_waybills_by_route_id cache HIT for route_id={}", route_id);
+                    info!(
+                        "get_chennai_waybills_by_route_id cache HIT for route_id={}",
+                        route_id
+                    );
                     return Ok(data.clone());
                 }
             }
@@ -2250,7 +2249,9 @@ impl VehicleDataReader for DBVehicleReader {
                 // Update cache
                 {
                     let mut cache = self.waybills_by_route_cache.write().await;
-                    cache.waybills_by_route.insert(cache_key, (rows.clone(), SystemTime::now()));
+                    cache
+                        .waybills_by_route
+                        .insert(cache_key, (rows.clone(), SystemTime::now()));
                 }
 
                 Ok(rows)
@@ -2380,7 +2381,8 @@ impl VehicleDataReader for DBVehicleReader {
         {
             let cache = self.routes_served_today_cache.read().await;
             if let Some((data, timestamp)) = &cache.data {
-                if timestamp.elapsed().unwrap_or_default() < self.routes_served_today_cache_duration {
+                if timestamp.elapsed().unwrap_or_default() < self.routes_served_today_cache_duration
+                {
                     info!("Routes served today cache HIT");
                     return Ok(data.clone());
                 }
@@ -2389,10 +2391,16 @@ impl VehicleDataReader for DBVehicleReader {
 
         let today_ist = {
             let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
-            chrono::Utc::now().with_timezone(&ist).format("%Y-%m-%d").to_string()
+            chrono::Utc::now()
+                .with_timezone(&ist)
+                .format("%Y-%m-%d")
+                .to_string()
         };
 
-        info!("Routes served today cache MISS, querying for date={}", today_ist);
+        info!(
+            "Routes served today cache MISS, querying for date={}",
+            today_ist
+        );
 
         let query = r#"
             SELECT
