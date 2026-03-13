@@ -1465,13 +1465,12 @@ async fn get_bus_trip_schedule(
         };
 
         // Calculate ETAs
-        let adjusted_start_time = trip_start_time.map(|t| t - 600_000); // 10 minutes in milliseconds
 
         let bus_stop_etas = match app_state.db_vehicle_reader_internal.get_station_etas(&gtfs_id).await {
             Ok(db_etas) if !db_etas.is_empty() => {
-                calculate_eta_from_db(&route_stop_mappings, adjusted_start_time, &db_etas)
+                calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
             }
-            _ => calculate_eta_from_haversine_distance(&route_stop_mappings, adjusted_start_time),
+            _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
         };
 
         schedule_details.push(crate::models::BusScheduleDetail {
@@ -1560,13 +1559,12 @@ async fn get_bus_route_schedule(
                         .and_then(|s| s.parse::<i64>().ok())
                 };
 
-            let adjusted_start_time = trip_start_time.map(|t| t - 600_000); // 10 minutes in milliseconds
 
             let bus_stop_etas = match app_state.db_vehicle_reader_internal.get_station_etas(&gtfs_id).await {
                 Ok(db_etas) if !db_etas.is_empty() => {
-                    calculate_eta_from_db(&route_stop_mappings, adjusted_start_time, &db_etas)
+                    calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
                 }
-                _ => calculate_eta_from_haversine_distance(&route_stop_mappings, adjusted_start_time),
+                _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
             };
 
             schedule_details.push(crate::models::BusScheduleDetail {
