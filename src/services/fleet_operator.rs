@@ -31,6 +31,7 @@ struct WaybillRow {
     driver_token_no: Option<String>,
     schedule_trip_id: Option<i64>,
     is_flexi: bool,
+    duty_date: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,9 @@ pub struct TripData {
     pub route_number: Option<String>,
     pub route_name: Option<String>,
     pub is_active_trip: bool,
+    pub duty_date: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,14 +214,24 @@ impl DBFleetOperatorService {
                 conductor_token_no,
                 driver_token_no,
                 schedule_trip_id,
-                is_flexi
+                is_flexi,
+                duty_date
             FROM waybills_internal
             WHERE gtfs_id = $1
               AND status = 'online'
               AND deleted = false
         "#;
 
-        let row: Option<(i64, String, String, Option<String>, Option<String>, Option<i64>, bool)> =
+        let row: Option<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            bool,
+            Option<String>,
+        )> =
             match anchor {
                 WaybillAnchor::DriverToken(token) => {
                     let sql = format!(
@@ -267,7 +281,16 @@ impl DBFleetOperatorService {
             };
 
         match row {
-            Some((waybill_id, waybill_no, vehicle_no, conductor_token_no, driver_token_no, schedule_trip_id, is_flexi)) => {
+            Some((
+                waybill_id,
+                waybill_no,
+                vehicle_no,
+                conductor_token_no,
+                driver_token_no,
+                schedule_trip_id,
+                is_flexi,
+                duty_date,
+            )) => {
                 Ok(WaybillRow {
                     waybill_id,
                     waybill_no,
@@ -276,6 +299,7 @@ impl DBFleetOperatorService {
                     driver_token_no,
                     schedule_trip_id,
                     is_flexi,
+                    duty_date,
                 })
             }
             None => Err(AppError::NotFound(
@@ -335,15 +359,17 @@ impl DBFleetOperatorService {
     async fn get_all_trips(
         &self,
         waybill: &WaybillRow,
-    ) -> AppResult<Vec<(i32, String, bool)>> {
-        // Returns Vec<(trip_number, route_id, is_active_trip)>
+    ) -> AppResult<Vec<(i32, String, bool, Option<String>, Option<String>)>> {
+        // Returns Vec<(trip_number, route_id, is_active_trip, start_time, end_time)>
         if waybill.is_flexi {
-            let rows: Vec<(i32, String, bool)> = sqlx::query_as(
+            let rows: Vec<(i32, String, bool, Option<String>, Option<String>)> = sqlx::query_as(
                 r#"
                 SELECT
                     trip_number,
                     route_number_id::text AS route_id,
-                    is_active_trip
+                    is_active_trip,
+                    start_time,
+                    end_time
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id = $1
                   AND trip_type != 'dead-trip'
@@ -362,12 +388,14 @@ impl DBFleetOperatorService {
             let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
                 AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
             })?;
-            let rows: Vec<(i32, String, bool)> = sqlx::query_as(
+            let rows: Vec<(i32, String, bool, Option<String>, Option<String>)> = sqlx::query_as(
                 r#"
                 SELECT
                     trip_number,
                     route_number_id::text AS route_id,
-                    is_active_trip
+                    is_active_trip,
+                    start_time,
+                    end_time
                 FROM bus_schedule_trip_detail_internal
                 WHERE schedule_trip_id = $1
                   AND trip_type != 'dead-trip'
@@ -762,7 +790,7 @@ impl FleetOperatorService for DBFleetOperatorService {
         // Collect unique route_ids for cache lookup
         let route_ids: Vec<String> = raw_trips
             .iter()
-            .map(|(_, route_id, _)| route_id.clone())
+            .map(|(_, route_id, _, _, _)| route_id.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -773,7 +801,7 @@ impl FleetOperatorService for DBFleetOperatorService {
         let mut current: Option<TripData> = None;
         let mut upcoming: Vec<TripData> = Vec::new();
 
-        for (trip_number, route_id, is_active_trip) in raw_trips {
+        for (trip_number, route_id, is_active_trip, start_time, end_time) in raw_trips {
             let info = route_map.get(&route_id);
             let trip_data = TripData {
                 trip_number,
@@ -781,8 +809,10 @@ impl FleetOperatorService for DBFleetOperatorService {
                 route_number: info.and_then(|i| i.route_number.clone()),
                 route_name: info.and_then(|i| i.route_name.clone()),
                 is_active_trip,
+                duty_date: waybill.duty_date.clone(),
+                start_time,
+                end_time,
             };
-
 
             if trip_number == previous_trip_number && is_active_trip {
                 current = Some(trip_data);
