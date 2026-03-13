@@ -1957,4 +1957,9 @@ impl GTFSService {
         }
         None
     }
+
+    /// Returns a read-only handle to the underlying GTFS data.
+    pub fn data(&self) -> &Arc<RwLock<GTFSData>> {
+        &self.data
+    }
 }

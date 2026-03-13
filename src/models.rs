@@ -625,3 +625,96 @@ pub struct SeatLayoutMappingRecord {
     pub gtfs_id: String,
     pub seat_layout_id: String,
 }
+
+// ── Schedule / Reach-on-Time types ─────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepartureQuery {
+    pub time: Option<String>,
+    pub date: Option<String>,
+    pub window_minutes: Option<u32>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArrivalQuery {
+    pub time: Option<String>,
+    pub date: Option<String>,
+    pub window_minutes: Option<u32>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TripsBetweenRequest {
+    pub origin_stop_code: String,
+    pub destination_stop_code: String,
+    pub date: Option<String>,
+    pub depart_after: Option<String>,
+    pub arrive_before: Option<String>,
+    pub window_minutes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NextServicesRequest {
+    pub stop_code: String,
+    pub date: Option<String>,
+    pub time: Option<String>,
+    pub modes: Option<Vec<String>>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledDeparture {
+    pub trip_id: String,
+    pub route_id: String,
+    pub route_short_name: Option<String>,
+    pub stop_code: String,
+    pub stop_name: Option<String>,
+    pub departure_time: String,
+    pub headsign: Option<String>,
+    pub stop_sequence: i32,
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledArrival {
+    pub trip_id: String,
+    pub route_id: String,
+    pub route_short_name: Option<String>,
+    pub stop_code: String,
+    pub stop_name: Option<String>,
+    pub arrival_time: String,
+    pub headsign: Option<String>,
+    pub stop_sequence: i32,
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledTrip {
+    pub trip_id: String,
+    pub route_id: String,
+    pub route_short_name: Option<String>,
+    pub origin_stop_code: String,
+    pub origin_stop_name: Option<String>,
+    pub destination_stop_code: String,
+    pub destination_stop_name: Option<String>,
+    pub departure_time: String,
+    pub arrival_time: String,
+    pub mode: Option<String>,
+    pub num_stops: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GtfsDataQualityReport {
+    pub gtfs_id: String,
+    pub total_routes: usize,
+    pub total_stops: usize,
+    pub total_trips: usize,
+    pub routes_with_trips: usize,
+    pub routes_without_trips: usize,
+    pub stops_with_departures: usize,
+    pub stops_without_departures: usize,
+    pub orphaned_stops: usize,
+    pub data_hash: Option<String>,
+    pub generated_at: String,
+}
