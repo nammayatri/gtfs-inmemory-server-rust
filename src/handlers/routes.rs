@@ -1,11 +1,14 @@
+use crate::services::fleet_operator::{TripAction, WaybillAnchor};
+use crate::services::operator::{
+    break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
+    SUPPORTED_OPERATOR_GTFS_IDS,
+};
 use actix_web::{
     web::{self, Data, Json, Path, Query},
     HttpResponse,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::services::operator::{break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody, SUPPORTED_OPERATOR_GTFS_IDS};
-use crate::services::fleet_operator::{TripAction, WaybillAnchor};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,9 +118,15 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             )
             .service(
                 web::scope("internal/fleet-operator/{gtfs_id}")
-                    .route("/currentOperation", web::post().to(fleet_operator_current_operation))
+                    .route(
+                        "/currentOperation",
+                        web::post().to(fleet_operator_current_operation),
+                    )
                     .route("/tripAction", web::post().to(fleet_operator_trip_action))
-                    .route("/currentTripDetails", web::post().to(fleet_operator_current_trip_details))
+                    .route(
+                        "/currentTripDetails",
+                        web::post().to(fleet_operator_current_trip_details),
+                    )
                     .route("/verify", web::post().to(fleet_operator_verify)),
             )
             .route(
@@ -927,7 +936,9 @@ async fn get_service_type_by_vehicle_impl(
                     Err(e) => {
                         tracing::warn!(
                             "Internal: failed to fetch stop mapping gtfs_id={} route={}: {}",
-                            gtfs_id, route_code, e
+                            gtfs_id,
+                            route_code,
+                            e
                         );
                         0
                     }
@@ -1270,7 +1281,6 @@ fn calculate_eta_from_db(
     trip_start_time: Option<i64>,
     db_etas: &HashMap<(String, String), i32>,
 ) -> Vec<crate::models::BusStopETA> {
-
     let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
     let now = chrono::Utc::now();
 
@@ -1285,7 +1295,10 @@ fn calculate_eta_from_db(
             let time_seconds = if let Some(&eta_secs) = db_etas.get(&pair) {
                 // Get ETA for this consecutive pair from DB (value is already in seconds)
                 let prev_eta = eta_secs as f64;
-                info!("calculate_eta_from_db - using DB pair ({}, {}): {} secs", prev_mapping.stop_code, mapping.stop_code, eta_secs);
+                info!(
+                    "calculate_eta_from_db - using DB pair ({}, {}): {} secs",
+                    prev_mapping.stop_code, mapping.stop_code, eta_secs
+                );
                 prev_eta
             } else {
                 // If not found (new stop inserted), calculate distance from previous stop to current stop
@@ -1299,7 +1312,10 @@ fn calculate_eta_from_db(
                 // Calculate time to travel this distance at 25 km/hr
                 let time_hours = distance_km / SPEED_KM_PER_HOUR;
                 let haversine_eta = time_hours * 3600.0;
-                info!("calculate_eta_from_db - fallback haversine pair ({}, {}): {} km -> {} secs", prev_mapping.stop_code, mapping.stop_code, distance_km, haversine_eta);
+                info!(
+                    "calculate_eta_from_db - fallback haversine pair ({}, {}): {} km -> {} secs",
+                    prev_mapping.stop_code, mapping.stop_code, distance_km, haversine_eta
+                );
                 haversine_eta
             };
 
@@ -1337,14 +1353,12 @@ fn calculate_eta_from_db(
     bus_stop_etas
 }
 
-
 /// Calculate arrival time and ETA based on haversine distance between stops
 /// Assumes constant speed of 25 km/hr
 fn calculate_eta_from_haversine_distance(
     route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
     trip_start_time: Option<i64>,
 ) -> Vec<crate::models::BusStopETA> {
-
     let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
     let now = chrono::Utc::now();
 
@@ -1466,7 +1480,11 @@ async fn get_bus_trip_schedule(
 
         // Calculate ETAs
 
-        let bus_stop_etas = match app_state.db_vehicle_reader_internal.get_station_etas(&gtfs_id).await {
+        let bus_stop_etas = match app_state
+            .db_vehicle_reader_internal
+            .get_station_etas(&gtfs_id)
+            .await
+        {
             Ok(db_etas) if !db_etas.is_empty() => {
                 calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
             }
@@ -1529,38 +1547,36 @@ async fn get_bus_route_schedule(
         for row in all_rows {
             // Resolve trip start time from (db_start_time HH:MM + duty_date) or
             // fall back to the stored epoch-millis in start_time_epoch.
-            let trip_start_time: Option<i64> =
-                if let (Some(hhmm), Some(duty)) =
-                    (row.db_start_time.as_deref(), row.duty_date.as_deref())
-                {
-                    let date =
-                        chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
-                    let time =
-                        chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
-                    if let (Some(d), Some(t)) = (date, time) {
-                        let dt = chrono::NaiveDateTime::new(d, t);
-                        if let Some(offset) =
-                            chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-                        {
-                            use chrono::TimeZone;
-                            offset
-                                .from_local_datetime(&dt)
-                                .single()
-                                .map(|dt_tz| dt_tz.timestamp_millis())
-                        } else {
-                            None
-                        }
+            let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
+                (row.db_start_time.as_deref(), row.duty_date.as_deref())
+            {
+                let date = chrono::NaiveDate::parse_from_str(duty, "%Y-%m-%d").ok();
+                let time = chrono::NaiveTime::parse_from_str(hhmm, "%H:%M").ok();
+                if let (Some(d), Some(t)) = (date, time) {
+                    let dt = chrono::NaiveDateTime::new(d, t);
+                    if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
+                        use chrono::TimeZone;
+                        offset
+                            .from_local_datetime(&dt)
+                            .single()
+                            .map(|dt_tz| dt_tz.timestamp_millis())
                     } else {
                         None
                     }
                 } else {
-                    row.start_time_epoch
-                        .as_deref()
-                        .and_then(|s| s.parse::<i64>().ok())
-                };
+                    None
+                }
+            } else {
+                row.start_time_epoch
+                    .as_deref()
+                    .and_then(|s| s.parse::<i64>().ok())
+            };
 
-
-            let bus_stop_etas = match app_state.db_vehicle_reader_internal.get_station_etas(&gtfs_id).await {
+            let bus_stop_etas = match app_state
+                .db_vehicle_reader_internal
+                .get_station_etas(&gtfs_id)
+                .await
+            {
                 Ok(db_etas) if !db_etas.is_empty() => {
                     calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
                 }
@@ -1899,8 +1915,6 @@ struct UpdateWaybillTabletBody {
     tablet_id: String,
 }
 
-
-
 async fn get_one_row(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
@@ -2012,7 +2026,10 @@ async fn get_service_types(
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
-    let list = app_state.operator_service.get_service_types_list(&gtfs_id).await?;
+    let list = app_state
+        .operator_service
+        .get_service_types_list(&gtfs_id)
+        .await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
@@ -2026,13 +2043,13 @@ async fn get_operator_routes(
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn get_depots(
-    app_state: Data<AppState>,
-    path: Path<String>,
-) -> AppResult<HttpResponse> {
+async fn get_depots(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
-    let list = app_state.operator_service.get_depot_names_and_ids(&gtfs_id).await?;
+    let list = app_state
+        .operator_service
+        .get_depot_names_and_ids(&gtfs_id)
+        .await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
@@ -2048,7 +2065,10 @@ async fn get_schedule_numbers(
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
-    let list = app_state.operator_service.get_schedule_numbers(&gtfs_id).await?;
+    let list = app_state
+        .operator_service
+        .get_schedule_numbers(&gtfs_id)
+        .await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
@@ -2084,10 +2104,7 @@ async fn get_trip_details(
     Ok(HttpResponse::Ok().json(details))
 }
 
-async fn get_fleets(
-    app_state: Data<AppState>,
-    path: Path<String>,
-) -> AppResult<HttpResponse> {
+async fn get_fleets(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let list = app_state.operator_service.get_fleets(&gtfs_id).await?;
@@ -2128,20 +2145,14 @@ async fn get_driver_info(
     }
 }
 
-async fn get_device_ids(
-    app_state: Data<AppState>,
-    path: Path<String>,
-) -> AppResult<HttpResponse> {
+async fn get_device_ids(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let ids = app_state.operator_service.get_device_ids(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(ids))
 }
 
-async fn get_tablet_ids(
-    app_state: Data<AppState>,
-    path: Path<String>,
-) -> AppResult<HttpResponse> {
+async fn get_tablet_ids(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let ids = app_state.operator_service.get_tablet_ids(&gtfs_id).await?;
@@ -2163,7 +2174,10 @@ async fn get_operators(
         ));
     }
 
-    let list = app_state.operator_service.get_operators(&gtfs_id, role).await?;
+    let list = app_state
+        .operator_service
+        .get_operators(&gtfs_id, role)
+        .await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
@@ -2242,12 +2256,18 @@ async fn get_waybills(
         })));
     }
 
-    let rows = app_state.operator_service.get_waybills(&gtfs_id, limit, offset).await?;
+    let rows = app_state
+        .operator_service
+        .get_waybills(&gtfs_id, limit, offset)
+        .await?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
 async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
-    let routes = app_state.db_vehicle_reader.get_routes_served_today().await?;
+    let routes = app_state
+        .db_vehicle_reader
+        .get_routes_served_today()
+        .await?;
     Ok(HttpResponse::Ok().json(routes))
 }
 
@@ -2400,7 +2420,11 @@ async fn fleet_operator_verify(
 
     let response = app_state
         .fleet_operator_service
-        .verify(&gtfs_id, &req.operator_badge_token, &req.device_serial_number)
+        .verify_without_device_serial_number(
+            &gtfs_id,
+            &req.operator_badge_token,
+            &req.device_serial_number,
+        )
         .await?;
     Ok(HttpResponse::Ok().json(response))
 }

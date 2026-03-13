@@ -35,12 +35,17 @@ pub fn break_types() -> Vec<&'static str> {
 }
 
 pub fn waybill_statuses() -> Vec<&'static str> {
-    vec!["online", "upcoming", "new", "processed", "audited", "closed"]
+    vec![
+        "online",
+        "upcoming",
+        "new",
+        "processed",
+        "audited",
+        "closed",
+    ]
 }
 
-pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &[
-    "chennai_bus",
-];
+pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus"];
 
 pub const MAX_QUERY_LIMIT: i64 = 1000;
 pub const MAX_QUERY_FILTERS: usize = 5;
@@ -55,95 +60,295 @@ pub struct QueryBody {
 pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
     match table {
         "route_internal" => Some(&[
-            "route_id", "created_at", "description", "route_direction", "route_group",
-            "route_name", "route_number", "route_string", "route_type_id", "status",
-            "updated_at", "via", "bus_service_type_id", "end_point_id", "start_point_id",
-            "route_distance", "gtfs_id",
+            "route_id",
+            "created_at",
+            "description",
+            "route_direction",
+            "route_group",
+            "route_name",
+            "route_number",
+            "route_string",
+            "route_type_id",
+            "status",
+            "updated_at",
+            "via",
+            "bus_service_type_id",
+            "end_point_id",
+            "start_point_id",
+            "route_distance",
+            "gtfs_id",
         ]),
         "route_point_internal" => Some(&[
-            "route_points_id", "created_at", "deleted", "fare_stage", "point_status",
-            "route_order", "stage_no", "sub_stage", "travel_distance", "travel_time",
-            "updated_at", "bus_stop_id", "route_id", "gtfs_id",
+            "route_points_id",
+            "created_at",
+            "deleted",
+            "fare_stage",
+            "point_status",
+            "route_order",
+            "stage_no",
+            "sub_stage",
+            "travel_distance",
+            "travel_time",
+            "updated_at",
+            "bus_stop_id",
+            "route_id",
+            "gtfs_id",
         ]),
         "bus_schedule_internal" => Some(&[
-            "schedule_id", "created_at", "deleted", "effective_from", "effective_till",
-            "route_code", "schedule_number", "service_code", "service_type_code",
-            "schedule_type_code", "status", "updated_at", "entity_id", "route_id",
-            "service_type_id", "schedule_type_id", "gtfs_id",
+            "schedule_id",
+            "created_at",
+            "deleted",
+            "effective_from",
+            "effective_till",
+            "route_code",
+            "schedule_number",
+            "service_code",
+            "service_type_code",
+            "schedule_type_code",
+            "status",
+            "updated_at",
+            "entity_id",
+            "route_id",
+            "service_type_id",
+            "schedule_type_id",
+            "gtfs_id",
         ]),
         "bus_schedule_trip_internal" => Some(&[
-            "schedule_trip_id", "created_at", "deleted", "effective_end_date",
-            "effective_start_date", "no_trip", "schedule_number_name", "start_time",
-            "status", "updated_at", "calendar_id", "schedule_id", "gtfs_id",
+            "schedule_trip_id",
+            "created_at",
+            "deleted",
+            "effective_end_date",
+            "effective_start_date",
+            "no_trip",
+            "schedule_number_name",
+            "start_time",
+            "status",
+            "updated_at",
+            "calendar_id",
+            "schedule_id",
+            "gtfs_id",
         ]),
         "bus_schedule_trip_detail_internal" => Some(&[
-            "schedule_trip_detail_id", "break_time", "break_type", "created_at", "deleted",
-            "distance", "end_time", "org_name", "running_time", "schedule_number",
-            "shift_day_name", "shift_type_name", "start_time", "trip_number", "trip_order",
-            "trip_type", "updated_at", "calendar_id", "route_number_id", "schedule_trip_id",
-            "is_active_trip", "trip_end_time", "trip_start_time", "sync_end_time",
-            "sync_start_time", "gtfs_id",
+            "schedule_trip_detail_id",
+            "break_time",
+            "break_type",
+            "created_at",
+            "deleted",
+            "distance",
+            "end_time",
+            "org_name",
+            "running_time",
+            "schedule_number",
+            "shift_day_name",
+            "shift_type_name",
+            "start_time",
+            "trip_number",
+            "trip_order",
+            "trip_type",
+            "updated_at",
+            "calendar_id",
+            "route_number_id",
+            "schedule_trip_id",
+            "is_active_trip",
+            "trip_end_time",
+            "trip_start_time",
+            "sync_end_time",
+            "sync_start_time",
+            "gtfs_id",
         ]),
         "bus_schedule_trip_flexi_internal" => Some(&[
-            "schedule_trip_flexi_id", "break_time", "break_type", "created_at", "deleted",
-            "distance", "end_time", "org_name", "running_time", "schedule_number",
-            "shift_day_name", "shift_type_name", "start_time", "trip_number", "trip_order",
-            "trip_type", "updated_at", "calendar_id", "route_number_id", "schedule_trip_id",
-            "waybill_id", "is_active_trip", "trip_end_time", "trip_start_time",
-            "sync_end_time", "sync_start_time", "gtfs_id",
+            "schedule_trip_flexi_id",
+            "break_time",
+            "break_type",
+            "created_at",
+            "deleted",
+            "distance",
+            "end_time",
+            "org_name",
+            "running_time",
+            "schedule_number",
+            "shift_day_name",
+            "shift_type_name",
+            "start_time",
+            "trip_number",
+            "trip_order",
+            "trip_type",
+            "updated_at",
+            "calendar_id",
+            "route_number_id",
+            "schedule_trip_id",
+            "waybill_id",
+            "is_active_trip",
+            "trip_end_time",
+            "trip_start_time",
+            "sync_end_time",
+            "sync_start_time",
+            "gtfs_id",
         ]),
         "service_type_internal" => Some(&[
-            "service_type_id", "abbreviation", "created_at", "deleted", "service_type_code",
-            "service_type_name", "status", "ticket_footer", "ticket_footer_local_lang",
-            "updated_at", "gtfs_id",
+            "service_type_id",
+            "abbreviation",
+            "created_at",
+            "deleted",
+            "service_type_code",
+            "service_type_name",
+            "status",
+            "ticket_footer",
+            "ticket_footer_local_lang",
+            "updated_at",
+            "gtfs_id",
         ]),
         "stop_internal" => Some(&[
-            "bus_stop_id", "bus_stop_code", "bus_stop_name", "bus_stop_name_local_lang",
-            "created_at", "deleted", "description", "fare_stage", "landmark",
-            "latitude_current", "longitude_current", "route_status", "status",
-            "stop_direction", "stop_group_id", "stop_type_id", "sub_stage", "toll_fee",
-            "toll_zone", "updated_at", "gtfs_id",
+            "bus_stop_id",
+            "bus_stop_code",
+            "bus_stop_name",
+            "bus_stop_name_local_lang",
+            "created_at",
+            "deleted",
+            "description",
+            "fare_stage",
+            "landmark",
+            "latitude_current",
+            "longitude_current",
+            "route_status",
+            "status",
+            "stop_direction",
+            "stop_group_id",
+            "stop_type_id",
+            "sub_stage",
+            "toll_fee",
+            "toll_zone",
+            "updated_at",
+            "gtfs_id",
         ]),
         "designations_internal" => Some(&[
-            "designation_id", "created_at", "deleted", "designation_name",
-            "designation_remark", "designation_status", "is_default", "updated_at", "gtfs_id",
+            "designation_id",
+            "created_at",
+            "deleted",
+            "designation_name",
+            "designation_remark",
+            "designation_status",
+            "is_default",
+            "updated_at",
+            "gtfs_id",
         ]),
         "employees_internal" => Some(&[
-            "emp_id", "address", "basic_amount", "created_at", "da_amount", "dob", "deleted",
-            "driving_license_expiry", "driving_license_number", "email", "father_name",
-            "first_name", "gender", "last_name", "mobile_no", "status", "token_no",
-            "updated_at", "week_off", "department_id", "designation_id", "entity_id",
-            "organization_id", "gtfs_id",
+            "emp_id",
+            "address",
+            "basic_amount",
+            "created_at",
+            "da_amount",
+            "dob",
+            "deleted",
+            "driving_license_expiry",
+            "driving_license_number",
+            "email",
+            "father_name",
+            "first_name",
+            "gender",
+            "last_name",
+            "mobile_no",
+            "status",
+            "token_no",
+            "updated_at",
+            "week_off",
+            "department_id",
+            "designation_id",
+            "entity_id",
+            "organization_id",
+            "gtfs_id",
         ]),
         "entities_internal" => Some(&[
-            "entity_id", "created_at", "deleted", "entity_address", "entity_contact",
-            "entity_email", "entity_name", "entity_name_local_lang", "entity_remark",
-            "entity_status", "updated_at", "organization_id", "gtfs_id",
+            "entity_id",
+            "created_at",
+            "deleted",
+            "entity_address",
+            "entity_contact",
+            "entity_email",
+            "entity_name",
+            "entity_name_local_lang",
+            "entity_remark",
+            "entity_status",
+            "updated_at",
+            "organization_id",
+            "gtfs_id",
         ]),
         "vehicles_internal" => Some(&[
-            "vehicle_id", "created_at", "deleted", "fleet_no", "status", "updated_at",
-            "vehicle_no", "bus_service_type_id", "entity_id", "organization_id", "gtfs_id",
+            "vehicle_id",
+            "created_at",
+            "deleted",
+            "fleet_no",
+            "status",
+            "updated_at",
+            "vehicle_no",
+            "bus_service_type_id",
+            "entity_id",
+            "organization_id",
+            "gtfs_id",
         ]),
         "waybill_device_internal" => Some(&[
-            "waybill_device_id", "created_at", "deleted", "device_serial_no", "is_audited",
-            "is_primary", "is_uploaded", "updated_at", "waybill_id", "gtfs_id",
+            "waybill_device_id",
+            "created_at",
+            "deleted",
+            "device_serial_no",
+            "is_audited",
+            "is_primary",
+            "is_uploaded",
+            "updated_at",
+            "waybill_id",
+            "gtfs_id",
         ]),
         "fleet_etm_mapping_internal" => Some(&[
-            "fleet_etm_mapping_id", "vehicle_no", "gtfs_id", "etm_serial_no",
-            "created_at", "updated_at", "deleted",
+            "fleet_etm_mapping_id",
+            "vehicle_no",
+            "gtfs_id",
+            "etm_serial_no",
+            "created_at",
+            "updated_at",
+            "deleted",
         ]),
         "fleet_obu_mapping_internal" => Some(&[
-            "fleet_obu_mapping_id", "vehicle_no", "gtfs_id", "obu_id",
-            "created_at", "updated_at", "deleted",
+            "fleet_obu_mapping_id",
+            "vehicle_no",
+            "gtfs_id",
+            "obu_id",
+            "created_at",
+            "updated_at",
+            "deleted",
         ]),
         "waybills_internal" => Some(&[
-            "waybill_id", "audited_date", "bag_master", "challan_no", "conductor_name",
-            "conductor_token_no", "created_at", "dc_name", "dc_token_no", "deleted",
-            "driver_name", "driver_token_no", "duty_date", "device_serial_number",
-            "is_flexi", "no_of_device", "schedule_id", "schedule_no", "schedule_trip_name",
-            "schedule_type", "service_type", "schedule_start_time", "status", "updated_at",
-            "vehicle_no", "waybill_no", "entity_id", "schedule_trip_id", "service_type_id",
-            "shift_type_id", "tablet_id", "gtfs_id",
+            "waybill_id",
+            "audited_date",
+            "bag_master",
+            "challan_no",
+            "conductor_name",
+            "conductor_token_no",
+            "created_at",
+            "dc_name",
+            "dc_token_no",
+            "deleted",
+            "driver_name",
+            "driver_token_no",
+            "duty_date",
+            "device_serial_number",
+            "is_flexi",
+            "no_of_device",
+            "schedule_id",
+            "schedule_no",
+            "schedule_trip_name",
+            "schedule_type",
+            "service_type",
+            "schedule_start_time",
+            "status",
+            "updated_at",
+            "vehicle_no",
+            "waybill_no",
+            "entity_id",
+            "schedule_trip_id",
+            "service_type_id",
+            "shift_type_id",
+            "tablet_id",
+            "gtfs_id",
         ]),
         _ => None,
     }
@@ -151,22 +356,22 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
 
 pub fn table_pk(table: &str) -> Option<&'static str> {
     match table {
-        "route_internal"                     => Some("route_id"),
-        "route_point_internal"               => Some("route_points_id"),
-        "bus_schedule_internal"              => Some("schedule_id"),
-        "bus_schedule_trip_internal"         => Some("schedule_trip_id"),
-        "bus_schedule_trip_detail_internal"  => Some("schedule_trip_detail_id"),
-        "bus_schedule_trip_flexi_internal"   => Some("schedule_trip_flexi_id"),
-        "service_type_internal"              => Some("service_type_id"),
-        "stop_internal"                      => Some("bus_stop_id"),
-        "designations_internal"              => Some("designation_id"),
-        "employees_internal"                 => Some("emp_id"),
-        "entities_internal"                  => Some("entity_id"),
-        "vehicles_internal"                  => Some("vehicle_id"),
-        "waybill_device_internal"            => Some("waybill_device_id"),
-        "fleet_etm_mapping_internal"         => Some("fleet_etm_mapping_id"),
-        "fleet_obu_mapping_internal"         => Some("fleet_obu_mapping_id"),
-        "waybills_internal"                  => Some("waybill_id"),
+        "route_internal" => Some("route_id"),
+        "route_point_internal" => Some("route_points_id"),
+        "bus_schedule_internal" => Some("schedule_id"),
+        "bus_schedule_trip_internal" => Some("schedule_trip_id"),
+        "bus_schedule_trip_detail_internal" => Some("schedule_trip_detail_id"),
+        "bus_schedule_trip_flexi_internal" => Some("schedule_trip_flexi_id"),
+        "service_type_internal" => Some("service_type_id"),
+        "stop_internal" => Some("bus_stop_id"),
+        "designations_internal" => Some("designation_id"),
+        "employees_internal" => Some("emp_id"),
+        "entities_internal" => Some("entity_id"),
+        "vehicles_internal" => Some("vehicle_id"),
+        "waybill_device_internal" => Some("waybill_device_id"),
+        "fleet_etm_mapping_internal" => Some("fleet_etm_mapping_id"),
+        "fleet_obu_mapping_internal" => Some("fleet_obu_mapping_id"),
+        "waybills_internal" => Some("waybill_id"),
         _ => None,
     }
 }
@@ -194,16 +399,25 @@ fn allowed_tables() -> &'static [&'static str] {
 
 fn validate_column_name(col: &str) -> AppResult<()> {
     if col.is_empty() || col.len() > 64 {
-        return Err(AppError::BadRequest(format!("Invalid column name: {}", col)));
+        return Err(AppError::BadRequest(format!(
+            "Invalid column name: {}",
+            col
+        )));
     }
     let mut chars = col.chars();
     let first = chars.next().unwrap();
     if !first.is_ascii_alphabetic() && first != '_' {
-        return Err(AppError::BadRequest(format!("Invalid column name: {}", col)));
+        return Err(AppError::BadRequest(format!(
+            "Invalid column name: {}",
+            col
+        )));
     }
     for c in chars {
         if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(AppError::BadRequest(format!("Invalid column name: {}", col)));
+            return Err(AppError::BadRequest(format!(
+                "Invalid column name: {}",
+                col
+            )));
         }
     }
     Ok(())
@@ -620,31 +834,46 @@ fn row_from_value(table: &str, v: serde_json::Value) -> AppResult<InternalRow> {
         }};
     }
     match table {
-        "route_internal"                      => parse!(RouteInternal, RouteInternal),
-        "route_point_internal"                => parse!(RoutePointInternal, RoutePointInternal),
-        "bus_schedule_internal"               => parse!(BusScheduleInternal, BusScheduleInternal),
-        "bus_schedule_trip_internal"          => parse!(BusScheduleTripInternal, BusScheduleTripInternal),
-        "bus_schedule_trip_detail_internal"   => parse!(BusScheduleTripDetailInternal, BusScheduleTripDetailInternal),
-        "bus_schedule_trip_flexi_internal"    => parse!(BusScheduleTripFlexiInternal, BusScheduleTripFlexiInternal),
-        "service_type_internal"               => parse!(ServiceTypeInternal, ServiceTypeInternal),
-        "stop_internal"                       => parse!(StopInternal, StopInternal),
-        "designations_internal"               => parse!(DesignationsInternal, DesignationsInternal),
-        "employees_internal"                  => parse!(EmployeesInternal, EmployeesInternal),
-        "entities_internal"                   => parse!(EntitiesInternal, EntitiesInternal),
-        "vehicles_internal"                   => parse!(VehiclesInternal, VehiclesInternal),
-        "waybill_device_internal"             => parse!(WaybillDeviceInternal, WaybillDeviceInternal),
-        "fleet_etm_mapping_internal"          => parse!(FleetEtmMappingInternal, FleetEtmMappingInternal),
-        "fleet_obu_mapping_internal"          => parse!(FleetObuMappingInternal, FleetObuMappingInternal),
-        "waybills_internal"                   => parse!(WaybillsInternal, WaybillsInternal),
+        "route_internal" => parse!(RouteInternal, RouteInternal),
+        "route_point_internal" => parse!(RoutePointInternal, RoutePointInternal),
+        "bus_schedule_internal" => parse!(BusScheduleInternal, BusScheduleInternal),
+        "bus_schedule_trip_internal" => parse!(BusScheduleTripInternal, BusScheduleTripInternal),
+        "bus_schedule_trip_detail_internal" => {
+            parse!(BusScheduleTripDetailInternal, BusScheduleTripDetailInternal)
+        }
+        "bus_schedule_trip_flexi_internal" => {
+            parse!(BusScheduleTripFlexiInternal, BusScheduleTripFlexiInternal)
+        }
+        "service_type_internal" => parse!(ServiceTypeInternal, ServiceTypeInternal),
+        "stop_internal" => parse!(StopInternal, StopInternal),
+        "designations_internal" => parse!(DesignationsInternal, DesignationsInternal),
+        "employees_internal" => parse!(EmployeesInternal, EmployeesInternal),
+        "entities_internal" => parse!(EntitiesInternal, EntitiesInternal),
+        "vehicles_internal" => parse!(VehiclesInternal, VehiclesInternal),
+        "waybill_device_internal" => parse!(WaybillDeviceInternal, WaybillDeviceInternal),
+        "fleet_etm_mapping_internal" => parse!(FleetEtmMappingInternal, FleetEtmMappingInternal),
+        "fleet_obu_mapping_internal" => parse!(FleetObuMappingInternal, FleetObuMappingInternal),
+        "waybills_internal" => parse!(WaybillsInternal, WaybillsInternal),
         other => Err(AppError::Internal(format!("Unknown table: {}", other))),
     }
 }
 
 #[async_trait]
 pub trait OperatorService: Send + Sync {
-    async fn get_one_row(&self, table: &str, gtfs_id: &str, query_params: HashMap<String, String>) -> AppResult<Option<InternalRow>>;
+    async fn get_one_row(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        query_params: HashMap<String, String>,
+    ) -> AppResult<Option<InternalRow>>;
 
-    async fn get_all_rows(&self, table: &str, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<InternalRow>>;
+    async fn get_all_rows(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<Vec<InternalRow>>;
 
     async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64>;
 
@@ -662,11 +891,19 @@ pub trait OperatorService: Send + Sync {
 
     async fn get_schedule_numbers(&self, gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>>;
 
-    async fn get_schedule_trip_details_by_schedule_number(&self, gtfs_id: &str, schedule_number: &str,) -> AppResult<Vec<TripDetailRow>>;
+    async fn get_schedule_trip_details_by_schedule_number(
+        &self,
+        gtfs_id: &str,
+        schedule_number: &str,
+    ) -> AppResult<Vec<TripDetailRow>>;
 
     async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>>;
 
-    async fn get_conductor_data(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>>;
+    async fn get_conductor_data(
+        &self,
+        gtfs_id: &str,
+        token: &str,
+    ) -> AppResult<Option<EmployeeRow>>;
     async fn get_driver_info(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>>;
 
     async fn get_device_ids(&self, gtfs_id: &str) -> AppResult<Vec<String>>;
@@ -674,13 +911,38 @@ pub trait OperatorService: Send + Sync {
 
     async fn get_operators(&self, gtfs_id: &str, role: &str) -> AppResult<Vec<EmployeeRow>>;
 
-    async fn update_waybill_status(&self, gtfs_id: &str, waybill_id: i64, status: &str) -> AppResult<u64>;
-    async fn update_waybill_fleet_number(&self, gtfs_id: &str, waybill_id: i64, fleet_no: &str) -> AppResult<u64>;
-    async fn update_waybill_tablet_id(&self, gtfs_id: &str, waybill_id: i64, tablet_id: &str) -> AppResult<u64>;
+    async fn update_waybill_status(
+        &self,
+        gtfs_id: &str,
+        waybill_id: i64,
+        status: &str,
+    ) -> AppResult<u64>;
+    async fn update_waybill_fleet_number(
+        &self,
+        gtfs_id: &str,
+        waybill_id: i64,
+        fleet_no: &str,
+    ) -> AppResult<u64>;
+    async fn update_waybill_tablet_id(
+        &self,
+        gtfs_id: &str,
+        waybill_id: i64,
+        tablet_id: &str,
+    ) -> AppResult<u64>;
 
-    async fn get_waybills(&self, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<WaybillsInternal>>;
+    async fn get_waybills(
+        &self,
+        gtfs_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<Vec<WaybillsInternal>>;
 
-    async fn query_rows(&self, table: &str, gtfs_id: &str, body: QueryBody) -> AppResult<Vec<InternalRow>>;
+    async fn query_rows(
+        &self,
+        table: &str,
+        gtfs_id: &str,
+        body: QueryBody,
+    ) -> AppResult<Vec<InternalRow>>;
 }
 
 pub struct MockOperatorService;
@@ -707,11 +969,22 @@ macro_rules! mock_err {
 
 #[async_trait]
 impl OperatorService for MockOperatorService {
-    async fn get_one_row(&self, _table: &str, _gtfs_id: &str, _query_params: HashMap<String, String>) -> AppResult<Option<InternalRow>> {
+    async fn get_one_row(
+        &self,
+        _table: &str,
+        _gtfs_id: &str,
+        _query_params: HashMap<String, String>,
+    ) -> AppResult<Option<InternalRow>> {
         mock_err!()
     }
 
-    async fn get_all_rows(&self, _table: &str, _gtfs_id: &str, _limit: i64, _offset: i64) -> AppResult<Vec<InternalRow>> {
+    async fn get_all_rows(
+        &self,
+        _table: &str,
+        _gtfs_id: &str,
+        _limit: i64,
+        _offset: i64,
+    ) -> AppResult<Vec<InternalRow>> {
         mock_err!()
     }
 
@@ -745,7 +1018,11 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
-    async fn get_schedule_trip_details_by_schedule_number(&self, _gtfs_id: &str, _schedule_number: &str) -> AppResult<Vec<TripDetailRow>> {
+    async fn get_schedule_trip_details_by_schedule_number(
+        &self,
+        _gtfs_id: &str,
+        _schedule_number: &str,
+    ) -> AppResult<Vec<TripDetailRow>> {
         mock_err!()
     }
 
@@ -753,11 +1030,19 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
-    async fn get_conductor_data(&self, _gtfs_id: &str, _token: &str) -> AppResult<Option<EmployeeRow>> {
+    async fn get_conductor_data(
+        &self,
+        _gtfs_id: &str,
+        _token: &str,
+    ) -> AppResult<Option<EmployeeRow>> {
         mock_err!()
     }
 
-    async fn get_driver_info(&self, _gtfs_id: &str, _token: &str) -> AppResult<Option<EmployeeRow>> {
+    async fn get_driver_info(
+        &self,
+        _gtfs_id: &str,
+        _token: &str,
+    ) -> AppResult<Option<EmployeeRow>> {
         mock_err!()
     }
 
@@ -773,23 +1058,48 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
-    async fn update_waybill_status(&self, _gtfs_id: &str, _waybill_id: i64, _status: &str) -> AppResult<u64> {
+    async fn update_waybill_status(
+        &self,
+        _gtfs_id: &str,
+        _waybill_id: i64,
+        _status: &str,
+    ) -> AppResult<u64> {
         mock_err!()
     }
 
-    async fn update_waybill_fleet_number(&self, _gtfs_id: &str, _waybill_id: i64, _fleet_no: &str) -> AppResult<u64> {
+    async fn update_waybill_fleet_number(
+        &self,
+        _gtfs_id: &str,
+        _waybill_id: i64,
+        _fleet_no: &str,
+    ) -> AppResult<u64> {
         mock_err!()
     }
 
-    async fn update_waybill_tablet_id(&self, _gtfs_id: &str, _waybill_id: i64, _tablet_id: &str) -> AppResult<u64> {
+    async fn update_waybill_tablet_id(
+        &self,
+        _gtfs_id: &str,
+        _waybill_id: i64,
+        _tablet_id: &str,
+    ) -> AppResult<u64> {
         mock_err!()
     }
 
-    async fn get_waybills(&self, _gtfs_id: &str, _limit: i64, _offset: i64) -> AppResult<Vec<WaybillsInternal>> {
+    async fn get_waybills(
+        &self,
+        _gtfs_id: &str,
+        _limit: i64,
+        _offset: i64,
+    ) -> AppResult<Vec<WaybillsInternal>> {
         mock_err!()
     }
 
-    async fn query_rows(&self, _table: &str, _gtfs_id: &str, _body: QueryBody) -> AppResult<Vec<InternalRow>> {
+    async fn query_rows(
+        &self,
+        _table: &str,
+        _gtfs_id: &str,
+        _body: QueryBody,
+    ) -> AppResult<Vec<InternalRow>> {
         mock_err!()
     }
 }
@@ -820,8 +1130,12 @@ impl DBOperatorService {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            device_ids_cache: Arc::new(RwLock::new(DeviceIdsCache { etm_ids: HashMap::new() })),
-            tablet_ids_cache: Arc::new(RwLock::new(TabletIdsCache { tablet_ids: HashMap::new() })),
+            device_ids_cache: Arc::new(RwLock::new(DeviceIdsCache {
+                etm_ids: HashMap::new(),
+            })),
+            tablet_ids_cache: Arc::new(RwLock::new(TabletIdsCache {
+                tablet_ids: HashMap::new(),
+            })),
             designation_cache: Arc::new(RwLock::new(DesignationCache { map: None })),
         }
     }
@@ -871,7 +1185,6 @@ impl DBOperatorService {
 
 #[async_trait]
 impl OperatorService for DBOperatorService {
-
     async fn get_one_row(
         &self,
         table: &str,
@@ -912,13 +1225,14 @@ impl OperatorService for DBOperatorService {
             q = q.bind(val);
         }
 
-        let val: Option<Value> = q.fetch_optional(&self.pool)
+        let val: Option<Value> = q
+            .fetch_optional(&self.pool)
             .await
             .map_err(|e| AppError::DbError(format!("get_one_row {}: {}", table, e)))?;
-            
+
         match val {
             Some(v) => Ok(Some(row_from_value(table, v)?)),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
@@ -944,9 +1258,7 @@ impl OperatorService for DBOperatorService {
             .await
             .map_err(|e| AppError::DbError(format!("get_all_rows {}: {}", table, e)))?;
 
-        vals.into_iter()
-            .map(|v| row_from_value(table, v))
-            .collect()
+        vals.into_iter().map(|v| row_from_value(table, v)).collect()
     }
 
     async fn query_rows(
@@ -982,22 +1294,26 @@ impl OperatorService for DBOperatorService {
         for f in &body.filters {
             if f.len() < 3 {
                 return Err(AppError::BadRequest(
-                    "Each filter must have at least 3 elements: [column, operator, value]".to_string(),
+                    "Each filter must have at least 3 elements: [column, operator, value]"
+                        .to_string(),
                 ));
             }
 
             let col = &f[0];
-            let op  = f[1].as_str();
+            let op = f[1].as_str();
 
             let sql_op: &'static str = match op {
-                "eq"    => "=",
+                "eq" => "=",
                 "noteq" => "!=",
-                "gt"    => ">",
-                "lt"    => "<",
-                "like"  => "ILIKE",
-                _ => return Err(AppError::BadRequest(format!(
-                    "Unknown operator '{}'. Valid: eq, noteq, gt, lt, like", op
-                ))),
+                "gt" => ">",
+                "lt" => "<",
+                "like" => "ILIKE",
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "Unknown operator '{}'. Valid: eq, noteq, gt, lt, like",
+                        op
+                    )))
+                }
             };
 
             // Automatically wrap the value with % wildcards for ILIKE
@@ -1011,11 +1327,16 @@ impl OperatorService for DBOperatorService {
 
             if !known_cols.contains(col.as_str()) {
                 return Err(AppError::BadRequest(format!(
-                    "Unknown column '{}' for table '{}'", col, table
+                    "Unknown column '{}' for table '{}'",
+                    col, table
                 )));
             }
 
-            valid_filters.push(Filter { col: col.clone(), sql_op, val1 });
+            valid_filters.push(Filter {
+                col: col.clone(),
+                sql_op,
+                val1,
+            });
         }
 
         if valid_filters.is_empty() {
@@ -1035,7 +1356,7 @@ impl OperatorService for DBOperatorService {
             param_idx += 1;
         }
 
-        let limit  = body.limit.unwrap_or(15).min(MAX_QUERY_LIMIT);
+        let limit = body.limit.unwrap_or(15).min(MAX_QUERY_LIMIT);
         let offset = body.offset.unwrap_or(0);
 
         let sql = format!(
@@ -1058,9 +1379,7 @@ impl OperatorService for DBOperatorService {
             .await
             .map_err(|e| AppError::DbError(format!("query_rows {}: {}", table, e)))?;
 
-        vals.into_iter()
-            .map(|v| row_from_value(table, v))
-            .collect()
+        vals.into_iter().map(|v| row_from_value(table, v)).collect()
     }
 
     async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64> {
@@ -1072,12 +1391,17 @@ impl OperatorService for DBOperatorService {
             .as_object()
             .ok_or_else(|| AppError::BadRequest("Body must be a JSON object".to_string()))?;
 
-        let pk_value = obj.get(pk)
-            .ok_or_else(|| AppError::BadRequest(format!("Body must contain the primary key: {}", pk)))?;
+        let pk_value = obj.get(pk).ok_or_else(|| {
+            AppError::BadRequest(format!("Body must contain the primary key: {}", pk))
+        })?;
 
         let id = match pk_value {
-            Value::Number(n) => n.as_i64().ok_or_else(|| AppError::BadRequest("ID must be an integer".to_string()))?,
-            Value::String(s) => s.parse::<i64>().map_err(|_| AppError::BadRequest("ID must be an integer string".to_string()))?,
+            Value::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| AppError::BadRequest("ID must be an integer".to_string()))?,
+            Value::String(s) => s
+                .parse::<i64>()
+                .map_err(|_| AppError::BadRequest("ID must be an integer string".to_string()))?,
             _ => return Err(AppError::BadRequest("ID must be an integer".to_string())),
         };
 
@@ -1146,7 +1470,8 @@ impl OperatorService for DBOperatorService {
         // Also exclude keys whose value is JSON null — omit-null semantics so that a partial
         // update (e.g. just {waybill_id, duty_date}) never triggers NOT NULL violations on
         // columns the caller didn't intend to touch.
-        let mut cols: Vec<&str> = first_obj.keys()
+        let mut cols: Vec<&str> = first_obj
+            .keys()
             .filter(|k| k.as_str() != "gtfs_id" && !first_obj[k.as_str()].is_null())
             .map(|s| s.as_str())
             .collect();
@@ -1184,7 +1509,9 @@ impl OperatorService for DBOperatorService {
         let mut q = sqlx::query_scalar::<_, Value>(&sql);
 
         for val in &arr {
-            let obj = val.as_object().ok_or_else(|| AppError::BadRequest("Array must contain JSON objects".to_string()))?;
+            let obj = val.as_object().ok_or_else(|| {
+                AppError::BadRequest("Array must contain JSON objects".to_string())
+            })?;
             // bind all cols except gtfs_id first
             for col in cols.iter().filter(|c| **c != "gtfs_id") {
                 let col_val = obj.get(*col).unwrap_or(&Value::Null);
@@ -1201,7 +1528,7 @@ impl OperatorService for DBOperatorService {
                         } else {
                             q = q.bind(s.as_str());
                         }
-                    },
+                    }
                     Value::Number(n) => {
                         if let Some(i) = n.as_i64() {
                             q = q.bind(i);
@@ -1213,7 +1540,7 @@ impl OperatorService for DBOperatorService {
                     Value::Null => q = q.bind(Option::<String>::None),
                     _ => {
                         return Err(AppError::BadRequest(
-                            "Unsupported JSON value type for key".to_string()
+                            "Unsupported JSON value type for key".to_string(),
                         ))
                     }
                 }
@@ -1222,7 +1549,8 @@ impl OperatorService for DBOperatorService {
             q = q.bind(gtfs_id);
         }
 
-        let results = q.fetch_all(&self.pool)
+        let results = q
+            .fetch_all(&self.pool)
             .await
             .map_err(|e| AppError::DbError(format!("upsert_one_row {}: {}", table, e)))?;
 
@@ -1336,7 +1664,11 @@ impl OperatorService for DBOperatorService {
         .map_err(|e| AppError::DbError(format!("get_fleets: {}", e)))
     }
 
-    async fn get_conductor_data(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>> {
+    async fn get_conductor_data(
+        &self,
+        gtfs_id: &str,
+        token: &str,
+    ) -> AppResult<Option<EmployeeRow>> {
         self.ensure_designation_cache().await?;
         let designation_id = self.designation_id_for("conductors").await?;
 
@@ -1404,7 +1736,9 @@ impl OperatorService for DBOperatorService {
         let ids: Vec<String> = rows.into_iter().map(|(s,)| s).collect();
 
         let mut cache = self.device_ids_cache.write().await;
-        cache.etm_ids.insert(gtfs_id.to_string(), (ids.clone(), SystemTime::now()));
+        cache
+            .etm_ids
+            .insert(gtfs_id.to_string(), (ids.clone(), SystemTime::now()));
         Ok(ids)
     }
 
@@ -1434,7 +1768,9 @@ impl OperatorService for DBOperatorService {
         let ids: Vec<String> = rows.into_iter().map(|(s,)| s).collect();
 
         let mut cache = self.tablet_ids_cache.write().await;
-        cache.tablet_ids.insert(gtfs_id.to_string(), (ids.clone(), SystemTime::now()));
+        cache
+            .tablet_ids
+            .insert(gtfs_id.to_string(), (ids.clone(), SystemTime::now()));
         Ok(ids)
     }
 
@@ -1456,7 +1792,12 @@ impl OperatorService for DBOperatorService {
         .map_err(|e| AppError::DbError(format!("get_operators: {}", e)))
     }
 
-    async fn update_waybill_status(&self, gtfs_id: &str, waybill_id: i64, status: &str) -> AppResult<u64> {
+    async fn update_waybill_status(
+        &self,
+        gtfs_id: &str,
+        waybill_id: i64,
+        status: &str,
+    ) -> AppResult<u64> {
         if !waybill_statuses().contains(&status) {
             return Err(AppError::BadRequest(format!(
                 "Invalid status '{}'. Valid: {:?}",
@@ -1478,7 +1819,12 @@ impl OperatorService for DBOperatorService {
         Ok(result.rows_affected())
     }
 
-    async fn update_waybill_fleet_number(&self, gtfs_id: &str, waybill_id: i64, fleet_no: &str) -> AppResult<u64> {
+    async fn update_waybill_fleet_number(
+        &self,
+        gtfs_id: &str,
+        waybill_id: i64,
+        fleet_no: &str,
+    ) -> AppResult<u64> {
         let result = sqlx::query(
             "UPDATE public.waybills_internal SET vehicle_no = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
         )
@@ -1492,7 +1838,12 @@ impl OperatorService for DBOperatorService {
         Ok(result.rows_affected())
     }
 
-    async fn update_waybill_tablet_id(&self, gtfs_id: &str, waybill_id: i64, tablet_id: &str) -> AppResult<u64> {
+    async fn update_waybill_tablet_id(
+        &self,
+        gtfs_id: &str,
+        waybill_id: i64,
+        tablet_id: &str,
+    ) -> AppResult<u64> {
         let result = sqlx::query(
             "UPDATE public.waybills_internal SET tablet_id = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
         )
@@ -1506,7 +1857,12 @@ impl OperatorService for DBOperatorService {
         Ok(result.rows_affected())
     }
 
-    async fn get_waybills(&self, gtfs_id: &str, limit: i64, offset: i64) -> AppResult<Vec<WaybillsInternal>> {
+    async fn get_waybills(
+        &self,
+        gtfs_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<Vec<WaybillsInternal>> {
         let vals: Vec<Value> = sqlx::query_scalar::<_, Value>(
             "SELECT row_to_json(t) FROM (
                 SELECT * FROM public.waybills_internal
@@ -1523,7 +1879,10 @@ impl OperatorService for DBOperatorService {
         .map_err(|e| AppError::DbError(format!("get_waybills: {}", e)))?;
 
         vals.into_iter()
-            .map(|v| serde_json::from_value(v).map_err(|e| AppError::Internal(format!("Failed to parse waybill: {}", e))))
+            .map(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| AppError::Internal(format!("Failed to parse waybill: {}", e)))
+            })
             .collect()
     }
 }

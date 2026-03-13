@@ -112,6 +112,13 @@ pub trait FleetOperatorService: Send + Sync {
         token: &str,
         device_serial_no: &str,
     ) -> AppResult<VerifyResponse>;
+
+    async fn verify_without_device_serial_number(
+        &self,
+        gtfs_id: &str,
+        token: &str,
+        device_serial_no: &str,
+    ) -> AppResult<VerifyResponse>;
 }
 
 // ─── Mock implementation ───────────────────────────────────────────────────────
@@ -176,6 +183,17 @@ impl FleetOperatorService for MockFleetOperatorService {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn verify_without_device_serial_number(
+        &self,
+        _gtfs_id: &str,
+        _token: &str,
+        _device_serial_no: &str,
+    ) -> AppResult<VerifyResponse> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
 }
 
 // ─── DB implementation ─────────────────────────────────────────────────────────
@@ -217,67 +235,80 @@ impl DBFleetOperatorService {
               AND deleted = false
         "#;
 
-        let row: Option<(i64, String, String, Option<String>, Option<String>, Option<i64>, bool)> =
-            match anchor {
-                WaybillAnchor::DriverToken(token) => {
-                    let sql = format!(
-                        "{} AND driver_token_no = $2 ORDER BY updated_at DESC LIMIT 1",
-                        base_select
-                    );
-                    sqlx::query_as(&sql)
-                        .bind(gtfs_id)
-                        .bind(token)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            error!("resolve_waybill (driver_token) failed: {}", e);
-                            AppError::Internal(e.to_string())
-                        })?
-                }
-                WaybillAnchor::ConductorToken(token) => {
-                    let sql = format!(
-                        "{} AND conductor_token_no = $2 ORDER BY updated_at DESC LIMIT 1",
-                        base_select
-                    );
-                    sqlx::query_as(&sql)
-                        .bind(gtfs_id)
-                        .bind(token)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            error!("resolve_waybill (conductor_token) failed: {}", e);
-                            AppError::Internal(e.to_string())
-                        })?
-                }
-                WaybillAnchor::VehicleNumber(vehicle_no) => {
-                    let sql = format!(
-                        "{} AND vehicle_no = $2 ORDER BY updated_at DESC LIMIT 1",
-                        base_select
-                    );
-                    sqlx::query_as(&sql)
-                        .bind(gtfs_id)
-                        .bind(vehicle_no)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            error!("resolve_waybill (vehicle_no) failed: {}", e);
-                            AppError::Internal(e.to_string())
-                        })?
-                }
-            };
+        let row: Option<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            bool,
+        )> = match anchor {
+            WaybillAnchor::DriverToken(token) => {
+                let sql = format!(
+                    "{} AND driver_token_no = $2 ORDER BY updated_at DESC LIMIT 1",
+                    base_select
+                );
+                sqlx::query_as(&sql)
+                    .bind(gtfs_id)
+                    .bind(token)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!("resolve_waybill (driver_token) failed: {}", e);
+                        AppError::Internal(e.to_string())
+                    })?
+            }
+            WaybillAnchor::ConductorToken(token) => {
+                let sql = format!(
+                    "{} AND conductor_token_no = $2 ORDER BY updated_at DESC LIMIT 1",
+                    base_select
+                );
+                sqlx::query_as(&sql)
+                    .bind(gtfs_id)
+                    .bind(token)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!("resolve_waybill (conductor_token) failed: {}", e);
+                        AppError::Internal(e.to_string())
+                    })?
+            }
+            WaybillAnchor::VehicleNumber(vehicle_no) => {
+                let sql = format!(
+                    "{} AND vehicle_no = $2 ORDER BY updated_at DESC LIMIT 1",
+                    base_select
+                );
+                sqlx::query_as(&sql)
+                    .bind(gtfs_id)
+                    .bind(vehicle_no)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!("resolve_waybill (vehicle_no) failed: {}", e);
+                        AppError::Internal(e.to_string())
+                    })?
+            }
+        };
 
         match row {
-            Some((waybill_id, waybill_no, vehicle_no, conductor_token_no, driver_token_no, schedule_trip_id, is_flexi)) => {
-                Ok(WaybillRow {
-                    waybill_id,
-                    waybill_no,
-                    vehicle_no,
-                    conductor_token_no,
-                    driver_token_no,
-                    schedule_trip_id,
-                    is_flexi,
-                })
-            }
+            Some((
+                waybill_id,
+                waybill_no,
+                vehicle_no,
+                conductor_token_no,
+                driver_token_no,
+                schedule_trip_id,
+                is_flexi,
+            )) => Ok(WaybillRow {
+                waybill_id,
+                waybill_no,
+                vehicle_no,
+                conductor_token_no,
+                driver_token_no,
+                schedule_trip_id,
+                is_flexi,
+            }),
             None => Err(AppError::NotFound(
                 "No active (online) waybill found for the provided anchor.".to_string(),
             )),
@@ -300,7 +331,10 @@ impl DBFleetOperatorService {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| {
-                error!("get_trip_count (flexi) failed for waybill_id={}: {}", waybill.waybill_id, e);
+                error!(
+                    "get_trip_count (flexi) failed for waybill_id={}: {}",
+                    waybill.waybill_id, e
+                );
                 AppError::Internal(e.to_string())
             })?;
             Ok(count)
@@ -332,10 +366,7 @@ impl DBFleetOperatorService {
 
     // ── All trips ────────────────────────────────────────────────────────────
 
-    async fn get_all_trips(
-        &self,
-        waybill: &WaybillRow,
-    ) -> AppResult<Vec<(i32, String, bool)>> {
+    async fn get_all_trips(&self, waybill: &WaybillRow) -> AppResult<Vec<(i32, String, bool)>> {
         // Returns Vec<(trip_number, route_id, is_active_trip)>
         if waybill.is_flexi {
             let rows: Vec<(i32, String, bool)> = sqlx::query_as(
@@ -354,7 +385,10 @@ impl DBFleetOperatorService {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
-                error!("get_all_trips (flexi) failed for waybill_id={}: {}", waybill.waybill_id, e);
+                error!(
+                    "get_all_trips (flexi) failed for waybill_id={}: {}",
+                    waybill.waybill_id, e
+                );
                 AppError::Internal(e.to_string())
             })?;
             Ok(rows)
@@ -645,10 +679,7 @@ impl DBFleetOperatorService {
 
     // ── Route info cache ─────────────────────────────────────────────────────
 
-    async fn get_route_infos(
-        &self,
-        route_ids: &[String],
-    ) -> AppResult<HashMap<String, RouteInfo>> {
+    async fn get_route_infos(&self, route_ids: &[String]) -> AppResult<HashMap<String, RouteInfo>> {
         if route_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -706,7 +737,10 @@ impl DBFleetOperatorService {
         let fetched_now = SystemTime::now();
         let mut cache = self.route_info_cache.write().await;
         for (route_id, route_number, route_name) in rows {
-            let info = RouteInfo { route_number, route_name };
+            let info = RouteInfo {
+                route_number,
+                route_name,
+            };
             cache.insert(route_id.clone(), (info.clone(), fetched_now));
             result.insert(route_id, info);
         }
@@ -746,7 +780,8 @@ impl FleetOperatorService for DBFleetOperatorService {
     ) -> AppResult<TripActionResponse> {
         let waybill = self.resolve_waybill(gtfs_id, &anchor).await?;
         self.validate_trip_exists(&waybill, trip_number).await?;
-        self.apply_trip_action(&waybill, &action, trip_number, timestamp).await?;
+        self.apply_trip_action(&waybill, &action, trip_number, timestamp)
+            .await?;
         Ok(TripActionResponse { success: true })
     }
 
@@ -783,7 +818,6 @@ impl FleetOperatorService for DBFleetOperatorService {
                 is_active_trip,
             };
 
-
             if trip_number == previous_trip_number && is_active_trip {
                 current = Some(trip_data);
             } else if trip_number <= previous_trip_number {
@@ -801,6 +835,41 @@ impl FleetOperatorService for DBFleetOperatorService {
             history,
             current,
             upcoming,
+        })
+    }
+
+    async fn verify_without_device_serial_number(
+        &self,
+        gtfs_id: &str,
+        token: &str,
+        _device_serial_no: &str,
+    ) -> AppResult<VerifyResponse> {
+        let employee_ok: bool = sqlx::query_scalar(
+            r#"
+            SELECT 1
+            FROM employees_internal
+            WHERE token_no = $1
+              AND gtfs_id  = $2
+              AND deleted  = false
+            LIMIT 1
+            "#,
+        )
+        .bind(token)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(
+                "verify employee check failed for token={} gtfs_id={}: {}",
+                token, gtfs_id, e
+            );
+            AppError::Internal(e.to_string())
+        })?
+        .map(|_: i32| true)
+        .unwrap_or(false);
+
+        Ok(VerifyResponse {
+            verified: employee_ok,
         })
     }
 
@@ -826,7 +895,10 @@ impl FleetOperatorService for DBFleetOperatorService {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            error!("verify employee check failed for token={} gtfs_id={}: {}", token, gtfs_id, e);
+            error!(
+                "verify employee check failed for token={} gtfs_id={}: {}",
+                token, gtfs_id, e
+            );
             AppError::Internal(e.to_string())
         })?
         .map(|_: i32| true)
@@ -852,7 +924,10 @@ impl FleetOperatorService for DBFleetOperatorService {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            error!("verify OBU check failed for device={} gtfs_id={}: {}", device_serial_no, gtfs_id, e);
+            error!(
+                "verify OBU check failed for device={} gtfs_id={}: {}",
+                device_serial_no, gtfs_id, e
+            );
             AppError::Internal(e.to_string())
         })?
         .map(|_: i32| true)
@@ -877,7 +952,10 @@ impl FleetOperatorService for DBFleetOperatorService {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            error!("verify ETM check failed for device={} gtfs_id={}: {}", device_serial_no, gtfs_id, e);
+            error!(
+                "verify ETM check failed for device={} gtfs_id={}: {}",
+                device_serial_no, gtfs_id, e
+            );
             AppError::Internal(e.to_string())
         })?
         .map(|_: i32| true)
