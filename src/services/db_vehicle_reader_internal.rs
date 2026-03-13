@@ -942,9 +942,6 @@ impl DBVehicleReaderInternal {
                     OVER (PARTITION BY waybill_no) AS active_trip_number
                 FROM base
             ) t
-            WHERE
-                has_active = 0
-                OR trip_number >= active_trip_number
             ORDER BY waybill_no, trip_number;
         "#;
 
