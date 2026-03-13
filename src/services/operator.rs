@@ -1351,7 +1351,7 @@ impl OperatorService for DBOperatorService {
         let mut bind_vals: Vec<String> = Vec::new();
 
         for f in &valid_filters {
-            where_parts.push(format!("{} {} ${}", f.col, f.sql_op, param_idx));
+            where_parts.push(format!("{}::text {} ${}", f.col, f.sql_op, param_idx));
             bind_vals.push(f.val1.clone());
             param_idx += 1;
         }
