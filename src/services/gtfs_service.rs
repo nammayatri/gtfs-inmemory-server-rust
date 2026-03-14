@@ -1962,4 +1962,55 @@ impl GTFSService {
     pub fn data(&self) -> &Arc<RwLock<GTFSData>> {
         &self.data
     }
+
+    /// Creates a GTFSService with pre-populated data for testing purposes.
+    #[cfg(test)]
+    pub fn new_with_data(data: GTFSData) -> Self {
+        Self {
+            config: AppConfig {
+                logger_cfg: shared::tools::logger::LoggerConfig {
+                    level: shared::tools::logger::LogLevel::INFO,
+                    log_to_file: false,
+                },
+                database_url: None,
+                internal_database_url: None,
+                db_max_connections: 1,
+                db_min_connections: 1,
+                db_acquire_timeout: 5,
+                db_idle_timeout: 5,
+                db_max_lifetime: 60,
+                cache_duration: 60,
+                otp_instances: crate::environment::OtpConfig {
+                    city_based_instances: vec![],
+                    gtfs_id_based_instances: vec![],
+                    default_instance: crate::environment::OtpInstance {
+                        url: "http://localhost".to_string(),
+                        identifier: "test".to_string(),
+                    },
+                },
+                polling_enabled: false,
+                polling_interval: 60,
+                process_batch_size: 10,
+                port: 8080,
+                gc_interval: 60,
+                max_retries: 3,
+                retry_delay: 1,
+                rate_limit_delay: 0.0,
+                cpu_threshold: 80.0,
+                connection_limit: 10,
+                http_pool_idle_timeout: 30,
+                http_tcp_keepalive: 30,
+                dns_ttl: 60,
+                memory_threshold: 1024,
+                ignored_trip_ids: vec![],
+                bhubaneswar_cache_update_interval: 60,
+                bhubaneswar_external_auth: None,
+                phone_number_hash_key: "test_key".to_string(),
+            },
+            data: Arc::new(RwLock::new(data)),
+            http_client: reqwest::Client::new(),
+            is_ready: Arc::new(RwLock::new(true)),
+            last_update: Arc::new(RwLock::new(Utc::now())),
+        }
+    }
 }
