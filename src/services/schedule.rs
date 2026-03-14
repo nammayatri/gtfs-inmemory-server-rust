@@ -71,10 +71,12 @@ impl ScheduleService {
         format!("{:02}:{:02}:{:02}", h, m, s)
     }
 
-    /// Build a departure time index for a given gtfs_id.
-    /// Returns BTreeMap<departure_seconds, Vec<(trip_id, stop_index)>>.
-    async fn build_departure_index(&self, gtfs_id: &str) -> AppResult<TimeIndex> {
-        let data = self.gtfs_service.data().read().await;
+    /// Build a departure time index from already-locked data.
+    /// Eliminates double-lock by taking data reference directly.
+    fn build_departure_index_from(
+        data: &crate::models::GTFSData,
+        gtfs_id: &str,
+    ) -> AppResult<TimeIndex> {
         let trip_map = data
             .route_example_trip_details_by_gtfs
             .get(gtfs_id)
@@ -94,9 +96,11 @@ impl ScheduleService {
         Ok(index)
     }
 
-    /// Build an arrival time index for a given gtfs_id.
-    async fn build_arrival_index(&self, gtfs_id: &str) -> AppResult<TimeIndex> {
-        let data = self.gtfs_service.data().read().await;
+    /// Build an arrival time index from already-locked data.
+    fn build_arrival_index_from(
+        data: &crate::models::GTFSData,
+        gtfs_id: &str,
+    ) -> AppResult<TimeIndex> {
         let trip_map = data
             .route_example_trip_details_by_gtfs
             .get(gtfs_id)
@@ -158,8 +162,9 @@ impl ScheduleService {
             stop_code, gtfs_id, start_secs, end_secs
         );
 
-        let dep_index = self.build_departure_index(&gtfs_id).await?;
+        // Single lock acquisition — build index and query from same data snapshot
         let data = self.gtfs_service.data().read().await;
+        let dep_index = Self::build_departure_index_from(&data, &gtfs_id)?;
         let trip_map = data
             .route_example_trip_details_by_gtfs
             .get(gtfs_id.as_str())
@@ -230,8 +235,9 @@ impl ScheduleService {
             stop_code, gtfs_id, start_secs, end_secs
         );
 
-        let arr_index = self.build_arrival_index(&gtfs_id).await?;
+        // Single lock acquisition — build index and query from same data snapshot
         let data = self.gtfs_service.data().read().await;
+        let arr_index = Self::build_arrival_index_from(&data, &gtfs_id)?;
         let trip_map = data
             .route_example_trip_details_by_gtfs
             .get(gtfs_id.as_str())
@@ -413,8 +419,9 @@ impl ScheduleService {
             stop_code, gtfs_id, start_secs
         );
 
-        let dep_index = self.build_departure_index(&gtfs_id).await?;
+        // Single lock acquisition — build index and query from same data snapshot
         let data = self.gtfs_service.data().read().await;
+        let dep_index = Self::build_departure_index_from(&data, &gtfs_id)?;
         let trip_map = data
             .route_example_trip_details_by_gtfs
             .get(gtfs_id.as_str())
@@ -706,10 +713,22 @@ mod tests {
     fn test_parse_time_invalid_format() {
         assert!(ScheduleService::parse_time("not_a_time").is_err());
         assert!(ScheduleService::parse_time("").is_err());
-        // Short format "8:30" is not valid for %H:%M:%S
-        assert!(ScheduleService::parse_time("8:30").is_err());
-        // Over-24h times are not valid NaiveTime
-        assert!(ScheduleService::parse_time("25:30:00").is_err());
+        assert!(ScheduleService::parse_time("12:99:00").is_err()); // minutes >= 60
+        assert!(ScheduleService::parse_time("12:00:99").is_err()); // seconds >= 60
+    }
+
+    #[test]
+    fn test_parse_time_short_format_accepted() {
+        // HH:MM format should be accepted (defaults seconds to 0)
+        let t = ScheduleService::parse_time("8:30").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t), 30600);
+    }
+
+    #[test]
+    fn test_parse_time_gtfs_over_24h_wraps() {
+        // GTFS 25:30:00 wraps to 01:30:00 = 5400s
+        let t = ScheduleService::parse_time("25:30:00").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t), 5400);
     }
 
     #[test]
