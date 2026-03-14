@@ -725,13 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_time_gtfs_over_24h_wraps() {
-        // GTFS 25:30:00 wraps to 01:30:00 = 5400s
-        let t = ScheduleService::parse_time("25:30:00").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 5400);
-    }
-
-    #[test]
     fn test_seconds_to_time_string() {
         assert_eq!(ScheduleService::seconds_to_time_string(0), "00:00:00");
         assert_eq!(ScheduleService::seconds_to_time_string(3661), "01:01:01");
@@ -1299,4 +1292,762 @@ mod tests {
         assert_eq!(trip.num_stops, 2); // A and B
         assert_eq!(trip.mode, Some("BUS".to_string()));
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Edge case & robustness tests
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── Time boundary tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_time_end_of_day_boundary() {
+        let t = ScheduleService::parse_time("23:59:59").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t), 86399);
+    }
+
+    #[test]
+    fn test_parse_time_gtfs_over_24h_wraps() {
+        // GTFS allows times > 24h for next-day trips. Our parser wraps hours % 24.
+        let t = ScheduleService::parse_time("25:30:00").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t), 5400); // 01:30:00
+        let t2 = ScheduleService::parse_time("24:00:00").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t2), 0); // wraps to 00:00:00
+        let t3 = ScheduleService::parse_time("26:15:30").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t3), 8130); // 02:15:30
+    }
+
+    #[test]
+    fn test_parse_time_empty_string() {
+        assert!(ScheduleService::parse_time("").is_err());
+    }
+
+    #[test]
+    fn test_parse_time_garbage_input() {
+        assert!(ScheduleService::parse_time("not-a-time").is_err());
+        assert!(ScheduleService::parse_time("12:AB:00").is_err());
+        // Note: "08:30" (HH:MM) is accepted by our parser — seconds default to 0
+        let t = ScheduleService::parse_time("08:30").unwrap();
+        assert_eq!(ScheduleService::time_to_seconds(&t), 30600);
+    }
+
+    #[test]
+    fn test_parse_time_negative_hours() {
+        assert!(ScheduleService::parse_time("-01:00:00").is_err());
+    }
+
+    #[test]
+    fn test_seconds_to_time_string_over_24h() {
+        // Verifies seconds_to_time_string can represent GTFS >24h times correctly
+        assert_eq!(ScheduleService::seconds_to_time_string(91800), "25:30:00");
+        assert_eq!(ScheduleService::seconds_to_time_string(86400), "24:00:00");
+        assert_eq!(ScheduleService::seconds_to_time_string(90000), "25:00:00");
+    }
+
+    #[test]
+    fn test_seconds_to_time_string_zero() {
+        assert_eq!(ScheduleService::seconds_to_time_string(0), "00:00:00");
+    }
+
+    #[test]
+    fn test_seconds_to_time_string_negative_documents_behavior() {
+        // Negative seconds will produce values with negative components due to
+        // Rust's truncation-toward-zero integer division. This documents the behavior.
+        let result = ScheduleService::seconds_to_time_string(-1);
+        assert!(!result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_departures_midnight_crossover_late_night() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_LATE".to_string(),
+            TripDetails {
+                trip_id: "trip_late".to_string(),
+                stops: vec![make_stop(STOP_A, "Late Stop", 86280, 86340, 1)],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("23:50:00"), None, 20, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "23:59 departure should be within 20-min window from 23:50");
+    }
+
+    #[tokio::test]
+    async fn test_departures_gtfs_next_day_trip_over_24h() {
+        // GTFS data with scheduled_departure > 86400 (next-day trip at 25:30:00 = 91800s)
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_NEXT_DAY".to_string(),
+            TripDetails {
+                trip_id: "trip_next_day".to_string(),
+                stops: vec![make_stop(STOP_A, "Next Day Stop", 91740, 91800, 1)],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        // Window from 23:00 (82800) + 180 min (10800s) = 93600 covers 91800
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("23:00:00"), None, 180, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].departure_time, "25:30:00");
+    }
+
+    // ── Empty/null data edge cases ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_departures_empty_trip_map() {
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), HashMap::new());
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Empty trip map should yield empty results");
+    }
+
+    #[tokio::test]
+    async fn test_arrivals_empty_trip_map() {
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), HashMap::new());
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_arrivals_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_trips_between_empty_trip_map() {
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), HashMap::new());
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_B, None, None, None, 60)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_next_services_empty_trip_map() {
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), HashMap::new());
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_next_services(TEST_GTFS_ID, STOP_A, None, Some("08:00:00"), None, 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_departures_trip_with_zero_stops() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            ROUTE_1.to_string(),
+            TripDetails {
+                trip_id: "trip_empty".to_string(),
+                stops: vec![],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 1440, 100)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Trip with no stops should produce no departures");
+    }
+
+    #[tokio::test]
+    async fn test_departures_headsign_null_json() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            ROUTE_1.to_string(),
+            TripDetails {
+                trip_id: "trip_null_hs".to_string(),
+                stops: vec![TripStopDetail {
+                    stop_id: "id_nh".to_string(),
+                    stop_code: STOP_A.to_string(),
+                    stop_name: Some("No Headsign Stop".to_string()),
+                    platform_code: None,
+                    lat: 0.0,
+                    lon: 0.0,
+                    scheduled_arrival: 28800,
+                    scheduled_departure: 28800,
+                    headsign: serde_json::Value::Null,
+                    stop_position: 1,
+                }],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 10, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].headsign.is_none(), "Null JSON headsign should yield None");
+    }
+
+    #[tokio::test]
+    async fn test_departures_headsign_numeric_json() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            ROUTE_1.to_string(),
+            TripDetails {
+                trip_id: "trip_num_hs".to_string(),
+                stops: vec![TripStopDetail {
+                    stop_id: "id_numhs".to_string(),
+                    stop_code: STOP_A.to_string(),
+                    stop_name: Some("Numeric Headsign".to_string()),
+                    platform_code: None,
+                    lat: 0.0,
+                    lon: 0.0,
+                    scheduled_arrival: 28800,
+                    scheduled_departure: 28800,
+                    headsign: serde_json::Value::Number(serde_json::Number::from(42)),
+                    stop_position: 1,
+                }],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 10, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].headsign.is_none(), "Non-string JSON headsign should yield None");
+    }
+
+    // ── Large window / limit edge cases ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_departures_full_day_window_1440() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("00:00:00"), None, 1440, 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "STOP_A appears in one trip");
+    }
+
+    #[tokio::test]
+    async fn test_departures_limit_zero() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 0)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Limit 0 should return empty results");
+    }
+
+    #[tokio::test]
+    async fn test_departures_limit_very_large() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_B, Some("00:00:00"), None, 1440, 10000)
+            .await
+            .unwrap();
+        assert!(results.len() <= 2, "Large limit should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_departures_window_zero_exact_match() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "Exact time match with zero window should return the departure");
+    }
+
+    #[tokio::test]
+    async fn test_departures_window_zero_no_match() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:01"), None, 0, 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "No departure at this exact second");
+    }
+
+    // ── Trips-between additional edge cases ────────────────────────────
+
+    #[tokio::test]
+    async fn test_trips_between_same_stop_edge() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_A, None, None, None, 120)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Same origin and destination => oi >= di => excluded");
+    }
+
+    #[tokio::test]
+    async fn test_trips_between_reversed_stops_edge() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_C, STOP_A, None, None, None, 120)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Origin after destination in trip => excluded");
+    }
+
+    #[tokio::test]
+    async fn test_trips_between_malformed_depart_after() {
+        let svc = create_schedule_service(build_test_data());
+
+        let result = svc
+            .get_trips_between_stops(
+                TEST_GTFS_ID, STOP_A, STOP_C, None, Some("bad_time"), None, 60,
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_trips_between_malformed_arrive_before() {
+        let svc = create_schedule_service(build_test_data());
+
+        let result = svc
+            .get_trips_between_stops(
+                TEST_GTFS_ID, STOP_A, STOP_C, None, None, Some("99:99:99"), 60,
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_trips_between_both_constraints_simultaneously() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_trips_between_stops(
+                TEST_GTFS_ID, STOP_A, STOP_C, None,
+                Some("07:50:00"), Some("08:35:00"), 60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "Trip should satisfy both constraints");
+    }
+
+    #[tokio::test]
+    async fn test_trips_between_conflicting_constraints() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_trips_between_stops(
+                TEST_GTFS_ID, STOP_A, STOP_C, None,
+                Some("10:00:00"), Some("07:00:00"), 60,
+            )
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Conflicting time constraints should yield no results");
+    }
+
+    // ── Next services additional edge cases ────────────────────────────
+
+    #[tokio::test]
+    async fn test_next_services_end_of_day_no_results() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_next_services(TEST_GTFS_ID, STOP_A, None, Some("23:00:00"), None, 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "No departures after 23:00 in test data");
+    }
+
+    #[tokio::test]
+    async fn test_next_services_limit_zero() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_next_services(TEST_GTFS_ID, STOP_B, None, Some("08:00:00"), None, 0)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Limit 0 should return empty");
+    }
+
+    #[tokio::test]
+    async fn test_next_services_no_route_info_without_mode_filter() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_NO_INFO".to_string(),
+            TripDetails {
+                trip_id: "trip_no_info".to_string(),
+                stops: vec![make_stop(STOP_A, "Stop A", 28800, 28800, 1)],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_next_services(TEST_GTFS_ID, STOP_A, None, Some("08:00:00"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "Without mode filter, missing route info is fine");
+        assert!(results[0].mode.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_next_services_no_route_info_with_mode_filter_excluded() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_NO_INFO".to_string(),
+            TripDetails {
+                trip_id: "trip_no_info".to_string(),
+                stops: vec![make_stop(STOP_A, "Stop A", 28800, 28800, 1)],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let modes = vec!["BUS".to_string()];
+        let results = svc
+            .get_next_services(TEST_GTFS_ID, STOP_A, None, Some("08:00:00"), Some(&modes), 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "No mode info => excluded when filter is set");
+    }
+
+    // ── Unicode / special characters in stop codes ─────────────────────
+
+    #[tokio::test]
+    async fn test_departures_hindi_stop_code() {
+        let hindi_code = "\u{0939}\u{093F}\u{0902}\u{0926}\u{0940}";
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_HINDI".to_string(),
+            TripDetails {
+                trip_id: "trip_hindi".to_string(),
+                stops: vec![TripStopDetail {
+                    stop_id: "id_hindi".to_string(),
+                    stop_code: hindi_code.to_string(),
+                    stop_name: Some("Hindi Stop".to_string()),
+                    platform_code: None,
+                    lat: 28.61,
+                    lon: 77.23,
+                    scheduled_arrival: 36000,
+                    scheduled_departure: 36060,
+                    headsign: serde_json::Value::String("Downtown".to_string()),
+                    stop_position: 1,
+                }],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, hindi_code, Some("10:00:00"), None, 10, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "Unicode stop codes should work");
+    }
+
+    #[tokio::test]
+    async fn test_departures_stop_code_with_spaces() {
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_SPACE".to_string(),
+            TripDetails {
+                trip_id: "trip_space".to_string(),
+                stops: vec![make_stop("STOP WITH SPACES", "Spacey Stop", 36000, 36060, 1)],
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, "STOP WITH SPACES", Some("10:00:00"), None, 10, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── URL-encoded / prefixed identifiers ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_departures_url_encoded_gtfs_prefix() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop(
+                "some_prefix%3Atest_gtfs", STOP_A, Some("08:00:00"), None, 60, 10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "URL-encoded prefix should be decoded and stripped");
+    }
+
+    #[tokio::test]
+    async fn test_departures_multiple_colon_prefix() {
+        let svc = create_schedule_service(build_test_data());
+
+        let results = svc
+            .get_departures_at_stop("a:b:test_gtfs", STOP_A, Some("08:00:00"), None, 60, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── clean_identifier additional edge cases ─────────────────────────
+
+    #[test]
+    fn test_clean_identifier_empty_string() {
+        assert_eq!(clean_identifier(""), "");
+    }
+
+    #[test]
+    fn test_clean_identifier_multiple_colons() {
+        assert_eq!(clean_identifier("a:b:c:d"), "d");
+    }
+
+    #[test]
+    fn test_clean_identifier_trailing_colon() {
+        assert_eq!(clean_identifier("prefix:"), "");
+    }
+
+    #[test]
+    fn test_clean_identifier_unicode_characters() {
+        let input = "\u{0939}\u{093F}\u{0902}\u{0926}\u{0940}";
+        assert_eq!(clean_identifier(input), input);
+    }
+
+    #[test]
+    fn test_clean_identifier_double_url_encoded() {
+        let result = clean_identifier("%253Avalue");
+        assert_eq!(result, "%3Avalue");
+    }
+
+    // ── Concurrent access tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_concurrent_departure_queries_no_deadlock() {
+        let svc = Arc::new(create_schedule_service(build_test_data()));
+
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let svc = svc.clone();
+            let stop = if i % 2 == 0 { STOP_A } else { STOP_B };
+            handles.push(tokio::spawn(async move {
+                svc.get_departures_at_stop(
+                    TEST_GTFS_ID,
+                    stop,
+                    Some("08:00:00"),
+                    None,
+                    60,
+                    10,
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok(), "Concurrent reads should not fail");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_mixed_query_types() {
+        let svc = Arc::new(create_schedule_service(build_test_data()));
+
+        let s1 = svc.clone();
+        let s2 = svc.clone();
+        let s3 = svc.clone();
+        let s4 = svc.clone();
+
+        let (r1, r2, r3, r4) = tokio::join!(
+            s1.get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 10),
+            s2.get_arrivals_at_stop(TEST_GTFS_ID, STOP_B, Some("08:00:00"), None, 60, 10),
+            s3.get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 120),
+            s4.get_next_services(TEST_GTFS_ID, STOP_B, None, Some("08:00:00"), None, 10),
+        );
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert!(r3.is_ok());
+        assert!(r4.is_ok());
+    }
+
+    // ── Trip with many stops (stress boundary) ─────────────────────────
+
+    #[tokio::test]
+    async fn test_trip_with_500_plus_stops() {
+        let stops: Vec<TripStopDetail> = (0..500)
+            .map(|i| {
+                make_stop(
+                    &format!("S{:04}", i),
+                    &format!("Stop {}", i),
+                    i * 120,
+                    i * 120 + 60,
+                    i as i32,
+                )
+            })
+            .collect();
+
+        let mut trip_map = HashMap::new();
+        trip_map.insert(
+            "R_LARGE".to_string(),
+            TripDetails {
+                trip_id: "trip_large".to_string(),
+                stops,
+            },
+        );
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_trips_between_stops(TEST_GTFS_ID, "S0000", "S0499", None, None, None, 1440)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_stops, 500);
+
+        let dep_results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, "S0250", Some("00:00:00"), None, 1440, 10)
+            .await
+            .unwrap();
+        assert_eq!(dep_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_many_routes_departure_limit() {
+        let mut trip_map = HashMap::new();
+        for i in 0..100 {
+            let dep_secs = 28800 + i * 30;
+            trip_map.insert(
+                format!("R{:03}", i),
+                TripDetails {
+                    trip_id: format!("trip_{:03}", i),
+                    stops: vec![make_stop(STOP_A, "Stop A", dep_secs - 30, dep_secs, 1)],
+                },
+            );
+        }
+        let mut data = GTFSData::new();
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), trip_map);
+        let svc = create_schedule_service(data);
+
+        let results = svc
+            .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 5)
+            .await
+            .unwrap();
+        assert!(results.len() <= 5, "Limit should truncate results from 100 routes to 5");
+    }
+
+    // ── Quality report additional edge cases ───────────────────────────
+
+    #[tokio::test]
+    async fn test_quality_report_routes_exist_but_no_trips() {
+        let mut data = GTFSData::new();
+        let mut route_map = HashMap::new();
+        route_map.insert(
+            "R_ORPHAN".to_string(),
+            NandiRoutesRes {
+                id: "R_ORPHAN".to_string(),
+                short_name: Some("Orphan Route".to_string()),
+                long_name: None,
+                mode: "BUS".to_string(),
+                agency_name: None,
+                trip_count: None,
+                stop_count: None,
+                start_point: None,
+                end_point: None,
+                service_tier_type: None,
+            },
+        );
+        data.routes_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), route_map);
+        data.route_example_trip_details_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), HashMap::new());
+
+        let svc = create_schedule_service(data);
+        let report = svc.get_quality_report(TEST_GTFS_ID).await.unwrap();
+
+        assert_eq!(report.total_routes, 1);
+        assert_eq!(report.routes_with_trips, 0);
+        assert_eq!(report.routes_without_trips, 1);
+    }
+
+    // ── Stress / load test scenarios (documented, not executed) ────────
+    //
+    // The following scenarios are documented for load testing tools
+    // (e.g., k6, wrk, Locust). They are NOT executed as unit tests.
+    //
+    // 1. 1000 CONCURRENT DEPARTURE QUERIES
+    //    - Simulate 1000 concurrent requests to GET /schedule/departures/{gtfs_id}/{stop_code}
+    //    - Vary stop_code and time parameters randomly.
+    //    - Expected: all return 200 OK, p99 latency < 100ms for in-memory data.
+    //    - Watch for: RwLock contention, memory spikes, BTreeMap iterator invalidation.
+    //
+    // 2. QUERY WITH 500+ STOPS IN A SINGLE TRIP
+    //    - POST /schedule/trips-between/{gtfs_id} with origin as first stop and destination
+    //      as last stop on a trip with 500+ stops.
+    //    - Expected: response within 500ms, correct num_stops count.
+    //    - Watch for: O(n) scan performance, excessive cloning.
+    //
+    // 3. RAPID SUCCESSIVE DATA REFRESHES
+    //    - Trigger data refresh (via GTFSService reload) every 100ms while 100
+    //      concurrent read queries are running.
+    //    - Expected: no panics, no data corruption, reads see consistent snapshots
+    //      (either old or new data, never partial).
+    //    - Watch for: RwLock writer starvation, inconsistent BTreeMap state,
+    //      Arc reference count overflow (extremely unlikely but worth monitoring).
+    //
+    // 4. FULL-DAY WINDOW ON LARGE DATASET
+    //    - Query with window_minutes=1440 on a GTFS feed with 10,000+ trips.
+    //    - Expected: returns all matching departures without OOM.
+    //    - Watch for: result vector allocation size, serialization time.
+
 }
