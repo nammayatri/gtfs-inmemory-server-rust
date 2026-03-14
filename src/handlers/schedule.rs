@@ -9,6 +9,22 @@ use crate::models::{ArrivalQuery, DepartureQuery, NextServicesRequest, TripsBetw
 use crate::services::schedule::ScheduleService;
 use crate::tools::error::AppResult;
 
+// Server-side caps to prevent abuse / DoS
+const MAX_WINDOW_MINUTES: u32 = 480; // 8 hours
+const MAX_LIMIT: usize = 200;
+const DEFAULT_WINDOW_MINUTES: u32 = 60;
+const DEFAULT_LIMIT: usize = 10;
+const DEFAULT_TRIPS_WINDOW_MINUTES: u32 = 120;
+
+/// Clamp window_minutes and limit to safe server-side maximums.
+fn clamp_window(window: Option<u32>, default: u32) -> u32 {
+    window.unwrap_or(default).min(MAX_WINDOW_MINUTES)
+}
+
+fn clamp_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1)
+}
+
 pub async fn get_departures_at_stop(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
@@ -16,8 +32,8 @@ pub async fn get_departures_at_stop(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
     let q = query.into_inner();
-    let window = q.window_minutes.unwrap_or(60);
-    let limit = q.limit.unwrap_or(10);
+    let window = clamp_window(q.window_minutes, DEFAULT_WINDOW_MINUTES);
+    let limit = clamp_limit(q.limit);
 
     info!(
         "GET /schedule/departures/{}/{} time={:?} window={} limit={}",
@@ -46,8 +62,8 @@ pub async fn get_arrivals_at_stop(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
     let q = query.into_inner();
-    let window = q.window_minutes.unwrap_or(60);
-    let limit = q.limit.unwrap_or(10);
+    let window = clamp_window(q.window_minutes, DEFAULT_WINDOW_MINUTES);
+    let limit = clamp_limit(q.limit);
 
     info!(
         "GET /schedule/arrivals/{}/{} time={:?} window={} limit={}",
@@ -82,7 +98,7 @@ pub async fn get_trips_between_stops(
         gtfs_id, req.origin_stop_code, req.destination_stop_code
     );
 
-    let window = req.window_minutes.unwrap_or(120);
+    let window = clamp_window(req.window_minutes, DEFAULT_TRIPS_WINDOW_MINUTES);
     let schedule_service = ScheduleService::new(app_state.gtfs_service.clone());
     let trips = schedule_service
         .get_trips_between_stops(
@@ -106,7 +122,7 @@ pub async fn get_next_services(
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let req = body.into_inner();
-    let limit = req.limit.unwrap_or(10);
+    let limit = clamp_limit(req.limit);
 
     info!(
         "POST /schedule/next-services/{} stop={} time={:?} limit={}",

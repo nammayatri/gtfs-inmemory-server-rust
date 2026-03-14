@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{NaiveTime, Timelike, Utc};
@@ -25,11 +25,38 @@ impl ScheduleService {
     // ── helpers ──────────────────────────────────────────────────────────
 
     fn parse_time(time_str: &str) -> AppResult<NaiveTime> {
-        NaiveTime::parse_from_str(time_str, "%H:%M:%S").map_err(|e| {
-            AppError::BadRequest(format!(
-                "Invalid time format '{}', expected HH:MM:SS: {}",
-                time_str, e
-            ))
+        // GTFS allows times > 24:00:00 for next-day trips, but NaiveTime only handles 0-23.
+        // For times >= 24:00, we wrap around (25:30:00 → 01:30:00) and handle via seconds math.
+        let parts: Vec<&str> = time_str.split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 {
+            return Err(AppError::BadRequest(format!(
+                "Invalid time format '{}', expected HH:MM or HH:MM:SS",
+                time_str
+            )));
+        }
+        // Validate each part is numeric
+        for part in &parts {
+            if part.parse::<u32>().is_err() {
+                return Err(AppError::BadRequest(format!(
+                    "Invalid time format '{}': non-numeric component",
+                    time_str
+                )));
+            }
+        }
+        let hours: u32 = parts[0].parse().unwrap();
+        let minutes: u32 = parts[1].parse().unwrap();
+        let seconds: u32 = if parts.len() == 3 { parts[2].parse().unwrap() } else { 0 };
+
+        if minutes >= 60 || seconds >= 60 {
+            return Err(AppError::BadRequest(format!(
+                "Invalid time '{}': minutes and seconds must be < 60",
+                time_str
+            )));
+        }
+        // For GTFS times > 24h, wrap hours
+        let wrapped_hours = hours % 24;
+        NaiveTime::from_hms_opt(wrapped_hours, minutes, seconds).ok_or_else(|| {
+            AppError::BadRequest(format!("Cannot construct time from '{}'", time_str))
         })
     }
 
@@ -288,27 +315,42 @@ impl ScheduleService {
                 AppError::NotFound(format!("No trip data found for gtfs_id '{}'", gtfs_id))
             })?;
 
+        // Build stop_code → Vec<(route_code, stop_index)> index for O(1) lookups
+        let mut stop_index: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
+        for (route_code, trip) in trip_map {
+            for (i, stop) in trip.stops.iter().enumerate() {
+                stop_index
+                    .entry(stop.stop_code.as_str())
+                    .or_default()
+                    .push((route_code.as_str(), i));
+            }
+        }
+
         let mut results: Vec<ScheduledTrip> = Vec::new();
 
-        for (route_code, trip) in trip_map {
-            // Find origin and destination stop indices
-            let origin_idx = trip
-                .stops
-                .iter()
-                .position(|s| s.stop_code == origin);
-            let dest_idx = trip
-                .stops
-                .iter()
-                .position(|s| s.stop_code == destination);
+        // Get all trips visiting the origin stop
+        let origin_entries = match stop_index.get(origin.as_str()) {
+            Some(entries) => entries.clone(),
+            None => return Ok(results),
+        };
 
-            if let (Some(oi), Some(di)) = (origin_idx, dest_idx) {
+        // Build a set of route_codes that visit destination, with their stop index
+        let dest_entries: HashMap<&str, usize> = stop_index
+            .get(destination.as_str())
+            .map(|entries| entries.iter().map(|(rc, idx)| (*rc, *idx)).collect())
+            .unwrap_or_default();
+
+        for (route_code, origin_stop_idx) in &origin_entries {
+            // O(1) lookup: does this route also visit the destination?
+            if let Some(&dest_stop_idx) = dest_entries.get(route_code) {
                 // Origin must come before destination
-                if oi >= di {
+                if *origin_stop_idx >= dest_stop_idx {
                     continue;
                 }
 
-                let dep_secs = trip.stops[oi].scheduled_departure;
-                let arr_secs = trip.stops[di].scheduled_arrival;
+                let trip = &trip_map[*route_code];
+                let dep_secs = trip.stops[*origin_stop_idx].scheduled_departure;
+                let arr_secs = trip.stops[dest_stop_idx].scheduled_arrival;
 
                 // Apply forward constraint (depart_after)
                 if let Some(da) = depart_after_secs {
@@ -329,16 +371,16 @@ impl ScheduleService {
 
                 results.push(ScheduledTrip {
                     trip_id: trip.trip_id.clone(),
-                    route_id: route_code.clone(),
+                    route_id: route_code.to_string(),
                     route_short_name: short_name,
                     origin_stop_code: origin.clone(),
-                    origin_stop_name: trip.stops[oi].stop_name.clone(),
+                    origin_stop_name: trip.stops[*origin_stop_idx].stop_name.clone(),
                     destination_stop_code: destination.clone(),
-                    destination_stop_name: trip.stops[di].stop_name.clone(),
+                    destination_stop_name: trip.stops[dest_stop_idx].stop_name.clone(),
                     departure_time: Self::seconds_to_time_string(dep_secs),
                     arrival_time: Self::seconds_to_time_string(arr_secs),
                     mode,
-                    num_stops: di - oi + 1,
+                    num_stops: dest_stop_idx - origin_stop_idx + 1,
                 });
             }
         }
