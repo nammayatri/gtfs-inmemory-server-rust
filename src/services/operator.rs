@@ -1246,7 +1246,7 @@ impl OperatorService for DBOperatorService {
         validate_table(table)?;
 
         let sql = format!(
-            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY 1 LIMIT $2 OFFSET $3) t",
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY 1 desc LIMIT $2 OFFSET $3) t",
             table
         );
 
@@ -1360,7 +1360,7 @@ impl OperatorService for DBOperatorService {
         let offset = body.offset.unwrap_or(0);
 
         let sql = format!(
-            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY 1 LIMIT ${} OFFSET ${}) t",
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY 1 DESC LIMIT ${} OFFSET ${}) t",
             table,
             where_parts.join(" AND "),
             param_idx,
@@ -1817,15 +1817,18 @@ impl OperatorService for DBOperatorService {
         .map_err(|e| AppError::DbError(format!("Failed to get schedule_trip_id: {}", e)))?;
 
         // Update the waybill status
-        let result = sqlx::query(
-            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
-        )
-        .bind(status)
-        .bind(waybill_id)
-        .bind(gtfs_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
+        let query_str = if status == "audited" {
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now(), audited_date = now() WHERE waybill_id = $2 AND gtfs_id = $3"
+        } else {
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3"
+        };
+        let result = sqlx::query(query_str)
+            .bind(status)
+            .bind(waybill_id)
+            .bind(gtfs_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
 
         // If status is 'closed' or 'audited' and we have a schedule_trip_id, 
         // set all is_active_trip to false in bus_schedule_trip_detail_internal
