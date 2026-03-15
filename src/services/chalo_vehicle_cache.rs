@@ -164,7 +164,7 @@ impl ChaloVehicleCache {
                 city_cache
                     .iter()
                     .filter_map(|(_, data)| {
-                        if data.route_id.as_ref().map(|r| r.as_str()) == Some(route_id) {
+                        if data.route_id.as_deref() == Some(route_id) {
                             Some(data.clone())
                         } else {
                             None

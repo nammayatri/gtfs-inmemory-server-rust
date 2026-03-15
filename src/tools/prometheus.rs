@@ -49,7 +49,7 @@ macro_rules! incoming_api {
 ///
 /// # Examples
 ///
-/// ```norun
+/// ```ignore
 /// fn main() {
 ///     HttpServer::new(move || {
 ///         App::new()

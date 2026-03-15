@@ -149,6 +149,7 @@ impl AppState {
         let gtfs_service = Arc::new(GTFSService::new(app_config.clone()).await?);
 
         // Create shared database pool or use mock readers
+        #[allow(clippy::type_complexity)]
         let (
             db_vehicle_reader,
             db_employee_reader,
@@ -424,9 +425,7 @@ impl AppState {
                         continue;
                     }
 
-                    let by_gtfs = fleet_map
-                        .entry(gtfs_id.trim().to_string())
-                        .or_insert_with(HashMap::new);
+                    let by_gtfs = fleet_map.entry(gtfs_id.trim().to_string()).or_default();
 
                     by_gtfs.insert(vehicle_no.trim().to_string(), ids_list);
                 }
@@ -474,7 +473,7 @@ impl AppState {
                     let record: BusRegistrationMappingRecord = record;
                     mapping
                         .entry(record.gtfs_id)
-                        .or_insert_with(HashMap::new)
+                        .or_default()
                         .insert(record.short_name, record.vehicle_no);
                 }
                 Err(e) => {
@@ -535,9 +534,7 @@ impl AppState {
                         }
                     };
 
-                    let by_gtfs = sub_types_map
-                        .entry(gtfs_id.trim().to_string())
-                        .or_insert_with(HashMap::new);
+                    let by_gtfs = sub_types_map.entry(gtfs_id.trim().to_string()).or_default();
 
                     by_gtfs.insert(vehicle_no.trim().to_string(), sub_types);
                 }

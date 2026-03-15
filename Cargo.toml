@@ -52,6 +52,9 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 
+# Lock-free atomic pointer swap for double-buffered cache
+arc-swap = "1"
+
 # System information
 sysinfo = "0.30"
 

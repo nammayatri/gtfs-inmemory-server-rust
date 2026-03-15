@@ -17,7 +17,8 @@ use crate::environment::AppConfig;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```no_run
+/// use gtfs_routes_service::tools::dhall::read_dhall_config;
 /// let config_path = "/path/to/config.dhall";
 /// match read_dhall_config(config_path) {
 ///     Ok(config) => println!("Successfully read config: {:?}", config),
