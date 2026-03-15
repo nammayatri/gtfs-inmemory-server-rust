@@ -106,6 +106,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
@@ -277,10 +278,7 @@ impl DBVehicleReaderInternal {
                 if let Some(ref remaining) = remaining_trip_details {
                     for row in remaining.iter() {
                         if let Some(key) = row.schedule_trip_id {
-                            schedule_map
-                                .entry(key)
-                                .or_insert_with(Vec::new)
-                                .push(row.clone());
+                            schedule_map.entry(key).or_default().push(row.clone());
                         }
                     }
                 }
@@ -288,7 +286,7 @@ impl DBVehicleReaderInternal {
                     if let Some(key) = schedule.schedule_trip_id {
                         schedule_map
                             .entry(key)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .insert(0, schedule.clone());
                     }
                 }

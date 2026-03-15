@@ -242,6 +242,7 @@ impl DBFleetOperatorService {
               AND deleted = false
         "#;
 
+        #[allow(clippy::type_complexity)]
         let row: Option<(
             i64,
             String,
@@ -376,7 +377,11 @@ impl DBFleetOperatorService {
 
     // ── All trips ────────────────────────────────────────────────────────────
 
-    async fn get_all_trips(&self, waybill: &WaybillRow) -> AppResult<Vec<(i32, String, bool, Option<String>, Option<String>)>> {
+    #[allow(clippy::type_complexity)]
+    async fn get_all_trips(
+        &self,
+        waybill: &WaybillRow,
+    ) -> AppResult<Vec<(i32, String, bool, Option<String>, Option<String>)>> {
         // Returns Vec<(trip_number, route_id, is_active_trip, start_time, end_time)>
         if waybill.is_flexi {
             let rows: Vec<(i32, String, bool, Option<String>, Option<String>)> = sqlx::query_as(

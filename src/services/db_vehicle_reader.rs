@@ -612,7 +612,7 @@ impl DBVehicleReader {
 
                     // Sort by trip_number if available, but keep index 0 if it is active trip
                     let has_active_front = detail_rows
-                        .get(0)
+                        .first()
                         .map(|r| r.is_active_trip.unwrap_or(false))
                         .unwrap_or(false);
                     detail_rows.sort_by(|a, b| {
@@ -1465,10 +1465,7 @@ impl VehicleDataReader for DBVehicleReader {
                 if let Some(ref remaining) = remaining_trip_details {
                     for row in remaining.iter() {
                         if let Some(key) = row.schedule_trip_id {
-                            schedule_map
-                                .entry(key)
-                                .or_insert_with(Vec::new)
-                                .push(row.clone());
+                            schedule_map.entry(key).or_default().push(row.clone());
                         }
                     }
                 }
@@ -1476,7 +1473,7 @@ impl VehicleDataReader for DBVehicleReader {
                     if let Some(key) = schedule.schedule_trip_id {
                         schedule_map
                             .entry(key)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .insert(0, schedule.clone()); // Insert active trip at front
                     }
                 }

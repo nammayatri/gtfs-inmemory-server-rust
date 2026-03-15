@@ -310,31 +310,31 @@ pub struct RouteStopMapping {
     #[serde(rename = "estimatedTravelTimeFromPreviousStop")]
     pub estimated_travel_time_from_previous_stop: Option<i32>,
     #[serde(rename = "providerCode")]
-    pub provider_code: String,
+    pub provider_code: Arc<str>,
     #[serde(rename = "routeCode")]
-    pub route_code: String,
+    pub route_code: Arc<str>,
     #[serde(rename = "sequenceNum")]
     pub sequence_num: i32,
     #[serde(rename = "stopCode")]
-    pub stop_code: String,
+    pub stop_code: Arc<str>,
     #[serde(rename = "stopName")]
-    pub stop_name: String,
+    pub stop_name: Arc<str>,
     #[serde(rename = "stopPoint")]
     pub stop_point: LatLong,
     #[serde(rename = "vehicleType")]
-    pub vehicle_type: String,
+    pub vehicle_type: Arc<str>,
     #[serde(rename = "geoJson")]
     pub geo_json: Option<serde_json::Value>,
     #[serde(rename = "gates")]
     pub gates: Option<Vec<Gate>>,
     #[serde(rename = "hindiName")]
-    pub hindi_name: Option<String>,
+    pub hindi_name: Option<Arc<str>>,
     #[serde(rename = "regionalName")]
-    pub regional_name: Option<String>,
+    pub regional_name: Option<Arc<str>>,
     #[serde(rename = "platform")]
-    pub platform: Option<String>,
+    pub platform: Option<Arc<str>>,
     #[serde(rename = "parentStopCode")]
-    pub parent_stop_code: Option<String>,
+    pub parent_stop_code: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,16 +429,127 @@ pub struct GTFSData {
     pub route_example_trip_by_gtfs: HashMap<String, HashMap<String, String>>,
     pub static_fleet_info_by_gtfs: HashMap<String, HashMap<String, StaticFleetInfo>>,
     pub entity_id_name_mapping: HashMap<String, String>,
-    pub route_example_trip_details_by_gtfs: HashMap<String, HashMap<String, TripDetails>>,
     pub alternate_stop_by_gtfs: HashMap<String, GTFSAlternateStopData>,
     pub route_service_tiers_by_gtfs: HashMap<String, HashMap<String, ServiceTierType>>,
     pub seat_layout_mapping_by_gtfs: HashMap<String, HashMap<String, String>>,
+    /// Pre-computed unique stops list per GTFS (avoids recomputation on every /stops request)
+    #[serde(skip)]
+    pub pre_computed_stops_by_gtfs: HashMap<String, Vec<Arc<RouteStopMapping>>>,
 }
 
 impl GTFSData {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Estimate heap memory usage in bytes for monitoring
+    pub fn memory_usage_bytes(&self) -> MemoryUsageStats {
+        let mut stats = MemoryUsageStats::default();
+
+        // Routes
+        for (gtfs_id, routes) in &self.routes_by_gtfs {
+            stats.routes_bytes += gtfs_id.len() + 24; // String overhead
+            for (code, route) in routes {
+                stats.routes_bytes += code.len() + 24;
+                stats.routes_bytes += route.id.len() + 24;
+                stats.routes_bytes += route.short_name.as_ref().map_or(0, |s| s.len() + 24);
+                stats.routes_bytes += route.long_name.as_ref().map_or(0, |s| s.len() + 24);
+                stats.routes_bytes += route.mode.len() + 24;
+                stats.routes_bytes += 64; // LatLong, counts, etc.
+            }
+        }
+
+        // Route data (mappings + indices)
+        for route_data in self.route_data_by_gtfs.values() {
+            // Each Arc<RouteStopMapping> pointer is 8 bytes
+            stats.route_data_bytes += route_data.mappings.len() * 8;
+            // Estimate each RouteStopMapping's heap size
+            for mapping in &route_data.mappings {
+                stats.route_data_bytes += mapping.stop_code.len()
+                    + mapping.stop_name.len()
+                    + mapping.route_code.len()
+                    + mapping.vehicle_type.len()
+                    + mapping.provider_code.len();
+                stats.route_data_bytes += mapping.hindi_name.as_ref().map_or(0, |s| s.len());
+                stats.route_data_bytes += mapping.regional_name.as_ref().map_or(0, |s| s.len());
+                stats.route_data_bytes += mapping.platform.as_ref().map_or(0, |s| s.len());
+                stats.route_data_bytes += mapping.parent_stop_code.as_ref().map_or(0, |s| s.len());
+                // Arc overhead (strong + weak counts) + struct fields
+                stats.route_data_bytes += 16 + 64;
+                // geo_json estimate
+                if mapping.geo_json.is_some() {
+                    stats.route_data_bytes += 256; // rough estimate
+                }
+            }
+            // Index maps
+            for (key, indices) in &route_data.by_route {
+                stats.route_data_bytes += key.len() + 24 + indices.len() * 8;
+            }
+            for (key, indices) in &route_data.by_stop {
+                stats.route_data_bytes += key.len() + 24 + indices.len() * 8;
+            }
+        }
+
+        // Stops
+        for stop_data in self.stops_by_gtfs.values() {
+            for (code, stop) in &stop_data.stops {
+                stats.stops_bytes += code.len() + 24;
+                stats.stops_bytes += stop.id.len() + stop.code.len() + stop.name.len() + 72;
+                stats.stops_bytes += stop.station_id.as_ref().map_or(0, |s| s.len() + 24);
+                stats.stops_bytes += stop.cluster.as_ref().map_or(0, |s| s.len() + 24);
+                stats.stops_bytes += 16; // lat, lon
+            }
+        }
+
+        // Pre-computed stops (Arc pointers only, data shared with route_data)
+        for stops in self.pre_computed_stops_by_gtfs.values() {
+            stats.pre_computed_stops_bytes += stops.len() * 8; // Arc pointers
+        }
+
+        // Children mapping
+        for parents in self.children_by_parent.values() {
+            for (parent, children) in parents {
+                stats.children_bytes += parent.len() + 24;
+                for child in children {
+                    stats.children_bytes += child.len() + 24;
+                }
+            }
+        }
+
+        // Stop geojsons (rough estimate)
+        for geojsons in self.stop_geojsons_by_gtfs.values() {
+            stats.geojson_bytes += geojsons.len() * 512; // rough estimate per geojson
+        }
+
+        // Provider mapping
+        for mapping in self.provider_stop_code_mapping.values() {
+            for (k, v) in mapping {
+                stats.provider_mapping_bytes += k.len() + v.len() + 48;
+            }
+        }
+
+        stats.total_bytes = stats.routes_bytes
+            + stats.route_data_bytes
+            + stats.stops_bytes
+            + stats.pre_computed_stops_bytes
+            + stats.children_bytes
+            + stats.geojson_bytes
+            + stats.provider_mapping_bytes;
+
+        stats
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct MemoryUsageStats {
+    pub total_bytes: usize,
+    pub routes_bytes: usize,
+    pub route_data_bytes: usize,
+    pub stops_bytes: usize,
+    pub pre_computed_stops_bytes: usize,
+    pub children_bytes: usize,
+    pub geojson_bytes: usize,
+    pub provider_mapping_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1830,7 +1830,7 @@ impl OperatorService for DBOperatorService {
             .await
             .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
 
-        // If status is 'closed' or 'audited' and we have a schedule_trip_id, 
+        // If status is 'closed' or 'audited' and we have a schedule_trip_id,
         // set all is_active_trip to false in bus_schedule_trip_detail_internal
         if (status == "closed" || status == "audited") && schedule_trip_id.is_some() {
             sqlx::query(

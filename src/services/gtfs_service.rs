@@ -8,6 +8,7 @@ use crate::models::{
 };
 use crate::models::{GTFSAlternateStopData, TripDetails};
 use crate::tools::error::{AppError, AppResult};
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use futures::future::join_all;
@@ -46,10 +47,14 @@ fn normalize_stop_name(name: &str) -> String {
 }
 pub struct GTFSService {
     config: AppConfig,
-    data: Arc<RwLock<GTFSData>>,
+    data: Arc<ArcSwap<GTFSData>>,
     http_client: reqwest::Client,
     is_ready: Arc<RwLock<bool>>,
     last_update: Arc<RwLock<DateTime<Utc>>>,
+    /// Separate cache for lazily-fetched trip details (avoids mutating main Arc<GTFSData>)
+    trip_details_cache: Arc<RwLock<HashMap<String, HashMap<String, TripDetails>>>>,
+    /// Pre-serialized JSON bytes for the /cached-data endpoint
+    cached_data_bytes: Arc<ArcSwap<Vec<u8>>>,
 }
 
 impl GTFSService {
@@ -66,10 +71,12 @@ impl GTFSService {
 
         let service = Self {
             config,
-            data: Arc::new(RwLock::new(GTFSData::new())),
+            data: Arc::new(ArcSwap::from_pointee(GTFSData::new())),
             http_client,
             is_ready: Arc::new(RwLock::new(false)),
             last_update: Arc::new(RwLock::new(Utc::now())),
+            trip_details_cache: Arc::new(RwLock::new(HashMap::new())),
+            cached_data_bytes: Arc::new(ArcSwap::from_pointee(Vec::new())),
         };
 
         service.load_initial_data().await?;
@@ -83,8 +90,10 @@ impl GTFSService {
 
         let temp_data = self.fetch_and_process_data().await?;
 
-        let mut data = self.data.write().await;
-        *data = temp_data; // Atomic replacement instead of field-by-field assignment
+        self.data.store(Arc::new(temp_data));
+
+        // Pre-serialize cached data while service is still loading
+        self.update_cached_data_bytes().await;
 
         let mut is_ready = self.is_ready.write().await;
         *is_ready = true;
@@ -102,14 +111,13 @@ impl GTFSService {
         let mut all_pattern_details = Vec::new();
         let mut all_routes = Vec::new();
         let mut all_stops = Vec::new();
-        let mut already_visited: HashMap<String, bool> = HashMap::new();
+        let mut already_visited: HashSet<String> = HashSet::new();
 
         for otp_instance in self.config.otp_instances.get_all_instances() {
             let base_url = &otp_instance.url;
-            if already_visited.contains_key(base_url) {
+            if !already_visited.insert(base_url.to_string()) {
                 continue;
             }
-            already_visited.insert(base_url.to_string(), true);
             let patterns = self.fetch_patterns(base_url).await?;
             let pattern_details = self
                 .fetch_pattern_details_batch(base_url, &patterns)
@@ -213,6 +221,10 @@ impl GTFSService {
         // Compute data hashes
         let data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
 
+        // Pre-compute unique stops list per GTFS feed (avoids recomputation on /stops requests)
+        let pre_computed_stops_by_gtfs =
+            Self::pre_compute_stops(&route_data_by_gtfs, &stop_regional_names_by_gtfs);
+
         temp_data.route_data_by_gtfs = route_data_by_gtfs;
         temp_data.stops_by_gtfs = stops_by_gtfs;
         temp_data.routes_by_gtfs = routes_by_gtfs;
@@ -227,6 +239,17 @@ impl GTFSService {
         temp_data.alternate_stop_by_gtfs = alternate_stops_by_gtfs;
         temp_data.route_service_tiers_by_gtfs = route_service_tiers_by_gtfs;
         temp_data.seat_layout_mapping_by_gtfs = seat_layout_mapping_by_gtfs;
+        temp_data.pre_computed_stops_by_gtfs = pre_computed_stops_by_gtfs;
+
+        let mem_stats = temp_data.memory_usage_bytes();
+        info!(
+            "GTFS data memory usage: ~{:.1} MB (routes: {:.1} KB, route_data: {:.1} KB, stops: {:.1} KB, geojson: {:.1} KB)",
+            mem_stats.total_bytes as f64 / 1_048_576.0,
+            mem_stats.routes_bytes as f64 / 1024.0,
+            mem_stats.route_data_bytes as f64 / 1024.0,
+            mem_stats.stops_bytes as f64 / 1024.0,
+            mem_stats.geojson_bytes as f64 / 1024.0,
+        );
 
         Ok(temp_data)
     }
@@ -783,6 +806,19 @@ impl GTFSService {
         suburban_stop_info_by_gtfs: &HashMap<String, HashMap<String, SuburbanStopInfo>>,
         stops_by_gtfs: &HashMap<String, GTFSStopData>,
     ) -> HashMap<String, GTFSRouteData> {
+        // Pre-compute reverse lookup: gtfs_id -> (stop_code -> provider_stop_code)
+        // Eliminates O(n) linear scan per stop in the inner loop
+        let reverse_provider_map: HashMap<&str, HashMap<&str, &str>> = provider_stop_code_mapping
+            .iter()
+            .map(|(gtfs_id, mapping)| {
+                let reverse: HashMap<&str, &str> = mapping
+                    .iter()
+                    .map(|(prov, stop)| (stop.as_str(), prov.as_str()))
+                    .collect();
+                (gtfs_id.as_str(), reverse)
+            })
+            .collect();
+
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
         // Group patterns by route to find the longest pattern for each route
@@ -814,14 +850,16 @@ impl GTFSService {
             let gtfs_id = parts[0];
             let route_code = parts[1];
 
-            let vehicle_type = routes_by_gtfs
+            // Intern vehicle_type and route_code: all mappings for this route share one Arc
+            let vehicle_type: Arc<str> = routes_by_gtfs
                 .get(gtfs_id)
                 .and_then(|r| r.get(route_code))
-                .map(|route| route.mode.clone())
-                .unwrap_or_else(|| "UNKNOWN".to_string());
+                .map(|route| Arc::from(route.mode.as_str()))
+                .unwrap_or_else(|| Arc::from("UNKNOWN"));
+            let route_code_arc: Arc<str> = Arc::from(route_code);
 
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
-            let mut visited_mapping: HashMap<String, bool> = HashMap::new();
+            let mut visited_mapping: HashSet<String> = HashSet::new();
 
             for (seq, stop) in longest_pattern.stops.iter().enumerate() {
                 let stop_geojson = stop_geojsons_by_gtfs
@@ -829,36 +867,31 @@ impl GTFSService {
                     .and_then(|g| g.get(&stop.code))
                     .cloned();
 
-                // Find provider stop code for this stop code
-                let provider_stop_code =
-                    provider_stop_code_mapping.get(gtfs_id).and_then(|mapping| {
-                        // Find the provider_stop_code that maps to this stop_code
-                        mapping
-                            .iter()
-                            .find(|(_, stop_code)| stop_code == &&stop.code)
-                            .map(|(provider_stop_code, _)| provider_stop_code.clone())
-                    });
+                // Find provider stop code via O(1) reverse lookup
+                let provider_code: Arc<str> = reverse_provider_map
+                    .get(gtfs_id)
+                    .and_then(|m| m.get(stop.code.as_str()))
+                    .map(|s| Arc::from(*s))
+                    .unwrap_or_else(|| Arc::from("GTFS"));
 
                 // Get platform from suburban stop info if available
-                let platform = suburban_stop_info_by_gtfs
+                let platform: Option<Arc<str>> = suburban_stop_info_by_gtfs
                     .get(gtfs_id)
                     .and_then(|stops| stops.get(&stop.code))
                     .and_then(|suburban_stop| {
-                        // For now, we'll use the first platform's platform number
-                        // You might want to implement more sophisticated logic based on your needs
                         suburban_stop
                             .platforms
                             .first()
-                            .map(|platform_info| platform_info.platforms.clone())
+                            .map(|platform_info| Arc::from(platform_info.platforms.as_str()))
                     });
 
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
-                    provider_code: provider_stop_code.unwrap_or("GTFS".to_string()),
-                    route_code: route_code.to_string(),
+                    provider_code,
+                    route_code: route_code_arc.clone(),
                     sequence_num: (seq + 1) as i32,
-                    stop_code: stop.code.clone(),
-                    stop_name: stop.name.clone(),
+                    stop_code: Arc::from(stop.code.as_str()),
+                    stop_name: Arc::from(stop.name.as_str()),
                     stop_point: LatLong {
                         lat: stop.lat,
                         lon: stop.lon,
@@ -869,25 +902,24 @@ impl GTFSService {
                         .and_then(|gtfs_stop| gtfs_stop.station_id.as_ref())
                         .and_then(|station_id| station_id.split(':').next_back())
                         .filter(|s| !s.is_empty())
-                        .map(|parent_code| parent_code.to_string()),
+                        .map(Arc::from),
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
                     hindi_name: stop_regional_names_by_gtfs
                         .get(gtfs_id)
                         .and_then(|m| m.get(&stop.code))
-                        .map(|r| r.hindi_name.clone()),
+                        .map(|r| Arc::from(r.hindi_name.as_str())),
                     regional_name: stop_regional_names_by_gtfs
                         .get(gtfs_id)
                         .and_then(|m| m.get(&stop.code))
-                        .map(|r| r.regional_name.clone()),
+                        .map(|r| Arc::from(r.regional_name.as_str())),
                     platform,
                 });
                 let hash = get_sha256_hash(&mapping);
-                if visited_mapping.contains_key(&hash) {
+                if !visited_mapping.insert(hash) {
                     continue;
                 }
-                visited_mapping.insert(hash, true);
 
                 let mapping_idx = route_data.mappings.len();
 
@@ -957,6 +989,40 @@ impl GTFSService {
         children_by_parent
     }
 
+    /// Pre-compute unique stops list per GTFS feed with regional names populated.
+    /// This avoids cloning and enriching on every /stops API request.
+    fn pre_compute_stops(
+        route_data_by_gtfs: &HashMap<String, GTFSRouteData>,
+        stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
+    ) -> HashMap<String, Vec<Arc<RouteStopMapping>>> {
+        let mut result = HashMap::new();
+        for (gtfs_id, route_data) in route_data_by_gtfs {
+            let regional_names = stop_regional_names_by_gtfs.get(gtfs_id);
+            let mut stops = Vec::with_capacity(route_data.by_stop.len());
+            for indices in route_data.by_stop.values() {
+                if let Some(&i) = indices.first() {
+                    if let Some(mapping) = route_data.mappings.get(i) {
+                        // Check if we need to enrich with regional names
+                        if let Some(regional_record) =
+                            regional_names.and_then(|names| names.get(&*mapping.stop_code))
+                        {
+                            let mut enriched = (**mapping).clone();
+                            enriched.hindi_name =
+                                Some(Arc::from(regional_record.hindi_name.as_str()));
+                            enriched.regional_name =
+                                Some(Arc::from(regional_record.regional_name.as_str()));
+                            stops.push(Arc::new(enriched));
+                        } else {
+                            stops.push(mapping.clone());
+                        }
+                    }
+                }
+            }
+            result.insert(gtfs_id.clone(), stops);
+        }
+        result
+    }
+
     fn compute_all_data_hashes(
         &self,
         routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
@@ -986,12 +1052,15 @@ impl GTFSService {
                 if self.check_for_changes(&new_data).await? {
                     info!("Changes detected, performing atomic update...");
 
-                    // Hold write lock for the entire update process
-                    // This blocks ALL read operations during the update
-                    let mut data = self.data.write().await;
-                    *data = new_data; // Atomic replacement of entire GTFSData structure
+                    // Atomic pointer swap - readers continue unblocked with old data
+                    self.data.store(Arc::new(new_data));
 
-                    // Update metadata while still holding the write lock
+                    // Clear trip details cache since underlying data changed
+                    self.trip_details_cache.write().await.clear();
+
+                    // Update pre-serialized cached data bytes
+                    self.update_cached_data_bytes().await;
+
                     let mut last_update = self.last_update.write().await;
                     *last_update = Utc::now();
                     let duration = start_time.elapsed();
@@ -1002,7 +1071,6 @@ impl GTFSService {
                         *is_ready = true;
                         info!("Service is now ready.");
                     }
-                    // Write lock is released here - now reads can proceed with new data
                 } else {
                     info!("No changes in GTFS data detected. Skipping update.");
                 }
@@ -1016,7 +1084,7 @@ impl GTFSService {
     }
 
     async fn check_for_changes(&self, new_data: &GTFSData) -> AppResult<bool> {
-        let current_data = self.data.read().await;
+        let current_data = self.data.load_full();
         if new_data.data_hash.len() != current_data.data_hash.len() {
             return Ok(true);
         }
@@ -1144,7 +1212,7 @@ impl GTFSService {
     }
 
     pub async fn get_route(&self, gtfs_id: &str, route_id: &str) -> AppResult<NandiRoutesRes> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.routes_by_gtfs
             .get(clean_identifier(gtfs_id).as_str())
             .and_then(|r| r.get(clean_identifier(route_id).as_str()))
@@ -1153,7 +1221,7 @@ impl GTFSService {
     }
 
     pub async fn get_routes(&self, gtfs_id: &str) -> AppResult<Vec<NandiRoutesRes>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.routes_by_gtfs
             .get(clean_identifier(gtfs_id).as_str())
             .map(|r| r.values().cloned().collect())
@@ -1165,7 +1233,7 @@ impl GTFSService {
         gtfs_id: &str,
         route_ids: Vec<String>,
     ) -> AppResult<Vec<NandiRoutesRes>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
         let mut found_routes = Vec::new();
 
@@ -1196,7 +1264,7 @@ impl GTFSService {
         route_code: &str,
         direction: Option<&str>,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
         let route_code = clean_identifier(route_code);
 
@@ -1213,7 +1281,7 @@ impl GTFSService {
                             if let Some(suburban_stop_info) =
                                 data.suburban_stop_info_by_gtfs.get(&gtfs_id)
                             {
-                                if let Some(stop_info) = suburban_stop_info.get(&mapping.stop_code)
+                                if let Some(stop_info) = suburban_stop_info.get(&*mapping.stop_code)
                                 {
                                     let has_matching_direction = stop_info
                                         .platforms
@@ -1271,7 +1339,7 @@ impl GTFSService {
         stop_code: &str,
         direction: Option<&str>,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
 
@@ -1288,7 +1356,7 @@ impl GTFSService {
                             if let Some(suburban_stop_info) =
                                 data.suburban_stop_info_by_gtfs.get(&gtfs_id)
                             {
-                                if let Some(stop_info) = suburban_stop_info.get(&mapping.stop_code)
+                                if let Some(stop_info) = suburban_stop_info.get(&*mapping.stop_code)
                                 {
                                     let has_matching_direction = stop_info
                                         .platforms
@@ -1332,30 +1400,13 @@ impl GTFSService {
     }
 
     pub async fn get_stops(&self, gtfs_id: &str) -> AppResult<Vec<Arc<RouteStopMapping>>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
 
-        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            let mut stops: Vec<Arc<RouteStopMapping>> = Vec::new();
-            let regional_names_by_stop = data.stop_regional_names_by_gtfs.get(&gtfs_id);
-            for indices in route_data.by_stop.values() {
-                if let Some(&i) = indices.first() {
-                    if let Some(mapping) = route_data.mappings.get(i) {
-                        let mut mapping = (**mapping).clone();
-                        // Populate hindi_name and regional_name if available
-                        if let Some(regional_names) = regional_names_by_stop {
-                            if let Some(regional_record) = regional_names.get(&mapping.stop_code) {
-                                mapping.hindi_name = Some(regional_record.hindi_name.clone());
-                                mapping.regional_name = Some(regional_record.regional_name.clone());
-                            }
-                        }
-                        stops.push(Arc::new(mapping));
-                    }
-                }
-            }
-            return Ok(stops);
-        }
-        Err(AppError::NotFound("GTFS ID not found".to_string()))
+        data.pre_computed_stops_by_gtfs
+            .get(&gtfs_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
     pub async fn get_alternate_stops(
@@ -1363,7 +1414,7 @@ impl GTFSService {
         gtfs_id: &str,
         stop_id: &str,
     ) -> AppResult<Vec<Arc<GTFSStop>>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_id = clean_identifier(stop_id);
 
@@ -1396,7 +1447,7 @@ impl GTFSService {
         gtfs_id: &str,
         stop_code: &str,
     ) -> AppResult<(GTFSStop, Option<Arc<RouteStopMapping>>)> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
 
@@ -1438,7 +1489,7 @@ impl GTFSService {
         gtfs_id: &str,
         stop_codes: Vec<String>,
     ) -> AppResult<Vec<GTFSStop>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let mut found_stops = Vec::new();
 
         if let Some(stops_data) = data.stops_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
@@ -1458,7 +1509,7 @@ impl GTFSService {
         gtfs_id: &str,
         route_codes: Vec<String>,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let mut found_mappings = Vec::new();
 
         if let Some(route_data) = data
@@ -1485,7 +1536,7 @@ impl GTFSService {
         gtfs_id: &str,
         stop_codes: Vec<String>,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let mut found_mappings = Vec::new();
 
         if let Some(route_data) = data
@@ -1512,7 +1563,7 @@ impl GTFSService {
         gtfs_id: &str,
         stop_code: &str,
     ) -> AppResult<Vec<String>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         Ok(data
             .children_by_parent
             .get(clean_identifier(gtfs_id).as_str())
@@ -1524,7 +1575,7 @@ impl GTFSService {
     }
 
     pub async fn get_version(&self, gtfs_id: &str) -> AppResult<String> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.data_hash
             .get(clean_identifier(gtfs_id).as_str())
             .cloned()
@@ -1536,7 +1587,7 @@ impl GTFSService {
         gtfs_id: &str,
         provider_stop_code: &str,
     ) -> AppResult<String> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
         let provider_stop_code = clean_identifier(provider_stop_code);
 
@@ -1548,28 +1599,10 @@ impl GTFSService {
     }
 
     // Memory monitoring utility
-    pub async fn get_memory_stats(&self) -> std::collections::HashMap<String, usize> {
-        let data = self.data.read().await;
-        let mut stats = std::collections::HashMap::new();
+    pub async fn get_memory_stats(&self) -> serde_json::Value {
+        let data = self.data.load_full();
 
-        stats.insert(
-            "routes_by_gtfs_count".to_string(),
-            data.routes_by_gtfs.len(),
-        );
-        stats.insert(
-            "route_data_by_gtfs_count".to_string(),
-            data.route_data_by_gtfs.len(),
-        );
-        stats.insert("stops_by_gtfs_count".to_string(), data.stops_by_gtfs.len());
-        stats.insert(
-            "children_by_parent_count".to_string(),
-            data.children_by_parent.len(),
-        );
-        stats.insert("data_hash_count".to_string(), data.data_hash.len());
-
-        let total_routes = data.routes_by_gtfs.values().map(|r| r.len()).sum::<usize>();
-        stats.insert("total_routes".to_string(), total_routes);
-
+        let total_routes: usize = data.routes_by_gtfs.values().map(|r| r.len()).sum();
         let (total_mappings, total_by_route, total_by_stop) =
             data.route_data_by_gtfs.values().fold((0, 0, 0), |acc, d| {
                 (
@@ -1578,40 +1611,73 @@ impl GTFSService {
                     acc.2 + d.by_stop.len(),
                 )
             });
-
-        stats.insert("total_mappings".to_string(), total_mappings);
-        stats.insert("total_by_route_keys".to_string(), total_by_route);
-        stats.insert("total_by_stop_keys".to_string(), total_by_stop);
-
-        let total_stops = data
-            .stops_by_gtfs
+        let total_stops: usize = data.stops_by_gtfs.values().map(|s| s.stops.len()).sum();
+        let total_pre_computed_stops: usize = data
+            .pre_computed_stops_by_gtfs
             .values()
-            .map(|s| s.stops.len())
-            .sum::<usize>();
-        stats.insert("total_stops".to_string(), total_stops);
+            .map(|s| s.len())
+            .sum();
 
-        stats
+        let mem = data.memory_usage_bytes();
+
+        serde_json::json!({
+            "counts": {
+                "gtfs_feeds": data.routes_by_gtfs.len(),
+                "total_routes": total_routes,
+                "total_mappings": total_mappings,
+                "total_by_route_keys": total_by_route,
+                "total_by_stop_keys": total_by_stop,
+                "total_stops": total_stops,
+                "total_pre_computed_stops": total_pre_computed_stops,
+                "children_groups": data.children_by_parent.len(),
+            },
+            "memory_bytes": mem,
+            "memory_mb": {
+                "total": format!("{:.2}", mem.total_bytes as f64 / 1_048_576.0),
+                "routes": format!("{:.2}", mem.routes_bytes as f64 / 1_048_576.0),
+                "route_data": format!("{:.2}", mem.route_data_bytes as f64 / 1_048_576.0),
+                "stops": format!("{:.2}", mem.stops_bytes as f64 / 1_048_576.0),
+                "pre_computed_stops": format!("{:.2}", mem.pre_computed_stops_bytes as f64 / 1_048_576.0),
+                "geojson": format!("{:.2}", mem.geojson_bytes as f64 / 1_048_576.0),
+            }
+        })
     }
 
     pub async fn get_fleet_service_type(&self, gtfs_id: &str, vehicle_no: &str) -> Option<String> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.static_fleet_info_by_gtfs
             .get(clean_identifier(gtfs_id).as_str())
             .and_then(|m| m.get(clean_identifier(vehicle_no).as_str()))
             .and_then(|info| info.service_type.clone())
     }
 
-    pub async fn get_all_cached_data(&self) -> CachedDataResponse {
-        let data = self.data.read().await;
-        CachedDataResponse {
+    /// Returns pre-serialized JSON bytes for the cached data endpoint.
+    /// Avoids re-serialization and deep cloning on every request.
+    pub async fn get_cached_data_bytes(&self) -> Arc<Vec<u8>> {
+        self.cached_data_bytes.load_full()
+    }
+
+    /// Pre-serialize cached data after a data refresh so the /cached-data
+    /// endpoint can serve bytes directly without lock contention or cloning.
+    async fn update_cached_data_bytes(&self) {
+        let data = self.data.load_full();
+        let response = CachedDataResponse {
             route_data_by_gtfs: data.route_data_by_gtfs.clone(),
             stops_by_gtfs: data.stops_by_gtfs.clone(),
             stop_geojsons_by_gtfs: data.stop_geojsons_by_gtfs.clone(),
+        };
+        match serde_json::to_vec(&response) {
+            Ok(bytes) => {
+                self.cached_data_bytes.store(Arc::new(bytes));
+            }
+            Err(e) => {
+                error!("Failed to pre-serialize cached data: {}", e);
+            }
         }
     }
 
     pub async fn get_feeds_in_memory(&self) -> Vec<String> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.route_data_by_gtfs.keys().cloned().collect()
     }
 
@@ -1620,19 +1686,25 @@ impl GTFSService {
         gtfs_id: &str,
         route_code: &str,
     ) -> AppResult<TripDetails> {
-        let data = self.data.read().await;
-        if let Some(cached) = data
-            .route_example_trip_details_by_gtfs
-            .get(clean_identifier(gtfs_id).as_str())
-            .and_then(|m| m.get(clean_identifier(route_code).as_str()))
+        let clean_gtfs = clean_identifier(gtfs_id);
+        let clean_route = clean_identifier(route_code);
+
+        // Check trip details cache first (separate lock from main data)
         {
-            return Ok(cached.clone());
+            let cache = self.trip_details_cache.read().await;
+            if let Some(cached) = cache
+                .get(clean_gtfs.as_str())
+                .and_then(|m| m.get(clean_route.as_str()))
+            {
+                return Ok(cached.clone());
+            }
         }
 
+        let data = self.data.load_full();
         let trip_feed = data
             .route_example_trip_by_gtfs
-            .get(clean_identifier(gtfs_id).as_str())
-            .and_then(|m| m.get(clean_identifier(route_code).as_str()))
+            .get(clean_gtfs.as_str())
+            .and_then(|m| m.get(clean_route.as_str()))
             .cloned()
             .ok_or_else(|| AppError::NotFound("Example trip not found".to_string()))?;
 
@@ -1649,8 +1721,7 @@ impl GTFSService {
 
         // Query trip details by trip_feed
         let query = "query Trip($id: String!) { trip(id: $id) { gtfsId stoptimes { stop { id lat lon code platformCode name } scheduledArrival scheduledDeparture headsign stopPosition } } }";
-        let variables =
-            serde_json::json!({ "id": format!("{}:{}", clean_identifier(gtfs_id), trip_feed) });
+        let variables = serde_json::json!({ "id": format!("{}:{}", &clean_gtfs, trip_feed) });
         let resp = self
             .execute_graphql_query("default", query, Some(variables), None, None)
             .await
@@ -1722,19 +1793,18 @@ impl GTFSService {
             stops,
         };
 
-        // Cache results
-        let mut data_w = self.data.write().await;
-        data_w
-            .route_example_trip_details_by_gtfs
-            .entry(clean_identifier(gtfs_id))
+        // Cache results in trip details cache (separate lock from main data)
+        let mut cache = self.trip_details_cache.write().await;
+        cache
+            .entry(clean_gtfs)
             .or_default()
-            .insert(clean_identifier(route_code), details.clone());
+            .insert(clean_route, details.clone());
 
         Ok(details)
     }
 
     pub async fn get_route_example_trip_map(&self) -> HashMap<String, HashMap<String, String>> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.route_example_trip_by_gtfs.clone()
     }
 
@@ -1941,7 +2011,7 @@ impl GTFSService {
     }
 
     pub async fn get_seat_layout_id(&self, gtfs_id: &str, fleet_id: &str) -> Option<String> {
-        let data = self.data.read().await;
+        let data = self.data.load_full();
         data.seat_layout_mapping_by_gtfs
             .get(gtfs_id)
             .and_then(|m| m.get(fleet_id))
@@ -1949,8 +2019,8 @@ impl GTFSService {
     }
 
     pub async fn get_seat_layout_id_by_fleet_id(&self, fleet_id: &str) -> Option<String> {
-        let data = self.data.read().await;
-        for (_, mapping) in &data.seat_layout_mapping_by_gtfs {
+        let data = self.data.load_full();
+        for mapping in data.seat_layout_mapping_by_gtfs.values() {
             if let Some(seat_layout_id) = mapping.get(fleet_id) {
                 return Some(seat_layout_id.clone());
             }

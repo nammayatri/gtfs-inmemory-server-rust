@@ -581,8 +581,8 @@ pub fn merge_stop_and_mapping(
 ) -> RouteStopMapping {
     let mapping_ref = mapping.as_deref();
     RouteStopMapping {
-        stop_code: stop.code,
-        stop_name: stop.name,
+        stop_code: Arc::from(stop.code.as_str()),
+        stop_name: Arc::from(stop.name.as_str()),
         stop_point: LatLong {
             lat: stop.lat,
             lon: stop.lon,
@@ -590,21 +590,21 @@ pub fn merge_stop_and_mapping(
         estimated_travel_time_from_previous_stop: None,
         geo_json: mapping_ref.and_then(|m| m.geo_json.clone()),
         gates: mapping_ref.and_then(|m| m.gates.clone()),
-        provider_code: "GTFS".to_string(),
-        route_code: "UNKNOWN".to_string(),
+        provider_code: Arc::from("GTFS"),
+        route_code: Arc::from("UNKNOWN"),
         vehicle_type: mapping_ref
             .map(|m| m.vehicle_type.clone())
-            .unwrap_or_else(|| "BUS".to_string()),
+            .unwrap_or_else(|| Arc::from("BUS")),
         sequence_num: 0,
-        hindi_name: stop.hindi_name,
-        regional_name: stop.regional_name,
+        hindi_name: stop.hindi_name.map(|s| Arc::from(s.as_str())),
+        regional_name: stop.regional_name.map(|s| Arc::from(s.as_str())),
         platform: mapping_ref.and_then(|m| m.platform.clone()),
         parent_stop_code: stop
             .station_id
             .as_ref()
             .and_then(|station_id| station_id.split(':').next_back())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string()),
+            .map(Arc::from),
     }
 }
 
@@ -637,7 +637,7 @@ async fn get_stops_fuzzy(
             || stop.stop_code.to_lowercase().contains(&query_lower);
 
         if matches {
-            unique_stops.insert(stop.stop_code.clone(), stop.clone());
+            unique_stops.insert(stop.stop_code.to_string(), stop.clone());
             if let Some(limit) = query.limit {
                 if unique_stops.len() >= limit as usize {
                     break;
@@ -865,7 +865,7 @@ async fn get_service_type_by_vehicle_impl(
             // Vehicle not found in cache, try to get service type from fleet
             if let Some(service_type) = app_state
                 .gtfs_service
-                .get_fleet_service_type(gtfs_id, &vehicle_no)
+                .get_fleet_service_type(gtfs_id, vehicle_no)
                 .await
             {
                 // Return response with service type from fleet
@@ -1163,15 +1163,14 @@ async fn get_vehicle_info(
 
 async fn get_memory_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let stats = app_state.gtfs_service.get_memory_stats().await;
-    Ok(HttpResponse::Ok().json(serde_json::json!(stats)))
+    Ok(HttpResponse::Ok().json(stats))
 }
 
 async fn get_all_cached_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
-    let cached_data = app_state.gtfs_service.get_all_cached_data().await;
-    Ok(HttpResponse::Ok().json(
-        serde_json::to_value(cached_data)
-            .map_err(|e| AppError::Internal(format!("Failed to serialize cached data: {}", e)))?,
-    ))
+    let bytes = app_state.gtfs_service.get_cached_data_bytes().await;
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(bytes.to_vec()))
 }
 
 async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
@@ -1300,7 +1299,10 @@ fn calculate_eta_from_db(
     for (idx, mapping) in route_stop_mappings.iter().enumerate() {
         if idx > 0 {
             let prev_mapping = &route_stop_mappings[idx - 1];
-            let pair = (prev_mapping.stop_code.clone(), mapping.stop_code.clone());
+            let pair = (
+                prev_mapping.stop_code.to_string(),
+                mapping.stop_code.to_string(),
+            );
 
             let time_seconds = if let Some(&eta_secs) = db_etas.get(&pair) {
                 // Get ETA for this consecutive pair from DB (value is already in seconds)
@@ -1353,10 +1355,10 @@ fn calculate_eta_from_db(
         };
 
         bus_stop_etas.push(crate::models::BusStopETA {
-            stop_code: mapping.stop_code.clone(),
+            stop_code: mapping.stop_code.to_string(),
             arrival_time: arrival_epoch,
             eta_seconds,
-            stop_name: Some(mapping.stop_name.clone()),
+            stop_name: Some(mapping.stop_name.to_string()),
         });
     }
 
@@ -1413,10 +1415,10 @@ fn calculate_eta_from_haversine_distance(
         };
 
         bus_stop_etas.push(crate::models::BusStopETA {
-            stop_code: mapping.stop_code.clone(),
+            stop_code: mapping.stop_code.to_string(),
             arrival_time: arrival_epoch,
             eta_seconds,
-            stop_name: Some(mapping.stop_name.clone()),
+            stop_name: Some(mapping.stop_name.to_string()),
         });
     }
 
