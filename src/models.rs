@@ -233,6 +233,8 @@ pub struct VehicleServiceTypeResponse {
     pub service_sub_types: Option<Vec<String>>,
     #[serde(rename = "seatLayoutId")]
     pub seat_layout_id: Option<String>,
+    #[serde(rename = "busTagNumber")]
+    pub bus_tag_number: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
