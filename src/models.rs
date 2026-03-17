@@ -629,6 +629,7 @@ pub struct SeatLayoutMappingRecord {
 // ── Schedule / Reach-on-Time types ─────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DepartureQuery {
     pub time: Option<String>,
     pub date: Option<String>,
@@ -637,6 +638,7 @@ pub struct DepartureQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArrivalQuery {
     pub time: Option<String>,
     pub date: Option<String>,
@@ -645,6 +647,7 @@ pub struct ArrivalQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TripsBetweenRequest {
     pub origin_stop_code: String,
     pub destination_stop_code: String,
@@ -655,6 +658,7 @@ pub struct TripsBetweenRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NextServicesRequest {
     pub stop_code: String,
     pub date: Option<String>,
@@ -664,6 +668,7 @@ pub struct NextServicesRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduledDeparture {
     pub trip_id: String,
     pub route_id: String,
@@ -677,6 +682,7 @@ pub struct ScheduledDeparture {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduledArrival {
     pub trip_id: String,
     pub route_id: String,
@@ -690,6 +696,7 @@ pub struct ScheduledArrival {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduledTrip {
     pub trip_id: String,
     pub route_id: String,
@@ -705,6 +712,7 @@ pub struct ScheduledTrip {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GtfsDataQualityReport {
     pub gtfs_id: String,
     pub total_routes: usize,
