@@ -30,6 +30,9 @@ pub enum AppError {
 
     #[error("Invalid request: {0}")]
     BadRequest(String),
+
+    #[error("Time range too wide: {0}")]
+    TimeRangeTooWide(String),
 }
 
 impl ResponseError for AppError {
@@ -41,6 +44,7 @@ impl ResponseError for AppError {
             AppError::NotReady(msg) => msg.clone(),
             AppError::RateLimit => "Rate limit exceeded".to_string(),
             AppError::BadRequest(msg) => msg.clone(),
+            AppError::TimeRangeTooWide(msg) => msg.clone(),
             AppError::HttpRequest(err) => format!("HTTP request failed: {}", err),
             AppError::JsonSerialization(err) => format!("JSON serialization failed: {}", err),
             AppError::Configuration(err) => format!("Configuration error: {}", err),
@@ -53,6 +57,7 @@ impl ResponseError for AppError {
             AppError::NotReady(_) => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
             AppError::RateLimit => actix_web::http::StatusCode::TOO_MANY_REQUESTS,
             AppError::BadRequest(_) => actix_web::http::StatusCode::BAD_REQUEST,
+            AppError::TimeRangeTooWide(_) => actix_web::http::StatusCode::BAD_REQUEST,
             AppError::HttpRequest(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             AppError::JsonSerialization(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Configuration(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
