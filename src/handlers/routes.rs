@@ -1031,7 +1031,16 @@ async fn get_service_type_by_vehicle_impl(
         }));
     }
 
-    // For other gtfs_id, use the existing DB logic
+    // For other gtfs_id, use the existing DB logic (legacy tables without gtfs_id scoping).
+    // Only allow the legacy fallback for gtfs_ids that are known to use the legacy tables.
+    let legacy_gtfs_ids = ["chennai_bus"];
+    if !legacy_gtfs_ids.contains(&gtfs_id) {
+        return Err(crate::tools::error::AppError::NotFound(format!(
+            "Vehicle {} not found for gtfs_id {}",
+            vehicle_no, gtfs_id
+        )));
+    }
+
     let mut vehicle_data = app_state
         .db_vehicle_reader
         .get_vehicle_data(vehicle_no, params.trip_number)
@@ -1969,6 +1978,17 @@ async fn get_all_rows(
     let limit = query.limit.unwrap_or(15);
     let offset = query.offset.unwrap_or(0);
 
+    if limit < 1 || limit > 1000 {
+        return Ok(HttpResponse::BadRequest().json(json!({
+            "error": "limit must be between 1 and 1000"
+        })));
+    }
+    if offset < 0 {
+        return Ok(HttpResponse::BadRequest().json(json!({
+            "error": "offset must be >= 0"
+        })));
+    }
+
     let rows = app_state
         .operator_service
         .get_all_rows(&table, &gtfs_id, limit, offset)
@@ -2217,6 +2237,12 @@ async fn update_waybill_status(
         .operator_service
         .update_waybill_status(&gtfs_id, body.waybill_id, &body.status)
         .await?;
+
+    if rows == 0 {
+        return Ok(HttpResponse::NotFound().json(json!({
+            "error": "No waybill found matching the given waybill_id and gtfs_id"
+        })));
+    }
 
     Ok(HttpResponse::Ok().json(json!({
         "message": "waybill status updated",

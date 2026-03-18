@@ -1245,9 +1245,11 @@ impl OperatorService for DBOperatorService {
     ) -> AppResult<Vec<InternalRow>> {
         validate_table(table)?;
 
+        let pk = table_pk(table)
+            .ok_or_else(|| AppError::Internal(format!("No PK for table: {}", table)))?;
         let sql = format!(
-            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY 1 LIMIT $2 OFFSET $3) t",
-            table
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY {} LIMIT $2 OFFSET $3) t",
+            table, pk
         );
 
         let vals: Vec<Value> = sqlx::query_scalar::<_, Value>(&sql)
@@ -1359,10 +1361,13 @@ impl OperatorService for DBOperatorService {
         let limit = body.limit.unwrap_or(15).min(MAX_QUERY_LIMIT);
         let offset = body.offset.unwrap_or(0);
 
+        let pk = table_pk(table)
+            .ok_or_else(|| AppError::Internal(format!("No PK for table: {}", table)))?;
         let sql = format!(
-            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY 1 LIMIT ${} OFFSET ${}) t",
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY {} LIMIT ${} OFFSET ${}) t",
             table,
             where_parts.join(" AND "),
+            pk,
             param_idx,
             param_idx + 1,
         );
@@ -1466,15 +1471,33 @@ impl OperatorService for DBOperatorService {
             return Err(AppError::BadRequest("First object is empty".to_string()));
         }
 
+        // Validate column names against allowed columns to prevent SQL injection
+        let known_cols: std::collections::HashSet<&str> = table_columns(table)
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("Unknown table '{}' for column validation", table))
+            })?
+            .iter()
+            .copied()
+            .collect();
+
         // Build column list from caller's keys, excluding gtfs_id (we inject it ourselves)
         // Also exclude keys whose value is JSON null — omit-null semantics so that a partial
         // update (e.g. just {waybill_id, duty_date}) never triggers NOT NULL violations on
         // columns the caller didn't intend to touch.
-        let mut cols: Vec<&str> = first_obj
-            .keys()
-            .filter(|k| k.as_str() != "gtfs_id" && !first_obj[k.as_str()].is_null())
-            .map(|s| s.as_str())
-            .collect();
+        let mut cols: Vec<&str> = Vec::new();
+        for key in first_obj.keys() {
+            let col = key.as_str();
+            if col == "gtfs_id" || first_obj[col].is_null() {
+                continue;
+            }
+            if !known_cols.contains(col) {
+                return Err(AppError::BadRequest(format!(
+                    "Unknown column '{}' for table '{}'",
+                    col, table
+                )));
+            }
+            cols.push(col);
+        }
         cols.push("gtfs_id"); // gtfs_id always last
 
         let update_set: Vec<String> = cols
@@ -1806,15 +1829,19 @@ impl OperatorService for DBOperatorService {
             )));
         }
 
-        let result = sqlx::query(
-            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
-        )
-        .bind(status)
-        .bind(waybill_id)
-        .bind(gtfs_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
+        let sql = if status == "audited" {
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now(), audited_date = COALESCE(audited_date, now()) WHERE waybill_id = $2 AND gtfs_id = $3"
+        } else {
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3"
+        };
+
+        let result = sqlx::query(sql)
+            .bind(status)
+            .bind(waybill_id)
+            .bind(gtfs_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
 
         Ok(result.rows_affected())
     }
