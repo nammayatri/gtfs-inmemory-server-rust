@@ -27,9 +27,9 @@ impl ScheduleService {
 
     // ── helpers ──────────────────────────────────────────────────────────
 
-    fn parse_time(time_str: &str) -> AppResult<NaiveTime> {
-        // GTFS allows times > 24:00:00 for next-day trips, but NaiveTime only handles 0-23.
-        // For times >= 24:00, we wrap around (25:30:00 → 01:30:00) and handle via seconds math.
+    /// Parse a time string into raw seconds from midnight.
+    /// Preserves GTFS >24h times (e.g. "25:30:00" → 91800).
+    fn parse_time_to_seconds(time_str: &str) -> AppResult<i32> {
         let parts: Vec<&str> = time_str.split(':').collect();
         if parts.len() < 2 || parts.len() > 3 {
             return Err(AppError::BadRequest(format!(
@@ -37,7 +37,6 @@ impl ScheduleService {
                 time_str
             )));
         }
-        // Validate each part is numeric
         for part in &parts {
             if part.parse::<u32>().is_err() {
                 return Err(AppError::BadRequest(format!(
@@ -56,11 +55,7 @@ impl ScheduleService {
                 time_str
             )));
         }
-        // For GTFS times > 24h, wrap hours
-        let wrapped_hours = hours % 24;
-        NaiveTime::from_hms_opt(wrapped_hours, minutes, seconds).ok_or_else(|| {
-            AppError::BadRequest(format!("Cannot construct time from '{}'", time_str))
-        })
+        Ok((hours * 3600 + minutes * 60 + seconds) as i32)
     }
 
     fn time_to_seconds(t: &NaiveTime) -> i32 {
@@ -211,11 +206,10 @@ impl ScheduleService {
         let stop_code = clean_identifier(stop_code);
         Self::validate_window(window_minutes)?;
 
-        let base_time = match time_str {
-            Some(t) => Self::parse_time(t)?,
-            None => Utc::now().time(),
+        let start_secs = match time_str {
+            Some(t) => Self::parse_time_to_seconds(t)?,
+            None => Self::time_to_seconds(&Utc::now().time()),
         };
-        let start_secs = Self::time_to_seconds(&base_time);
         let end_secs = start_secs + (window_minutes as i32) * 60;
 
         info!(
@@ -286,11 +280,10 @@ impl ScheduleService {
         let stop_code = clean_identifier(stop_code);
         Self::validate_window(window_minutes)?;
 
-        let base_time = match time_str {
-            Some(t) => Self::parse_time(t)?,
-            None => Utc::now().time(),
+        let start_secs = match time_str {
+            Some(t) => Self::parse_time_to_seconds(t)?,
+            None => Self::time_to_seconds(&Utc::now().time()),
         };
-        let start_secs = Self::time_to_seconds(&base_time);
         let end_secs = start_secs + (window_minutes as i32) * 60;
 
         info!(
@@ -370,11 +363,11 @@ impl ScheduleService {
         }
 
         let depart_after_secs = match depart_after {
-            Some(t) => Some(Self::time_to_seconds(&Self::parse_time(t)?)),
+            Some(t) => Some(Self::parse_time_to_seconds(t)?),
             None => None,
         };
         let arrive_before_secs = match arrive_before {
-            Some(t) => Some(Self::time_to_seconds(&Self::parse_time(t)?)),
+            Some(t) => Some(Self::parse_time_to_seconds(t)?),
             None => None,
         };
         let window_secs = (window_minutes as i32) * 60;
@@ -483,11 +476,10 @@ impl ScheduleService {
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
 
-        let base_time = match time_str {
-            Some(t) => Self::parse_time(t)?,
-            None => Utc::now().time(),
+        let start_secs = match time_str {
+            Some(t) => Self::parse_time_to_seconds(t)?,
+            None => Self::time_to_seconds(&Utc::now().time()),
         };
-        let start_secs = Self::time_to_seconds(&base_time);
 
         info!(
             "Querying next services at stop {} for gtfs_id {}, from {}s",
@@ -788,29 +780,26 @@ mod tests {
 
     #[test]
     fn test_parse_time_valid() {
-        let t = ScheduleService::parse_time("08:30:00").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 30600);
+        assert_eq!(ScheduleService::parse_time_to_seconds("08:30:00").unwrap(), 30600);
     }
 
     #[test]
     fn test_parse_time_midnight() {
-        let t = ScheduleService::parse_time("00:00:00").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 0);
+        assert_eq!(ScheduleService::parse_time_to_seconds("00:00:00").unwrap(), 0);
     }
 
     #[test]
     fn test_parse_time_invalid_format() {
-        assert!(ScheduleService::parse_time("not_a_time").is_err());
-        assert!(ScheduleService::parse_time("").is_err());
-        assert!(ScheduleService::parse_time("12:99:00").is_err()); // minutes >= 60
-        assert!(ScheduleService::parse_time("12:00:99").is_err()); // seconds >= 60
+        assert!(ScheduleService::parse_time_to_seconds("not_a_time").is_err());
+        assert!(ScheduleService::parse_time_to_seconds("").is_err());
+        assert!(ScheduleService::parse_time_to_seconds("12:99:00").is_err()); // minutes >= 60
+        assert!(ScheduleService::parse_time_to_seconds("12:00:99").is_err()); // seconds >= 60
     }
 
     #[test]
     fn test_parse_time_short_format_accepted() {
         // HH:MM format should be accepted (defaults seconds to 0)
-        let t = ScheduleService::parse_time("8:30").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 30600);
+        assert_eq!(ScheduleService::parse_time_to_seconds("8:30").unwrap(), 30600);
     }
 
     #[test]
@@ -1390,38 +1379,33 @@ mod tests {
 
     #[test]
     fn test_parse_time_end_of_day_boundary() {
-        let t = ScheduleService::parse_time("23:59:59").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 86399);
+        assert_eq!(ScheduleService::parse_time_to_seconds("23:59:59").unwrap(), 86399);
     }
 
     #[test]
-    fn test_parse_time_gtfs_over_24h_wraps() {
-        // GTFS allows times > 24h for next-day trips. Our parser wraps hours % 24.
-        let t = ScheduleService::parse_time("25:30:00").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 5400); // 01:30:00
-        let t2 = ScheduleService::parse_time("24:00:00").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t2), 0); // wraps to 00:00:00
-        let t3 = ScheduleService::parse_time("26:15:30").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t3), 8130); // 02:15:30
+    fn test_parse_time_gtfs_over_24h_preserves() {
+        // GTFS allows times > 24h for next-day trips. Parser now preserves raw seconds.
+        assert_eq!(ScheduleService::parse_time_to_seconds("25:30:00").unwrap(), 91800); // 25*3600+30*60
+        assert_eq!(ScheduleService::parse_time_to_seconds("24:00:00").unwrap(), 86400);
+        assert_eq!(ScheduleService::parse_time_to_seconds("26:15:30").unwrap(), 94530); // 26*3600+15*60+30
     }
 
     #[test]
     fn test_parse_time_empty_string() {
-        assert!(ScheduleService::parse_time("").is_err());
+        assert!(ScheduleService::parse_time_to_seconds("").is_err());
     }
 
     #[test]
     fn test_parse_time_garbage_input() {
-        assert!(ScheduleService::parse_time("not-a-time").is_err());
-        assert!(ScheduleService::parse_time("12:AB:00").is_err());
+        assert!(ScheduleService::parse_time_to_seconds("not-a-time").is_err());
+        assert!(ScheduleService::parse_time_to_seconds("12:AB:00").is_err());
         // Note: "08:30" (HH:MM) is accepted by our parser — seconds default to 0
-        let t = ScheduleService::parse_time("08:30").unwrap();
-        assert_eq!(ScheduleService::time_to_seconds(&t), 30600);
+        assert_eq!(ScheduleService::parse_time_to_seconds("08:30").unwrap(), 30600);
     }
 
     #[test]
     fn test_parse_time_negative_hours() {
-        assert!(ScheduleService::parse_time("-01:00:00").is_err());
+        assert!(ScheduleService::parse_time_to_seconds("-01:00:00").is_err());
     }
 
     #[test]
