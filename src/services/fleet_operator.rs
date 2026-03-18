@@ -17,9 +17,11 @@ pub enum WaybillAnchor {
     VehicleNumber(String),
 }
 
+#[derive(PartialEq)]
 pub enum TripAction {
     Start,
     End,
+    Reset,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +687,48 @@ impl DBFleetOperatorService {
                     }
                 }
             }
+            TripAction::Reset => {
+                if waybill.is_flexi {
+                    sqlx::query(
+                        r#"
+                        UPDATE bus_schedule_trip_flexi_internal
+                        SET is_active_trip = false
+                        WHERE waybill_id = $1
+                        "#,
+                    )
+                    .bind(waybill.waybill_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "apply_trip_action reset (flexi) failed for waybill_id={}: {}",
+                            waybill.waybill_id, e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?;
+                } else {
+                    let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+                        AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
+                    })?;
+                    sqlx::query(
+                        r#"
+                        UPDATE bus_schedule_trip_detail_internal
+                        SET is_active_trip = false
+                        WHERE schedule_trip_id = $1
+                        "#,
+                    )
+                    .bind(schedule_trip_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "apply_trip_action reset (detail) failed for schedule_trip_id={}: {}",
+                            schedule_trip_id, e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -791,9 +835,10 @@ impl FleetOperatorService for DBFleetOperatorService {
         timestamp: Option<i64>,
     ) -> AppResult<TripActionResponse> {
         let waybill = self.resolve_waybill(gtfs_id, &anchor).await?;
-        self.validate_trip_exists(&waybill, trip_number).await?;
-        self.apply_trip_action(&waybill, &action, trip_number, timestamp)
-            .await?;
+        if action != TripAction::Reset {
+            self.validate_trip_exists(&waybill, trip_number).await?;
+        }
+        self.apply_trip_action(&waybill, &action, trip_number, timestamp).await?;
         Ok(TripActionResponse { success: true })
     }
 

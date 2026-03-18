@@ -2317,7 +2317,7 @@ struct FleetAnchorRequest {
 #[derive(Debug, Deserialize)]
 struct FleetTripActionRequest {
     action: String,
-    trip_number: i32,
+    trip_number: Option<i32>,
     timestamp: Option<i64>,
     conductor_token: Option<String>,
     driver_token: Option<String>,
@@ -2389,18 +2389,26 @@ async fn fleet_operator_trip_action(
     let action = match req.action.as_str() {
         "start" => TripAction::Start,
         "end" => TripAction::End,
+        "reset" => TripAction::Reset,
         other => {
             return Err(AppError::BadRequest(format!(
-                "Invalid action '{}'. Must be 'start' or 'end'.",
+                "Invalid action '{}'. Must be 'start', 'end', or 'reset'.",
                 other
             )))
         }
     };
 
+    let trip_number = match action {
+        TripAction::Reset => 0,
+        _ => req.trip_number.ok_or_else(|| {
+            AppError::BadRequest("trip_number is required for 'start' and 'end' actions.".to_string())
+        })?,
+    };
+
     let anchor = parse_fleet_anchor(req.conductor_token, req.driver_token, req.vehicle_number)?;
     let response = app_state
         .fleet_operator_service
-        .trip_action(&gtfs_id, anchor, action, req.trip_number, req.timestamp)
+        .trip_action(&gtfs_id, anchor, action, trip_number, req.timestamp)
         .await?;
     Ok(HttpResponse::Ok().json(response))
 }
