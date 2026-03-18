@@ -750,6 +750,12 @@ async fn get_service_type_by_vehicle_impl(
         path
     };
 
+    let tag_number = app_state
+        .fleet_tag_list
+        .get(gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
+        .cloned();
+
     // Get vehicle verification if requested
     let is_valid = if pass_verify_req {
         app_state
@@ -853,6 +859,7 @@ async fn get_service_type_by_vehicle_impl(
                 eligible_pass_ids,
                 service_sub_types,
                 seat_layout_id,
+                bus_tag_number: tag_number,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -895,6 +902,7 @@ async fn get_service_type_by_vehicle_impl(
                         .cloned(),
                     service_sub_types,
                     seat_layout_id,
+                    bus_tag_number: tag_number,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -1004,6 +1012,7 @@ async fn get_service_type_by_vehicle_impl(
             eligible_pass_ids,
             service_sub_types,
             seat_layout_id,
+            bus_tag_number: tag_number,
         }));
     }
 
@@ -1101,6 +1110,7 @@ async fn get_service_type_by_vehicle_impl(
         eligible_pass_ids,
         service_sub_types,
         seat_layout_id,
+        bus_tag_number: tag_number,
     }))
 }
 
