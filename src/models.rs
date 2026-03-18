@@ -655,6 +655,7 @@ pub struct TripsBetweenRequest {
     pub depart_after: Option<String>,
     pub arrive_before: Option<String>,
     pub window_minutes: Option<u32>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

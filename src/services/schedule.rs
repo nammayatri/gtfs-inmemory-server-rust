@@ -13,6 +13,9 @@ use crate::tools::error::{AppError, AppResult};
 /// Maximum window allowed for time-range queries (8 hours in minutes).
 const MAX_QUERY_WINDOW_MINUTES: u32 = 480;
 
+/// Maximum result limit allowed per query.
+const MAX_QUERY_LIMIT: usize = 200;
+
 /// Index entry: maps seconds-from-midnight → list of (trip_id, stop_index) pairs.
 type TimeIndex = BTreeMap<i32, Vec<(String, usize)>>;
 
@@ -47,7 +50,11 @@ impl ScheduleService {
         }
         let hours: u32 = parts[0].parse().unwrap();
         let minutes: u32 = parts[1].parse().unwrap();
-        let seconds: u32 = if parts.len() == 3 { parts[2].parse().unwrap() } else { 0 };
+        let seconds: u32 = if parts.len() == 3 {
+            parts[2].parse().unwrap()
+        } else {
+            0
+        };
 
         if minutes >= 60 || seconds >= 60 {
             return Err(AppError::BadRequest(format!(
@@ -129,7 +136,23 @@ impl ScheduleService {
         Ok(())
     }
 
+    /// Validates that the requested limit is within acceptable bounds.
+    fn validate_limit(limit: usize) -> AppResult<()> {
+        if limit < 1 {
+            return Err(AppError::BadRequest("Limit must be at least 1".to_string()));
+        }
+        if limit > MAX_QUERY_LIMIT {
+            return Err(AppError::BadRequest(format!(
+                "Limit {} exceeds the maximum of {}",
+                limit, MAX_QUERY_LIMIT
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates that a stop code exists in the GTFS stop data.
+    /// Returns NotFound if stop data is loaded but the stop code is absent.
+    /// Returns Ok if stop data is not loaded (we can't validate, so allow the query).
     fn validate_stop_code(
         data: &crate::models::GTFSData,
         gtfs_id: &str,
@@ -149,24 +172,18 @@ impl ScheduleService {
                 )))
             }
             None => {
-                warn!(
-                    "No stop data loaded for gtfs_id '{}'",
-                    gtfs_id
-                );
-                Err(AppError::NotReady(format!(
-                    "No stop data loaded for gtfs_id '{}'",
-                    gtfs_id
-                )))
+                // No stop data loaded — skip validation rather than blocking the query
+                Ok(())
             }
         }
     }
 
     /// Validates that trip data is available for the given GTFS feed.
-    fn validate_gtfs_loaded(
-        data: &crate::models::GTFSData,
-        gtfs_id: &str,
-    ) -> AppResult<()> {
-        if !data.route_example_trip_details_by_gtfs.contains_key(gtfs_id) {
+    fn validate_gtfs_loaded(data: &crate::models::GTFSData, gtfs_id: &str) -> AppResult<()> {
+        if !data
+            .route_example_trip_details_by_gtfs
+            .contains_key(gtfs_id)
+        {
             return Err(AppError::NotReady(format!(
                 "GTFS data not loaded for '{}'",
                 gtfs_id
@@ -205,6 +222,11 @@ impl ScheduleService {
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
         Self::validate_window(window_minutes)?;
+        Self::validate_limit(limit)?;
+
+        if let Some(d) = _date_str {
+            warn!("date parameter '{}' was provided but date-based filtering is not yet implemented; ignoring", d);
+        }
 
         let start_secs = match time_str {
             Some(t) => Self::parse_time_to_seconds(t)?,
@@ -220,6 +242,7 @@ impl ScheduleService {
         // Single lock acquisition — build index and query from same data snapshot
         let data = self.gtfs_service.data().read().await;
         Self::validate_gtfs_loaded(&data, &gtfs_id)?;
+        Self::validate_stop_code(&data, &gtfs_id, &stop_code)?;
         let dep_index = Self::build_departure_index_from(&data, &gtfs_id)?;
         let trip_map = data
             .route_example_trip_details_by_gtfs
@@ -237,10 +260,7 @@ impl ScheduleService {
                         if stop.stop_code == stop_code {
                             let (short_name, mode) =
                                 self.lookup_route_info(&data, &gtfs_id, route_code);
-                            let headsign = stop
-                                .headsign
-                                .as_str()
-                                .map(|s| s.to_string());
+                            let headsign = stop.headsign.as_str().map(|s| s.to_string());
                             results.push(ScheduledDeparture {
                                 trip_id: trip.trip_id.clone(),
                                 route_id: route_code.clone(),
@@ -279,6 +299,11 @@ impl ScheduleService {
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
         Self::validate_window(window_minutes)?;
+        Self::validate_limit(limit)?;
+
+        if let Some(d) = _date_str {
+            warn!("date parameter '{}' was provided but date-based filtering is not yet implemented; ignoring", d);
+        }
 
         let start_secs = match time_str {
             Some(t) => Self::parse_time_to_seconds(t)?,
@@ -294,6 +319,7 @@ impl ScheduleService {
         // Single lock acquisition — build index and query from same data snapshot
         let data = self.gtfs_service.data().read().await;
         Self::validate_gtfs_loaded(&data, &gtfs_id)?;
+        Self::validate_stop_code(&data, &gtfs_id, &stop_code)?;
         let arr_index = Self::build_arrival_index_from(&data, &gtfs_id)?;
         let trip_map = data
             .route_example_trip_details_by_gtfs
@@ -311,19 +337,14 @@ impl ScheduleService {
                         if stop.stop_code == stop_code {
                             let (short_name, mode) =
                                 self.lookup_route_info(&data, &gtfs_id, route_code);
-                            let headsign = stop
-                                .headsign
-                                .as_str()
-                                .map(|s| s.to_string());
+                            let headsign = stop.headsign.as_str().map(|s| s.to_string());
                             results.push(ScheduledArrival {
                                 trip_id: trip.trip_id.clone(),
                                 route_id: route_code.clone(),
                                 route_short_name: short_name,
                                 stop_code: stop.stop_code.clone(),
                                 stop_name: stop.stop_name.clone(),
-                                arrival_time: Self::seconds_to_time_string(
-                                    stop.scheduled_arrival,
-                                ),
+                                arrival_time: Self::seconds_to_time_string(stop.scheduled_arrival),
                                 headsign,
                                 stop_sequence: stop.stop_position,
                                 mode,
@@ -350,11 +371,17 @@ impl ScheduleService {
         depart_after: Option<&str>,
         arrive_before: Option<&str>,
         window_minutes: u32,
+        limit: usize,
     ) -> AppResult<Vec<ScheduledTrip>> {
         let gtfs_id = clean_identifier(gtfs_id);
         let origin = clean_identifier(origin_stop_code);
         let destination = clean_identifier(destination_stop_code);
         Self::validate_window(window_minutes)?;
+        Self::validate_limit(limit)?;
+
+        if let Some(d) = _date_str {
+            warn!("date parameter '{}' was provided but date-based filtering is not yet implemented; ignoring", d);
+        }
 
         if origin == destination {
             return Err(AppError::BadRequest(
@@ -408,19 +435,31 @@ impl ScheduleService {
             None => return Ok(results),
         };
 
-        // Build a set of route_codes that visit destination, with their stop index
-        let dest_entries: HashMap<&str, usize> = stop_index
-            .get(destination.as_str())
-            .map(|entries| entries.iter().map(|(rc, idx)| (*rc, *idx)).collect())
-            .unwrap_or_default();
+        // Build route_code → Vec<stop_index> for all destination occurrences per route.
+        // Using a Vec to handle looping trips that visit the destination more than once.
+        let dest_entries: HashMap<&str, Vec<usize>> = {
+            let mut map: HashMap<&str, Vec<usize>> = HashMap::new();
+            if let Some(entries) = stop_index.get(destination.as_str()) {
+                for &(rc, idx) in entries {
+                    map.entry(rc).or_default().push(idx);
+                }
+            }
+            map
+        };
 
         for (route_code, origin_stop_idx) in &origin_entries {
             // O(1) lookup: does this route also visit the destination?
-            if let Some(&dest_stop_idx) = dest_entries.get(route_code) {
-                // Origin must come before destination
-                if *origin_stop_idx >= dest_stop_idx {
-                    continue;
-                }
+            if let Some(dest_stop_indices) = dest_entries.get(route_code) {
+                // Find the first destination occurrence that comes after the origin
+                let dest_stop_idx = match dest_stop_indices
+                    .iter()
+                    .copied()
+                    .filter(|&d| d > *origin_stop_idx)
+                    .min()
+                {
+                    Some(idx) => idx,
+                    None => continue, // no destination after this origin
+                };
 
                 let trip = &trip_map[*route_code];
                 let dep_secs = trip.stops[*origin_stop_idx].scheduled_departure;
@@ -440,8 +479,7 @@ impl ScheduleService {
                     }
                 }
 
-                let (short_name, mode) =
-                    self.lookup_route_info(&data, &gtfs_id, route_code);
+                let (short_name, mode) = self.lookup_route_info(&data, &gtfs_id, route_code);
 
                 results.push(ScheduledTrip {
                     trip_id: trip.trip_id.clone(),
@@ -459,8 +497,9 @@ impl ScheduleService {
             }
         }
 
-        // Sort by departure time
+        // Sort by departure time and cap at limit
         results.sort_by(|a, b| a.departure_time.cmp(&b.departure_time));
+        results.truncate(limit);
         Ok(results)
     }
 
@@ -475,6 +514,11 @@ impl ScheduleService {
     ) -> AppResult<Vec<ScheduledDeparture>> {
         let gtfs_id = clean_identifier(gtfs_id);
         let stop_code = clean_identifier(stop_code);
+        Self::validate_limit(limit)?;
+
+        if let Some(d) = _date_str {
+            warn!("date parameter '{}' was provided but date-based filtering is not yet implemented; ignoring", d);
+        }
 
         let start_secs = match time_str {
             Some(t) => Self::parse_time_to_seconds(t)?,
@@ -489,6 +533,7 @@ impl ScheduleService {
         // Single lock acquisition — build index and query from same data snapshot
         let data = self.gtfs_service.data().read().await;
         Self::validate_gtfs_loaded(&data, &gtfs_id)?;
+        Self::validate_stop_code(&data, &gtfs_id, &stop_code)?;
         let dep_index = Self::build_departure_index_from(&data, &gtfs_id)?;
         let trip_map = data
             .route_example_trip_details_by_gtfs
@@ -521,19 +566,14 @@ impl ScheduleService {
                             }
                         }
 
-                        let headsign = stop
-                            .headsign
-                            .as_str()
-                            .map(|s| s.to_string());
+                        let headsign = stop.headsign.as_str().map(|s| s.to_string());
                         results.push(ScheduledDeparture {
                             trip_id: trip.trip_id.clone(),
                             route_id: route_code.clone(),
                             route_short_name: short_name,
                             stop_code: stop.stop_code.clone(),
                             stop_name: stop.stop_name.clone(),
-                            departure_time: Self::seconds_to_time_string(
-                                stop.scheduled_departure,
-                            ),
+                            departure_time: Self::seconds_to_time_string(stop.scheduled_departure),
                             headsign,
                             stop_sequence: stop.stop_position,
                             mode,
@@ -608,9 +648,7 @@ impl ScheduleService {
             .get(gtfs_id.as_str())
             .map(|s| s.stops.keys().cloned().collect())
             .unwrap_or_default();
-        let orphaned_stops = all_stop_codes
-            .difference(&stops_in_trips)
-            .count();
+        let orphaned_stops = all_stop_codes.difference(&stops_in_trips).count();
         let stops_without_departures = total_stops.saturating_sub(stops_with_departures);
 
         let data_hash = data.data_hash.get(gtfs_id.as_str()).cloned();
@@ -680,9 +718,9 @@ mod tests {
         let trip1 = TripDetails {
             trip_id: "trip_1".to_string(),
             stops: vec![
-                make_stop(STOP_A, "Stop A Station", 28800, 28800, 1),   // 08:00:00
-                make_stop(STOP_B, "Stop B Station", 29700, 29700, 2),   // 08:15:00
-                make_stop(STOP_C, "Stop C Station", 30600, 30600, 3),   // 08:30:00
+                make_stop(STOP_A, "Stop A Station", 28800, 28800, 1), // 08:00:00
+                make_stop(STOP_B, "Stop B Station", 29700, 29700, 2), // 08:15:00
+                make_stop(STOP_C, "Stop C Station", 30600, 30600, 3), // 08:30:00
             ],
         };
 
@@ -690,9 +728,9 @@ mod tests {
         let trip2 = TripDetails {
             trip_id: "trip_2".to_string(),
             stops: vec![
-                make_stop(STOP_B, "Stop B Station", 32400, 32400, 1),   // 09:00:00
-                make_stop(STOP_C, "Stop C Station", 33600, 33600, 2),   // 09:20:00
-                make_stop(STOP_D, "Stop D Station", 34800, 34800, 3),   // 09:40:00
+                make_stop(STOP_B, "Stop B Station", 32400, 32400, 1), // 09:00:00
+                make_stop(STOP_C, "Stop C Station", 33600, 33600, 2), // 09:20:00
+                make_stop(STOP_D, "Stop D Station", 34800, 34800, 3), // 09:40:00
             ],
         };
 
@@ -760,10 +798,8 @@ mod tests {
                 },
             );
         }
-        data.stops_by_gtfs.insert(
-            TEST_GTFS_ID.to_string(),
-            GTFSStopData { stops: stop_map },
-        );
+        data.stops_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), GTFSStopData { stops: stop_map });
 
         data.data_hash
             .insert(TEST_GTFS_ID.to_string(), "abc123hash".to_string());
@@ -780,12 +816,18 @@ mod tests {
 
     #[test]
     fn test_parse_time_valid() {
-        assert_eq!(ScheduleService::parse_time_to_seconds("08:30:00").unwrap(), 30600);
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("08:30:00").unwrap(),
+            30600
+        );
     }
 
     #[test]
     fn test_parse_time_midnight() {
-        assert_eq!(ScheduleService::parse_time_to_seconds("00:00:00").unwrap(), 0);
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("00:00:00").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -799,7 +841,10 @@ mod tests {
     #[test]
     fn test_parse_time_short_format_accepted() {
         // HH:MM format should be accepted (defaults seconds to 0)
-        assert_eq!(ScheduleService::parse_time_to_seconds("8:30").unwrap(), 30600);
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("8:30").unwrap(),
+            30600
+        );
     }
 
     #[test]
@@ -829,12 +874,11 @@ mod tests {
     #[tokio::test]
     async fn test_departures_stop_not_in_any_trip() {
         let svc = create_schedule_service(build_test_data());
-        // UNKNOWN_STOP does not appear in any trip – should return empty.
-        let results = svc
+        // UNKNOWN_STOP does not exist in stop data – should return NotFound.
+        let result = svc
             .get_departures_at_stop(TEST_GTFS_ID, "UNKNOWN_STOP", Some("08:00:00"), None, 60, 10)
-            .await
-            .unwrap();
-        assert!(results.is_empty());
+            .await;
+        assert!(matches!(result, Err(AppError::NotFound(_))));
     }
 
     #[tokio::test]
@@ -919,11 +963,10 @@ mod tests {
     #[tokio::test]
     async fn test_arrivals_invalid_stop() {
         let svc = create_schedule_service(build_test_data());
-        let results = svc
+        let result = svc
             .get_arrivals_at_stop(TEST_GTFS_ID, "NO_SUCH_STOP", Some("08:00:00"), None, 60, 10)
-            .await
-            .unwrap();
-        assert!(results.is_empty());
+            .await;
+        assert!(matches!(result, Err(AppError::NotFound(_))));
     }
 
     #[tokio::test]
@@ -974,9 +1017,7 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
         // ROUTE_1 goes A -> B -> C. Querying A -> C should find it.
         let results = svc
-            .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 120,
-            )
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 120, 50)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -993,9 +1034,7 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
         // STOP_A -> STOP_D: no single route covers this.
         let results = svc
-            .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_D, None, None, None, 120,
-            )
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_D, None, None, None, 120, 50)
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1006,9 +1045,7 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
         // C -> A is reverse direction on ROUTE_1. Should yield no results.
         let results = svc
-            .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_C, STOP_A, None, None, None, 120,
-            )
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_C, STOP_A, None, None, None, 120, 50)
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1027,6 +1064,7 @@ mod tests {
                 Some("09:00:00"),
                 None,
                 60,
+                50,
             )
             .await
             .unwrap();
@@ -1046,6 +1084,7 @@ mod tests {
                 Some("07:30:00"),
                 None,
                 60,
+                50,
             )
             .await
             .unwrap();
@@ -1066,6 +1105,7 @@ mod tests {
                 None,
                 Some("08:00:00"),
                 60,
+                50,
             )
             .await
             .unwrap();
@@ -1085,6 +1125,7 @@ mod tests {
                 None,
                 Some("09:00:00"),
                 60,
+                50,
             )
             .await
             .unwrap();
@@ -1095,7 +1136,7 @@ mod tests {
     async fn test_trips_between_invalid_gtfs_id() {
         let svc = create_schedule_service(build_test_data());
         let result = svc
-            .get_trips_between_stops("bad_gtfs", STOP_A, STOP_C, None, None, None, 120)
+            .get_trips_between_stops("bad_gtfs", STOP_A, STOP_C, None, None, None, 120, 50)
             .await;
         assert!(result.is_err());
     }
@@ -1105,9 +1146,7 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
         // B -> C appears on both ROUTE_1 and ROUTE_2.
         let results = svc
-            .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_B, STOP_C, None, None, None, 120,
-            )
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_B, STOP_C, None, None, None, 120, 50)
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -1354,9 +1393,7 @@ mod tests {
     async fn test_trip_response_fields() {
         let svc = create_schedule_service(build_test_data());
         let results = svc
-            .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_B, None, None, None, 120,
-            )
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_B, None, None, None, 120, 50)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1379,15 +1416,27 @@ mod tests {
 
     #[test]
     fn test_parse_time_end_of_day_boundary() {
-        assert_eq!(ScheduleService::parse_time_to_seconds("23:59:59").unwrap(), 86399);
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("23:59:59").unwrap(),
+            86399
+        );
     }
 
     #[test]
     fn test_parse_time_gtfs_over_24h_preserves() {
         // GTFS allows times > 24h for next-day trips. Parser now preserves raw seconds.
-        assert_eq!(ScheduleService::parse_time_to_seconds("25:30:00").unwrap(), 91800); // 25*3600+30*60
-        assert_eq!(ScheduleService::parse_time_to_seconds("24:00:00").unwrap(), 86400);
-        assert_eq!(ScheduleService::parse_time_to_seconds("26:15:30").unwrap(), 94530); // 26*3600+15*60+30
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("25:30:00").unwrap(),
+            91800
+        ); // 25*3600+30*60
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("24:00:00").unwrap(),
+            86400
+        );
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("26:15:30").unwrap(),
+            94530
+        ); // 26*3600+15*60+30
     }
 
     #[test]
@@ -1400,7 +1449,10 @@ mod tests {
         assert!(ScheduleService::parse_time_to_seconds("not-a-time").is_err());
         assert!(ScheduleService::parse_time_to_seconds("12:AB:00").is_err());
         // Note: "08:30" (HH:MM) is accepted by our parser — seconds default to 0
-        assert_eq!(ScheduleService::parse_time_to_seconds("08:30").unwrap(), 30600);
+        assert_eq!(
+            ScheduleService::parse_time_to_seconds("08:30").unwrap(),
+            30600
+        );
     }
 
     #[test]
@@ -1448,7 +1500,11 @@ mod tests {
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("23:50:00"), None, 20, 10)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1, "23:59 departure should be within 20-min window from 23:50");
+        assert_eq!(
+            results.len(),
+            1,
+            "23:59 departure should be within 20-min window from 23:50"
+        );
     }
 
     #[tokio::test]
@@ -1489,7 +1545,10 @@ mod tests {
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 10)
             .await
             .unwrap();
-        assert!(results.is_empty(), "Empty trip map should yield empty results");
+        assert!(
+            results.is_empty(),
+            "Empty trip map should yield empty results"
+        );
     }
 
     #[tokio::test]
@@ -1529,14 +1588,12 @@ mod tests {
                 },
             );
         }
-        data.stops_by_gtfs.insert(
-            TEST_GTFS_ID.to_string(),
-            GTFSStopData { stops: stop_map },
-        );
+        data.stops_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), GTFSStopData { stops: stop_map });
         let svc = create_schedule_service(data);
 
         let results = svc
-            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_B, None, None, None, 60)
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_B, None, None, None, 60, 50)
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1575,7 +1632,10 @@ mod tests {
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 480, 100)
             .await
             .unwrap();
-        assert!(results.is_empty(), "Trip with no stops should produce no departures");
+        assert!(
+            results.is_empty(),
+            "Trip with no stops should produce no departures"
+        );
     }
 
     #[tokio::test]
@@ -1609,7 +1669,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].headsign.is_none(), "Null JSON headsign should yield None");
+        assert!(
+            results[0].headsign.is_none(),
+            "Null JSON headsign should yield None"
+        );
     }
 
     #[tokio::test]
@@ -1643,7 +1706,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].headsign.is_none(), "Non-string JSON headsign should yield None");
+        assert!(
+            results[0].headsign.is_none(),
+            "Non-string JSON headsign should yield None"
+        );
     }
 
     // ── Large window / limit edge cases ────────────────────────────────
@@ -1663,22 +1729,26 @@ mod tests {
     async fn test_departures_limit_zero() {
         let svc = create_schedule_service(build_test_data());
 
-        let results = svc
+        let result = svc
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 0)
-            .await
-            .unwrap();
-        assert!(results.is_empty(), "Limit 0 should return empty results");
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "Limit 0 should be rejected"
+        );
     }
 
     #[tokio::test]
     async fn test_departures_limit_very_large() {
         let svc = create_schedule_service(build_test_data());
 
-        let results = svc
+        let result = svc
             .get_departures_at_stop(TEST_GTFS_ID, STOP_B, Some("00:00:00"), None, 480, 10000)
-            .await
-            .unwrap();
-        assert!(results.len() <= 2, "Large limit should not panic");
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "Limit exceeding max should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -1689,7 +1759,11 @@ mod tests {
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 0, 10)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1, "Exact time match with zero window should return the departure");
+        assert_eq!(
+            results.len(),
+            1,
+            "Exact time match with zero window should return the departure"
+        );
     }
 
     #[tokio::test]
@@ -1710,9 +1784,12 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
 
         let result = svc
-            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_A, None, None, None, 120)
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_A, None, None, None, 120, 50)
             .await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))), "Same origin and destination should be rejected");
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "Same origin and destination should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -1720,10 +1797,13 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
 
         let results = svc
-            .get_trips_between_stops(TEST_GTFS_ID, STOP_C, STOP_A, None, None, None, 120)
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_C, STOP_A, None, None, None, 120, 50)
             .await
             .unwrap();
-        assert!(results.is_empty(), "Origin after destination in trip => excluded");
+        assert!(
+            results.is_empty(),
+            "Origin after destination in trip => excluded"
+        );
     }
 
     #[tokio::test]
@@ -1732,7 +1812,14 @@ mod tests {
 
         let result = svc
             .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_C, None, Some("bad_time"), None, 60,
+                TEST_GTFS_ID,
+                STOP_A,
+                STOP_C,
+                None,
+                Some("bad_time"),
+                None,
+                60,
+                50,
             )
             .await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
@@ -1744,7 +1831,14 @@ mod tests {
 
         let result = svc
             .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_C, None, None, Some("99:99:99"), 60,
+                TEST_GTFS_ID,
+                STOP_A,
+                STOP_C,
+                None,
+                None,
+                Some("99:99:99"),
+                60,
+                50,
             )
             .await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
@@ -1756,8 +1850,14 @@ mod tests {
 
         let results = svc
             .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_C, None,
-                Some("07:50:00"), Some("08:35:00"), 60,
+                TEST_GTFS_ID,
+                STOP_A,
+                STOP_C,
+                None,
+                Some("07:50:00"),
+                Some("08:35:00"),
+                60,
+                50,
             )
             .await
             .unwrap();
@@ -1770,12 +1870,21 @@ mod tests {
 
         let results = svc
             .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_C, None,
-                Some("10:00:00"), Some("07:00:00"), 60,
+                TEST_GTFS_ID,
+                STOP_A,
+                STOP_C,
+                None,
+                Some("10:00:00"),
+                Some("07:00:00"),
+                60,
+                50,
             )
             .await
             .unwrap();
-        assert!(results.is_empty(), "Conflicting time constraints should yield no results");
+        assert!(
+            results.is_empty(),
+            "Conflicting time constraints should yield no results"
+        );
     }
 
     // ── Next services additional edge cases ────────────────────────────
@@ -1795,11 +1904,13 @@ mod tests {
     async fn test_next_services_limit_zero() {
         let svc = create_schedule_service(build_test_data());
 
-        let results = svc
+        let result = svc
             .get_next_services(TEST_GTFS_ID, STOP_B, None, Some("08:00:00"), None, 0)
-            .await
-            .unwrap();
-        assert!(results.is_empty(), "Limit 0 should return empty");
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "Limit 0 should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -1821,7 +1932,11 @@ mod tests {
             .get_next_services(TEST_GTFS_ID, STOP_A, None, Some("08:00:00"), None, 10)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1, "Without mode filter, missing route info is fine");
+        assert_eq!(
+            results.len(),
+            1,
+            "Without mode filter, missing route info is fine"
+        );
         assert!(results[0].mode.is_none());
     }
 
@@ -1842,10 +1957,20 @@ mod tests {
 
         let modes = vec!["BUS".to_string()];
         let results = svc
-            .get_next_services(TEST_GTFS_ID, STOP_A, None, Some("08:00:00"), Some(&modes), 10)
+            .get_next_services(
+                TEST_GTFS_ID,
+                STOP_A,
+                None,
+                Some("08:00:00"),
+                Some(&modes),
+                10,
+            )
             .await
             .unwrap();
-        assert!(results.is_empty(), "No mode info => excluded when filter is set");
+        assert!(
+            results.is_empty(),
+            "No mode info => excluded when filter is set"
+        );
     }
 
     // ── Unicode / special characters in stop codes ─────────────────────
@@ -1891,7 +2016,13 @@ mod tests {
             "R_SPACE".to_string(),
             TripDetails {
                 trip_id: "trip_space".to_string(),
-                stops: vec![make_stop("STOP WITH SPACES", "Spacey Stop", 36000, 36060, 1)],
+                stops: vec![make_stop(
+                    "STOP WITH SPACES",
+                    "Spacey Stop",
+                    36000,
+                    36060,
+                    1,
+                )],
             },
         );
         let mut data = GTFSData::new();
@@ -1900,7 +2031,14 @@ mod tests {
         let svc = create_schedule_service(data);
 
         let results = svc
-            .get_departures_at_stop(TEST_GTFS_ID, "STOP WITH SPACES", Some("10:00:00"), None, 10, 10)
+            .get_departures_at_stop(
+                TEST_GTFS_ID,
+                "STOP WITH SPACES",
+                Some("10:00:00"),
+                None,
+                10,
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1914,11 +2052,20 @@ mod tests {
 
         let results = svc
             .get_departures_at_stop(
-                "some_prefix%3Atest_gtfs", STOP_A, Some("08:00:00"), None, 60, 10,
+                "some_prefix%3Atest_gtfs",
+                STOP_A,
+                Some("08:00:00"),
+                None,
+                60,
+                10,
             )
             .await
             .unwrap();
-        assert_eq!(results.len(), 1, "URL-encoded prefix should be decoded and stripped");
+        assert_eq!(
+            results.len(),
+            1,
+            "URL-encoded prefix should be decoded and stripped"
+        );
     }
 
     #[tokio::test]
@@ -1972,15 +2119,8 @@ mod tests {
             let svc = svc.clone();
             let stop = if i % 2 == 0 { STOP_A } else { STOP_B };
             handles.push(tokio::spawn(async move {
-                svc.get_departures_at_stop(
-                    TEST_GTFS_ID,
-                    stop,
-                    Some("08:00:00"),
-                    None,
-                    60,
-                    10,
-                )
-                .await
+                svc.get_departures_at_stop(TEST_GTFS_ID, stop, Some("08:00:00"), None, 60, 10)
+                    .await
             }));
         }
 
@@ -2002,7 +2142,7 @@ mod tests {
         let (r1, r2, r3, r4) = tokio::join!(
             s1.get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 10),
             s2.get_arrivals_at_stop(TEST_GTFS_ID, STOP_B, Some("08:00:00"), None, 60, 10),
-            s3.get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 120),
+            s3.get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 120, 50),
             s4.get_next_services(TEST_GTFS_ID, STOP_B, None, Some("08:00:00"), None, 10),
         );
 
@@ -2041,7 +2181,7 @@ mod tests {
             .insert(TEST_GTFS_ID.to_string(), trip_map);
         // Add stop data for origin and destination so validation passes
         let mut stop_map = HashMap::new();
-        for i in [0, 499] {
+        for i in [0, 250, 499] {
             let code = format!("S{:04}", i);
             stop_map.insert(
                 code.clone(),
@@ -2058,14 +2198,12 @@ mod tests {
                 },
             );
         }
-        data.stops_by_gtfs.insert(
-            TEST_GTFS_ID.to_string(),
-            GTFSStopData { stops: stop_map },
-        );
+        data.stops_by_gtfs
+            .insert(TEST_GTFS_ID.to_string(), GTFSStopData { stops: stop_map });
         let svc = create_schedule_service(data);
 
         let results = svc
-            .get_trips_between_stops(TEST_GTFS_ID, "S0000", "S0499", None, None, None, 480)
+            .get_trips_between_stops(TEST_GTFS_ID, "S0000", "S0499", None, None, None, 480, 50)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -2101,7 +2239,10 @@ mod tests {
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 60, 5)
             .await
             .unwrap();
-        assert!(results.len() <= 5, "Limit should truncate results from 100 routes to 5");
+        assert!(
+            results.len() <= 5,
+            "Limit should truncate results from 100 routes to 5"
+        );
     }
 
     // ── Quality report additional edge cases ───────────────────────────
@@ -2198,9 +2339,7 @@ mod tests {
         let svc = create_schedule_service(build_test_data());
 
         let result = svc
-            .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 600,
-            )
+            .get_trips_between_stops(TEST_GTFS_ID, STOP_A, STOP_C, None, None, None, 600, 50)
             .await;
         assert!(matches!(result, Err(AppError::TimeRangeTooWide(_))));
     }
@@ -2211,7 +2350,14 @@ mod tests {
 
         let result = svc
             .get_trips_between_stops(
-                TEST_GTFS_ID, "NONEXISTENT", STOP_C, None, None, None, 120,
+                TEST_GTFS_ID,
+                "NONEXISTENT",
+                STOP_C,
+                None,
+                None,
+                None,
+                120,
+                50,
             )
             .await;
         assert!(
@@ -2226,7 +2372,14 @@ mod tests {
 
         let result = svc
             .get_trips_between_stops(
-                TEST_GTFS_ID, STOP_A, "NONEXISTENT", None, None, None, 120,
+                TEST_GTFS_ID,
+                STOP_A,
+                "NONEXISTENT",
+                None,
+                None,
+                None,
+                120,
+                50,
             )
             .await;
         assert!(
@@ -2269,7 +2422,10 @@ mod tests {
         let result = svc
             .get_departures_at_stop(TEST_GTFS_ID, STOP_A, Some("08:00:00"), None, 480, 10)
             .await;
-        assert!(result.is_ok(), "Exactly MAX_QUERY_WINDOW_MINUTES should be allowed");
+        assert!(
+            result.is_ok(),
+            "Exactly MAX_QUERY_WINDOW_MINUTES should be allowed"
+        );
     }
 
     #[tokio::test]
