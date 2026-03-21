@@ -50,6 +50,9 @@ pub struct GTFSService {
     http_client: reqwest::Client,
     is_ready: Arc<RwLock<bool>>,
     last_update: Arc<RwLock<DateTime<Utc>>>,
+    /// SHA256 hash of the raw route list from OTP, used for lightweight
+    /// change detection before performing expensive full data fetches.
+    route_list_hash: Arc<RwLock<String>>,
 }
 
 impl GTFSService {
@@ -70,6 +73,7 @@ impl GTFSService {
             http_client,
             is_ready: Arc::new(RwLock::new(false)),
             last_update: Arc::new(RwLock::new(Utc::now())),
+            route_list_hash: Arc::new(RwLock::new(String::new())),
         };
 
         service.load_initial_data().await?;
@@ -981,31 +985,41 @@ impl GTFSService {
     async fn update_data(&self) -> AppResult<()> {
         info!("Checking for GTFS data updates...");
         let start_time = std::time::Instant::now();
+
+        // Lightweight pre-check: fetch only routes from each OTP instance and
+        // compare hashes BEFORE doing the expensive full fetch (patterns, stops,
+        // CSVs, etc.). This avoids hundreds of HTTP requests when nothing changed.
+        if !self.has_upstream_changes().await? {
+            let duration = start_time.elapsed();
+            info!(
+                "No upstream changes detected via lightweight route check in {:?}. Skipping full fetch.",
+                duration
+            );
+            return Ok(());
+        }
+
+        info!("Upstream changes detected, performing full data fetch...");
         match self.fetch_and_process_data().await {
             Ok(new_data) => {
-                if self.check_for_changes(&new_data).await? {
-                    info!("Changes detected, performing atomic update...");
+                info!("Full fetch complete, updating data...");
 
-                    // Hold write lock for the entire update process
-                    // This blocks ALL read operations during the update
-                    let mut data = self.data.write().await;
-                    *data = new_data; // Atomic replacement of entire GTFSData structure
+                // Hold write lock for the entire update process
+                // This blocks ALL read operations during the update
+                let mut data = self.data.write().await;
+                *data = new_data; // Atomic replacement of entire GTFSData structure
 
-                    // Update metadata while still holding the write lock
-                    let mut last_update = self.last_update.write().await;
-                    *last_update = Utc::now();
-                    let duration = start_time.elapsed();
-                    info!("Data updated atomically in {:?}", duration);
+                // Update metadata while still holding the write lock
+                let mut last_update = self.last_update.write().await;
+                *last_update = Utc::now();
+                let duration = start_time.elapsed();
+                info!("Data updated atomically in {:?}", duration);
 
-                    let mut is_ready = self.is_ready.write().await;
-                    if !*is_ready {
-                        *is_ready = true;
-                        info!("Service is now ready.");
-                    }
-                    // Write lock is released here - now reads can proceed with new data
-                } else {
-                    info!("No changes in GTFS data detected. Skipping update.");
+                let mut is_ready = self.is_ready.write().await;
+                if !*is_ready {
+                    *is_ready = true;
+                    info!("Service is now ready.");
                 }
+                // Write lock is released here - now reads can proceed with new data
                 Ok(())
             }
             Err(e) => {
@@ -1015,22 +1029,44 @@ impl GTFSService {
         }
     }
 
-    async fn check_for_changes(&self, new_data: &GTFSData) -> AppResult<bool> {
-        let current_data = self.data.read().await;
-        if new_data.data_hash.len() != current_data.data_hash.len() {
-            return Ok(true);
+    /// Lightweight change detection: fetch only the route list from each OTP
+    /// instance and compute a hash. Compare with the current data hash.
+    /// Returns true if changes are detected and a full fetch is needed.
+    async fn has_upstream_changes(&self) -> AppResult<bool> {
+        let mut all_routes: Vec<NandiRoutesRes> = Vec::new();
+        let mut already_visited: HashSet<String> = HashSet::new();
+
+        for otp_instance in self.config.otp_instances.get_all_instances() {
+            let base_url = &otp_instance.url;
+            if !already_visited.insert(base_url.to_string()) {
+                continue;
+            }
+            all_routes.extend(self.fetch_routes(base_url).await?);
         }
 
-        for (gtfs_id, new_hash) in &new_data.data_hash {
-            if let Some(current_hash) = current_data.data_hash.get(gtfs_id) {
-                if new_hash != current_hash {
-                    return Ok(true);
-                }
-            } else {
-                return Ok(true); // New GTFS ID found
-            }
+        // Compute a hash of the raw route data (same field used for change detection)
+        let raw_hash = {
+            let btree_map: BTreeMap<_, _> = all_routes
+                .iter()
+                .map(|r| (&r.id, r))
+                .collect();
+            let json = serde_json::to_string(&btree_map).unwrap_or_default();
+            let mut hasher = Sha256::new();
+            hasher.update(json.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        // Compare with stored lightweight hash
+        let current_hash = self.route_list_hash.read().await;
+        if *current_hash == raw_hash {
+            return Ok(false);
         }
-        Ok(false)
+        drop(current_hash);
+
+        // Update the stored hash
+        let mut hash = self.route_list_hash.write().await;
+        *hash = raw_hash;
+        Ok(true)
     }
 
     fn compute_data_hash(&self, data: &HashMap<String, NandiRoutesRes>) -> String {
