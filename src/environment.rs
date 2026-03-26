@@ -5,9 +5,10 @@ use serde_json;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::sync::RwLock;
 
 use crate::services::{
     chalo_vehicle_cache::ChaloVehicleCache,
@@ -141,6 +142,7 @@ pub struct AppState {
     pub conductor_details: Arc<HashMap<String, crate::models::MinimalEmployee>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
+    pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
 }
 
 impl AppState {
@@ -320,6 +322,7 @@ impl AppState {
             conductor_details,
             depot_manager_details,
             fleet_tag_list: Arc::new(Self::load_fleet_tag_list().await?),
+            chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Ok(app_state)

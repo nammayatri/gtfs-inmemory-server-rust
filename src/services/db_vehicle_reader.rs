@@ -13,6 +13,14 @@ use crate::models::{
 };
 use crate::tools::error::{AppError, AppResult};
 
+/// GTFS feeds whose vehicle data comes from the CHALO external API cache.
+/// Keep this as the single source of truth for CHALO-backed feeds.
+pub const CHALO_GTFS_IDS: [&str; 2] = ["bhubaneshwar_bus", "sambalpur_bus"];
+
+pub fn is_chalo_gtfs_id(gtfs_id: &str) -> bool {
+    CHALO_GTFS_IDS.contains(&gtfs_id)
+}
+
 // Depot cache structure
 struct DepotCache {
     depot_names: Option<(Vec<String>, SystemTime)>,

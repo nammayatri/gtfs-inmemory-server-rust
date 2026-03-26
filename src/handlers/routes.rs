@@ -12,14 +12,16 @@ use serde_json::{json, Value};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{error, info};
 
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
     BusScheduleDetails, GTFSStop, NandiRoutesRes, RouteStopMapping,
-    StopCodeFromProviderStopCodeResponse, VehicleServiceTypeResponse,
+    StopCodeFromProviderStopCodeResponse, VehicleMetadataResponse, VehicleServiceTypeResponse,
 };
+use crate::services::db_vehicle_reader::{is_chalo_gtfs_id, CHALO_GTFS_IDS};
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
 use crate::{
@@ -180,6 +182,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/vehicle/{gtfs_id}/service-type/{vehicle_no}",
                 actix_web::web::get().to(get_service_type_by_vehicle_by_gtfs_id),
+            )
+            .route(
+                "/vehicle/{gtfs_id}/metadata/{vehicle_no}",
+                actix_web::web::get().to(get_vehicle_metadata_by_gtfs_id),
             )
             .route(
                 "/vehicle/{gtfs_id}/{vehicle_no}/info",
@@ -724,6 +730,144 @@ async fn get_service_type_by_vehicle_by_gtfs_id(
     .await
 }
 
+async fn get_vehicle_metadata_by_gtfs_id(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, path_vehicle) = path.into_inner();
+    let gtfs_id = gtfs_id.replace("\"", "");
+    let path_vehicle = path_vehicle.replace("\"", "");
+
+    // Support short_name -> vehicle_no mapping (same behavior as /service-type)
+    let vehicle_no = app_state
+        .bus_registration_mapping
+        .get(&gtfs_id)
+        .and_then(|m| m.get(&path_vehicle))
+        .cloned()
+        .unwrap_or(path_vehicle);
+
+    let vehicle_tag_number = app_state
+        .fleet_tag_list
+        .get(&gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(&vehicle_no))
+        .cloned();
+
+    let service_sub_types = app_state
+        .vehicle_service_sub_types
+        .get(&gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(&vehicle_no))
+        .cloned();
+
+    let service_type = get_vehicle_service_type_with_optional_chennai_cache(
+        app_state.as_ref(),
+        &gtfs_id,
+        &vehicle_no,
+    )
+    .await?;
+
+    Ok(HttpResponse::Ok().json(VehicleMetadataResponse {
+        service_type,
+        service_sub_types,
+        bus_tag_number: vehicle_tag_number,
+    }))
+}
+
+async fn get_vehicle_service_type_with_optional_chennai_cache(
+    app_state: &AppState,
+    gtfs_id: &str,
+    vehicle_no: &str,
+) -> AppResult<Option<String>> {
+    if gtfs_id != "chennai_bus" {
+        return fetch_vehicle_service_type(app_state, gtfs_id, vehicle_no).await;
+    }
+
+    let now = Instant::now();
+    {
+        let cache = app_state.chennai_service_type_cache.read().await;
+        if let Some((expires_at, cached)) = cache.get(vehicle_no) {
+            if *expires_at > now {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    {
+        let mut cache = app_state.chennai_service_type_cache.write().await;
+        if let Some((expires_at, _)) = cache.get(vehicle_no) {
+            if *expires_at <= now {
+                cache.remove(vehicle_no);
+            }
+        }
+    }
+    let computed = fetch_vehicle_service_type(app_state, gtfs_id, vehicle_no).await?;
+    if computed.is_some() {
+        let mut cache = app_state.chennai_service_type_cache.write().await;
+        cache.insert(
+            vehicle_no.to_string(),
+            (now + Duration::from_secs(60 * 60), computed.clone()),
+        );
+    }
+    Ok(computed)
+}
+
+async fn fetch_vehicle_service_type(
+    app_state: &AppState,
+    gtfs_id: &str,
+    vehicle_no: &str,
+) -> AppResult<Option<String>> {
+    // CHALO-based cities: service_type comes from cache (route mapping) with fleet fallback
+    if is_chalo_gtfs_id(gtfs_id) {
+        if let Some(cached) = app_state
+            .chalo_vehicle_cache
+            .get_vehicle_data(gtfs_id, vehicle_no)
+            .await
+        {
+            if cached.service_type.is_some() {
+                return Ok(cached.service_type);
+            }
+            return Ok(app_state
+                .gtfs_service
+                .get_fleet_service_type(gtfs_id, vehicle_no)
+                .await);
+        }
+        return Ok(app_state
+            .gtfs_service
+            .get_fleet_service_type(gtfs_id, vehicle_no)
+            .await);
+    }
+
+    // Internal-table check
+    if app_state
+        .db_vehicle_reader_internal
+        .is_vehicle_in_internal(vehicle_no, gtfs_id)
+        .await
+    {
+        let vehicle_data = app_state
+            .db_vehicle_reader_internal
+            .get_vehicle_data(vehicle_no, gtfs_id, None)
+            .await?;
+        if vehicle_data.service_type.is_some() {
+            return Ok(vehicle_data.service_type);
+        }
+        return Ok(app_state
+            .gtfs_service
+            .get_fleet_service_type(gtfs_id, vehicle_no)
+            .await);
+    }
+
+    // Standard DB path
+    let vehicle_data = app_state
+        .db_vehicle_reader
+        .get_vehicle_data(vehicle_no, None)
+        .await?;
+    if vehicle_data.service_type.is_some() {
+        return Ok(vehicle_data.service_type);
+    }
+    Ok(app_state
+        .gtfs_service
+        .get_fleet_service_type(gtfs_id, vehicle_no)
+        .await)
+}
+
 async fn get_service_type_by_vehicle_impl(
     app_state: Data<AppState>,
     gtfs_id: Option<&str>,
@@ -767,14 +911,13 @@ async fn get_service_type_by_vehicle_impl(
     };
 
     // Check if this is a CHALO-based city and use cache instead of DB
-    let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
     info!(
         "chalo_gtfs_ids: {:?}, gtfs_id: {:?}, contains: {:?}",
-        chalo_gtfs_ids,
+        CHALO_GTFS_IDS,
         gtfs_id,
-        chalo_gtfs_ids.contains(&gtfs_id)
+        is_chalo_gtfs_id(gtfs_id)
     );
-    if chalo_gtfs_ids.contains(&gtfs_id) {
+    if is_chalo_gtfs_id(gtfs_id) {
         info!(
             "Using CHALO vehicle cache for gtfs_id={}, vehicle_no={}",
             gtfs_id, vehicle_no
@@ -1607,8 +1750,7 @@ async fn get_bus_route_schedule(
         return Ok(HttpResponse::Ok().json(schedule_details));
     }
 
-    let chalo_gtfs_ids = ["bhubaneshwar_bus", "sambalpur_bus"];
-    let waybills = if chalo_gtfs_ids.contains(&gtfs_id.as_str()) {
+    let waybills = if is_chalo_gtfs_id(gtfs_id.as_str()) {
         // Get vehicles from cache filtered by route_id
         let cached_vehicles = app_state
             .chalo_vehicle_cache
