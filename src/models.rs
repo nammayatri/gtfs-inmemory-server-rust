@@ -237,6 +237,16 @@ pub struct VehicleServiceTypeResponse {
     pub bus_tag_number: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VehicleMetadataResponse {
+    #[serde(rename = "serviceType")]
+    pub service_type: Option<String>,
+    #[serde(rename = "serviceSubTypes")]
+    pub service_sub_types: Option<Vec<String>>,
+    #[serde(rename = "busTagNumber")]
+    pub bus_tag_number: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WaybillStatus {
     Online,
