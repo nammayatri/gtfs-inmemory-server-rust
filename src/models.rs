@@ -245,6 +245,7 @@ pub struct VehicleMetadataResponse {
     pub service_sub_types: Option<Vec<String>>,
     #[serde(rename = "busTagNumber")]
     pub bus_tag_number: Option<String>,
+    pub is_actually_valid: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

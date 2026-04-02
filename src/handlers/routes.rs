@@ -733,6 +733,7 @@ async fn get_service_type_by_vehicle_by_gtfs_id(
 async fn get_vehicle_metadata_by_gtfs_id(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    params: web::Query<TripQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, path_vehicle) = path.into_inner();
     let gtfs_id = gtfs_id.replace("\"", "");
@@ -765,10 +766,24 @@ async fn get_vehicle_metadata_by_gtfs_id(
     )
     .await?;
 
+    let pass_verify_req = params.pass_verify_req.unwrap_or(false);
+    let mut service_type = service_type;
+    let mut is_actually_valid: Option<bool> = None;
+
+    if pass_verify_req {
+        if service_type.is_some() {
+            is_actually_valid = Some(true);
+        } else {
+            service_type = Some("Ordinary".to_string());
+            is_actually_valid = Some(false);
+        }
+    }
+
     Ok(HttpResponse::Ok().json(VehicleMetadataResponse {
         service_type,
         service_sub_types,
         bus_tag_number: vehicle_tag_number,
+        is_actually_valid,
     }))
 }
 
