@@ -836,18 +836,21 @@ async fn fetch_vehicle_service_type(
             .get_vehicle_data(gtfs_id, vehicle_no)
             .await
         {
-            if cached.service_type.is_some() {
-                return Ok(cached.service_type);
-            }
-            return Ok(app_state
-                .gtfs_service
-                .get_fleet_service_type(gtfs_id, vehicle_no)
-                .await);
+            // Cache hit: return whatever cache contains (even None).
+            return Ok(cached.service_type);
         }
-        return Ok(app_state
+        // Cache miss: use fleet fallback; if still missing, return 404.
+        let fleet = app_state
             .gtfs_service
             .get_fleet_service_type(gtfs_id, vehicle_no)
-            .await);
+            .await;
+        if fleet.is_some() {
+            return Ok(fleet);
+        }
+        return Err(crate::tools::error::AppError::NotFound(format!(
+            "Vehicle {} not found in cache",
+            vehicle_no
+        )));
     }
 
     // Internal-table check
