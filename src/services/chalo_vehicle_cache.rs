@@ -3,8 +3,9 @@ use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use reqwest::Client;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -71,6 +72,51 @@ struct CityConfig {
     api_url: String,
 }
 
+/// Single source of truth for CHALO-backed GTFS feeds (city metadata + external API URL).
+#[derive(Debug, Clone, Copy)]
+pub struct ChaloCityDef {
+    pub city_name: &'static str,
+    pub gtfs_id: &'static str,
+    pub api_url: &'static str,
+}
+
+pub const CHALO_CITY_DEFS: [ChaloCityDef; 2] = [
+    ChaloCityDef {
+        city_name: "bhubaneswar",
+        gtfs_id: "bhubaneshwar_bus",
+        api_url: "https://external.chalo.com/dashboard/operator-app/bhubaneswar/crut/liveTripsData?mode=bus",
+    },
+    ChaloCityDef {
+        city_name: "sambalpur",
+        gtfs_id: "sambalpur_bus",
+        api_url: "https://external.chalo.com/dashboard/operator-app/sambalpur/crut/liveTripsData?mode=bus",
+    },
+];
+
+/// Membership for [`CHALO_CITY_DEFS`], built once per process. The set only changes with a deploy
+/// (same as edits to [`CHALO_CITY_DEFS`]), so no runtime invalidation.
+static CHALO_GTFS_ID_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    CHALO_CITY_DEFS.iter().map(|c| c.gtfs_id).collect()
+});
+
+/// Same order as [`CHALO_CITY_DEFS`]; built once per process (see [`CHALO_GTFS_ID_SET`]).
+static CHALO_GTFS_IDS_SLICE: Lazy<Box<[&'static str]>> = Lazy::new(|| {
+    CHALO_CITY_DEFS
+        .iter()
+        .map(|c| c.gtfs_id)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+});
+
+pub fn is_chalo_gtfs_id(gtfs_id: &str) -> bool {
+    CHALO_GTFS_ID_SET.contains(gtfs_id)
+}
+
+/// GTFS IDs backed by CHALO — derived from [`CHALO_CITY_DEFS`], cached for process lifetime.
+pub fn chalo_gtfs_ids() -> &'static [&'static str] {
+    Lazy::force(&CHALO_GTFS_IDS_SLICE).as_ref()
+}
+
 pub struct ChaloVehicleCache {
     http_client: Client,
     // Cache structure: HashMap<gtfs_id, HashMap<vehicle_no, CachedVehicleData>>
@@ -90,19 +136,14 @@ impl ChaloVehicleCache {
 
         let cache = Arc::new(RwLock::new(HashMap::new()));
 
-        // Configure CHALO-based cities
-        let city_configs = vec![
-            CityConfig {
-                city_name: "bhubaneswar".to_string(),
-                gtfs_id: "bhubaneshwar_bus".to_string(),
-                api_url: "https://external.chalo.com/dashboard/operator-app/bhubaneswar/crut/liveTripsData?mode=bus".to_string(),
-            },
-            CityConfig {
-                city_name: "sambalpur".to_string(),
-                gtfs_id: "sambalpur_bus".to_string(),
-                api_url: "https://external.chalo.com/dashboard/operator-app/sambalpur/crut/liveTripsData?mode=bus".to_string(),
-            },
-        ];
+        let city_configs = CHALO_CITY_DEFS
+            .iter()
+            .map(|def| CityConfig {
+                city_name: def.city_name.to_string(),
+                gtfs_id: def.gtfs_id.to_string(),
+                api_url: def.api_url.to_string(),
+            })
+            .collect();
 
         Ok(Self {
             http_client,
