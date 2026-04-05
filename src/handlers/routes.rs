@@ -21,7 +21,7 @@ use crate::models::{
     BusScheduleDetails, GTFSStop, NandiRoutesRes, RouteStopMapping,
     StopCodeFromProviderStopCodeResponse, VehicleMetadataResponse, VehicleServiceTypeResponse,
 };
-use crate::services::db_vehicle_reader::{is_chalo_gtfs_id, CHALO_GTFS_IDS};
+use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
 use crate::{
@@ -931,7 +931,7 @@ async fn get_service_type_by_vehicle_impl(
     // Check if this is a CHALO-based city and use cache instead of DB
     info!(
         "chalo_gtfs_ids: {:?}, gtfs_id: {:?}, contains: {:?}",
-        CHALO_GTFS_IDS,
+        chalo_gtfs_ids(),
         gtfs_id,
         is_chalo_gtfs_id(gtfs_id)
     );
