@@ -129,6 +129,7 @@ pub struct VehicleData {
     pub start_time_epoch: Option<String>,
     #[sqlx(default)]
     pub trip_number: Option<i32>,
+    pub is_active_trip: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -696,6 +697,8 @@ pub struct BusScheduleDetail {
     pub trip_number: Option<i32>,
     #[serde(rename = "waybill_no")]
     pub waybill_no: Option<String>,
+    #[serde(rename = "is_active_trip", skip_serializing_if = "Option::is_none")]
+    pub is_active_trip: Option<bool>,
 }
 
 pub type BusScheduleDetails = Vec<BusScheduleDetail>;

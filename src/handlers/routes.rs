@@ -1592,6 +1592,7 @@ pub struct BusRouteScheduleQuery {
     pub just_internal: Option<bool>,
     #[serde(rename = "justExternal")]
     pub just_external: Option<bool>,
+    pub vehicle_no: Option<String>,
 }
 
 async fn get_bus_trip_schedule(
@@ -1670,6 +1671,7 @@ async fn get_bus_trip_schedule(
             service_tier: row.service_type,
             trip_number: row.trip_number,
             waybill_no: Some(row.waybill_no),
+            is_active_trip: row.is_active_trip,
         });
     }
 
@@ -1689,6 +1691,7 @@ async fn get_bus_route_schedule(
     if gtfs_id == "chennai_bus" {
         let just_internal = query.just_internal.unwrap_or(false);
         let just_external = query.just_external.unwrap_or(false);
+        let vehicle_no = query.vehicle_no.as_deref();
 
         let route_stop_mappings = app_state
             .gtfs_service
@@ -1702,7 +1705,7 @@ async fn get_bus_route_schedule(
         if !just_internal {
             let mut ext_rows = app_state
                 .db_vehicle_reader
-                .get_chennai_waybills_by_route_id(&route_id)
+                .get_chennai_waybills_by_route_id(&route_id, vehicle_no)
                 .await?;
             all_rows.append(&mut ext_rows);
         }
@@ -1711,7 +1714,7 @@ async fn get_bus_route_schedule(
         if !just_external {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
-                .get_chennai_waybills_by_route_id(&route_id, &gtfs_id)
+                .get_chennai_waybills_by_route_id(&route_id, &gtfs_id, vehicle_no)
                 .await?;
             all_rows.append(&mut int_rows);
         }
@@ -1762,6 +1765,7 @@ async fn get_bus_route_schedule(
                 service_tier: row.service_type,
                 trip_number: row.trip_number,
                 waybill_no: Some(row.waybill_no),
+                is_active_trip: row.is_active_trip,
             });
         }
 
@@ -1802,6 +1806,7 @@ async fn get_bus_route_schedule(
                     db_start_time: None,
                     start_time_epoch: None,
                     trip_number: None,
+                    is_active_trip: None,
                 })
                 .collect()
         } else {
@@ -1896,6 +1901,7 @@ async fn get_bus_route_schedule(
             service_tier: waybill.service_type.clone(),
             trip_number: None,
             waybill_no: None,
+            is_active_trip: None,
         });
     }
 

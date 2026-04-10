@@ -72,7 +72,7 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
-    async fn get_chennai_waybills_by_route_id(&self, route_id: &str)
+    async fn get_chennai_waybills_by_route_id(&self, route_id: &str, vehicle_no: Option<&str>)
         -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybill_by_waybill_and_trip(
         &self,
@@ -198,6 +198,7 @@ impl VehicleDataReader for MockDBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         _route_id: &str,
+        _vehicle_no: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -275,7 +276,7 @@ impl DBVehicleReader {
             waybills_by_route_cache: Arc::new(RwLock::new(WaybillsByRouteCache {
                 waybills_by_route: HashMap::new(),
             })),
-            waybills_by_route_cache_duration: Duration::from_secs(3600), // 60 minutes TTL
+            waybills_by_route_cache_duration: Duration::from_secs(300), // 5 minutes TTL
             routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache { data: None })),
             routes_served_today_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
         }
@@ -2157,92 +2158,166 @@ impl VehicleDataReader for DBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         route_id: &str,
+        vehicle_no: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
-        let cache_key = self.get_waybills_by_route_cache_key("chennai_bus", route_id);
+        let cache_key = match vehicle_no {
+            Some(vno) => format!("chennai_bus:{}:vno:{}", route_id, vno),
+            None => self.get_waybills_by_route_cache_key("chennai_bus", route_id),
+        };
 
-        // Check cache first
+        // Check cache
         {
             let cache = self.waybills_by_route_cache.read().await;
             if let Some((data, ts)) = cache.waybills_by_route.get(&cache_key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
                     info!(
-                        "get_chennai_waybills_by_route_id cache HIT for route_id={}",
-                        route_id
+                        "get_chennai_waybills_by_route_id cache HIT for route_id={} vehicle_no={:?}",
+                        route_id, vehicle_no
                     );
                     return Ok(data.clone());
                 }
             }
         }
 
-        let query = r#"
-            WITH base AS (
-                SELECT
-                    w.waybill_id::text,
-                    w.waybill_no::text,
-                    w.service_type,
-                    w.vehicle_no,
-                    w.schedule_no,
-                    w.updated_at::timestamptz AS last_updated,
-                    w.duty_date,
-                    w.schedule_trip_id::text,
-                    e.entity_remark::text,
-                    w.driver_token_no::text AS driver_code,
-                    w.conductor_token_no::text AS conductor_code,
-                    w.deleted,
-                    w.status,
-                    w.is_flexi,
-                    COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
-                    COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
-                    COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
-                    COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
-                FROM waybills w
-                LEFT JOIN entities e
-                    ON e.entity_id = w.entity_id
-                LEFT JOIN bus_schedule_trip_detail bstd
-                    ON w.is_flexi = false
-                    AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
-                    AND bstd.route_number_id::text = $1
-                    AND bstd.trip_type <> 'dead-trip'
-                LEFT JOIN bus_schedule_trip_flexi bstf
-                    ON w.is_flexi = true
-                    AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
-                    AND bstf.route_number_id::text = $1
-                    AND bstf.trip_type <> 'dead-trip'
+        let rows = if let Some(vno) = vehicle_no {
+            let query = r#"
+                WITH base AS (
+                    SELECT
+                        w.waybill_id::text,
+                        w.waybill_no::text,
+                        w.service_type,
+                        w.vehicle_no,
+                        w.schedule_no,
+                        w.updated_at::timestamptz AS last_updated,
+                        w.duty_date,
+                        w.schedule_trip_id::text,
+                        e.entity_remark::text,
+                        w.driver_token_no::text AS driver_code,
+                        w.conductor_token_no::text AS conductor_code,
+                        w.deleted,
+                        w.status,
+                        w.is_flexi,
+                        COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
+                        COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
+                        COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
+                        COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
+                    FROM waybills w
+                    LEFT JOIN entities e
+                        ON e.entity_id = w.entity_id
+                    LEFT JOIN bus_schedule_trip_detail bstd
+                        ON w.is_flexi = false
+                        AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                        AND bstd.route_number_id::text = $1
+                        AND bstd.trip_type <> 'dead-trip'
+                    LEFT JOIN bus_schedule_trip_flexi bstf
+                        ON w.is_flexi = true
+                        AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
+                        AND bstf.route_number_id::text = $1
+                        AND bstf.trip_type <> 'dead-trip'
+                    WHERE
+                        w.status = 'Online'
+                        AND w.deleted = false
+                        AND w.vehicle_no = $2
+                        AND (
+                            (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                            OR
+                            (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                        )
+                )
+
+                SELECT *
+                FROM (
+                    SELECT *,
+                        MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY waybill_no) AS has_active,
+                        MAX(CASE WHEN is_active_trip THEN trip_number END)
+                        OVER (PARTITION BY waybill_no) AS active_trip_number
+                    FROM base
+                ) t
                 WHERE
-                    w.status = 'Online'
-                    AND w.deleted = false
-                    AND (
-                        (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
-                        OR
-                        (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
-                    )
-            )
+                    has_active = 0
+                    OR trip_number >= active_trip_number
+                ORDER BY waybill_no, trip_number;
+            "#;
 
-            SELECT *
-            FROM (
-                SELECT *,
-                    MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
-                    OVER (PARTITION BY waybill_no) AS has_active,
-                    MAX(CASE WHEN is_active_trip THEN trip_number END)
-                    OVER (PARTITION BY waybill_no) AS active_trip_number
-                FROM base
-            ) t
-            WHERE
-                has_active = 0
-                OR trip_number >= active_trip_number
-            ORDER BY waybill_no, trip_number;
-        "#;
+            sqlx::query_as::<_, VehicleData>(query)
+                .bind(route_id)
+                .bind(vno)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            let query = r#"
+                WITH base AS (
+                    SELECT
+                        w.waybill_id::text,
+                        w.waybill_no::text,
+                        w.service_type,
+                        w.vehicle_no,
+                        w.schedule_no,
+                        w.updated_at::timestamptz AS last_updated,
+                        w.duty_date,
+                        w.schedule_trip_id::text,
+                        e.entity_remark::text,
+                        w.driver_token_no::text AS driver_code,
+                        w.conductor_token_no::text AS conductor_code,
+                        w.deleted,
+                        w.status,
+                        w.is_flexi,
+                        COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
+                        COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
+                        COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
+                        COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
+                    FROM waybills w
+                    LEFT JOIN entities e
+                        ON e.entity_id = w.entity_id
+                    LEFT JOIN bus_schedule_trip_detail bstd
+                        ON w.is_flexi = false
+                        AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                        AND bstd.route_number_id::text = $1
+                        AND bstd.trip_type <> 'dead-trip'
+                    LEFT JOIN bus_schedule_trip_flexi bstf
+                        ON w.is_flexi = true
+                        AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
+                        AND bstf.route_number_id::text = $1
+                        AND bstf.trip_type <> 'dead-trip'
+                    WHERE
+                        w.status = 'Online'
+                        AND w.deleted = false
+                        AND (
+                            (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                            OR
+                            (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                        )
+                )
 
-        match sqlx::query_as::<_, VehicleData>(query)
-            .bind(route_id)
-            .fetch_all(&self.pool)
-            .await
-        {
+                SELECT *
+                FROM (
+                    SELECT *,
+                        MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY waybill_no) AS has_active,
+                        MAX(CASE WHEN is_active_trip THEN trip_number END)
+                        OVER (PARTITION BY waybill_no) AS active_trip_number
+                    FROM base
+                ) t
+                WHERE
+                    has_active = 0
+                    OR trip_number >= active_trip_number
+                ORDER BY waybill_no, trip_number;
+            "#;
+
+            sqlx::query_as::<_, VehicleData>(query)
+                .bind(route_id)
+                .fetch_all(&self.pool)
+                .await
+        };
+
+        match rows {
             Ok(rows) => {
                 info!(
-                    "Chennai direct query: found {} waybills for route_id={}",
+                    "Chennai direct query: found {} waybills for route_id={} vehicle_no={:?}",
                     rows.len(),
-                    route_id
+                    route_id,
+                    vehicle_no
                 );
 
                 // Update cache
