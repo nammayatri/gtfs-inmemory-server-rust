@@ -45,7 +45,7 @@ pub fn waybill_statuses() -> Vec<&'static str> {
     ]
 }
 
-pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus"];
+pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"];
 
 pub const MAX_QUERY_LIMIT: i64 = 1000;
 pub const MAX_QUERY_FILTERS: usize = 5;

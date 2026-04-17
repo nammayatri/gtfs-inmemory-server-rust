@@ -32,6 +32,7 @@ pub enum ServiceTierType {
     ElectricVPmi,
     AcEmuFirstClass,
     PREMIUM,
+    SHUTTLE,
 }
 
 impl Serialize for ServiceTierType {
@@ -56,6 +57,7 @@ impl Serialize for ServiceTierType {
             ServiceTierType::ElectricVPmi => "ELECTRIC_V_PMI",
             ServiceTierType::AcEmuFirstClass => "AC_EMU_FIRST_CLASS",
             ServiceTierType::PREMIUM => "PREMIUM",
+            ServiceTierType::SHUTTLE => "SHUTTLE",
         };
         serializer.serialize_str(s)
     }
@@ -87,6 +89,7 @@ impl<'de> Deserialize<'de> for ServiceTierType {
             "ELECTRIC_V_PMI" => Ok(ServiceTierType::ElectricVPmi),
             "AC_EMU_FIRST_CLASS" => Ok(ServiceTierType::AcEmuFirstClass),
             "PREMIUM" | "Premium" => Ok(ServiceTierType::PREMIUM),
+            "SHUTTLE" | "Shuttle" => Ok(ServiceTierType::SHUTTLE),
             _ => {
                 // Return Ordinary as default if parsing fails like some lenient setups or log warning? Let's just fail
                 Err(serde::de::Error::custom(format!(
