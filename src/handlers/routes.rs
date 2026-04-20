@@ -1,3 +1,4 @@
+use crate::handlers::draw::draw_route_map;
 use crate::services::fleet_operator::{TripAction, WaybillAnchor};
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
@@ -147,6 +148,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/route-stop-mapping/{gtfs_id}/route/{route_code}",
                 actix_web::web::get().to(get_route_stop_mapping_by_route),
+            )
+            .route(
+                "/draw/{gtfs_id}/{route_code}",
+                actix_web::web::get().to(draw_route_map),
             )
             .route(
                 "/route-stop-mapping/{gtfs_id}/stop/{stop_code}",
@@ -519,6 +524,128 @@ async fn get_route_stop_mapping_by_route(
         )
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
+}
+
+async fn draw_route_map(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DirectionQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_code) = path.into_inner();
+    let mappings = app_state
+        .gtfs_service
+        .get_route_stop_mapping_by_route_with_direction(
+            &gtfs_id,
+            &route_code,
+            query.direction.as_deref(),
+        )
+        .await?;
+
+    let stops_json = serde_json::to_string(&mappings).unwrap_or_else(|_| "[]".to_string());
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Route Map - {}</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <style>
+        body {{ margin: 0; padding: 0; }}
+        #map {{ height: 100vh; width: 100%; }}
+        .info-panel {{
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+            font-family: Arial, sans-serif;
+        }}
+        .stop-marker {{
+            background-color: #3388ff;
+            border: 2px solid white;
+            border-radius: 50%;
+            width: 12px;
+            height: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="info-panel">
+        <h3>Route: {}</h3>
+        <p>GTFS ID: {}</p>
+        <p>Stops: {}</p>
+    </div>
+    <script>
+        const stops = {};
+        
+        // Calculate center of all stops
+        let avgLat = 0, avgLon = 0;
+        stops.forEach(stop => {{
+            avgLat += stop.stop_point.lat;
+            avgLon += stop.stop_point.lon;
+        }});
+        avgLat /= stops.length;
+        avgLon /= stops.length;
+        
+        const map = L.map('map').setView([avgLat, avgLon], 13);
+        
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }}).addTo(map);
+        
+        const latlngs = [];
+        stops.forEach((stop, index) => {{
+            const lat = stop.stop_point.lat;
+            const lon = stop.stop_point.lon;
+            latlngs.push([lat, lon]);
+            
+            const marker = L.circleMarker([lat, lon], {{
+                radius: 8,
+                fillColor: '#3388ff',
+                color: '#fff',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.8
+            }}).addTo(map);
+            
+            marker.bindPopup(`<b>${{stop.stop_name}}</b><br>Code: ${{stop.stop_code}}<br>Sequence: ${{index + 1}}`);
+            
+            // Add sequence number label
+            L.marker([lat, lon], {{
+                icon: L.divIcon({{
+                    className: 'sequence-label',
+                    html: `<div style="background: #ff6b6b; color: white; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold;">${{index + 1}}</div>`,
+                    iconSize: [20, 20],
+                    iconAnchor: [25, -10]
+                }})
+            }}).addTo(map);
+        }});
+        
+        // Draw polyline connecting stops
+        if (latlngs.length > 1) {{
+            L.polyline(latlngs, {{color: '#3388ff', weight: 3, opacity: 0.7}}).addTo(map);
+        }}
+        
+        // Fit bounds to show all stops
+        if (latlngs.length > 0) {{
+            map.fitBounds(latlngs);
+        }}
+    </script>
+</body>
+</html>"#,
+        route_code, route_code, gtfs_id, mappings.len(), stops_json
+    );
+
+    Ok(HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html))
 }
 
 async fn get_route_stop_mapping_by_stop(
