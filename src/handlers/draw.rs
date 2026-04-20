@@ -28,12 +28,25 @@ pub async fn draw_route_map(
         .body(html))
 }
 
+/// Escape special HTML characters to prevent XSS attacks
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 /// Generate HTML string with embedded Leaflet map
 fn generate_leaflet_html(
     gtfs_id: &str,
     route_code: &str,
     mappings: &[std::sync::Arc<crate::models::RouteStopMapping>],
 ) -> String {
+    // Sanitize user inputs to prevent XSS
+    let safe_gtfs_id = html_escape(gtfs_id);
+    let safe_route_code = html_escape(route_code);
     // Build stops data for JavaScript
     let mut stops_js = String::new();
     for (idx, mapping) in mappings.iter().enumerate() {
@@ -168,8 +181,8 @@ fn generate_leaflet_html(
     </script>
 </body>
 </html>"#,
-        route_code = route_code,
-        gtfs_id = gtfs_id,
+        route_code = safe_route_code,
+        gtfs_id = safe_gtfs_id,
         total_stops = mappings.len(),
         center_lat = center_lat,
         center_lng = center_lng,
