@@ -23,6 +23,7 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         &self,
         route_id: &str,
         gtfs_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybill_by_waybill_and_trip(
         &self,
@@ -78,6 +79,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         &self,
         _route_id: &str,
         _gtfs_id: &str,
+        _vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
         Ok(Vec::new())
     }
@@ -153,6 +155,18 @@ impl DBVehicleReaderInternal {
 
     fn get_waybills_by_route_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
         format!("{}_{}", gtfs_id, route_id)
+    }
+
+    fn get_waybills_by_route_cache_key_with_vehicle(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+        vehicle_no: Option<&str>,
+    ) -> String {
+        match vehicle_no {
+            Some(v) if !v.is_empty() => format!("{}_{}_vehicle_no={}", gtfs_id, route_id, v),
+            _ => self.get_waybills_by_route_cache_key(gtfs_id, route_id),
+        }
     }
 
     fn get_station_eta_cache_key(&self, gtfs_id: &str) -> String {
@@ -867,6 +881,7 @@ impl DBVehicleReaderInternal {
         &self,
         route_id: &str,
         gtfs_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
         let pool = match &self.pool {
             Some(p) => p,
@@ -875,7 +890,18 @@ impl DBVehicleReaderInternal {
             }
         };
 
-        let cache_key = self.get_waybills_by_route_cache_key(gtfs_id, route_id);
+        // Normalize: trim and convert empty string to None to ensure cache key
+        // and SQL filter are consistent (Some("") would fallback to unfiltered cache
+        // but still filter by empty string in SQL, potentially poisoning the cache)
+        let vehicle_number = vehicle_number
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let cache_key = self.get_waybills_by_route_cache_key_with_vehicle(
+            gtfs_id,
+            route_id,
+            vehicle_number.as_deref(),
+        );
 
         // Check cache first
         {
@@ -932,6 +958,7 @@ impl DBVehicleReaderInternal {
                     w.status in ('online', 'upcoming')
                     AND w.deleted = false
                     AND w.gtfs_id = $2
+                    AND ($3::text IS NULL OR w.vehicle_no = $3)
                     AND (
                         (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                         OR
@@ -954,6 +981,7 @@ impl DBVehicleReaderInternal {
         match sqlx::query_as::<_, VehicleData>(query)
             .bind(route_id)
             .bind(gtfs_id)
+            .bind(vehicle_number)
             .fetch_all(pool)
             .await
         {
@@ -1014,7 +1042,8 @@ impl DBVehicleReaderInternal {
                 w.is_flexi,
                 COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
                 COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
-                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
+                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
+                COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
             FROM waybills_internal w
             LEFT JOIN entities_internal e
                 ON e.entity_id = w.entity_id
@@ -1143,8 +1172,9 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         &self,
         route_id: &str,
         gtfs_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id)
+        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
             .await
     }
 

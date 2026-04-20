@@ -129,6 +129,8 @@ pub struct VehicleData {
     pub start_time_epoch: Option<String>,
     #[sqlx(default)]
     pub trip_number: Option<i32>,
+    #[sqlx(default)]
+    pub is_active_trip: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -694,6 +696,8 @@ pub struct BusScheduleDetail {
     pub service_tier: String,
     #[serde(rename = "trip_number")]
     pub trip_number: Option<i32>,
+    #[serde(rename = "is_active_trip")]
+    pub is_active_trip: Option<bool>,
     #[serde(rename = "waybill_no")]
     pub waybill_no: Option<String>,
 }

@@ -72,7 +72,11 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
-    async fn get_chennai_waybills_by_route_id(&self, route_id: &str)
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        route_id: &str,
+        vehicle_number: Option<String>,
+    )
         -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybill_by_waybill_and_trip(
         &self,
@@ -198,6 +202,7 @@ impl VehicleDataReader for MockDBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         _route_id: &str,
+        _vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -298,6 +303,18 @@ impl DBVehicleReader {
 
     fn get_waybills_by_route_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
         format!("{}:{}", gtfs_id, route_id)
+    }
+
+    fn get_waybills_by_route_cache_key_with_vehicle(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+        vehicle_no: Option<&str>,
+    ) -> String {
+        match vehicle_no {
+            Some(v) if !v.is_empty() => format!("{}:{}:vehicle_no={}", gtfs_id, route_id, v),
+            _ => self.get_waybills_by_route_cache_key(gtfs_id, route_id),
+        }
     }
 
     async fn get_all_vehicles_pool(&self) -> AppResult<std::collections::HashSet<String>> {
@@ -2157,8 +2174,20 @@ impl VehicleDataReader for DBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         route_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
-        let cache_key = self.get_waybills_by_route_cache_key("chennai_bus", route_id);
+        // Normalize: trim and convert empty string to None to ensure cache key
+        // and SQL filter are consistent (Some("") would fallback to unfiltered cache
+        // but still filter by empty string in SQL, potentially poisoning the cache)
+        let vehicle_number = vehicle_number
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let cache_key = self.get_waybills_by_route_cache_key_with_vehicle(
+            "chennai_bus",
+            route_id,
+            vehicle_number.as_deref(),
+        );
 
         // Check cache first
         {
@@ -2211,6 +2240,7 @@ impl VehicleDataReader for DBVehicleReader {
                 WHERE
                     w.status = 'Online'
                     AND w.deleted = false
+                    AND ($2::text IS NULL OR w.vehicle_no = $2)
                     AND (
                         (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                         OR
@@ -2235,6 +2265,7 @@ impl VehicleDataReader for DBVehicleReader {
 
         match sqlx::query_as::<_, VehicleData>(query)
             .bind(route_id)
+            .bind(vehicle_number)
             .fetch_all(&self.pool)
             .await
         {
@@ -2288,7 +2319,8 @@ impl VehicleDataReader for DBVehicleReader {
                 w.is_flexi,
                 COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
                 COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
-                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
+                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
+                COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
             FROM waybills w
             LEFT JOIN entities e
                 ON e.entity_id = w.entity_id
