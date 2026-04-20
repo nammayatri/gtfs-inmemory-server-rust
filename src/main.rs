@@ -1,4 +1,3 @@
-use actix_files::Files;
 use actix_web::{web, App, HttpServer};
 use gtfs_routes_service::{
     environment, handlers::routes, middleware::*, tools::prometheus::prometheus_metrics,
@@ -51,7 +50,6 @@ async fn main() -> anyhow::Result<()> {
             .wrap(IncomingRequestMetrics)
             .wrap(TracingLogger::<DomainRootSpanBuilder>::new())
             .wrap(prometheus.clone())
-            .service(Files::new("/static", "./static"))
             .configure(routes::create_routes)
     })
     .bind((Ipv4Addr::UNSPECIFIED, port))?
