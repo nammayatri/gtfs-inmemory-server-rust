@@ -25,6 +25,7 @@ use crate::models::{
     VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
+use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
 use crate::{
@@ -724,6 +725,16 @@ pub async fn get_routes_fuzzy(
 )]
 pub async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
+    if gtfs_id == app_state.config.osrtc_feed_key.as_ref().unwrap_or(&"odisha_osrtc".to_string()).to_string() {
+        let cache = app_state
+            .osrtc_cache
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("OSRTC cache not configured".to_string()))?;
+        let stations = cache.get_all_stations().await;
+        let mappings: Vec<RouteStopMapping> =
+            stations.iter().map(osrtc_station_to_route_stop_mapping).collect();
+        return Ok(HttpResponse::Ok().json(mappings));
+    }
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(stops))
 }
@@ -776,6 +787,17 @@ pub async fn get_stop(
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
+    if gtfs_id == app_state.config.osrtc_feed_key.as_ref().unwrap_or(&"odisha_osrtc".to_string()).to_string() {
+        let cache = app_state
+            .osrtc_cache
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("OSRTC cache not configured".to_string()))?;
+        let station = cache
+            .get_station_by_id(&stop_code)
+            .await
+            .ok_or_else(|| AppError::NotFound(format!("OSRTC station not found: {}", stop_code)))?;
+        return Ok(HttpResponse::Ok().json(osrtc_station_to_route_stop_mapping(&station)));
+    }
     let (stop, maybe_mapping) = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)
