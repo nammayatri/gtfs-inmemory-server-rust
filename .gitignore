@@ -48,6 +48,8 @@ dhall-configs/secrets/gtfs_in_memory_server_rust.dhall
 # Temporary files
 *.tmp
 *.temp
+CLAUDE.md
+.claude/
 
 # Unused files
 ignored/
