@@ -6,4 +6,5 @@ pub mod field_generator;
 pub mod fleet_operator;
 pub mod gtfs_service;
 pub mod operator;
+pub mod osrtc_station_cache;
 pub mod trip_service;
