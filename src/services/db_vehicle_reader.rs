@@ -713,6 +713,7 @@ impl DBVehicleReader {
                     schedule_details: None,
                     db_start_time: None,
                     db_end_time: None,
+                    waybill_status: Some(WaybillStatus::Online),
                     seat_layout_id: None,
                 };
                 if let Some(schedule) = schedule_result {
@@ -774,6 +775,7 @@ impl DBVehicleReader {
                             schedule_details: None,
                             db_start_time: None,
                             db_end_time: None,
+                            waybill_status: Some(WaybillStatus::NotFound),
                             seat_layout_id: None,
                         }
                     } else {
@@ -799,6 +801,7 @@ impl DBVehicleReader {
                             schedule_details: None,
                             db_start_time: None,
                             db_end_time: None,
+                            waybill_status: Some(WaybillStatus::NotFound),
                             seat_layout_id: None,
                         }
                     };
@@ -1320,7 +1323,7 @@ impl DBVehicleReader {
                         .await
                 }
             }
-            WaybillStatus::ProcessedOrNew => {
+            WaybillStatus::ProcessedOrNew | WaybillStatus::Closed => {
                 // Always use detail trips, force first as active
                 self.handle_detail_trips(&waybill_data, true, trip_number)
                     .await
@@ -1459,6 +1462,7 @@ impl VehicleDataReader for DBVehicleReader {
                 );
 
                 // Resolve trip data based on waybill status and is_flexi flag
+                let resolved_waybill_status = waybill_status.clone();
                 let (schedule_result, is_active_trip, remaining_trip_details) = self
                     .resolve_trip_data(vehicle_data.clone(), waybill_status, trip_number)
                     .await?;
@@ -1502,6 +1506,7 @@ impl VehicleDataReader for DBVehicleReader {
                     schedule_details: Some(schedule_map),
                     db_start_time: None,
                     db_end_time: None,
+                    waybill_status: Some(resolved_waybill_status),
                     seat_layout_id: None,
                 };
 
@@ -1568,6 +1573,7 @@ impl VehicleDataReader for DBVehicleReader {
                             schedule_details: None,
                             db_start_time: None,
                             db_end_time: None,
+                            waybill_status: Some(WaybillStatus::NotFound),
                             seat_layout_id: None,
                         }
                     } else {
@@ -1593,6 +1599,7 @@ impl VehicleDataReader for DBVehicleReader {
                             status: None,
                             db_start_time: None,
                             db_end_time: None,
+                            waybill_status: Some(WaybillStatus::NotFound),
                             seat_layout_id: None,
                         }
                     };
@@ -1835,6 +1842,7 @@ impl VehicleDataReader for DBVehicleReader {
                 schedule_details: None,
                 db_start_time: None,
                 db_end_time: None,
+                waybill_status: None,
                 seat_layout_id: None,
             };
 

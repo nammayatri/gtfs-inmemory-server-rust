@@ -163,6 +163,7 @@ pub struct VehicleDataWithRouteId {
     pub schedule_details: Option<HashMap<i64, Vec<BusSchedule>>>,
     pub db_start_time: Option<String>,
     pub db_end_time: Option<String>,
+    pub waybill_status: Option<WaybillStatus>,
     #[sqlx(default)]
     #[serde(rename = "seatLayoutId")]
     pub seat_layout_id: Option<String>,
@@ -233,6 +234,7 @@ pub struct VehicleServiceTypeResponse {
     pub driver_id: Option<String>,
     pub conductor_id: Option<String>,
     pub eligible_pass_ids: Option<Vec<String>>,
+    pub waybill_status: Option<WaybillStatus>,
     pub service_sub_types: Option<Vec<String>>,
     #[serde(rename = "seatLayoutId")]
     pub seat_layout_id: Option<String>,
@@ -251,11 +253,12 @@ pub struct VehicleMetadataResponse {
     pub is_actually_valid: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WaybillStatus {
     Online,
     ProcessedOrNew,
     NotFound,
+    Closed
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
