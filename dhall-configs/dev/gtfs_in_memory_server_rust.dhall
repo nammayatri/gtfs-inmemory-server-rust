@@ -55,5 +55,12 @@ in {
 
   -- Bhubaneswar vehicle cache configuration
   bhubaneswar_cache_update_interval = 10,
-  phone_number_hash_key = "HASH_KEY"
+  phone_number_hash_key = "HASH_KEY",
+
+  -- OSRTC station cache configuration
+  osrtc_base_url = Some "https://osrtcuatthirdpartyapi.amnex.com",
+  osrtc_username = None Text,
+  osrtc_secret_key = None Text,
+  osrtc_station_refresh_interval_hours = 24,
+  osrtc_feed_key = Some "odisha_osrtc"
 }
