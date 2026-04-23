@@ -579,14 +579,16 @@ async fn get_routes_fuzzy(
 
 async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
-    if gtfs_id == app_state.config.osrtc_feed_key.as_ref().unwrap_or(&"odisha_osrtc".to_string()).to_string() {
+    if app_state.config.osrtc_feed_key.as_deref() == Some(gtfs_id.as_str()) {
         let cache = app_state
             .osrtc_cache
             .as_ref()
             .ok_or_else(|| AppError::Internal("OSRTC cache not configured".to_string()))?;
         let stations = cache.get_all_stations().await;
-        let mappings: Vec<RouteStopMapping> =
-            stations.iter().map(osrtc_station_to_route_stop_mapping).collect();
+        let mappings: Vec<RouteStopMapping> = stations
+            .iter()
+            .map(osrtc_station_to_route_stop_mapping)
+            .collect();
         return Ok(HttpResponse::Ok().json(mappings));
     }
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
@@ -631,7 +633,7 @@ async fn get_stop(
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
-    if gtfs_id == app_state.config.osrtc_feed_key.as_ref().unwrap_or(&"odisha_osrtc".to_string()).to_string() {
+    if app_state.config.osrtc_feed_key.as_deref() == Some(gtfs_id.as_str()) {
         let cache = app_state
             .osrtc_cache
             .as_ref()
@@ -639,7 +641,7 @@ async fn get_stop(
         let station = cache
             .get_station_by_id(&stop_code)
             .await
-            .ok_or_else(|| AppError::NotFound(format!("OSRTC station not found: {}", stop_code)))?;
+            .ok_or_else(|| AppError::NotFound(format!("OSRTC station not found: {stop_code}")))?;
         return Ok(HttpResponse::Ok().json(osrtc_station_to_route_stop_mapping(&station)));
     }
     let (stop, maybe_mapping) = app_state
@@ -2923,7 +2925,9 @@ async fn fleet_operator_trip_action(
     let trip_number = match action {
         TripAction::Reset => 0,
         _ => req.trip_number.ok_or_else(|| {
-            AppError::BadRequest("trip_number is required for 'start' and 'end' actions.".to_string())
+            AppError::BadRequest(
+                "trip_number is required for 'start' and 'end' actions.".to_string(),
+            )
         })?,
     };
 

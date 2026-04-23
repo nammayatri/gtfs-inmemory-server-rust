@@ -2,8 +2,8 @@ use crate::services::gtfs_service::GTFSService;
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
-use reqwest::Client;
 use once_cell::sync::Lazy;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -95,9 +95,8 @@ pub const CHALO_CITY_DEFS: [ChaloCityDef; 2] = [
 
 /// Membership for [`CHALO_CITY_DEFS`], built once per process. The set only changes with a deploy
 /// (same as edits to [`CHALO_CITY_DEFS`]), so no runtime invalidation.
-static CHALO_GTFS_ID_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    CHALO_CITY_DEFS.iter().map(|c| c.gtfs_id).collect()
-});
+static CHALO_GTFS_ID_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| CHALO_CITY_DEFS.iter().map(|c| c.gtfs_id).collect());
 
 /// Same order as [`CHALO_CITY_DEFS`]; built once per process (see [`CHALO_GTFS_ID_SET`]).
 static CHALO_GTFS_IDS_SLICE: Lazy<Box<[&'static str]>> = Lazy::new(|| {

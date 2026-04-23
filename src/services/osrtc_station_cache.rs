@@ -1,10 +1,11 @@
+use crate::models::{LatLong, RouteStopMapping};
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
 // --- API response types (private) ---
@@ -60,9 +61,12 @@ pub struct OsrtcStationCache {
     base_url: String,
     username: String,
     secret_key: String,
-    token: Arc<RwLock<Option<OsrtcToken>>>,
+    // Mutex so check-and-refresh is atomic — prevents concurrent callers from all hitting the auth endpoint on expiry
+    token: Arc<Mutex<Option<OsrtcToken>>>,
     // Keyed by intStationID.to_string() — the identifier used by frontend/backend
     stations: Arc<RwLock<HashMap<String, OsrtcStation>>>,
+    // Pre-built snapshot; get_all_stations is a single Arc::clone instead of a full HashMap copy
+    station_list: Arc<RwLock<Arc<Vec<OsrtcStation>>>>,
     station_refresh_interval_secs: u64,
 }
 
@@ -83,13 +87,14 @@ impl OsrtcStationCache {
             base_url,
             username,
             secret_key,
-            token: Arc::new(RwLock::new(None)),
+            token: Arc::new(Mutex::new(None)),
             stations: Arc::new(RwLock::new(HashMap::new())),
+            station_list: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             station_refresh_interval_secs,
         })
     }
 
-    async fn refresh_token(&self) -> AppResult<String> {
+    async fn fetch_fresh_token(&self) -> AppResult<OsrtcToken> {
         info!("Refreshing OSRTC auth token...");
         let url = format!("{}/api/Auth/GenerateAccess", self.base_url);
         let body = serde_json::json!({
@@ -104,7 +109,9 @@ impl OsrtcStationCache {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("OSRTC GenerateAccess request failed: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!("OSRTC GenerateAccess request failed: {}", e))
+            })?;
 
         if !response.status().is_success() {
             return Err(AppError::Internal(format!(
@@ -114,7 +121,10 @@ impl OsrtcStationCache {
         }
 
         let parsed: GenerateAccessResponse = response.json().await.map_err(|e| {
-            AppError::Internal(format!("Failed to parse OSRTC GenerateAccess response: {}", e))
+            AppError::Internal(format!(
+                "Failed to parse OSRTC GenerateAccess response: {}",
+                e
+            ))
         })?;
 
         if !parsed.issuccess {
@@ -123,45 +133,46 @@ impl OsrtcStationCache {
             ));
         }
 
-        let token_data = parsed.data.into_iter().next().ok_or_else(|| {
-            AppError::Internal("OSRTC GenerateAccess returned empty data array".to_string())
-        })?;
-
-        let mut token_lock = self.token.write().await;
-        let token = OsrtcToken { access_token: token_data.access_token, expires_at: token_data.expires_at };                                                                                                                                             
-        let access_token = token.access_token.clone();                                                                                                                                                                                                   
-        *token_lock = Some(token);                                                                                                                                                                                                                            
-
-        info!("OSRTC auth token refreshed successfully");
-        Ok(access_token)
+        parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|td| OsrtcToken {
+                access_token: td.access_token,
+                expires_at: td.expires_at,
+            })
+            .ok_or_else(|| {
+                AppError::Internal("OSRTC GenerateAccess returned empty data array".to_string())
+            })
     }
 
     // Lazy refresh: returns cached token if it has >5 min left, otherwise re-fetches.
+    // Holds the mutex across the HTTP call so only one caller refreshes at a time.
     async fn get_valid_token(&self) -> AppResult<String> {
-        {
-            let token = self.token.read().await;
-            if let Some(t) = &*token {
-                if t.expires_at > Utc::now() + Duration::minutes(5) {
-                    return Ok(t.access_token.clone());
-                }
+        let mut token_guard = self.token.lock().await;
+        if let Some(t) = &*token_guard {
+            if t.expires_at > Utc::now() + Duration::minutes(5) {
+                return Ok(t.access_token.clone());
             }
         }
-        self.refresh_token().await
+        let new_token = self.fetch_fresh_token().await?;
+        let access_token = new_token.access_token.clone();
+        *token_guard = Some(new_token);
+        info!("OSRTC auth token refreshed successfully");
+        info!("OSRTC access token: {}", access_token);
+        Ok(access_token)
     }
 
     async fn refresh_stations(&self) -> AppResult<()> {
         info!("Refreshing OSRTC station list...");
         let token = self.get_valid_token().await?;
-        let url = format!(
-            "{}/api/List/GetStationList?intStationID=0",
-            self.base_url
-        );
+        let url = format!("{}/api/List/GetStationList", self.base_url);
 
         let response = self
             .http_client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("content-type", "application/json")
+            .json(&serde_json::json!({}))
             .send()
             .await
             .map_err(|e| {
@@ -169,14 +180,19 @@ impl OsrtcStationCache {
             })?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(AppError::Internal(format!(
-                "OSRTC GetStationList returned status: {}",
-                response.status()
+                "OSRTC GetStationList returned status: {} body: {}",
+                status, body
             )));
         }
 
         let parsed: GetStationListResponse = response.json().await.map_err(|e| {
-            AppError::Internal(format!("Failed to parse OSRTC GetStationList response: {}", e))
+            AppError::Internal(format!(
+                "Failed to parse OSRTC GetStationList response: {}",
+                e
+            ))
         })?;
 
         if !parsed.issuccess {
@@ -199,8 +215,15 @@ impl OsrtcStationCache {
         }
 
         let count = new_stations.len();
+        let list: Arc<Vec<OsrtcStation>> =
+            Arc::new(new_stations.values().cloned().collect());
+
         let mut stations_lock = self.stations.write().await;
         *stations_lock = new_stations;
+        drop(stations_lock);
+
+        let mut list_lock = self.station_list.write().await;
+        *list_lock = list;
 
         info!("OSRTC station list refreshed: {} stations loaded", count);
         Ok(())
@@ -214,13 +237,21 @@ impl OsrtcStationCache {
     }
 
     pub async fn get_station_by_id(&self, id: &str) -> Option<OsrtcStation> {
-        let stations = self.stations.read().await;
-        stations.get(id).cloned()
+        if self.stations.read().await.is_empty() {
+            if let Err(e) = self.refresh_stations().await {
+                error!("OSRTC on-demand station refresh failed: {}", e);
+            }
+        }
+        self.stations.read().await.get(id).cloned()
     }
 
-    pub async fn get_all_stations(&self) -> Vec<OsrtcStation> {
-        let stations = self.stations.read().await;
-        stations.values().cloned().collect()
+    pub async fn get_all_stations(&self) -> Arc<Vec<OsrtcStation>> {
+        if self.station_list.read().await.is_empty() {
+            if let Err(e) = self.refresh_stations().await {
+                error!("OSRTC on-demand station refresh failed: {}", e);
+            }
+        }
+        self.station_list.read().await.clone()
     }
 
     pub async fn start_background_refresh_task(self: Arc<Self>) {
@@ -230,8 +261,8 @@ impl OsrtcStationCache {
             interval_secs
         );
         let duration = std::time::Duration::from_secs(interval_secs);
-        let mut interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
+        let mut interval = tokio::time::interval(duration);
+        interval.tick().await; // discard the immediate first tick
         loop {
             interval.tick().await;
             if let Err(e) = self.refresh_stations().await {
@@ -242,8 +273,6 @@ impl OsrtcStationCache {
 }
 
 // --- Conversion helper ---
-
-use crate::models::{LatLong, RouteStopMapping};
 
 pub fn osrtc_station_to_route_stop_mapping(station: &OsrtcStation) -> RouteStopMapping {
     let id_str: Arc<str> = station.station_id.to_string().into();
@@ -264,4 +293,3 @@ pub fn osrtc_station_to_route_stop_mapping(station: &OsrtcStation) -> RouteStopM
         parent_stop_code: None,
     }
 }
-

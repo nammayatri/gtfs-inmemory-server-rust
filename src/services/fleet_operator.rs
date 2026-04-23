@@ -843,7 +843,8 @@ impl FleetOperatorService for DBFleetOperatorService {
         if action != TripAction::Reset {
             self.validate_trip_exists(&waybill, trip_number).await?;
         }
-        self.apply_trip_action(&waybill, &action, trip_number, timestamp).await?;
+        self.apply_trip_action(&waybill, &action, trip_number, timestamp)
+            .await?;
         Ok(TripActionResponse { success: true })
     }
 
