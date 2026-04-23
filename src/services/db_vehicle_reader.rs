@@ -2191,45 +2191,47 @@ impl VehicleDataReader for DBVehicleReader {
                     w.deleted,
                     w.status,
                     w.is_flexi,
-                    COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
-                    COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
-                    COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number,
-                    COALESCE(bstd.is_active_trip, bstf.is_active_trip) AS is_active_trip
+                    CASE
+                        WHEN w.is_flexi THEN bstf.start_time
+                        ELSE bstd.start_time
+                    END AS db_start_time,
+                    CASE
+                        WHEN w.is_flexi THEN bstf.trip_start_time::text
+                        ELSE bstd.trip_start_time::text
+                    END AS start_time_epoch,
+                    CASE
+                        WHEN w.is_flexi THEN bstf.trip_number::int
+                        ELSE bstd.trip_number::int
+                    END AS trip_number,
+                    CASE
+                        WHEN w.is_flexi THEN bstf.is_active_trip
+                        ELSE bstd.is_active_trip
+                    END AS is_active_trip
                 FROM waybills w
                 LEFT JOIN entities e
                     ON e.entity_id = w.entity_id
+                LEFT JOIN bus_schedule_trip_flexi bstf
+                    ON w.is_flexi = true
+                    AND bstf.waybill_id = w.waybill_id::bigint
+                    AND bstf.route_number_id::text = $1
+                    AND bstf.trip_type <> 'dead-trip'
                 LEFT JOIN bus_schedule_trip_detail bstd
                     ON w.is_flexi = false
                     AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
                     AND bstd.route_number_id::text = $1
                     AND bstd.trip_type <> 'dead-trip'
-                LEFT JOIN bus_schedule_trip_flexi bstf
-                    ON w.is_flexi = true
-                    AND bstf.schedule_trip_id = w.schedule_trip_id::bigint
-                    AND bstf.route_number_id::text = $1
-                    AND bstf.trip_type <> 'dead-trip'
                 WHERE
                     w.status = 'Online'
                     AND w.deleted = false
                     AND (
-                        (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                        (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                         OR
-                        (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                        (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                     )
             )
 
             SELECT *
-            FROM (
-                SELECT *,
-                    MAX(CASE WHEN is_active_trip THEN 1 ELSE 0 END)
-                    OVER (PARTITION BY waybill_no) AS has_active,
-                    MAX(CASE WHEN is_active_trip THEN trip_number END)
-                    OVER (PARTITION BY waybill_no) AS active_trip_number
-                FROM base
-            ) t
-            WHERE
-                has_active = 0
-                OR trip_number >= active_trip_number
+            FROM base
             ORDER BY waybill_no, trip_number;
         "#;
 
@@ -2286,30 +2288,39 @@ impl VehicleDataReader for DBVehicleReader {
                 w.deleted,
                 w.status,
                 w.is_flexi,
-                COALESCE(bstd.start_time, bstf.start_time) AS db_start_time,
-                COALESCE(bstd.trip_start_time, bstf.trip_start_time)::text AS start_time_epoch,
-                COALESCE(bstd.trip_number, bstf.trip_number)::int AS trip_number
+                CASE
+                    WHEN w.is_flexi THEN bstf.start_time
+                    ELSE bstd.start_time
+                END AS db_start_time,
+                CASE
+                    WHEN w.is_flexi THEN bstf.trip_start_time::text
+                    ELSE bstd.trip_start_time::text
+                END AS start_time_epoch,
+                CASE
+                    WHEN w.is_flexi THEN bstf.trip_number::int
+                    ELSE bstd.trip_number::int
+                END AS trip_number
             FROM waybills w
             LEFT JOIN entities e
                 ON e.entity_id = w.entity_id
-            LEFT JOIN bus_schedule_trip_detail bstd
-                ON w.is_flexi = false
-                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
-                AND bstd.trip_number = $2
-                AND bstd.trip_type <> 'dead-trip'
             LEFT JOIN bus_schedule_trip_flexi bstf
                 ON w.is_flexi = true
                 AND bstf.waybill_id = w.waybill_id::bigint
                 AND bstf.trip_number = $2
                 AND bstf.trip_type <> 'dead-trip'
+            LEFT JOIN bus_schedule_trip_detail bstd
+                ON w.is_flexi = false
+                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                AND bstd.trip_number = $2
+                AND bstd.trip_type <> 'dead-trip'
             WHERE
                 w.waybill_no::text = $1
                 AND w.status = 'Online'
                 AND w.deleted = false
                 AND (
-                    (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                    (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                     OR
-                    (w.is_flexi = true  AND bstf.schedule_trip_id IS NOT NULL)
+                    (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                 )
             ORDER BY w.waybill_no, trip_number;
         "#;
