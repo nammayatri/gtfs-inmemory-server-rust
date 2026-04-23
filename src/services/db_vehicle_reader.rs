@@ -714,6 +714,7 @@ impl DBVehicleReader {
                     db_start_time: None,
                     db_end_time: None,
                     seat_layout_id: None,
+                    waybill_status: None,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -775,6 +776,7 @@ impl DBVehicleReader {
                             db_start_time: None,
                             db_end_time: None,
                             seat_layout_id: None,
+                            waybill_status: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -800,6 +802,7 @@ impl DBVehicleReader {
                             db_start_time: None,
                             db_end_time: None,
                             seat_layout_id: None,
+                            waybill_status: None,
                         }
                     };
 
@@ -979,7 +982,7 @@ impl DBVehicleReader {
         }
     }
 
-    /// Query for Processed/New waybills
+    /// Query for non-online waybills (Processed, New, Closed, Audited)
     async fn get_processed_new_waybill(&self, vehicle_no: &str) -> AppResult<Option<VehicleData>> {
         let fallback_query = r#"
             SELECT
@@ -999,10 +1002,12 @@ impl DBVehicleReader {
                 w.status AS status
             FROM waybills w
             LEFT JOIN entities e ON e.entity_id = w.entity_id
-            WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New') AND w.deleted = false
+            WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New', 'Closed', 'Audited') AND w.deleted = false
             ORDER BY CASE
                 WHEN w.status = 'Processed' THEN 1
-                WHEN w.status = 'New' THEN 2
+                WHEN w.status = 'New'       THEN 2
+                WHEN w.status = 'Closed'    THEN 3
+                WHEN w.status = 'Audited'   THEN 4
             END, w.updated_at DESC
             LIMIT 1
         "#;
@@ -1023,7 +1028,7 @@ impl DBVehicleReader {
         }
     }
 
-    /// Split waybill query strategy with priority: Online first, then Processed/New
+    /// Split waybill query strategy with priority: Online first, then Processed/New/Closed/Audited
     async fn get_waybill_with_priority(
         &self,
         vehicle_no: &str,
@@ -1033,12 +1038,16 @@ impl DBVehicleReader {
             return Ok((Some(online_waybill), WaybillStatus::Online));
         }
 
-        // Priority 2: Processed/New waybills
-        if let Some(processed_waybill) = self.get_processed_new_waybill(vehicle_no).await? {
-            return Ok((Some(processed_waybill), WaybillStatus::ProcessedOrNew));
+        // Priority 2: Processed/New/Closed/Audited waybills
+        if let Some(w) = self.get_processed_new_waybill(vehicle_no).await? {
+            let status = w
+                .status
+                .as_deref()
+                .map(WaybillStatus::from_db_str)
+                .unwrap_or(WaybillStatus::NotFound);
+            return Ok((Some(w), status));
         }
 
-        // No waybill found
         Ok((None, WaybillStatus::NotFound))
     }
 
@@ -1320,15 +1329,14 @@ impl DBVehicleReader {
                         .await
                 }
             }
-            WaybillStatus::ProcessedOrNew => {
-                // Always use detail trips, force first as active
+            WaybillStatus::Processed
+            | WaybillStatus::New
+            | WaybillStatus::Closed
+            | WaybillStatus::Audited => {
                 self.handle_detail_trips(&waybill_data, true, trip_number)
                     .await
             }
-            WaybillStatus::NotFound => {
-                // This shouldn't happen in this context
-                Ok((None, false, None))
-            }
+            WaybillStatus::NotFound => Ok((None, false, None)),
         }
     }
 
@@ -1460,7 +1468,7 @@ impl VehicleDataReader for DBVehicleReader {
 
                 // Resolve trip data based on waybill status and is_flexi flag
                 let (schedule_result, is_active_trip, remaining_trip_details) = self
-                    .resolve_trip_data(vehicle_data.clone(), waybill_status, trip_number)
+                    .resolve_trip_data(vehicle_data.clone(), waybill_status.clone(), trip_number)
                     .await?;
 
                 // Populate schedule_map for backward compatibility
@@ -1503,6 +1511,7 @@ impl VehicleDataReader for DBVehicleReader {
                     db_start_time: None,
                     db_end_time: None,
                     seat_layout_id: None,
+                    waybill_status: Some(waybill_status),
                 };
 
                 // Set route and trip details from active schedule
@@ -1569,6 +1578,7 @@ impl VehicleDataReader for DBVehicleReader {
                             db_start_time: None,
                             db_end_time: None,
                             seat_layout_id: None,
+                            waybill_status: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -1594,6 +1604,7 @@ impl VehicleDataReader for DBVehicleReader {
                             db_start_time: None,
                             db_end_time: None,
                             seat_layout_id: None,
+                            waybill_status: None,
                         }
                     };
 
@@ -1836,6 +1847,7 @@ impl VehicleDataReader for DBVehicleReader {
                 db_start_time: None,
                 db_end_time: None,
                 seat_layout_id: None,
+                waybill_status: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {

@@ -166,6 +166,9 @@ pub struct VehicleDataWithRouteId {
     #[sqlx(default)]
     #[serde(rename = "seatLayoutId")]
     pub seat_layout_id: Option<String>,
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub waybill_status: Option<WaybillStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -238,6 +241,15 @@ pub struct VehicleServiceTypeResponse {
     pub seat_layout_id: Option<String>,
     #[serde(rename = "busTagNumber")]
     pub bus_tag_number: Option<String>,
+    pub waybill_status: Option<WaybillStatus>,
+    pub is_historic: bool,
+    pub schedule_based_active_trip: Option<bool>,
+    /// Start time of the first/active trip (for schedule-based reconciliation)
+    #[serde(rename = "dbStartTime")]
+    pub db_start_time: Option<String>,
+    /// End time of the first/active trip (for schedule-based reconciliation)
+    #[serde(rename = "dbEndTime")]
+    pub db_end_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,11 +263,32 @@ pub struct VehicleMetadataResponse {
     pub is_actually_valid: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WaybillStatus {
     Online,
-    ProcessedOrNew,
+    Processed,
+    New,
+    Closed,
+    Audited,
     NotFound,
+}
+
+impl WaybillStatus {
+    pub fn from_db_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "online" => Self::Online,
+            "processed" => Self::Processed,
+            "new" => Self::New,
+            "closed" => Self::Closed,
+            "audited" => Self::Audited,
+            _ => Self::NotFound,
+        }
+    }
+
+    pub fn is_historic(&self) -> bool {
+        matches!(self, Self::Closed | Self::Audited)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
