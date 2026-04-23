@@ -1404,7 +1404,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         .and_then(|by_vehicle| by_vehicle.get(&vehicle_no))
         .cloned();
 
-    let service_type = get_vehicle_service_type_with_optional_chennai_cache(
+    let service_type = get_vehicle_service_type_with_optional_internal_cache(
         app_state.as_ref(),
         &gtfs_id,
         &vehicle_no,
@@ -1432,19 +1432,20 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
     }))
 }
 
-async fn get_vehicle_service_type_with_optional_chennai_cache(
+async fn get_vehicle_service_type_with_optional_internal_cache(
     app_state: &AppState,
     gtfs_id: &str,
     vehicle_no: &str,
 ) -> AppResult<Option<String>> {
-    if gtfs_id != "chennai_bus" {
+    if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
         return fetch_vehicle_service_type(app_state, gtfs_id, vehicle_no).await;
     }
 
+    let cache_key = format!("{}:{}", gtfs_id, vehicle_no);
     let now = Instant::now();
     {
         let cache = app_state.chennai_service_type_cache.read().await;
-        if let Some((expires_at, cached)) = cache.get(vehicle_no) {
+        if let Some((expires_at, cached)) = cache.get(&cache_key) {
             if *expires_at > now {
                 return Ok(cached.clone());
             }
@@ -1452,9 +1453,9 @@ async fn get_vehicle_service_type_with_optional_chennai_cache(
     }
     {
         let mut cache = app_state.chennai_service_type_cache.write().await;
-        if let Some((expires_at, _)) = cache.get(vehicle_no) {
+        if let Some((expires_at, _)) = cache.get(&cache_key) {
             if *expires_at <= now {
-                cache.remove(vehicle_no);
+                cache.remove(&cache_key);
             }
         }
     }
@@ -1462,7 +1463,7 @@ async fn get_vehicle_service_type_with_optional_chennai_cache(
     if computed.is_some() {
         let mut cache = app_state.chennai_service_type_cache.write().await;
         cache.insert(
-            vehicle_no.to_string(),
+            cache_key,
             (now + Duration::from_secs(60 * 60), computed.clone()),
         );
     }
@@ -2781,18 +2782,26 @@ pub async fn get_bus_trip_schedule(
         .await
         .unwrap_or_default();
 
-    // Fetch from external tables
-    let external_rows = app_state
-        .db_vehicle_reader
-        .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number)
-        .await?;
-
-    // Fetch from internal tables
-    let internal_rows = app_state
-        .db_vehicle_reader_internal
-        .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
-        .await
-        .unwrap_or_default();
+    // kolkata_bus: internal only; chennai_bus: both external + internal
+    let (external_rows, internal_rows) = if gtfs_id == "kolkata_bus" {
+        (vec![], app_state
+            .db_vehicle_reader_internal
+            .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
+            .await
+            .unwrap_or_default())
+    } else {
+        (
+            app_state
+                .db_vehicle_reader
+                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number)
+                .await?,
+            app_state
+                .db_vehicle_reader_internal
+                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
+                .await
+                .unwrap_or_default(),
+        )
+    };
 
     let all: Vec<crate::models::VehicleData> = external_rows
         .into_iter()
@@ -2872,10 +2881,12 @@ pub async fn get_bus_route_schedule(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
 
-    // chennai_bus guy
+    // chennai_bus / kolkata_bus - internal DB flow
     // Single join query returns waybills + trip (bstd & bstf) times
     // No per-vehicle get_vehicle_data call req
-    if gtfs_id == "chennai_bus" {
+    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
+        // kolkata_bus: internal reader only; chennai_bus: both internal + external
+        let is_kolkata = gtfs_id == "kolkata_bus";
         let just_internal = query.just_internal.unwrap_or(false);
         let just_external = query.just_external.unwrap_or(false);
         let vehicle_number = query.vehicle_number.as_deref();
@@ -2889,7 +2900,8 @@ pub async fn get_bus_route_schedule(
         let mut all_rows = Vec::new();
 
         // 1. Fetch from external (existing) tables unless justInternal is strictly true
-        if !just_internal {
+        //    Skip for kolkata_bus (internal only)
+        if !just_internal && !is_kolkata {
             let mut ext_rows = app_state
                 .db_vehicle_reader
                 .get_chennai_waybills_by_route_id(&route_id, vehicle_number)
