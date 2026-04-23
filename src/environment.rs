@@ -70,6 +70,8 @@ pub struct AppConfig {
     pub bhubaneswar_cache_update_interval: u64,
     pub bhubaneswar_external_auth: Option<String>,
     pub phone_number_hash_key: String,
+    /// Enable schedule-based active trip reconciliation (default: false)
+    pub enable_schedule_reconciliation: bool,
 }
 
 impl OtpConfig {

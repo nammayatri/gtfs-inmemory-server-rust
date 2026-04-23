@@ -10,6 +10,7 @@ use actix_web::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use chrono::Timelike;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -886,6 +887,241 @@ async fn fetch_vehicle_service_type(
         .await)
 }
 
+/// Reconcile active trip for chennai_bus using schedule times.
+/// Converts db_start_time/db_end_time to minutes, handles midnight crossing by adding 24h (1440 min),
+/// and finds the active trip based on current IST time.
+/// Cases:
+/// 1. Waybill status is Online/New/Processed in external, or Online in internal, AND no trip has is_active_trip
+/// 2. Waybill status is Closed/Audited in both readers (always apply)
+fn reconcile_active_trip_by_schedule(
+    response: &mut crate::models::VehicleServiceTypeResponse,
+    waybill_status: &crate::models::WaybillStatus,
+) {
+    use tracing::info;
+
+    // Determine if schedule-based reconciliation should apply
+    let should_apply = match waybill_status {
+        // Case 1: Online/New/Processed - apply only if no is_active_trip found
+        crate::models::WaybillStatus::Online
+        | crate::models::WaybillStatus::Processed
+        | crate::models::WaybillStatus::New => {
+            // Check if any trip has is_active_trip = true
+            let has_any_active = response.is_active_trip
+                || response
+                    .remaining_trip_details
+                    .as_ref()
+                    .map(|details| details.iter().any(|t| t.is_active_trip.unwrap_or(false)))
+                    .unwrap_or(false);
+            !has_any_active // Apply if NO active trip found
+        }
+        // Case 2: Closed/Audited - always apply
+        crate::models::WaybillStatus::Closed | crate::models::WaybillStatus::Audited => true,
+        _ => false,
+    };
+
+    if !should_apply {
+        response.schedule_based_active_trip = Some(false);
+        return;
+    }
+
+    // Take ownership of remaining trips (into local variable, leaving response empty temporarily)
+    let mut all_trips: Vec<crate::models::BusSchedule> =
+        response.remaining_trip_details.take().unwrap_or_default();
+
+    // If there's currently an "active" trip, we need to reconstruct it with proper schedule times.
+    // Try to find a matching trip in all_trips by trip_number to get the schedule times.
+    // If not found, we'll create a synthetic trip using the response's db_start_time/db_end_time.
+    if response.is_active_trip && response.trip_number.is_some() {
+        let current_trip_num = response.trip_number.unwrap();
+
+        if let Some(pos) = all_trips.iter().position(|t| t.trip_number == Some(current_trip_num)) {
+            // Found it - move it to the front
+            let trip = all_trips.remove(pos);
+            all_trips.insert(0, trip);
+        } else {
+            // Not found in remaining - create synthetic trip using response's db_start_time/db_end_time
+            let current_trip = crate::models::BusSchedule {
+                schedule_number: response.schedule_no.clone().unwrap_or_default(),
+                route_id: response.route_id.clone().unwrap_or_default(),
+                route_name: None,
+                org_name: response.depot_no.clone(),
+                trip_number: response.trip_number,
+                route_number: response.route_number.clone(),
+                stops_count: None,
+                is_active_trip: Some(true),
+                schedule_trip_id: None,
+                start_time: None,
+                end_time: None,
+                deleted: Some(false),
+                trip_order: response.trip_number,
+                db_start_time: response.db_start_time.clone(),
+                db_end_time: response.db_end_time.clone(),
+            };
+            all_trips.insert(0, current_trip);
+        }
+    }
+
+    // If there's no active trip but we have db_start_time/db_end_time in the response,
+    // create a synthetic trip for the first trip (this handles the case where first trip is not in remaining_trips)
+    if !response.is_active_trip && response.trip_number.is_some() && !all_trips.is_empty() {
+        // Check if the first trip (by trip_number order) is missing from all_trips
+        let first_trip_num = response.trip_number.unwrap();
+        let first_trip_exists = all_trips.iter().any(|t| t.trip_number == Some(first_trip_num));
+
+        if !first_trip_exists {
+            // Create synthetic first trip using response's db_start_time/db_end_time
+            let synthetic_first_trip = crate::models::BusSchedule {
+                schedule_number: response.schedule_no.clone().unwrap_or_default(),
+                route_id: response.route_id.clone().unwrap_or_default(),
+                route_name: None,
+                org_name: response.depot_no.clone(),
+                trip_number: response.trip_number,
+                route_number: response.route_number.clone(),
+                stops_count: None,
+                is_active_trip: Some(false),
+                schedule_trip_id: None,
+                start_time: None,
+                end_time: None,
+                deleted: Some(false),
+                trip_order: response.trip_number,
+                db_start_time: response.db_start_time.clone(),
+                db_end_time: response.db_end_time.clone(),
+            };
+            all_trips.insert(0, synthetic_first_trip);
+        }
+    }
+
+    if all_trips.is_empty() {
+        response.remaining_trip_details = Some(all_trips);
+        response.schedule_based_active_trip = Some(false);
+        return;
+    }
+
+    // Get current time in IST (UTC+5:30)
+    let now = chrono::Utc::now();
+    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    let ist_now = now.with_timezone(&ist_offset);
+    let current_minutes = (ist_now.hour() * 60 + ist_now.minute()) as i32;
+
+    // Parse time strings to minutes, handling HH:MM format
+    fn parse_time_to_minutes(time_str: &str) -> Option<i32> {
+        let parts: Vec<&str> = time_str.split(':').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let hh: i32 = parts[0].parse().ok()?;
+        let mm: i32 = parts[1].parse().ok()?;
+        Some(hh * 60 + mm)
+    }
+
+    // Convert trip times to minutes, handling midnight crossing
+    let mut trip_times: Vec<(usize, i32, i32, i32)> = Vec::new(); // (index, start_min, end_min, trip_num)
+    let mut last_end_time: Option<i32> = None;
+    let mut has_shifted_trips = false;
+
+    for (idx, trip) in all_trips.iter().enumerate() {
+        let start_min = trip.db_start_time.as_deref().and_then(parse_time_to_minutes);
+        let end_min = trip.db_end_time.as_deref().and_then(parse_time_to_minutes);
+        let trip_num = trip.trip_number.unwrap_or(0);
+
+        if let (Some(mut start), Some(mut end)) = (start_min, end_min) {
+            // Handle midnight crossing: if start < last_end, add 24h
+            if let Some(last_end) = last_end_time {
+                if start < last_end {
+                    start += 1440; // Add 24h in minutes
+                    end += 1440;
+                    has_shifted_trips = true;
+                }
+            }
+            trip_times.push((idx, start, end, trip_num));
+            last_end_time = Some(end);
+        }
+    }
+
+    if trip_times.is_empty() {
+        // Restore original remaining trips if we can't process
+        response.remaining_trip_details = Some(all_trips);
+        response.schedule_based_active_trip = Some(false);
+        return;
+    }
+
+    // Sort trip_times by start time
+    trip_times.sort_by_key(|(_, start, _, _)| *start);
+
+    // Adjust current_minutes for midnight comparison.
+    // If we have shifted trips and current time is before the first unshifted trip,
+    // add 1440 to current_minutes so we can compare in the same 0-2880 timeline.
+    let first_unshifted_start = trip_times
+        .iter()
+        .find(|(_, start, _, _)| *start < 1440)
+        .map(|(_, start, _, _)| *start);
+
+    let adjusted_current_minutes =
+        if has_shifted_trips && current_minutes < first_unshifted_start.unwrap_or(0) {
+            current_minutes + 1440
+        } else {
+            current_minutes
+        };
+
+    // Find the active trip: the last trip whose start time is <= current time
+    // If current time is before all trips, use the last trip (wrap around)
+    let mut active_trip_idx: Option<usize> = None;
+
+    // First pass: find last trip that has started
+    for (idx, start_min, _, _) in &trip_times {
+        if adjusted_current_minutes >= *start_min {
+            active_trip_idx = Some(*idx);
+        }
+    }
+
+    // If no active trip found (current time is before first trip),
+    // use the last trip in the day (could be post-midnight)
+    if active_trip_idx.is_none() && !trip_times.is_empty() {
+        active_trip_idx = Some(trip_times.last().unwrap().0);
+    }
+
+    let Some(active_idx) = active_trip_idx else {
+        response.remaining_trip_details = Some(all_trips);
+        response.schedule_based_active_trip = Some(false);
+        return;
+    };
+
+    // Get the active trip and its trip number
+    let mut active_trip = all_trips.remove(active_idx);
+    let active_trip_num = active_trip.trip_number.unwrap_or(0);
+
+    // Normalize is_active_trip flags: set active to true, all others to false
+    active_trip.is_active_trip = Some(true);
+
+    // Filter remaining trips to only include those AFTER the active trip (by trip_number)
+    // and ensure all have is_active_trip = false
+    let remaining_trips: Vec<crate::models::BusSchedule> = all_trips
+        .into_iter()
+        .filter(|t| t.trip_number.unwrap_or(0) > active_trip_num)
+        .map(|mut t| {
+            t.is_active_trip = Some(false);
+            t
+        })
+        .collect();
+
+    // Update response
+    response.is_active_trip = true;
+    response.trip_number = active_trip.trip_number;
+    response.route_id = Some(active_trip.route_id.clone());
+    response.route_number = active_trip.route_number.clone();
+    response.remaining_trip_details = if remaining_trips.is_empty() {
+        None
+    } else {
+        Some(remaining_trips)
+    };
+    response.schedule_based_active_trip = Some(true);
+
+    info!(
+        "Schedule-based reconciliation applied: trip {} is active",
+        response.trip_number.unwrap_or(0)
+    );
+}
+
 async fn get_service_type_by_vehicle_impl(
     app_state: Data<AppState>,
     gtfs_id: Option<&str>,
@@ -1021,6 +1257,11 @@ async fn get_service_type_by_vehicle_impl(
                 service_sub_types,
                 seat_layout_id,
                 bus_tag_number: tag_number,
+                waybill_status: None,
+                is_historic: false,
+                schedule_based_active_trip: None,
+                db_start_time: cached_data.db_start_time.clone(),
+                db_end_time: cached_data.db_end_time.clone(),
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -1064,6 +1305,11 @@ async fn get_service_type_by_vehicle_impl(
                     service_sub_types,
                     seat_layout_id,
                     bus_tag_number: tag_number,
+                    waybill_status: None,
+                    is_historic: false,
+                    schedule_based_active_trip: None,
+                    db_start_time: None,
+                    db_end_time: None,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -1155,7 +1401,13 @@ async fn get_service_type_by_vehicle_impl(
             .get_seat_layout_id(gtfs_id, &vehicle_data.vehicle_no)
             .await;
 
-        return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
+        let is_historic = vehicle_data
+            .waybill_status
+            .as_ref()
+            .map(|s| s.is_historic())
+            .unwrap_or(false);
+
+        let mut response = VehicleServiceTypeResponse {
             vehicle_no: vehicle_data.vehicle_no,
             service_type,
             waybill_id: vehicle_data.waybill_no,
@@ -1174,7 +1426,32 @@ async fn get_service_type_by_vehicle_impl(
             service_sub_types,
             seat_layout_id,
             bus_tag_number: tag_number,
-        }));
+            waybill_status: vehicle_data.waybill_status,
+            is_historic,
+            schedule_based_active_trip: None,
+            db_start_time: vehicle_data.db_start_time.clone(),
+            db_end_time: vehicle_data.db_end_time.clone(),
+        };
+
+        // Apply schedule-based reconciliation if enabled in config
+        if app_state.config.enable_schedule_reconciliation {
+            if let Some(status) = response.waybill_status.clone() {
+                reconcile_active_trip_by_schedule(&mut response, &status);
+            }
+        } else {
+            // Old behavior: set the first trip as active
+            if let Some(ref mut trips) = response.remaining_trip_details {
+                if let Some(first_trip) = trips.first_mut() {
+                    first_trip.is_active_trip = Some(true);
+                    response.is_active_trip = true;
+                    response.trip_number = first_trip.trip_number;
+                    response.route_id = Some(first_trip.route_id.clone());
+                    response.route_number = first_trip.route_number.clone();
+                }
+            }
+        }
+
+        return Ok(HttpResponse::Ok().json(response));
     }
 
     // For other gtfs_id, use the existing DB logic
@@ -1253,7 +1530,13 @@ async fn get_service_type_by_vehicle_impl(
         .get_seat_layout_id(gtfs_id, &vehicle_data.vehicle_no)
         .await;
 
-    Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
+    let is_historic = vehicle_data
+        .waybill_status
+        .as_ref()
+        .map(|s| s.is_historic())
+        .unwrap_or(false);
+
+    let mut response = VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
         waybill_id: vehicle_data.waybill_no,
@@ -1272,7 +1555,32 @@ async fn get_service_type_by_vehicle_impl(
         service_sub_types,
         seat_layout_id,
         bus_tag_number: tag_number,
-    }))
+        waybill_status: vehicle_data.waybill_status,
+        is_historic,
+        schedule_based_active_trip: None,
+        db_start_time: vehicle_data.db_start_time.clone(),
+        db_end_time: vehicle_data.db_end_time.clone(),
+    };
+
+    // Apply schedule-based reconciliation if enabled in config
+    if app_state.config.enable_schedule_reconciliation {
+        if let Some(status) = response.waybill_status.clone() {
+            reconcile_active_trip_by_schedule(&mut response, &status);
+        }
+    } else {
+        // Old behavior: set the first trip as active
+        if let Some(ref mut trips) = response.remaining_trip_details {
+            if let Some(first_trip) = trips.first_mut() {
+                first_trip.is_active_trip = Some(true);
+                response.is_active_trip = true;
+                response.trip_number = first_trip.trip_number;
+                response.route_id = Some(first_trip.route_id.clone());
+                response.route_number = first_trip.route_number.clone();
+            }
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(response))
 }
 
 #[derive(serde::Serialize)]
