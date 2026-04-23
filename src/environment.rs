@@ -12,7 +12,6 @@ use tokio::sync::RwLock;
 
 use crate::services::{
     chalo_vehicle_cache::ChaloVehicleCache,
-    osrtc_station_cache::OsrtcStationCache,
     db_employee_reader::{DBEmployeeReader, EmployeeReader, MockEmployeeReader},
     db_vehicle_reader::{DBVehicleReader, MockDBVehicleReader, VehicleDataReader},
     db_vehicle_reader_internal::{
@@ -21,6 +20,7 @@ use crate::services::{
     fleet_operator::{DBFleetOperatorService, FleetOperatorService, MockFleetOperatorService},
     gtfs_service::GTFSService,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
+    osrtc_station_cache::OsrtcStationCache,
     trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
@@ -338,7 +338,9 @@ impl AppState {
                     secret_key.clone(),
                     app_config.osrtc_station_refresh_interval_hours * 3600,
                 )?;
-                cache.initialize().await?;
+                if let Err(e) = cache.initialize().await {
+                    error!("OSRTC station cache initial load failed (will retry in background): {}", e);
+                }
                 Some(Arc::new(cache))
             }
             _ => {
