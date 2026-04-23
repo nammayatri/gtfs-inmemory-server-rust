@@ -272,7 +272,7 @@ impl DBVehicleReaderInternal {
                 );
 
                 let (schedule_result, is_active_trip, remaining_trip_details) = self
-                    .resolve_trip_data(vehicle_data.clone(), waybill_status, trip_number)
+                    .resolve_trip_data(vehicle_data.clone(), waybill_status.clone(), trip_number)
                     .await?;
 
                 if let Some(ref remaining) = remaining_trip_details {
@@ -314,6 +314,7 @@ impl DBVehicleReaderInternal {
                     db_start_time: None,
                     db_end_time: None,
                     seat_layout_id: None,
+                    waybill_status: Some(waybill_status),
                 };
 
                 if let Some(schedule) = schedule_result {
@@ -370,6 +371,7 @@ impl DBVehicleReaderInternal {
                 };
 
                 let out = if let Some(m) = minimal {
+                    let waybill_status = m.status.as_deref().map(WaybillStatus::from_db_str);
                     VehicleDataWithRouteId {
                         waybill_id: Some(m.waybill_id),
                         waybill_no: Some(m.waybill_no),
@@ -393,6 +395,7 @@ impl DBVehicleReaderInternal {
                         db_start_time: None,
                         db_end_time: None,
                         seat_layout_id: None,
+                        waybill_status,
                     }
                 } else {
                     VehicleDataWithRouteId {
@@ -418,6 +421,7 @@ impl DBVehicleReaderInternal {
                         db_start_time: None,
                         db_end_time: None,
                         seat_layout_id: None,
+                        waybill_status: None,
                     }
                 };
 
@@ -477,7 +481,7 @@ impl DBVehicleReaderInternal {
         }
     }
 
-    async fn get_processed_new_waybill(
+    async fn get_closed_audited_waybill(
         &self,
         vehicle_no: &str,
         gtfs_id: &str,
@@ -502,14 +506,13 @@ impl DBVehicleReaderInternal {
             LEFT JOIN entities_internal e
                    ON e.entity_id = w.entity_id AND e.gtfs_id = $2
             WHERE w.vehicle_no = $1
-              AND w.status IN ('processed', 'new', 'closed')
+              AND w.status IN ('closed', 'audited')
               AND w.deleted    = false
               AND w.gtfs_id   = $2
             ORDER BY
                 CASE
-                    WHEN w.status = 'processed' THEN 1
-                    WHEN w.status = 'new'       THEN 2
-                    WHEN w.status = 'closed'    THEN 3
+                    WHEN w.status = 'closed'    THEN 1
+                    WHEN w.status = 'audited'   THEN 2
                 END,
                 w.updated_at DESC
             LIMIT 1
@@ -540,8 +543,14 @@ impl DBVehicleReaderInternal {
         if let Some(w) = self.get_online_waybill(vehicle_no, gtfs_id).await? {
             return Ok((Some(w), WaybillStatus::Online));
         }
-        if let Some(w) = self.get_processed_new_waybill(vehicle_no, gtfs_id).await? {
-            return Ok((Some(w), WaybillStatus::ProcessedOrNew));
+        // Only consider Closed/Audited waybills, not New/Processed
+        if let Some(w) = self.get_closed_audited_waybill(vehicle_no, gtfs_id).await? {
+            let status = w
+                .status
+                .as_deref()
+                .map(WaybillStatus::from_db_str)
+                .unwrap_or(WaybillStatus::NotFound);
+            return Ok((Some(w), status));
         }
         Ok((None, WaybillStatus::NotFound))
     }
@@ -561,7 +570,10 @@ impl DBVehicleReaderInternal {
                         .await
                 }
             }
-            WaybillStatus::ProcessedOrNew => {
+            WaybillStatus::Processed
+            | WaybillStatus::New
+            | WaybillStatus::Closed
+            | WaybillStatus::Audited => {
                 self.handle_detail_trips(&waybill_data, true, trip_number)
                     .await
             }
