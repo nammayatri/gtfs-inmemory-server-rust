@@ -72,8 +72,11 @@ pub trait VehicleDataReader: Send + Sync {
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
-    async fn get_chennai_waybills_by_route_id(&self, route_id: &str)
-        -> AppResult<Vec<VehicleData>>;
+    async fn get_chennai_waybills_by_route_id(
+        &self,
+        route_id: &str,
+        vehicle_number: Option<String>,
+    ) -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybill_by_waybill_and_trip(
         &self,
         waybill_no: &str,
@@ -198,6 +201,7 @@ impl VehicleDataReader for MockDBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         _route_id: &str,
+        _vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -2157,13 +2161,25 @@ impl VehicleDataReader for DBVehicleReader {
     async fn get_chennai_waybills_by_route_id(
         &self,
         route_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
-        let cache_key = self.get_waybills_by_route_cache_key("chennai_bus", route_id);
+        // Normalize: trim and convert empty string to None to ensure cache key
+        // and SQL filter are consistent (Some("") would fallback to unfiltered cache
+        // but still filter by empty string in SQL, potentially poisoning the cache)
+        let vehicle_number = vehicle_number
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
 
-        // Check cache first
-        {
+        // Only cache unfiltered results to prevent unbounded cache growth
+        // from unique vehicle_number values
+        let cache_key = vehicle_number.is_none().then(|| {
+            self.get_waybills_by_route_cache_key("chennai_bus", route_id)
+        });
+
+        // Check cache first (only for unfiltered queries)
+        if let Some(ref key) = cache_key {
             let cache = self.waybills_by_route_cache.read().await;
-            if let Some((data, ts)) = cache.waybills_by_route.get(&cache_key) {
+            if let Some((data, ts)) = cache.waybills_by_route.get(key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
                     info!(
                         "get_chennai_waybills_by_route_id cache HIT for route_id={}",
@@ -2223,6 +2239,7 @@ impl VehicleDataReader for DBVehicleReader {
                 WHERE
                     w.status = 'Online'
                     AND w.deleted = false
+                    AND ($2::text IS NULL OR w.vehicle_no = $2)
                     AND (
                         (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                         OR
@@ -2237,6 +2254,7 @@ impl VehicleDataReader for DBVehicleReader {
 
         match sqlx::query_as::<_, VehicleData>(query)
             .bind(route_id)
+            .bind(vehicle_number)
             .fetch_all(&self.pool)
             .await
         {
@@ -2247,12 +2265,12 @@ impl VehicleDataReader for DBVehicleReader {
                     route_id
                 );
 
-                // Update cache
-                {
+                // Update cache only for unfiltered queries
+                if let Some(key) = cache_key {
                     let mut cache = self.waybills_by_route_cache.write().await;
                     cache
                         .waybills_by_route
-                        .insert(cache_key, (rows.clone(), SystemTime::now()));
+                        .insert(key, (rows.clone(), SystemTime::now()));
                 }
 
                 Ok(rows)

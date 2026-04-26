@@ -23,6 +23,7 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         &self,
         route_id: &str,
         gtfs_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>>;
     async fn get_chennai_waybill_by_waybill_and_trip(
         &self,
@@ -78,6 +79,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         &self,
         _route_id: &str,
         _gtfs_id: &str,
+        _vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
         Ok(Vec::new())
     }
@@ -867,6 +869,7 @@ impl DBVehicleReaderInternal {
         &self,
         route_id: &str,
         gtfs_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
         let pool = match &self.pool {
             Some(p) => p,
@@ -875,12 +878,23 @@ impl DBVehicleReaderInternal {
             }
         };
 
-        let cache_key = self.get_waybills_by_route_cache_key(gtfs_id, route_id);
+        // Normalize: trim and convert empty string to None to ensure cache key
+        // and SQL filter are consistent (Some("") would fallback to unfiltered cache
+        // but still filter by empty string in SQL, potentially poisoning the cache)
+        let vehicle_number = vehicle_number
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
 
-        // Check cache first
-        {
+        // Only cache unfiltered results to prevent unbounded cache growth
+        // from unique vehicle_number values
+        let cache_key = vehicle_number.is_none().then(|| {
+            self.get_waybills_by_route_cache_key(gtfs_id, route_id)
+        });
+
+        // Check cache first (only for unfiltered queries)
+        if let Some(ref key) = cache_key {
             let cache = self.waybills_by_route_cache.read().await;
-            if let Some((data, ts)) = cache.get(&cache_key) {
+            if let Some((data, ts)) = cache.get(key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
                     info!(
                         "internal get_chennai_waybills_by_route_id cache HIT for route_id={}",
@@ -944,6 +958,7 @@ impl DBVehicleReaderInternal {
                     w.status in ('online', 'upcoming')
                     AND w.deleted = false
                     AND w.gtfs_id = $2
+                    AND ($3::text IS NULL OR w.vehicle_no = $3)
                     AND (
                         (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                         OR
@@ -959,6 +974,7 @@ impl DBVehicleReaderInternal {
         match sqlx::query_as::<_, VehicleData>(query)
             .bind(route_id)
             .bind(gtfs_id)
+            .bind(vehicle_number)
             .fetch_all(pool)
             .await
         {
@@ -969,10 +985,10 @@ impl DBVehicleReaderInternal {
                     route_id
                 );
 
-                // Update cache
-                {
+                // Update cache only for unfiltered queries
+                if let Some(key) = cache_key {
                     let mut cache = self.waybills_by_route_cache.write().await;
-                    cache.insert(cache_key, (rows.clone(), SystemTime::now()));
+                    cache.insert(key, (rows.clone(), SystemTime::now()));
                 }
 
                 Ok(rows)
@@ -1157,8 +1173,9 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         &self,
         route_id: &str,
         gtfs_id: &str,
+        vehicle_number: Option<String>,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id)
+        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
             .await
     }
 
