@@ -789,7 +789,10 @@ impl GTFSService {
                     .insert(stop.cluster.clone().unwrap(), cluster_stop_res);
             }
 
-            stop_data.stops.insert(stop_code.to_string(), stop_res);
+            stop_data.stops.insert(stop_code.to_string(), stop_res.clone());
+            if stop.code != stop_code && !stop.code.is_empty() {
+                stop_data.stops.insert(stop.code.clone(), stop_res);
+            }
         }
 
         stops_by_gtfs
