@@ -4,12 +4,8 @@ use uuid::Uuid;
 
 pub fn generate_waybill_number() -> String {
     let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let random_suffix = Uuid::new_v4()
-        .to_string()
-        .replace('-', "")
-        .split_at(8)
-        .0
-        .to_string();
+    let uuid_hex = Uuid::new_v4().simple().to_string();
+    let random_suffix = &uuid_hex[..8];
     format!("T{}{}", timestamp, random_suffix)
 }
 
