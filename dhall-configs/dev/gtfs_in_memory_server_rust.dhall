@@ -5,6 +5,8 @@ let logger_cfg = {
     log_to_file = False
 }
 
+let secrets = ../secrets/gtfs_in_memory_server_rust.example.dhall
+
 in {
   -- Logger configuration
   logger_cfg = logger_cfg,
@@ -55,5 +57,13 @@ in {
 
   -- Bhubaneswar vehicle cache configuration
   bhubaneswar_cache_update_interval = 10,
-  phone_number_hash_key = "HASH_KEY"
+  phone_number_hash_key = "HASH_KEY",
+
+ enable_schedule_reconciliation=True,
+  -- OSRTC station cache configuration
+  osrtc_base_url = Some "OSRTC_BASE_URL",
+  osrtc_username = secrets.osrtc_username,
+  osrtc_secret_key = secrets.osrtc_secret_key,
+  osrtc_station_refresh_interval_hours = 1,
+  osrtc_feed_key = Some "odisha_osrtc"
 }

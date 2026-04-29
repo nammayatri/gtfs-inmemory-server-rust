@@ -41,6 +41,13 @@ async fn main() -> anyhow::Result<()> {
         chalo_cache_clone.start_background_update_task().await;
     });
 
+    // Start background task to periodically refresh OSRTC station list
+    if let Some(osrtc_cache) = app_state.osrtc_cache.clone() {
+        tokio::spawn(async move {
+            osrtc_cache.start_background_refresh_task().await;
+        });
+    }
+
     let prometheus = prometheus_metrics();
 
     // Create and run the web server with performance optimizations

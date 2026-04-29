@@ -20,6 +20,7 @@ use crate::services::{
     fleet_operator::{DBFleetOperatorService, FleetOperatorService, MockFleetOperatorService},
     gtfs_service::GTFSService,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
+    osrtc_station_cache::OsrtcStationCache,
     trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
@@ -72,6 +73,11 @@ pub struct AppConfig {
     pub phone_number_hash_key: String,
     /// Enable schedule-based active trip reconciliation (default: false)
     pub enable_schedule_reconciliation: bool,
+    pub osrtc_base_url: Option<String>,
+    pub osrtc_username: Option<String>,
+    pub osrtc_secret_key: Option<String>,
+    pub osrtc_station_refresh_interval_hours: u64,
+    pub osrtc_feed_key: Option<String>,
 }
 
 impl OtpConfig {
@@ -137,6 +143,7 @@ pub struct AppState {
     pub fleet_operator_service: Arc<dyn FleetOperatorService>,
     pub trip_service: Arc<TripService>,
     pub chalo_vehicle_cache: Arc<ChaloVehicleCache>,
+    pub osrtc_cache: Option<Arc<OsrtcStationCache>>,
     pub config: AppConfig,
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
@@ -299,6 +306,29 @@ impl AppState {
         chalo_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
         let chalo_vehicle_cache = Arc::new(chalo_vehicle_cache);
 
+        let osrtc_cache = match (
+            &app_config.osrtc_base_url,
+            &app_config.osrtc_username,
+            &app_config.osrtc_secret_key,
+        ) {
+            (Some(base_url), Some(username), Some(secret_key)) => {
+                let cache = OsrtcStationCache::new(
+                    base_url.clone(),
+                    username.clone(),
+                    secret_key.clone(),
+                    app_config.osrtc_station_refresh_interval_hours * 3600,
+                )?;
+                if let Err(e) = cache.initialize().await {
+                    error!("OSRTC station cache initial load failed (will retry in background): {}", e);
+                }
+                Some(Arc::new(cache))
+            }
+            _ => {
+                info!("OSRTC credentials not configured; OSRTC station cache disabled");
+                None
+            }
+        };
+
         // Load bus registration mapping from CSV
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
 
@@ -317,6 +347,7 @@ impl AppState {
             fleet_operator_service,
             trip_service,
             chalo_vehicle_cache,
+            osrtc_cache,
             config: app_config,
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),
@@ -379,10 +410,7 @@ impl AppState {
             }
         }
 
-        info!(
-            "Loaded fleet tag list for {} GTFS feeds",
-            fleet_map.len()
-        );
+        info!("Loaded fleet tag list for {} GTFS feeds", fleet_map.len());
 
         Ok(fleet_map)
     }
