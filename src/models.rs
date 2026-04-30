@@ -2,8 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Gate {
     #[serde(rename = "gateName")]
     pub gate_name: String,
@@ -13,7 +14,8 @@ pub struct Gate {
     pub lon: f64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Default, ToSchema)]
+#[schema(as = String, example = "ORDINARY")]
 pub enum ServiceTierType {
     #[default]
     Ordinary,
@@ -108,7 +110,7 @@ pub struct RouteServiceTierRecord {
     pub servicetier: ServiceTierType,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct VehicleData {
     pub waybill_id: String,
     pub waybill_no: String,
@@ -180,7 +182,7 @@ pub struct DepotVehicleSummary {
     pub vehicle_no: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct VehicleOperationData {
     pub waybill_id: Option<String>,
     pub waybill_no: Option<String>,
@@ -191,7 +193,7 @@ pub struct VehicleOperationData {
     pub depot_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct BusSchedule {
     pub schedule_number: String,
     pub route_id: String,
@@ -220,7 +222,7 @@ pub struct BusSchedule {
     pub db_end_time: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VehicleServiceTypeResponse {
     pub vehicle_no: String,
     pub service_type: Option<String>,
@@ -254,7 +256,7 @@ pub struct VehicleServiceTypeResponse {
     pub db_end_time: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VehicleMetadataResponse {
     #[serde(rename = "serviceType")]
     pub service_type: Option<String>,
@@ -265,7 +267,7 @@ pub struct VehicleMetadataResponse {
     pub is_actually_valid: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WaybillStatus {
     Online,
@@ -293,13 +295,13 @@ impl WaybillStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LatLong {
     pub lat: f64,
     pub lon: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NandiStop {
     pub id: String,
     pub code: String,
@@ -308,13 +310,13 @@ pub struct NandiStop {
     pub lon: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NandiTrip {
     pub id: String,
     pub direction: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NandiPattern {
     pub id: String,
     pub desc: String,
@@ -322,7 +324,7 @@ pub struct NandiPattern {
     pub route_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NandiPatternDetails {
     pub id: String,
     pub desc: Option<String>,
@@ -332,7 +334,7 @@ pub struct NandiPatternDetails {
     pub trips: Vec<NandiTrip>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NandiRoutesRes {
     pub id: String,
     #[serde(rename = "shortName")]
@@ -354,39 +356,49 @@ pub struct NandiRoutesRes {
     pub service_tier_type: Option<ServiceTierType>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RouteStopMapping {
     #[serde(rename = "estimatedTravelTimeFromPreviousStop")]
     pub estimated_travel_time_from_previous_stop: Option<i32>,
     #[serde(rename = "providerCode")]
+    #[schema(value_type = String)]
     pub provider_code: Arc<str>,
     #[serde(rename = "routeCode")]
+    #[schema(value_type = String)]
     pub route_code: Arc<str>,
     #[serde(rename = "sequenceNum")]
     pub sequence_num: i32,
     #[serde(rename = "stopCode")]
+    #[schema(value_type = String)]
     pub stop_code: Arc<str>,
     #[serde(rename = "stopName")]
+    #[schema(value_type = String)]
     pub stop_name: Arc<str>,
     #[serde(rename = "stopPoint")]
     pub stop_point: LatLong,
     #[serde(rename = "vehicleType")]
+    #[schema(value_type = String)]
     pub vehicle_type: Arc<str>,
     #[serde(rename = "geoJson")]
+    #[schema(value_type = Option<Object>)]
     pub geo_json: Option<serde_json::Value>,
     #[serde(rename = "gates")]
     pub gates: Option<Vec<Gate>>,
     #[serde(rename = "hindiName")]
+    #[schema(value_type = Option<String>)]
     pub hindi_name: Option<Arc<str>>,
     #[serde(rename = "regionalName")]
+    #[schema(value_type = Option<String>)]
     pub regional_name: Option<Arc<str>>,
     #[serde(rename = "platform")]
+    #[schema(value_type = Option<String>)]
     pub platform: Option<Arc<str>>,
     #[serde(rename = "parentStopCode")]
+    #[schema(value_type = Option<String>)]
     pub parent_stop_code: Option<Arc<str>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Stop {
     #[serde(rename = "stopCode")]
     pub stop_code: String,
@@ -398,7 +410,7 @@ pub struct Stop {
     pub vehicle_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GTFSStop {
     pub id: String,
     pub code: String,
@@ -452,7 +464,7 @@ pub struct ProviderStopCodeRecord {
     pub stop_code: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StopCodeFromProviderStopCodeResponse {
     pub stop_code: String,
 }
@@ -589,7 +601,7 @@ impl GTFSData {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, ToSchema)]
 pub struct MemoryUsageStats {
     pub total_bytes: usize,
     pub routes_bytes: usize,
@@ -632,7 +644,7 @@ pub struct SuburbanStopInfo {
     pub platforms: Vec<PlatformInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TripStopDetail {
     #[serde(rename = "stopId")]
     pub stop_id: String,
@@ -649,12 +661,13 @@ pub struct TripStopDetail {
     #[serde(rename = "scheduledDeparture")]
     pub scheduled_departure: i32,
     #[serde(rename = "headsign")]
+    #[schema(value_type = Object)]
     pub headsign: serde_json::Value,
     #[serde(rename = "stopPosition")]
     pub stop_position: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TripDetails {
     #[serde(rename = "tripId")]
     pub trip_id: String,
@@ -685,7 +698,7 @@ pub struct StaticFleetInfo {
     pub service_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct MinimalEmployee {
     pub token_no: Option<String>,
     pub first_name: String,
@@ -711,7 +724,7 @@ pub struct BusRegistrationMappingRecord {
     pub short_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BusStopETA {
     #[serde(rename = "stop_id")]
     pub stop_code: String,
@@ -723,7 +736,7 @@ pub struct BusStopETA {
     pub stop_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BusScheduleDetail {
     pub eta: Vec<BusStopETA>,
     #[serde(rename = "vehicle_no")]

@@ -50,7 +50,7 @@ pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"]
 pub const MAX_QUERY_LIMIT: i64 = 1000;
 pub const MAX_QUERY_FILTERS: usize = 5;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct QueryBody {
     pub filters: Vec<Vec<String>>,
     pub limit: Option<i64>,

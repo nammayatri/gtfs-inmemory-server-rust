@@ -1,11 +1,14 @@
 use actix_web::{web, App, HttpServer};
 use gtfs_routes_service::{
-    environment, handlers::routes, middleware::*, tools::prometheus::prometheus_metrics,
+    environment, handlers::routes, middleware::*, swagger::ApiDoc,
+    tools::prometheus::prometheus_metrics,
 };
 use shared::tools::logger::setup_tracing;
 use std::{env, net::Ipv4Addr};
 use tracing::{error, info};
 use tracing_actix_web::TracingLogger;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
 
     let prometheus = prometheus_metrics();
 
+    let openapi = ApiDoc::openapi();
+
     // Create and run the web server with performance optimizations
     HttpServer::new(move || {
         App::new()
@@ -50,6 +55,9 @@ async fn main() -> anyhow::Result<()> {
             .wrap(IncomingRequestMetrics)
             .wrap(TracingLogger::<DomainRootSpanBuilder>::new())
             .wrap(prometheus.clone())
+            .service(
+                SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
+            )
             .configure(routes::create_routes)
     })
     .bind((Ipv4Addr::UNSPECIFIED, port))?
