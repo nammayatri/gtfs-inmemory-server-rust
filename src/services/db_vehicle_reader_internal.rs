@@ -891,16 +891,13 @@ impl DBVehicleReaderInternal {
         };
 
         // Normalize: trim and convert empty string to None
-        let vehicle_number = vehicle_number
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty());
+        let vehicle_number = vehicle_number.map(|v| v.trim()).filter(|v| !v.is_empty());
 
         let is_filtered = vehicle_number.is_some();
 
         // Only cache unfiltered results to prevent unbounded cache growth
-        let cache_key = (!is_filtered).then(|| {
-            self.get_waybills_by_route_cache_key(gtfs_id, route_id)
-        });
+        let cache_key =
+            (!is_filtered).then(|| self.get_waybills_by_route_cache_key(gtfs_id, route_id));
 
         // Check cache first (only for unfiltered queries)
         if let Some(ref key) = cache_key {

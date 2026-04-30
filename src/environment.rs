@@ -379,10 +379,7 @@ impl AppState {
             }
         }
 
-        info!(
-            "Loaded fleet tag list for {} GTFS feeds",
-            fleet_map.len()
-        );
+        info!("Loaded fleet tag list for {} GTFS feeds", fleet_map.len());
 
         Ok(fleet_map)
     }

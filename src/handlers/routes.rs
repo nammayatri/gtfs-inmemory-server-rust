@@ -9,6 +9,7 @@ use actix_web::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use utoipa::ToSchema;
 
 use chrono::Timelike;
 use std::collections::HashMap;
@@ -19,8 +20,9 @@ use tracing::{error, info};
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
-    BusScheduleDetails, GTFSStop, NandiRoutesRes, RouteStopMapping,
-    StopCodeFromProviderStopCodeResponse, VehicleMetadataResponse, VehicleServiceTypeResponse,
+    BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats, MinimalEmployee,
+    NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
+    VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 // alias for query param map (string->string)
@@ -40,7 +42,7 @@ pub struct DirectionQuery {
     direction: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllRoutesByIdsRequest {
     #[serde(rename = "gtfsId")]
     pub gtfs_id: String,
@@ -48,7 +50,7 @@ pub struct GetAllRoutesByIdsRequest {
     pub route_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllStopsByIdsRequest {
     #[serde(rename = "gtfsId")]
     pub gtfs_id: String,
@@ -56,7 +58,7 @@ pub struct GetAllStopsByIdsRequest {
     pub stop_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllRouteStopMappingsByRouteCodesRequest {
     #[serde(rename = "gtfsId")]
     pub gtfs_id: String,
@@ -64,7 +66,7 @@ pub struct GetAllRouteStopMappingsByRouteCodesRequest {
     pub route_codes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllRouteStopMappingsByStopCodesRequest {
     #[serde(rename = "gtfsId")]
     pub gtfs_id: String,
@@ -72,13 +74,13 @@ pub struct GetAllRouteStopMappingsByStopCodesRequest {
     pub stop_codes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllVehiclesByIdsRequest {
     #[serde(rename = "vehicleIds")]
     pub vehicle_ids: Vec<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, ToSchema)]
 pub struct StationEtaUpsertRequest {
     #[serde(rename = "sourceStationCode")]
     pub source_station_code: String,
@@ -297,7 +299,17 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
     );
 }
 
-async fn get_example_trip(
+#[utoipa::path(
+    get,
+    path = "/example-trip/{gtfs_id}/{route_code}",
+    tag = "Trip",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("route_code" = String, Path, description = "Route code"),
+    ),
+    responses((status = 200, description = "Example trip details", body = TripDetails))
+)]
+pub async fn get_example_trip(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -309,12 +321,28 @@ async fn get_example_trip(
     Ok(HttpResponse::Ok().json(details))
 }
 
-async fn get_example_trip_map(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/example-trip-map",
+    tag = "Trip",
+    responses((status = 200, description = "Map of route codes to example trips"))
+)]
+pub async fn get_example_trip_map(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let map = app_state.gtfs_service.get_route_example_trip_map().await;
     Ok(HttpResponse::Ok().json(map))
 }
 
-async fn get_route(
+#[utoipa::path(
+    get,
+    path = "/route/{gtfs_id}/{route_id}",
+    tag = "Routes",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("route_id" = String, Path, description = "Route identifier"),
+    ),
+    responses((status = 200, description = "Route details", body = NandiRoutesRes))
+)]
+pub async fn get_route(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -326,7 +354,15 @@ async fn get_route(
     Ok(HttpResponse::Ok().json(route))
 }
 
-async fn get_routes_by_ids(
+#[utoipa::path(
+    post,
+    path = "/getRoutesByIds/{gtfs_id}",
+    tag = "Bulk",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = Vec<String>,
+    responses((status = 200, description = "Routes matching IDs", body = Vec<NandiRoutesRes>))
+)]
+pub async fn get_routes_by_ids(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<Vec<String>>,
@@ -340,7 +376,14 @@ async fn get_routes_by_ids(
     Ok(HttpResponse::Ok().json(routes))
 }
 
-async fn get_vehicle_data_eta(
+#[utoipa::path(
+    get,
+    path = "/getVehicle/{vehicle_no}",
+    tag = "Vehicle",
+    params(("vehicle_no" = String, Path, description = "Vehicle number")),
+    responses((status = 200, description = "Vehicle data with ETA", body = VehicleData))
+)]
+pub async fn get_vehicle_data_eta(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -360,7 +403,14 @@ async fn get_vehicle_data_eta(
     Ok(HttpResponse::Ok().json(vehicle_data))
 }
 
-async fn get_conductor_by_phone_number(
+#[utoipa::path(
+    get,
+    path = "/getConductor/byNumber/{phoneNumber}",
+    tag = "Vehicle",
+    params(("phoneNumber" = String, Path, description = "Phone number")),
+    responses((status = 200, description = "Conductor details", body = MinimalEmployee))
+)]
+pub async fn get_conductor_by_phone_number(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -386,7 +436,14 @@ async fn get_conductor_by_phone_number(
     }
 }
 
-async fn get_manager_by_phone_number(
+#[utoipa::path(
+    get,
+    path = "/getManager/byNumber/{phoneNumber}",
+    tag = "Vehicle",
+    params(("phoneNumber" = String, Path, description = "Phone number")),
+    responses((status = 200, description = "Depot manager details"))
+)]
+pub async fn get_manager_by_phone_number(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -403,7 +460,14 @@ async fn get_manager_by_phone_number(
     }
 }
 
-async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/routes/{gtfs_id}",
+    tag = "Routes",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of routes", body = Vec<NandiRoutesRes>))
+)]
+pub async fn get_routes(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let routes = app_state.gtfs_service.get_routes(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(routes))
@@ -417,7 +481,17 @@ fn strip_surrounding_quotes(s: &str) -> String {
         .to_string()
 }
 
-async fn get_vehicles_by_depot_query(
+#[utoipa::path(
+    get,
+    path = "/getVehiclesFrom",
+    tag = "Vehicle",
+    params(
+        ("depotName" = Option<String>, Query, description = "Depot name"),
+        ("depotId" = Option<String>, Query, description = "Depot ID"),
+    ),
+    responses((status = 200, description = "Vehicles from depot", body = Vec<VehicleData>))
+)]
+pub async fn get_vehicles_by_depot_query(
     app_state: Data<AppState>,
     query: Query<MapStringString>,
 ) -> AppResult<HttpResponse> {
@@ -463,17 +537,36 @@ async fn get_vehicles_by_depot_query(
     Ok(HttpResponse::BadRequest().body("Please provide depotName or depotId as query parameter"))
 }
 
-async fn get_depot_names(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/depotNames",
+    tag = "Vehicle",
+    responses((status = 200, description = "List of depot names", body = Vec<String>))
+)]
+pub async fn get_depot_names(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let names = app_state.db_vehicle_reader.get_depot_names().await?;
     Ok(HttpResponse::Ok().json(names))
 }
 
-async fn get_depot_ids(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/depotIds",
+    tag = "Vehicle",
+    responses((status = 200, description = "List of depot IDs", body = Vec<String>))
+)]
+pub async fn get_depot_ids(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let ids = app_state.db_vehicle_reader.get_depot_ids().await?;
     Ok(HttpResponse::Ok().json(ids))
 }
 
-async fn get_depot_name_by_id(
+#[utoipa::path(
+    get,
+    path = "/getDepotNameById/{depot_id}",
+    tag = "Vehicle",
+    params(("depot_id" = String, Path, description = "Depot ID")),
+    responses((status = 200, description = "Depot name", body = String))
+)]
+pub async fn get_depot_name_by_id(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -486,14 +579,27 @@ async fn get_depot_name_by_id(
     Ok(HttpResponse::Ok().json(depot_name))
 }
 
-async fn clear_depot_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    post,
+    path = "/depotDataCache/clear",
+    tag = "System",
+    responses((status = 200, description = "Depot cache cleared"))
+)]
+pub async fn clear_depot_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     app_state.db_vehicle_reader.clear_depot_cache().await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "message": "Depot cache cleared successfully"
     })))
 }
 
-async fn get_vehicle_operation_data(
+#[utoipa::path(
+    get,
+    path = "/vehicle-operation-data/{fleet_no}",
+    tag = "Vehicle",
+    params(("fleet_no" = String, Path, description = "Fleet number")),
+    responses((status = 200, description = "Vehicle operation data", body = VehicleOperationData))
+)]
+pub async fn get_vehicle_operation_data(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -505,7 +611,18 @@ async fn get_vehicle_operation_data(
     Ok(HttpResponse::Ok().json(operation_data))
 }
 
-async fn get_route_stop_mapping_by_route(
+#[utoipa::path(
+    get,
+    path = "/route-stop-mapping/{gtfs_id}/route/{route_code}",
+    tag = "Routes",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("route_code" = String, Path, description = "Route code"),
+        ("direction" = Option<String>, Query, description = "Direction filter"),
+    ),
+    responses((status = 200, description = "Route-stop mappings for route", body = Vec<RouteStopMapping>))
+)]
+pub async fn get_route_stop_mapping_by_route(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: Query<DirectionQuery>,
@@ -522,7 +639,18 @@ async fn get_route_stop_mapping_by_route(
     Ok(HttpResponse::Ok().json(mappings))
 }
 
-async fn get_route_stop_mapping_by_stop(
+#[utoipa::path(
+    get,
+    path = "/route-stop-mapping/{gtfs_id}/stop/{stop_code}",
+    tag = "Stops",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("stop_code" = String, Path, description = "Stop code"),
+        ("direction" = Option<String>, Query, description = "Direction filter"),
+    ),
+    responses((status = 200, description = "Route-stop mappings for stop", body = Vec<RouteStopMapping>))
+)]
+pub async fn get_route_stop_mapping_by_stop(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: Query<DirectionQuery>,
@@ -539,7 +667,18 @@ async fn get_route_stop_mapping_by_stop(
     Ok(HttpResponse::Ok().json(mappings))
 }
 
-async fn get_routes_fuzzy(
+#[utoipa::path(
+    get,
+    path = "/routes/{gtfs_id}/fuzzy/{query}",
+    tag = "Routes",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("query" = String, Path, description = "Fuzzy search query"),
+        ("limit" = Option<i32>, Query, description = "Max results to return"),
+    ),
+    responses((status = 200, description = "Fuzzy matched routes", body = Vec<NandiRoutesRes>))
+)]
+pub async fn get_routes_fuzzy(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: Query<LimitQuery>,
@@ -576,7 +715,14 @@ async fn get_routes_fuzzy(
     Ok(HttpResponse::Ok().json(unique_routes.into_values().collect::<Vec<_>>()))
 }
 
-async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/stops/{gtfs_id}",
+    tag = "Stops",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of stops", body = Vec<RouteStopMapping>))
+)]
+pub async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(stops))
@@ -615,7 +761,17 @@ pub fn merge_stop_and_mapping(
     }
 }
 
-async fn get_stop(
+#[utoipa::path(
+    get,
+    path = "/stop/{gtfs_id}/{stop_code}",
+    tag = "Stops",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("stop_code" = String, Path, description = "Stop code"),
+    ),
+    responses((status = 200, description = "Stop details", body = RouteStopMapping))
+)]
+pub async fn get_stop(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -628,7 +784,18 @@ async fn get_stop(
     Ok(HttpResponse::Ok().json(merged_stop))
 }
 
-async fn get_stops_fuzzy(
+#[utoipa::path(
+    get,
+    path = "/stops/{gtfs_id}/fuzzy/{query}",
+    tag = "Stops",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("query" = String, Path, description = "Fuzzy search query"),
+        ("limit" = Option<i32>, Query, description = "Max results to return"),
+    ),
+    responses((status = 200, description = "Fuzzy matched stops", body = Vec<GTFSStop>))
+)]
+pub async fn get_stops_fuzzy(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: Query<LimitQuery>,
@@ -656,7 +823,17 @@ async fn get_stops_fuzzy(
     Ok(HttpResponse::Ok().json(unique_stops.into_values().collect::<Vec<_>>()))
 }
 
-async fn get_stop_code_from_provider_stop_code(
+#[utoipa::path(
+    get,
+    path = "/stop-code/{gtfs_id}/{provider_stop_code}",
+    tag = "Stops",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("provider_stop_code" = String, Path, description = "Provider stop code"),
+    ),
+    responses((status = 200, description = "Mapped stop code", body = StopCodeFromProviderStopCodeResponse))
+)]
+pub async fn get_stop_code_from_provider_stop_code(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -668,7 +845,17 @@ async fn get_stop_code_from_provider_stop_code(
     Ok(HttpResponse::Ok().json(StopCodeFromProviderStopCodeResponse { stop_code }))
 }
 
-async fn get_station_children(
+#[utoipa::path(
+    get,
+    path = "/station-children/{gtfs_id}/{stop_code}",
+    tag = "Stops",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("stop_code" = String, Path, description = "Parent station stop code"),
+    ),
+    responses((status = 200, description = "Child stops of station"))
+)]
+pub async fn get_station_children(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -680,7 +867,13 @@ async fn get_station_children(
     Ok(HttpResponse::Ok().json(children))
 }
 
-async fn readiness_probe(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/ready",
+    tag = "System",
+    responses((status = 200, description = "Service is ready"))
+)]
+pub async fn readiness_probe(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     if !app_state.gtfs_service.is_ready().await {
         return Err(AppError::NotReady(
             "Service not ready - still loading initial data".to_string(),
@@ -693,7 +886,14 @@ async fn readiness_probe(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     })))
 }
 
-async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/version/{gtfs_id}",
+    tag = "System",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "Data version hash"))
+)]
+pub async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let version = app_state.gtfs_service.get_version(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(version))
@@ -708,7 +908,19 @@ struct TripQuery {
     cur_time: Option<String>,
 }
 
-async fn get_service_type_by_vehicle(
+#[utoipa::path(
+    get,
+    path = "/vehicle/{vehicle_no}/service-type",
+    tag = "Vehicle",
+    params(
+        ("vehicle_no" = String, Path, description = "Vehicle number"),
+        ("trip_number" = Option<i32>, Query, description = "Trip number"),
+        ("passVerifyReq" = Option<bool>, Query, description = "Whether pass verification is required"),
+        ("cur_time" = Option<String>, Query, description = "Override current time (HH:MM)"),
+    ),
+    responses((status = 200, description = "Vehicle service type info (deprecated)", body = VehicleServiceTypeResponse))
+)]
+pub async fn get_service_type_by_vehicle(
     app_state: Data<AppState>,
     path: Path<String>,
     params: web::Query<TripQuery>,
@@ -717,7 +929,20 @@ async fn get_service_type_by_vehicle(
     get_service_type_by_vehicle_impl(app_state, None, &vehicle_no, params).await
 }
 
-async fn get_service_type_by_vehicle_by_gtfs_id(
+#[utoipa::path(
+    get,
+    path = "/vehicle/{gtfs_id}/service-type/{vehicle_no}",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_no" = String, Path, description = "Vehicle number"),
+        ("trip_number" = Option<i32>, Query, description = "Trip number"),
+        ("passVerifyReq" = Option<bool>, Query, description = "Whether pass verification is required"),
+        ("cur_time" = Option<String>, Query, description = "Override current time (HH:MM)"),
+    ),
+    responses((status = 200, description = "Vehicle service type info", body = VehicleServiceTypeResponse))
+)]
+pub async fn get_service_type_by_vehicle_by_gtfs_id(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     params: web::Query<TripQuery>,
@@ -733,7 +958,17 @@ async fn get_service_type_by_vehicle_by_gtfs_id(
     .await
 }
 
-async fn get_vehicle_metadata_by_gtfs_id(
+#[utoipa::path(
+    get,
+    path = "/vehicle/{gtfs_id}/metadata/{vehicle_no}",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_no" = String, Path, description = "Vehicle number"),
+    ),
+    responses((status = 200, description = "Vehicle metadata", body = VehicleMetadataResponse))
+)]
+pub async fn get_vehicle_metadata_by_gtfs_id(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     params: web::Query<TripQuery>,
@@ -937,7 +1172,10 @@ fn reconcile_active_trip_by_schedule(
     if response.is_active_trip && response.trip_number.is_some() {
         let current_trip_num = response.trip_number.unwrap();
 
-        if let Some(pos) = all_trips.iter().position(|t| t.trip_number == Some(current_trip_num)) {
+        if let Some(pos) = all_trips
+            .iter()
+            .position(|t| t.trip_number == Some(current_trip_num))
+        {
             // Found it - move it to the front
             let trip = all_trips.remove(pos);
             all_trips.insert(0, trip);
@@ -969,7 +1207,9 @@ fn reconcile_active_trip_by_schedule(
     if !response.is_active_trip && response.trip_number.is_some() && !all_trips.is_empty() {
         // Check if the first trip (by trip_number order) is missing from all_trips
         let first_trip_num = response.trip_number.unwrap();
-        let first_trip_exists = all_trips.iter().any(|t| t.trip_number == Some(first_trip_num));
+        let first_trip_exists = all_trips
+            .iter()
+            .any(|t| t.trip_number == Some(first_trip_num));
 
         if !first_trip_exists {
             // Create synthetic first trip using response's db_start_time/db_end_time
@@ -1035,7 +1275,10 @@ fn reconcile_active_trip_by_schedule(
     let mut has_shifted_trips = false;
 
     for (idx, trip) in all_trips.iter().enumerate() {
-        let start_min = trip.db_start_time.as_deref().and_then(parse_time_to_minutes);
+        let start_min = trip
+            .db_start_time
+            .as_deref()
+            .and_then(parse_time_to_minutes);
         let end_min = trip.db_end_time.as_deref().and_then(parse_time_to_minutes);
         let trip_num = trip.trip_number.unwrap_or(0);
 
@@ -1459,7 +1702,11 @@ async fn get_service_type_by_vehicle_impl(
         // Apply schedule-based reconciliation if enabled in config
         if app_state.config.enable_schedule_reconciliation {
             if let Some(status) = response.waybill_status.clone() {
-                reconcile_active_trip_by_schedule(&mut response, &status, params.cur_time.as_deref());
+                reconcile_active_trip_by_schedule(
+                    &mut response,
+                    &status,
+                    params.cur_time.as_deref(),
+                );
             }
         } else {
             // Old behavior: set the first trip as active
@@ -1622,7 +1869,17 @@ struct VehicleInfoResponse {
     seat_layout_id: Option<String>,
 }
 
-async fn get_vehicle_info(
+#[utoipa::path(
+    get,
+    path = "/vehicle/{gtfs_id}/{vehicle_no}/info",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_no" = String, Path, description = "Vehicle number"),
+    ),
+    responses((status = 200, description = "Vehicle info"))
+)]
+pub async fn get_vehicle_info(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -1653,19 +1910,37 @@ async fn get_vehicle_info(
     Ok(HttpResponse::Ok().json(resp))
 }
 
-async fn get_memory_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/memory-stats",
+    tag = "System",
+    responses((status = 200, description = "Memory usage statistics", body = MemoryUsageStats))
+)]
+pub async fn get_memory_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let stats = app_state.gtfs_service.get_memory_stats().await;
     Ok(HttpResponse::Ok().json(stats))
 }
 
-async fn get_all_cached_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/cached-data",
+    tag = "System",
+    responses((status = 200, description = "All cached GTFS data"))
+)]
+pub async fn get_all_cached_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let bytes = app_state.gtfs_service.get_cached_data_bytes().await;
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .body(bytes.to_vec()))
 }
 
-async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/config",
+    tag = "System",
+    responses((status = 200, description = "Current server configuration"))
+)]
+pub async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     // Get feeds loaded in memory from routes
     let feeds_in_memory = app_state.gtfs_service.get_feeds_in_memory().await;
 
@@ -1677,17 +1952,24 @@ async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     Ok(HttpResponse::Ok().json(response))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct GraphQLRequest {
-    query: String,
-    variables: Option<serde_json::Value>,
-    operation_name: Option<String>,
-    city: Option<String>,
+#[derive(Debug, serde::Deserialize, ToSchema)]
+pub struct GraphQLRequest {
+    pub query: String,
+    pub variables: Option<serde_json::Value>,
+    pub operation_name: Option<String>,
+    pub city: Option<String>,
     #[serde(alias = "feedId")]
-    gtfs_id: Option<String>, // accept "feedId" as "gtfs_id"
+    pub gtfs_id: Option<String>,
 }
 
-async fn graphql_query(
+#[utoipa::path(
+    post,
+    path = "/graphql",
+    tag = "System",
+    request_body = GraphQLRequest,
+    responses((status = 200, description = "GraphQL query result"))
+)]
+pub async fn graphql_query(
     app_state: Data<AppState>,
     payload: Json<GraphQLRequest>,
 ) -> AppResult<HttpResponse> {
@@ -1708,7 +1990,13 @@ async fn graphql_query(
     Ok(HttpResponse::Ok().json(result))
 }
 
-async fn get_connection_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/connection-stats",
+    tag = "System",
+    responses((status = 200, description = "Database and HTTP connection statistics"))
+)]
+pub async fn get_connection_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     // Get configuration-based connection stats
     let db_stats = serde_json::json!({
         "database": {
@@ -1747,7 +2035,18 @@ async fn get_connection_stats(app_state: Data<AppState>) -> AppResult<HttpRespon
     })))
 }
 
-async fn get_trip_data(
+#[utoipa::path(
+    get,
+    path = "/trip/{trip_id}",
+    tag = "Trip",
+    params(
+        ("trip_id" = String, Path, description = "Trip identifier"),
+        ("gtfs_id" = Option<String>, Query, description = "GTFS feed identifier"),
+        ("city" = Option<String>, Query, description = "City name"),
+    ),
+    responses((status = 200, description = "Trip data", body = TripDetails))
+)]
+pub async fn get_trip_data(
     app_state: Data<AppState>,
     path: Path<String>,
     query: Query<TripQueryParams>,
@@ -1927,7 +2226,19 @@ pub struct BusRouteScheduleQuery {
     pub vehicle_number: Option<String>,
 }
 
-async fn get_bus_trip_schedule(
+#[utoipa::path(
+    get,
+    path = "/bus-trip-schedule/{gtfs_id}/{waybill_no}/{trip_number}/{route_id}",
+    tag = "Schedule",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("waybill_no" = String, Path, description = "Waybill number"),
+        ("trip_number" = i32, Path, description = "Trip number"),
+        ("route_id" = String, Path, description = "Route identifier"),
+    ),
+    responses((status = 200, description = "Bus trip schedule", body = Vec<BusScheduleDetail>))
+)]
+pub async fn get_bus_trip_schedule(
     app_state: Data<AppState>,
     path: Path<(String, String, i32, String)>,
 ) -> AppResult<HttpResponse> {
@@ -2010,7 +2321,20 @@ async fn get_bus_trip_schedule(
     Ok(HttpResponse::Ok().json(schedule_details))
 }
 
-async fn get_bus_route_schedule(
+#[utoipa::path(
+    get,
+    path = "/bus-route-schedule/{gtfs_id}/{route_id}",
+    tag = "Schedule",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("route_id" = String, Path, description = "Route identifier"),
+        ("justInternal" = Option<bool>, Query, description = "Only internal vehicles"),
+        ("justExternal" = Option<bool>, Query, description = "Only external vehicles"),
+        ("vehicleNumber" = Option<String>, Query, description = "Filter by vehicle number"),
+    ),
+    responses((status = 200, description = "Bus route schedule", body = Vec<BusScheduleDetail>))
+)]
+pub async fn get_bus_route_schedule(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: web::Query<BusRouteScheduleQuery>,
@@ -2240,19 +2564,37 @@ async fn get_bus_route_schedule(
     Ok(HttpResponse::Ok().json(schedule_details))
 }
 
-async fn get_trip_cache_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/trip-cache/stats",
+    tag = "System",
+    responses((status = 200, description = "Trip cache statistics"))
+)]
+pub async fn get_trip_cache_stats(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let stats = app_state.trip_service.get_cache_stats().await;
     Ok(HttpResponse::Ok().json(stats))
 }
 
-async fn clear_trip_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    post,
+    path = "/trip-cache/clear",
+    tag = "System",
+    responses((status = 200, description = "Trip cache cleared"))
+)]
+pub async fn clear_trip_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     app_state.trip_service.clear_cache().await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "message": "Trip cache cleared successfully"
     })))
 }
 
-async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    post,
+    path = "/refresh-data",
+    tag = "System",
+    responses((status = 200, description = "GTFS data refresh initiated"))
+)]
+pub async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     // Trigger a background refresh of GTFS data
     let gtfs_service = app_state.gtfs_service.clone();
 
@@ -2271,7 +2613,14 @@ async fn force_refresh_data(app_state: Data<AppState>) -> AppResult<HttpResponse
     })))
 }
 
-async fn get_all_routes_by_ids(
+#[utoipa::path(
+    post,
+    path = "/getAllRoutesByIds",
+    tag = "Bulk",
+    request_body = GetAllRoutesByIdsRequest,
+    responses((status = 200, description = "Routes matching IDs", body = Vec<NandiRoutesRes>))
+)]
+pub async fn get_all_routes_by_ids(
     app_state: Data<AppState>,
     payload: Json<GetAllRoutesByIdsRequest>,
 ) -> AppResult<HttpResponse> {
@@ -2283,7 +2632,14 @@ async fn get_all_routes_by_ids(
     Ok(HttpResponse::Ok().json(routes))
 }
 
-async fn get_all_stops_by_ids(
+#[utoipa::path(
+    post,
+    path = "/getAllStopsByIds",
+    tag = "Bulk",
+    request_body = GetAllStopsByIdsRequest,
+    responses((status = 200, description = "Stops matching IDs", body = Vec<GTFSStop>))
+)]
+pub async fn get_all_stops_by_ids(
     app_state: Data<AppState>,
     payload: Json<GetAllStopsByIdsRequest>,
 ) -> AppResult<HttpResponse> {
@@ -2295,7 +2651,14 @@ async fn get_all_stops_by_ids(
     Ok(HttpResponse::Ok().json(stops))
 }
 
-async fn get_all_route_stop_mappings_by_route_codes(
+#[utoipa::path(
+    post,
+    path = "/getAllRouteStopMappingsByRouteCodes",
+    tag = "Bulk",
+    request_body = GetAllRouteStopMappingsByRouteCodesRequest,
+    responses((status = 200, description = "Route-stop mappings for route codes", body = Vec<RouteStopMapping>))
+)]
+pub async fn get_all_route_stop_mappings_by_route_codes(
     app_state: Data<AppState>,
     payload: Json<GetAllRouteStopMappingsByRouteCodesRequest>,
 ) -> AppResult<HttpResponse> {
@@ -2307,7 +2670,14 @@ async fn get_all_route_stop_mappings_by_route_codes(
     Ok(HttpResponse::Ok().json(mappings))
 }
 
-async fn get_all_route_stop_mappings_by_stop_codes(
+#[utoipa::path(
+    post,
+    path = "/getAllRouteStopMappingsByStopCodes",
+    tag = "Bulk",
+    request_body = GetAllRouteStopMappingsByStopCodesRequest,
+    responses((status = 200, description = "Route-stop mappings for stop codes", body = Vec<RouteStopMapping>))
+)]
+pub async fn get_all_route_stop_mappings_by_stop_codes(
     app_state: Data<AppState>,
     payload: Json<GetAllRouteStopMappingsByStopCodesRequest>,
 ) -> AppResult<HttpResponse> {
@@ -2319,7 +2689,14 @@ async fn get_all_route_stop_mappings_by_stop_codes(
     Ok(HttpResponse::Ok().json(mappings))
 }
 
-async fn get_all_vehicles_by_ids(
+#[utoipa::path(
+    post,
+    path = "/getAllVehiclesByIds",
+    tag = "Bulk",
+    request_body = GetAllVehiclesByIdsRequest,
+    responses((status = 200, description = "Vehicles matching IDs", body = Vec<VehicleData>))
+)]
+pub async fn get_all_vehicles_by_ids(
     app_state: Data<AppState>,
     payload: Json<GetAllVehiclesByIdsRequest>,
 ) -> AppResult<HttpResponse> {
@@ -2331,7 +2708,17 @@ async fn get_all_vehicles_by_ids(
     Ok(HttpResponse::Ok().json(vehicles))
 }
 
-async fn get_vehicles_by_service_tier(
+#[utoipa::path(
+    get,
+    path = "/vehicles/{gtfs_id}/list/service-tier/{serviceTier}",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("serviceTier" = String, Path, description = "Service tier type"),
+    ),
+    responses((status = 200, description = "Vehicles by service tier", body = Vec<VehicleData>))
+)]
+pub async fn get_vehicles_by_service_tier(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -2344,7 +2731,17 @@ async fn get_vehicles_by_service_tier(
     Ok(HttpResponse::Ok().json(vehicles))
 }
 
-async fn get_alternate_stops(
+#[utoipa::path(
+    get,
+    path = "/alternateStops/{gtfs_id}/{stop_code}",
+    tag = "Stops",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("stop_code" = String, Path, description = "Stop code"),
+    ),
+    responses((status = 200, description = "Alternate stops", body = Vec<RouteStopMapping>))
+)]
+pub async fn get_alternate_stops(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
@@ -2361,7 +2758,14 @@ async fn get_alternate_stops(
     Ok(HttpResponse::Ok().json(merged_stops))
 }
 
-async fn get_cache_data_by_gtfs_id(
+#[utoipa::path(
+    get,
+    path = "/cache-data/{gtfs_id}",
+    tag = "System",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "Cached vehicle data for feed"))
+)]
+pub async fn get_cache_data_by_gtfs_id(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -2385,47 +2789,57 @@ fn check_gtfs_id(gtfs_id: &str) -> AppResult<()> {
     }
 }
 
-#[derive(Deserialize)]
-struct PaginationQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
+#[derive(Deserialize, ToSchema)]
+pub struct PaginationQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct TokenQuery {
-    token: String,
+#[derive(Deserialize, ToSchema)]
+pub struct TokenQuery {
+    pub token: String,
 }
 
-#[derive(Deserialize)]
-struct ScheduleNumberQuery {
+#[derive(Deserialize, ToSchema)]
+pub struct ScheduleNumberQuery {
     #[serde(rename = "scheduleNumber")]
-    schedule_number: String,
+    pub schedule_number: String,
 }
 
-#[derive(Deserialize)]
-struct RoleQuery {
-    role: String,
+#[derive(Deserialize, ToSchema)]
+pub struct RoleQuery {
+    pub role: String,
 }
 
-#[derive(Deserialize)]
-struct UpdateWaybillStatusBody {
-    waybill_id: i64,
-    status: String,
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateWaybillStatusBody {
+    pub waybill_id: i64,
+    pub status: String,
 }
 
-#[derive(Deserialize)]
-struct UpdateWaybillFleetBody {
-    waybill_id: i64,
-    fleet_no: String,
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateWaybillFleetBody {
+    pub waybill_id: i64,
+    pub fleet_no: String,
 }
 
-#[derive(Deserialize)]
-struct UpdateWaybillTabletBody {
-    waybill_id: i64,
-    tablet_id: String,
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateWaybillTabletBody {
+    pub waybill_id: i64,
+    pub tablet_id: String,
 }
 
-async fn get_one_row(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/crud/{table}",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    responses((status = 200, description = "Single row from table"))
+)]
+pub async fn get_one_row(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: Query<HashMap<String, String>>,
@@ -2444,7 +2858,19 @@ async fn get_one_row(
     }
 }
 
-async fn get_all_rows(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/crud/{table}/all",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("table" = String, Path, description = "Table name"),
+        ("limit" = Option<i64>, Query, description = "Limit (default 15)"),
+        ("offset" = Option<i64>, Query, description = "Offset (default 0)"),
+    ),
+    responses((status = 200, description = "All rows from table"))
+)]
+pub async fn get_all_rows(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     query: Query<PaginationQuery>,
@@ -2463,7 +2889,18 @@ async fn get_all_rows(
     Ok(HttpResponse::Ok().json(rows))
 }
 
-async fn query_rows_handler(
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/crud/{table}/query",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    request_body = QueryBody,
+    responses((status = 200, description = "Filtered rows from table"))
+)]
+pub async fn query_rows_handler(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     body: Json<QueryBody>,
@@ -2479,7 +2916,18 @@ async fn query_rows_handler(
     Ok(HttpResponse::Ok().json(rows))
 }
 
-async fn delete_one_row(
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/crud/{table}/delete",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    request_body = serde_json::Value,
+    responses((status = 200, description = "Row deleted"))
+)]
+pub async fn delete_one_row(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     body: Json<Value>,
@@ -2498,7 +2946,18 @@ async fn delete_one_row(
     })))
 }
 
-async fn upsert_one_row(
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/crud/{table}/upsert",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    request_body = serde_json::Value,
+    responses((status = 200, description = "Row upserted"))
+)]
+pub async fn upsert_one_row(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     body: Json<Value>,
@@ -2530,7 +2989,14 @@ async fn upsert_one_row(
     Ok(HttpResponse::Ok().json(result))
 }
 
-async fn get_service_types(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/service-types",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of service types"))
+)]
+pub async fn get_service_types(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -2543,7 +3009,14 @@ async fn get_service_types(
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn get_operator_routes(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/routes",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of operator routes"))
+)]
+pub async fn get_operator_routes(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -2553,7 +3026,14 @@ async fn get_operator_routes(
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn get_depots(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/depots",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of depots"))
+)]
+pub async fn get_depots(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let list = app_state
@@ -2563,13 +3043,27 @@ async fn get_depots(app_state: Data<AppState>, path: Path<String>) -> AppResult<
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn get_shift_types(path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/shift-types",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of shift types"))
+)]
+pub async fn get_shift_types(path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     Ok(HttpResponse::Ok().json(shift_types()))
 }
 
-async fn get_schedule_numbers(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/schedule-numbers",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of schedule numbers"))
+)]
+pub async fn get_schedule_numbers(
     app_state: Data<AppState>,
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
@@ -2582,25 +3076,56 @@ async fn get_schedule_numbers(
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn get_day_types(path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/day-types",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of day types"))
+)]
+pub async fn get_day_types(path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     Ok(HttpResponse::Ok().json(day_types()))
 }
 
-async fn get_trip_types(path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/trip-types",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of trip types"))
+)]
+pub async fn get_trip_types(path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     Ok(HttpResponse::Ok().json(trip_types()))
 }
 
-async fn get_break_types_handler(path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/break-types",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of break types"))
+)]
+pub async fn get_break_types_handler(path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     Ok(HttpResponse::Ok().json(break_types()))
 }
 
-async fn get_trip_details(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/trip-details",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("scheduleNumber" = String, Query, description = "Schedule number"),
+    ),
+    responses((status = 200, description = "Trip details for schedule"))
+)]
+pub async fn get_trip_details(
     app_state: Data<AppState>,
     path: Path<String>,
     query: Query<ScheduleNumberQuery>,
@@ -2614,14 +3139,31 @@ async fn get_trip_details(
     Ok(HttpResponse::Ok().json(details))
 }
 
-async fn get_fleets(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/fleets",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of fleets"))
+)]
+pub async fn get_fleets(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let list = app_state.operator_service.get_fleets(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn get_conductor_data(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/conductors",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("token" = String, Query, description = "Conductor token"),
+    ),
+    responses((status = 200, description = "Conductor data"))
+)]
+pub async fn get_conductor_data(
     app_state: Data<AppState>,
     path: Path<String>,
     query: Query<TokenQuery>,
@@ -2638,7 +3180,17 @@ async fn get_conductor_data(
     }
 }
 
-async fn get_driver_info(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/drivers",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("token" = String, Query, description = "Driver token"),
+    ),
+    responses((status = 200, description = "Driver info"))
+)]
+pub async fn get_driver_info(
     app_state: Data<AppState>,
     path: Path<String>,
     query: Query<TokenQuery>,
@@ -2655,21 +3207,51 @@ async fn get_driver_info(
     }
 }
 
-async fn get_device_ids(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/device-ids",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of device IDs"))
+)]
+pub async fn get_device_ids(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let ids = app_state.operator_service.get_device_ids(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(ids))
 }
 
-async fn get_tablet_ids(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/tablet-ids",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "List of tablet IDs"))
+)]
+pub async fn get_tablet_ids(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
     let ids = app_state.operator_service.get_tablet_ids(&gtfs_id).await?;
     Ok(HttpResponse::Ok().json(ids))
 }
 
-async fn get_operators(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/operators",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("role" = String, Query, description = "Role: 'drivers' or 'conductors'"),
+    ),
+    responses((status = 200, description = "List of operators"))
+)]
+pub async fn get_operators(
     app_state: Data<AppState>,
     path: Path<String>,
     query: Query<RoleQuery>,
@@ -2691,7 +3273,15 @@ async fn get_operators(
     Ok(HttpResponse::Ok().json(list))
 }
 
-async fn update_waybill_status(
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill/status",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = UpdateWaybillStatusBody,
+    responses((status = 200, description = "Waybill status updated"))
+)]
+pub async fn update_waybill_status(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<UpdateWaybillStatusBody>,
@@ -2711,7 +3301,15 @@ async fn update_waybill_status(
     })))
 }
 
-async fn update_waybill_fleet(
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill/fleet",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = UpdateWaybillFleetBody,
+    responses((status = 200, description = "Waybill fleet number updated"))
+)]
+pub async fn update_waybill_fleet(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<UpdateWaybillFleetBody>,
@@ -2730,7 +3328,15 @@ async fn update_waybill_fleet(
     })))
 }
 
-async fn update_waybill_tablet(
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill/tablet",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = UpdateWaybillTabletBody,
+    responses((status = 200, description = "Waybill tablet ID updated"))
+)]
+pub async fn update_waybill_tablet(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<UpdateWaybillTabletBody>,
@@ -2749,7 +3355,18 @@ async fn update_waybill_tablet(
     })))
 }
 
-async fn get_waybills(
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/waybills",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("limit" = Option<i64>, Query, description = "Limit (default 15)"),
+        ("offset" = Option<i64>, Query, description = "Offset (default 0)"),
+    ),
+    responses((status = 200, description = "List of waybills"))
+)]
+pub async fn get_waybills(
     app_state: Data<AppState>,
     path: Path<String>,
     query: Query<PaginationQuery>,
@@ -2773,7 +3390,13 @@ async fn get_waybills(
     Ok(HttpResponse::Ok().json(rows))
 }
 
-async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
+#[utoipa::path(
+    get,
+    path = "/routes-served-today",
+    tag = "Routes",
+    responses((status = 200, description = "Routes served today"))
+)]
+pub async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpResponse> {
     let routes = app_state
         .db_vehicle_reader
         .get_routes_served_today()
@@ -2781,6 +3404,14 @@ async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<HttpRes
     Ok(HttpResponse::Ok().json(routes))
 }
 
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/station-eta/upsert",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = StationEtaUpsertRequest,
+    responses((status = 200, description = "Station ETA upserted"))
+)]
 pub async fn upsert_station_eta(
     app_state: Data<AppState>,
     path: Path<String>,
@@ -2807,35 +3438,35 @@ pub async fn upsert_station_eta(
 
 // ─── Fleet operator ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct FleetAnchorRequest {
-    conductor_token: Option<String>,
-    driver_token: Option<String>,
-    vehicle_number: Option<String>,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FleetAnchorRequest {
+    pub conductor_token: Option<String>,
+    pub driver_token: Option<String>,
+    pub vehicle_number: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct FleetTripActionRequest {
-    action: String,
-    trip_number: Option<i32>,
-    timestamp: Option<i64>,
-    conductor_token: Option<String>,
-    driver_token: Option<String>,
-    vehicle_number: Option<String>,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FleetTripActionRequest {
+    pub action: String,
+    pub trip_number: Option<i32>,
+    pub timestamp: Option<i64>,
+    pub conductor_token: Option<String>,
+    pub driver_token: Option<String>,
+    pub vehicle_number: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct FleetCurrentTripDetailsRequest {
-    previous_trip_number: i32,
-    conductor_token: Option<String>,
-    driver_token: Option<String>,
-    vehicle_number: Option<String>,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FleetCurrentTripDetailsRequest {
+    pub previous_trip_number: i32,
+    pub conductor_token: Option<String>,
+    pub driver_token: Option<String>,
+    pub vehicle_number: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct FleetVerifyRequest {
-    operator_badge_token: String,
-    device_serial_number: String,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FleetVerifyRequest {
+    pub operator_badge_token: String,
+    pub device_serial_number: String,
 }
 
 fn parse_fleet_anchor(
@@ -2863,7 +3494,15 @@ fn parse_fleet_anchor(
     Ok(WaybillAnchor::VehicleNumber(vehicle_number.unwrap()))
 }
 
-async fn fleet_operator_current_operation(
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/currentOperation",
+    tag = "Internal Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = FleetAnchorRequest,
+    responses((status = 200, description = "Current fleet operation"))
+)]
+pub async fn fleet_operator_current_operation(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<FleetAnchorRequest>,
@@ -2878,7 +3517,15 @@ async fn fleet_operator_current_operation(
     Ok(HttpResponse::Ok().json(response))
 }
 
-async fn fleet_operator_trip_action(
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/tripAction",
+    tag = "Internal Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = FleetTripActionRequest,
+    responses((status = 200, description = "Trip action result"))
+)]
+pub async fn fleet_operator_trip_action(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<FleetTripActionRequest>,
@@ -2901,7 +3548,9 @@ async fn fleet_operator_trip_action(
     let trip_number = match action {
         TripAction::Reset => 0,
         _ => req.trip_number.ok_or_else(|| {
-            AppError::BadRequest("trip_number is required for 'start' and 'end' actions.".to_string())
+            AppError::BadRequest(
+                "trip_number is required for 'start' and 'end' actions.".to_string(),
+            )
         })?,
     };
 
@@ -2913,7 +3562,15 @@ async fn fleet_operator_trip_action(
     Ok(HttpResponse::Ok().json(response))
 }
 
-async fn fleet_operator_current_trip_details(
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/currentTripDetails",
+    tag = "Internal Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = FleetCurrentTripDetailsRequest,
+    responses((status = 200, description = "Current trip details"))
+)]
+pub async fn fleet_operator_current_trip_details(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<FleetCurrentTripDetailsRequest>,
@@ -2928,7 +3585,15 @@ async fn fleet_operator_current_trip_details(
     Ok(HttpResponse::Ok().json(response))
 }
 
-async fn fleet_operator_verify(
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/verify",
+    tag = "Internal Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = FleetVerifyRequest,
+    responses((status = 200, description = "Fleet operator verification result"))
+)]
+pub async fn fleet_operator_verify(
     app_state: Data<AppState>,
     path: Path<String>,
     body: Json<FleetVerifyRequest>,
