@@ -1709,14 +1709,76 @@ async fn get_service_type_by_vehicle_impl(
                 );
             }
         } else {
-            // Old behavior: set the first trip as active
-            if let Some(ref mut trips) = response.remaining_trip_details {
-                if let Some(first_trip) = trips.first_mut() {
-                    first_trip.is_active_trip = Some(true);
-                    response.is_active_trip = true;
-                    response.trip_number = first_trip.trip_number;
-                    response.route_id = Some(first_trip.route_id.clone());
-                    response.route_number = first_trip.route_number.clone();
+            // Old behavior: ensure trip 1 is the main trip when no actual active trip exists
+            // and remaining_trip_details starts from trip 2
+            // Only apply when: no active trip at top level AND no active trip in remaining
+            let has_active_in_remaining = response
+                .remaining_trip_details
+                .as_ref()
+                .map(|details| details.iter().any(|t| t.is_active_trip.unwrap_or(false)))
+                .unwrap_or(false);
+
+            if !response.is_active_trip && !has_active_in_remaining && response.trip_number != Some(1)
+            {
+                // Try to find trip 1 in schedule_details and promote it
+                if let Some(ref schedule_map) = vehicle_data.schedule_details {
+                    for (_, trips) in schedule_map.iter() {
+                        if let Some(trip_1) = trips.iter().find(|t| t.trip_number == Some(1)) {
+                            // Insert current main trip into remaining_trip_details
+                            let current_main = crate::models::BusSchedule {
+                                schedule_number: response.schedule_no.clone().unwrap_or_default(),
+                                route_id: response.route_id.clone().unwrap_or_default(),
+                                route_name: None,
+                                org_name: response.depot_no.clone(),
+                                trip_number: response.trip_number,
+                                route_number: response.route_number.clone(),
+                                stops_count: None,
+                                is_active_trip: Some(false),
+                                schedule_trip_id: None,
+                                start_time: None,
+                                end_time: None,
+                                deleted: Some(false),
+                                trip_order: response.trip_number,
+                                db_start_time: response.db_start_time.clone(),
+                                db_end_time: response.db_end_time.clone(),
+                            };
+
+                            // Update response to use trip 1
+                            response.trip_number = trip_1.trip_number;
+                            response.route_id = Some(trip_1.route_id.clone());
+                            response.route_number = trip_1.route_number.clone();
+                            response.db_start_time = trip_1.db_start_time.clone();
+                            response.db_end_time = trip_1.db_end_time.clone();
+                            response.is_active_trip = false;
+
+                            // Rebuild remaining_trip_details with trip 1 excluded
+                            let mut new_remaining: Vec<crate::models::BusSchedule> =
+                                vec![current_main];
+                            if let Some(ref existing) = response.remaining_trip_details {
+                                for t in existing.iter() {
+                                    if t.trip_number != Some(1) {
+                                        new_remaining.push(t.clone());
+                                    }
+                                }
+                            }
+                            // Sort by trip_number
+                            new_remaining.sort_by_key(|t| t.trip_number.unwrap_or(0));
+                            response.remaining_trip_details = if new_remaining.is_empty() {
+                                None
+                            } else {
+                                Some(new_remaining)
+                            };
+                            break;
+                        }
+                    }
+                }
+            } else if response.trip_number == Some(1) {
+                // Trip 1 is already the main trip, just ensure remaining starts from trip 2
+                // and no trip is marked as active (since none is actually active)
+                if let Some(ref mut trips) = response.remaining_trip_details {
+                    for t in trips.iter_mut() {
+                        t.is_active_trip = Some(false);
+                    }
                 }
             }
         }
@@ -1838,14 +1900,74 @@ async fn get_service_type_by_vehicle_impl(
             reconcile_active_trip_by_schedule(&mut response, &status, params.cur_time.as_deref());
         }
     } else {
-        // Old behavior: set the first trip as active
-        if let Some(ref mut trips) = response.remaining_trip_details {
-            if let Some(first_trip) = trips.first_mut() {
-                first_trip.is_active_trip = Some(true);
-                response.is_active_trip = true;
-                response.trip_number = first_trip.trip_number;
-                response.route_id = Some(first_trip.route_id.clone());
-                response.route_number = first_trip.route_number.clone();
+        // Old behavior: ensure trip 1 is the main trip when no actual active trip exists
+        // and remaining_trip_details starts from trip 2
+        // Only apply when: no active trip at top level AND no active trip in remaining
+        let has_active_in_remaining = response
+            .remaining_trip_details
+            .as_ref()
+            .map(|details| details.iter().any(|t| t.is_active_trip.unwrap_or(false)))
+            .unwrap_or(false);
+
+        if !response.is_active_trip && !has_active_in_remaining && response.trip_number != Some(1) {
+            // Try to find trip 1 in schedule_details and promote it
+            if let Some(ref schedule_map) = vehicle_data.schedule_details {
+                for (_, trips) in schedule_map.iter() {
+                    if let Some(trip_1) = trips.iter().find(|t| t.trip_number == Some(1)) {
+                        // Insert current main trip into remaining_trip_details
+                        let current_main = crate::models::BusSchedule {
+                            schedule_number: response.schedule_no.clone().unwrap_or_default(),
+                            route_id: response.route_id.clone().unwrap_or_default(),
+                            route_name: None,
+                            org_name: response.depot_no.clone(),
+                            trip_number: response.trip_number,
+                            route_number: response.route_number.clone(),
+                            stops_count: None,
+                            is_active_trip: Some(false),
+                            schedule_trip_id: None,
+                            start_time: None,
+                            end_time: None,
+                            deleted: Some(false),
+                            trip_order: response.trip_number,
+                            db_start_time: response.db_start_time.clone(),
+                            db_end_time: response.db_end_time.clone(),
+                        };
+
+                        // Update response to use trip 1
+                        response.trip_number = trip_1.trip_number;
+                        response.route_id = Some(trip_1.route_id.clone());
+                        response.route_number = trip_1.route_number.clone();
+                        response.db_start_time = trip_1.db_start_time.clone();
+                        response.db_end_time = trip_1.db_end_time.clone();
+                        response.is_active_trip = false;
+
+                        // Rebuild remaining_trip_details with trip 1 excluded
+                        let mut new_remaining: Vec<crate::models::BusSchedule> = vec![current_main];
+                        if let Some(ref existing) = response.remaining_trip_details {
+                            for t in existing.iter() {
+                                if t.trip_number != Some(1) {
+                                    new_remaining.push(t.clone());
+                                }
+                            }
+                        }
+                        // Sort by trip_number
+                        new_remaining.sort_by_key(|t| t.trip_number.unwrap_or(0));
+                        response.remaining_trip_details = if new_remaining.is_empty() {
+                            None
+                        } else {
+                            Some(new_remaining)
+                        };
+                        break;
+                    }
+                }
+            }
+        } else if response.trip_number == Some(1) {
+            // Trip 1 is already the main trip, just ensure remaining starts from trip 2
+            // and no trip is marked as active (since none is actually active)
+            if let Some(ref mut trips) = response.remaining_trip_details {
+                for t in trips.iter_mut() {
+                    t.is_active_trip = Some(false);
+                }
             }
         }
     }
