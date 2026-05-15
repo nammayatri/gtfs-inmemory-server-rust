@@ -48,6 +48,7 @@ use crate::services::operator::QueryBody;
         routes::get_all_stops_by_ids,
         routes::get_all_route_stop_mappings_by_route_codes,
         routes::get_all_route_stop_mappings_by_stop_codes,
+        routes::get_cluster_destinations,
         routes::get_all_vehicles_by_ids,
         routes::get_routes_by_ids,
         // Trip
@@ -146,6 +147,7 @@ use crate::services::operator::QueryBody;
         (name = "Vehicle", description = "Vehicle and service type endpoints"),
         (name = "Schedule", description = "Bus schedule endpoints"),
         (name = "Bulk", description = "Bulk data retrieval endpoints"),
+        (name = "Cluster", description = "H3 cluster-based stop endpoints"),
         (name = "Trip", description = "Trip information endpoints"),
         (name = "System", description = "Health and system info endpoints"),
         (name = "Internal Operator", description = "Internal operator CRUD and management endpoints"),
