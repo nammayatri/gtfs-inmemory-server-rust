@@ -762,6 +762,7 @@ impl GTFSService {
         stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
     ) -> HashMap<String, GTFSStopData> {
         let mut stops_by_gtfs: HashMap<String, GTFSStopData> = HashMap::new();
+        let mut by_cluster_set: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
 
         for stop in stops {
             let parts: Vec<&str> = stop.id.split(':').collect();
@@ -812,14 +813,25 @@ impl GTFSService {
             }
 
             if let Some(cid) = &cluster_id {
-                stop_data
-                    .by_cluster_id
+                by_cluster_set
+                    .entry(gtfs_id.to_string())
+                    .or_default()
                     .entry(cid.clone())
                     .or_default()
-                    .push(stop_code.to_string());
+                    .insert(stop_code.to_string());
             }
 
             stop_data.stops.insert(stop_code.to_string(), stop_res);
+        }
+
+        for (gtfs_id, per_cluster) in by_cluster_set {
+            if let Some(stop_data) = stops_by_gtfs.get_mut(&gtfs_id) {
+                for (cid, codes) in per_cluster {
+                    let mut v: Vec<String> = codes.into_iter().collect();
+                    v.sort();
+                    stop_data.by_cluster_id.insert(cid, v);
+                }
+            }
         }
 
         for (gtfs_id, data) in &stops_by_gtfs {
@@ -1540,7 +1552,7 @@ impl GTFSService {
                 siblings
             }
             None => {
-                warn!(
+                debug!(
                     gtfs_id = %gtfs_id,
                     stop_code = %stop_code,
                     "destinations: no cluster_id, falling back to single-stop walk",

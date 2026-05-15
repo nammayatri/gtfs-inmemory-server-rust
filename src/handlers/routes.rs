@@ -683,11 +683,15 @@ pub async fn get_route_stop_mapping_by_stop(
     ),
     responses((
         status = 200,
-        description = "Destination stop_codes reachable downstream of the source on the same trip pattern, \
-                       deduplicated by H3 cluster (one representative stop_code per reachable cluster). \
-                       Does NOT include destinations reachable via a transfer. \
-                       Falls back to a single-stop walk when the source stop has no cluster_id (logged at warn). \
-                       Returns 404 on unknown gtfs_id; returns [] for an unknown stop_code or a stop with no outgoing routes.",
+        description = "Destination stop_codes reachable downstream of the source, computed against the \
+                       server's precomputed representative pattern per route (the longest pattern observed \
+                       for each route at build time — see build_route_data). Deduplicated by H3 cluster \
+                       so the response carries one representative stop_code per reachable cluster. \
+                       Does NOT include destinations reachable via a transfer, and does NOT enumerate \
+                       every trip pattern — patterns shorter than the longest for the same route are not \
+                       walked. Falls back to a single-stop walk when the source stop has no cluster_id \
+                       (logged at debug). Returns 404 on unknown gtfs_id; returns [] for an unknown \
+                       stop_code or a stop with no outgoing routes on the representative pattern.",
         body = Vec<String>,
     ))
 )]
