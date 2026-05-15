@@ -424,6 +424,14 @@ pub struct GTFSStop {
     pub hindi_name: Option<String>,
     #[serde(rename = "regionalName")]
     pub regional_name: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub desc: Option<String>,
+    #[serde(
+        rename = "clusterId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cluster_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +458,8 @@ pub struct GTFSRouteData {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GTFSStopData {
     pub stops: HashMap<String, GTFSStop>,
+    #[serde(default)]
+    pub by_cluster_id: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
