@@ -196,6 +196,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/cluster/{gtfs_id}/destinations/{stop_code}",
                 actix_web::web::get().to(get_cluster_destinations),
             )
+            .route(
+                "/cluster/{gtfs_id}/routes/{src_stop_code}/{dst_stop_code}",
+                actix_web::web::get().to(get_routes_between_clusters_for_stops),
+            )
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
             .route(
@@ -1101,6 +1105,37 @@ pub async fn get_route_stop_mapping_draw(
     );
 
     Ok(HttpResponse::Ok().content_type("text/html").body(html))
+}
+
+#[utoipa::path(
+    get,
+    path = "/cluster/{gtfs_id}/routes/{src_stop_code}/{dst_stop_code}",
+    tag = "Cluster",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("src_stop_code" = String, Path, description = "Source stop code"),
+        ("dst_stop_code" = String, Path, description = "Destination stop code"),
+    ),
+    responses((
+        status = 200,
+        description = "Route codes applicable between the source and destination clusters (each input stop \
+                       is expanded to its H3 cluster, falling back to the single stop_code when the stop \
+                       has no cluster_id). The intersection of routes serving either side is returned. \
+                       Direction-agnostic — does not require the route to traverse src before dst. \
+                       Deduplicated, unsorted. Returns 404 on unknown gtfs_id; returns [] for unknown stop \
+                       codes or when no route serves both clusters.",
+        body = Vec<String>,
+    ))
+)]
+pub async fn get_routes_between_clusters_for_stops(
+    app_state: Data<AppState>,
+    path: Path<(String, String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, src_stop_code, dst_stop_code) = path.into_inner();
+    let routes = app_state
+        .gtfs_service
+        .get_routes_between_clusters_for_stops(&gtfs_id, &src_stop_code, &dst_stop_code)?;
+    Ok(HttpResponse::Ok().json(routes))
 }
 
 #[utoipa::path(
