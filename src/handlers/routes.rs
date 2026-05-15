@@ -20,9 +20,10 @@ use tracing::{error, info};
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
-    BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats, MinimalEmployee,
-    NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
-    VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
+    BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats,
+    MinimalEmployee, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
+    TripDetails, VehicleData, VehicleMetadataResponse, VehicleOperationData,
+    VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
@@ -180,6 +181,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/station-children/{gtfs_id}/{stop_code}",
                 actix_web::web::get().to(get_station_children),
+            )
+            .route(
+                "/cluster/{gtfs_id}/destinations/{stop_code}",
+                actix_web::web::get().to(get_cluster_destinations),
             )
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
@@ -662,6 +667,39 @@ pub async fn get_route_stop_mapping_by_stop(
         )
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
+}
+
+#[utoipa::path(
+    get,
+    path = "/cluster/{gtfs_id}/destinations/{stop_code}",
+    tag = "Cluster",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("stop_code" = String, Path, description = "Source stop code"),
+    ),
+    responses((
+        status = 200,
+        description = "Destination stop_codes reachable downstream of the source, computed against the \
+                       server's precomputed representative pattern per route (the longest pattern observed \
+                       for each route at build time — see build_route_data). Deduplicated by H3 cluster \
+                       so the response carries one representative stop_code per reachable cluster. \
+                       Does NOT include destinations reachable via a transfer, and does NOT enumerate \
+                       every trip pattern — patterns shorter than the longest for the same route are not \
+                       walked. Falls back to a single-stop walk when the source stop has no cluster_id \
+                       (logged at debug). Returns 404 on unknown gtfs_id; returns [] for an unknown \
+                       stop_code or a stop with no outgoing routes on the representative pattern.",
+        body = Vec<String>,
+    ))
+)]
+pub async fn get_cluster_destinations(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, stop_code) = path.into_inner();
+    let destinations = app_state
+        .gtfs_service
+        .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
+    Ok(HttpResponse::Ok().json(destinations))
 }
 
 #[utoipa::path(
