@@ -805,7 +805,7 @@ impl GTFSService {
                     hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                     regional_name: regional_name.map(|r| r.regional_name.clone()),
                     desc: None,
-                    cluster_id: cluster_id.clone(),
+                    cluster_id: None,
                 };
                 stop_data
                     .stops
