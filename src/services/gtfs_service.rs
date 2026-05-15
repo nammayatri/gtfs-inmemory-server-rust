@@ -1637,6 +1637,63 @@ impl GTFSService {
         Ok(out)
     }
 
+    pub fn get_routes_between_clusters_for_stops(
+        &self,
+        gtfs_id: &str,
+        src_stop_code: &str,
+        dst_stop_code: &str,
+    ) -> AppResult<Vec<String>> {
+        let data = self.data.load_full();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let src_stop_code = clean_identifier(src_stop_code);
+        let dst_stop_code = clean_identifier(dst_stop_code);
+
+        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
+            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
+        })?;
+
+        let route_data = match data.route_data_by_gtfs.get(&gtfs_id) {
+            Some(r) => r,
+            None => return Ok(Vec::new()),
+        };
+
+        let collect_routes = |stop_code: &str| -> HashSet<Arc<str>> {
+            let mut routes: HashSet<Arc<str>> = HashSet::new();
+            let siblings: &[String] = match stops_data.stops.get(stop_code) {
+                Some(stop) => match stop.cluster_id.as_ref() {
+                    Some(cid) => stops_data
+                        .by_cluster_id
+                        .get(cid)
+                        .map(|v| v.as_slice())
+                        .unwrap_or_default(),
+                    None => std::slice::from_ref(&stop.code),
+                },
+                None => &[],
+            };
+            for sib in siblings {
+                if let Some(idxs) = route_data.by_stop.get(sib) {
+                    for &i in idxs {
+                        if let Some(m) = route_data.mappings.get(i) {
+                            routes.insert(m.route_code.clone());
+                        }
+                    }
+                }
+            }
+            routes
+        };
+
+        let src_routes = collect_routes(&src_stop_code);
+        if src_routes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_routes = collect_routes(&dst_stop_code);
+
+        Ok(src_routes
+            .intersection(&dst_routes)
+            .map(|r| r.as_ref().to_string())
+            .collect())
+    }
+
     pub async fn get_stop(
         &self,
         gtfs_id: &str,
