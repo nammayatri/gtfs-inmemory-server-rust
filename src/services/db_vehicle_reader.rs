@@ -526,7 +526,7 @@ impl DBVehicleReader {
                 w.driver_token_no::text AS driver_code,
                 w.conductor_token_no::text AS conductor_code,
                 w.deleted AS deleted,
-                w.status AS status,
+                w.status AS status
             FROM waybills w
             LEFT JOIN entities e
                 ON e.entity_id = w.entity_id
