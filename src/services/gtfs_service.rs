@@ -1,10 +1,11 @@
 use crate::environment::AppConfig;
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
-    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, SeatLayoutMappingRecord,
-    ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord,
-    StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData,
+    GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern, NandiPatternDetails,
+    NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord, RouteServiceTierRecord,
+    RouteStopMapping, SeatLayoutMappingRecord, ServiceTierType, StaticFleetInfo,
+    StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
+    SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails};
 use crate::tools::error::{AppError, AppResult};
@@ -34,6 +35,21 @@ fn get_sha256_hash<T: Serialize>(val: &T) -> String {
     let mut hasher = Sha256::new();
     hasher.update(json);
     format!("{:x}", hasher.finalize())
+}
+
+const SENTINEL_CLUSTER_ID: &str = "INVALID_SENTINEL";
+
+fn parse_cluster_id_from_desc(desc: Option<&str>) -> Option<String> {
+    let raw = desc?.trim();
+    if raw.is_empty() || raw == "{}" {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let cid = parsed.get("clusterId")?.as_str()?;
+    if cid == SENTINEL_CLUSTER_ID {
+        return None;
+    }
+    Some(cid.to_string())
 }
 
 fn normalize_stop_name(name: &str) -> String {
@@ -760,6 +776,8 @@ impl GTFSService {
                 .get(gtfs_id)
                 .and_then(|m| m.get(stop_code));
 
+            let cluster_id = parse_cluster_id_from_desc(stop.desc.as_deref());
+
             // Create a new GTFSStop with the clean stop code
             let stop_res = GTFSStop {
                 id: stop.id.clone(),
@@ -771,6 +789,8 @@ impl GTFSService {
                 cluster: stop.cluster.clone(),
                 hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                 regional_name: regional_name.map(|r| r.regional_name.clone()),
+                desc: None,
+                cluster_id: cluster_id.clone(),
             };
             if stop.cluster.is_some() {
                 let cluster_stop_res = GTFSStop {
@@ -783,13 +803,47 @@ impl GTFSService {
                     cluster: stop.cluster.clone(),
                     hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                     regional_name: regional_name.map(|r| r.regional_name.clone()),
+                    desc: None,
+                    cluster_id: cluster_id.clone(),
                 };
                 stop_data
                     .stops
                     .insert(stop.cluster.clone().unwrap(), cluster_stop_res);
             }
 
+            if let Some(cid) = &cluster_id {
+                stop_data
+                    .by_cluster_id
+                    .entry(cid.clone())
+                    .or_default()
+                    .push(stop_code.to_string());
+            }
+
             stop_data.stops.insert(stop_code.to_string(), stop_res);
+        }
+
+        for (gtfs_id, data) in &stops_by_gtfs {
+            let total = data.stops.len();
+            let clustered = data
+                .stops
+                .values()
+                .filter(|s| s.cluster_id.is_some())
+                .count();
+            if clustered == 0 {
+                warn!(
+                    gtfs_id = %gtfs_id,
+                    total_stops = total,
+                    "No stops have a cluster_id; cluster destinations endpoint will fall back to single-stop walks for every request",
+                );
+            } else {
+                info!(
+                    gtfs_id = %gtfs_id,
+                    total_stops = total,
+                    clustered_stops = clustered,
+                    distinct_clusters = data.by_cluster_id.len(),
+                    "cluster_id coverage after build",
+                );
+            }
         }
 
         stops_by_gtfs
@@ -1440,6 +1494,136 @@ impl GTFSService {
             })
             .collect();
         Ok(stops)
+    }
+
+    pub fn get_cluster_destinations_for_stop(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<Vec<String>> {
+        let data = self.data.load_full();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = clean_identifier(stop_code);
+
+        // Unknown gtfs_id is a configuration error → 404. Unknown stop_code
+        // inside a known feed is semantically "no destinations" → 200 [].
+        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
+            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
+        })?;
+
+        let src_stop = match stops_data.stops.get(&stop_code) {
+            Some(s) => s,
+            None => {
+                info!(
+                    gtfs_id = %gtfs_id,
+                    stop_code = %stop_code,
+                    "destinations: stop not found in feed, returning empty list",
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let sibling_codes: Vec<String> = match src_stop.cluster_id.as_ref() {
+            Some(cid) => {
+                let siblings = stops_data
+                    .by_cluster_id
+                    .get(cid)
+                    .cloned()
+                    .unwrap_or_default();
+                info!(
+                    gtfs_id = %gtfs_id,
+                    stop_code = %stop_code,
+                    cluster_id = %cid,
+                    siblings = siblings.len(),
+                    "destinations: cluster walk",
+                );
+                siblings
+            }
+            None => {
+                warn!(
+                    gtfs_id = %gtfs_id,
+                    stop_code = %stop_code,
+                    "destinations: no cluster_id, falling back to single-stop walk",
+                );
+                vec![stop_code.clone()]
+            }
+        };
+
+        let route_data = match data.route_data_by_gtfs.get(&gtfs_id) {
+            Some(r) => r,
+            None => return Ok(Vec::new()),
+        };
+
+        // For each sibling source stop, collect (route_code, src_seq) pairs.
+        // Multiple siblings may serve the same route — keep the min src_seq so
+        // we look as far downstream as possible on that route.
+        let mut src_seq_by_route: HashMap<Arc<str>, i32> = HashMap::new();
+        for sib in &sibling_codes {
+            if let Some(idxs) = route_data.by_stop.get(sib) {
+                for &i in idxs {
+                    if let Some(m) = route_data.mappings.get(i) {
+                        src_seq_by_route
+                            .entry(m.route_code.clone())
+                            .and_modify(|existing| {
+                                if m.sequence_num < *existing {
+                                    *existing = m.sequence_num;
+                                }
+                            })
+                            .or_insert(m.sequence_num);
+                    }
+                }
+            }
+        }
+
+        let src_cluster = src_stop.cluster_id.as_deref();
+        let mut rep_by_key: HashMap<String, String> = HashMap::new();
+        for (route_code, src_seq) in &src_seq_by_route {
+            let idxs = match route_data.by_route.get(route_code.as_ref()) {
+                Some(v) => v,
+                None => continue,
+            };
+            for &i in idxs {
+                let m = match route_data.mappings.get(i) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if m.sequence_num <= *src_seq {
+                    continue;
+                }
+                let dst_code = m.stop_code.as_ref();
+                let dst_stop = match stops_data.stops.get(dst_code) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                match (src_cluster, dst_stop.cluster_id.as_deref()) {
+                    (Some(s), Some(d)) if s == d => continue,
+                    (None, _) if dst_code == stop_code.as_str() => continue,
+                    _ => {}
+                }
+                let dedup_key = dst_stop
+                    .cluster_id
+                    .clone()
+                    .unwrap_or_else(|| dst_code.to_string());
+                rep_by_key
+                    .entry(dedup_key)
+                    .and_modify(|existing| {
+                        if dst_code < existing.as_str() {
+                            *existing = dst_code.to_string();
+                        }
+                    })
+                    .or_insert_with(|| dst_code.to_string());
+            }
+        }
+
+        let mut out: Vec<String> = rep_by_key.into_values().collect();
+        out.sort();
+        info!(
+            gtfs_id = %gtfs_id,
+            stop_code = %stop_code,
+            destinations = out.len(),
+            "destinations: result",
+        );
+        Ok(out)
     }
 
     pub async fn get_stop(
