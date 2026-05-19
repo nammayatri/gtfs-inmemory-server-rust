@@ -267,6 +267,30 @@ pub struct VehicleMetadataResponse {
     pub is_actually_valid: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WaybillMetadataResponse {
+    pub waybill_no: String,
+    pub vehicle_no: String,
+    #[serde(rename = "serviceType")]
+    pub service_type: String,
+    pub driver_id: Option<String>,
+    #[serde(rename = "driverName")]
+    pub driver_name: Option<String>,
+    #[serde(rename = "driverMobileNumber")]
+    pub driver_mobile_number: Option<String>
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WaybillTripInfo {
+    pub waybill_no: String,
+    pub vehicle_no: String,
+    pub service_type: String,
+    pub driver_token_no: Option<String>,
+    pub driver_first_name: Option<String>,
+    pub driver_last_name: Option<String>,
+    pub driver_mobile_number: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WaybillStatus {
