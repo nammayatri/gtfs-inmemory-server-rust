@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use sqlx::PgPool;
 use tracing::{debug, error, info};
 
-use crate::models::{BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillStatus};
+use crate::models::{BusSchedule, WaybillMetadataResponse, WaybillTripInfo, VehicleData, VehicleDataWithRouteId, WaybillStatus};
 use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
@@ -41,6 +41,12 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         destination_station_code: &str,
         eta_in_seconds: i32,
     ) -> AppResult<()>;
+
+    async fn get_waybill_metadata(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+    ) -> AppResult<WaybillMetadataResponse>;
 }
 
 // Mock implementation for local testing without a database
@@ -105,6 +111,16 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         _eta_in_seconds: i32,
     ) -> AppResult<()> {
         Ok(())
+    }
+
+    async fn get_waybill_metadata(
+        &self,
+        _gtfs_id: &str,
+        _waybill_no: &str,
+    ) -> AppResult<WaybillMetadataResponse> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 }
 
@@ -1286,5 +1302,74 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             eta_in_seconds,
         )
         .await
+    }
+
+    async fn get_waybill_metadata(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+    ) -> AppResult<WaybillMetadataResponse> {
+        self.get_waybill_metadata_impl(gtfs_id, waybill_no)
+            .await
+    }
+}
+
+impl DBVehicleReaderInternal {
+    async fn get_waybill_metadata_impl(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+    ) -> AppResult<WaybillMetadataResponse> {
+        let pool = self.pool()?;
+
+        let waybill_query = r#"
+            SELECT
+                w.waybill_no::text,
+                w.vehicle_no,
+                w.service_type,
+                w.driver_token_no::text AS driver_token_no,
+                d.first_name AS driver_first_name,
+                d.last_name AS driver_last_name,
+                d.mobile_no AS driver_mobile_number
+            FROM waybills_internal w
+            LEFT JOIN employees_internal d
+                   ON d.token_no = w.driver_token_no::text AND d.gtfs_id = $2 AND d.deleted = false
+            WHERE w.waybill_no = $1
+              AND w.gtfs_id = $2
+              AND w.deleted = false
+            ORDER BY w.updated_at DESC
+            LIMIT 1
+        "#;
+
+        let waybill_row = sqlx::query_as::<_, WaybillTripInfo>(waybill_query)
+            .bind(waybill_no)
+            .bind(gtfs_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("Waybill query failed: {}", e)))?
+            .ok_or_else(|| AppError::NotFound(format!("Waybill not found: {}", waybill_no)))?;
+
+        // Build driver name
+        let driver_name = match (waybill_row.driver_first_name, waybill_row.driver_last_name) {
+            (Some(f), Some(l)) => {
+                let combined = format!("{} {}", f, l).trim().to_string();
+                if combined.is_empty() { None } else { Some(combined) }
+            }
+            (Some(f), None) if !f.trim().is_empty() => Some(f),
+            (None, Some(l)) if !l.trim().is_empty() => Some(l),
+            _ => None,
+        };
+        let driver_mobile_number = waybill_row.driver_mobile_number.filter(|m| !m.trim().is_empty());
+
+        let response = WaybillMetadataResponse {
+            waybill_no: waybill_row.waybill_no,
+            vehicle_no: waybill_row.vehicle_no,
+            service_type: waybill_row.service_type,
+            driver_id: waybill_row.driver_token_no,
+            driver_name,
+            driver_mobile_number
+        };
+
+        Ok(response)
     }
 }
