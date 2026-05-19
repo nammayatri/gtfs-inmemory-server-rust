@@ -213,6 +213,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             )
             .route("/trip/{trip_id}", actix_web::web::get().to(get_trip_data))
             .route(
+                "/waybill/{gtfs_id}/metadata/{waybill_no}",
+                actix_web::web::get().to(get_waybill_metadata),
+            )
+            .route(
                 "/trip-cache/stats",
                 actix_web::web::get().to(get_trip_cache_stats),
             )
@@ -2246,6 +2250,31 @@ pub async fn get_trip_data(
 
     Ok(HttpResponse::Ok().json(trip_data))
 }
+
+#[utoipa::path(
+    get,
+    path = "/waybill/{gtfs_id}/metadata/{waybill_no}",
+    tag = "Waybill",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("waybill_no" = String, Path, description = "Waybill number"),
+    ),
+    responses((status = 200, description = "Waybill metadata with driver details", body = crate::models::WaybillMetadataResponse))
+)]
+pub async fn get_waybill_metadata(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, waybill_no) = path.into_inner();
+
+    let waybill_metadata = app_state
+        .db_vehicle_reader_internal
+        .get_waybill_metadata(&gtfs_id, &waybill_no)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(waybill_metadata))
+}
+
 const SPEED_KM_PER_HOUR: f64 = 25.0;
 const EARTH_RADIUS_KM: f64 = 6371.0; // Earth radius in kilometers
 
