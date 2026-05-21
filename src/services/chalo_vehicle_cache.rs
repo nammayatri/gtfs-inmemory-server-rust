@@ -3,8 +3,9 @@ use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use once_cell::sync::Lazy;
-use reqwest::Client;
+use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
+use shared::tools::callapi::{call_api, Protocol};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::fs::File;
@@ -117,7 +118,6 @@ pub fn chalo_gtfs_ids() -> &'static [&'static str] {
 }
 
 pub struct ChaloVehicleCache {
-    http_client: Client,
     // Cache structure: HashMap<gtfs_id, HashMap<vehicle_no, CachedVehicleData>>
     cache: Arc<RwLock<HashMap<String, HashMap<String, CachedVehicleData>>>>,
     city_configs: Vec<CityConfig>,
@@ -128,11 +128,6 @@ pub struct ChaloVehicleCache {
 
 impl ChaloVehicleCache {
     pub fn new(external_auth: Option<String>, gtfs_service: Arc<GTFSService>) -> AppResult<Self> {
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
-
         let cache = Arc::new(RwLock::new(HashMap::new()));
 
         let city_configs = CHALO_CITY_DEFS
@@ -145,7 +140,6 @@ impl ChaloVehicleCache {
             .collect();
 
         Ok(Self {
-            http_client,
             cache,
             city_configs,
             external_auth_header: external_auth,
@@ -245,45 +239,42 @@ impl ChaloVehicleCache {
             city_config.city_name, gtfs_id
         );
 
-        let mut request = self.http_client.get(&city_config.api_url);
-
-        if let Some(ref auth_header) = self.external_auth_header {
-            request = request.header("externalauth", auth_header);
-        } else {
-            warn!("No external auth header configured for CHALO vehicle cache");
-        }
-
-        let response = request.send().await.map_err(|e| {
+        let url: Url = Url::parse(&city_config.api_url).map_err(|e| {
             error!(
-                "Failed to fetch data from external API for {}: {}",
+                "Invalid CHALO API URL for {}: {}",
                 city_config.city_name, e
             );
             AppError::Internal(format!(
-                "Failed to fetch data from external API for {}: {}",
+                "Invalid CHALO API URL for {}: {}",
                 city_config.city_name, e
             ))
         })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            error!(
-                "External API returned error status for {}: {}",
-                city_config.city_name, status
-            );
-            return Err(AppError::Internal(format!(
-                "External API returned error status for {}: {}",
-                city_config.city_name, status
-            )));
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(ref auth_header) = self.external_auth_header {
+            headers.push(("externalauth", auth_header.as_str()));
+        } else {
+            warn!("No external auth header configured for CHALO vehicle cache");
         }
 
-        // The API returns a direct array
-        let vehicles: Vec<ExternalApiVehicle> = response.json().await.map_err(|e| {
+        // The API returns a direct array. `call_api` handles the request, status
+        // check, JSON deserialization, Prometheus metrics, and structured logging.
+        let vehicles: Vec<ExternalApiVehicle> = call_api::<Vec<ExternalApiVehicle>, ()>(
+            Protocol::Http1,
+            Method::GET,
+            &url,
+            headers,
+            None,
+            Some("chalo_live_trips"),
+        )
+        .await
+        .map_err(|e| {
             error!(
-                "Failed to parse external API response for {}: {}",
+                "Failed to fetch data from external API for {}: {}",
                 city_config.city_name, e
             );
             AppError::Internal(format!(
-                "Failed to parse external API response for {}: {}",
+                "Failed to fetch data from external API for {}: {}",
                 city_config.city_name, e
             ))
         })?;
