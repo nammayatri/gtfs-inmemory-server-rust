@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +86,38 @@ pub struct CurrentTripDetailsResponse {
     pub upcoming: Vec<TripData>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub enum AuthType {
+    Email,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EmployeeLoginRequest {
+    pub auth_type: Option<AuthType>,
+    pub email_hash: Option<String>,
+    pub password_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EmployeeLoginResponse {
+    pub verified: bool,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EmployeeRegisterRequest {
+    pub token_no: String,
+    pub email_hash: String,
+    pub password_hash: String,
+    pub first_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EmployeeRegisterResponse {
+    pub success: bool,
+    pub token_no: String,
+}
+
 // ─── Service trait ─────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -125,6 +157,18 @@ pub trait FleetOperatorService: Send + Sync {
         token: &str,
         device_serial_no: &str,
     ) -> AppResult<VerifyResponse>;
+
+    async fn login(
+        &self,
+        gtfs_id: &str,
+        req: &EmployeeLoginRequest,
+    ) -> AppResult<EmployeeLoginResponse>;
+
+    async fn register(
+        &self,
+        gtfs_id: &str,
+        req: &EmployeeRegisterRequest,
+    ) -> AppResult<EmployeeRegisterResponse>;
 }
 
 // ─── Mock implementation ───────────────────────────────────────────────────────
@@ -196,6 +240,26 @@ impl FleetOperatorService for MockFleetOperatorService {
         _token: &str,
         _device_serial_no: &str,
     ) -> AppResult<VerifyResponse> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn login(
+        &self,
+        _gtfs_id: &str,
+        _req: &EmployeeLoginRequest,
+    ) -> AppResult<EmployeeLoginResponse> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn register(
+        &self,
+        _gtfs_id: &str,
+        _req: &EmployeeRegisterRequest,
+    ) -> AppResult<EmployeeRegisterResponse> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -1028,5 +1092,91 @@ impl FleetOperatorService for DBFleetOperatorService {
         .unwrap_or(false);
 
         Ok(VerifyResponse { verified: etm_ok })
+    }
+
+    async fn login(
+        &self,
+        gtfs_id: &str,
+        req: &EmployeeLoginRequest,
+    ) -> AppResult<EmployeeLoginResponse> {
+        match req.auth_type {
+            Some(AuthType::Email) => {
+                let email_hash = req.email_hash.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("email_hash is required for email auth".into())
+                })?;
+                let password_hash = req.password_hash.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("password_hash is required for email auth".into())
+                })?;
+
+                let token_no: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT token_no
+                    FROM employees_internal
+                    WHERE email_hash = $1
+                      AND password_hash = $2
+                      AND gtfs_id = $3
+                      AND deleted = false
+                    LIMIT 1
+                    "#,
+                )
+                .bind(email_hash)
+                .bind(password_hash)
+                .bind(gtfs_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    error!("login failed for gtfs_id={}: {}", gtfs_id, e);
+                    AppError::Internal(e.to_string())
+                })?;
+
+                match token_no {
+                    Some(token) => Ok(EmployeeLoginResponse {
+                        verified: true,
+                        token: Some(token),
+                    }),
+                    None => Ok(EmployeeLoginResponse {
+                        verified: false,
+                        token: None,
+                    }),
+                }
+            }
+            _ => Ok(EmployeeLoginResponse {
+                verified: false,
+                token: None,
+            }),
+        }
+    }
+
+    async fn register(
+        &self,
+        gtfs_id: &str,
+        req: &EmployeeRegisterRequest,
+    ) -> AppResult<EmployeeRegisterResponse> {
+        sqlx::query(
+            r#"
+            INSERT INTO employees_internal (token_no, email_hash, password_hash, gtfs_id, first_name)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (gtfs_id, token_no) DO UPDATE SET
+                email_hash = EXCLUDED.email_hash,
+                password_hash = EXCLUDED.password_hash,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&req.token_no)
+        .bind(&req.email_hash)
+        .bind(&req.password_hash)
+        .bind(gtfs_id)
+        .bind(&req.first_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            error!("register upsert failed for gtfs_id={}, token_no={}: {}", gtfs_id, req.token_no, e);
+            AppError::Internal(e.to_string())
+        })?;
+
+        Ok(EmployeeRegisterResponse {
+            success: true,
+            token_no: req.token_no.clone(),
+        })
     }
 }
