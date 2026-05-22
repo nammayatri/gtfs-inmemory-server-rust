@@ -332,6 +332,15 @@ pub struct NandiStop {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
+    /// Example-trip schedule times (seconds since midnight) from the
+    /// preprocessor's patterns.json. Absent in OTP responses and in older
+    /// preprocessed data, so default to None.
+    #[serde(rename = "arrivalTime", default)]
+    pub arrival_time: Option<i32>,
+    #[serde(rename = "departureTime", default)]
+    pub departure_time: Option<i32>,
+    #[serde(rename = "stopSequence", default)]
+    pub stop_sequence: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

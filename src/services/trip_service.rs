@@ -11,15 +11,50 @@ use crate::graphql::{
 use crate::services::gtfs_service::GTFSService;
 use crate::tools::error::{AppError, AppResult};
 
+/// One stop's schedule within a preprocessed trip shard
+/// (trip_stoptimes/<gtfs_id>.json). Mirrors the preprocessor's output.
+#[derive(serde::Deserialize)]
+struct ShardStop {
+    #[serde(rename = "stopId")]
+    stop_id: String,
+    #[serde(rename = "stopCode")]
+    stop_code: String,
+    #[serde(rename = "stopName")]
+    stop_name: String,
+    lat: f64,
+    lon: f64,
+    #[serde(rename = "arrivalTime")]
+    arrival_time: Option<i32>,
+    #[serde(rename = "departureTime")]
+    departure_time: Option<i32>,
+    sequence: i32,
+}
+
+#[derive(serde::Deserialize)]
+struct ShardTrip {
+    #[serde(rename = "tripId")]
+    trip_id: String,
+    #[serde(rename = "routeId")]
+    route_id: String,
+    direction: Option<i32>,
+    stops: Vec<ShardStop>,
+}
+
 pub struct TripService {
     gtfs_service: Arc<GTFSService>,
     cache: Arc<RwLock<HashMap<String, TripCacheEntry>>>,
     stats: Arc<RwLock<TripCacheStats>>,
     cache_ttl_hours: u64,
+    /// When true, /trip is served from preprocessed trip_stoptimes shards
+    /// (falling back to OTP only if the shard/trip isn't found).
+    use_preprocessed_data: bool,
+    preprocessed_data_dir: String,
 }
 
 impl TripService {
     pub fn new(gtfs_service: Arc<GTFSService>) -> Self {
+        let use_preprocessed_data = gtfs_service.use_preprocessed_data();
+        let preprocessed_data_dir = gtfs_service.preprocessed_data_dir();
         Self {
             gtfs_service,
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -30,6 +65,8 @@ impl TripService {
                 last_cache_cleanup: None,
             })),
             cache_ttl_hours: 24, // Cache for 24 hours by default
+            use_preprocessed_data,
+            preprocessed_data_dir,
         }
     }
 
@@ -55,6 +92,36 @@ impl TripService {
             return Ok(cached_data);
         }
 
+        // Preprocessed mode: try the per-feed trip_stoptimes shard before OTP.
+        // We cache the parsed trip so the shard file is only read on a cold
+        // miss for that feed; warm trips come from `cache` above. Falls through
+        // to GraphQL if the shard or trip isn't found (e.g. unknown trip_id, or
+        // a feed not covered by preprocessed data).
+        if self.use_preprocessed_data {
+            if let Some(gid) = gtfs_id.as_deref() {
+                match self.load_trip_from_shard(trip_id, gid).await {
+                    Ok(Some(trip_data)) => {
+                        let mut cached_data = trip_data.clone();
+                        cached_data.source = "cache".to_string();
+                        self.store_in_cache(&cache_key, &cached_data).await?;
+                        return Ok(trip_data);
+                    }
+                    Ok(None) => {
+                        info!(
+                            "Trip {} not in preprocessed shard for {}, falling back to GraphQL",
+                            trip_id, gid
+                        );
+                    }
+                    Err(e) => {
+                        info!(
+                            "Preprocessed shard read failed for {} ({}): {} — falling back to GraphQL",
+                            trip_id, gid, e
+                        );
+                    }
+                }
+            }
+        }
+
         // Cache miss - fetch from GraphQL
         info!("Cache miss, fetching from GraphQL for key: {}", cache_key);
         let trip_data = self.fetch_trip_from_graphql(trip_id, gtfs_id, city).await?;
@@ -66,6 +133,72 @@ impl TripService {
 
         // Return original data with source = "graphql"
         Ok(trip_data)
+    }
+
+    /// Read one trip from the preprocessed `trip_stoptimes/<gtfs_id>.json`
+    /// shard. Returns Ok(None) if the shard exists but has no such trip, or if
+    /// the shard file is absent. Errs only on read/parse failure (caller falls
+    /// back to GraphQL in every non-success case anyway).
+    async fn load_trip_from_shard(
+        &self,
+        trip_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<TripApiResponse>> {
+        let path = std::path::Path::new(&self.preprocessed_data_dir)
+            .join("trip_stoptimes")
+            .join(format!("{}.json", gtfs_id));
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            AppError::Internal(format!("Failed to read trip shard {}: {}", path.display(), e))
+        })?;
+        // Shard is a JSON object: { trip_id -> ShardTrip }. Deserialize the
+        // whole feed's trips, then pick the one we need. The shard is per-feed
+        // so this is bounded by one feed's size, not the global dataset.
+        let trips: HashMap<String, ShardTrip> = serde_json::from_slice(&bytes).map_err(|e| {
+            AppError::Internal(format!("Failed to parse trip shard {}: {}", path.display(), e))
+        })?;
+
+        let trip = match trips.get(trip_id) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let stops: Vec<TripStopResponse> = trip
+            .stops
+            .iter()
+            .map(|s| TripStopResponse {
+                stop_id: s.stop_id.clone(),
+                stop_code: s.stop_code.clone(),
+                stop_name: s.stop_name.clone(),
+                sequence: s.sequence,
+                lat: s.lat,
+                lon: s.lon,
+            })
+            .collect();
+        let schedule: Vec<TripScheduleResponse> = trip
+            .stops
+            .iter()
+            .map(|s| TripScheduleResponse {
+                stop_code: s.stop_code.clone(),
+                arrival_time: s.arrival_time,
+                departure_time: s.departure_time,
+                sequence: s.sequence,
+            })
+            .collect();
+
+        Ok(Some(TripApiResponse {
+            trip_id: trip.trip_id.clone(),
+            route_id: trip.route_id.clone(),
+            route_name: None,
+            direction: trip.direction,
+            stops,
+            schedule,
+            last_updated: Utc::now(),
+            source: "preprocessed".to_string(),
+        }))
     }
 
     async fn get_from_cache(&self, cache_key: &str) -> AppResult<Option<TripApiResponse>> {
