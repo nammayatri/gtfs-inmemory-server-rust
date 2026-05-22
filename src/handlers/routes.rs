@@ -1,4 +1,7 @@
-use crate::services::fleet_operator::{TripAction, WaybillAnchor};
+use crate::services::fleet_operator::{
+    EmployeeLoginRequest, EmployeeLoginResponse, EmployeeRegisterRequest, EmployeeRegisterResponse,
+    TripAction, WaybillAnchor,
+};
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
     SUPPORTED_OPERATOR_GTFS_IDS,
@@ -134,7 +137,15 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                         "/currentTripDetails",
                         web::post().to(fleet_operator_current_trip_details),
                     )
-                    .route("/verify", web::post().to(fleet_operator_verify)),
+                    .route("/verify", web::post().to(fleet_operator_verify))
+                    .route(
+                        "/employee/login",
+                        web::post().to(fleet_operator_employee_login),
+                    )
+                    .route(
+                        "/employee/register",
+                        web::post().to(fleet_operator_employee_register),
+                    ),
             )
             .route(
                 "/bus-route-schedule/{gtfs_id}/{route_id}",
@@ -966,7 +977,7 @@ pub async fn get_version(app_state: Data<AppState>, path: Path<String>) -> AppRe
 }
 
 #[derive(Deserialize)]
-struct TripQuery {
+pub struct TripQuery {
     trip_number: Option<i32>,
     #[serde(rename = "passVerifyReq")]
     pass_verify_req: Option<bool>,
@@ -1785,7 +1796,9 @@ async fn get_service_type_by_vehicle_impl(
                 .map(|details| details.iter().any(|t| t.is_active_trip.unwrap_or(false)))
                 .unwrap_or(false);
 
-            if !response.is_active_trip && !has_active_in_remaining && response.trip_number != Some(1)
+            if !response.is_active_trip
+                && !has_active_in_remaining
+                && response.trip_number != Some(1)
             {
                 // Try to find trip 1 in schedule_details and promote it
                 if let Some(ref schedule_map) = vehicle_data.schedule_details {
@@ -3834,5 +3847,53 @@ pub async fn fleet_operator_verify(
             &req.device_serial_number,
         )
         .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/employee/login",
+    tag = "Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS dataset identifier")),
+    request_body = EmployeeLoginRequest,
+    responses((status = 200, description = "Login response", body = EmployeeLoginResponse))
+)]
+pub async fn fleet_operator_employee_login(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<EmployeeLoginRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+
+    let response = app_state
+        .fleet_operator_service
+        .login(&gtfs_id, &req)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/employee/register",
+    tag = "Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS dataset identifier")),
+    request_body = EmployeeRegisterRequest,
+    responses((status = 200, description = "Registration response", body = EmployeeRegisterResponse))
+)]
+pub async fn fleet_operator_employee_register(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<EmployeeRegisterRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+
+    let response = app_state
+        .fleet_operator_service
+        .register(&gtfs_id, &req)
+        .await?;
+
     Ok(HttpResponse::Ok().json(response))
 }
