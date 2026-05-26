@@ -215,8 +215,7 @@ impl OsrtcStationCache {
         }
 
         let count = new_stations.len();
-        let list: Arc<Vec<OsrtcStation>> =
-            Arc::new(new_stations.values().cloned().collect());
+        let list: Arc<Vec<OsrtcStation>> = Arc::new(new_stations.values().cloned().collect());
 
         let mut stations_lock = self.stations.write().await;
         *stations_lock = new_stations;
