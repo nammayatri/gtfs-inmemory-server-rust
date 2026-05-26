@@ -148,7 +148,6 @@ pub struct AppState {
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
-    pub conductor_details: Arc<HashMap<String, crate::models::MinimalEmployee>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
@@ -181,13 +180,17 @@ impl AppState {
                         info!("Successfully connected to the local database.");
                         let vehicle_reader =
                             Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                        let employee_reader =
-                            Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
                         // operator and internal reader use ONLY the internal pool
-                        let (operator_svc, vehicle_reader_internal, fleet_op_svc): (
+                        let (
+                            operator_svc,
+                            vehicle_reader_internal,
+                            fleet_op_svc,
+                            internal_pool_opt,
+                        ): (
                             Arc<dyn OperatorService>,
                             Arc<dyn VehicleDataReaderInternal>,
                             Arc<dyn FleetOperatorService>,
+                            Option<PgPool>,
                         ) = if let Some(internal_url) = &app_config.internal_database_url {
                             info!("Connecting to internal database (local)...");
                             match create_pool_from_url(internal_url, &app_config).await {
@@ -198,7 +201,10 @@ impl AppState {
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
                                         )),
-                                        Arc::new(DBFleetOperatorService::new(internal_pool)),
+                                        Arc::new(DBFleetOperatorService::new(
+                                            internal_pool.clone(),
+                                        )),
+                                        Some(internal_pool),
                                     )
                                 }
                                 Err(e) => {
@@ -209,6 +215,7 @@ impl AppState {
                                             as Arc<dyn VehicleDataReaderInternal>,
                                         Arc::new(MockFleetOperatorService::new())
                                             as Arc<dyn FleetOperatorService>,
+                                        None,
                                     )
                                 }
                             }
@@ -220,8 +227,14 @@ impl AppState {
                                     as Arc<dyn VehicleDataReaderInternal>,
                                 Arc::new(MockFleetOperatorService::new())
                                     as Arc<dyn FleetOperatorService>,
+                                None,
                             )
                         };
+                        let employee_reader = Arc::new(DBEmployeeReader::new(
+                            pool.clone(),
+                            internal_pool_opt,
+                            &app_config,
+                        ));
                         (
                             vehicle_reader,
                             employee_reader,
@@ -250,12 +263,12 @@ impl AppState {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
                 let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                let employee_reader = Arc::new(DBEmployeeReader::new(pool.clone(), &app_config));
                 // operator and internal reader use ONLY the internal pool
-                let (operator_svc, vehicle_reader_internal, fleet_op_svc): (
+                let (operator_svc, vehicle_reader_internal, fleet_op_svc, internal_pool_opt): (
                     Arc<dyn OperatorService>,
                     Arc<dyn VehicleDataReaderInternal>,
                     Arc<dyn FleetOperatorService>,
+                    Option<PgPool>,
                 ) = if let Some(internal_url) = &app_config.internal_database_url {
                     info!("Connecting to internal database (production)...");
                     let internal_pool = create_pool_from_url(internal_url, &app_config)
@@ -266,7 +279,8 @@ impl AppState {
                     (
                         Arc::new(DBOperatorService::new(internal_pool.clone())),
                         Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
-                        Arc::new(DBFleetOperatorService::new(internal_pool)),
+                        Arc::new(DBFleetOperatorService::new(internal_pool.clone())),
+                        Some(internal_pool),
                     )
                 } else {
                     info!("No internal_database_url set; using mock internal services.");
@@ -275,8 +289,14 @@ impl AppState {
                         Arc::new(MockDBVehicleReaderInternal::new())
                             as Arc<dyn VehicleDataReaderInternal>,
                         Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
+                        None,
                     )
                 };
+                let employee_reader = Arc::new(DBEmployeeReader::new(
+                    pool.clone(),
+                    internal_pool_opt,
+                    &app_config,
+                ));
                 (
                     vehicle_reader,
                     employee_reader,
@@ -335,9 +355,6 @@ impl AppState {
         // Load bus registration mapping from CSV
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
 
-        // Load conductor details from CSV
-        let conductor_details = Arc::new(Self::load_conductor_details().await?);
-
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
 
@@ -355,7 +372,6 @@ impl AppState {
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
-            conductor_details,
             depot_manager_details,
             fleet_tag_list: Arc::new(Self::load_fleet_tag_list().await?),
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -586,85 +602,6 @@ impl AppState {
         );
 
         Ok(sub_types_map)
-    }
-
-    async fn load_conductor_details() -> Result<HashMap<String, crate::models::MinimalEmployee>> {
-        use crate::models::MinimalEmployee;
-        let file_path = "./assets/conductor_details.csv";
-
-        let mut file = match File::open(file_path).await {
-            Ok(file) => file,
-            Err(_) => {
-                info!("conductor_details.csv file not found, proceeding without conductor details data");
-                return Ok(HashMap::new());
-            }
-        };
-
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read conductor_details.csv: {}", e))?;
-
-        let mut reader = ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(contents.as_bytes());
-
-        let mut phone_to_employee: HashMap<String, MinimalEmployee> = HashMap::new();
-
-        for result in reader.records() {
-            match result {
-                Ok(record) => {
-                    // CSV columns: Token No(0), Phone Number(1), UPI ID(2), Depot Name(3), Name(4)
-                    let (Some(token_no), Some(phone_number), Some(depot_name), Some(name)) =
-                        (record.get(0), record.get(1), record.get(3), record.get(4))
-                    else {
-                        continue;
-                    };
-
-                    // CSV stores pre-computed HMAC-SHA256 hash of the phone number
-                    let phone_hash = phone_number.trim().to_string();
-                    let token = token_no.trim().to_string();
-                    let full_name = name.trim();
-                    let depot = depot_name.trim().to_string();
-
-                    if phone_hash.is_empty() || token.is_empty() {
-                        continue;
-                    }
-
-                    let depot_opt = if depot.is_empty() || depot == "nan" {
-                        None
-                    } else {
-                        Some(depot)
-                    };
-
-                    // Split name into first and last
-                    let (first_name, last_name) = match full_name.split_once(' ') {
-                        Some((first, last)) => (first.to_string(), Some(last.to_string())),
-                        None => (full_name.to_string(), None),
-                    };
-
-                    let employee = MinimalEmployee {
-                        token_no: Some(token),
-                        first_name,
-                        last_name,
-                        mobile_no: None,
-                        depot_name: depot_opt,
-                    };
-
-                    phone_to_employee.insert(phone_hash, employee);
-                }
-                Err(e) => {
-                    error!("Error parsing conductor_details CSV row: {}", e);
-                }
-            }
-        }
-
-        info!(
-            "Loaded conductor details for {} conductors",
-            phone_to_employee.len()
-        );
-
-        Ok(phone_to_employee)
     }
 
     async fn load_depot_manager_details(

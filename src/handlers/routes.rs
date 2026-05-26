@@ -435,14 +435,6 @@ pub async fn get_conductor_by_phone_number(
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
     let phone_number = path.into_inner();
-    let hash_key = &app_state.config.phone_number_hash_key;
-    let phone_hash = crate::tools::hash::hash_phone_number(&phone_number, hash_key);
-
-    if let Some(emp) = app_state.conductor_details.get(&phone_hash) {
-        return Ok(HttpResponse::Ok().json(emp));
-    }
-
-    // Fallback to DB lookup (plain number for DB query)
     let employee_data = app_state
         .db_employee_reader
         .get_employee_by_phone(&phone_number)
