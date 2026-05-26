@@ -415,14 +415,6 @@ pub async fn get_conductor_by_phone_number(
     path: Path<String>,
 ) -> AppResult<HttpResponse> {
     let phone_number = path.into_inner();
-    let hash_key = &app_state.config.phone_number_hash_key;
-    let phone_hash = crate::tools::hash::hash_phone_number(&phone_number, hash_key);
-
-    if let Some(emp) = app_state.conductor_details.get(&phone_hash) {
-        return Ok(HttpResponse::Ok().json(emp));
-    }
-
-    // Fallback to DB lookup (plain number for DB query)
     let employee_data = app_state
         .db_employee_reader
         .get_employee_by_phone(&phone_number)
@@ -1718,7 +1710,9 @@ async fn get_service_type_by_vehicle_impl(
                 .map(|details| details.iter().any(|t| t.is_active_trip.unwrap_or(false)))
                 .unwrap_or(false);
 
-            if !response.is_active_trip && !has_active_in_remaining && response.trip_number != Some(1)
+            if !response.is_active_trip
+                && !has_active_in_remaining
+                && response.trip_number != Some(1)
             {
                 // Try to find trip 1 in schedule_details and promote it
                 if let Some(ref schedule_map) = vehicle_data.schedule_details {
