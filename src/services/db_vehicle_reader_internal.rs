@@ -7,7 +7,10 @@ use tokio::sync::RwLock;
 use sqlx::PgPool;
 use tracing::{debug, error, info};
 
-use crate::models::{BusSchedule, WaybillMetadataResponse, WaybillTripInfo, VehicleData, VehicleDataWithRouteId, WaybillStatus};
+use crate::models::{
+    BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillMetadataResponse, WaybillStatus,
+    WaybillTripInfo,
+};
 use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
@@ -1309,8 +1312,7 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         gtfs_id: &str,
         waybill_no: &str,
     ) -> AppResult<WaybillMetadataResponse> {
-        self.get_waybill_metadata_impl(gtfs_id, waybill_no)
-            .await
+        self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
     }
 }
 
@@ -1353,13 +1355,19 @@ impl DBVehicleReaderInternal {
         let driver_name = match (waybill_row.driver_first_name, waybill_row.driver_last_name) {
             (Some(f), Some(l)) => {
                 let combined = format!("{} {}", f, l).trim().to_string();
-                if combined.is_empty() { None } else { Some(combined) }
+                if combined.is_empty() {
+                    None
+                } else {
+                    Some(combined)
+                }
             }
             (Some(f), None) if !f.trim().is_empty() => Some(f),
             (None, Some(l)) if !l.trim().is_empty() => Some(l),
             _ => None,
         };
-        let driver_mobile_number = waybill_row.driver_mobile_number.filter(|m| !m.trim().is_empty());
+        let driver_mobile_number = waybill_row
+            .driver_mobile_number
+            .filter(|m| !m.trim().is_empty());
 
         let response = WaybillMetadataResponse {
             waybill_no: waybill_row.waybill_no,
@@ -1367,7 +1375,7 @@ impl DBVehicleReaderInternal {
             service_type: waybill_row.service_type,
             driver_id: waybill_row.driver_token_no,
             driver_name,
-            driver_mobile_number
+            driver_mobile_number,
         };
 
         Ok(response)

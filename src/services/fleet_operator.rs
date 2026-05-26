@@ -91,6 +91,13 @@ pub enum AuthType {
     Email,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Driver,
+    Conductor,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EmployeeLoginRequest {
     pub auth_type: Option<AuthType>,
@@ -102,6 +109,7 @@ pub struct EmployeeLoginRequest {
 pub struct EmployeeLoginResponse {
     pub verified: bool,
     pub token: Option<String>,
+    pub role: Option<Role>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -110,6 +118,7 @@ pub struct EmployeeRegisterRequest {
     pub email_hash: String,
     pub password_hash: String,
     pub first_name: String,
+    pub role: Option<Role>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -1108,14 +1117,18 @@ impl FleetOperatorService for DBFleetOperatorService {
                     AppError::BadRequest("password_hash is required for email auth".into())
                 })?;
 
-                let token_no: Option<String> = sqlx::query_scalar(
+                let row: Option<(String, Option<String>)> = sqlx::query_as(
                     r#"
-                    SELECT token_no
-                    FROM employees_internal
-                    WHERE email_hash = $1
-                      AND password_hash = $2
-                      AND gtfs_id = $3
-                      AND deleted = false
+                    SELECT e.token_no, LOWER(d.designation_name)
+                    FROM employees_internal e
+                    LEFT JOIN designations_internal d
+                      ON d.designation_id = e.designation_id
+                     AND d.gtfs_id = e.gtfs_id
+                     AND d.deleted = false
+                    WHERE e.email_hash = $1
+                      AND e.password_hash = $2
+                      AND e.gtfs_id = $3
+                      AND e.deleted = false
                     LIMIT 1
                     "#,
                 )
@@ -1129,20 +1142,30 @@ impl FleetOperatorService for DBFleetOperatorService {
                     AppError::Internal(e.to_string())
                 })?;
 
-                match token_no {
-                    Some(token) => Ok(EmployeeLoginResponse {
-                        verified: true,
-                        token: Some(token),
-                    }),
+                match row {
+                    Some((token, designation_name)) => {
+                        let role = designation_name.as_deref().and_then(|n| match n {
+                            "driver" => Some(Role::Driver),
+                            "conductor" => Some(Role::Conductor),
+                            _ => None,
+                        });
+                        Ok(EmployeeLoginResponse {
+                            verified: true,
+                            token: Some(token),
+                            role,
+                        })
+                    }
                     None => Ok(EmployeeLoginResponse {
                         verified: false,
                         token: None,
+                        role: None,
                     }),
                 }
             }
             _ => Ok(EmployeeLoginResponse {
                 verified: false,
                 token: None,
+                role: None,
             }),
         }
     }
@@ -1152,27 +1175,90 @@ impl FleetOperatorService for DBFleetOperatorService {
         gtfs_id: &str,
         req: &EmployeeRegisterRequest,
     ) -> AppResult<EmployeeRegisterResponse> {
-        sqlx::query(
-            r#"
-            INSERT INTO employees_internal (token_no, email_hash, password_hash, gtfs_id, first_name)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (gtfs_id, token_no) DO UPDATE SET
-                email_hash = EXCLUDED.email_hash,
-                password_hash = EXCLUDED.password_hash,
-                updated_at = NOW()
-            "#,
-        )
-        .bind(&req.token_no)
-        .bind(&req.email_hash)
-        .bind(&req.password_hash)
-        .bind(gtfs_id)
-        .bind(&req.first_name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            error!("register upsert failed for gtfs_id={}, token_no={}: {}", gtfs_id, req.token_no, e);
-            AppError::Internal(e.to_string())
-        })?;
+        let designation_id: Option<i64> = match req.role {
+            Some(role) => {
+                let name = match role {
+                    Role::Driver => "driver",
+                    Role::Conductor => "conductor",
+                };
+                let id: Option<i64> = sqlx::query_scalar(
+                    r#"
+                    SELECT designation_id
+                    FROM designations_internal
+                    WHERE LOWER(designation_name) = $1
+                      AND gtfs_id = $2
+                      AND deleted = false
+                    LIMIT 1
+                    "#,
+                )
+                .bind(name)
+                .bind(gtfs_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "register designation lookup failed for gtfs_id={}, role={}: {}",
+                        gtfs_id, name, e
+                    );
+                    AppError::Internal(e.to_string())
+                })?;
+                Some(id.ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "designation '{}' not found for gtfs_id={}",
+                        name, gtfs_id
+                    ))
+                })?)
+            }
+            None => None,
+        };
+
+        if let Some(did) = designation_id {
+            sqlx::query(
+                r#"
+                INSERT INTO employees_internal (token_no, email_hash, password_hash, gtfs_id, first_name, designation_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (gtfs_id, token_no) DO UPDATE SET
+                    email_hash = EXCLUDED.email_hash,
+                    password_hash = EXCLUDED.password_hash,
+                    designation_id = EXCLUDED.designation_id,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(&req.token_no)
+            .bind(&req.email_hash)
+            .bind(&req.password_hash)
+            .bind(gtfs_id)
+            .bind(&req.first_name)
+            .bind(did)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                error!("register upsert failed for gtfs_id={}, token_no={}: {}", gtfs_id, req.token_no, e);
+                AppError::Internal(e.to_string())
+            })?;
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO employees_internal (token_no, email_hash, password_hash, gtfs_id, first_name)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (gtfs_id, token_no) DO UPDATE SET
+                    email_hash = EXCLUDED.email_hash,
+                    password_hash = EXCLUDED.password_hash,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(&req.token_no)
+            .bind(&req.email_hash)
+            .bind(&req.password_hash)
+            .bind(gtfs_id)
+            .bind(&req.first_name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                error!("register upsert failed for gtfs_id={}, token_no={}: {}", gtfs_id, req.token_no, e);
+                AppError::Internal(e.to_string())
+            })?;
+        }
 
         Ok(EmployeeRegisterResponse {
             success: true,
