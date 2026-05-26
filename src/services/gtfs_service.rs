@@ -1,11 +1,10 @@
 use crate::environment::AppConfig;
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData,
-    GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern, NandiPatternDetails,
-    NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord, RouteServiceTierRecord,
-    RouteStopMapping, SeatLayoutMappingRecord, ServiceTierType, StaticFleetInfo,
-    StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
-    SuburbanStopInfo, SuburbanStopInfoRecord,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
+    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
+    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, SeatLayoutMappingRecord,
+    ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord,
+    StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails};
 use crate::tools::error::{AppError, AppResult};

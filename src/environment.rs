@@ -319,7 +319,10 @@ impl AppState {
                     app_config.osrtc_station_refresh_interval_hours * 3600,
                 )?;
                 if let Err(e) = cache.initialize().await {
-                    error!("OSRTC station cache initial load failed (will retry in background): {}", e);
+                    error!(
+                        "OSRTC station cache initial load failed (will retry in background): {}",
+                        e
+                    );
                 }
                 Some(Arc::new(cache))
             }
