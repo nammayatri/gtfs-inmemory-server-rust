@@ -23,10 +23,9 @@ use tracing::{error, info};
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
-    BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats,
-    MinimalEmployee, NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse,
-    TripDetails, VehicleData, VehicleMetadataResponse, VehicleOperationData,
-    VehicleServiceTypeResponse,
+    BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats, MinimalEmployee,
+    NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
+    VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
@@ -2479,11 +2478,14 @@ pub async fn get_bus_trip_schedule(
 
     // kolkata_bus: internal only; chennai_bus: both external + internal
     let (external_rows, internal_rows) = if gtfs_id == "kolkata_bus" {
-        (vec![], app_state
-            .db_vehicle_reader_internal
-            .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
-            .await
-            .unwrap_or_default())
+        (
+            vec![],
+            app_state
+                .db_vehicle_reader_internal
+                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
+                .await
+                .unwrap_or_default(),
+        )
     } else {
         (
             app_state

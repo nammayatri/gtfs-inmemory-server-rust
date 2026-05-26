@@ -277,7 +277,7 @@ pub struct WaybillMetadataResponse {
     #[serde(rename = "driverName")]
     pub driver_name: Option<String>,
     #[serde(rename = "driverMobileNumber")]
-    pub driver_mobile_number: Option<String>
+    pub driver_mobile_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -450,11 +450,7 @@ pub struct GTFSStop {
     pub regional_name: Option<String>,
     #[serde(default, skip_serializing)]
     pub desc: Option<String>,
-    #[serde(
-        rename = "clusterId",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
 }
 
