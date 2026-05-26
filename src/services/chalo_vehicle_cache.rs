@@ -240,10 +240,7 @@ impl ChaloVehicleCache {
         );
 
         let url: Url = Url::parse(&city_config.api_url).map_err(|e| {
-            error!(
-                "Invalid CHALO API URL for {}: {}",
-                city_config.city_name, e
-            );
+            error!("Invalid CHALO API URL for {}: {}", city_config.city_name, e);
             AppError::Internal(format!(
                 "Invalid CHALO API URL for {}: {}",
                 city_config.city_name, e
