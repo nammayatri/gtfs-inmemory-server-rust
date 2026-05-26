@@ -39,14 +39,16 @@ impl EmployeeReader for MockEmployeeReader {
 
 pub struct DBEmployeeReader {
     pool: PgPool,
+    internal_pool: Option<PgPool>,
     cache: Arc<RwLock<HashMap<String, (MinimalEmployee, SystemTime)>>>,
     cache_duration: Duration,
 }
 
 impl DBEmployeeReader {
-    pub fn new(pool: PgPool, config: &AppConfig) -> Self {
+    pub fn new(pool: PgPool, internal_pool: Option<PgPool>, config: &AppConfig) -> Self {
         Self {
             pool,
+            internal_pool,
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_duration: Duration::from_secs(config.cache_duration),
         }
@@ -77,7 +79,8 @@ impl EmployeeReader for DBEmployeeReader {
             return Ok(Some(cached_employee));
         }
 
-        let query = r#"
+        // Primary lookup in employees table
+        let primary_query = r#"
             SELECT
                 e.token_no,
                 e.first_name,
@@ -91,17 +94,58 @@ impl EmployeeReader for DBEmployeeReader {
             LIMIT 1
         "#;
 
-        match sqlx::query_as::<_, MinimalEmployee>(query)
+        match sqlx::query_as::<_, MinimalEmployee>(primary_query)
             .bind(phone)
             .fetch_optional(&self.pool)
             .await
         {
             Ok(Some(emp)) => {
+                debug!("Employee found in employees table for phone {}", phone);
+                self.cache_employee_data(&emp, phone).await;
+                return Ok(Some(emp));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(AppError::Internal(format!("DB query error: {}", e))),
+        }
+
+        // Fallback lookup in employees_internal table
+        let internal_pool = match &self.internal_pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let internal_query = r#"
+            SELECT
+                e.token_no,
+                e.first_name,
+                e.last_name,
+                e.mobile_no,
+                ent.entity_remark AS depot_name
+            FROM employees_internal e
+            LEFT JOIN entities_internal ent ON ent.entity_id = e.entity_id
+            WHERE e.mobile_no = $1
+              AND e.deleted = false
+            LIMIT 1
+        "#;
+
+        match sqlx::query_as::<_, MinimalEmployee>(internal_query)
+            .bind(phone)
+            .fetch_optional(internal_pool)
+            .await
+        {
+            Ok(Some(emp)) => {
+                debug!(
+                    "Employee found in employees_internal table for phone {}",
+                    phone
+                );
                 self.cache_employee_data(&emp, phone).await;
                 Ok(Some(emp))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(AppError::Internal(format!("DB query error: {}", e))),
+            Err(e) => Err(AppError::Internal(format!(
+                "DB query error (internal): {}",
+                e
+            ))),
         }
     }
 }
