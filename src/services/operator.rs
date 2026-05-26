@@ -1112,12 +1112,13 @@ struct TabletIdsCache {
     tablet_ids: HashMap<String, (Vec<String>, SystemTime)>,
 }
 
-// Designation cache: name (lowercase) → id
+// Designation cache: gtfs_id → (name(lowercase) → id, loaded_at)
 struct DesignationCache {
-    map: Option<HashMap<String, i64>>,
+    by_gtfs: HashMap<String, (HashMap<String, i64>, SystemTime)>,
 }
 
 const DEVICE_CACHE_SECS: u64 = 3600; // 1 hour
+const DESIGNATION_CACHE_SECS: u64 = 43200; // 12 hours
 
 pub struct DBOperatorService {
     pool: PgPool,
@@ -1136,7 +1137,9 @@ impl DBOperatorService {
             tablet_ids_cache: Arc::new(RwLock::new(TabletIdsCache {
                 tablet_ids: HashMap::new(),
             })),
-            designation_cache: Arc::new(RwLock::new(DesignationCache { map: None })),
+            designation_cache: Arc::new(RwLock::new(DesignationCache {
+                by_gtfs: HashMap::new(),
+            })),
         }
     }
 
@@ -1144,42 +1147,60 @@ impl DBOperatorService {
         ts.elapsed().unwrap_or_default() >= Duration::from_secs(secs)
     }
 
-    /// Load designation name→id map if not already loaded (infinite TTL).
-    async fn ensure_designation_cache(&self) -> AppResult<()> {
+    /// Load the designation name→id map for a gtfs_id if missing or expired (12h TTL).
+    async fn ensure_designation_cache(&self, gtfs_id: &str) -> AppResult<()> {
         {
             let cache = self.designation_cache.read().await;
-            if cache.map.is_some() {
-                return Ok(());
+            if let Some((_, ts)) = cache.by_gtfs.get(gtfs_id) {
+                if !Self::cache_expired(*ts, DESIGNATION_CACHE_SECS) {
+                    return Ok(());
+                }
             }
         }
 
-        info!("Loading designation cache from DB");
+        info!("Loading designation cache from DB for gtfs_id={}", gtfs_id);
         let rows = sqlx::query_as::<_, (i64, String)>(
-            "SELECT designation_id, LOWER(designation_name) FROM designations_internal WHERE deleted = false",
+            "SELECT designation_id, LOWER(designation_name) FROM designations_internal WHERE deleted = false AND gtfs_id = $1",
         )
+        .bind(gtfs_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::DbError(format!("designation cache load: {}", e)))?;
 
         let map: HashMap<String, i64> = rows.into_iter().map(|(id, name)| (name, id)).collect();
-        info!("Designation cache loaded with {} entries", map.len());
+        info!(
+            "Designation cache loaded with {} entries for gtfs_id={}",
+            map.len(),
+            gtfs_id
+        );
 
         let mut cache = self.designation_cache.write().await;
-        cache.map = Some(map);
+        cache
+            .by_gtfs
+            .insert(gtfs_id.to_string(), (map, SystemTime::now()));
         Ok(())
     }
 
-    async fn designation_id_for(&self, role: &str) -> AppResult<i64> {
-        self.ensure_designation_cache().await?;
+    async fn designation_id_for(&self, gtfs_id: &str, role: &str) -> AppResult<i64> {
+        self.ensure_designation_cache(gtfs_id).await?;
         let cache = self.designation_cache.read().await;
-        let map = cache.map.as_ref().unwrap();
+        let map = cache
+            .by_gtfs
+            .get(gtfs_id)
+            .map(|(m, _)| m)
+            .expect("cache populated by ensure_designation_cache");
         // role could be "conductors" or "drivers"; strip trailing 's' for matching
         let search = role.trim_end_matches('s').to_lowercase();
         // Find partial match (e.g. "conductor" matches "conductor", "driver" matches "driver")
         map.iter()
             .find(|(name, _)| name.contains(&search))
             .map(|(_, id)| *id)
-            .ok_or_else(|| AppError::NotFound(format!("No designation found for role: {}", role)))
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "No designation found for role '{}' in gtfs_id '{}'",
+                    role, gtfs_id
+                ))
+            })
     }
 }
 
@@ -1669,8 +1690,7 @@ impl OperatorService for DBOperatorService {
         gtfs_id: &str,
         token: &str,
     ) -> AppResult<Option<EmployeeRow>> {
-        self.ensure_designation_cache().await?;
-        let designation_id = self.designation_id_for("conductors").await?;
+        let designation_id = self.designation_id_for(gtfs_id, "conductors").await?;
 
         sqlx::query_as::<_, EmployeeRow>(
             "SELECT emp_id, first_name, last_name, token_no, mobile_no
@@ -1690,8 +1710,7 @@ impl OperatorService for DBOperatorService {
     }
 
     async fn get_driver_info(&self, gtfs_id: &str, token: &str) -> AppResult<Option<EmployeeRow>> {
-        self.ensure_designation_cache().await?;
-        let designation_id = self.designation_id_for("drivers").await?;
+        let designation_id = self.designation_id_for(gtfs_id, "drivers").await?;
 
         sqlx::query_as::<_, EmployeeRow>(
             "SELECT emp_id, first_name, last_name, token_no, mobile_no
@@ -1775,7 +1794,7 @@ impl OperatorService for DBOperatorService {
     }
 
     async fn get_operators(&self, gtfs_id: &str, role: &str) -> AppResult<Vec<EmployeeRow>> {
-        let designation_id = self.designation_id_for(role).await?;
+        let designation_id = self.designation_id_for(gtfs_id, role).await?;
 
         sqlx::query_as::<_, EmployeeRow>(
             "SELECT emp_id, first_name, last_name, token_no, mobile_no
