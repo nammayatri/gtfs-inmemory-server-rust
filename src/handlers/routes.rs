@@ -152,6 +152,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 actix_web::web::get().to(get_route_stop_mapping_by_route),
             )
             .route(
+                "/route-stop-mapping/{gtfs_id}/route/{route_code}/draw",
+                actix_web::web::get().to(get_route_stop_mapping_draw),
+            )
+            .route(
                 "/route-stop-mapping/{gtfs_id}/stop/{stop_code}",
                 actix_web::web::get().to(get_route_stop_mapping_by_stop),
             )
@@ -665,6 +669,393 @@ pub async fn get_route_stop_mapping_by_stop(
         )
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
+}
+
+#[utoipa::path(
+    get,
+    path = "/route-stop-mapping/{gtfs_id}/route/{route_code}/draw",
+    tag = "Routes",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("route_code" = String, Path, description = "Route code"),
+        ("direction" = Option<String>, Query, description = "Direction filter"),
+    ),
+    responses((status = 200, description = "HTML page with Leaflet map", body = String))
+)]
+pub async fn get_route_stop_mapping_draw(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DirectionQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_code) = path.into_inner();
+    let mappings = app_state
+        .gtfs_service
+        .get_route_stop_mapping_by_route_with_direction(
+            &gtfs_id,
+            &route_code,
+            query.direction.as_deref(),
+        )
+        .await?;
+
+    let stops_json = serde_json::to_string(&mappings).unwrap_or_else(|_| "[]".to_string());
+    let stops_json = stops_json.replace('<', "\\u003c");
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Route Stop Mapping Draw</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body {{ margin: 0; padding: 0; height: 100%; font-family: Arial, sans-serif; overflow: hidden; }}
+  #map {{ height: 100vh; width: 100%; }}
+  #topbar {{ position: absolute; top: 10px; left: 10px; right: 10px; z-index: 1000; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; background: rgba(255,255,255,0.95); padding: 8px 12px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); }}
+  #filterPanel {{ position: absolute; top: 70px; left: 10px; z-index: 1000; max-height: 70vh; overflow-y: auto; background: rgba(255,255,255,0.95); padding: 10px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); min-width: 220px; display: none; }}
+  #filterPanel.active {{ display: block; }}
+  .filter-group {{ margin-bottom: 8px; }}
+  .filter-group label {{ display: block; font-size: 12px; font-weight: bold; margin-bottom: 2px; }}
+  .filter-group input[type="number"], .filter-group select {{ width: 100%; box-sizing: border-box; }}
+  .error {{ color: #c0392b; font-size: 12px; }}
+  .numbered-marker {{
+    background: #2980b9;
+    color: #fff;
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: bold;
+    border: 2px solid #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <label>Upload CSV: <input type="file" id="csvInput" accept=".csv" /></label>
+  <span id="csvError" class="error"></span>
+  <button id="toggleFilters">Filters</button>
+</div>
+<div id="filterPanel"></div>
+<script type="application/json" id="stops-data">{stops_json}</script>
+<div id="map"></div>
+<script>
+(function() {{
+  const serverStops = JSON.parse(document.getElementById('stops-data').textContent);
+  let csvRows = [];
+  let csvHeaders = [];
+  let map = L.map('map');
+  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 20
+  }}).addTo(map);
+
+  const routeStopsLayer = L.layerGroup().addTo(map);
+  const csvPointsLayer = L.layerGroup().addTo(map);
+
+  function makeNumberedIcon(num) {{
+    return L.divIcon({{
+      className: '',
+      html: `<div class="numbered-marker">${{num}}</div>`,
+      iconSize: [24, 24],
+      iconAnchor: [12, 12]
+    }});
+  }}
+
+  function buildPopup(s) {{
+    const gates = (s.gates && s.gates.length)
+      ? s.gates.map(g => g.gateName).join(', ')
+      : 'None';
+    return `
+      <div style="font-size:13px;line-height:1.4;">
+        <strong>${{s.stopName}}</strong><br/>
+        <span style="color:#555;">Code:</span> ${{s.stopCode}}<br/>
+        <span style="color:#555;">Sequence:</span> ${{s.sequenceNum}}<br/>
+        <span style="color:#555;">Vehicle Type:</span> ${{s.vehicleType}}<br/>
+        <span style="color:#555;">Platform:</span> ${{s.platform ?? '-'}}<br/>
+        <span style="color:#555;">Gates:</span> ${{gates}}
+      </div>
+    `;
+  }}
+
+  function renderRouteStops(stops) {{
+    routeStopsLayer.clearLayers();
+    if (!stops || stops.length === 0) return;
+    const latlngs = stops.map((s) => {{
+      const lat = s.stopPoint?.latitude ?? s.stopPoint?.lat;
+      const lng = s.stopPoint?.longitude ?? s.stopPoint?.lon;
+      if (lat == null || lng == null) return null;
+      const marker = L.marker([lat, lng], {{ icon: makeNumberedIcon(s.sequenceNum) }}).bindPopup(buildPopup(s));
+      routeStopsLayer.addLayer(marker);
+      return [lat, lng];
+    }}).filter(Boolean);
+    if (latlngs.length > 0) {{
+      const polyline = L.polyline(latlngs, {{color: 'blue'}});
+      routeStopsLayer.addLayer(polyline);
+    }}
+  }}
+
+  function renderCsvPoints(rows) {{
+    csvPointsLayer.clearLayers();
+    if (!rows || rows.length === 0) return;
+    rows.forEach((r, i) => {{
+      const lat = r.stopPoint?.latitude ?? r.stopPoint?.lat;
+      const lng = r.stopPoint?.longitude ?? r.stopPoint?.lon;
+      if (lat == null || lng == null) return;
+      const marker = L.circleMarker([lat, lng], {{
+        radius: 6,
+        color: '#e74c3c',
+        fillColor: '#e74c3c',
+        fillOpacity: 0.8
+      }}).bindPopup(`CSV #${{i+1}} ${{r.stopName}} (${{r.stopCode}})`);
+      csvPointsLayer.addLayer(marker);
+    }});
+  }}
+
+  function parseCsv(text) {{
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    let i = 0;
+    while (i < text.length) {{
+      const char = text[i];
+      const next = text[i + 1];
+      if (inQuotes) {{
+        if (char === '"') {{
+          if (next === '"') {{
+            field += '"';
+            i += 2;
+            continue;
+          }} else {{
+            inQuotes = false;
+          }}
+        }} else {{
+          field += char;
+        }}
+      }} else {{
+        if (char === '"') {{
+          inQuotes = true;
+        }} else if (char === ',') {{
+          row.push(field);
+          field = '';
+        }} else if (char === '\r' && next === '\n') {{
+          row.push(field);
+          field = '';
+          if (row.length > 1 || row[0] !== '') rows.push(row);
+          row = [];
+          i += 1;
+        }} else if (char === '\n' || char === '\r') {{
+          row.push(field);
+          field = '';
+          if (row.length > 1 || row[0] !== '') rows.push(row);
+          row = [];
+        }} else {{
+          field += char;
+        }}
+      }}
+      i += 1;
+    }}
+    row.push(field);
+    if (row.length > 1 || row[0] !== '') rows.push(row);
+    return rows;
+  }}
+
+  function validateCsv(parsedRows) {{
+    if (!Array.isArray(parsedRows) || parsedRows.length < 2) throw new Error('CSV is empty or too short');
+    const rawHeaders = parsedRows[0];
+    const headers = rawHeaders.map(h => h.trim().toLowerCase());
+    const latIdx = headers.findIndex(h => h === 'lat' || h === 'latitude');
+    const lngIdx = headers.findIndex(h => h === 'lon' || h === 'lng' || h === 'longitude');
+    if (latIdx === -1 || lngIdx === -1) throw new Error('CSV must contain latitude/longitude columns');
+    const dataRows = parsedRows.slice(1);
+    return dataRows.map((vals, i) => {{
+      const obj = {{}};
+      rawHeaders.forEach((h, idx) => obj[h.trim()] = (vals[idx] ?? '').trim());
+      const lat = parseFloat(obj[rawHeaders[latIdx].trim()]);
+      const lng = parseFloat(obj[rawHeaders[lngIdx].trim()]);
+      if (isNaN(lat) || isNaN(lng)) {{
+        throw new Error(`Row ${{i + 1}} has invalid latitude or longitude`);
+      }}
+      return {{
+        stopPoint: {{ latitude: lat, longitude: lng }},
+        stopName: obj.stopName ?? obj.name ?? '',
+        stopCode: obj.stopCode ?? obj.code ?? String(i+1),
+        sequenceNum: parseInt(obj.sequenceNum ?? obj.sequence ?? (i+1), 10),
+        _raw: obj
+      }};
+    }}).sort((a,b) => a.sequenceNum - b.sequenceNum);
+  }}
+
+  function inferColumnTypes(rows, rawHeaders) {{
+    const types = {{}};
+    rawHeaders.forEach(h => {{
+      const key = h.trim();
+      let numeric = 0, bool = 0, total = 0;
+      rows.forEach(r => {{
+        const v = r[key];
+        if (v === undefined || v === '') return;
+        total++;
+        if (v.toLowerCase() === 'true' || v.toLowerCase() === 'false') bool++;
+        if (!isNaN(parseFloat(v)) && isFinite(v)) numeric++;
+      }});
+      if (total === 0) {{ types[key] = 'string'; }}
+      else if (bool === total) {{ types[key] = 'boolean'; }}
+      else if (numeric === total) {{ types[key] = 'number'; }}
+      else {{ types[key] = 'string'; }}
+    }});
+    return types;
+  }}
+
+  function buildFilterControls(rows, rawHeaders) {{
+    const panel = document.getElementById('filterPanel');
+    panel.innerHTML = '';
+    if (!rows.length) {{ panel.classList.remove('active'); return; }}
+    const types = inferColumnTypes(rows, rawHeaders);
+    rawHeaders.forEach(key => {{
+      const k = key.trim();
+      const t = types[k];
+      const group = document.createElement('div');
+      group.className = 'filter-group';
+      const label = document.createElement('label');
+      label.textContent = k;
+      group.appendChild(label);
+      if (t === 'number') {{
+        const nums = rows.map(r => parseFloat(r[k])).filter(v => !isNaN(v));
+        const min = Math.min(...nums);
+        const max = Math.max(...nums);
+        const minIn = document.createElement('input');
+        minIn.type = 'number';
+        minIn.placeholder = `min (${{min}})`;
+        minIn.dataset.col = k;
+        minIn.dataset.kind = 'min';
+        const maxIn = document.createElement('input');
+        maxIn.type = 'number';
+        maxIn.placeholder = `max (${{max}})`;
+        maxIn.dataset.col = k;
+        maxIn.dataset.kind = 'max';
+        group.appendChild(minIn);
+        group.appendChild(maxIn);
+      }} else if (t === 'boolean') {{
+        const wrap = document.createElement('div');
+        ['true','false'].forEach(val => {{
+          const lbl = document.createElement('label');
+          lbl.style.fontWeight = 'normal';
+          lbl.style.fontSize = '12px';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = val;
+          cb.dataset.col = k;
+          cb.dataset.kind = 'bool';
+          lbl.appendChild(cb);
+          lbl.appendChild(document.createTextNode(' ' + val));
+          wrap.appendChild(lbl);
+        }});
+        group.appendChild(wrap);
+      }} else {{
+        const vals = [...new Set(rows.map(r => r[k]).filter(v => v !== ''))].sort();
+        const sel = document.createElement('select');
+        sel.multiple = true;
+        sel.size = Math.min(4, vals.length);
+        sel.dataset.col = k;
+        sel.dataset.kind = 'select';
+        const allOpt = document.createElement('option');
+        allOpt.value = '__ALL__';
+        allOpt.textContent = '(all)';
+        allOpt.selected = true;
+        sel.appendChild(allOpt);
+        vals.forEach(v => {{
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v;
+          sel.appendChild(opt);
+        }});
+        group.appendChild(sel);
+      }}
+      panel.appendChild(group);
+    }});
+    const applyBtn = document.createElement('button');
+    applyBtn.textContent = 'Apply Filters';
+    applyBtn.style.marginTop = '6px';
+    applyBtn.addEventListener('click', applyFilters);
+    panel.appendChild(applyBtn);
+    panel.classList.add('active');
+  }}
+
+  function applyFilters() {{
+    if (!csvRows.length) return;
+    const panel = document.getElementById('filterPanel');
+    const mins = {{}}, maxs = {{}}, bools = {{}}, selects = {{}};
+    panel.querySelectorAll('input[data-kind="min"]').forEach(el => {{ if (el.value !== '') mins[el.dataset.col] = parseFloat(el.value); }});
+    panel.querySelectorAll('input[data-kind="max"]').forEach(el => {{ if (el.value !== '') maxs[el.dataset.col] = parseFloat(el.value); }});
+    panel.querySelectorAll('input[data-kind="bool"]:checked').forEach(el => {{
+      if (!bools[el.dataset.col]) bools[el.dataset.col] = [];
+      bools[el.dataset.col].push(el.value === 'true');
+    }});
+    panel.querySelectorAll('select[data-kind="select"]').forEach(el => {{
+      const chosen = Array.from(el.selectedOptions).map(o => o.value).filter(v => v !== '__ALL__');
+      if (chosen.length) selects[el.dataset.col] = chosen;
+    }});
+    const filtered = csvRows.filter(r => {{
+      const raw = r._raw;
+      for (const col in mins) {{ const v = parseFloat(raw[col]); if (isNaN(v) || v < mins[col]) return false; }}
+      for (const col in maxs) {{ const v = parseFloat(raw[col]); if (isNaN(v) || v > maxs[col]) return false; }}
+      for (const col in bools) {{ const v = raw[col]?.toLowerCase() === 'true'; if (!bools[col].includes(v)) return false; }}
+      for (const col in selects) {{ if (!selects[col].includes(raw[col])) return false; }}
+      return true;
+    }});
+    renderCsvPoints(filtered);
+  }}
+
+  document.getElementById('csvInput').addEventListener('change', function(e) {{
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev) {{
+      const text = ev.target.result;
+      try {{
+        const parsed = parseCsv(text);
+        if (parsed.length < 2) {{ document.getElementById('csvError').textContent = 'CSV too short'; return; }}
+        const rawHeaders = parsed[0];
+        csvRows = validateCsv(parsed);
+        csvHeaders = rawHeaders.map(h => h.trim());
+        document.getElementById('csvError').textContent = '';
+        renderCsvPoints(csvRows);
+        buildFilterControls(csvRows.map(r => r._raw), rawHeaders);
+      }} catch (err) {{
+        document.getElementById('csvError').textContent = err.message;
+      }}
+    }};
+    reader.readAsText(file);
+  }});
+
+  document.getElementById('toggleFilters').addEventListener('click', function() {{
+    document.getElementById('filterPanel').classList.toggle('active');
+  }});
+
+  renderRouteStops(serverStops);
+  const initLatLngs = serverStops.map(s => {{
+    const lat = s.stopPoint?.latitude ?? s.stopPoint?.lat;
+    const lng = s.stopPoint?.longitude ?? s.stopPoint?.lon;
+    if (lat == null || lng == null) return null;
+    return [lat, lng];
+  }}).filter(Boolean);
+  if (initLatLngs.length > 0) {{
+    map.fitBounds(L.latLngBounds(initLatLngs), {{padding: [20, 20]}});
+  }}
+}})();
+</script>
+</body>
+</html>"#
+    );
+
+    Ok(HttpResponse::Ok().content_type("text/html").body(html))
 }
 
 #[utoipa::path(
