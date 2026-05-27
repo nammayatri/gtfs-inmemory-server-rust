@@ -20,6 +20,7 @@ use crate::services::operator::QueryBody;
         routes::get_routes_fuzzy,
         routes::get_stops_fuzzy,
         routes::get_route_stop_mapping_by_route,
+        routes::get_route_stop_mapping_draw,
         routes::get_route_stop_mapping_by_stop,
         routes::get_stop_code_from_provider_stop_code,
         routes::get_station_children,
