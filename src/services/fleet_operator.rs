@@ -51,6 +51,8 @@ pub struct CurrentOperationResponse {
     pub conductor_token: Option<String>,
     pub driver_token: Option<String>,
     pub number_of_trips: i64,
+    pub driver_person_id: Option<i64>,
+    pub conductor_person_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,6 +292,30 @@ impl DBFleetOperatorService {
             pool,
             route_info_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    async fn emp_id_for_token(&self, gtfs_id: &str, token: &str) -> AppResult<Option<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT emp_id
+            FROM employees_internal
+            WHERE gtfs_id = $1
+              AND token_no = $2
+              AND deleted = false
+            LIMIT 1
+            "#,
+        )
+        .bind(gtfs_id)
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(
+                "emp_id lookup failed for gtfs_id={}, token_no={}: {}",
+                gtfs_id, token, e
+            );
+            AppError::Internal(e.to_string())
+        })
     }
 
     // ── Waybill resolution ───────────────────────────────────────────────────
@@ -895,12 +921,23 @@ impl FleetOperatorService for DBFleetOperatorService {
         let waybill = self.resolve_waybill(gtfs_id, &anchor).await?;
         let number_of_trips = self.get_trip_count(&waybill).await?;
 
+        let driver_person_id = match waybill.driver_token_no.as_deref() {
+            Some(t) if !t.is_empty() => self.emp_id_for_token(gtfs_id, t).await?,
+            _ => None,
+        };
+        let conductor_person_id = match waybill.conductor_token_no.as_deref() {
+            Some(t) if !t.is_empty() => self.emp_id_for_token(gtfs_id, t).await?,
+            _ => None,
+        };
+
         Ok(CurrentOperationResponse {
             waybill_no: waybill.waybill_no,
             vehicle_number: waybill.vehicle_no,
             conductor_token: waybill.conductor_token_no,
             driver_token: waybill.driver_token_no,
             number_of_trips,
+            driver_person_id,
+            conductor_person_id,
         })
     }
 
