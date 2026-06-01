@@ -38,8 +38,8 @@ fn get_sha256_hash<T: Serialize>(val: &T) -> String {
 
 const SENTINEL_CLUSTER_ID: &str = "INVALID_SENTINEL";
 
-fn parse_cluster_id_from_desc(desc: Option<&str>) -> Option<String> {
-    let raw = desc?.trim();
+fn parse_cluster_id_from_info_json(info_json: Option<&str>) -> Option<String> {
+    let raw = info_json?.trim();
     if raw.is_empty() || raw == "{}" {
         return None;
     }
@@ -776,7 +776,7 @@ impl GTFSService {
                 .get(gtfs_id)
                 .and_then(|m| m.get(stop_code));
 
-            let cluster_id = parse_cluster_id_from_desc(stop.desc.as_deref());
+            let cluster_id = parse_cluster_id_from_info_json(stop.info_json.as_deref());
 
             // Create a new GTFSStop with the clean stop code
             let stop_res = GTFSStop {
@@ -789,7 +789,7 @@ impl GTFSService {
                 cluster: stop.cluster.clone(),
                 hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                 regional_name: regional_name.map(|r| r.regional_name.clone()),
-                desc: None,
+                info_json: None,
                 cluster_id: cluster_id.clone(),
             };
             if stop.cluster.is_some() {
@@ -803,7 +803,7 @@ impl GTFSService {
                     cluster: stop.cluster.clone(),
                     hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                     regional_name: regional_name.map(|r| r.regional_name.clone()),
-                    desc: None,
+                    info_json: None,
                     cluster_id: None,
                 };
                 stop_data
