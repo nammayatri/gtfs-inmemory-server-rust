@@ -2623,7 +2623,11 @@ impl GTFSService {
                     lon: s.lon,
                     scheduled_arrival: s.arrival_time.unwrap_or(0),
                     scheduled_departure: s.departure_time.unwrap_or(0),
-                    headsign: serde_json::Value::Null,
+                    headsign: s
+                        .headsign
+                        .as_deref()
+                        .map(|h| serde_json::Value::String(h.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
                     stop_position: s.stop_sequence.unwrap_or(i as i32),
                 })
                 .collect();

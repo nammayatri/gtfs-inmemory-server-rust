@@ -189,10 +189,27 @@ impl TripService {
             })
             .collect();
 
+        // Resolve route_name from the in-memory route table so the backend's
+        // non-Maybe `Text` decoder doesn't see null. The shard only carries the
+        // feed-scoped routeId (e.g. "kolkata_bus:AC54L-D") — strip the prefix
+        // and look up the route's long_name; fall back to empty string if the
+        // route isn't found or has no long_name.
+        let route_name = {
+            let code = trip
+                .route_id
+                .split(':')
+                .next_back()
+                .unwrap_or(&trip.route_id);
+            match self.gtfs_service.get_route(gtfs_id, code).await {
+                Ok(r) => r.long_name,
+                Err(_) => None,
+            }
+        };
+
         Ok(Some(TripApiResponse {
             trip_id: trip.trip_id.clone(),
             route_id: trip.route_id.clone(),
-            route_name: None,
+            route_name,
             direction: trip.direction,
             stops,
             schedule,
