@@ -256,11 +256,13 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "driving_license_expiry",
             "driving_license_number",
             "email",
+            "email_hash",
             "father_name",
             "first_name",
             "gender",
             "last_name",
             "mobile_no",
+            "password_hash",
             "status",
             "token_no",
             "updated_at",
@@ -396,7 +398,7 @@ pub fn table_pk(table: &str) -> Option<&'static str> {
         "service_type_internal" => Some("service_type_id"),
         "stop_internal" => Some("bus_stop_id"),
         "designations_internal" => Some("designation_id"),
-        "employees_internal" => Some("emp_id"),
+        "employees_internal" => Some("gtfs_id, token_no"),
         "entities_internal" => Some("entity_id"),
         "vehicles_internal" => Some("vehicle_id"),
         "waybill_device_internal" => Some("waybill_device_id"),
@@ -1186,7 +1188,7 @@ pub trait OperatorService: Send + Sync {
 
     async fn delete_one_row(&self, table: &str, gtfs_id: &str, data: Value) -> AppResult<u64>;
 
-    async fn upsert_one_row(
+    async fn upsert_many_rows(
         &self,
         table: &str,
         gtfs_id: &str,
@@ -1368,7 +1370,7 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
-    async fn upsert_one_row(
+    async fn upsert_many_rows(
         &self,
         _table: &str,
         _gtfs_id: &str,
@@ -1894,34 +1896,72 @@ impl OperatorService for DBOperatorService {
             .as_object()
             .ok_or_else(|| AppError::BadRequest("Body must be a JSON object".to_string()))?;
 
-        let pk_value = obj.get(pk).ok_or_else(|| {
-            AppError::BadRequest(format!("Body must contain the primary key: {}", pk))
-        })?;
+        let key_cols: Vec<&str> = pk.split(',').map(|s| s.trim()).collect();
 
-        let id = match pk_value {
-            Value::Number(n) => n
-                .as_i64()
-                .map(|i| i.to_string())
-                .or_else(|| n.as_f64().map(|f| f.to_string()))
-                .ok_or_else(|| AppError::BadRequest("ID must be a number".to_string()))?,
-            Value::String(s) => s.clone(),
-            _ => {
-                return Err(AppError::BadRequest(
-                    "ID must be a string or number".to_string(),
-                ))
+        let mut where_clauses = Vec::new();
+        let mut bind_index = 1;
+
+        for key_col in &key_cols {
+            if *key_col == "gtfs_id" {
+                where_clauses.push(format!("gtfs_id = ${}", bind_index));
+            } else {
+                obj.get(*key_col).ok_or_else(|| {
+                    AppError::BadRequest(format!("Body must contain key column: {}", key_col))
+                })?;
+                // `::text` cast so the id predicate works whether the column is still
+                // `bigint` (prod) or already migrated to `text` — bind the string either way.
+                where_clauses.push(format!("{}::text = ${}", key_col, bind_index));
             }
+            bind_index += 1;
+        }
+
+        let sql = if key_cols.contains(&"gtfs_id") {
+            format!(
+                "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {} AND deleted = false",
+                table,
+                where_clauses.join(" AND ")
+            )
+        } else {
+            format!(
+                "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {} AND gtfs_id = ${} AND deleted = false",
+                table,
+                where_clauses.join(" AND "),
+                bind_index
+            )
         };
 
-        // `::text` cast so the id predicate works whether the column is still
-        // `bigint` (prod) or already migrated to `text` — bind the string either way.
-        let sql = format!(
-            "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {}::text = $1 AND gtfs_id = $2 AND deleted = false",
-            table, pk
-        );
+        let mut q = sqlx::query(&sql);
 
-        let result = sqlx::query(&sql)
-            .bind(&id)
-            .bind(gtfs_id)
+        for key_col in &key_cols {
+            if *key_col == "gtfs_id" {
+                q = q.bind(gtfs_id);
+            } else {
+                let val = obj.get(*key_col).unwrap();
+                let s = match val {
+                    Value::Number(n) => n
+                        .as_i64()
+                        .map(|i| i.to_string())
+                        .or_else(|| n.as_f64().map(|f| f.to_string()))
+                        .ok_or_else(|| {
+                            AppError::BadRequest(format!("Invalid number for {}", key_col))
+                        })?,
+                    Value::String(s) => s.clone(),
+                    _ => {
+                        return Err(AppError::BadRequest(format!(
+                            "Invalid type for {}",
+                            key_col
+                        )))
+                    }
+                };
+                q = q.bind(s);
+            }
+        }
+
+        if !key_cols.contains(&"gtfs_id") {
+            q = q.bind(gtfs_id);
+        }
+
+        let result = q
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::DbError(format!("delete_one_row {}: {}", table, e)))?;
@@ -1929,7 +1969,7 @@ impl OperatorService for DBOperatorService {
         Ok(result.rows_affected())
     }
 
-    async fn upsert_one_row(
+    async fn upsert_many_rows(
         &self,
         table: &str,
         gtfs_id: &str,
@@ -1955,18 +1995,26 @@ impl OperatorService for DBOperatorService {
             return Err(AppError::BadRequest("Body is empty".to_string()));
         }
 
-        // Auto-inject PK with a random ID if missing or null
+        // Auto-inject PK with a random ID if missing or null. `pk` may be a comma-separated
+        // composite (e.g. "gtfs_id, token_no"); inject per non-gtfs_id key column so the
+        // key column names actually exist on the row (gtfs_id is bound from the URL).
+        let pk_key_cols: Vec<&str> = pk.split(',').map(|s| s.trim()).collect();
         for val in arr.iter_mut() {
             if let Some(obj) = val.as_object_mut() {
-                let missing = obj.get(pk).map_or(true, |v| v.is_null());
-                if missing {
-                    // numeric id for still-`bigint` columns (pre-migration), else UUID
-                    let id = if self.gen_int_for_id {
-                        Value::from(field_generator::gen_random_int_id())
-                    } else {
-                        Value::String(field_generator::gen_random_id())
-                    };
-                    obj.insert(pk.to_string(), id);
+                for key_col in &pk_key_cols {
+                    if *key_col == "gtfs_id" {
+                        continue;
+                    }
+                    let missing = obj.get(*key_col).map_or(true, |v| v.is_null());
+                    if missing {
+                        // numeric id for still-`bigint` columns (pre-migration), else UUID
+                        let id = if self.gen_int_for_id {
+                            Value::from(field_generator::gen_random_int_id())
+                        } else {
+                            Value::String(field_generator::gen_random_id())
+                        };
+                        obj.insert(key_col.to_string(), id);
+                    }
                 }
             }
         }
@@ -2026,33 +2074,59 @@ impl OperatorService for DBOperatorService {
             return Err(AppError::BadRequest("First object is empty".to_string()));
         }
 
-        // Build column list from caller's keys, excluding gtfs_id (we inject it ourselves)
-        // Also exclude keys whose value is JSON null — omit-null semantics so that a partial
-        // update (e.g. just {waybill_id, duty_date}) never triggers NOT NULL violations on
-        // columns the caller didn't intend to touch.
-        let mut cols: Vec<&str> = first_obj
-            .keys()
-            .filter(|k| k.as_str() != "gtfs_id" && !first_obj[k.as_str()].is_null())
-            .map(|s| s.as_str())
-            .collect();
+        // Build column list as the UNION of non-null keys across all rows, excluding gtfs_id
+        // (we inject it ourselves). For each row × col, the VALUES clause either binds the
+        // row's value or emits the literal `DEFAULT` keyword for missing/null cells; Postgres
+        // resolves `DEFAULT` to the column's declared default (or NULL if none). This lets a
+        // single bulk INSERT handle heterogeneous row shapes without binding NULL for missing
+        // cells (which would violate NOT NULL on fresh INSERTs).
+        //
+        // On ON CONFLICT, `COALESCE(EXCLUDED.col, table.col)` preserves the existing value
+        // when EXCLUDED.col resolved to NULL (the typical "this row didn't touch this col"
+        // case for nullable columns without DB defaults).
+        let mut col_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for row in &arr {
+            if let Some(obj) = row.as_object() {
+                for (k, v) in obj.iter() {
+                    if k.as_str() != "gtfs_id" && !v.is_null() {
+                        col_set.insert(k.as_str());
+                    }
+                }
+            }
+        }
+        let mut cols: Vec<&str> = col_set.into_iter().collect();
+        cols.sort(); // Sort for consistent SQL generation
         cols.push("gtfs_id"); // gtfs_id always last
+
+        // Parse primary key columns and exclude them from UPDATE SET
+        let key_cols: Vec<&str> = pk.split(',').map(|s| s.trim()).collect();
 
         let update_set: Vec<String> = cols
             .iter()
-            .map(|c| format!("{} = EXCLUDED.{}", c, c))
+            .filter(|c| !key_cols.contains(c))
+            .map(|c| format!("{} = COALESCE(EXCLUDED.{}, {}.{})", c, c, table, c))
             .collect();
 
-        let mut placeholders = Vec::new();
-        let mut bind_index = 1;
+        // Build per-row placeholder tuples in lockstep with the binding plan: each cell is
+        // either "$N" (value will be bound below) or the literal "DEFAULT".
+        let mut placeholders: Vec<String> = Vec::with_capacity(arr.len());
+        let mut bind_index: usize = 1;
 
-        for _ in 0..arr.len() {
-            let row_placeholders: Vec<String> = (0..cols.len())
-                .map(|_| {
-                    let s = format!("${}", bind_index);
+        for val in arr.iter() {
+            let obj = val.as_object().ok_or_else(|| {
+                AppError::BadRequest("Array must contain JSON objects".to_string())
+            })?;
+            let mut row_placeholders: Vec<String> = Vec::with_capacity(cols.len());
+            for col in cols.iter() {
+                let bind_cell =
+                    *col == "gtfs_id" || matches!(obj.get(*col), Some(v) if !v.is_null());
+                if bind_cell {
+                    row_placeholders.push(format!("${}", bind_index));
                     bind_index += 1;
-                    s
-                })
-                .collect();
+                } else {
+                    row_placeholders.push("DEFAULT".to_string());
+                }
+            }
             placeholders.push(format!("({})", row_placeholders.join(", ")));
         }
 
@@ -2078,7 +2152,7 @@ impl OperatorService for DBOperatorService {
         .bind(table)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| AppError::DbError(format!("upsert_one_row col types {}: {}", table, e)))?
+        .map_err(|e| AppError::DbError(format!("upsert_many_rows col types {}: {}", table, e)))?
         .into_iter()
         .collect();
         let is_int_col = |c: &str| {
@@ -2090,13 +2164,20 @@ impl OperatorService for DBOperatorService {
 
         let mut q = sqlx::query_scalar::<_, Value>(&sql);
 
-        for val in &arr {
-            let obj = val.as_object().ok_or_else(|| {
-                AppError::BadRequest("Array must contain JSON objects".to_string())
-            })?;
-            // bind all cols except gtfs_id first
-            for col in cols.iter().filter(|c| **c != "gtfs_id") {
-                let col_val = obj.get(*col).unwrap_or(&Value::Null);
+        // Bind in the exact same order the placeholders were emitted. Cells where we wrote
+        // "DEFAULT" above contribute no bind here.
+        for val in arr.iter() {
+            // Safe: arr was validated to contain only JSON objects in the placeholder pass.
+            let obj = val.as_object().unwrap();
+            for col in cols.iter() {
+                if *col == "gtfs_id" {
+                    q = q.bind(gtfs_id);
+                    continue;
+                }
+                let col_val = match obj.get(*col) {
+                    Some(v) if !v.is_null() => v,
+                    _ => continue, // emitted DEFAULT above
+                };
                 let int_col = is_int_col(col);
                 match col_val {
                     Value::String(s) => {
@@ -2158,22 +2239,20 @@ impl OperatorService for DBOperatorService {
                         }
                     }
                     Value::Bool(b) => q = q.bind(b),
-                    Value::Null => q = q.bind(Option::<String>::None),
                     _ => {
-                        return Err(AppError::BadRequest(
-                            "Unsupported JSON value type for key".to_string(),
-                        ))
+                        return Err(AppError::BadRequest(format!(
+                            "Unsupported JSON value type for column {}",
+                            col
+                        )))
                     }
                 }
             }
-            // inject gtfs_id last
-            q = q.bind(gtfs_id);
         }
 
         let results = q
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(format!("upsert_one_row {}: {}", table, e)))?;
+            .map_err(|e| AppError::DbError(format!("upsert_many_rows {}: {}", table, e)))?;
 
         let ret = if is_array {
             Value::Array(results)
