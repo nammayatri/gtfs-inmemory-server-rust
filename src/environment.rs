@@ -207,7 +207,11 @@ impl AppState {
                                 Ok(internal_pool) => {
                                     info!("Internal database pool created successfully.");
                                     (
-                                        Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone(), app_config.gen_int_for_id.unwrap_or(false))),
+                                        Arc::new(DBOperatorService::new(
+                                            internal_pool.clone(),
+                                            app_config.osrm_url.clone(),
+                                            app_config.gen_int_for_id.unwrap_or(false),
+                                        )),
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
                                         )),
@@ -287,7 +291,11 @@ impl AppState {
                             anyhow::anyhow!("Failed to create internal database pool: {}", e)
                         })?;
                     (
-                        Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone(), app_config.gen_int_for_id.unwrap_or(false))),
+                        Arc::new(DBOperatorService::new(
+                            internal_pool.clone(),
+                            app_config.osrm_url.clone(),
+                            app_config.gen_int_for_id.unwrap_or(false),
+                        )),
                         Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
                         Arc::new(DBFleetOperatorService::new(internal_pool.clone())),
                         Some(internal_pool),
