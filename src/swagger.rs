@@ -49,6 +49,7 @@ use crate::services::operator::QueryBody;
         routes::get_all_route_stop_mappings_by_stop_codes,
         routes::get_cluster_destinations,
         routes::get_routes_between_clusters_for_stops,
+        routes::get_stop_cluster,
         routes::get_all_vehicles_by_ids,
         routes::get_routes_by_ids,
         // Trip
@@ -116,6 +117,7 @@ use crate::services::operator::QueryBody;
         models::BusScheduleDetail,
         models::BusStopETA,
         models::StopCodeFromProviderStopCodeResponse,
+        models::StopClusterResponse,
         models::MemoryUsageStats,
         models::TripDetails,
         models::TripStopDetail,

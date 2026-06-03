@@ -1637,11 +1637,35 @@ impl GTFSService {
         Ok(out)
     }
 
+    pub fn get_stop_cluster_for_stop(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<Option<String>> {
+        let data = self.data.load_full();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = clean_identifier(stop_code);
+
+        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
+            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
+        })?;
+
+        let stop = stops_data.stops.get(&stop_code).ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Stop not found for stop_code: {} under gtfs_id: {}",
+                stop_code, gtfs_id
+            ))
+        })?;
+
+        Ok(stop.cluster_id.clone())
+    }
+
     pub fn get_routes_between_clusters_for_stops(
         &self,
         gtfs_id: &str,
         src_stop_code: &str,
         dst_stop_code: &str,
+        direction_check: bool,
     ) -> AppResult<Vec<String>> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
@@ -1657,19 +1681,25 @@ impl GTFSService {
             None => return Ok(Vec::new()),
         };
 
-        let collect_routes = |stop_code: &str| -> HashSet<Arc<str>> {
-            let mut routes: HashSet<Arc<str>> = HashSet::new();
-            let siblings: &[String] = match stops_data.stops.get(stop_code) {
+        let siblings_for = |stop_code: &str| -> Vec<String> {
+            match stops_data.stops.get(stop_code) {
                 Some(stop) => match stop.cluster_id.as_ref() {
                     Some(cid) => stops_data
                         .by_cluster_id
                         .get(cid)
-                        .map(|v| v.as_slice())
+                        .cloned()
                         .unwrap_or_default(),
-                    None => std::slice::from_ref(&stop.code),
+                    None => vec![stop.code.clone()],
                 },
-                None => &[],
-            };
+                None => Vec::new(),
+            }
+        };
+
+        let src_siblings = siblings_for(&src_stop_code);
+        let dst_siblings = siblings_for(&dst_stop_code);
+
+        let collect_routes = |siblings: &[String]| -> HashSet<Arc<str>> {
+            let mut routes: HashSet<Arc<str>> = HashSet::new();
             for sib in siblings {
                 if let Some(idxs) = route_data.by_stop.get(sib) {
                     for &i in idxs {
@@ -1682,15 +1712,60 @@ impl GTFSService {
             routes
         };
 
-        let src_routes = collect_routes(&src_stop_code);
+        let src_routes = collect_routes(&src_siblings);
         if src_routes.is_empty() {
             return Ok(Vec::new());
         }
-        let dst_routes = collect_routes(&dst_stop_code);
+        let dst_routes = collect_routes(&dst_siblings);
+        let candidate_routes: HashSet<Arc<str>> =
+            src_routes.intersection(&dst_routes).cloned().collect();
 
-        Ok(src_routes
-            .intersection(&dst_routes)
-            .map(|r| r.as_ref().to_string())
+        if !direction_check {
+            return Ok(candidate_routes
+                .iter()
+                .map(|r| r.as_ref().to_string())
+                .collect());
+        }
+
+        let collect_seq_extremes = |siblings: &[String], is_min: bool| -> HashMap<Arc<str>, i32> {
+            let mut out: HashMap<Arc<str>, i32> = HashMap::new();
+            for sib in siblings {
+                if let Some(idxs) = route_data.by_stop.get(sib) {
+                    for &i in idxs {
+                        if let Some(m) = route_data.mappings.get(i) {
+                            if !candidate_routes.contains(&m.route_code) {
+                                continue;
+                            }
+                            out.entry(m.route_code.clone())
+                                .and_modify(|existing| {
+                                    if (is_min && m.sequence_num < *existing)
+                                        || (!is_min && m.sequence_num > *existing)
+                                    {
+                                        *existing = m.sequence_num;
+                                    }
+                                })
+                                .or_insert(m.sequence_num);
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let src_min_seq = collect_seq_extremes(&src_siblings, true);
+        let dst_max_seq = collect_seq_extremes(&dst_siblings, false);
+
+        Ok(candidate_routes
+            .into_iter()
+            .filter_map(|route_code| {
+                let src = src_min_seq.get(&route_code)?;
+                let dst = dst_max_seq.get(&route_code)?;
+                if src < dst {
+                    Some(route_code.as_ref().to_string())
+                } else {
+                    None
+                }
+            })
             .collect())
     }
 
