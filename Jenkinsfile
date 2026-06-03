@@ -35,6 +35,20 @@ pipeline {
             sh "docker tag ${env.IMAGE_NAME}:latest ${env.ACCOUNT_ID2}.dkr.ecr.ap-south-1.amazonaws.com/${env.IMAGE_NAME}:${env.LAST_COMMIT_HASH}"
             sh "docker push ${env.ACCOUNT_ID2}.dkr.ecr.ap-south-1.amazonaws.com/${env.IMAGE_NAME}:${env.LAST_COMMIT_HASH}"
 
+            // Push to GCP Artifact Registry — master (ny-sandbox)
+            withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GCP_KEY_FILE')]) {
+              sh 'cat $GCP_KEY_FILE | docker login -u _json_key --password-stdin https://asia-south1-docker.pkg.dev'
+              sh "docker tag ${env.IMAGE_NAME}:latest asia-south1-docker.pkg.dev/ny-sandbox/${env.IMAGE_NAME}/${env.IMAGE_NAME}:${env.LAST_COMMIT_HASH}"
+              sh "docker push asia-south1-docker.pkg.dev/ny-sandbox/${env.IMAGE_NAME}/${env.IMAGE_NAME}:${env.LAST_COMMIT_HASH}"
+            }
+
+            // Push to GCP Artifact Registry — prod (ny-prod)
+            withCredentials([file(credentialsId: 'gcp-sa-key-prod', variable: 'GCP_KEY_FILE_PROD')]) {
+              sh 'cat $GCP_KEY_FILE_PROD | docker login -u _json_key --password-stdin https://asia-south1-docker.pkg.dev'
+              sh "docker tag ${env.IMAGE_NAME}:latest asia-south1-docker.pkg.dev/ny-prod/${env.IMAGE_NAME}/${env.IMAGE_NAME}:${env.LAST_COMMIT_HASH}"
+              sh "docker push asia-south1-docker.pkg.dev/ny-prod/${env.IMAGE_NAME}/${env.IMAGE_NAME}:${env.LAST_COMMIT_HASH}"
+            }
+
         }
       }
     }
