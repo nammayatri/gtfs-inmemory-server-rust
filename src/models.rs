@@ -458,6 +458,11 @@ pub struct GTFSStop {
     pub cluster_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StopClusterResponse {
+    pub cluster_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopGeojsonRecord {
     pub stop_code: String,
