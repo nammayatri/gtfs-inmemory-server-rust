@@ -459,7 +459,10 @@ pub struct GTFSStop {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct StopClusterResponse {
+pub struct StopDetailResponse {
+    #[serde(flatten)]
+    pub mapping: RouteStopMapping,
+    #[serde(rename = "clusterId", skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
 }
 

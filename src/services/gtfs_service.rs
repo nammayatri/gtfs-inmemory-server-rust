@@ -1637,29 +1637,6 @@ impl GTFSService {
         Ok(out)
     }
 
-    pub fn get_stop_cluster_for_stop(
-        &self,
-        gtfs_id: &str,
-        stop_code: &str,
-    ) -> AppResult<Option<String>> {
-        let data = self.data.load_full();
-        let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
-
-        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
-            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
-        })?;
-
-        let stop = stops_data.stops.get(&stop_code).ok_or_else(|| {
-            AppError::NotFound(format!(
-                "Stop not found for stop_code: {} under gtfs_id: {}",
-                stop_code, gtfs_id
-            ))
-        })?;
-
-        Ok(stop.cluster_id.clone())
-    }
-
     pub fn get_routes_between_clusters_for_stops(
         &self,
         gtfs_id: &str,
