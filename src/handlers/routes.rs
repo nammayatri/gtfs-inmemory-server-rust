@@ -24,8 +24,9 @@ use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
     BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats, MinimalEmployee,
-    NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
-    VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
+    NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, StopDetailResponse,
+    TripDetails, VehicleData, VehicleMetadataResponse, VehicleOperationData,
+    VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
@@ -44,6 +45,11 @@ pub struct LimitQuery {
 #[derive(Debug, Deserialize)]
 pub struct DirectionQuery {
     direction: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClusterRoutesQuery {
+    direction: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -195,6 +201,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/cluster/{gtfs_id}/destinations/{stop_code}",
                 actix_web::web::get().to(get_cluster_destinations),
+            )
+            .route(
+                "/cluster/{gtfs_id}/routes/{src_stop_code}/{dst_stop_code}",
+                actix_web::web::get().to(get_routes_between_clusters_for_stops),
             )
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
@@ -1105,6 +1115,44 @@ pub async fn get_route_stop_mapping_draw(
 
 #[utoipa::path(
     get,
+    path = "/cluster/{gtfs_id}/routes/{src_stop_code}/{dst_stop_code}",
+    tag = "Cluster",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("src_stop_code" = String, Path, description = "Source stop code"),
+        ("dst_stop_code" = String, Path, description = "Destination stop code"),
+        ("direction" = Option<bool>, Query, description = "When true, keep only routes where some src-sibling occurrence precedes some dst-sibling occurrence (min(src_seq) < max(dst_seq) per route). Default false preserves direction-agnostic behavior."),
+    ),
+    responses((
+        status = 200,
+        description = "Route codes applicable between the source and destination clusters (each input stop \
+                       is expanded to its H3 cluster, falling back to the single stop_code when the stop \
+                       has no cluster_id). The intersection of routes serving either side is returned. \
+                       When direction=true, the result is additionally filtered to routes that traverse \
+                       src before dst on at least one trip leg. Deduplicated, unsorted. Returns 404 on \
+                       unknown gtfs_id; returns [] for unknown stop codes or when no route serves both \
+                       clusters in the requested direction.",
+        body = Vec<String>,
+    ))
+)]
+pub async fn get_routes_between_clusters_for_stops(
+    app_state: Data<AppState>,
+    path: Path<(String, String, String)>,
+    query: Query<ClusterRoutesQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, src_stop_code, dst_stop_code) = path.into_inner();
+    let direction_check = query.direction.unwrap_or(false);
+    let routes = app_state.gtfs_service.get_routes_between_clusters_for_stops(
+        &gtfs_id,
+        &src_stop_code,
+        &dst_stop_code,
+        direction_check,
+    )?;
+    Ok(HttpResponse::Ok().json(routes))
+}
+
+#[utoipa::path(
+    get,
     path = "/routes/{gtfs_id}/fuzzy/{query}",
     tag = "Routes",
     params(
@@ -1217,7 +1265,7 @@ pub fn merge_stop_and_mapping(
         ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
         ("stop_code" = String, Path, description = "Stop code"),
     ),
-    responses((status = 200, description = "Stop details", body = RouteStopMapping))
+    responses((status = 200, description = "Stop details", body = StopDetailResponse))
 )]
 pub async fn get_stop(
     app_state: Data<AppState>,
@@ -1233,14 +1281,21 @@ pub async fn get_stop(
             .get_station_by_id(&stop_code)
             .await
             .ok_or_else(|| AppError::NotFound(format!("OSRTC station not found: {stop_code}")))?;
-        return Ok(HttpResponse::Ok().json(osrtc_station_to_route_stop_mapping(&station)));
+        return Ok(HttpResponse::Ok().json(StopDetailResponse {
+            mapping: osrtc_station_to_route_stop_mapping(&station),
+            cluster_id: None,
+        }));
     }
     let (stop, maybe_mapping) = app_state
         .gtfs_service
         .get_stop(&gtfs_id, &stop_code)
         .await?;
-    let merged_stop = merge_stop_and_mapping(stop, maybe_mapping);
-    Ok(HttpResponse::Ok().json(merged_stop))
+    let cluster_id = stop.cluster_id.clone();
+    let mapping = merge_stop_and_mapping(stop, maybe_mapping);
+    Ok(HttpResponse::Ok().json(StopDetailResponse {
+        mapping,
+        cluster_id,
+    }))
 }
 
 #[utoipa::path(

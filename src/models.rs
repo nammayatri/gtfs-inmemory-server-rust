@@ -449,8 +449,20 @@ pub struct GTFSStop {
     #[serde(rename = "regionalName")]
     pub regional_name: Option<String>,
     #[serde(default, skip_serializing)]
-    pub desc: Option<String>,
-    #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
+    pub info_json: Option<String>,
+    #[serde(
+        rename = "clusterId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cluster_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StopDetailResponse {
+    #[serde(flatten)]
+    pub mapping: RouteStopMapping,
+    #[serde(rename = "clusterId", skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
 }
 
