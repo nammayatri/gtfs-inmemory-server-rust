@@ -1223,6 +1223,7 @@ pub fn merge_stop_and_mapping(
             .and_then(|station_id| station_id.split(':').next_back())
             .filter(|s| !s.is_empty())
             .map(Arc::from),
+        cluster_id: stop.cluster_id.as_deref().map(Arc::from),
     }
 }
 
