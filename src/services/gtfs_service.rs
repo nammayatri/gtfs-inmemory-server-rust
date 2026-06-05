@@ -39,8 +39,8 @@ fn get_sha256_hash<T: Serialize>(val: &T) -> String {
 
 const SENTINEL_CLUSTER_ID: &str = "INVALID_SENTINEL";
 
-fn parse_cluster_id_from_desc(desc: Option<&str>) -> Option<String> {
-    let raw = desc?.trim();
+fn parse_cluster_id_from_info_json(info_json: Option<&str>) -> Option<String> {
+    let raw = info_json?.trim();
     if raw.is_empty() || raw == "{}" {
         return None;
     }
@@ -816,7 +816,7 @@ impl GTFSService {
                 .get(gtfs_id)
                 .and_then(|m| m.get(stop_code));
 
-            let cluster_id = parse_cluster_id_from_desc(stop.desc.as_deref());
+            let cluster_id = parse_cluster_id_from_info_json(stop.info_json.as_deref());
 
             // Create a new GTFSStop with the clean stop code
             let stop_res = GTFSStop {
@@ -829,7 +829,7 @@ impl GTFSService {
                 cluster: stop.cluster.clone(),
                 hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                 regional_name: regional_name.map(|r| r.regional_name.clone()),
-                desc: None,
+                info_json: None,
                 cluster_id: cluster_id.clone(),
             };
             if stop.cluster.is_some() {
@@ -843,7 +843,7 @@ impl GTFSService {
                     cluster: stop.cluster.clone(),
                     hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                     regional_name: regional_name.map(|r| r.regional_name.clone()),
-                    desc: None,
+                    info_json: None,
                     cluster_id: None,
                 };
                 stop_data
@@ -1007,6 +1007,11 @@ impl GTFSService {
                         .and_then(|gtfs_stop| gtfs_stop.station_id.as_ref())
                         .and_then(|station_id| station_id.split(':').next_back())
                         .filter(|s| !s.is_empty())
+                        .map(Arc::from),
+                    cluster_id: stops_by_gtfs
+                        .get(gtfs_id)
+                        .and_then(|stops_data| stops_data.stops.get(&stop.code))
+                        .and_then(|gtfs_stop| gtfs_stop.cluster_id.as_deref())
                         .map(Arc::from),
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
