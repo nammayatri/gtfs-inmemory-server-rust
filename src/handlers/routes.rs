@@ -50,6 +50,12 @@ pub struct DirectionQuery {
     direction: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IncludeClusterIdQuery {
+    #[serde(rename = "includeClusterId")]
+    include_cluster_id: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllRoutesByIdsRequest {
     #[serde(rename = "gtfsId")]
@@ -1172,11 +1178,19 @@ pub async fn get_routes_fuzzy(
     get,
     path = "/stops/{gtfs_id}",
     tag = "Stops",
-    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("includeClusterId" = Option<bool>, Query, description = "If true, include clusterId in each stop's response"),
+    ),
     responses((status = 200, description = "List of stops", body = Vec<RouteStopMapping>))
 )]
-pub async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+pub async fn get_stops(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<IncludeClusterIdQuery>,
+) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
+    let include_cluster_id = query.include_cluster_id.unwrap_or(false);
     if app_state.config.osrtc_feed_key.as_deref() == Some(gtfs_id.as_str()) {
         let cache = app_state
             .osrtc_cache
@@ -1187,10 +1201,29 @@ pub async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResu
             .iter()
             .map(osrtc_station_to_route_stop_mapping)
             .collect();
-        return Ok(HttpResponse::Ok().json(mappings));
+        return Ok(stops_response(&mappings, include_cluster_id)?);
     }
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
-    Ok(HttpResponse::Ok().json(stops))
+    stops_response(stops.as_slice(), include_cluster_id)
+}
+
+fn stops_response<T: serde::Serialize>(
+    stops: &[T],
+    include_cluster_id: bool,
+) -> AppResult<HttpResponse> {
+    if include_cluster_id {
+        return Ok(HttpResponse::Ok().json(stops));
+    }
+    let mut value = serde_json::to_value(stops)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize stops: {}", e)))?;
+    if let Some(arr) = value.as_array_mut() {
+        for item in arr {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("clusterId");
+            }
+        }
+    }
+    Ok(HttpResponse::Ok().json(value))
 }
 
 pub fn merge_stop_and_mapping(
