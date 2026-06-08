@@ -3,6 +3,10 @@ name = "gtfs-routes-service"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "gtfs-routes-service"
+path = "src/main.rs"
+
 [dependencies]
 # Web framework
 actix-web = "4.3.1"
