@@ -1,0 +1,170 @@
+{
+  "version": "60c162a080f3",
+  "build_commit": "5ad145",
+  "generated_at": "2026-06-05T19:44:13Z",
+  "gtfs_feeds": [
+    "bangalore_metro",
+    "bhubaneshwar_bus",
+    "chennai_bus",
+    "chennai_metro",
+    "chennai_suburban",
+    "delhi_bus_nammayatri_application_mock",
+    "delhi_metro",
+    "kochi_metro",
+    "kolkata_bus",
+    "kolkata_metro",
+    "mumbai_metro",
+    "mumbai_suburban",
+    "sambalpur_bus"
+  ],
+  "files": {
+    "routes.json": {
+      "sha256": "4985f6d10c1ef7fc6c3181b07dd4a92ee8f0d1a17e0f9c7fe58f9d9b1fc5dc3e",
+      "count": 5643
+    },
+    "stops.json": {
+      "sha256": "074bcec44ac8d4ddc7eae05e86470b6faaaa4141f3a3df2c59bdbd25b3ffe53c",
+      "count": 24998
+    },
+    "patterns.json": {
+      "sha256": "efd57d7bff3fecbb1dc4e29dc11b5515665c05989fbc03b58b5e7b85c33fa7e7",
+      "count": 5755
+    },
+    "route_stops.json": {
+      "sha256": "7a1a7077970d8aae04ea9f910fe3b4e0cfcd495bdceffc41de26967839fb3893",
+      "count": 109280
+    },
+    "trip_stoptimes/bangalore_metro.json": {
+      "sha256": "e639d9a639c089d51cfd85efadcda52c2b5a277e8c6a77b159d5b4c4ea8a17f4",
+      "count": 2722
+    },
+    "trip_stoptimes/bhubaneshwar_bus.json": {
+      "sha256": "70816626318d547ab9cd801f62369af29c8c878d6a1dc3409dd4d6bb194ff47e",
+      "count": 4199
+    },
+    "trip_stoptimes/chennai_bus.json": {
+      "sha256": "5ab26b1ea65ef894f0d7f22f6db60d4be28215703178bca1677d4f47fe63f029",
+      "count": 51512
+    },
+    "trip_stoptimes/chennai_metro.json": {
+      "sha256": "19433454474303f58dc3428ccd33aa8c32239d9b2956a4299a539dc28e34a9a1",
+      "count": 3738
+    },
+    "trip_stoptimes/chennai_suburban.json": {
+      "sha256": "981ea7728f23fdf991e83329fd6988090f63a56f3955ef87ce1f11bd5f20ef9a",
+      "count": 807
+    },
+    "trip_stoptimes/delhi_bus_nammayatri_application_mock.json": {
+      "sha256": "da9b10ea10dd6dcd3c9ca2bf9cc33d26c874c03ba0f78dda9cbb89bf4b320b60",
+      "count": 24
+    },
+    "trip_stoptimes/delhi_metro.json": {
+      "sha256": "ae75e590e6a4149e9f1355ddbc76a105a0104aa9ad9a1cd1842ac7a3a1587c8c",
+      "count": 21825
+    },
+    "trip_stoptimes/kochi_metro.json": {
+      "sha256": "13c6cb2d264d3f10e50351801f7d3cebd0b3fd68e7460d5797b2e1223fcbb928",
+      "count": 450
+    },
+    "trip_stoptimes/kolkata_bus.json": {
+      "sha256": "b2d61d80185de6db39c61f3a475ff61065fe3794a2eeb73f9d0002983655816f",
+      "count": 17227
+    },
+    "trip_stoptimes/kolkata_metro.json": {
+      "sha256": "d84a6561c5b6415fb9d63ab1738ba502ff0fed7fcaf75572f38c6d2fa3ec0d19",
+      "count": 1652
+    },
+    "trip_stoptimes/mumbai_metro.json": {
+      "sha256": "4b04febcf317c01a7a3344232538e1f76677a8055947f2f4acb5fff549f9e145",
+      "count": 278
+    },
+    "trip_stoptimes/mumbai_suburban.json": {
+      "sha256": "8a374cba7e8b57f9cb8e9c43300984dd7014e2a51e3cc210c7a41fdfa928d2d7",
+      "count": 134
+    },
+    "trip_stoptimes/sambalpur_bus.json": {
+      "sha256": "11196eed2c41b0aa60e8f4268aa5eeb7aa04de108bcb046ade0800fa8f22f496",
+      "count": 405
+    }
+  },
+  "stats": {
+    "bangalore_metro": {
+      "routes": 6,
+      "stops": 472,
+      "patterns": 58,
+      "route_stop_mappings": 170
+    },
+    "bhubaneshwar_bus": {
+      "routes": 493,
+      "stops": 2916,
+      "patterns": 493,
+      "route_stop_mappings": 16875
+    },
+    "chennai_bus": {
+      "routes": 4138,
+      "stops": 17909,
+      "patterns": 4138,
+      "route_stop_mappings": 71269
+    },
+    "chennai_metro": {
+      "routes": 44,
+      "stops": 313,
+      "patterns": 50,
+      "route_stop_mappings": 593
+    },
+    "chennai_suburban": {
+      "routes": 804,
+      "stops": 722,
+      "patterns": 807,
+      "route_stop_mappings": 16814
+    },
+    "delhi_bus_nammayatri_application_mock": {
+      "routes": 1,
+      "stops": 11,
+      "patterns": 1,
+      "route_stop_mappings": 11
+    },
+    "delhi_metro": {
+      "routes": 22,
+      "stops": 1126,
+      "patterns": 57,
+      "route_stop_mappings": 561
+    },
+    "kochi_metro": {
+      "routes": 2,
+      "stops": 25,
+      "patterns": 8,
+      "route_stop_mappings": 50
+    },
+    "kolkata_bus": {
+      "routes": 88,
+      "stops": 693,
+      "patterns": 88,
+      "route_stop_mappings": 1773
+    },
+    "kolkata_metro": {
+      "routes": 10,
+      "stops": 182,
+      "patterns": 20,
+      "route_stop_mappings": 114
+    },
+    "mumbai_metro": {
+      "routes": 2,
+      "stops": 12,
+      "patterns": 2,
+      "route_stop_mappings": 24
+    },
+    "mumbai_suburban": {
+      "routes": 2,
+      "stops": 37,
+      "patterns": 2,
+      "route_stop_mappings": 74
+    },
+    "sambalpur_bus": {
+      "routes": 31,
+      "stops": 580,
+      "patterns": 31,
+      "route_stop_mappings": 952
+    }
+  }
+}
