@@ -1,13 +1,21 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::models::serialize_option_as_empty_string;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripApiResponse {
     #[serde(rename = "tripId")]
     pub trip_id: String,
     #[serde(rename = "routeId")]
     pub route_id: String,
-    #[serde(rename = "routeName")]
+    // Backend's `TripInfoResponse.routeName :: Text` is non-Maybe — emit "" not
+    // null when the route lookup misses (e.g. the trip's route is missing from
+    // the routes feed) so the Aeson decoder doesn't fail.
+    #[serde(
+        rename = "routeName",
+        serialize_with = "serialize_option_as_empty_string"
+    )]
     pub route_name: Option<String>,
     #[serde(rename = "direction")]
     pub direction: Option<i32>,
