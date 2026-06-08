@@ -454,6 +454,23 @@ pub struct NandiStop {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
+    /// Example-trip schedule times (seconds since midnight) from the
+    /// preprocessor's patterns.json. Absent in OTP responses and in older
+    /// preprocessed data, so default to None.
+    #[serde(rename = "arrivalTime", default)]
+    pub arrival_time: Option<i32>,
+    #[serde(rename = "departureTime", default)]
+    pub departure_time: Option<i32>,
+    #[serde(rename = "stopSequence", default)]
+    pub stop_sequence: Option<i32>,
+    /// stop_headsign verbatim from GTFS. For Chennai-style feeds this is a
+    /// Python-dict-shaped string like
+    /// "{'fareStageNumber': '3', 'isStageStop': true}" that the backend's
+    /// TripStopDetail FromJSON sanitizes into ExtraInfo. The FRFS fare-stage
+    /// lookup (getFareThroughGTFS) needs this field — without it, PREMIUM bus
+    /// quotes come back empty.
+    #[serde(default)]
+    pub headsign: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -920,8 +937,25 @@ pub type BusScheduleDetails = Vec<BusScheduleDetail>;
 pub struct RouteLastScheduleTime {
     #[serde(rename = "routeId")]
     pub route_id: String,
-    #[serde(rename = "lastScheduleTime")]
+    // The SQL `MAX(end_time)` can return NULL when end_time is NULL for every
+    // row in a route's group. We keep the field nullable internally (sqlx
+    // requires it to match the SQL column nullability) but serialize as ""
+    // so the backend's `Text`-typed Aeson decoder doesn't fail on null.
+    #[serde(
+        rename = "lastScheduleTime",
+        serialize_with = "serialize_option_as_empty_string"
+    )]
     pub last_schedule_time: Option<String>,
+}
+
+pub fn serialize_option_as_empty_string<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_deref().unwrap_or(""))
 }
 
 pub fn cast_vehicle_type(vehicle_type: &str) -> String {

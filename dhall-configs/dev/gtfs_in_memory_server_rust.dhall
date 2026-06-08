@@ -1,4 +1,4 @@
-let LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
+clet LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
 
 let logger_cfg = {
     level = LogLevel.INFO,
@@ -65,14 +65,9 @@ in {
   osrtc_username = secrets.osrtc_username,
   osrtc_secret_key = secrets.osrtc_secret_key,
   osrtc_station_refresh_interval_hours = 1,
-  osrtc_feed_key = Some "odisha_osrtc"
   osrtc_feed_key = Some "odisha_osrtc",
 
     -- Preprocessed data configuration
   use_preprocessed_data = False,
-  preprocessed_data_dir = "./assets",
-
-  -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
-  osrm_url = Some "http://localhost:5050",
-  gen_int_for_id = Some True,
+  preprocessed_data_dir = "./assets"
 }
