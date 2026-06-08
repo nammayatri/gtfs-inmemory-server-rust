@@ -4,7 +4,7 @@ use crate::services::fleet_operator::{
 };
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
-    SUPPORTED_OPERATOR_GTFS_IDS,
+    EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
 };
 use actix_web::{
     web::{self, Data, Json, Path, Query},
@@ -2893,28 +2893,29 @@ pub async fn get_bus_trip_schedule(
         .await
         .unwrap_or_default();
 
-    // kolkata_bus: internal only; chennai_bus: both external + internal
-    let (external_rows, internal_rows) = if gtfs_id == "kolkata_bus" {
-        (
-            vec![],
-            app_state
-                .db_vehicle_reader_internal
-                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
-                .await
-                .unwrap_or_default(),
-        )
+    // Route to the internal and/or external readers based on the operator config.
+    // Rejects unsupported operators (the external reader is Chennai-specific) and
+    // misconfigured both-lists gtfs_ids. Keeps routing consistent with the
+    // bus-route-schedule handler.
+    let (use_external, use_internal) = operator_reader_routing(&gtfs_id)?;
+
+    let external_rows = if use_external {
+        app_state
+            .db_vehicle_reader
+            .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number)
+            .await?
     } else {
-        (
-            app_state
-                .db_vehicle_reader
-                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number)
-                .await?,
-            app_state
-                .db_vehicle_reader_internal
-                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
-                .await
-                .unwrap_or_default(),
-        )
+        vec![]
+    };
+
+    let internal_rows = if use_internal {
+        app_state
+            .db_vehicle_reader_internal
+            .get_operator_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        vec![]
     };
 
     let all: Vec<crate::models::VehicleData> = external_rows
@@ -2999,8 +3000,11 @@ pub async fn get_bus_route_schedule(
     // Single join query returns waybills + trip (bstd & bstf) times
     // No per-vehicle get_vehicle_data call req
     if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
-        // kolkata_bus: internal reader only; chennai_bus: both internal + external
-        let is_kolkata = gtfs_id == "kolkata_bus";
+        // Some operators are served from only one reader. An internal-only gtfs_id
+        // (e.g. kolkata_bus) skips the external tables; an external-only gtfs_id skips
+        // the internal tables. An operator in neither list (e.g. chennai_bus) joins both.
+        let is_internal_only = INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let is_external_only = EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         let just_internal = query.just_internal.unwrap_or(false);
         let just_external = query.just_external.unwrap_or(false);
         let vehicle_number = query.vehicle_number.as_deref();
@@ -3013,9 +3017,9 @@ pub async fn get_bus_route_schedule(
 
         let mut all_rows = Vec::new();
 
-        // 1. Fetch from external (existing) tables unless justInternal is strictly true
-        //    Skip for kolkata_bus (internal only)
-        if !just_internal && !is_kolkata {
+        // 1. Fetch from external (existing) tables unless justInternal is strictly true.
+        //    Skip for internal-only operators.
+        if !just_internal && !is_internal_only {
             let mut ext_rows = app_state
                 .db_vehicle_reader
                 .get_chennai_waybills_by_route_id(&route_id, vehicle_number)
@@ -3023,11 +3027,12 @@ pub async fn get_bus_route_schedule(
             all_rows.append(&mut ext_rows);
         }
 
-        // 2. Fetch from internal (_internal) tables unless justExternal is strictly true
-        if !just_external {
+        // 2. Fetch from internal (_internal) tables unless justExternal is strictly true.
+        //    Skip for external-only operators.
+        if !just_external && !is_external_only {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
-                .get_chennai_waybills_by_route_id(&route_id, &gtfs_id, vehicle_number)
+                .get_operator_waybills_by_route_id(&route_id, &gtfs_id, vehicle_number)
                 .await?;
             all_rows.append(&mut int_rows);
         }

@@ -47,6 +47,45 @@ pub fn waybill_statuses() -> Vec<&'static str> {
 
 pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"];
 
+/// Operator gtfs_id values whose waybills come ONLY from the internal reader
+/// (external tables are skipped entirely for these).
+pub const INTERNAL_ONLY_GTFS_IDS: &[&str] = &["kolkata_bus"];
+
+/// Operator gtfs_id values whose waybills come ONLY from the external reader
+/// (internal tables are skipped entirely for these).
+pub const EXTERNAL_ONLY_GTFS_IDS: &[&str] = &[];
+
+/// Decides which readers serve a supported operator's waybills, returning
+/// `(use_external, use_internal)`.
+///
+/// - Internal-only operators (e.g. kolkata_bus) skip the external reader.
+/// - External-only operators skip the internal reader.
+/// - Operators in neither list (e.g. chennai_bus) use both.
+///
+/// Errors when the gtfs_id is not a supported operator (the external reader is
+/// Chennai-specific, so running it for an unknown operator would return wrong data),
+/// or when a gtfs_id is misconfigured into both the internal-only and external-only
+/// lists (which would otherwise silently skip both readers).
+pub fn operator_reader_routing(gtfs_id: &str) -> AppResult<(bool, bool)> {
+    if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported operator gtfs_id: {}",
+            gtfs_id
+        )));
+    }
+
+    let is_internal_only = INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id);
+    let is_external_only = EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id);
+    if is_internal_only && is_external_only {
+        return Err(AppError::Internal(format!(
+            "gtfs_id {} is misconfigured as both internal-only and external-only",
+            gtfs_id
+        )));
+    }
+
+    Ok((!is_internal_only, !is_external_only))
+}
+
 pub const MAX_QUERY_LIMIT: i64 = 1000;
 pub const MAX_QUERY_FILTERS: usize = 5;
 

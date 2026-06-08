@@ -22,7 +22,7 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
         trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId>;
-    async fn get_chennai_waybills_by_route_id(
+    async fn get_operator_waybills_by_route_id(
         &self,
         route_id: &str,
         gtfs_id: &str,
@@ -84,7 +84,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         ))
     }
 
-    async fn get_chennai_waybills_by_route_id(
+    async fn get_operator_waybills_by_route_id(
         &self,
         _route_id: &str,
         _gtfs_id: &str,
@@ -896,7 +896,7 @@ impl DBVehicleReaderInternal {
         Ok(())
     }
 
-    async fn get_chennai_waybills_by_route_id_impl(
+    async fn get_operator_waybills_by_route_id_impl(
         &self,
         route_id: &str,
         gtfs_id: &str,
@@ -924,7 +924,7 @@ impl DBVehicleReaderInternal {
             if let Some((data, ts)) = cache.get(key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
                     info!(
-                        "internal get_chennai_waybills_by_route_id cache HIT for route_id={}",
+                        "internal get_operator_waybills_by_route_id cache HIT for route_id={}",
                         route_id
                     );
                     return Ok(data.clone());
@@ -964,7 +964,10 @@ impl DBVehicleReaderInternal {
                             WHEN w.is_flexi THEN bstf.trip_number::int
                             ELSE bstd.trip_number::int
                         END AS trip_number,
+                        -- Only propagate is_active_trip for online waybills; upcoming
+                        -- waybills are never active, so force false regardless of trip flag.
                         CASE
+                            WHEN w.status <> 'online' THEN false
                             WHEN w.is_flexi THEN bstf.is_active_trip
                             ELSE bstd.is_active_trip
                         END AS is_active_trip
@@ -1030,7 +1033,10 @@ impl DBVehicleReaderInternal {
                             WHEN w.is_flexi THEN bstf.trip_number::int
                             ELSE bstd.trip_number::int
                         END AS trip_number,
+                        -- Only propagate is_active_trip for online waybills; upcoming
+                        -- waybills are never active, so force false regardless of trip flag.
                         CASE
+                            WHEN w.status <> 'online' THEN false
                             WHEN w.is_flexi THEN bstf.is_active_trip
                             ELSE bstd.is_active_trip
                         END AS is_active_trip
@@ -1078,7 +1084,7 @@ impl DBVehicleReaderInternal {
         match query_builder.fetch_all(pool).await {
             Ok(rows) => {
                 info!(
-                    "Chennai internal direct query: found {} waybills for route_id={}",
+                    "Operator internal direct query: found {} waybills for route_id={}",
                     rows.len(),
                     route_id
                 );
@@ -1093,7 +1099,7 @@ impl DBVehicleReaderInternal {
             }
             Err(e) => {
                 error!(
-                    "Internal get_chennai_waybills_by_route_id failed for route_id={}: {}",
+                    "Internal get_operator_waybills_by_route_id failed for route_id={}: {}",
                     route_id, e
                 );
                 // Fail gracefully so we just don't append internal records
@@ -1267,13 +1273,13 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             .await
     }
 
-    async fn get_chennai_waybills_by_route_id(
+    async fn get_operator_waybills_by_route_id(
         &self,
         route_id: &str,
         gtfs_id: &str,
         vehicle_number: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
+        self.get_operator_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
             .await
     }
 
