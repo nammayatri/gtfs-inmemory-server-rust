@@ -1,7 +1,7 @@
 {
-  "version": "4f9d7276b7cc",
-  "build_commit": "32e0c3",
-  "generated_at": "2026-06-08T14:20:28Z",
+  "version": "99536bde1a1e",
+  "build_commit": "8f871e",
+  "generated_at": "2026-06-09T07:12:42Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
@@ -24,7 +24,7 @@
       "count": 8262
     },
     "stops.json": {
-      "sha256": "c2cc66a47c6069d9c0d940eb0f03112c70e389d73d5f8390ed223d781d9c1056",
+      "sha256": "614cdcfe98fdf4cb8449c29a92545989683f61f19321b08038b86a5858bba8dc",
       "count": 31662
     },
     "patterns.json": {
