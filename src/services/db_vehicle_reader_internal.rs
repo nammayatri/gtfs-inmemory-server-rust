@@ -967,7 +967,11 @@ impl DBVehicleReaderInternal {
                         CASE
                             WHEN w.is_flexi THEN bstf.is_active_trip
                             ELSE bstd.is_active_trip
-                        END AS is_active_trip
+                        END AS is_active_trip,
+                        CASE
+                            WHEN w.is_flexi THEN NULL
+                            ELSE bstd.is_completed
+                        END AS is_completed
                     FROM waybills_internal w
                     LEFT JOIN entities_internal e
                         ON e.entity_id = w.entity_id
@@ -1033,7 +1037,11 @@ impl DBVehicleReaderInternal {
                         CASE
                             WHEN w.is_flexi THEN bstf.is_active_trip
                             ELSE bstd.is_active_trip
-                        END AS is_active_trip
+                        END AS is_active_trip,
+                        CASE
+                            WHEN w.is_flexi THEN NULL
+                            ELSE bstd.is_completed
+                        END AS is_completed
                     FROM waybills_internal w
                     LEFT JOIN entities_internal e
                         ON e.entity_id = w.entity_id
