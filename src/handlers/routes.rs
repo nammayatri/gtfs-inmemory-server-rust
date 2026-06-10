@@ -2983,6 +2983,7 @@ pub async fn get_bus_trip_schedule(
             trip_number: row.trip_number,
             is_active_trip: row.is_active_trip,
             waybill_no: Some(row.waybill_no),
+            is_completed: row.is_completed,
         });
     }
 
@@ -3093,6 +3094,7 @@ pub async fn get_bus_route_schedule(
                 trip_number: row.trip_number,
                 is_active_trip: row.is_active_trip,
                 waybill_no: Some(row.waybill_no),
+                is_completed: row.is_completed,
             });
         }
 
@@ -3134,6 +3136,7 @@ pub async fn get_bus_route_schedule(
                     start_time_epoch: None,
                     trip_number: None,
                     is_active_trip: None,
+                    is_completed: None,
                 })
                 .collect()
         } else {
@@ -3229,6 +3232,7 @@ pub async fn get_bus_route_schedule(
             trip_number: None,
             is_active_trip: None,
             waybill_no: None,
+            is_completed: None,
         });
     }
 
