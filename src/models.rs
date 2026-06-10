@@ -136,6 +136,8 @@ pub struct VehicleData {
     pub trip_number: Option<i32>,
     #[sqlx(default)]
     pub is_active_trip: Option<bool>,
+    #[sqlx(default)]
+    pub is_completed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -803,6 +805,8 @@ pub struct BusScheduleDetail {
     pub is_active_trip: Option<bool>,
     #[serde(rename = "waybill_no")]
     pub waybill_no: Option<String>,
+    #[serde(rename = "is_completed", skip_serializing_if = "Option::is_none")]
+    pub is_completed: Option<bool>,
 }
 
 pub type BusScheduleDetails = Vec<BusScheduleDetail>;

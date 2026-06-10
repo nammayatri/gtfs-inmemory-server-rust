@@ -589,6 +589,7 @@ pub struct BusScheduleTripDetailInternal {
     pub route_number_id: i64,
     pub schedule_trip_id: i64,
     pub is_active_trip: bool,
+    pub is_completed: bool,
     pub trip_end_time: Option<String>,
     pub trip_start_time: Option<String>,
     pub sync_end_time: Option<String>,
@@ -1850,16 +1851,16 @@ impl OperatorService for DBOperatorService {
             .map_err(|e| AppError::DbError(format!("update_waybill_status: {}", e)))?;
 
         // If status is 'closed' or 'audited' and we have a schedule_trip_id,
-        // set all is_active_trip to false in bus_schedule_trip_detail_internal
+        // set all is_active_trip to false and is_completed to false in bus_schedule_trip_detail_internal
         if (status == "closed" || status == "audited") && schedule_trip_id.is_some() {
             sqlx::query(
-                "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false WHERE schedule_trip_id = $1 AND gtfs_id = $2",
+                "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false WHERE schedule_trip_id = $1 AND gtfs_id = $2",
             )
             .bind(schedule_trip_id)
             .bind(gtfs_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(format!("Failed to update is_active_trip: {}", e)))?;
+            .map_err(|e| AppError::DbError(format!("Failed to update is_active_trip/is_completed: {}", e)))?;
         }
 
         Ok(result.rows_affected())
