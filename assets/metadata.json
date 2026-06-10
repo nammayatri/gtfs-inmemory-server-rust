@@ -1,7 +1,7 @@
 {
-  "version": "99536bde1a1e",
-  "build_commit": "8f871e",
-  "generated_at": "2026-06-10T14:57:00Z",
+  "version": "99d400ec1052",
+  "build_commit": "b1ca96",
+  "generated_at": "2026-06-10T17:33:46Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
@@ -20,20 +20,20 @@
   ],
   "files": {
     "routes.json": {
-      "sha256": "428b568fb5c1138bccf786215eddd686649326539d5c3367cb30c23f22f8a28b",
-      "count": 8262
+      "sha256": "a210a0b40008684ec0e272a01fd4dccea10ad1e49e55e5eb91527399171f1d6b",
+      "count": 8264
     },
     "stops.json": {
-      "sha256": "614cdcfe98fdf4cb8449c29a92545989683f61f19321b08038b86a5858bba8dc",
-      "count": 31662
+      "sha256": "830bda9c1603df304d262877065bf442c6385e76145d9e5ceeb1388db0225da4",
+      "count": 31695
     },
     "patterns.json": {
-      "sha256": "2da129c5be442275ac24a383d86c6a8b79e65f29105d11b26e121a512f9c0e7e",
-      "count": 8374
+      "sha256": "497c817965775c27fa6dfefa68f1fcdfd3da8fcadee2d4f40496b167585b91f3",
+      "count": 8376
     },
     "route_stops.json": {
-      "sha256": "f6da9eaa4cd8d47d2194c410a54e4ac2954570535a0709acedf02bd40a0f8479",
-      "count": 208215
+      "sha256": "db0a84d023891b8cdf9a92df2623f765d253f43d4dfd0b5e37a034fe323fba2d",
+      "count": 208226
     },
     "trip_stoptimes/bangalore_metro.json": {
       "sha256": "e639d9a639c089d51cfd85efadcda52c2b5a277e8c6a77b159d5b4c4ea8a17f4",
@@ -56,8 +56,8 @@
       "count": 807
     },
     "trip_stoptimes/delhi_bus.json": {
-      "sha256": "f8db39b8eacc6ed58c9ea4a74036c4e2ead64a6affd2e74d38bc1e00c4d8af06",
-      "count": 211803
+      "sha256": "3c9a13d868ccb5cf8074e55c36580902c9331afe3db494548af7f7e3aee47241",
+      "count": 211851
     },
     "trip_stoptimes/delhi_bus_nammayatri_application_mock.json": {
       "sha256": "da9b10ea10dd6dcd3c9ca2bf9cc33d26c874c03ba0f78dda9cbb89bf4b320b60",
@@ -72,7 +72,7 @@
       "count": 450
     },
     "trip_stoptimes/kolkata_bus.json": {
-      "sha256": "b2d61d80185de6db39c61f3a475ff61065fe3794a2eeb73f9d0002983655816f",
+      "sha256": "985e38be3a87d41be9d803d68b5ad7dfd73a59bb93aac45f205aadd213f039cc",
       "count": 17227
     },
     "trip_stoptimes/kolkata_metro.json": {
@@ -124,10 +124,10 @@
       "route_stop_mappings": 16814
     },
     "delhi_bus": {
-      "routes": 2619,
-      "stops": 6664,
-      "patterns": 2619,
-      "route_stop_mappings": 98935
+      "routes": 2621,
+      "stops": 6676,
+      "patterns": 2621,
+      "route_stop_mappings": 98947
     },
     "delhi_bus_nammayatri_application_mock": {
       "routes": 1,
@@ -149,9 +149,9 @@
     },
     "kolkata_bus": {
       "routes": 88,
-      "stops": 693,
+      "stops": 714,
       "patterns": 88,
-      "route_stop_mappings": 1773
+      "route_stop_mappings": 1772
     },
     "kolkata_metro": {
       "routes": 10,
