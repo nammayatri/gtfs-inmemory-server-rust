@@ -727,6 +727,7 @@ impl DBFleetOperatorService {
                             r#"
                             UPDATE bus_schedule_trip_detail_internal
                             SET is_active_trip = false,
+                                is_completed   = CASE WHEN trip_number = $4 AND is_active_trip THEN true ELSE is_completed END,
                                 trip_end_time  = CASE WHEN is_active_trip THEN $2 ELSE trip_end_time END,
                                 sync_end_time  = CASE WHEN is_active_trip THEN $3 ELSE sync_end_time END
                             WHERE schedule_trip_id = $1
@@ -735,6 +736,7 @@ impl DBFleetOperatorService {
                         .bind(schedule_trip_id)
                         .bind(ts)
                         .bind(sync_now)
+                        .bind(trip_number)
                         .execute(&self.pool)
                         .await
                         .map_err(|e| {
@@ -748,11 +750,13 @@ impl DBFleetOperatorService {
                         sqlx::query(
                             r#"
                             UPDATE bus_schedule_trip_detail_internal
-                            SET is_active_trip = false
+                            SET is_active_trip = false,
+                                is_completed   = CASE WHEN trip_number = $2 AND is_active_trip THEN true ELSE is_completed END
                             WHERE schedule_trip_id = $1
                             "#,
                         )
                         .bind(schedule_trip_id)
+                        .bind(trip_number)
                         .execute(&self.pool)
                         .await
                         .map_err(|e| {
