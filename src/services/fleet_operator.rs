@@ -584,6 +584,7 @@ impl DBFleetOperatorService {
                             r#"
                             UPDATE bus_schedule_trip_flexi_internal
                             SET is_active_trip  = (trip_number = $2),
+                                is_completed    = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END,
                                 trip_start_time = CASE WHEN trip_number = $2 THEN $3 ELSE trip_start_time END,
                                 sync_start_time = CASE WHEN trip_number = $2 THEN $4 ELSE sync_start_time END
                             WHERE waybill_id = $1
@@ -607,7 +608,8 @@ impl DBFleetOperatorService {
                         sqlx::query(
                             r#"
                             UPDATE bus_schedule_trip_flexi_internal
-                            SET is_active_trip = (trip_number = $2)
+                            SET is_active_trip = (trip_number = $2),
+                                is_completed   = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END
                             WHERE waybill_id = $1
                               AND trip_type != 'dead-trip'
                             "#,
@@ -633,6 +635,7 @@ impl DBFleetOperatorService {
                             r#"
                             UPDATE bus_schedule_trip_detail_internal
                             SET is_active_trip  = (trip_number = $2),
+                                is_completed    = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END,
                                 trip_start_time = CASE WHEN trip_number = $2 THEN $3 ELSE trip_start_time END,
                                 sync_start_time = CASE WHEN trip_number = $2 THEN $4 ELSE sync_start_time END
                             WHERE schedule_trip_id = $1
@@ -656,7 +659,8 @@ impl DBFleetOperatorService {
                         sqlx::query(
                             r#"
                             UPDATE bus_schedule_trip_detail_internal
-                            SET is_active_trip = (trip_number = $2)
+                            SET is_active_trip = (trip_number = $2),
+                                is_completed   = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END
                             WHERE schedule_trip_id = $1
                               AND trip_type != 'dead-trip'
                             "#,
@@ -774,7 +778,8 @@ impl DBFleetOperatorService {
                     sqlx::query(
                         r#"
                         UPDATE bus_schedule_trip_flexi_internal
-                        SET is_active_trip = false
+                        SET is_active_trip = false,
+                            is_completed   = false
                         WHERE waybill_id = $1
                         "#,
                     )
@@ -795,7 +800,8 @@ impl DBFleetOperatorService {
                     sqlx::query(
                         r#"
                         UPDATE bus_schedule_trip_detail_internal
-                        SET is_active_trip = false
+                        SET is_active_trip = false,
+                            is_completed   = false
                         WHERE schedule_trip_id = $1
                         "#,
                     )
