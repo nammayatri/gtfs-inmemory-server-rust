@@ -999,7 +999,7 @@ impl DBVehicleReaderInternal {
                             (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                         )
                 )
-                SELECT * FROM base ORDER BY waybill_no, trip_number;
+                SELECT * FROM base WHERE is_completed IS NOT TRUE ORDER BY waybill_no, trip_number;
                 "#,
                 Some(vn),
             )
@@ -1068,7 +1068,7 @@ impl DBVehicleReaderInternal {
                             (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                         )
                 )
-                SELECT * FROM base ORDER BY waybill_no, trip_number;
+                SELECT * FROM base WHERE is_completed IS NOT TRUE ORDER BY waybill_no, trip_number;
                 "#,
                 None::<&str>,
             )
