@@ -3087,12 +3087,21 @@ pub async fn get_bus_route_schedule(
                 _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
             };
 
+            let is_upcoming = row
+                .status
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("upcoming"))
+                .unwrap_or(false);
             schedule_details.push(crate::models::BusScheduleDetail {
                 eta: bus_stop_etas,
                 vehicle_no: row.vehicle_no,
                 service_tier: row.service_type,
                 trip_number: row.trip_number,
-                is_active_trip: row.is_active_trip,
+                is_active_trip: if is_upcoming {
+                    Some(false)
+                } else {
+                    row.is_active_trip
+                },
                 waybill_no: Some(row.waybill_no),
                 is_completed: row.is_completed,
             });
