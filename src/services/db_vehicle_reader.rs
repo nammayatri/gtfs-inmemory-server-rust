@@ -2354,7 +2354,7 @@ impl VehicleDataReader for DBVehicleReader {
             }
             Err(e) => {
                 error!(
-                    "Chennai get_waybills_by_route_id failed for route_id={}: {}",
+                    "Chennai get_chennai_waybills_by_route_id failed for route_id={}: {}",
                     route_id, e
                 );
                 Err(AppError::Internal(format!("Database query failed: {}", e)))
