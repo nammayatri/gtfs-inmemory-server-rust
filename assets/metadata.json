@@ -1,7 +1,7 @@
 {
-  "version": "99d400ec1052",
-  "build_commit": "b1ca96",
-  "generated_at": "2026-06-10T17:33:46Z",
+  "version": "25beb48cf1fd",
+  "build_commit": "337064",
+  "generated_at": "2026-06-15T08:15:45Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
@@ -20,20 +20,20 @@
   ],
   "files": {
     "routes.json": {
-      "sha256": "a210a0b40008684ec0e272a01fd4dccea10ad1e49e55e5eb91527399171f1d6b",
-      "count": 8264
+      "sha256": "79a22bffbecbe59bb632ed4126b2ca1a1b0d07105754f5d3617836f0fcb41648",
+      "count": 8265
     },
     "stops.json": {
-      "sha256": "830bda9c1603df304d262877065bf442c6385e76145d9e5ceeb1388db0225da4",
-      "count": 31695
+      "sha256": "bc5e3f009a3d2bf99b54e1fbb6397c09488e24b96e73533deb1fe137240b7da2",
+      "count": 31733
     },
     "patterns.json": {
-      "sha256": "497c817965775c27fa6dfefa68f1fcdfd3da8fcadee2d4f40496b167585b91f3",
-      "count": 8376
+      "sha256": "601bfa044bd8c19c5184025629f0dec7c99ee376d9ff0f18f175ef5a42915486",
+      "count": 8377
     },
     "route_stops.json": {
-      "sha256": "db0a84d023891b8cdf9a92df2623f765d253f43d4dfd0b5e37a034fe323fba2d",
-      "count": 208226
+      "sha256": "703b899c42dc91fa9f08d4a40e60a869e00a04719eab553af42296950920baab",
+      "count": 208264
     },
     "trip_stoptimes/bangalore_metro.json": {
       "sha256": "e639d9a639c089d51cfd85efadcda52c2b5a277e8c6a77b159d5b4c4ea8a17f4",
@@ -80,8 +80,8 @@
       "count": 1652
     },
     "trip_stoptimes/mumbai_metro.json": {
-      "sha256": "4b04febcf317c01a7a3344232538e1f76677a8055947f2f4acb5fff549f9e145",
-      "count": 278
+      "sha256": "5af5a06131992c5305ea6bc75aa676792f4497dcf41e31c8711bca365b23931b",
+      "count": 279
     },
     "trip_stoptimes/mumbai_suburban.json": {
       "sha256": "8a374cba7e8b57f9cb8e9c43300984dd7014e2a51e3cc210c7a41fdfa928d2d7",
@@ -160,10 +160,10 @@
       "route_stop_mappings": 114
     },
     "mumbai_metro": {
-      "routes": 2,
-      "stops": 12,
-      "patterns": 2,
-      "route_stop_mappings": 24
+      "routes": 3,
+      "stops": 50,
+      "patterns": 3,
+      "route_stop_mappings": 62
     },
     "mumbai_suburban": {
       "routes": 2,
