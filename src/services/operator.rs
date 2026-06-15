@@ -47,6 +47,12 @@ pub fn waybill_statuses() -> Vec<&'static str> {
 
 pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"];
 
+/// gtfs_ids that should only use the internal reader (no external fetch)
+pub const INTERNAL_ONLY_GTFS_IDS: &[&str] = &["kolkata_bus"];
+
+/// gtfs_ids that should only use the external reader (no internal fetch)
+pub const EXTERNAL_ONLY_GTFS_IDS: &[&str] = &[];
+
 pub const MAX_QUERY_LIMIT: i64 = 1000;
 pub const MAX_QUERY_FILTERS: usize = 5;
 

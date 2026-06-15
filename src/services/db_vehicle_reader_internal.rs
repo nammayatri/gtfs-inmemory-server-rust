@@ -22,13 +22,13 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
         trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId>;
-    async fn get_chennai_waybills_by_route_id(
+    async fn get_waybills_by_route_id(
         &self,
         route_id: &str,
         gtfs_id: &str,
         vehicle_number: Option<&str>,
     ) -> AppResult<Vec<VehicleData>>;
-    async fn get_chennai_waybill_by_waybill_and_trip(
+    async fn get_waybill_by_waybill_and_trip(
         &self,
         waybill_no: &str,
         trip_number: i32,
@@ -84,7 +84,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         ))
     }
 
-    async fn get_chennai_waybills_by_route_id(
+    async fn get_waybills_by_route_id(
         &self,
         _route_id: &str,
         _gtfs_id: &str,
@@ -93,7 +93,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         Ok(Vec::new())
     }
 
-    async fn get_chennai_waybill_by_waybill_and_trip(
+    async fn get_waybill_by_waybill_and_trip(
         &self,
         _waybill_no: &str,
         _trip_number: i32,
@@ -896,7 +896,7 @@ impl DBVehicleReaderInternal {
         Ok(())
     }
 
-    async fn get_chennai_waybills_by_route_id_impl(
+    async fn get_waybills_by_route_id_impl(
         &self,
         route_id: &str,
         gtfs_id: &str,
@@ -924,7 +924,7 @@ impl DBVehicleReaderInternal {
             if let Some((data, ts)) = cache.get(key) {
                 if !self.is_waybills_by_route_cache_expired(*ts) {
                     info!(
-                        "internal get_chennai_waybills_by_route_id cache HIT for route_id={}",
+                        "internal get_waybills_by_route_id cache HIT for route_id={}",
                         route_id
                     );
                     return Ok(data.clone());
@@ -1101,7 +1101,7 @@ impl DBVehicleReaderInternal {
             }
             Err(e) => {
                 error!(
-                    "Internal get_chennai_waybills_by_route_id failed for route_id={}: {}",
+                    "Internal get_waybills_by_route_id failed for route_id={}: {}",
                     route_id, e
                 );
                 // Fail gracefully so we just don't append internal records
@@ -1110,7 +1110,7 @@ impl DBVehicleReaderInternal {
         }
     }
 
-    async fn get_chennai_waybill_by_waybill_and_trip_impl(
+    async fn get_waybill_by_waybill_and_trip_impl(
         &self,
         waybill_no: &str,
         trip_number: i32,
@@ -1199,7 +1199,7 @@ impl DBVehicleReaderInternal {
             }
             Err(e) => {
                 error!(
-                    "Internal get_chennai_waybill_by_waybill_and_trip failed for waybill_no={}, trip_number={}, gtfs_id={}: {}",
+                    "Internal get_waybill_by_waybill_and_trip failed for waybill_no={}, trip_number={}, gtfs_id={}: {}",
                     waybill_no, trip_number, gtfs_id, e
                 );
                 // Fail gracefully so external results are still returned
@@ -1275,23 +1275,23 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             .await
     }
 
-    async fn get_chennai_waybills_by_route_id(
+    async fn get_waybills_by_route_id(
         &self,
         route_id: &str,
         gtfs_id: &str,
         vehicle_number: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
+        self.get_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
             .await
     }
 
-    async fn get_chennai_waybill_by_waybill_and_trip(
+    async fn get_waybill_by_waybill_and_trip(
         &self,
         waybill_no: &str,
         trip_number: i32,
         gtfs_id: &str,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_chennai_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id)
+        self.get_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id)
             .await
     }
 
