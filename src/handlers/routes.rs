@@ -4,7 +4,7 @@ use crate::services::fleet_operator::{
 };
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
-    SUPPORTED_OPERATOR_GTFS_IDS,
+    EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
 };
 use actix_web::{
     web::{self, Data, Json, Path, Query},
@@ -2865,7 +2865,7 @@ pub async fn get_bus_trip_schedule(
             vec![],
             app_state
                 .db_vehicle_reader_internal
-                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
+                .get_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
                 .await
                 .unwrap_or_default(),
         )
@@ -2877,7 +2877,7 @@ pub async fn get_bus_trip_schedule(
                 .await?,
             app_state
                 .db_vehicle_reader_internal
-                .get_chennai_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
+                .get_waybill_by_waybill_and_trip(&waybill_no, trip_number, &gtfs_id)
                 .await
                 .unwrap_or_default(),
         )
@@ -2962,12 +2962,10 @@ pub async fn get_bus_route_schedule(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
 
-    // chennai_bus / kolkata_bus - internal DB flow
+    // Operator gtfs_ids (e.g. chennai_bus, kolkata_bus) - internal DB flow
     // Single join query returns waybills + trip (bstd & bstf) times
     // No per-vehicle get_vehicle_data call req
     if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
-        // kolkata_bus: internal reader only; chennai_bus: both internal + external
-        let is_kolkata = gtfs_id == "kolkata_bus";
         let just_internal = query.just_internal.unwrap_or(false);
         let just_external = query.just_external.unwrap_or(false);
         let vehicle_number = query.vehicle_number.as_deref();
@@ -2980,9 +2978,11 @@ pub async fn get_bus_route_schedule(
 
         let mut all_rows = Vec::new();
 
-        // 1. Fetch from external (existing) tables unless justInternal is strictly true
-        //    Skip for kolkata_bus (internal only)
-        if !just_internal && !is_kolkata {
+        // Fetch from external tables unless the query forces internal-only
+        // or the gtfs_id is listed as internal-only.
+        let fetch_external =
+            !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        if fetch_external {
             let mut ext_rows = app_state
                 .db_vehicle_reader
                 .get_chennai_waybills_by_route_id(&route_id, vehicle_number)
@@ -2990,11 +2990,14 @@ pub async fn get_bus_route_schedule(
             all_rows.append(&mut ext_rows);
         }
 
-        // 2. Fetch from internal (_internal) tables unless justExternal is strictly true
-        if !just_external {
+        // Fetch from internal tables unless the query forces external-only
+        // or the gtfs_id is listed as external-only.
+        let fetch_internal =
+            !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        if fetch_internal {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
-                .get_chennai_waybills_by_route_id(&route_id, &gtfs_id, vehicle_number)
+                .get_waybills_by_route_id(&route_id, &gtfs_id, vehicle_number)
                 .await?;
             all_rows.append(&mut int_rows);
         }
