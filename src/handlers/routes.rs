@@ -46,6 +46,12 @@ pub struct DirectionQuery {
     direction: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IncludeClusterIdQuery {
+    #[serde(rename = "includeClusterId")]
+    include_cluster_id: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct GetAllRoutesByIdsRequest {
     #[serde(rename = "gtfsId")]
@@ -319,6 +325,19 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/routes-served-today",
                 actix_web::web::get().to(get_routes_served_today),
+            )
+            // ── Metro routing endpoints ──
+            .route(
+                "/metro/route-plan/{gtfs_id}",
+                actix_web::web::get().to(metro_route_plan),
+            )
+            .route(
+                "/metro/nearby-stops/{gtfs_id}",
+                actix_web::web::get().to(metro_nearby_stops),
+            )
+            .route(
+                "/metro/graph-info/{gtfs_id}",
+                actix_web::web::get().to(metro_graph_info),
             ),
     );
 }
@@ -681,39 +700,6 @@ pub async fn get_route_stop_mapping_by_stop(
         )
         .await?;
     Ok(HttpResponse::Ok().json(mappings))
-}
-
-#[utoipa::path(
-    get,
-    path = "/cluster/{gtfs_id}/destinations/{stop_code}",
-    tag = "Cluster",
-    params(
-        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
-        ("stop_code" = String, Path, description = "Source stop code"),
-    ),
-    responses((
-        status = 200,
-        description = "Destination stop_codes reachable downstream of the source, computed against the \
-                       server's precomputed representative pattern per route (the longest pattern observed \
-                       for each route at build time — see build_route_data). Deduplicated by H3 cluster \
-                       so the response carries one representative stop_code per reachable cluster. \
-                       Does NOT include destinations reachable via a transfer, and does NOT enumerate \
-                       every trip pattern — patterns shorter than the longest for the same route are not \
-                       walked. Falls back to a single-stop walk when the source stop has no cluster_id \
-                       (logged at debug). Returns 404 on unknown gtfs_id; returns [] for an unknown \
-                       stop_code or a stop with no outgoing routes on the representative pattern.",
-        body = Vec<String>,
-    ))
-)]
-pub async fn get_cluster_destinations(
-    app_state: Data<AppState>,
-    path: Path<(String, String)>,
-) -> AppResult<HttpResponse> {
-    let (gtfs_id, stop_code) = path.into_inner();
-    let destinations = app_state
-        .gtfs_service
-        .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
-    Ok(HttpResponse::Ok().json(destinations))
 }
 
 #[utoipa::path(
@@ -1105,6 +1091,40 @@ pub async fn get_route_stop_mapping_draw(
 
 #[utoipa::path(
     get,
+    path = "/cluster/{gtfs_id}/destinations/{stop_code}",
+    tag = "Cluster",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("stop_code" = String, Path, description = "Source stop code"),
+    ),
+    responses((
+        status = 200,
+        description = "Destination stop_codes reachable downstream of the source, computed against the \
+                       server's precomputed representative pattern per route (the longest pattern observed \
+                       for each route at build time — see build_route_data). Deduplicated by H3 cluster \
+                       so the response carries one representative stop_code per reachable cluster. \
+                       Does NOT include destinations reachable via a transfer, and does NOT enumerate \
+                       every trip pattern — patterns shorter than the longest for the same route are not \
+                       walked. Falls back to a single-stop walk when the source stop has no cluster_id \
+                       (logged at debug). Returns 404 on unknown gtfs_id; returns [] for an unknown \
+                       stop_code or a stop with no outgoing routes on the representative pattern.",
+        body = Vec<String>,
+    ))
+)]
+pub async fn get_cluster_destinations(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, stop_code) = path.into_inner();
+    let destinations = app_state
+        .gtfs_service
+        .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
+    Ok(HttpResponse::Ok().json(destinations))
+}
+
+
+#[utoipa::path(
+    get,
     path = "/routes/{gtfs_id}/fuzzy/{query}",
     tag = "Routes",
     params(
@@ -1155,11 +1175,19 @@ pub async fn get_routes_fuzzy(
     get,
     path = "/stops/{gtfs_id}",
     tag = "Stops",
-    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("includeClusterId" = Option<bool>, Query, description = "If true, include clusterId in each stop's response"),
+    ),
     responses((status = 200, description = "List of stops", body = Vec<RouteStopMapping>))
 )]
-pub async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+pub async fn get_stops(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<IncludeClusterIdQuery>,
+) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
+    let include_cluster_id = query.include_cluster_id.unwrap_or(false);
     if app_state.config.osrtc_feed_key.as_deref() == Some(gtfs_id.as_str()) {
         let cache = app_state
             .osrtc_cache
@@ -1170,10 +1198,29 @@ pub async fn get_stops(app_state: Data<AppState>, path: Path<String>) -> AppResu
             .iter()
             .map(osrtc_station_to_route_stop_mapping)
             .collect();
-        return Ok(HttpResponse::Ok().json(mappings));
+        return Ok(stops_response(&mappings, include_cluster_id)?);
     }
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
-    Ok(HttpResponse::Ok().json(stops))
+    stops_response(stops.as_slice(), include_cluster_id)
+}
+
+fn stops_response<T: serde::Serialize>(
+    stops: &[T],
+    include_cluster_id: bool,
+) -> AppResult<HttpResponse> {
+    if include_cluster_id {
+        return Ok(HttpResponse::Ok().json(stops));
+    }
+    let mut value = serde_json::to_value(stops)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize stops: {}", e)))?;
+    if let Some(arr) = value.as_array_mut() {
+        for item in arr {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("clusterId");
+            }
+        }
+    }
+    Ok(HttpResponse::Ok().json(value))
 }
 
 pub fn merge_stop_and_mapping(
@@ -1206,6 +1253,7 @@ pub fn merge_stop_and_mapping(
             .and_then(|station_id| station_id.split(':').next_back())
             .filter(|s| !s.is_empty())
             .map(Arc::from),
+        cluster_id: stop.cluster_id.as_deref().map(Arc::from),
     }
 }
 
@@ -4281,4 +4329,162 @@ pub async fn fleet_operator_employee_register(
         .await?;
 
     Ok(HttpResponse::Ok().json(response))
+}
+
+// ── Metro routing handlers ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct MetroRoutePlanQuery {
+    pub from: String,
+    pub to: String,
+    /// Optional departure time in "HH:MM:SS" format
+    pub departure_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetroNearbyStopsQuery {
+    pub lat: f64,
+    pub lon: f64,
+    /// Search radius in meters (default: 1000)
+    pub radius_m: Option<f64>,
+}
+
+/// GET /metro/route-plan/{gtfs_id}?from={stop_id}&to={stop_id}&departure_time={HH:MM:SS}
+///
+/// Finds the shortest path between two metro stops using A*.
+async fn metro_route_plan(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<MetroRoutePlanQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let params = query.into_inner();
+
+    let graph = app_state
+        .metro_graphs
+        .get(&gtfs_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "No metro graph found for gtfs_id: {}. Available: {:?}",
+                gtfs_id,
+                app_state.metro_graphs.keys().collect::<Vec<_>>()
+            ))
+        })?;
+
+    let departure_time = params
+        .departure_time
+        .as_deref()
+        .and_then(crate::services::metro_graph::parse_time_str);
+
+    let result = crate::services::astar_router::find_shortest_path(
+        graph,
+        &params.from,
+        &params.to,
+        departure_time,
+    )?;
+
+    Ok(HttpResponse::Ok().json(result))
+}
+
+/// GET /metro/nearby-stops/{gtfs_id}?lat={}&lon={}&radius_m={}
+///
+/// Find metro stops within a given radius of a lat/lon point.
+async fn metro_nearby_stops(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<MetroNearbyStopsQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let params = query.into_inner();
+    let radius = params.radius_m.unwrap_or(1000.0);
+
+    let graph = app_state
+        .metro_graphs
+        .get(&gtfs_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "No metro graph found for gtfs_id: {}",
+                gtfs_id
+            ))
+        })?;
+
+    let nearby = graph.find_nearby_stops(params.lat, params.lon, radius);
+
+    let result: Vec<serde_json::Value> = nearby
+        .iter()
+        .map(|node| {
+            let dist = crate::services::metro_graph::haversine_distance_meters(
+                params.lat,
+                params.lon,
+                node.lat,
+                node.lon,
+            );
+            serde_json::json!({
+                "stopId": node.stop_id,
+                "stopName": node.stop_name,
+                "lat": node.lat,
+                "lon": node.lon,
+                "distanceMeters": (dist * 10.0).round() / 10.0,
+                "parentStation": node.parent_station,
+            })
+        })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(result))
+}
+
+/// GET /metro/graph-info/{gtfs_id}
+///
+/// Returns metadata about the metro graph (number of nodes, edges, routes).
+async fn metro_graph_info(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+
+    let graph = app_state
+        .metro_graphs
+        .get(&gtfs_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "No metro graph found for gtfs_id: {}",
+                gtfs_id
+            ))
+        })?;
+
+    let total_edges: usize = graph.adjacency.values().map(|v| v.len()).sum();
+    let transfer_edges: usize = graph
+        .adjacency
+        .values()
+        .flat_map(|v| v.iter())
+        .filter(|e| e.is_transfer)
+        .count();
+
+    let route_info: Vec<serde_json::Value> = graph
+        .route_names
+        .iter()
+        .map(|(id, name)| {
+            let stop_count = graph
+                .route_stop_sequences
+                .get(id)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            serde_json::json!({
+                "routeId": id,
+                "routeName": name,
+                "stopCount": stop_count,
+            })
+        })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "gtfsId": gtfs_id,
+        "totalNodes": graph.nodes.len(),
+        "totalEdges": total_edges,
+        "transferEdges": transfer_edges,
+        "routeEdges": total_edges - transfer_edges,
+        "totalRoutes": graph.route_names.len(),
+        "routes": route_info,
+        "availableStops": graph.nodes.len(),
+    })))
 }
