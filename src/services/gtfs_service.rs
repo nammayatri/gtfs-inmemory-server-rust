@@ -7,6 +7,7 @@ use crate::models::{
     StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails};
+use crate::services::operator::OperatorService;
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -70,6 +71,8 @@ pub struct GTFSService {
     trip_details_cache: Arc<RwLock<HashMap<String, HashMap<String, TripDetails>>>>,
     /// Pre-serialized JSON bytes for the /cached-data endpoint
     cached_data_bytes: Arc<ArcSwap<Vec<u8>>>,
+    /// Set once at startup so refreshes can enrich routes with DB-only fields (e.g. encoded_polyline).
+    operator_service: std::sync::OnceLock<Arc<dyn OperatorService>>,
 }
 
 impl GTFSService {
@@ -92,14 +95,17 @@ impl GTFSService {
             last_update: Arc::new(RwLock::new(Utc::now())),
             trip_details_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_data_bytes: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            operator_service: std::sync::OnceLock::new(),
         };
-
-        service.load_initial_data().await?;
 
         Ok(service)
     }
 
-    async fn load_initial_data(&self) -> AppResult<()> {
+    pub fn set_operator_service(&self, op: Arc<dyn OperatorService>) {
+        let _ = self.operator_service.set(op);
+    }
+
+    pub async fn load_initial_data(&self) -> AppResult<()> {
         info!("Loading initial GTFS data...");
         let start_time = std::time::Instant::now();
 
@@ -229,6 +235,9 @@ impl GTFSService {
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
+
+        // Enrich with encoded_polyline from route_internal (DB-only field)
+        self.enrich_routes_with_polylines(&mut routes_by_gtfs).await;
 
         // Fetch stops and build children mapping
         let children_by_parent = self.build_children_mapping(all_stops);
@@ -706,6 +715,7 @@ impl GTFSService {
                 start_point: None,
                 end_point: None,
                 service_tier_type,
+                encoded_polyline: None,
             };
             routes_by_gtfs
                 .entry(gtfs_id.to_string())
@@ -713,6 +723,36 @@ impl GTFSService {
                 .insert(route_code.to_string(), route_res);
         }
         routes_by_gtfs
+    }
+
+    async fn enrich_routes_with_polylines(
+        &self,
+        routes_by_gtfs: &mut HashMap<String, HashMap<String, NandiRoutesRes>>,
+    ) {
+        let Some(op_svc) = self.operator_service.get() else {
+            return;
+        };
+        for (gtfs_id, routes) in routes_by_gtfs.iter_mut() {
+            let rows = match op_svc.get_routes_list(gtfs_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "enrich_routes_with_polylines: get_routes_list({}) failed: {}",
+                        gtfs_id, e
+                    );
+                    continue;
+                }
+            };
+            for row in rows {
+                if row.encoded_polyline.is_none() {
+                    continue;
+                }
+                let route_key = row.route_id.to_string();
+                if let Some(route) = routes.get_mut(&route_key) {
+                    route.encoded_polyline = row.encoded_polyline;
+                }
+            }
+        }
     }
 
     fn build_alternate_stops_by_gtfs(

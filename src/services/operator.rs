@@ -76,6 +76,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "end_point_id",
             "start_point_id",
             "route_distance",
+            "encoded_polyline",
             "gtfs_id",
         ]),
         "route_point_internal" => Some(&[
@@ -446,6 +447,7 @@ pub struct RouteRow {
     pub route_direction: Option<String>,
     pub start_point_id: i64,
     pub end_point_id: i64,
+    pub encoded_polyline: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -511,6 +513,7 @@ pub struct RouteInternal {
     pub end_point_id: i64,
     pub start_point_id: i64,
     pub route_distance: Option<f64>,
+    pub encoded_polyline: Option<String>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -1598,7 +1601,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>> {
         sqlx::query_as::<_, RouteRow>(
-            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id
+            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id, encoded_polyline
              FROM public.route_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY route_number",

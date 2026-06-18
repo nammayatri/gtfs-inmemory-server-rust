@@ -378,6 +378,8 @@ pub struct NandiRoutesRes {
     pub end_point: Option<LatLong>,
     #[serde(rename = "serviceTierType")]
     pub service_tier_type: Option<ServiceTierType>,
+    #[serde(rename = "encodedPolyline", skip_serializing_if = "Option::is_none")]
+    pub encoded_polyline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

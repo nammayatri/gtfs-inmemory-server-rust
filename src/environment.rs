@@ -317,6 +317,9 @@ impl AppState {
             )
         };
 
+        gtfs_service.set_operator_service(operator_service.clone());
+        gtfs_service.load_initial_data().await?;
+
         let trip_service = Arc::new(TripService::new(gtfs_service.clone()));
 
         let mut chalo_vehicle_cache = ChaloVehicleCache::new(
