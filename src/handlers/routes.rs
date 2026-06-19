@@ -2860,7 +2860,7 @@ pub async fn get_bus_trip_schedule(
         .unwrap_or_default();
 
     // kolkata_bus: internal only; chennai_bus: both external + internal
-    let (external_rows, internal_rows) = if gtfs_id == "kolkata_bus" {
+    let (external_rows, internal_rows) = if INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str()) {
         (
             vec![],
             app_state
