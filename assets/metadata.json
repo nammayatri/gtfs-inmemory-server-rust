@@ -1,7 +1,7 @@
 {
   "version": "d61c89ac3482",
-  "build_commit": "4ae3a3",
-  "generated_at": "2026-06-19T08:49:52Z",
+  "build_commit": "dc65ae",
+  "generated_at": "2026-06-19T11:58:28Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
