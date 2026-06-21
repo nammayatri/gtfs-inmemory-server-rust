@@ -379,6 +379,8 @@ pub fn table_pk(table: &str) -> Option<&'static str> {
         "fleet_etm_mapping_internal" => Some("fleet_etm_mapping_id"),
         "fleet_obu_mapping_internal" => Some("fleet_obu_mapping_id"),
         "waybills_internal" => Some("waybill_id"),
+        "bus_shift_type_internal" => Some("shift_type_id"),
+        "bus_schedule_type_internal" => Some("schedule_type_id"),
         _ => None,
     }
 }
@@ -401,6 +403,8 @@ fn allowed_tables() -> &'static [&'static str] {
         "fleet_etm_mapping_internal",
         "fleet_obu_mapping_internal",
         "waybills_internal",
+        "bus_shift_type_internal",
+        "bus_schedule_type_internal",
     ]
 }
 
@@ -440,44 +444,44 @@ fn validate_table(table: &str) -> AppResult<()> {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ServiceTypeRow {
-    pub service_type_id: i64,
+    pub service_type_id: String,
     pub service_type_code: Option<String>,
     pub service_type_name: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RouteRow {
-    pub route_id: i64,
+    pub route_id: String,
     pub route_number: Option<String>,
     pub route_name: Option<String>,
     pub route_direction: Option<String>,
-    pub start_point_id: i64,
-    pub end_point_id: i64,
+    pub start_point_id: String,
+    pub end_point_id: String,
     pub encoded_polyline: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct DepotRow {
-    pub entity_id: i64,
+    pub entity_id: String,
     pub entity_name: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ScheduleNumberRow {
-    pub schedule_id: i64,
+    pub schedule_id: String,
     pub schedule_number: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct FleetRow {
-    pub vehicle_id: i64,
+    pub vehicle_id: String,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct EmployeeRow {
-    pub emp_id: i64,
+    pub emp_id: String,
     pub first_name: String,
     pub last_name: Option<String>,
     pub token_no: Option<String>,
@@ -486,7 +490,7 @@ pub struct EmployeeRow {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct TripDetailRow {
-    pub schedule_trip_detail_id: i64,
+    pub schedule_trip_detail_id: String,
     pub trip_number: i32,
     pub trip_order: i32,
     pub trip_type: Option<String>,
@@ -496,14 +500,14 @@ pub struct TripDetailRow {
     pub break_type: Option<String>,
     pub shift_type_name: Option<String>,
     pub distance: f32,
-    pub schedule_trip_id: i64,
+    pub schedule_trip_id: String,
     pub is_active_trip: bool,
-    pub route_id: i32,
+    pub route_id: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct RouteInternal {
-    pub route_id: i64,
+    pub route_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub description: Option<String>,
     pub route_direction: Option<String>,
@@ -511,20 +515,20 @@ pub struct RouteInternal {
     pub route_name: Option<String>,
     pub route_number: Option<String>,
     pub route_string: Option<String>,
-    pub route_type_id: i64,
+    pub route_type_id: String,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub via: Option<String>,
-    pub bus_service_type_id: i64,
-    pub end_point_id: i64,
-    pub start_point_id: i64,
+    pub bus_service_type_id: String,
+    pub end_point_id: String,
+    pub start_point_id: String,
     pub route_distance: Option<f64>,
     pub encoded_polyline: Option<String>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct RoutePointInternal {
-    pub route_points_id: i64,
+    pub route_points_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fare_stage: Option<String>,
@@ -535,13 +539,13 @@ pub struct RoutePointInternal {
     pub travel_distance: i64,
     pub travel_time: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub bus_stop_id: i64,
-    pub route_id: i64,
+    pub bus_stop_id: String,
+    pub route_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleInternal {
-    pub schedule_id: i64,
+    pub schedule_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub effective_from: Option<chrono::DateTime<chrono::Utc>>,
@@ -553,15 +557,15 @@ pub struct BusScheduleInternal {
     pub schedule_type_code: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub entity_id: i64,
-    pub route_id: i64,
-    pub service_type_id: i64,
-    pub schedule_type_id: i64,
+    pub entity_id: String,
+    pub route_id: String,
+    pub service_type_id: String,
+    pub schedule_type_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripInternal {
-    pub schedule_trip_id: i64,
+    pub schedule_trip_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub effective_end_date: Option<chrono::DateTime<chrono::Utc>>,
@@ -571,13 +575,13 @@ pub struct BusScheduleTripInternal {
     pub start_time: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: i64,
-    pub schedule_id: i64,
+    pub calendar_id: String,
+    pub schedule_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripDetailInternal {
-    pub schedule_trip_detail_id: i64,
+    pub schedule_trip_detail_id: String,
     pub break_time: Option<String>,
     pub break_type: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -594,9 +598,9 @@ pub struct BusScheduleTripDetailInternal {
     pub trip_order: i64,
     pub trip_type: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: i64,
-    pub route_number_id: i64,
-    pub schedule_trip_id: i64,
+    pub calendar_id: String,
+    pub route_number_id: String,
+    pub schedule_trip_id: String,
     pub is_active_trip: bool,
     pub trip_end_time: Option<String>,
     pub trip_start_time: Option<String>,
@@ -606,7 +610,7 @@ pub struct BusScheduleTripDetailInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripFlexiInternal {
-    pub schedule_trip_flexi_id: i64,
+    pub schedule_trip_flexi_id: String,
     pub break_time: Option<String>,
     pub break_type: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -623,20 +627,20 @@ pub struct BusScheduleTripFlexiInternal {
     pub trip_order: i64,
     pub trip_type: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: i64,
-    pub route_number_id: i64,
-    pub schedule_trip_id: i64,
-    pub waybill_id: i64,
+    pub calendar_id: String,
+    pub route_number_id: String,
+    pub schedule_trip_id: String,
+    pub waybill_id: String,
     pub is_active_trip: bool,
-    pub trip_end_time: Option<String>,
-    pub trip_start_time: Option<String>,
-    pub sync_end_time: Option<String>,
-    pub sync_start_time: Option<String>,
+    pub trip_end_time: Option<i64>,
+    pub trip_start_time: Option<i64>,
+    pub sync_end_time: Option<i64>,
+    pub sync_start_time: Option<i64>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct ServiceTypeInternal {
-    pub service_type_id: i64,
+    pub service_type_id: String,
     pub abbreviation: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
@@ -650,7 +654,7 @@ pub struct ServiceTypeInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct StopInternal {
-    pub bus_stop_id: i64,
+    pub bus_stop_id: String,
     pub bus_stop_code: Option<String>,
     pub bus_stop_name: Option<String>,
     pub bus_stop_name_local_lang: Option<String>,
@@ -664,8 +668,8 @@ pub struct StopInternal {
     pub route_status: Option<String>,
     pub status: Option<String>,
     pub stop_direction: Option<String>,
-    pub stop_group_id: Option<i64>,
-    pub stop_type_id: i64,
+    pub stop_group_id: Option<String>,
+    pub stop_type_id: String,
     pub sub_stage: Option<String>,
     pub toll_fee: Option<i64>,
     pub toll_zone: Option<String>,
@@ -674,7 +678,7 @@ pub struct StopInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct DesignationsInternal {
-    pub designation_id: i64,
+    pub designation_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub designation_name: String,
@@ -686,7 +690,7 @@ pub struct DesignationsInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct EmployeesInternal {
-    pub emp_id: i64,
+    pub emp_id: String,
     pub address: Option<String>,
     pub basic_amount: Option<f64>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -705,15 +709,15 @@ pub struct EmployeesInternal {
     pub token_no: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub week_off: Option<String>,
-    pub department_id: i64,
-    pub designation_id: i64,
-    pub entity_id: i64,
-    pub organization_id: i64,
+    pub department_id: String,
+    pub designation_id: String,
+    pub entity_id: String,
+    pub organization_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct EntitiesInternal {
-    pub entity_id: i64,
+    pub entity_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub entity_address: Option<String>,
@@ -724,26 +728,26 @@ pub struct EntitiesInternal {
     pub entity_remark: Option<String>,
     pub entity_status: String,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub organization_id: i64,
+    pub organization_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct VehiclesInternal {
-    pub vehicle_id: i64,
+    pub vehicle_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fleet_no: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
-    pub bus_service_type_id: i64,
-    pub entity_id: i64,
-    pub organization_id: i64,
+    pub bus_service_type_id: String,
+    pub entity_id: String,
+    pub organization_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillDeviceInternal {
-    pub waybill_device_id: i64,
+    pub waybill_device_id: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub device_serial_no: Option<String>,
@@ -751,12 +755,12 @@ pub struct WaybillDeviceInternal {
     pub is_primary: Option<bool>,
     pub is_uploaded: Option<bool>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub waybill_id: i64,
+    pub waybill_id: String,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct FleetEtmMappingInternal {
-    pub fleet_etm_mapping_id: i64,
+    pub fleet_etm_mapping_id: String,
     pub vehicle_no: String,
     pub gtfs_id: String,
     pub etm_serial_no: String,
@@ -766,7 +770,7 @@ pub struct FleetEtmMappingInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct FleetObuMappingInternal {
-    pub fleet_obu_mapping_id: i64,
+    pub fleet_obu_mapping_id: String,
     pub vehicle_no: String,
     pub gtfs_id: String,
     pub obu_id: String,
@@ -776,7 +780,7 @@ pub struct FleetObuMappingInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillsInternal {
-    pub waybill_id: i64,
+    pub waybill_id: String,
     pub audited_date: Option<chrono::DateTime<chrono::Utc>>,
     pub bag_master: Option<String>,
     pub challan_no: Option<i64>,
@@ -792,7 +796,7 @@ pub struct WaybillsInternal {
     pub device_serial_number: Option<String>,
     pub is_flexi: bool,
     pub no_of_device: i64,
-    pub schedule_id: i64,
+    pub schedule_id: String,
     pub schedule_no: Option<String>,
     pub schedule_trip_name: Option<String>,
     pub schedule_type: Option<String>,
@@ -802,13 +806,34 @@ pub struct WaybillsInternal {
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
     pub waybill_no: Option<String>,
-    pub entity_id: i64,
-    pub schedule_trip_id: i64,
-    pub service_type_id: i64,
-    pub shift_type_id: i64,
+    pub entity_id: String,
+    pub schedule_trip_id: String,
+    pub service_type_id: String,
+    pub shift_type_id: String,
     pub tablet_id: Option<String>,
     pub gtfs_id: String,
 }
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct BusShiftTypeInternal {
+    pub shift_type_id: String,
+    pub shift_type_code: Option<String>,
+    pub description: Option<String>,
+    pub gtfs_id: Option<String>,
+    pub deleted: Option<bool>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct BusScheduleTypeInternal {
+    pub schedule_type_id: String,
+    pub schedule_type_code: Option<String>,
+    pub schedule_type_name: Option<String>,
+    pub deleted: Option<bool>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(untagged)]
 pub enum InternalRow {
@@ -828,6 +853,8 @@ pub enum InternalRow {
     FleetEtmMappingInternal(FleetEtmMappingInternal),
     FleetObuMappingInternal(FleetObuMappingInternal),
     WaybillsInternal(WaybillsInternal),
+    BusShiftTypeInternal(BusShiftTypeInternal),
+    BusScheduleTypeInternal(BusScheduleTypeInternal),
 }
 
 /// Deserialize a raw `row_to_json` value into the correct `InternalRow` variant
@@ -863,6 +890,8 @@ fn row_from_value(table: &str, v: serde_json::Value) -> AppResult<InternalRow> {
         "fleet_etm_mapping_internal" => parse!(FleetEtmMappingInternal, FleetEtmMappingInternal),
         "fleet_obu_mapping_internal" => parse!(FleetObuMappingInternal, FleetObuMappingInternal),
         "waybills_internal" => parse!(WaybillsInternal, WaybillsInternal),
+        "bus_shift_type_internal" => parse!(BusShiftTypeInternal, BusShiftTypeInternal),
+        "bus_schedule_type_internal" => parse!(BusScheduleTypeInternal, BusScheduleTypeInternal),
         other => Err(AppError::Internal(format!("Unknown table: {}", other))),
     }
 }
@@ -923,19 +952,19 @@ pub trait OperatorService: Send + Sync {
     async fn update_waybill_status(
         &self,
         gtfs_id: &str,
-        waybill_id: i64,
+        waybill_id: String,
         status: &str,
     ) -> AppResult<u64>;
     async fn update_waybill_fleet_number(
         &self,
         gtfs_id: &str,
-        waybill_id: i64,
+        waybill_id: String,
         fleet_no: &str,
     ) -> AppResult<u64>;
     async fn update_waybill_tablet_id(
         &self,
         gtfs_id: &str,
-        waybill_id: i64,
+        waybill_id: String,
         tablet_id: &str,
     ) -> AppResult<u64>;
 
@@ -1070,7 +1099,7 @@ impl OperatorService for MockOperatorService {
     async fn update_waybill_status(
         &self,
         _gtfs_id: &str,
-        _waybill_id: i64,
+        _waybill_id: String,
         _status: &str,
     ) -> AppResult<u64> {
         mock_err!()
@@ -1079,7 +1108,7 @@ impl OperatorService for MockOperatorService {
     async fn update_waybill_fleet_number(
         &self,
         _gtfs_id: &str,
-        _waybill_id: i64,
+        _waybill_id: String,
         _fleet_no: &str,
     ) -> AppResult<u64> {
         mock_err!()
@@ -1088,7 +1117,7 @@ impl OperatorService for MockOperatorService {
     async fn update_waybill_tablet_id(
         &self,
         _gtfs_id: &str,
-        _waybill_id: i64,
+        _waybill_id: String,
         _tablet_id: &str,
     ) -> AppResult<u64> {
         mock_err!()
@@ -1123,7 +1152,7 @@ struct TabletIdsCache {
 
 // Designation cache: gtfs_id → (name(lowercase) → id, loaded_at)
 struct DesignationCache {
-    by_gtfs: HashMap<String, (HashMap<String, i64>, SystemTime)>,
+    by_gtfs: HashMap<String, (HashMap<String, String>, SystemTime)>,
 }
 
 const DEVICE_CACHE_SECS: u64 = 3600; // 1 hour
@@ -1168,7 +1197,7 @@ impl DBOperatorService {
         }
 
         info!("Loading designation cache from DB for gtfs_id={}", gtfs_id);
-        let rows = sqlx::query_as::<_, (i64, String)>(
+        let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT designation_id, LOWER(designation_name) FROM designations_internal WHERE deleted = false AND gtfs_id = $1",
         )
         .bind(gtfs_id)
@@ -1176,7 +1205,7 @@ impl DBOperatorService {
         .await
         .map_err(|e| AppError::DbError(format!("designation cache load: {}", e)))?;
 
-        let map: HashMap<String, i64> = rows.into_iter().map(|(id, name)| (name, id)).collect();
+        let map: HashMap<String, String> = rows.into_iter().map(|(id, name)| (name, id)).collect();
         info!(
             "Designation cache loaded with {} entries for gtfs_id={}",
             map.len(),
@@ -1190,7 +1219,7 @@ impl DBOperatorService {
         Ok(())
     }
 
-    async fn designation_id_for(&self, gtfs_id: &str, role: &str) -> AppResult<i64> {
+    async fn designation_id_for(&self, gtfs_id: &str, role: &str) -> AppResult<String> {
         self.ensure_designation_cache(gtfs_id).await?;
         let cache = self.designation_cache.read().await;
         let map = cache
@@ -1203,7 +1232,7 @@ impl DBOperatorService {
         // Find partial match (e.g. "conductor" matches "conductor", "driver" matches "driver")
         map.iter()
             .find(|(name, _)| name.contains(&search))
-            .map(|(_, id)| *id)
+            .map(|(_, id)| id.clone())
             .ok_or_else(|| {
                 AppError::NotFound(format!(
                     "No designation found for role '{}' in gtfs_id '{}'",
@@ -1428,11 +1457,11 @@ impl OperatorService for DBOperatorService {
         let id = match pk_value {
             Value::Number(n) => n
                 .as_i64()
-                .ok_or_else(|| AppError::BadRequest("ID must be an integer".to_string()))?,
-            Value::String(s) => s
-                .parse::<i64>()
-                .map_err(|_| AppError::BadRequest("ID must be an integer string".to_string()))?,
-            _ => return Err(AppError::BadRequest("ID must be an integer".to_string())),
+                .map(|i| i.to_string())
+                .or_else(|| n.as_f64().map(|f| f.to_string()))
+                .ok_or_else(|| AppError::BadRequest("ID must be a number".to_string()))?,
+            Value::String(s) => s.clone(),
+            _ => return Err(AppError::BadRequest("ID must be a string or number".to_string())),
         };
 
         let sql = format!(
@@ -1441,7 +1470,7 @@ impl OperatorService for DBOperatorService {
         );
 
         let result = sqlx::query(&sql)
-            .bind(id)
+            .bind(&id)
             .bind(gtfs_id)
             .execute(&self.pool)
             .await
@@ -1474,6 +1503,16 @@ impl OperatorService for DBOperatorService {
 
         if arr.is_empty() {
             return Err(AppError::BadRequest("Body is empty".to_string()));
+        }
+
+        // Auto-inject PK with a random ID if missing or null
+        for val in arr.iter_mut() {
+            if let Some(obj) = val.as_object_mut() {
+                let missing = obj.get(pk).map_or(true, |v| v.is_null());
+                if missing {
+                    obj.insert(pk.to_string(), Value::String(field_generator::gen_random_id()));
+                }
+            }
         }
 
         // Apply field regeneration if requested
@@ -1560,7 +1599,14 @@ impl OperatorService for DBOperatorService {
                         }
                     }
                     Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
+                        if col.ends_with("_id") {
+                            // ID columns are text — coerce number to string
+                            if let Some(i) = n.as_i64() {
+                                q = q.bind(i.to_string());
+                            } else if let Some(f) = n.as_f64() {
+                                q = q.bind(f.to_string());
+                            }
+                        } else if let Some(i) = n.as_i64() {
                             q = q.bind(i);
                         } else if let Some(f) = n.as_f64() {
                             q = q.bind(f);
@@ -1823,7 +1869,7 @@ impl OperatorService for DBOperatorService {
     async fn update_waybill_status(
         &self,
         gtfs_id: &str,
-        waybill_id: i64,
+        waybill_id: String,
         status: &str,
     ) -> AppResult<u64> {
         if !waybill_statuses().contains(&status) {
@@ -1835,10 +1881,10 @@ impl OperatorService for DBOperatorService {
         }
 
         // First, get the schedule_trip_id for this waybill
-        let schedule_trip_id: Option<i64> = sqlx::query_scalar(
+        let schedule_trip_id: Option<String> = sqlx::query_scalar(
             "SELECT schedule_trip_id FROM public.waybills_internal WHERE waybill_id = $1 AND gtfs_id = $2",
         )
-        .bind(waybill_id)
+        .bind(&waybill_id)
         .bind(gtfs_id)
         .fetch_optional(&self.pool)
         .await
@@ -1852,7 +1898,7 @@ impl OperatorService for DBOperatorService {
         };
         let result = sqlx::query(query_str)
             .bind(status)
-            .bind(waybill_id)
+            .bind(&waybill_id)
             .bind(gtfs_id)
             .execute(&self.pool)
             .await
@@ -1877,7 +1923,7 @@ impl OperatorService for DBOperatorService {
     async fn update_waybill_fleet_number(
         &self,
         gtfs_id: &str,
-        waybill_id: i64,
+        waybill_id: String,
         fleet_no: &str,
     ) -> AppResult<u64> {
         let result = sqlx::query(
@@ -1896,7 +1942,7 @@ impl OperatorService for DBOperatorService {
     async fn update_waybill_tablet_id(
         &self,
         gtfs_id: &str,
-        waybill_id: i64,
+        waybill_id: String,
         tablet_id: &str,
     ) -> AppResult<u64> {
         let result = sqlx::query(
