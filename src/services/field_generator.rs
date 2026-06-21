@@ -2,6 +2,10 @@ use crate::tools::error::{AppError, AppResult};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub fn gen_random_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 pub fn generate_waybill_number() -> String {
     let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let random_suffix = Uuid::new_v4()

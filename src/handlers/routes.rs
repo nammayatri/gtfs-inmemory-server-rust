@@ -3500,19 +3500,19 @@ pub struct RoleQuery {
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillStatusBody {
-    pub waybill_id: i64,
+    pub waybill_id: String,
     pub status: String,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillFleetBody {
-    pub waybill_id: i64,
+    pub waybill_id: String,
     pub fleet_no: String,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillTabletBody {
-    pub waybill_id: i64,
+    pub waybill_id: String,
     pub tablet_id: String,
 }
 
@@ -3978,7 +3978,7 @@ pub async fn update_waybill_status(
 
     let rows = app_state
         .operator_service
-        .update_waybill_status(&gtfs_id, body.waybill_id, &body.status)
+        .update_waybill_status(&gtfs_id, body.waybill_id.clone(), &body.status)
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({
@@ -4006,7 +4006,7 @@ pub async fn update_waybill_fleet(
 
     let rows = app_state
         .operator_service
-        .update_waybill_fleet_number(&gtfs_id, body.waybill_id, &body.fleet_no)
+        .update_waybill_fleet_number(&gtfs_id, body.waybill_id.clone(), &body.fleet_no)
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({
@@ -4033,7 +4033,7 @@ pub async fn update_waybill_tablet(
 
     let rows = app_state
         .operator_service
-        .update_waybill_tablet_id(&gtfs_id, body.waybill_id, &body.tablet_id)
+        .update_waybill_tablet_id(&gtfs_id, body.waybill_id.clone(), &body.tablet_id)
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({
