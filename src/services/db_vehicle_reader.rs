@@ -279,7 +279,7 @@ impl DBVehicleReader {
             waybills_by_route_cache: Arc::new(RwLock::new(WaybillsByRouteCache {
                 waybills_by_route: HashMap::new(),
             })),
-            waybills_by_route_cache_duration: Duration::from_secs(3600), // 60 minutes TTL
+            waybills_by_route_cache_duration: Duration::from_secs(180), // 3 minutes TTL
             routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache { data: None })),
             routes_served_today_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
         }
