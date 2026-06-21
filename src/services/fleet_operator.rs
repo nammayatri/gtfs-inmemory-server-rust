@@ -26,12 +26,12 @@ pub enum TripAction {
 
 #[derive(Debug, Clone)]
 struct WaybillRow {
-    waybill_id: i64,
+    waybill_id: String,
     waybill_no: String,
     vehicle_no: String,
     conductor_token_no: Option<String>,
     driver_token_no: Option<String>,
-    schedule_trip_id: Option<i64>,
+    schedule_trip_id: Option<String>,
     is_flexi: bool,
     duty_date: Option<String>,
 }
@@ -317,12 +317,12 @@ impl DBFleetOperatorService {
 
         #[allow(clippy::type_complexity)]
         let row: Option<(
-            i64,
+            String,
             String,
             String,
             Option<String>,
             Option<String>,
-            Option<i64>,
+            Option<String>,
             bool,
             Option<String>,
         )> = match anchor {
@@ -411,7 +411,7 @@ impl DBFleetOperatorService {
                   AND trip_type != 'dead-trip'
                 "#,
             )
-            .bind(waybill.waybill_id)
+            .bind(&waybill.waybill_id)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| {
@@ -423,7 +423,7 @@ impl DBFleetOperatorService {
             })?;
             Ok(count)
         } else {
-            let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+            let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                 AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
             })?;
             let count: i64 = sqlx::query_scalar(
@@ -434,7 +434,7 @@ impl DBFleetOperatorService {
                   AND trip_type != 'dead-trip'
                 "#,
             )
-            .bind(schedule_trip_id)
+            .bind(&schedule_trip_id)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| {
@@ -461,7 +461,7 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT
                     trip_number,
-                    route_number_id::text AS route_id,
+                    route_number_id AS route_id,
                     is_active_trip,
                     start_time,
                     end_time
@@ -471,7 +471,7 @@ impl DBFleetOperatorService {
                 ORDER BY trip_number ASC
                 "#,
             )
-            .bind(waybill.waybill_id)
+            .bind(&waybill.waybill_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
@@ -483,14 +483,14 @@ impl DBFleetOperatorService {
             })?;
             Ok(rows)
         } else {
-            let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+            let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                 AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
             })?;
             let rows: Vec<(i32, String, bool, Option<String>, Option<String>)> = sqlx::query_as(
                 r#"
                 SELECT
                     trip_number,
-                    route_number_id::text AS route_id,
+                    route_number_id AS route_id,
                     is_active_trip,
                     start_time,
                     end_time
@@ -500,7 +500,7 @@ impl DBFleetOperatorService {
                 ORDER BY trip_number ASC
                 "#,
             )
-            .bind(schedule_trip_id)
+            .bind(&schedule_trip_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
@@ -528,14 +528,14 @@ impl DBFleetOperatorService {
                 LIMIT 1
                 "#,
             )
-            .bind(waybill.waybill_id)
+            .bind(&waybill.waybill_id)
             .bind(trip_number)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
             r.is_some()
         } else {
-            let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+            let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                 AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
             })?;
             let r: Option<i32> = sqlx::query_scalar(
@@ -548,7 +548,7 @@ impl DBFleetOperatorService {
                 LIMIT 1
                 "#,
             )
-            .bind(schedule_trip_id)
+            .bind(&schedule_trip_id)
             .bind(trip_number)
             .fetch_optional(&self.pool)
             .await
@@ -591,7 +591,7 @@ impl DBFleetOperatorService {
                               AND trip_type != 'dead-trip'
                             "#,
                         )
-                        .bind(waybill.waybill_id)
+                        .bind(&waybill.waybill_id)
                         .bind(trip_number)
                         .bind(ts)
                         .bind(sync_now)
@@ -614,7 +614,7 @@ impl DBFleetOperatorService {
                               AND trip_type != 'dead-trip'
                             "#,
                         )
-                        .bind(waybill.waybill_id)
+                        .bind(&waybill.waybill_id)
                         .bind(trip_number)
                         .execute(&self.pool)
                         .await
@@ -627,7 +627,7 @@ impl DBFleetOperatorService {
                         })?;
                     }
                 } else {
-                    let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+                    let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                         AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
                     })?;
                     if let Some(ts) = timestamp {
@@ -642,7 +642,7 @@ impl DBFleetOperatorService {
                               AND trip_type != 'dead-trip'
                             "#,
                         )
-                        .bind(schedule_trip_id)
+                        .bind(&schedule_trip_id)
                         .bind(trip_number)
                         .bind(ts)
                         .bind(sync_now)
@@ -665,7 +665,7 @@ impl DBFleetOperatorService {
                               AND trip_type != 'dead-trip'
                             "#,
                         )
-                        .bind(schedule_trip_id)
+                        .bind(&schedule_trip_id)
                         .bind(trip_number)
                         .execute(&self.pool)
                         .await
@@ -691,7 +691,7 @@ impl DBFleetOperatorService {
                             WHERE waybill_id = $1
                             "#,
                         )
-                        .bind(waybill.waybill_id)
+                        .bind(&waybill.waybill_id)
                         .bind(ts)
                         .bind(sync_now)
                         .execute(&self.pool)
@@ -711,7 +711,7 @@ impl DBFleetOperatorService {
                             WHERE waybill_id = $1
                             "#,
                         )
-                        .bind(waybill.waybill_id)
+                        .bind(&waybill.waybill_id)
                         .execute(&self.pool)
                         .await
                         .map_err(|e| {
@@ -723,7 +723,7 @@ impl DBFleetOperatorService {
                         })?;
                     }
                 } else {
-                    let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+                    let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                         AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
                     })?;
                     if let Some(ts) = timestamp {
@@ -737,7 +737,7 @@ impl DBFleetOperatorService {
                             WHERE schedule_trip_id = $1
                             "#,
                         )
-                        .bind(schedule_trip_id)
+                        .bind(&schedule_trip_id)
                         .bind(ts)
                         .bind(sync_now)
                         .bind(trip_number)
@@ -759,7 +759,7 @@ impl DBFleetOperatorService {
                             WHERE schedule_trip_id = $1
                             "#,
                         )
-                        .bind(schedule_trip_id)
+                        .bind(&schedule_trip_id)
                         .bind(trip_number)
                         .execute(&self.pool)
                         .await
@@ -783,7 +783,7 @@ impl DBFleetOperatorService {
                         WHERE waybill_id = $1
                         "#,
                     )
-                    .bind(waybill.waybill_id)
+                    .bind(&waybill.waybill_id)
                     .execute(&self.pool)
                     .await
                     .map_err(|e| {
@@ -794,7 +794,7 @@ impl DBFleetOperatorService {
                         AppError::Internal(e.to_string())
                     })?;
                 } else {
-                    let schedule_trip_id = waybill.schedule_trip_id.ok_or_else(|| {
+                    let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                         AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
                     })?;
                     sqlx::query(
@@ -805,7 +805,7 @@ impl DBFleetOperatorService {
                         WHERE schedule_trip_id = $1
                         "#,
                     )
-                    .bind(schedule_trip_id)
+                    .bind(&schedule_trip_id)
                     .execute(&self.pool)
                     .await
                     .map_err(|e| {
@@ -861,7 +861,7 @@ impl DBFleetOperatorService {
         // Batch query for uncached ids (parameterized, no injection risk)
         let placeholders: Vec<String> = (1..=uncached.len()).map(|i| format!("${}", i)).collect();
         let sql = format!(
-            "SELECT route_id::text, route_number, route_name FROM route_internal WHERE route_id::text IN ({})",
+            "SELECT route_id, route_number, route_name FROM route_internal WHERE route_id IN ({})",
             placeholders.join(",")
         );
 
@@ -1185,13 +1185,13 @@ impl FleetOperatorService for DBFleetOperatorService {
         gtfs_id: &str,
         req: &EmployeeRegisterRequest,
     ) -> AppResult<EmployeeRegisterResponse> {
-        let designation_id: Option<i64> = match req.role {
+        let designation_id: Option<String> = match req.role {
             Some(role) => {
                 let name = match role {
                     Role::Driver => "driver",
                     Role::Conductor => "conductor",
                 };
-                let id: Option<i64> = sqlx::query_scalar(
+                let id: Option<String> = sqlx::query_scalar(
                     r#"
                     SELECT designation_id
                     FROM designations_internal
