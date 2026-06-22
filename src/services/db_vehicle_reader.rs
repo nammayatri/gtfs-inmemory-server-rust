@@ -20,8 +20,16 @@ struct DepotCache {
     depot_names: Option<(Vec<String>, SystemTime)>,
     depot_ids: Option<(Vec<String>, SystemTime)>,
     depot_name_by_id: HashMap<String, (String, SystemTime)>,
+    /// gtfs-aware cache of (entity_name, entity_remark) keyed by (gtfs_id, entity_id).
+    depot_info_by_key: HashMap<(String, i64), (DepotInfo, SystemTime)>,
     vehicles_by_depot_name: HashMap<String, (Vec<DepotVehicleSummary>, SystemTime)>,
     vehicles_by_depot_id: HashMap<String, (Vec<DepotVehicleSummary>, SystemTime)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DepotInfo {
+    pub name: String,
+    pub code: Option<String>,
 }
 
 // Vehicle pool cache structure
@@ -69,6 +77,10 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_depot_names(&self) -> AppResult<Vec<String>>;
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
+    /// Resolve depot info (name + code) for a gtfs_id + entity_id pair.
+    /// Reads from `entities` (chennai_bus) or `entities_internal` (others).
+    /// Returns `None` if no row matches.
+    async fn get_depot_info(&self, gtfs_id: &str, entity_id: i64) -> AppResult<Option<DepotInfo>>;
     async fn clear_depot_cache(&self) -> AppResult<()>;
     async fn get_vehicle_operation_data(&self, fleet_no: &str) -> AppResult<VehicleOperationData>;
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool>;
@@ -183,6 +195,13 @@ impl VehicleDataReader for MockDBVehicleReader {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+    async fn get_depot_info(
+        &self,
+        _gtfs_id: &str,
+        _entity_id: i64,
+    ) -> AppResult<Option<DepotInfo>> {
+        Ok(None)
+    }
     async fn clear_depot_cache(&self) -> AppResult<()> {
         Ok(())
     }
@@ -246,6 +265,7 @@ mod tests {
 
 pub struct DBVehicleReader {
     pool: PgPool,
+    internal_pool: Option<PgPool>,
     cache: Arc<RwLock<HashMap<String, (VehicleDataWithRouteId, SystemTime)>>>,
     cache_duration: Duration,
     refresh_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>>,
@@ -260,9 +280,10 @@ pub struct DBVehicleReader {
 }
 
 impl DBVehicleReader {
-    pub fn new(pool: PgPool, config: &AppConfig) -> Self {
+    pub fn new(pool: PgPool, internal_pool: Option<PgPool>, config: &AppConfig) -> Self {
         Self {
             pool,
+            internal_pool,
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_duration: Duration::from_secs(config.cache_duration),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
@@ -270,6 +291,7 @@ impl DBVehicleReader {
                 depot_names: None,
                 depot_ids: None,
                 depot_name_by_id: HashMap::new(),
+                depot_info_by_key: HashMap::new(),
                 vehicles_by_depot_name: HashMap::new(),
                 vehicles_by_depot_id: HashMap::new(),
             })),
@@ -2083,11 +2105,80 @@ impl VehicleDataReader for DBVehicleReader {
         }
     }
 
+    async fn get_depot_info(&self, gtfs_id: &str, entity_id: i64) -> AppResult<Option<DepotInfo>> {
+        // Check cache first
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((info, timestamp)) = cache
+                .depot_info_by_key
+                .get(&(gtfs_id.to_string(), entity_id))
+            {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!(
+                        "Depot info cache HIT for gtfs_id={} entity_id={}",
+                        gtfs_id, entity_id
+                    );
+                    return Ok(Some(info.clone()));
+                }
+            }
+        }
+        debug!(
+            "Depot info cache MISS for gtfs_id={} entity_id={}",
+            gtfs_id, entity_id
+        );
+
+        // Not single-flighted: concurrent first hits for the same (gtfs_id, entity_id)
+        // will all query. Acceptable — depots are few and rarely change.
+        let result: Result<Option<(String, Option<String>)>, sqlx::Error> =
+            if gtfs_id == crate::services::PRIMARY_GTFS_ID {
+                sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT entity_name, entity_remark FROM entities WHERE entity_id = $1",
+                )
+                .bind(entity_id)
+                .fetch_optional(&self.pool)
+                .await
+            } else {
+                let internal_pool = match &self.internal_pool {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT entity_name, entity_remark FROM entities_internal \
+                 WHERE entity_id = $1 AND gtfs_id = $2",
+                )
+                .bind(entity_id)
+                .bind(gtfs_id)
+                .fetch_optional(internal_pool)
+                .await
+            };
+
+        match result {
+            Ok(Some((name, code))) => {
+                let info = DepotInfo { name, code };
+                let mut cache = self.depot_cache.write().await;
+                cache.depot_info_by_key.insert(
+                    (gtfs_id.to_string(), entity_id),
+                    (info.clone(), SystemTime::now()),
+                );
+                Ok(Some(info))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                error!(
+                    "get_depot_info query failed for gtfs_id={} entity_id={}: {}",
+                    gtfs_id, entity_id, e
+                );
+                Err(AppError::Internal(format!("get_depot_info: {}", e)))
+            }
+        }
+    }
+
     async fn clear_depot_cache(&self) -> AppResult<()> {
         let mut cache = self.depot_cache.write().await;
         cache.depot_names = None;
         cache.depot_ids = None;
         cache.depot_name_by_id.clear();
+        cache.depot_info_by_key.clear();
         cache.vehicles_by_depot_name.clear();
         cache.vehicles_by_depot_id.clear();
         info!("Depot cache cleared successfully");

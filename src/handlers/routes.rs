@@ -4235,25 +4235,36 @@ pub async fn fleet_operator_verify(
     Ok(HttpResponse::Ok().json(response))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EmployeeLoginQuery {
+    #[serde(rename = "withMetadata")]
+    pub with_metadata: Option<bool>,
+}
+
 #[utoipa::path(
     post,
     path = "/internal/fleet-operator/{gtfs_id}/employee/login",
     tag = "Fleet Operator",
-    params(("gtfs_id" = String, Path, description = "GTFS dataset identifier")),
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS dataset identifier"),
+        ("withMetadata" = Option<bool>, Query, description = "Include employee metadata (name, depot) in the response"),
+    ),
     request_body = EmployeeLoginRequest,
     responses((status = 200, description = "Login response", body = EmployeeLoginResponse))
 )]
 pub async fn fleet_operator_employee_login(
     app_state: Data<AppState>,
     path: Path<String>,
+    query: Query<EmployeeLoginQuery>,
     body: Json<EmployeeLoginRequest>,
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let req = body.into_inner();
+    let with_metadata = query.with_metadata.unwrap_or(false);
 
     let response = app_state
         .fleet_operator_service
-        .login(&gtfs_id, &req)
+        .login(&gtfs_id, &req, with_metadata)
         .await?;
 
     Ok(HttpResponse::Ok().json(response))

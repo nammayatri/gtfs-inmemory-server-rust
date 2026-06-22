@@ -125,6 +125,8 @@ use crate::services::operator::QueryBody;
         models::NandiPattern,
         models::NandiPatternDetails,
         models::MinimalEmployee,
+        models::EmployeeMetadata,
+        crate::services::fleet_operator::EmployeeLoginError,
         routes::GetAllRoutesByIdsRequest,
         routes::GetAllStopsByIdsRequest,
         routes::GetAllRouteStopMappingsByRouteCodesRequest,
