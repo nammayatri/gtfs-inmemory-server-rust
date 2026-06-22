@@ -205,7 +205,7 @@ impl GTFSService {
                 if !already_visited.insert(base_url.to_string()) {
                     continue;
                 }
-    
+
                 let patterns = self.fetch_patterns(base_url).await?;
                 let pattern_details = self
                     .fetch_pattern_details_batch(base_url, &patterns)
@@ -309,14 +309,21 @@ impl GTFSService {
         } else {
             // For preprocessed feeds, build example trip map from patterns (no GraphQL)
             let (preprocessed_trip_map, preprocessed_trip_details) =
-                Self::build_example_trip_from_patterns(&all_pattern_details, &preprocessed_gtfs_ids);
+                Self::build_example_trip_from_patterns(
+                    &all_pattern_details,
+                    &preprocessed_gtfs_ids,
+                );
 
             let mut trip_map = preprocessed_trip_map;
 
             // Still fetch from Nandi for non-preprocessed feeds
-            if self.config.otp_instances.get_all_instances().iter().any(|inst| {
-                !preprocessed_gtfs_ids.contains(&inst.identifier)
-            }) {
+            if self
+                .config
+                .otp_instances
+                .get_all_instances()
+                .iter()
+                .any(|inst| !preprocessed_gtfs_ids.contains(&inst.identifier))
+            {
                 match self.fetch_route_example_trip_for_all_feeds().await {
                     Ok(api_trips) => {
                         for (gtfs_id, trips) in api_trips {
@@ -415,13 +422,11 @@ impl GTFSService {
         // Load routes.json
         let routes_path = dir.join("routes.json");
         if routes_path.exists() {
-            let json = tokio::fs::read_to_string(&routes_path).await.map_err(|e| {
-                AppError::Internal(format!("Failed to read routes.json: {}", e))
-            })?;
-            let routes_by_gtfs: HashMap<String, Vec<NandiRoutesRes>> =
-                serde_json::from_str(&json).map_err(|e| {
-                    AppError::Internal(format!("Failed to parse routes.json: {}", e))
-                })?;
+            let json = tokio::fs::read_to_string(&routes_path)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to read routes.json: {}", e)))?;
+            let routes_by_gtfs: HashMap<String, Vec<NandiRoutesRes>> = serde_json::from_str(&json)
+                .map_err(|e| AppError::Internal(format!("Failed to parse routes.json: {}", e)))?;
             for (gtfs_id, routes) in routes_by_gtfs {
                 loaded_gtfs_ids.insert(gtfs_id.clone());
                 info!(
@@ -438,13 +443,11 @@ impl GTFSService {
         // Load stops.json
         let stops_path = dir.join("stops.json");
         if stops_path.exists() {
-            let json = tokio::fs::read_to_string(&stops_path).await.map_err(|e| {
-                AppError::Internal(format!("Failed to read stops.json: {}", e))
-            })?;
-            let stops_by_gtfs: HashMap<String, Vec<GTFSStop>> =
-                serde_json::from_str(&json).map_err(|e| {
-                    AppError::Internal(format!("Failed to parse stops.json: {}", e))
-                })?;
+            let json = tokio::fs::read_to_string(&stops_path)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to read stops.json: {}", e)))?;
+            let stops_by_gtfs: HashMap<String, Vec<GTFSStop>> = serde_json::from_str(&json)
+                .map_err(|e| AppError::Internal(format!("Failed to parse stops.json: {}", e)))?;
             for (gtfs_id, stops) in stops_by_gtfs {
                 loaded_gtfs_ids.insert(gtfs_id.clone());
                 info!(
@@ -463,9 +466,7 @@ impl GTFSService {
         if patterns_path.exists() {
             let json = tokio::fs::read_to_string(&patterns_path)
                 .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to read patterns.json: {}", e))
-                })?;
+                .map_err(|e| AppError::Internal(format!("Failed to read patterns.json: {}", e)))?;
             let patterns_by_gtfs: HashMap<String, Vec<NandiPatternDetails>> =
                 serde_json::from_str(&json).map_err(|e| {
                     AppError::Internal(format!("Failed to parse patterns.json: {}", e))
@@ -482,7 +483,6 @@ impl GTFSService {
         } else {
             warn!("patterns.json not found in {}", preprocessed_dir);
         }
-
 
         let missing_feeds: Vec<&String> = manifest
             .gtfs_feeds
@@ -507,7 +507,6 @@ impl GTFSService {
 
         Ok((all_routes, all_patterns, all_stops, loaded_gtfs_ids))
     }
-
 
     async fn verify_preprocessed_manifest(
         &self,
@@ -989,7 +988,9 @@ impl GTFSService {
                 long_name: route.long_name,
                 mode: cast_vehicle_type(&route.mode),
                 agency_name: route.agency_name,
-                trip_count: route.trip_count.or_else(|| trip_counts.get(route_code).copied()),
+                trip_count: route
+                    .trip_count
+                    .or_else(|| trip_counts.get(route_code).copied()),
                 stop_count: route.stop_count.or_else(|| {
                     stop_counts
                         .get(gtfs_id)
@@ -1128,7 +1129,6 @@ impl GTFSService {
                     .or_default()
                     .insert(stop_code.to_string());
             }
-
 
             // A station and its child platforms share one stop_code. Keep the
             // entry that carries a station_id (a child pointing at its parent)
