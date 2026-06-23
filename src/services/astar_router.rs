@@ -4,7 +4,6 @@
 /// optimal path between two metro stops. Supports both:
 /// - Time-independent routing (uses minimum edge weights)
 /// - Time-dependent routing (uses scheduled departure times)
-
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -71,12 +70,12 @@ pub fn find_shortest_path(
     departure_time: Option<i32>,
 ) -> AppResult<MetroRouteResult> {
     // Validate inputs
-    let from_node = graph.get_node(from_stop_id).ok_or_else(|| {
-        AppError::NotFound(format!("Source stop not found: {}", from_stop_id))
-    })?;
-    let to_node = graph.get_node(to_stop_id).ok_or_else(|| {
-        AppError::NotFound(format!("Destination stop not found: {}", to_stop_id))
-    })?;
+    let from_node = graph
+        .get_node(from_stop_id)
+        .ok_or_else(|| AppError::NotFound(format!("Source stop not found: {}", from_stop_id)))?;
+    let to_node = graph
+        .get_node(to_stop_id)
+        .ok_or_else(|| AppError::NotFound(format!("Destination stop not found: {}", to_stop_id)))?;
 
     if from_stop_id == to_stop_id {
         return Ok(MetroRouteResult {
@@ -133,12 +132,7 @@ pub fn find_shortest_path(
         // Goal check
         if current_stop == to_stop_id {
             // Reconstruct path
-            return reconstruct_path(
-                graph,
-                from_stop_id,
-                to_stop_id,
-                &predecessors,
-            );
+            return reconstruct_path(graph, from_stop_id, to_stop_id, &predecessors);
         }
 
         // Skip if already processed
@@ -167,7 +161,8 @@ pub fn find_shortest_path(
                     match MetroGraph::next_departure(edge, ct) {
                         Some(schedule) => {
                             let wait_time = (schedule.departure_time - ct).max(0);
-                            let total_time = wait_time + (schedule.arrival_time - schedule.departure_time).max(0);
+                            let total_time = wait_time
+                                + (schedule.arrival_time - schedule.departure_time).max(0);
                             (
                                 total_time as i64,
                                 Some(schedule.departure_time),
@@ -177,11 +172,7 @@ pub fn find_shortest_path(
                         None => {
                             // No more departures today, use min travel time as fallback
                             let arrival = ct + edge.min_travel_time_secs;
-                            (
-                                edge.min_travel_time_secs as i64,
-                                Some(ct),
-                                Some(arrival),
-                            )
+                            (edge.min_travel_time_secs as i64, Some(ct), Some(arrival))
                         }
                     }
                 }
@@ -214,8 +205,7 @@ pub fn find_shortest_path(
 
                 // Calculate heuristic for neighbor
                 if let Some(neighbor_node) = graph.get_node(&edge.to_stop_id) {
-                    let h =
-                        heuristic(neighbor_node.lat, neighbor_node.lon, dest_lat, dest_lon);
+                    let h = heuristic(neighbor_node.lat, neighbor_node.lon, dest_lat, dest_lon);
                     open_set.push(Reverse(AStarNode {
                         f_score: tentative_g + h,
                         _g_score: tentative_g,

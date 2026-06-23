@@ -1122,7 +1122,6 @@ pub async fn get_cluster_destinations(
     Ok(HttpResponse::Ok().json(destinations))
 }
 
-
 #[utoipa::path(
     get,
     path = "/routes/{gtfs_id}/fuzzy/{query}",
@@ -3028,8 +3027,7 @@ pub async fn get_bus_route_schedule(
 
         // Fetch from external tables unless the query forces internal-only
         // or the gtfs_id is listed as internal-only.
-        let fetch_external =
-            !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let fetch_external = !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         if fetch_external {
             let mut ext_rows = app_state
                 .db_vehicle_reader
@@ -3040,8 +3038,7 @@ pub async fn get_bus_route_schedule(
 
         // Fetch from internal tables unless the query forces external-only
         // or the gtfs_id is listed as external-only.
-        let fetch_internal =
-            !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let fetch_internal = !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         if fetch_internal {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
@@ -4299,25 +4296,36 @@ pub async fn fleet_operator_verify(
     Ok(HttpResponse::Ok().json(response))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EmployeeLoginQuery {
+    #[serde(rename = "withMetadata")]
+    pub with_metadata: Option<bool>,
+}
+
 #[utoipa::path(
     post,
     path = "/internal/fleet-operator/{gtfs_id}/employee/login",
     tag = "Fleet Operator",
-    params(("gtfs_id" = String, Path, description = "GTFS dataset identifier")),
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS dataset identifier"),
+        ("withMetadata" = Option<bool>, Query, description = "Include employee metadata (name, depot) in the response"),
+    ),
     request_body = EmployeeLoginRequest,
     responses((status = 200, description = "Login response", body = EmployeeLoginResponse))
 )]
 pub async fn fleet_operator_employee_login(
     app_state: Data<AppState>,
     path: Path<String>,
+    query: Query<EmployeeLoginQuery>,
     body: Json<EmployeeLoginRequest>,
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     let req = body.into_inner();
+    let with_metadata = query.with_metadata.unwrap_or(false);
 
     let response = app_state
         .fleet_operator_service
-        .login(&gtfs_id, &req)
+        .login(&gtfs_id, &req, with_metadata)
         .await?;
 
     Ok(HttpResponse::Ok().json(response))
@@ -4376,16 +4384,13 @@ async fn metro_route_plan(
     let gtfs_id = path.into_inner();
     let params = query.into_inner();
 
-    let graph = app_state
-        .metro_graphs
-        .get(&gtfs_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No metro graph found for gtfs_id: {}. Available: {:?}",
-                gtfs_id,
-                app_state.metro_graphs.keys().collect::<Vec<_>>()
-            ))
-        })?;
+    let graph = app_state.metro_graphs.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "No metro graph found for gtfs_id: {}. Available: {:?}",
+            gtfs_id,
+            app_state.metro_graphs.keys().collect::<Vec<_>>()
+        ))
+    })?;
 
     let departure_time = params
         .departure_time
@@ -4414,15 +4419,9 @@ async fn metro_nearby_stops(
     let params = query.into_inner();
     let radius = params.radius_m.unwrap_or(1000.0);
 
-    let graph = app_state
-        .metro_graphs
-        .get(&gtfs_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No metro graph found for gtfs_id: {}",
-                gtfs_id
-            ))
-        })?;
+    let graph = app_state.metro_graphs.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!("No metro graph found for gtfs_id: {}", gtfs_id))
+    })?;
 
     let nearby = graph.find_nearby_stops(params.lat, params.lon, radius);
 
@@ -4430,10 +4429,7 @@ async fn metro_nearby_stops(
         .iter()
         .map(|node| {
             let dist = crate::services::metro_graph::haversine_distance_meters(
-                params.lat,
-                params.lon,
-                node.lat,
-                node.lon,
+                params.lat, params.lon, node.lat, node.lon,
             );
             serde_json::json!({
                 "stopId": node.stop_id,
@@ -4458,15 +4454,9 @@ async fn metro_graph_info(
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
 
-    let graph = app_state
-        .metro_graphs
-        .get(&gtfs_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No metro graph found for gtfs_id: {}",
-                gtfs_id
-            ))
-        })?;
+    let graph = app_state.metro_graphs.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!("No metro graph found for gtfs_id: {}", gtfs_id))
+    })?;
 
     let total_edges: usize = graph.adjacency.values().map(|v| v.len()).sum();
     let transfer_edges: usize = graph
