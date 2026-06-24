@@ -88,6 +88,10 @@ pub struct AppConfig {
     pub osrtc_secret_key: Option<String>,
     pub osrtc_station_refresh_interval_hours: u64,
     pub osrtc_feed_key: Option<String>,
+    /// Base URL of an OSRM server (e.g. "http://localhost:5050") used to compute
+    /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
+    #[serde(default)]
+    pub osrm_url: Option<String>,
 }
 
 fn default_preprocessed_data_dir() -> String {
@@ -213,7 +217,7 @@ impl AppState {
                                 Ok(internal_pool) => {
                                     info!("Internal database pool created successfully.");
                                     (
-                                        Arc::new(DBOperatorService::new(internal_pool.clone())),
+                                        Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone())),
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
                                         )),
@@ -293,7 +297,7 @@ impl AppState {
                             anyhow::anyhow!("Failed to create internal database pool: {}", e)
                         })?;
                     (
-                        Arc::new(DBOperatorService::new(internal_pool.clone())),
+                        Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone())),
                         Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
                         Arc::new(DBFleetOperatorService::new(internal_pool.clone())),
                         Some(internal_pool),
