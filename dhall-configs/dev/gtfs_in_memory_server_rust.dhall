@@ -1,4 +1,4 @@
-clet LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
+let LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
 
 let logger_cfg = {
     level = LogLevel.INFO,
@@ -69,5 +69,8 @@ in {
 
     -- Preprocessed data configuration
   use_preprocessed_data = False,
-  preprocessed_data_dir = "./assets"
+  preprocessed_data_dir = "./assets",
+
+  -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
+  osrm_url = Some "http://localhost:5050"
 }

@@ -166,7 +166,7 @@ pub struct VehicleDataWithRouteId {
     pub conductor_code: Option<String>,
     pub deleted: Option<bool>,
     pub status: Option<String>,
-    pub schedule_details: Option<HashMap<i64, Vec<BusSchedule>>>,
+    pub schedule_details: Option<HashMap<String, Vec<BusSchedule>>>,
     pub db_start_time: Option<String>,
     pub db_end_time: Option<String>,
     #[sqlx(default)]
@@ -210,7 +210,7 @@ pub struct BusSchedule {
     #[sqlx(default)]
     pub is_active_trip: Option<bool>,
     #[serde(rename = "scheduleTripId")]
-    pub schedule_trip_id: Option<i64>,
+    pub schedule_trip_id: Option<String>,
     #[serde(rename = "startTime")]
     pub start_time: Option<String>,
     #[serde(rename = "endTime")]
