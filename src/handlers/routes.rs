@@ -18,7 +18,7 @@ use chrono::Timelike;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
@@ -31,6 +31,10 @@ use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
+use actix_web::web::Bytes;
+use async_stream::stream as async_stream;
+use futures::StreamExt;
+
 use crate::{
     models::LatLong,
     tools::error::{AppError, AppResult},
@@ -123,7 +127,21 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/waybill/fleet", web::post().to(update_waybill_fleet))
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
                     .route("/waybills", web::get().to(get_waybills))
-                    .route("/station-eta/upsert", web::post().to(upsert_station_eta)),
+                    .route("/station-eta/upsert", web::post().to(upsert_station_eta))
+                    // stop & route management (clubber / editor)
+                    .route("/stops/search", web::get().to(search_stops))
+                    .route("/stops/nearby", web::get().to(nearby_stops))
+                    .route("/stops/bulk-replace", web::post().to(bulk_replace_stops))
+                    .route("/routes/reprocess", web::post().to(reprocess_routes))
+                    .route("/routes/{route_id}/stops", web::get().to(get_route_stops))
+                    .route(
+                        "/routes/{route_id}/stops/insert",
+                        web::post().to(insert_route_stop),
+                    )
+                    .route(
+                        "/export/route-stop-mapping",
+                        web::get().to(export_route_stop_mapping),
+                    ),
             )
             .service(
                 web::scope("internal/fleet-operator/{gtfs_id}")
@@ -3665,6 +3683,222 @@ pub async fn get_operator_routes(
     Ok(HttpResponse::Ok().json(list))
 }
 
+// ===== Stop & route management (clubber / editor) =====
+
+#[derive(Debug, Deserialize)]
+pub struct StopSearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+    #[serde(rename = "withRoutes")]
+    pub with_routes: Option<bool>,
+}
+
+/// GET /internal/operator/{gtfs_id}/stops/search
+pub async fn search_stops(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<StopSearchQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    let res = app_state
+        .operator_service
+        .search_stops(&gtfs_id, &query.q, limit, query.with_routes.unwrap_or(false))
+        .await?;
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NearbyQuery {
+    pub lat: f64,
+    pub lon: f64,
+    pub radius: Option<f64>,
+    pub limit: Option<i64>,
+    #[serde(rename = "withRoutes")]
+    pub with_routes: Option<bool>,
+}
+
+/// GET /internal/operator/{gtfs_id}/stops/nearby
+pub async fn nearby_stops(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<NearbyQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let radius = query.radius.unwrap_or(500.0);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let res = app_state
+        .operator_service
+        .nearby_stops(
+            &gtfs_id,
+            query.lat,
+            query.lon,
+            radius,
+            limit,
+            query.with_routes.unwrap_or(false),
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkReplaceBody {
+    pub from: Vec<String>,
+    pub to: String,
+}
+
+/// POST /internal/operator/{gtfs_id}/stops/bulk-replace
+pub async fn bulk_replace_stops(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<BulkReplaceBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let body = body.into_inner();
+    let res = app_state
+        .operator_service
+        .bulk_replace_stops(&gtfs_id, &body.from, &body.to)
+        .await?;
+    Ok(HttpResponse::Ok().json(res))
+}
+
+/// GET /internal/operator/{gtfs_id}/routes/{route_id}/stops
+pub async fn get_route_stops(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let res = app_state
+        .operator_service
+        .get_route_stops(&gtfs_id, &route_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(res))
+}
+
+/// POST /internal/operator/{gtfs_id}/routes/{route_id}/stops/insert
+pub async fn insert_route_stop(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    body: Json<Value>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, route_id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let data = body.into_inner();
+    let position = data
+        .get("position")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| AppError::BadRequest("position is required".to_string()))?;
+    if position < 1 {
+        return Err(AppError::BadRequest("position must be >= 1".to_string()));
+    }
+    let res = app_state
+        .operator_service
+        .insert_route_stop(&gtfs_id, &route_id, position, data)
+        .await?;
+    if let Err(e) = app_state
+        .operator_service
+        .reprocess_routes(&gtfs_id, &[route_id.clone()], false)
+        .await
+    {
+        warn!(
+            "insert_route_stop: stop inserted (route={}, gtfs={}) but reprocess failed — stage_no may be stale, trigger reprocess manually: {}",
+            route_id, gtfs_id, e
+        );
+    }
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReprocessBody {
+    #[serde(rename = "routeIds")]
+    pub route_ids: Vec<String>,
+    #[serde(rename = "recomputePolyline")]
+    pub recompute_polyline: Option<bool>,
+}
+
+/// POST /internal/operator/{gtfs_id}/routes/reprocess
+pub async fn reprocess_routes(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<ReprocessBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let body = body.into_inner();
+    let res = app_state
+        .operator_service
+        .reprocess_routes(&gtfs_id, &body.route_ids, body.recompute_polyline.unwrap_or(false))
+        .await?;
+    Ok(HttpResponse::Ok().json(res))
+}
+
+/// GET /internal/operator/{gtfs_id}/export/route-stop-mapping
+/// Streams a JSON array row-by-row — never materialises the full result set in memory.
+pub async fn export_route_stop_mapping(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    if let Some(pool) = app_state.operator_service.pool() {
+        let pool = pool.clone();
+        let gtfs_id = gtfs_id.clone();
+        let sql = "SELECT row_to_json(t) FROM ( \
+               SELECT rp.route_id AS \"routeId\", r.route_number AS \"routeNumber\", \
+                 rp.bus_stop_id AS \"stopId\", s.bus_stop_name AS \"stopName\", \
+                 s.latitude_current AS latitude, s.longitude_current AS longitude, \
+                 rp.stop_type AS \"stopType\", rp.stage_no AS \"stageNo\", \
+                 rp.route_order AS \"stopSequence\", rp.stage_name AS \"stageName\", \
+                 rp.route_id AS \"providerId\" \
+               FROM route_point_internal rp \
+               JOIN route_internal r ON r.route_id = rp.route_id AND r.gtfs_id = rp.gtfs_id AND r.deleted=false \
+               LEFT JOIN stop_internal s ON s.bus_stop_id = rp.bus_stop_id AND s.gtfs_id = rp.gtfs_id AND s.deleted=false \
+               WHERE rp.gtfs_id=$1 AND rp.deleted=false \
+               ORDER BY rp.route_id, rp.route_order \
+             ) t";
+        let stream = async_stream! {
+            let mut row_stream = sqlx::query_scalar::<_, serde_json::Value>(sql)
+                .bind(gtfs_id)
+                .fetch(&pool);
+            let mut first = true;
+            yield Ok::<Bytes, actix_web::Error>(Bytes::from("["));
+            while let Some(result) = row_stream.next().await {
+                match result {
+                    Ok(val) => {
+                        let chunk = if first {
+                            first = false;
+                            val.to_string()
+                        } else {
+                            format!(",{}", val)
+                        };
+                        yield Ok(Bytes::from(chunk));
+                    }
+                    Err(e) => {
+                        yield Err(actix_web::error::ErrorInternalServerError(e));
+                        return;
+                    }
+                }
+            }
+            yield Ok(Bytes::from("]"));
+        };
+        Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .streaming(stream))
+    } else {
+        // Mock service path: fall back to buffered response
+        let rows = app_state
+            .operator_service
+            .export_route_stop_mapping(&gtfs_id)
+            .await?;
+        Ok(HttpResponse::Ok().json(rows))
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/internal/operator/{gtfs_id}/depots",
@@ -4176,9 +4410,10 @@ pub async fn fleet_operator_trip_action(
         "start" => TripAction::Start,
         "end" => TripAction::End,
         "reset" => TripAction::Reset,
+        "rollback" => TripAction::Rollback,
         other => {
             return Err(AppError::BadRequest(format!(
-                "Invalid action '{}'. Must be 'start', 'end', or 'reset'.",
+                "Invalid action '{}'. Must be 'start', 'end', 'reset', or 'rollback'.",
                 other
             )))
         }
@@ -4188,7 +4423,7 @@ pub async fn fleet_operator_trip_action(
         TripAction::Reset => 0,
         _ => req.trip_number.ok_or_else(|| {
             AppError::BadRequest(
-                "trip_number is required for 'start' and 'end' actions.".to_string(),
+                "trip_number is required for 'start', 'end', and 'rollback' actions.".to_string(),
             )
         })?,
     };
