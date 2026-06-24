@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::services::field_generator;
 use crate::tools::error::{AppError, AppResult};
@@ -93,6 +93,9 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "point_status",
             "route_order",
             "stage_no",
+            "stage_name",
+            "stop_type",
+            "is_visible",
             "sub_stage",
             "travel_distance",
             "travel_time",
@@ -161,6 +164,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "trip_start_time",
             "sync_end_time",
             "sync_start_time",
+            "status",
             "gtfs_id",
         ]),
         "bus_schedule_trip_flexi_internal" => Some(&[
@@ -219,6 +223,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "longitude_current",
             "route_status",
             "status",
+            "source",
             "stop_direction",
             "stop_group_id",
             "stop_type_id",
@@ -357,6 +362,24 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "tablet_id",
             "gtfs_id",
         ]),
+        "bus_shift_type_internal" => Some(&[
+            "shift_type_id",
+            "shift_type_code",
+            "description",
+            "gtfs_id",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
+        "bus_schedule_type_internal" => Some(&[
+            "schedule_type_id",
+            "schedule_type_code",
+            "schedule_type_name",
+            "gtfs_id",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
         _ => None,
     }
 }
@@ -460,6 +483,241 @@ pub struct RouteRow {
     pub encoded_polyline: Option<String>,
 }
 
+// ===== Stop & route management (clubber / editor) =====
+
+/// Route point stop types. String values match the `stop_type` column / downstream script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopType {
+    StageStop,
+    IntermediateStop,
+    RouteCorrection,
+}
+
+impl StopType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopType::StageStop => "STAGE STOP",
+            StopType::IntermediateStop => "INTERMEDIATE STOP",
+            StopType::RouteCorrection => "ROUTE CORRECTION",
+        }
+    }
+
+    /// Parse a `stop_type` value; anything not recognised defaults to INTERMEDIATE STOP.
+    pub fn from_opt(s: Option<&str>) -> StopType {
+        match s.map(|x| x.trim().to_uppercase()).as_deref() {
+            Some("STAGE STOP") => StopType::StageStop,
+            Some("ROUTE CORRECTION") => StopType::RouteCorrection,
+            _ => StopType::IntermediateStop,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct StopRouteRef {
+    pub route_id: String,
+    pub route_number: Option<String>,
+}
+
+/// A stop enriched with route count / passing routes / source. Used by search & nearby.
+#[derive(Debug, serde::Serialize)]
+pub struct EnrichedStop {
+    pub stop_id: String,
+    pub code: Option<String>,
+    pub name: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    pub source: Option<String>,
+    pub status: Option<String>,
+    pub route_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<StopRouteRef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_m: Option<f64>,
+}
+
+/// One stop within a route, joined with stop details (route stops editor + single-route export).
+#[derive(Debug, serde::Serialize)]
+pub struct RouteStopDetail {
+    pub route_point_id: String,
+    pub bus_stop_id: String,
+    pub stop_name: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    pub route_order: i64,
+    pub stage_no: Option<i64>,
+    pub stage_name: Option<String>,
+    pub stop_type: Option<String>,
+    pub is_visible: Option<bool>,
+    pub travel_distance: Option<i64>,
+    pub travel_time: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RouteStopsResponse {
+    pub route_id: String,
+    pub route_number: Option<String>,
+    pub route_name: Option<String>,
+    pub encoded_polyline: Option<String>,
+    pub stops: Vec<RouteStopDetail>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BulkReplaceResult {
+    pub rows_affected: u64,
+    pub affected_route_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ReprocessResult {
+    pub route_id: String,
+    pub stops_renumbered: i64,
+    pub stages: i64,
+    pub route_name: Option<String>,
+    pub polyline: Option<String>,
+}
+
+// ----- private FromRow helpers for the SQL above -----
+
+#[derive(sqlx::FromRow)]
+struct EnrichedStopRow {
+    bus_stop_id: String,
+    bus_stop_code: Option<String>,
+    bus_stop_name: Option<String>,
+    latitude_current: f64,
+    longitude_current: f64,
+    source: Option<String>,
+    status: Option<String>,
+    route_count: i64,
+    distance_m: Option<f64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct StopRouteJoinRow {
+    bus_stop_id: String,
+    route_id: String,
+    route_number: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RouteStopJoinRow {
+    route_points_id: String,
+    bus_stop_id: String,
+    stop_name: Option<String>,
+    lat: f64,
+    lon: f64,
+    route_order: i64,
+    stage_no: Option<i64>,
+    stage_name: Option<String>,
+    stop_type: Option<String>,
+    is_visible: Option<bool>,
+    travel_distance: Option<i64>,
+    travel_time: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReprocessPointRow {
+    route_points_id: String,
+    stop_type: Option<String>,
+    stop_name: Option<String>,
+    lat: f64,
+    lon: f64,
+}
+
+/// Attach the passing-routes list (when `with_routes`) to a set of enriched-stop rows.
+async fn enrich_stops(
+    pool: &PgPool,
+    gtfs_id: &str,
+    rows: Vec<EnrichedStopRow>,
+    with_routes: bool,
+) -> AppResult<Vec<EnrichedStop>> {
+    let routes_map: HashMap<String, Vec<StopRouteRef>> = if with_routes && !rows.is_empty() {
+        let ids: Vec<String> = rows.iter().map(|r| r.bus_stop_id.clone()).collect();
+        let jr = sqlx::query_as::<_, StopRouteJoinRow>(
+            "SELECT DISTINCT rp.bus_stop_id, rp.route_id, r.route_number \
+             FROM route_point_internal rp \
+             JOIN route_internal r ON r.route_id = rp.route_id AND r.gtfs_id = rp.gtfs_id AND r.deleted = false \
+             WHERE rp.gtfs_id = $1 AND rp.deleted = false AND rp.bus_stop_id = ANY($2)",
+        )
+        .bind(gtfs_id)
+        .bind(&ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("enrich_stops routes: {}", e)))?;
+        let mut m: HashMap<String, Vec<StopRouteRef>> = HashMap::new();
+        for row in jr {
+            m.entry(row.bus_stop_id).or_default().push(StopRouteRef {
+                route_id: row.route_id,
+                route_number: row.route_number,
+            });
+        }
+        m
+    } else {
+        HashMap::new()
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let routes = if with_routes {
+                Some(routes_map.get(&r.bus_stop_id).cloned().unwrap_or_default())
+            } else {
+                None
+            };
+            EnrichedStop {
+                stop_id: r.bus_stop_id,
+                code: r.bus_stop_code,
+                name: r.bus_stop_name,
+                lat: r.latitude_current,
+                lon: r.longitude_current,
+                source: r.source,
+                status: r.status,
+                route_count: r.route_count,
+                routes,
+                distance_m: r.distance_m,
+            }
+        })
+        .collect())
+}
+
+/// Call OSRM `/route` with all stop coords (lat, lon) → (encoded polyline, per-leg (distance_m, duration_s)).
+/// Returns None if `base` is None/empty, fewer than 2 coords, or any request/parse error.
+async fn osrm_route(base: Option<&str>, coords: &[(f64, f64)]) -> Option<(String, Vec<(f64, f64)>)> {
+    let base = base.filter(|s| !s.is_empty())?;
+    if coords.len() < 2 {
+        return None;
+    }
+    let coord_str = coords
+        .iter()
+        .map(|(lat, lon)| format!("{},{}", lon, lat))
+        .collect::<Vec<_>>()
+        .join(";");
+    let url = format!(
+        "{}/route/v1/driving/{}?overview=full&geometries=polyline&annotations=distance,duration",
+        base.trim_end_matches('/'),
+        coord_str
+    );
+    let json: serde_json::Value =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            reqwest::get(&url).await?.json::<serde_json::Value>().await
+        })
+        .await
+        .ok()?
+        .ok()?;
+    let route0 = json.get("routes")?.as_array()?.first()?;
+    let geometry = route0.get("geometry")?.as_str()?.to_string();
+    let legs = route0
+        .get("legs")?
+        .as_array()?
+        .iter()
+        .map(|l| {
+            let d = l.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let t = l.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            (d, t)
+        })
+        .collect();
+    Some((geometry, legs))
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct DepotRow {
     pub entity_id: String,
@@ -535,8 +793,11 @@ pub struct RoutePointInternal {
     pub point_status: Option<String>,
     pub route_order: i64,
     pub stage_no: Option<i64>,
+    pub stage_name: Option<String>,
+    pub stop_type: Option<String>,
+    pub is_visible: Option<bool>,
     pub sub_stage: Option<String>,
-    pub travel_distance: i64,
+    pub travel_distance: Option<i64>,
     pub travel_time: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub bus_stop_id: String,
@@ -602,11 +863,13 @@ pub struct BusScheduleTripDetailInternal {
     pub route_number_id: String,
     pub schedule_trip_id: String,
     pub is_active_trip: bool,
-    pub trip_end_time: Option<String>,
-    pub trip_start_time: Option<String>,
-    pub sync_end_time: Option<String>,
-    pub sync_start_time: Option<String>,
+    pub is_completed: bool,
+    pub trip_end_time: Option<i64>,
+    pub trip_start_time: Option<i64>,
+    pub sync_end_time: Option<i64>,
+    pub sync_start_time: Option<i64>,
     pub gtfs_id: String,
+    pub status: Option<String>,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripFlexiInternal {
@@ -667,6 +930,7 @@ pub struct StopInternal {
     pub longitude_current: f64,
     pub route_status: Option<String>,
     pub status: Option<String>,
+    pub source: Option<String>,
     pub stop_direction: Option<String>,
     pub stop_group_id: Option<String>,
     pub stop_type_id: String,
@@ -818,7 +1082,7 @@ pub struct BusShiftTypeInternal {
     pub shift_type_id: String,
     pub shift_type_code: Option<String>,
     pub description: Option<String>,
-    pub gtfs_id: Option<String>,
+    pub gtfs_id: String,
     pub deleted: Option<bool>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -829,6 +1093,7 @@ pub struct BusScheduleTypeInternal {
     pub schedule_type_id: String,
     pub schedule_type_code: Option<String>,
     pub schedule_type_name: Option<String>,
+    pub gtfs_id: String,
     pub deleted: Option<bool>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -981,6 +1246,72 @@ pub trait OperatorService: Send + Sync {
         gtfs_id: &str,
         body: QueryBody,
     ) -> AppResult<Vec<InternalRow>>;
+
+    // ===== Stop & route management =====
+
+    /// Fuzzy stop search by name/code (ILIKE). `with_routes` adds passing-route list.
+    async fn search_stops(
+        &self,
+        gtfs_id: &str,
+        q: &str,
+        limit: i64,
+        with_routes: bool,
+    ) -> AppResult<Vec<EnrichedStop>>;
+
+    /// Stops within `radius_m` of (lat, lon), ordered by distance (PostGIS).
+    async fn nearby_stops(
+        &self,
+        gtfs_id: &str,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+        limit: i64,
+        with_routes: bool,
+    ) -> AppResult<Vec<EnrichedStop>>;
+
+    /// Club stops: repoint every route_point from `from` ids to `to`, collapsing
+    /// consecutive duplicates per affected route. Returns rows changed + affected routes.
+    async fn bulk_replace_stops(
+        &self,
+        gtfs_id: &str,
+        from: &[String],
+        to: &str,
+    ) -> AppResult<BulkReplaceResult>;
+
+    /// Route points joined with stop details, ordered by route_order (editor feed).
+    async fn get_route_stops(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<RouteStopsResponse>;
+
+    /// Insert a stop at position `position`, shifting existing route_order up by 1.
+    async fn insert_route_stop(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+        position: i64,
+        data: Value,
+    ) -> AppResult<Value>;
+
+    /// Recompute route_order/stage_no/stage_name/route_name for each route; optionally polyline.
+    async fn reprocess_routes(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+        recompute_polyline: bool,
+    ) -> AppResult<Vec<ReprocessResult>>;
+
+    /// Full route-stop-mapping across all routes (for CSV export).
+    async fn export_route_stop_mapping(
+        &self,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<Value>>;
+
+    /// Returns the underlying pool for streaming responses. None for mock implementations.
+    fn pool(&self) -> Option<&PgPool> {
+        None
+    }
 }
 
 pub struct MockOperatorService;
@@ -1140,6 +1471,71 @@ impl OperatorService for MockOperatorService {
     ) -> AppResult<Vec<InternalRow>> {
         mock_err!()
     }
+
+    async fn search_stops(
+        &self,
+        _gtfs_id: &str,
+        _q: &str,
+        _limit: i64,
+        _with_routes: bool,
+    ) -> AppResult<Vec<EnrichedStop>> {
+        mock_err!()
+    }
+
+    async fn nearby_stops(
+        &self,
+        _gtfs_id: &str,
+        _lat: f64,
+        _lon: f64,
+        _radius_m: f64,
+        _limit: i64,
+        _with_routes: bool,
+    ) -> AppResult<Vec<EnrichedStop>> {
+        mock_err!()
+    }
+
+    async fn bulk_replace_stops(
+        &self,
+        _gtfs_id: &str,
+        _from: &[String],
+        _to: &str,
+    ) -> AppResult<BulkReplaceResult> {
+        mock_err!()
+    }
+
+    async fn get_route_stops(
+        &self,
+        _gtfs_id: &str,
+        _route_id: &str,
+    ) -> AppResult<RouteStopsResponse> {
+        mock_err!()
+    }
+
+    async fn insert_route_stop(
+        &self,
+        _gtfs_id: &str,
+        _route_id: &str,
+        _position: i64,
+        _data: Value,
+    ) -> AppResult<Value> {
+        mock_err!()
+    }
+
+    async fn reprocess_routes(
+        &self,
+        _gtfs_id: &str,
+        _route_ids: &[String],
+        _recompute_polyline: bool,
+    ) -> AppResult<Vec<ReprocessResult>> {
+        mock_err!()
+    }
+
+    async fn export_route_stop_mapping(
+        &self,
+        _gtfs_id: &str,
+    ) -> AppResult<Vec<Value>> {
+        mock_err!()
+    }
 }
 
 struct DeviceIdsCache {
@@ -1160,15 +1556,17 @@ const DESIGNATION_CACHE_SECS: u64 = 43200; // 12 hours
 
 pub struct DBOperatorService {
     pool: PgPool,
+    osrm_url: Option<String>,
     device_ids_cache: Arc<RwLock<DeviceIdsCache>>,
     tablet_ids_cache: Arc<RwLock<TabletIdsCache>>,
     designation_cache: Arc<RwLock<DesignationCache>>,
 }
 
 impl DBOperatorService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, osrm_url: Option<String>) -> Self {
         Self {
             pool,
+            osrm_url: osrm_url.filter(|s| !s.is_empty()),
             device_ids_cache: Arc::new(RwLock::new(DeviceIdsCache {
                 etm_ids: HashMap::new(),
             })),
@@ -1242,8 +1640,34 @@ impl DBOperatorService {
     }
 }
 
+/// Resolve (schedule_number, org_name, shift_type_name) for a schedule_trip_id by walking
+/// schedule_trip → schedule → entity and schedule → schedule_type. Used to enrich
+/// trip-detail inserts so those columns are never left null. shift_type_name comes from
+/// bus_schedule_type_internal.schedule_type_name (the source of truth) — no hardcoded map.
+async fn fetch_schedule_meta_for_trip(
+    pool: &PgPool,
+    schedule_trip_id: &str,
+) -> AppResult<Option<(Option<String>, Option<String>, Option<String>)>> {
+    sqlx::query_as(
+        "SELECT s.schedule_number, e.entity_name, st.schedule_type_name \
+         FROM bus_schedule_trip_internal t \
+         JOIN bus_schedule_internal s ON s.schedule_id = t.schedule_id \
+         LEFT JOIN entities_internal e ON e.entity_id = s.entity_id AND e.gtfs_id = s.gtfs_id AND e.deleted = false \
+         LEFT JOIN bus_schedule_type_internal st ON st.schedule_type_id = s.schedule_type_id \
+         WHERE t.schedule_trip_id = $1 LIMIT 1",
+    )
+    .bind(schedule_trip_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DbError(format!("fetch_schedule_meta_for_trip: {}", e)))
+}
+
 #[async_trait]
 impl OperatorService for DBOperatorService {
+    fn pool(&self) -> Option<&PgPool> {
+        Some(&self.pool)
+    }
+
     async fn get_one_row(
         &self,
         table: &str,
@@ -1515,6 +1939,39 @@ impl OperatorService for DBOperatorService {
             }
         }
 
+        // Enrich bus_schedule_trip_detail_internal: derive schedule_number / org_name /
+        // shift_type_name from the parent schedule (via schedule_trip_id) when the caller
+        // didn't supply them. The single-row create UI omits these, and the trip-detail
+        // read path requires a non-null schedule_number, so we backfill here for all callers.
+        if table == "bus_schedule_trip_detail_internal" {
+            for val in arr.iter_mut() {
+                let Some(obj) = val.as_object_mut() else { continue };
+                let needs_enrich = ["schedule_number", "org_name", "shift_type_name"]
+                    .iter()
+                    .any(|k| obj.get(*k).map_or(true, |v| v.is_null()));
+                let trip_id = obj
+                    .get("schedule_trip_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let (true, Some(trip_id)) = (needs_enrich, trip_id) {
+                    if let Some((schedule_number, org_name, shift_type_name)) =
+                        fetch_schedule_meta_for_trip(&self.pool, &trip_id).await?
+                    {
+                        let mut set_if_absent = |key: &str, value: Option<String>| {
+                            if let Some(v) = value {
+                                if obj.get(key).map_or(true, |x| x.is_null()) {
+                                    obj.insert(key.to_string(), Value::String(v));
+                                }
+                            }
+                        };
+                        set_if_absent("schedule_number", schedule_number);
+                        set_if_absent("org_name", org_name);
+                        set_if_absent("shift_type_name", shift_type_name);
+                    }
+                }
+            }
+        }
+
         // Apply field regeneration if requested
         if let Some(ref regen_fields) = to_regen {
             if let Some(columns) = table_columns(table) {
@@ -1605,11 +2062,21 @@ impl OperatorService for DBOperatorService {
                                 q = q.bind(i.to_string());
                             } else if let Some(f) = n.as_f64() {
                                 q = q.bind(f.to_string());
+                            } else {
+                                return Err(AppError::BadRequest(format!(
+                                    "Column '{}': numeric value not representable as string",
+                                    col
+                                )));
                             }
                         } else if let Some(i) = n.as_i64() {
                             q = q.bind(i);
                         } else if let Some(f) = n.as_f64() {
                             q = q.bind(f);
+                        } else {
+                            return Err(AppError::BadRequest(format!(
+                                "Column '{}': numeric value not representable",
+                                col
+                            )));
                         }
                     }
                     Value::Bool(b) => q = q.bind(b),
@@ -1708,7 +2175,7 @@ impl OperatorService for DBOperatorService {
                 d.break_type,
                 d.shift_type_name,
                 d.distance,
-                d.route_number_id::int as route_id,
+                d.route_number_id as route_id,
                 d.schedule_trip_id,
                 d.is_active_trip
             FROM public.bus_schedule_trip_detail_internal d
@@ -1985,5 +2452,444 @@ impl OperatorService for DBOperatorService {
                     .map_err(|e| AppError::Internal(format!("Failed to parse waybill: {}", e)))
             })
             .collect()
+    }
+
+    async fn search_stops(
+        &self,
+        gtfs_id: &str,
+        q: &str,
+        limit: i64,
+        with_routes: bool,
+    ) -> AppResult<Vec<EnrichedStop>> {
+        let pattern = format!("%{}%", q);
+        let rows = sqlx::query_as::<_, EnrichedStopRow>(
+            "SELECT s.bus_stop_id, s.bus_stop_code, s.bus_stop_name, s.latitude_current, s.longitude_current, \
+                s.source, s.status, \
+                (SELECT COUNT(DISTINCT rp.route_id) FROM route_point_internal rp \
+                   WHERE rp.bus_stop_id = s.bus_stop_id AND rp.gtfs_id = s.gtfs_id AND rp.deleted = false) AS route_count, \
+                NULL::double precision AS distance_m \
+             FROM stop_internal s \
+             WHERE s.gtfs_id = $1 AND s.deleted = false AND LOWER(COALESCE(s.status,'active')) <> 'inactive' \
+               AND (s.bus_stop_name ILIKE $2 OR s.bus_stop_code ILIKE $2) \
+             ORDER BY s.bus_stop_name LIMIT $3",
+        )
+        .bind(gtfs_id)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("search_stops: {}", e)))?;
+        enrich_stops(&self.pool, gtfs_id, rows, with_routes).await
+    }
+
+    async fn nearby_stops(
+        &self,
+        gtfs_id: &str,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+        limit: i64,
+        with_routes: bool,
+    ) -> AppResult<Vec<EnrichedStop>> {
+        // PostGIS geography: ST_DWithin uses the spatial index (stop_geom_idx) and computes
+        // great-circle distance in metres on the spheroid. $2=lat $3=lon $4=radius_m $5=limit.
+        let rows = sqlx::query_as::<_, EnrichedStopRow>(
+            "SELECT s.bus_stop_id, s.bus_stop_code, s.bus_stop_name, s.latitude_current, s.longitude_current, \
+                s.source, s.status, \
+                (SELECT COUNT(DISTINCT rp.route_id) FROM route_point_internal rp \
+                   WHERE rp.bus_stop_id = s.bus_stop_id AND rp.gtfs_id = s.gtfs_id AND rp.deleted = false) AS route_count, \
+                ST_Distance(s.geom::geography, ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography) AS distance_m \
+             FROM stop_internal s \
+             WHERE s.gtfs_id = $1 AND s.deleted = false AND LOWER(COALESCE(s.status,'active')) <> 'inactive' \
+               AND ST_DWithin(s.geom::geography, ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography, $4) \
+             ORDER BY distance_m LIMIT $5",
+        )
+        .bind(gtfs_id)
+        .bind(lat)
+        .bind(lon)
+        .bind(radius_m)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("nearby_stops: {}", e)))?;
+        enrich_stops(&self.pool, gtfs_id, rows, with_routes).await
+    }
+
+    async fn bulk_replace_stops(
+        &self,
+        gtfs_id: &str,
+        from: &[String],
+        to: &str,
+    ) -> AppResult<BulkReplaceResult> {
+        if from.is_empty() {
+            return Err(AppError::BadRequest("from list is empty".to_string()));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::DbError(format!("bulk_replace begin: {}", e)))?;
+
+        let affected: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT route_id FROM route_point_internal \
+             WHERE gtfs_id=$1 AND deleted=false AND bus_stop_id = ANY($2) AND bus_stop_id <> $3",
+        )
+        .bind(gtfs_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(format!("bulk_replace affected: {}", e)))?;
+        let affected_route_ids: Vec<String> = affected.into_iter().map(|(r,)| r).collect();
+
+        let res = sqlx::query(
+            "UPDATE route_point_internal SET bus_stop_id=$3, updated_at=now() \
+             WHERE gtfs_id=$1 AND deleted=false AND bus_stop_id = ANY($2) AND bus_stop_id <> $3",
+        )
+        .bind(gtfs_id)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(format!("bulk_replace update: {}", e)))?;
+        let rows_affected = res.rows_affected();
+
+        if !affected_route_ids.is_empty() {
+            sqlx::query(
+                "WITH ordered AS ( \
+                   SELECT route_points_id, bus_stop_id, \
+                     LAG(bus_stop_id) OVER (PARTITION BY route_id ORDER BY route_order, created_at, route_points_id) AS prev_stop \
+                   FROM route_point_internal \
+                   WHERE gtfs_id=$1 AND deleted=false AND route_id = ANY($2) \
+                 ) \
+                 UPDATE route_point_internal rp SET deleted=true, updated_at=now() \
+                 FROM ordered o WHERE rp.route_points_id = o.route_points_id AND o.bus_stop_id = o.prev_stop",
+            )
+            .bind(gtfs_id)
+            .bind(&affected_route_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::DbError(format!("bulk_replace collapse: {}", e)))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::DbError(format!("bulk_replace commit: {}", e)))?;
+        Ok(BulkReplaceResult {
+            rows_affected,
+            affected_route_ids,
+        })
+    }
+
+    async fn get_route_stops(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<RouteStopsResponse> {
+        let header: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT route_number, route_name, encoded_polyline FROM route_internal \
+             WHERE gtfs_id=$1 AND route_id=$2 AND deleted=false LIMIT 1",
+        )
+        .bind(gtfs_id)
+        .bind(route_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_route_stops header: {}", e)))?;
+        let (route_number, route_name, encoded_polyline) =
+            header.ok_or_else(|| AppError::NotFound(format!("route {} not found", route_id)))?;
+
+        let rows = sqlx::query_as::<_, RouteStopJoinRow>(
+            "SELECT rp.route_points_id, rp.bus_stop_id, s.bus_stop_name AS stop_name, \
+                COALESCE(s.latitude_current,0)::double precision AS lat, COALESCE(s.longitude_current,0)::double precision AS lon, \
+                rp.route_order::bigint AS route_order, rp.stage_no::bigint AS stage_no, \
+                rp.stage_name, rp.stop_type, rp.is_visible, rp.travel_distance::bigint AS travel_distance, rp.travel_time \
+             FROM route_point_internal rp \
+             LEFT JOIN stop_internal s ON s.bus_stop_id = rp.bus_stop_id AND s.gtfs_id = rp.gtfs_id AND s.deleted=false \
+             WHERE rp.gtfs_id=$1 AND rp.route_id=$2 AND rp.deleted=false \
+             ORDER BY rp.route_order, rp.created_at, rp.route_points_id",
+        )
+        .bind(gtfs_id)
+        .bind(route_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_route_stops: {}", e)))?;
+
+        let stops = rows
+            .into_iter()
+            .map(|r| RouteStopDetail {
+                route_point_id: r.route_points_id,
+                bus_stop_id: r.bus_stop_id,
+                stop_name: r.stop_name,
+                lat: r.lat,
+                lon: r.lon,
+                route_order: r.route_order,
+                stage_no: r.stage_no,
+                stage_name: r.stage_name,
+                stop_type: r.stop_type,
+                is_visible: r.is_visible,
+                travel_distance: r.travel_distance,
+                travel_time: r.travel_time,
+            })
+            .collect();
+
+        Ok(RouteStopsResponse {
+            route_id: route_id.to_string(),
+            route_number,
+            route_name,
+            encoded_polyline,
+            stops,
+        })
+    }
+
+    async fn insert_route_stop(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+        position: i64,
+        data: Value,
+    ) -> AppResult<Value> {
+        let bus_stop_id = data
+            .get("bus_stop_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("bus_stop_id is required".to_string()))?;
+        let travel_distance = data.get("travel_distance").and_then(|v| v.as_i64());
+        let stop_type = data
+            .get("stop_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("INTERMEDIATE STOP");
+        let stage_no = data.get("stage_no").and_then(|v| v.as_i64());
+        let stage_name = data.get("stage_name").and_then(|v| v.as_str());
+        let travel_time = data.get("travel_time").and_then(|v| v.as_str());
+        // New route stops are visible and active by default.
+        let is_visible = data.get("is_visible").and_then(|v| v.as_bool()).unwrap_or(true);
+        let new_id = field_generator::gen_random_id();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::DbError(format!("insert_route_stop begin: {}", e)))?;
+
+        sqlx::query(
+            "UPDATE route_point_internal SET route_order = route_order + 1, updated_at = now() \
+             WHERE gtfs_id=$1 AND route_id=$2 AND deleted=false AND route_order >= $3",
+        )
+        .bind(gtfs_id)
+        .bind(route_id)
+        .bind(position)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(format!("insert_route_stop shift: {}", e)))?;
+
+        sqlx::query(
+            "INSERT INTO route_point_internal \
+               (route_points_id, route_id, gtfs_id, route_order, bus_stop_id, travel_distance, travel_time, stop_type, stage_no, stage_name, is_visible, point_status, deleted) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',false)",
+        )
+        .bind(&new_id)
+        .bind(route_id)
+        .bind(gtfs_id)
+        .bind(position)
+        .bind(bus_stop_id)
+        .bind(travel_distance)
+        .bind(travel_time)
+        .bind(stop_type)
+        .bind(stage_no)
+        .bind(stage_name)
+        .bind(is_visible)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(format!("insert_route_stop insert: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::DbError(format!("insert_route_stop commit: {}", e)))?;
+
+        Ok(serde_json::json!({ "route_points_id": new_id, "route_order": position }))
+    }
+
+    async fn reprocess_routes(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+        recompute_polyline: bool,
+    ) -> AppResult<Vec<ReprocessResult>> {
+        let mut out = Vec::new();
+        for route_id in route_ids {
+            let pts = sqlx::query_as::<_, ReprocessPointRow>(
+                "SELECT rp.route_points_id, rp.stop_type, s.bus_stop_name AS stop_name, \
+                    COALESCE(s.latitude_current,0) AS lat, COALESCE(s.longitude_current,0) AS lon \
+                 FROM route_point_internal rp \
+                 LEFT JOIN stop_internal s ON s.bus_stop_id = rp.bus_stop_id AND s.gtfs_id = rp.gtfs_id AND s.deleted=false \
+                 WHERE rp.gtfs_id=$1 AND rp.route_id=$2 AND rp.deleted=false \
+                 ORDER BY rp.route_order, rp.created_at, rp.route_points_id",
+            )
+            .bind(gtfs_id)
+            .bind(route_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("reprocess fetch {}: {}", route_id, e)))?;
+
+            if pts.is_empty() {
+                out.push(ReprocessResult {
+                    route_id: route_id.clone(),
+                    stops_renumbered: 0,
+                    stages: 0,
+                    route_name: None,
+                    polyline: None,
+                });
+                continue;
+            }
+
+            let mut stage = 1i64;
+            let mut current_stage_name = pts[0].stop_name.clone().unwrap_or_default();
+            let mut max_stage = 1i64;
+            // (route_points_id, new_order, stage_no, stage_name)
+            let mut updates: Vec<(String, i64, i64, String)> = Vec::with_capacity(pts.len());
+            for (i, p) in pts.iter().enumerate() {
+                let st = StopType::from_opt(p.stop_type.as_deref());
+                if i == 0 {
+                    current_stage_name = p.stop_name.clone().unwrap_or_default();
+                } else if st == StopType::StageStop {
+                    stage += 1;
+                    current_stage_name = p.stop_name.clone().unwrap_or_default();
+                }
+                max_stage = max_stage.max(stage);
+                updates.push((
+                    p.route_points_id.clone(),
+                    (i as i64) + 1,
+                    stage,
+                    current_stage_name.clone(),
+                ));
+            }
+
+            // route_name = "<first stop> - <last stop>". Fall back to whichever endpoint
+            // has a name so a route with one unnamed terminal still gets named.
+            let route_name = match (
+                pts.first().and_then(|p| p.stop_name.clone()),
+                pts.last().and_then(|p| p.stop_name.clone()),
+            ) {
+                (Some(a), Some(b)) => Some(format!("{} - {}", a, b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+
+            let ids: Vec<&str> = updates.iter().map(|(id, _, _, _)| id.as_str()).collect();
+            let orders: Vec<i64> = updates.iter().map(|(_, o, _, _)| *o).collect();
+            let stage_nos: Vec<i64> = updates.iter().map(|(_, _, s, _)| *s).collect();
+            let stage_names: Vec<&str> = updates.iter().map(|(_, _, _, n)| n.as_str()).collect();
+
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AppError::DbError(format!("reprocess begin: {}", e)))?;
+            sqlx::query(
+                "UPDATE route_point_internal AS rp \
+                 SET route_order = u.route_order, stage_no = u.stage_no, stage_name = u.stage_name, updated_at = now() \
+                 FROM (SELECT UNNEST($1::text[]) AS route_points_id, \
+                              UNNEST($2::bigint[]) AS route_order, \
+                              UNNEST($3::bigint[]) AS stage_no, \
+                              UNNEST($4::text[]) AS stage_name) AS u \
+                 WHERE rp.route_points_id = u.route_points_id AND rp.gtfs_id = $5",
+            )
+            .bind(&ids)
+            .bind(&orders)
+            .bind(&stage_nos)
+            .bind(&stage_names)
+            .bind(gtfs_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::DbError(format!("reprocess update points: {}", e)))?;
+            if let Some(ref rn) = route_name {
+                sqlx::query(
+                    "UPDATE route_internal SET route_name=$2, updated_at=now() WHERE route_id=$1 AND gtfs_id=$3",
+                )
+                .bind(route_id)
+                .bind(rn)
+                .bind(gtfs_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::DbError(format!("reprocess route_name: {}", e)))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| AppError::DbError(format!("reprocess commit: {}", e)))?;
+
+            let mut polyline_out = None;
+            if recompute_polyline {
+                let coords: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
+                match osrm_route(self.osrm_url.as_deref(), &coords).await {
+                    Some((geom, legs)) => {
+                        if let Err(e) = sqlx::query(
+                            "UPDATE route_internal SET encoded_polyline=$2, updated_at=now() WHERE route_id=$1 AND gtfs_id=$3",
+                        )
+                        .bind(route_id)
+                        .bind(&geom)
+                        .bind(gtfs_id)
+                        .execute(&self.pool)
+                        .await
+                        {
+                            error!("reprocess_routes: failed to persist polyline for route {}: {}", route_id, e);
+                        }
+                        // leg[i] is between pts[i] and pts[i+1] → assign to pts[i+1]
+                        for (i, (dist, dur)) in legs.iter().enumerate() {
+                            if let Some(p) = pts.get(i + 1) {
+                                if let Err(e) = sqlx::query(
+                                    "UPDATE route_point_internal SET travel_distance=$2, travel_time=$3, updated_at=now() \
+                                     WHERE route_points_id=$1 AND gtfs_id=$4",
+                                )
+                                .bind(&p.route_points_id)
+                                .bind(*dist as i64)
+                                .bind(format!("{}", (*dur * 1000.0) as i64))
+                                .bind(gtfs_id)
+                                .execute(&self.pool)
+                                .await
+                                {
+                                    error!("reprocess_routes: failed to persist leg distance for point {}: {}", p.route_points_id, e);
+                                }
+                            }
+                        }
+                        polyline_out = Some(geom);
+                    }
+                    None => {
+                        warn!("reprocess_routes: OSRM unavailable for route {}, polyline not updated", route_id);
+                    }
+                }
+            }
+
+            out.push(ReprocessResult {
+                route_id: route_id.clone(),
+                stops_renumbered: updates.len() as i64,
+                stages: max_stage,
+                route_name,
+                polyline: polyline_out,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn export_route_stop_mapping(&self, gtfs_id: &str) -> AppResult<Vec<Value>> {
+        let rows = sqlx::query_scalar::<_, Value>(
+            "SELECT row_to_json(t) FROM ( \
+               SELECT rp.route_id AS \"routeId\", r.route_number AS \"routeNumber\", \
+                 rp.bus_stop_id AS \"stopId\", s.bus_stop_name AS \"stopName\", \
+                 s.latitude_current AS latitude, s.longitude_current AS longitude, \
+                 rp.stop_type AS \"stopType\", rp.stage_no AS \"stageNo\", \
+                 rp.route_order AS \"stopSequence\", rp.stage_name AS \"stageName\", \
+                 rp.route_id AS \"providerId\" \
+               FROM route_point_internal rp \
+               JOIN route_internal r ON r.route_id = rp.route_id AND r.gtfs_id = rp.gtfs_id AND r.deleted=false \
+               LEFT JOIN stop_internal s ON s.bus_stop_id = rp.bus_stop_id AND s.gtfs_id = rp.gtfs_id AND s.deleted=false \
+               WHERE rp.gtfs_id=$1 AND rp.deleted=false \
+               ORDER BY rp.route_id, rp.route_order \
+             ) t",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("export_route_stop_mapping: {}", e)))?;
+        Ok(rows)
     }
 }

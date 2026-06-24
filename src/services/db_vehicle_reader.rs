@@ -1071,7 +1071,7 @@ impl DBVehicleReader {
                     schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text AS schedule_trip_id,
                     trip_start_time AS start_time,
                     trip_end_time AS end_time,
                     deleted,
@@ -1096,7 +1096,7 @@ impl DBVehicleReader {
                     schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text AS schedule_trip_id,
                     trip_start_time AS start_time,
                     trip_end_time AS end_time,
                     deleted,
@@ -1154,7 +1154,7 @@ impl DBVehicleReader {
                     schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text AS schedule_trip_id,
                     trip_start_time AS start_time,
                     trip_end_time AS end_time,
                     start_time AS db_start_time,
@@ -1176,7 +1176,7 @@ impl DBVehicleReader {
                     schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text AS schedule_trip_id,
                     trip_start_time AS start_time,
                     trip_end_time AS end_time,
                     start_time AS db_start_time,
@@ -1278,7 +1278,7 @@ impl DBVehicleReader {
                 schedule_number,
                 NULL::text AS org_name,
                 NULL::int AS trip_number,
-                NULL::bigint AS schedule_trip_id,
+                NULL::text AS schedule_trip_id,
                 NULL::text AS start_time,
                 NULL::text AS end_time,
                 FALSE AS deleted,
@@ -1463,7 +1463,7 @@ impl VehicleDataReader for DBVehicleReader {
         // Enhanced flow: Split waybill query with priority (Online -> Processed/New)
         let (waybill_result, waybill_status) = self.get_waybill_with_priority(vehicle_no).await?;
 
-        let mut schedule_map: HashMap<i64, Vec<BusSchedule>> = HashMap::new();
+        let mut schedule_map: HashMap<String, Vec<BusSchedule>> = HashMap::new();
         match waybill_result {
             Some(vehicle_data) => {
                 info!(
@@ -1479,13 +1479,13 @@ impl VehicleDataReader for DBVehicleReader {
                 // Populate schedule_map for backward compatibility
                 if let Some(ref remaining) = remaining_trip_details {
                     for row in remaining.iter() {
-                        if let Some(key) = row.schedule_trip_id {
+                        if let Some(key) = row.schedule_trip_id.clone() {
                             schedule_map.entry(key).or_default().push(row.clone());
                         }
                     }
                 }
                 if let Some(ref schedule) = schedule_result {
-                    if let Some(key) = schedule.schedule_trip_id {
+                    if let Some(key) = schedule.schedule_trip_id.clone() {
                         schedule_map
                             .entry(key)
                             .or_default()

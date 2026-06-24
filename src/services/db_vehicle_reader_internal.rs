@@ -134,7 +134,7 @@ pub struct DBVehicleReaderInternal {
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
 }
 
-const WAYBILL_ROUTE_CACHE_DURATION: u64 = 300;
+const WAYBILL_ROUTE_CACHE_DURATION: u64 = 180;
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 
 impl DBVehicleReaderInternal {
@@ -283,7 +283,7 @@ impl DBVehicleReaderInternal {
         let (waybill_result, waybill_status) =
             self.get_waybill_with_priority(vehicle_no, gtfs_id).await?;
 
-        let mut schedule_map: HashMap<i64, Vec<BusSchedule>> = HashMap::new();
+        let mut schedule_map: HashMap<String, Vec<BusSchedule>> = HashMap::new();
 
         match waybill_result {
             Some(vehicle_data) => {
@@ -298,13 +298,13 @@ impl DBVehicleReaderInternal {
 
                 if let Some(ref remaining) = remaining_trip_details {
                     for row in remaining.iter() {
-                        if let Some(key) = row.schedule_trip_id {
+                        if let Some(key) = row.schedule_trip_id.clone() {
                             schedule_map.entry(key).or_default().push(row.clone());
                         }
                     }
                 }
                 if let Some(ref schedule) = schedule_result {
-                    if let Some(key) = schedule.schedule_trip_id {
+                    if let Some(key) = schedule.schedule_trip_id.clone() {
                         schedule_map
                             .entry(key)
                             .or_default()
@@ -613,7 +613,7 @@ impl DBVehicleReaderInternal {
                 SELECT
                     NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number,
+                    COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
@@ -625,7 +625,7 @@ impl DBVehicleReaderInternal {
                     start_time::text AS db_start_time,
                     end_time::text AS db_end_time
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1::bigint
+                WHERE waybill_id = $1
                   AND trip_number >= {}
                   AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
@@ -637,7 +637,7 @@ impl DBVehicleReaderInternal {
                 SELECT
                     NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number,
+                    COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
@@ -649,7 +649,7 @@ impl DBVehicleReaderInternal {
                     start_time::text AS db_start_time,
                     end_time::text AS db_end_time
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1::bigint
+                WHERE waybill_id = $1
                   AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#
@@ -657,7 +657,8 @@ impl DBVehicleReaderInternal {
         };
 
         let flexi_rows = match sqlx::query_as::<_, BusSchedule>(&flexi_query)
-            .bind(waybill_data.waybill_id.parse::<i64>().unwrap_or(0))
+            .bind(&waybill_data.waybill_id)
+            .bind(&waybill_data.schedule_no)
             .fetch_all(self.pool()?)
             .await
         {
@@ -691,7 +692,7 @@ impl DBVehicleReaderInternal {
                 SELECT
                     NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number,
+                    COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
@@ -703,9 +704,10 @@ impl DBVehicleReaderInternal {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1::bigint
+                WHERE schedule_trip_id = $1
                   AND trip_number >= {}
                   AND trip_type != 'dead-trip'
+                  AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
                 "#,
                 trip_num
@@ -715,7 +717,7 @@ impl DBVehicleReaderInternal {
                 SELECT
                     NULL::int AS stops_count,
                     route_number_id::text AS route_id,
-                    schedule_number,
+                    COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
                     schedule_trip_id,
@@ -727,15 +729,17 @@ impl DBVehicleReaderInternal {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1::bigint
+                WHERE schedule_trip_id = $1
                   AND trip_number >= (
                       SELECT COALESCE(
                           (SELECT trip_number FROM bus_schedule_trip_detail_internal
-                           WHERE schedule_trip_id = $1::bigint
+                           WHERE schedule_trip_id = $1
                              AND is_active_trip = true
-                             AND trip_type != 'dead-trip'),
+                             AND trip_type != 'dead-trip'
+                             AND LOWER(COALESCE(status, 'active')) <> 'inactive'),
                           1))
                   AND trip_type != 'dead-trip'
+                  AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
             "#
             .to_string()
@@ -743,6 +747,7 @@ impl DBVehicleReaderInternal {
 
         let detail_rows = match sqlx::query_as::<_, BusSchedule>(&detail_query)
             .bind(&waybill_data.schedule_trip_id)
+            .bind(&waybill_data.schedule_no)
             .fetch_all(self.pool()?)
             .await
         {
@@ -778,7 +783,7 @@ impl DBVehicleReaderInternal {
                 schedule_number,
                 NULL::text AS org_name,
                 NULL::int AS trip_number,
-                NULL::bigint AS schedule_trip_id,
+                NULL::text AS schedule_trip_id,
                 NULL::text AS start_time,
                 NULL::text AS end_time,
                 FALSE AS deleted,
@@ -974,16 +979,17 @@ impl DBVehicleReaderInternal {
                         AND e.gtfs_id = $2
                     LEFT JOIN bus_schedule_trip_flexi_internal bstf
                         ON w.is_flexi = true
-                        AND bstf.waybill_id = w.waybill_id::bigint
+                        AND bstf.waybill_id = w.waybill_id
                         AND bstf.route_number_id::text = $1
                         AND bstf.gtfs_id = $2
                         AND bstf.trip_type <> 'dead-trip'
                     LEFT JOIN bus_schedule_trip_detail_internal bstd
                         ON w.is_flexi = false
-                        AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                        AND bstd.schedule_trip_id = w.schedule_trip_id
                         AND bstd.route_number_id::text = $1
                         AND bstd.gtfs_id = $2
                         AND bstd.trip_type <> 'dead-trip'
+                        AND LOWER(COALESCE(bstd.status, 'active')) <> 'inactive'
                     WHERE
                         w.status in ('online', 'upcoming')
                         AND w.deleted = false
@@ -1040,16 +1046,17 @@ impl DBVehicleReaderInternal {
                         AND e.gtfs_id = $2
                     LEFT JOIN bus_schedule_trip_flexi_internal bstf
                         ON w.is_flexi = true
-                        AND bstf.waybill_id = w.waybill_id::bigint
+                        AND bstf.waybill_id = w.waybill_id
                         AND bstf.route_number_id::text = $1
                         AND bstf.gtfs_id = $2
                         AND bstf.trip_type <> 'dead-trip'
                     LEFT JOIN bus_schedule_trip_detail_internal bstd
                         ON w.is_flexi = false
-                        AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                        AND bstd.schedule_trip_id = w.schedule_trip_id
                         AND bstd.route_number_id::text = $1
                         AND bstd.gtfs_id = $2
                         AND bstd.trip_type <> 'dead-trip'
+                        AND LOWER(COALESCE(bstd.status, 'active')) <> 'inactive'
                     WHERE
                         w.status in ('online', 'upcoming')
                         AND w.deleted = false
@@ -1149,16 +1156,17 @@ impl DBVehicleReaderInternal {
                 AND e.gtfs_id = $3
             LEFT JOIN bus_schedule_trip_flexi_internal bstf
                 ON w.is_flexi = true
-                AND bstf.waybill_id = w.waybill_id::bigint
+                AND bstf.waybill_id = w.waybill_id
                 AND bstf.trip_number = $2
                 AND bstf.gtfs_id = $3
                 AND bstf.trip_type <> 'dead-trip'
             LEFT JOIN bus_schedule_trip_detail_internal bstd
                 ON w.is_flexi = false
-                AND bstd.schedule_trip_id = w.schedule_trip_id::bigint
+                AND bstd.schedule_trip_id = w.schedule_trip_id
                 AND bstd.trip_number = $2
                 AND bstd.gtfs_id = $3
                 AND bstd.trip_type <> 'dead-trip'
+                AND LOWER(COALESCE(bstd.status, 'active')) <> 'inactive'
             WHERE
                 w.waybill_no::text = $1
                 AND w.gtfs_id = $3

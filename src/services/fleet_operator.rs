@@ -22,6 +22,9 @@ pub enum TripAction {
     Start,
     End,
     Reset,
+    /// Undo the last forward step: revert the given trip_number back to "upcoming"
+    /// (is_active_trip=false, is_completed=false) without touching any other trip.
+    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,9 @@ pub struct CurrentOperationResponse {
     pub conductor_token: Option<String>,
     pub driver_token: Option<String>,
     pub number_of_trips: i64,
+    /// Ordered real (non-dead, non-inactive) trip_numbers, e.g. [2,3] when trip 1 is dead.
+    /// Lets the caller drive tripAction off real numbers without the heavier currentTripDetails call.
+    pub trip_numbers: Vec<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -401,51 +407,54 @@ impl DBFleetOperatorService {
 
     // ── Trip count ───────────────────────────────────────────────────────────
 
-    async fn get_trip_count(&self, waybill: &WaybillRow) -> AppResult<i64> {
-        if waybill.is_flexi {
-            let count: i64 = sqlx::query_scalar(
+    /// Ordered real (non-dead) trip_numbers for a waybill, e.g. [2, 3].
+    async fn get_trip_numbers(&self, waybill: &WaybillRow) -> AppResult<Vec<i64>> {
+        let rows: Vec<(i32,)> = if waybill.is_flexi {
+            sqlx::query_as(
                 r#"
-                SELECT COUNT(*)
+                SELECT trip_number
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id = $1
                   AND trip_type != 'dead-trip'
+                ORDER BY trip_number
                 "#,
             )
             .bind(&waybill.waybill_id)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .map_err(|e| {
                 error!(
-                    "get_trip_count (flexi) failed for waybill_id={}: {}",
+                    "get_trip_numbers (flexi) failed for waybill_id={}: {}",
                     waybill.waybill_id, e
                 );
                 AppError::Internal(e.to_string())
-            })?;
-            Ok(count)
+            })?
         } else {
             let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
                 AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
             })?;
-            let count: i64 = sqlx::query_scalar(
+            sqlx::query_as(
                 r#"
-                SELECT COUNT(*)
+                SELECT trip_number
                 FROM bus_schedule_trip_detail_internal
                 WHERE schedule_trip_id = $1
                   AND trip_type != 'dead-trip'
+                  AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                ORDER BY trip_number
                 "#,
             )
             .bind(&schedule_trip_id)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .map_err(|e| {
                 error!(
-                    "get_trip_count (detail) failed for schedule_trip_id={}: {}",
+                    "get_trip_numbers (detail) failed for schedule_trip_id={}: {}",
                     schedule_trip_id, e
                 );
                 AppError::Internal(e.to_string())
-            })?;
-            Ok(count)
-        }
+            })?
+        };
+        Ok(rows.into_iter().map(|(n,)| n as i64).collect())
     }
 
     // ── All trips ────────────────────────────────────────────────────────────
@@ -497,6 +506,7 @@ impl DBFleetOperatorService {
                 FROM bus_schedule_trip_detail_internal
                 WHERE schedule_trip_id = $1
                   AND trip_type != 'dead-trip'
+                  AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
                 "#,
             )
@@ -545,6 +555,7 @@ impl DBFleetOperatorService {
                 WHERE schedule_trip_id = $1
                   AND trip_number = $2
                   AND trip_type != 'dead-trip'
+                  AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 LIMIT 1
                 "#,
             )
@@ -640,6 +651,7 @@ impl DBFleetOperatorService {
                                 sync_start_time = CASE WHEN trip_number = $2 THEN $4 ELSE sync_start_time END
                             WHERE schedule_trip_id = $1
                               AND trip_type != 'dead-trip'
+                              AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -663,6 +675,7 @@ impl DBFleetOperatorService {
                                 is_completed   = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END
                             WHERE schedule_trip_id = $1
                               AND trip_type != 'dead-trip'
+                              AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -813,6 +826,59 @@ impl DBFleetOperatorService {
                     })?;
                 }
             }
+            TripAction::Rollback => {
+                // Revert just this trip back to "upcoming" (de-activate + un-complete);
+                // every other trip is left untouched.
+                if waybill.is_flexi {
+                    sqlx::query(
+                        r#"
+                        UPDATE bus_schedule_trip_flexi_internal
+                        SET is_active_trip = false,
+                            is_completed   = false
+                        WHERE waybill_id = $1
+                          AND trip_number = $2
+                          AND trip_type != 'dead-trip'
+                        "#,
+                    )
+                    .bind(&waybill.waybill_id)
+                    .bind(trip_number)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "apply_trip_action rollback (flexi) failed for waybill_id={}: {}",
+                            waybill.waybill_id, e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?;
+                } else {
+                    let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
+                        AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
+                    })?;
+                    sqlx::query(
+                        r#"
+                        UPDATE bus_schedule_trip_detail_internal
+                        SET is_active_trip = false,
+                            is_completed   = false
+                        WHERE schedule_trip_id = $1
+                          AND trip_number = $2
+                          AND trip_type != 'dead-trip'
+                          AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                        "#,
+                    )
+                    .bind(&schedule_trip_id)
+                    .bind(trip_number)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "apply_trip_action rollback (detail) failed for schedule_trip_id={}: {}",
+                            schedule_trip_id, e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -899,7 +965,8 @@ impl FleetOperatorService for DBFleetOperatorService {
         anchor: WaybillAnchor,
     ) -> AppResult<CurrentOperationResponse> {
         let waybill = self.resolve_waybill(gtfs_id, &anchor).await?;
-        let number_of_trips = self.get_trip_count(&waybill).await?;
+        let trip_numbers = self.get_trip_numbers(&waybill).await?;
+        let number_of_trips = trip_numbers.len() as i64;
 
         Ok(CurrentOperationResponse {
             waybill_no: waybill.waybill_no,
@@ -907,6 +974,7 @@ impl FleetOperatorService for DBFleetOperatorService {
             conductor_token: waybill.conductor_token_no,
             driver_token: waybill.driver_token_no,
             number_of_trips,
+            trip_numbers,
         })
     }
 

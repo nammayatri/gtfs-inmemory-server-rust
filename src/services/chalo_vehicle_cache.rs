@@ -55,7 +55,7 @@ pub struct CachedVehicleData {
     pub depot: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub service_type: Option<String>,
-    pub schedule_trip_id: Option<i64>,
+    pub schedule_trip_id: Option<String>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     pub deleted: Option<bool>,
