@@ -616,7 +616,7 @@ impl DBVehicleReaderInternal {
                     COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text,
                     trip_start_time::text AS start_time,
                     trip_end_time::text AS end_time,
                     deleted,
@@ -625,7 +625,7 @@ impl DBVehicleReaderInternal {
                     start_time::text AS db_start_time,
                     end_time::text AS db_end_time
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1
+                WHERE waybill_id::text = $1
                   AND trip_number >= {}
                   AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
@@ -640,7 +640,7 @@ impl DBVehicleReaderInternal {
                     COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text,
                     trip_start_time::text AS start_time,
                     trip_end_time::text AS end_time,
                     deleted,
@@ -649,7 +649,7 @@ impl DBVehicleReaderInternal {
                     start_time::text AS db_start_time,
                     end_time::text AS db_end_time
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1
+                WHERE waybill_id::text = $1
                   AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
             "#
@@ -695,7 +695,7 @@ impl DBVehicleReaderInternal {
                     COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text,
                     trip_start_time::text AS start_time,
                     trip_end_time::text AS end_time,
                     start_time::text AS db_start_time,
@@ -704,7 +704,7 @@ impl DBVehicleReaderInternal {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1
+                WHERE schedule_trip_id::text = $1
                   AND trip_number >= {}
                   AND trip_type != 'dead-trip'
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
@@ -720,7 +720,7 @@ impl DBVehicleReaderInternal {
                     COALESCE(schedule_number, $2) AS schedule_number,
                     org_name::text AS org_name,
                     trip_number,
-                    schedule_trip_id,
+                    schedule_trip_id::text,
                     trip_start_time::text AS start_time,
                     trip_end_time::text AS end_time,
                     start_time::text AS db_start_time,
@@ -729,11 +729,11 @@ impl DBVehicleReaderInternal {
                     is_active_trip,
                     trip_order
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1
+                WHERE schedule_trip_id::text = $1
                   AND trip_number >= (
                       SELECT COALESCE(
                           (SELECT trip_number FROM bus_schedule_trip_detail_internal
-                           WHERE schedule_trip_id = $1
+                           WHERE schedule_trip_id::text = $1
                              AND is_active_trip = true
                              AND trip_type != 'dead-trip'
                              AND LOWER(COALESCE(status, 'active')) <> 'inactive'),
@@ -989,7 +989,7 @@ impl DBVehicleReaderInternal {
                         AND bstd.route_number_id::text = $1
                         AND bstd.gtfs_id = $2
                         AND bstd.trip_type <> 'dead-trip'
-                        AND LOWER(COALESCE(bstd.status, 'active')) <> 'inactive'
+                        AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
                     WHERE
                         w.status in ('online', 'upcoming')
                         AND w.deleted = false
@@ -1001,7 +1001,7 @@ impl DBVehicleReaderInternal {
                             (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                         )
                 )
-                SELECT * FROM base WHERE is_completed IS NOT TRUE ORDER BY waybill_no, trip_number;
+                SELECT * FROM base WHERE (status <> 'online' OR is_completed IS NOT TRUE) ORDER BY waybill_no, trip_number;
                 "#,
                 Some(vn),
             )
@@ -1056,7 +1056,7 @@ impl DBVehicleReaderInternal {
                         AND bstd.route_number_id::text = $1
                         AND bstd.gtfs_id = $2
                         AND bstd.trip_type <> 'dead-trip'
-                        AND LOWER(COALESCE(bstd.status, 'active')) <> 'inactive'
+                        AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
                     WHERE
                         w.status in ('online', 'upcoming')
                         AND w.deleted = false
@@ -1067,7 +1067,7 @@ impl DBVehicleReaderInternal {
                             (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                         )
                 )
-                SELECT * FROM base WHERE is_completed IS NOT TRUE ORDER BY waybill_no, trip_number;
+                SELECT * FROM base WHERE (status <> 'online' OR is_completed IS NOT TRUE) ORDER BY waybill_no, trip_number;
                 "#,
                 None::<&str>,
             )
@@ -1166,7 +1166,7 @@ impl DBVehicleReaderInternal {
                 AND bstd.trip_number = $2
                 AND bstd.gtfs_id = $3
                 AND bstd.trip_type <> 'dead-trip'
-                AND LOWER(COALESCE(bstd.status, 'active')) <> 'inactive'
+                AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
             WHERE
                 w.waybill_no::text = $1
                 AND w.gtfs_id = $3

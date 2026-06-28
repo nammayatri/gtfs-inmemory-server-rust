@@ -307,12 +307,12 @@ impl DBFleetOperatorService {
     ) -> AppResult<WaybillRow> {
         let base_select = r#"
             SELECT
-                waybill_id,
+                waybill_id::text,
                 waybill_no,
                 vehicle_no,
                 conductor_token_no,
                 driver_token_no,
-                schedule_trip_id,
+                schedule_trip_id::text,
                 is_flexi,
                 duty_date
             FROM waybills_internal
@@ -414,7 +414,7 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT trip_number
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1
+                WHERE waybill_id::text = $1
                   AND trip_type != 'dead-trip'
                 ORDER BY trip_number
                 "#,
@@ -437,7 +437,7 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT trip_number
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1
+                WHERE schedule_trip_id::text = $1
                   AND trip_type != 'dead-trip'
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number
@@ -470,12 +470,12 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT
                     trip_number,
-                    route_number_id AS route_id,
+                    route_number_id::text AS route_id,
                     is_active_trip,
                     start_time,
                     end_time
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1
+                WHERE waybill_id::text = $1
                   AND trip_type != 'dead-trip'
                 ORDER BY trip_number ASC
                 "#,
@@ -499,12 +499,12 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT
                     trip_number,
-                    route_number_id AS route_id,
+                    route_number_id::text AS route_id,
                     is_active_trip,
                     start_time,
                     end_time
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1
+                WHERE schedule_trip_id::text = $1
                   AND trip_type != 'dead-trip'
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
@@ -532,7 +532,7 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT 1
                 FROM bus_schedule_trip_flexi_internal
-                WHERE waybill_id = $1
+                WHERE waybill_id::text = $1
                   AND trip_number = $2
                   AND trip_type != 'dead-trip'
                 LIMIT 1
@@ -552,7 +552,7 @@ impl DBFleetOperatorService {
                 r#"
                 SELECT 1
                 FROM bus_schedule_trip_detail_internal
-                WHERE schedule_trip_id = $1
+                WHERE schedule_trip_id::text = $1
                   AND trip_number = $2
                   AND trip_type != 'dead-trip'
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
@@ -598,7 +598,7 @@ impl DBFleetOperatorService {
                                 is_completed    = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END,
                                 trip_start_time = CASE WHEN trip_number = $2 THEN $3 ELSE trip_start_time END,
                                 sync_start_time = CASE WHEN trip_number = $2 THEN $4 ELSE sync_start_time END
-                            WHERE waybill_id = $1
+                            WHERE waybill_id::text = $1
                               AND trip_type != 'dead-trip'
                             "#,
                         )
@@ -621,7 +621,7 @@ impl DBFleetOperatorService {
                             UPDATE bus_schedule_trip_flexi_internal
                             SET is_active_trip = (trip_number = $2),
                                 is_completed   = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END
-                            WHERE waybill_id = $1
+                            WHERE waybill_id::text = $1
                               AND trip_type != 'dead-trip'
                             "#,
                         )
@@ -649,7 +649,7 @@ impl DBFleetOperatorService {
                                 is_completed    = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END,
                                 trip_start_time = CASE WHEN trip_number = $2 THEN $3 ELSE trip_start_time END,
                                 sync_start_time = CASE WHEN trip_number = $2 THEN $4 ELSE sync_start_time END
-                            WHERE schedule_trip_id = $1
+                            WHERE schedule_trip_id::text = $1
                               AND trip_type != 'dead-trip'
                               AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                             "#,
@@ -673,7 +673,7 @@ impl DBFleetOperatorService {
                             UPDATE bus_schedule_trip_detail_internal
                             SET is_active_trip = (trip_number = $2),
                                 is_completed   = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END
-                            WHERE schedule_trip_id = $1
+                            WHERE schedule_trip_id::text = $1
                               AND trip_type != 'dead-trip'
                               AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                             "#,
@@ -701,7 +701,7 @@ impl DBFleetOperatorService {
                             SET is_active_trip = false,
                                 trip_end_time  = CASE WHEN is_active_trip THEN $2 ELSE trip_end_time END,
                                 sync_end_time  = CASE WHEN is_active_trip THEN $3 ELSE sync_end_time END
-                            WHERE waybill_id = $1
+                            WHERE waybill_id::text = $1
                             "#,
                         )
                         .bind(&waybill.waybill_id)
@@ -721,7 +721,7 @@ impl DBFleetOperatorService {
                             r#"
                             UPDATE bus_schedule_trip_flexi_internal
                             SET is_active_trip = false
-                            WHERE waybill_id = $1
+                            WHERE waybill_id::text = $1
                             "#,
                         )
                         .bind(&waybill.waybill_id)
@@ -746,7 +746,7 @@ impl DBFleetOperatorService {
                             SET is_active_trip = false,
                                 trip_end_time  = CASE WHEN is_active_trip THEN $2 ELSE trip_end_time END,
                                 sync_end_time  = CASE WHEN is_active_trip THEN $3 ELSE sync_end_time END
-                            WHERE schedule_trip_id = $1
+                            WHERE schedule_trip_id::text = $1
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -765,8 +765,9 @@ impl DBFleetOperatorService {
                         sqlx::query(
                             r#"
                             UPDATE bus_schedule_trip_detail_internal
-                            SET is_active_trip = false
-                            WHERE schedule_trip_id = $1
+                            SET is_active_trip = false,
+                                is_completed   = CASE WHEN trip_number = $2 AND is_active_trip THEN true ELSE is_completed END
+                            WHERE schedule_trip_id::text = $1
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -789,7 +790,7 @@ impl DBFleetOperatorService {
                         UPDATE bus_schedule_trip_flexi_internal
                         SET is_active_trip = false,
                             is_completed   = false
-                        WHERE waybill_id = $1
+                        WHERE waybill_id::text = $1
                         "#,
                     )
                     .bind(&waybill.waybill_id)
@@ -811,7 +812,7 @@ impl DBFleetOperatorService {
                         UPDATE bus_schedule_trip_detail_internal
                         SET is_active_trip = false,
                             is_completed   = false
-                        WHERE schedule_trip_id = $1
+                        WHERE schedule_trip_id::text = $1
                         "#,
                     )
                     .bind(&schedule_trip_id)
@@ -835,7 +836,7 @@ impl DBFleetOperatorService {
                         UPDATE bus_schedule_trip_flexi_internal
                         SET is_active_trip = false,
                             is_completed   = false
-                        WHERE waybill_id = $1
+                        WHERE waybill_id::text = $1
                           AND trip_number = $2
                           AND trip_type != 'dead-trip'
                         "#,
@@ -860,7 +861,7 @@ impl DBFleetOperatorService {
                         UPDATE bus_schedule_trip_detail_internal
                         SET is_active_trip = false,
                             is_completed   = false
-                        WHERE schedule_trip_id = $1
+                        WHERE schedule_trip_id::text = $1
                           AND trip_number = $2
                           AND trip_type != 'dead-trip'
                           AND LOWER(COALESCE(status, 'active')) <> 'inactive'

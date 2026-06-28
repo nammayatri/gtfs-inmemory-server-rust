@@ -4,6 +4,126 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// An identifier column that may live as either an integer or text.
+///
+/// The operator `*_internal` id columns are mid-migration from `bigint` to
+/// `text`: in prod most are still `bigint`, locally most are already `text`, and
+/// values are either numeric strings (`"5"`) or, eventually, UUID strings.
+///
+/// - **Reads** tolerate both: serde deserializes from a JSON number *or* string,
+///   and sqlx decodes from a Postgres `int2/int4/int8` *or* `text/varchar`
+///   column. So GIMS never 500s on the bigint/text split.
+/// - **Writes (serialize) are numeric-coalescing**: emit a JSON *number* whenever
+///   the id is numerically representable (a real int, or a numeric string like
+///   `"5"`), and a string only for genuinely non-numeric ids (UUIDs). This keeps
+///   a still-deployed `Int64`-typed consumer (the rider-app backend, mid-move to
+///   Aeson `Value`) decoding successfully for as long as every id is numeric —
+///   which is the case until the frontend starts minting UUIDs. It also makes the
+///   mixed schema consistent: the same logical id serializes identically whether
+///   its column is `bigint` or already-migrated `text`.
+///
+/// Caveat: coalescing a numeric string drops leading zeros (`"007"` -> `7`).
+/// That's fine for sequence/UUID `*_id` columns but would corrupt a zero-padded
+/// code — none of the id columns are such.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IdValue {
+    Int(i64),
+    Text(String),
+}
+
+impl std::fmt::Display for IdValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdValue::Int(n) => write!(f, "{}", n),
+            IdValue::Text(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl Serialize for IdValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            IdValue::Int(n) => serializer.serialize_i64(*n),
+            IdValue::Text(s) => match s.parse::<i64>() {
+                Ok(n) => serializer.serialize_i64(n),
+                Err(_) => serializer.serialize_str(s),
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IdValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct IdValueVisitor;
+        impl<'de> serde::de::Visitor<'de> for IdValueVisitor {
+            type Value = IdValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an integer or string id")
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<IdValue, E> {
+                Ok(IdValue::Int(v))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<IdValue, E> {
+                Ok(IdValue::Int(v as i64))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<IdValue, E>
+            where
+                E: serde::de::Error,
+            {
+                // ids are never fractional; a whole float is tolerated
+                Ok(IdValue::Int(v as i64))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<IdValue, E> {
+                Ok(IdValue::Text(v.to_string()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<IdValue, E> {
+                Ok(IdValue::Text(v))
+            }
+        }
+        deserializer.deserialize_any(IdValueVisitor)
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for IdValue {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+            || <i64 as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+            || <i32 as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+            || <i16 as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for IdValue {
+    fn decode(
+        value: sqlx::postgres::PgValueRef<'r>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use sqlx::{TypeInfo, ValueRef};
+        match value.type_info().name() {
+            "INT8" => Ok(IdValue::Int(
+                <i64 as sqlx::Decode<sqlx::Postgres>>::decode(value)?,
+            )),
+            "INT4" => Ok(IdValue::Int(
+                <i32 as sqlx::Decode<sqlx::Postgres>>::decode(value)? as i64,
+            )),
+            "INT2" => Ok(IdValue::Int(
+                <i16 as sqlx::Decode<sqlx::Postgres>>::decode(value)? as i64,
+            )),
+            _ => Ok(IdValue::Text(
+                <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?,
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Gate {
     #[serde(rename = "gateName")]
