@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use crate::models::IdValue;
 use crate::services::field_generator;
 use crate::tools::error::{AppError, AppResult};
 
@@ -467,19 +468,19 @@ fn validate_table(table: &str) -> AppResult<()> {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ServiceTypeRow {
-    pub service_type_id: String,
+    pub service_type_id: IdValue,
     pub service_type_code: Option<String>,
     pub service_type_name: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RouteRow {
-    pub route_id: String,
+    pub route_id: IdValue,
     pub route_number: Option<String>,
     pub route_name: Option<String>,
     pub route_direction: Option<String>,
-    pub start_point_id: String,
-    pub end_point_id: String,
+    pub start_point_id: IdValue,
+    pub end_point_id: IdValue,
     pub encoded_polyline: Option<String>,
 }
 
@@ -720,26 +721,26 @@ async fn osrm_route(base: Option<&str>, coords: &[(f64, f64)]) -> Option<(String
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct DepotRow {
-    pub entity_id: String,
+    pub entity_id: IdValue,
     pub entity_name: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ScheduleNumberRow {
-    pub schedule_id: String,
+    pub schedule_id: IdValue,
     pub schedule_number: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct FleetRow {
-    pub vehicle_id: String,
+    pub vehicle_id: IdValue,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct EmployeeRow {
-    pub emp_id: String,
+    pub emp_id: IdValue,
     pub first_name: String,
     pub last_name: Option<String>,
     pub token_no: Option<String>,
@@ -748,7 +749,7 @@ pub struct EmployeeRow {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct TripDetailRow {
-    pub schedule_trip_detail_id: String,
+    pub schedule_trip_detail_id: IdValue,
     pub trip_number: i32,
     pub trip_order: i32,
     pub trip_type: Option<String>,
@@ -758,14 +759,14 @@ pub struct TripDetailRow {
     pub break_type: Option<String>,
     pub shift_type_name: Option<String>,
     pub distance: f32,
-    pub schedule_trip_id: String,
+    pub schedule_trip_id: IdValue,
     pub is_active_trip: bool,
-    pub route_id: String,
+    pub route_id: IdValue,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct RouteInternal {
-    pub route_id: String,
+    pub route_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub description: Option<String>,
     pub route_direction: Option<String>,
@@ -773,20 +774,20 @@ pub struct RouteInternal {
     pub route_name: Option<String>,
     pub route_number: Option<String>,
     pub route_string: Option<String>,
-    pub route_type_id: String,
+    pub route_type_id: IdValue,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub via: Option<String>,
-    pub bus_service_type_id: String,
-    pub end_point_id: String,
-    pub start_point_id: String,
+    pub bus_service_type_id: IdValue,
+    pub end_point_id: IdValue,
+    pub start_point_id: IdValue,
     pub route_distance: Option<f64>,
     pub encoded_polyline: Option<String>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct RoutePointInternal {
-    pub route_points_id: String,
+    pub route_points_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fare_stage: Option<String>,
@@ -800,13 +801,13 @@ pub struct RoutePointInternal {
     pub travel_distance: Option<i64>,
     pub travel_time: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub bus_stop_id: String,
-    pub route_id: String,
+    pub bus_stop_id: IdValue,
+    pub route_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleInternal {
-    pub schedule_id: String,
+    pub schedule_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub effective_from: Option<chrono::DateTime<chrono::Utc>>,
@@ -818,15 +819,15 @@ pub struct BusScheduleInternal {
     pub schedule_type_code: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub entity_id: String,
-    pub route_id: String,
-    pub service_type_id: String,
-    pub schedule_type_id: String,
+    pub entity_id: IdValue,
+    pub route_id: IdValue,
+    pub service_type_id: IdValue,
+    pub schedule_type_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripInternal {
-    pub schedule_trip_id: String,
+    pub schedule_trip_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub effective_end_date: Option<chrono::DateTime<chrono::Utc>>,
@@ -836,13 +837,13 @@ pub struct BusScheduleTripInternal {
     pub start_time: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: String,
-    pub schedule_id: String,
+    pub calendar_id: IdValue,
+    pub schedule_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripDetailInternal {
-    pub schedule_trip_detail_id: String,
+    pub schedule_trip_detail_id: IdValue,
     pub break_time: Option<String>,
     pub break_type: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -859,9 +860,9 @@ pub struct BusScheduleTripDetailInternal {
     pub trip_order: i64,
     pub trip_type: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: String,
-    pub route_number_id: String,
-    pub schedule_trip_id: String,
+    pub calendar_id: IdValue,
+    pub route_number_id: IdValue,
+    pub schedule_trip_id: IdValue,
     pub is_active_trip: bool,
     pub is_completed: bool,
     pub trip_end_time: Option<i64>,
@@ -873,7 +874,7 @@ pub struct BusScheduleTripDetailInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct BusScheduleTripFlexiInternal {
-    pub schedule_trip_flexi_id: String,
+    pub schedule_trip_flexi_id: IdValue,
     pub break_time: Option<String>,
     pub break_type: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -890,10 +891,10 @@ pub struct BusScheduleTripFlexiInternal {
     pub trip_order: i64,
     pub trip_type: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: String,
-    pub route_number_id: String,
-    pub schedule_trip_id: String,
-    pub waybill_id: String,
+    pub calendar_id: IdValue,
+    pub route_number_id: IdValue,
+    pub schedule_trip_id: IdValue,
+    pub waybill_id: IdValue,
     pub is_active_trip: bool,
     pub trip_end_time: Option<i64>,
     pub trip_start_time: Option<i64>,
@@ -903,7 +904,7 @@ pub struct BusScheduleTripFlexiInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct ServiceTypeInternal {
-    pub service_type_id: String,
+    pub service_type_id: IdValue,
     pub abbreviation: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
@@ -917,7 +918,7 @@ pub struct ServiceTypeInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct StopInternal {
-    pub bus_stop_id: String,
+    pub bus_stop_id: IdValue,
     pub bus_stop_code: Option<String>,
     pub bus_stop_name: Option<String>,
     pub bus_stop_name_local_lang: Option<String>,
@@ -932,8 +933,8 @@ pub struct StopInternal {
     pub status: Option<String>,
     pub source: Option<String>,
     pub stop_direction: Option<String>,
-    pub stop_group_id: Option<String>,
-    pub stop_type_id: String,
+    pub stop_group_id: Option<IdValue>,
+    pub stop_type_id: IdValue,
     pub sub_stage: Option<String>,
     pub toll_fee: Option<i64>,
     pub toll_zone: Option<String>,
@@ -942,7 +943,7 @@ pub struct StopInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct DesignationsInternal {
-    pub designation_id: String,
+    pub designation_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub designation_name: String,
@@ -954,7 +955,7 @@ pub struct DesignationsInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct EmployeesInternal {
-    pub emp_id: String,
+    pub emp_id: IdValue,
     pub address: Option<String>,
     pub basic_amount: Option<f64>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -973,15 +974,15 @@ pub struct EmployeesInternal {
     pub token_no: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub week_off: Option<String>,
-    pub department_id: String,
-    pub designation_id: String,
-    pub entity_id: String,
-    pub organization_id: String,
+    pub department_id: IdValue,
+    pub designation_id: IdValue,
+    pub entity_id: IdValue,
+    pub organization_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct EntitiesInternal {
-    pub entity_id: String,
+    pub entity_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub entity_address: Option<String>,
@@ -992,26 +993,26 @@ pub struct EntitiesInternal {
     pub entity_remark: Option<String>,
     pub entity_status: String,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub organization_id: String,
+    pub organization_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct VehiclesInternal {
-    pub vehicle_id: String,
+    pub vehicle_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fleet_no: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
-    pub bus_service_type_id: String,
-    pub entity_id: String,
-    pub organization_id: String,
+    pub bus_service_type_id: IdValue,
+    pub entity_id: IdValue,
+    pub organization_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillDeviceInternal {
-    pub waybill_device_id: String,
+    pub waybill_device_id: IdValue,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub device_serial_no: Option<String>,
@@ -1019,12 +1020,12 @@ pub struct WaybillDeviceInternal {
     pub is_primary: Option<bool>,
     pub is_uploaded: Option<bool>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub waybill_id: String,
+    pub waybill_id: IdValue,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct FleetEtmMappingInternal {
-    pub fleet_etm_mapping_id: String,
+    pub fleet_etm_mapping_id: IdValue,
     pub vehicle_no: String,
     pub gtfs_id: String,
     pub etm_serial_no: String,
@@ -1034,7 +1035,7 @@ pub struct FleetEtmMappingInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct FleetObuMappingInternal {
-    pub fleet_obu_mapping_id: String,
+    pub fleet_obu_mapping_id: IdValue,
     pub vehicle_no: String,
     pub gtfs_id: String,
     pub obu_id: String,
@@ -1044,7 +1045,7 @@ pub struct FleetObuMappingInternal {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillsInternal {
-    pub waybill_id: String,
+    pub waybill_id: IdValue,
     pub audited_date: Option<chrono::DateTime<chrono::Utc>>,
     pub bag_master: Option<String>,
     pub challan_no: Option<i64>,
@@ -1060,7 +1061,7 @@ pub struct WaybillsInternal {
     pub device_serial_number: Option<String>,
     pub is_flexi: bool,
     pub no_of_device: i64,
-    pub schedule_id: String,
+    pub schedule_id: IdValue,
     pub schedule_no: Option<String>,
     pub schedule_trip_name: Option<String>,
     pub schedule_type: Option<String>,
@@ -1070,16 +1071,16 @@ pub struct WaybillsInternal {
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
     pub waybill_no: Option<String>,
-    pub entity_id: String,
-    pub schedule_trip_id: String,
-    pub service_type_id: String,
-    pub shift_type_id: String,
-    pub tablet_id: Option<String>,
+    pub entity_id: IdValue,
+    pub schedule_trip_id: IdValue,
+    pub service_type_id: IdValue,
+    pub shift_type_id: IdValue,
+    pub tablet_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct BusShiftTypeInternal {
-    pub shift_type_id: String,
+    pub shift_type_id: IdValue,
     pub shift_type_code: Option<String>,
     pub description: Option<String>,
     pub gtfs_id: String,
@@ -1090,7 +1091,7 @@ pub struct BusShiftTypeInternal {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct BusScheduleTypeInternal {
-    pub schedule_type_id: String,
+    pub schedule_type_id: IdValue,
     pub schedule_type_code: Option<String>,
     pub schedule_type_name: Option<String>,
     pub gtfs_id: String,
@@ -1557,16 +1558,20 @@ const DESIGNATION_CACHE_SECS: u64 = 43200; // 12 hours
 pub struct DBOperatorService {
     pool: PgPool,
     osrm_url: Option<String>,
+    /// When true, auto-injected PKs are numeric (i64) instead of UUID — for DBs
+    /// whose id columns are still `bigint` (pre bigint->text migration).
+    gen_int_for_id: bool,
     device_ids_cache: Arc<RwLock<DeviceIdsCache>>,
     tablet_ids_cache: Arc<RwLock<TabletIdsCache>>,
     designation_cache: Arc<RwLock<DesignationCache>>,
 }
 
 impl DBOperatorService {
-    pub fn new(pool: PgPool, osrm_url: Option<String>) -> Self {
+    pub fn new(pool: PgPool, osrm_url: Option<String>, gen_int_for_id: bool) -> Self {
         Self {
             pool,
             osrm_url: osrm_url.filter(|s| !s.is_empty()),
+            gen_int_for_id,
             device_ids_cache: Arc::new(RwLock::new(DeviceIdsCache {
                 etm_ids: HashMap::new(),
             })),
@@ -1596,7 +1601,7 @@ impl DBOperatorService {
 
         info!("Loading designation cache from DB for gtfs_id={}", gtfs_id);
         let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT designation_id, LOWER(designation_name) FROM designations_internal WHERE deleted = false AND gtfs_id = $1",
+            "SELECT designation_id::text, LOWER(designation_name) FROM designations_internal WHERE deleted = false AND gtfs_id = $1",
         )
         .bind(gtfs_id)
         .fetch_all(&self.pool)
@@ -1654,7 +1659,7 @@ async fn fetch_schedule_meta_for_trip(
          JOIN bus_schedule_internal s ON s.schedule_id = t.schedule_id \
          LEFT JOIN entities_internal e ON e.entity_id = s.entity_id AND e.gtfs_id = s.gtfs_id AND e.deleted = false \
          LEFT JOIN bus_schedule_type_internal st ON st.schedule_type_id = s.schedule_type_id \
-         WHERE t.schedule_trip_id = $1 LIMIT 1",
+         WHERE t.schedule_trip_id::text = $1 LIMIT 1",
     )
     .bind(schedule_trip_id)
     .fetch_optional(pool)
@@ -1690,10 +1695,12 @@ impl OperatorService for DBOperatorService {
         let cols: Vec<&str> = query_params.keys().map(|s| s.as_str()).collect();
         let vals: Vec<&str> = query_params.values().map(|s| s.as_str()).collect();
 
+        // `::text` cast so equality works whether the column is `bigint` or `text`
+        // (filter values arrive as strings) — same as query_rows.
         let extra_clause: String = cols
             .iter()
             .enumerate()
-            .map(|(i, col)| format!("{} = ${}", col, i + 2))
+            .map(|(i, col)| format!("{}::text = ${}", col, i + 2))
             .collect::<Vec<_>>()
             .join(" AND ");
 
@@ -1888,8 +1895,10 @@ impl OperatorService for DBOperatorService {
             _ => return Err(AppError::BadRequest("ID must be a string or number".to_string())),
         };
 
+        // `::text` cast so the id predicate works whether the column is still
+        // `bigint` (prod) or already migrated to `text` — bind the string either way.
         let sql = format!(
-            "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {} = $1 AND gtfs_id = $2 AND deleted = false",
+            "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {}::text = $1 AND gtfs_id = $2 AND deleted = false",
             table, pk
         );
 
@@ -1934,7 +1943,13 @@ impl OperatorService for DBOperatorService {
             if let Some(obj) = val.as_object_mut() {
                 let missing = obj.get(pk).map_or(true, |v| v.is_null());
                 if missing {
-                    obj.insert(pk.to_string(), Value::String(field_generator::gen_random_id()));
+                    // numeric id for still-`bigint` columns (pre-migration), else UUID
+                    let id = if self.gen_int_for_id {
+                        Value::from(field_generator::gen_random_int_id())
+                    } else {
+                        Value::String(field_generator::gen_random_id())
+                    };
+                    obj.insert(pk.to_string(), id);
                 }
             }
         }
@@ -2032,6 +2047,28 @@ impl OperatorService for DBOperatorService {
             table
         );
 
+        // Fetch the table's real column types so we coerce ids correctly across the
+        // bigint->text migration: a numeric id may target a still-`bigint` column
+        // (bind i64) or an already-migrated `text` column (bind String), and the
+        // caller (old or new frontend) may send either a JSON number or string.
+        // (Per-call lookup; cache by table name if this ever gets hot.)
+        let col_types: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("upsert_one_row col types {}: {}", table, e)))?
+        .into_iter()
+        .collect();
+        let is_int_col = |c: &str| {
+            matches!(
+                col_types.get(c).map(|s| s.as_str()),
+                Some("bigint") | Some("integer") | Some("smallint")
+            )
+        };
+
         let mut q = sqlx::query_scalar::<_, Value>(&sql);
 
         for val in &arr {
@@ -2041,9 +2078,21 @@ impl OperatorService for DBOperatorService {
             // bind all cols except gtfs_id first
             for col in cols.iter().filter(|c| **c != "gtfs_id") {
                 let col_val = obj.get(*col).unwrap_or(&Value::Null);
+                let int_col = is_int_col(col);
                 match col_val {
                     Value::String(s) => {
-                        if col.ends_with("_at") || col.starts_with("effective_") {
+                        if int_col {
+                            // numeric string into a bigint/int column -> bind i64
+                            match s.parse::<i64>() {
+                                Ok(i) => q = q.bind(i),
+                                Err(_) => {
+                                    return Err(AppError::BadRequest(format!(
+                                        "Column '{}' is integer but value '{}' is not numeric",
+                                        col, s
+                                    )))
+                                }
+                            }
+                        } else if col.ends_with("_at") || col.starts_with("effective_") {
                             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
                                 q = q.bind(dt.with_timezone(&chrono::Utc));
                             } else if let Ok(dt) = s.parse::<chrono::DateTime<chrono::Utc>>() {
@@ -2056,8 +2105,18 @@ impl OperatorService for DBOperatorService {
                         }
                     }
                     Value::Number(n) => {
-                        if col.ends_with("_id") {
-                            // ID columns are text — coerce number to string
+                        if int_col {
+                            // bigint/int column -> bind the integer directly
+                            if let Some(i) = n.as_i64() {
+                                q = q.bind(i);
+                            } else {
+                                return Err(AppError::BadRequest(format!(
+                                    "Column '{}': numeric value not representable as integer",
+                                    col
+                                )));
+                            }
+                        } else if col.ends_with("_id") {
+                            // already-migrated text id column -> coerce number to string
                             if let Some(i) = n.as_i64() {
                                 q = q.bind(i.to_string());
                             } else if let Some(f) = n.as_f64() {
@@ -2218,7 +2277,7 @@ impl OperatorService for DBOperatorService {
             "SELECT emp_id, first_name, last_name, token_no, mobile_no
              FROM public.employees_internal
              WHERE token_no = $1
-               AND designation_id = $2
+               AND designation_id::text = $2
                AND deleted = false
                AND gtfs_id = $3
              LIMIT 1",
@@ -2238,7 +2297,7 @@ impl OperatorService for DBOperatorService {
             "SELECT emp_id, first_name, last_name, token_no, mobile_no
              FROM public.employees_internal
              WHERE token_no = $1
-               AND designation_id = $2
+               AND designation_id::text = $2
                AND deleted = false
                AND gtfs_id = $3
              LIMIT 1",
@@ -2321,7 +2380,7 @@ impl OperatorService for DBOperatorService {
         sqlx::query_as::<_, EmployeeRow>(
             "SELECT emp_id, first_name, last_name, token_no, mobile_no
              FROM public.employees_internal
-             WHERE designation_id = $1
+             WHERE designation_id::text = $1
                AND deleted = false
                AND gtfs_id = $2
              ORDER BY first_name",
@@ -2347,9 +2406,11 @@ impl OperatorService for DBOperatorService {
             )));
         }
 
-        // First, get the schedule_trip_id for this waybill
+        // First, get the schedule_trip_id for this waybill.
+        // `::text` casts make the id predicates work whether the column is still
+        // `bigint` (prod) or already migrated to `text` (local) — bind a string either way.
         let schedule_trip_id: Option<String> = sqlx::query_scalar(
-            "SELECT schedule_trip_id FROM public.waybills_internal WHERE waybill_id = $1 AND gtfs_id = $2",
+            "SELECT schedule_trip_id::text FROM public.waybills_internal WHERE waybill_id::text = $1 AND gtfs_id = $2",
         )
         .bind(&waybill_id)
         .bind(gtfs_id)
@@ -2359,9 +2420,9 @@ impl OperatorService for DBOperatorService {
 
         // Update the waybill status
         let query_str = if status == "audited" {
-            "UPDATE public.waybills_internal SET status = $1, updated_at = now(), audited_date = now() WHERE waybill_id = $2 AND gtfs_id = $3"
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now(), audited_date = now() WHERE waybill_id::text = $2 AND gtfs_id = $3"
         } else {
-            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3"
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id::text = $2 AND gtfs_id = $3"
         };
         let result = sqlx::query(query_str)
             .bind(status)
@@ -2375,7 +2436,7 @@ impl OperatorService for DBOperatorService {
         // set all is_active_trip to false and is_completed to false in bus_schedule_trip_detail_internal
         if (status == "closed" || status == "audited") && schedule_trip_id.is_some() {
             sqlx::query(
-                "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false WHERE schedule_trip_id = $1 AND gtfs_id = $2",
+                "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
             )
             .bind(schedule_trip_id)
             .bind(gtfs_id)
@@ -2394,7 +2455,7 @@ impl OperatorService for DBOperatorService {
         fleet_no: &str,
     ) -> AppResult<u64> {
         let result = sqlx::query(
-            "UPDATE public.waybills_internal SET vehicle_no = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
+            "UPDATE public.waybills_internal SET vehicle_no = $1, updated_at = now() WHERE waybill_id::text = $2 AND gtfs_id = $3",
         )
         .bind(fleet_no)
         .bind(waybill_id)
@@ -2413,7 +2474,7 @@ impl OperatorService for DBOperatorService {
         tablet_id: &str,
     ) -> AppResult<u64> {
         let result = sqlx::query(
-            "UPDATE public.waybills_internal SET tablet_id = $1, updated_at = now() WHERE waybill_id = $2 AND gtfs_id = $3",
+            "UPDATE public.waybills_internal SET tablet_id = $1, updated_at = now() WHERE waybill_id::text = $2 AND gtfs_id = $3",
         )
         .bind(tablet_id)
         .bind(waybill_id)
