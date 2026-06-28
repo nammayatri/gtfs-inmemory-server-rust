@@ -72,5 +72,6 @@ in {
   preprocessed_data_dir = "./assets",
 
   -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
-  osrm_url = Some "http://localhost:5050"
+  osrm_url = Some "http://localhost:5050",
+  gen_int_for_id = Some True,
 }
