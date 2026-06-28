@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
-    BusScheduleDetail, BusScheduleDetails, GTFSStop, MemoryUsageStats, MinimalEmployee,
+    BusScheduleDetail, BusScheduleDetails, GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee,
     NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
     VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
 };
@@ -3470,19 +3470,23 @@ pub struct RoleQuery {
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillStatusBody {
-    pub waybill_id: String,
+    // accept a JSON number or string id (bigint/text split); normalized via Display
+    #[schema(value_type = String)]
+    pub waybill_id: IdValue,
     pub status: String,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillFleetBody {
-    pub waybill_id: String,
+    #[schema(value_type = String)]
+    pub waybill_id: IdValue,
     pub fleet_no: String,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillTabletBody {
-    pub waybill_id: String,
+    #[schema(value_type = String)]
+    pub waybill_id: IdValue,
     pub tablet_id: String,
 }
 
@@ -4164,7 +4168,7 @@ pub async fn update_waybill_status(
 
     let rows = app_state
         .operator_service
-        .update_waybill_status(&gtfs_id, body.waybill_id.clone(), &body.status)
+        .update_waybill_status(&gtfs_id, body.waybill_id.to_string(), &body.status)
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({
@@ -4192,7 +4196,7 @@ pub async fn update_waybill_fleet(
 
     let rows = app_state
         .operator_service
-        .update_waybill_fleet_number(&gtfs_id, body.waybill_id.clone(), &body.fleet_no)
+        .update_waybill_fleet_number(&gtfs_id, body.waybill_id.to_string(), &body.fleet_no)
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({
@@ -4219,7 +4223,7 @@ pub async fn update_waybill_tablet(
 
     let rows = app_state
         .operator_service
-        .update_waybill_tablet_id(&gtfs_id, body.waybill_id.clone(), &body.tablet_id)
+        .update_waybill_tablet_id(&gtfs_id, body.waybill_id.to_string(), &body.tablet_id)
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({
