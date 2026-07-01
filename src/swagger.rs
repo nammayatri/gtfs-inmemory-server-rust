@@ -2,6 +2,9 @@ use utoipa::OpenApi;
 
 use crate::handlers::routes;
 use crate::models;
+use crate::services::fleet_operator::{
+    EmployeeLoginRequest, EmployeeLoginResponse, EmployeeRegisterRequest, EmployeeRegisterResponse,
+};
 use crate::services::operator::QueryBody;
 
 #[derive(OpenApi)]
@@ -99,6 +102,9 @@ use crate::services::operator::QueryBody;
         routes::fleet_operator_trip_action,
         routes::fleet_operator_current_trip_details,
         routes::fleet_operator_verify,
+        routes::fleet_operator_employee_login,
+        routes::fleet_operator_employee_register,
+        routes::get_waybill_metadata,
     ),
     components(schemas(
         models::NandiRoutesRes,
@@ -135,10 +141,17 @@ use crate::services::operator::QueryBody;
         routes::UpdateWaybillStatusBody,
         routes::UpdateWaybillFleetBody,
         routes::UpdateWaybillTabletBody,
+        models::WaybillMetadataResponse,
         routes::FleetAnchorRequest,
         routes::FleetTripActionRequest,
         routes::FleetCurrentTripDetailsRequest,
         routes::FleetVerifyRequest,
+        EmployeeLoginRequest,
+        EmployeeLoginResponse,
+        EmployeeRegisterRequest,
+        EmployeeRegisterResponse,
+        crate::services::fleet_operator::AuthType,
+        crate::services::fleet_operator::Role,
         QueryBody,
     )),
     tags(
@@ -152,6 +165,7 @@ use crate::services::operator::QueryBody;
         (name = "System", description = "Health and system info endpoints"),
         (name = "Internal Operator", description = "Internal operator CRUD and management endpoints"),
         (name = "Internal Fleet Operator", description = "Internal fleet operator endpoints"),
+        (name = "Waybill", description = "Waybill metadata endpoints"),
     )
 )]
 pub struct ApiDoc;
