@@ -95,6 +95,7 @@ pub struct CurrentTripDetailsResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub enum AuthType {
     Email,
+    EmployeeId,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
@@ -108,6 +109,9 @@ pub enum Role {
 pub struct EmployeeLoginRequest {
     pub auth_type: Option<AuthType>,
     pub email_hash: Option<String>,
+    /// Plain badge/token number for `AuthType::EmployeeId` login (it is a username,
+    /// not a secret, so unlike the email it is not hashed).
+    pub employee_id: Option<String>,
     pub password_hash: Option<String>,
 }
 
@@ -116,6 +120,31 @@ pub struct EmployeeLoginResponse {
     pub verified: bool,
     pub token: Option<String>,
     pub role: Option<Role>,
+}
+
+/// Map a matched `(token_no, designation_name)` login row into a response. Shared by
+/// every `auth_type`: once an employee row is found — by whichever credential — deriving
+/// the badge token and role is identical, so only the lookup query differs per auth type.
+fn login_response_from_row(row: Option<(String, Option<String>)>) -> EmployeeLoginResponse {
+    match row {
+        Some((token, designation_name)) => {
+            let role = designation_name.as_deref().and_then(|n| match n {
+                "driver" => Some(Role::Driver),
+                "conductor" => Some(Role::Conductor),
+                _ => None,
+            });
+            EmployeeLoginResponse {
+                verified: true,
+                token: Some(token),
+                role,
+            }
+        }
+        None => EmployeeLoginResponse {
+            verified: false,
+            token: None,
+            role: None,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -1220,27 +1249,50 @@ impl FleetOperatorService for DBFleetOperatorService {
                     AppError::Internal(e.to_string())
                 })?;
 
-                match row {
-                    Some((token, designation_name)) => {
-                        let role = designation_name.as_deref().and_then(|n| match n {
-                            "driver" => Some(Role::Driver),
-                            "conductor" => Some(Role::Conductor),
-                            _ => None,
-                        });
-                        Ok(EmployeeLoginResponse {
-                            verified: true,
-                            token: Some(token),
-                            role,
-                        })
-                    }
-                    None => Ok(EmployeeLoginResponse {
-                        verified: false,
-                        token: None,
-                        role: None,
-                    }),
-                }
+                Ok(login_response_from_row(row))
             }
-            _ => Ok(EmployeeLoginResponse {
+            Some(AuthType::EmployeeId) => {
+                let employee_id = req.employee_id.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("employee_id is required for employee_id auth".into())
+                })?;
+                let password_hash = req.password_hash.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("password_hash is required for employee_id auth".into())
+                })?;
+
+                // The id a conductor/driver types is their badge number (token_no); the
+                // password is still verified. token_no is also what verify() keys off, so
+                // the token returned here round-trips as the operator badge token.
+                let row: Option<(String, Option<String>)> = sqlx::query_as(
+                    r#"
+                    SELECT e.token_no, LOWER(d.designation_name)
+                    FROM employees_internal e
+                    LEFT JOIN designations_internal d
+                      ON d.designation_id = e.designation_id
+                     AND d.gtfs_id = e.gtfs_id
+                     AND d.deleted = false
+                    WHERE e.token_no = $1
+                      AND e.password_hash = $2
+                      AND e.gtfs_id = $3
+                      AND e.deleted = false
+                    LIMIT 1
+                    "#,
+                )
+                .bind(employee_id)
+                .bind(password_hash)
+                .bind(gtfs_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "login failed for employee_id={} gtfs_id={}: {}",
+                        employee_id, gtfs_id, e
+                    );
+                    AppError::Internal(e.to_string())
+                })?;
+
+                Ok(login_response_from_row(row))
+            }
+            None => Ok(EmployeeLoginResponse {
                 verified: false,
                 token: None,
                 role: None,
@@ -1342,5 +1394,142 @@ impl FleetOperatorService for DBFleetOperatorService {
             success: true,
             token_no: req.token_no.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── login_response_from_row: shared response shaping ─────────────────────────
+    //
+    // This pure function backs both the Email and EmployeeId auth branches: once a row is
+    // found, deriving the token and role is identical, so testing it here covers the shared
+    // response-shaping logic for every auth_type without needing a database.
+
+    #[test]
+    fn login_response_maps_driver_designation() {
+        let res = login_response_from_row(Some(("BADGE-1".into(), Some("driver".into()))));
+        assert!(res.verified);
+        assert_eq!(res.token.as_deref(), Some("BADGE-1"));
+        assert!(matches!(res.role, Some(Role::Driver)));
+    }
+
+    #[test]
+    fn login_response_maps_conductor_designation() {
+        let res = login_response_from_row(Some(("BADGE-2".into(), Some("conductor".into()))));
+        assert!(res.verified);
+        assert_eq!(res.token.as_deref(), Some("BADGE-2"));
+        assert!(matches!(res.role, Some(Role::Conductor)));
+    }
+
+    #[test]
+    fn login_response_verified_with_no_role_for_unknown_designation() {
+        // A matched employee with a designation we don't map (or none) is still a valid
+        // login — verified is true and a token is returned, only the role is absent.
+        let res = login_response_from_row(Some(("BADGE-3".into(), Some("supervisor".into()))));
+        assert!(res.verified);
+        assert_eq!(res.token.as_deref(), Some("BADGE-3"));
+        assert!(res.role.is_none());
+
+        let res = login_response_from_row(Some(("BADGE-4".into(), None)));
+        assert!(res.verified);
+        assert_eq!(res.token.as_deref(), Some("BADGE-4"));
+        assert!(res.role.is_none());
+    }
+
+    #[test]
+    fn login_response_unverified_when_no_row() {
+        // No matching credential row -> not verified, no token, no role.
+        let res = login_response_from_row(None);
+        assert!(!res.verified);
+        assert!(res.token.is_none());
+        assert!(res.role.is_none());
+    }
+
+    // ── login: request validation guards ─────────────────────────────────────────
+    //
+    // Each auth_type rejects a missing credential with BadRequest *before* running any
+    // query. A lazily-connected pool never opens a socket until a query is executed, so
+    // these guard paths are fully testable without a live database.
+
+    fn lazy_service() -> DBFleetOperatorService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://user:pass@localhost/db")
+            .expect("lazy pool construction must not attempt to connect");
+        DBFleetOperatorService::new(pool)
+    }
+
+    fn assert_bad_request(err: AppError, expected_substring: &str) {
+        match err {
+            AppError::BadRequest(msg) => assert!(
+                msg.contains(expected_substring),
+                "expected BadRequest containing {expected_substring:?}, got {msg:?}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_email_requires_email_hash() {
+        let req = EmployeeLoginRequest {
+            auth_type: Some(AuthType::Email),
+            email_hash: None,
+            employee_id: None,
+            password_hash: Some("pw".into()),
+        };
+        let err = lazy_service().login("gtfs", &req).await.unwrap_err();
+        assert_bad_request(err, "email_hash is required");
+    }
+
+    #[tokio::test]
+    async fn login_email_requires_password_hash() {
+        let req = EmployeeLoginRequest {
+            auth_type: Some(AuthType::Email),
+            email_hash: Some("eh".into()),
+            employee_id: None,
+            password_hash: None,
+        };
+        let err = lazy_service().login("gtfs", &req).await.unwrap_err();
+        assert_bad_request(err, "password_hash is required for email auth");
+    }
+
+    #[tokio::test]
+    async fn login_employee_id_requires_employee_id() {
+        let req = EmployeeLoginRequest {
+            auth_type: Some(AuthType::EmployeeId),
+            email_hash: None,
+            employee_id: None,
+            password_hash: Some("pw".into()),
+        };
+        let err = lazy_service().login("gtfs", &req).await.unwrap_err();
+        assert_bad_request(err, "employee_id is required");
+    }
+
+    #[tokio::test]
+    async fn login_employee_id_requires_password_hash() {
+        let req = EmployeeLoginRequest {
+            auth_type: Some(AuthType::EmployeeId),
+            email_hash: None,
+            employee_id: Some("BADGE-9".into()),
+            password_hash: None,
+        };
+        let err = lazy_service().login("gtfs", &req).await.unwrap_err();
+        assert_bad_request(err, "password_hash is required for employee_id auth");
+    }
+
+    #[tokio::test]
+    async fn login_without_auth_type_is_unverified() {
+        // A request with no auth_type is not an error — it resolves to an unverified
+        // response without ever touching the database.
+        let req = EmployeeLoginRequest {
+            auth_type: None,
+            email_hash: None,
+            employee_id: None,
+            password_hash: None,
+        };
+        let res = lazy_service().login("gtfs", &req).await.unwrap();
+        assert!(!res.verified);
+        assert!(res.token.is_none());
+        assert!(res.role.is_none());
     }
 }
