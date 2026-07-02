@@ -3779,7 +3779,7 @@ pub async fn nearby_stops(
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
-    let radius = query.radius.unwrap_or(500.0);
+    let radius = query.radius.unwrap_or(500.0).clamp(1.0, 5000.0);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let res = app_state
         .operator_service
