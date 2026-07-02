@@ -2552,24 +2552,45 @@ impl OperatorService for DBOperatorService {
         limit: i64,
         with_routes: bool,
     ) -> AppResult<Vec<EnrichedStop>> {
-        // PostGIS geography: ST_DWithin uses the spatial index (stop_geom_idx) and computes
-        // great-circle distance in metres on the spheroid. $2=lat $3=lon $4=radius_m $5=limit.
+        // No PostGIS dependency: a cheap lat/lon bounding-box prefilter narrows candidates,
+        // then the great-circle (haversine) distance is computed in SQL for exact filtering and
+        // ordering. Bounding box is computed here to keep the query index-friendly.
+        // $1=gtfs_id $2=lat $3=lon $4=radius_m $5=limit $6..$9=bbox (min/max lat, min/max lon).
+        const M_PER_DEG_LAT: f64 = 111_320.0;
+        let lat_delta = radius_m / M_PER_DEG_LAT;
+        // Guard against division by ~0 near the poles; clamp cos(lat) to a small floor.
+        let cos_lat = lat.to_radians().cos().abs().max(1e-6);
+        let lon_delta = radius_m / (M_PER_DEG_LAT * cos_lat);
+        let (min_lat, max_lat) = (lat - lat_delta, lat + lat_delta);
+        let (min_lon, max_lon) = (lon - lon_delta, lon + lon_delta);
         let rows = sqlx::query_as::<_, EnrichedStopRow>(
-            "SELECT s.bus_stop_id, s.bus_stop_code, s.bus_stop_name, s.latitude_current, s.longitude_current, \
-                s.source, s.status, \
-                (SELECT COUNT(DISTINCT rp.route_id) FROM route_point_internal rp \
-                   WHERE rp.bus_stop_id = s.bus_stop_id AND rp.gtfs_id = s.gtfs_id AND rp.deleted = false) AS route_count, \
-                ST_Distance(s.geom::geography, ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography) AS distance_m \
-             FROM stop_internal s \
-             WHERE s.gtfs_id = $1 AND s.deleted = false AND LOWER(COALESCE(s.status,'active')) <> 'inactive' \
-               AND ST_DWithin(s.geom::geography, ST_SetSRID(ST_MakePoint($3, $2), 4326)::geography, $4) \
-             ORDER BY distance_m LIMIT $5",
+            "SELECT * FROM ( \
+               SELECT s.bus_stop_id, s.bus_stop_code, s.bus_stop_name, s.latitude_current, s.longitude_current, \
+                 s.source, s.status, \
+                 (SELECT COUNT(DISTINCT rp.route_id) FROM route_point_internal rp \
+                    WHERE rp.bus_stop_id = s.bus_stop_id AND rp.gtfs_id = s.gtfs_id AND rp.deleted = false) AS route_count, \
+                 6371000.0 * acos(LEAST(1.0, GREATEST(-1.0, \
+                   sin(radians($2)) * sin(radians(s.latitude_current)) \
+                   + cos(radians($2)) * cos(radians(s.latitude_current)) \
+                     * cos(radians(s.longitude_current) - radians($3)) \
+                 ))) AS distance_m \
+               FROM stop_internal s \
+               WHERE s.gtfs_id = $1 AND s.deleted = false AND LOWER(COALESCE(s.status,'active')) <> 'inactive' \
+                 AND s.latitude_current BETWEEN $6 AND $7 \
+                 AND s.longitude_current BETWEEN $8 AND $9 \
+             ) t \
+             WHERE t.distance_m <= $4 \
+             ORDER BY t.distance_m LIMIT $5",
         )
         .bind(gtfs_id)
         .bind(lat)
         .bind(lon)
         .bind(radius_m)
         .bind(limit)
+        .bind(min_lat)
+        .bind(max_lat)
+        .bind(min_lon)
+        .bind(max_lon)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::DbError(format!("nearby_stops: {}", e)))?;
