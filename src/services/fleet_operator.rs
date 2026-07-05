@@ -927,7 +927,7 @@ impl DBFleetOperatorService {
         // Batch query for uncached ids (parameterized, no injection risk)
         let placeholders: Vec<String> = (1..=uncached.len()).map(|i| format!("${}", i)).collect();
         let sql = format!(
-            "SELECT route_id, route_number, route_name FROM route_internal WHERE route_id IN ({})",
+            "SELECT route_id::TEXT, route_number, route_name FROM route_internal WHERE route_id::text IN ({})",
             placeholders.join(",")
         );
 
