@@ -1,7 +1,7 @@
 {
-  "version": "a9e838f79e90",
-  "build_commit": "712e15",
-  "generated_at": "2026-07-02T21:06:24Z",
+  "version": "aa171d6f164e",
+  "build_commit": "d5ef04",
+  "generated_at": "2026-07-06T09:08:48Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
@@ -14,26 +14,28 @@
     "kochi_metro",
     "kolkata_bus",
     "kolkata_metro",
-    "mumbai_metro",
+    "mumbai_MMMOPL_metro",
+    "mumbai_MMOCL_metro",
+    "mumbai_MMRCL_metro",
     "mumbai_suburban",
     "sambalpur_bus"
   ],
   "files": {
     "routes.json": {
-      "sha256": "ae9940e85e78b23554405038965c40990a014a3503d7eb3fb112406083329731",
-      "count": 8260
+      "sha256": "9818570dfeefcb3612c8da654d0bb5e380771005f50cf60c0f3b24b08f088af9",
+      "count": 8263
     },
     "stops.json": {
-      "sha256": "ddec82651e7273ac8e64e74efe19ef7c612526f977947edbea30f67ae72b5829",
-      "count": 31832
+      "sha256": "48dc038ffc4494a9cd1ea9e913049ccd7b7adfd02bbfaa3e39068b6e55c492b1",
+      "count": 31859
     },
     "patterns.json": {
-      "sha256": "cf4b2cc1c7b2e0a1df68cd9dd2acdc72249e56be180b0ea92a4f005fb42d6986",
-      "count": 8372
+      "sha256": "5184626d7659a3d2862d84135f5068b085b6b5ee7a9078be2c81bcf3b74800d3",
+      "count": 8375
     },
     "route_stops.json": {
-      "sha256": "af9de83b6ae38cbf68974d2b8e2c21d063df8f41c8a0e59a992a82604391f8db",
-      "count": 208798
+      "sha256": "59831f81bbc573bc3d856710f695a96d9fdb33e00ce266624de09b8b7665c487",
+      "count": 208815
     },
     "trip_stoptimes/bangalore_metro.json": {
       "sha256": "e639d9a639c089d51cfd85efadcda52c2b5a277e8c6a77b159d5b4c4ea8a17f4",
@@ -79,9 +81,17 @@
       "sha256": "d84a6561c5b6415fb9d63ab1738ba502ff0fed7fcaf75572f38c6d2fa3ec0d19",
       "count": 1652
     },
-    "trip_stoptimes/mumbai_metro.json": {
-      "sha256": "5af5a06131992c5305ea6bc75aa676792f4497dcf41e31c8711bca365b23931b",
-      "count": 279
+    "trip_stoptimes/mumbai_MMMOPL_metro.json": {
+      "sha256": "76fe2c88a106a372b19d032f2d2a8df9faa744db113b64820164e88da3042ca2",
+      "count": 1
+    },
+    "trip_stoptimes/mumbai_MMOCL_metro.json": {
+      "sha256": "7d7a99bde7d9b1720aec64d98efb1ffed791d8bf1d9d08bb6b50ddd84edf8244",
+      "count": 4
+    },
+    "trip_stoptimes/mumbai_MMRCL_metro.json": {
+      "sha256": "ea866668bf79e7137ed1f14332854cd167940fede157051436514325aefba602",
+      "count": 1
     },
     "trip_stoptimes/mumbai_suburban.json": {
       "sha256": "8a374cba7e8b57f9cb8e9c43300984dd7014e2a51e3cc210c7a41fdfa928d2d7",
@@ -159,11 +169,23 @@
       "patterns": 20,
       "route_stop_mappings": 114
     },
-    "mumbai_metro": {
-      "routes": 3,
-      "stops": 50,
-      "patterns": 3,
-      "route_stop_mappings": 62
+    "mumbai_MMMOPL_metro": {
+      "routes": 1,
+      "stops": 12,
+      "patterns": 1,
+      "route_stop_mappings": 12
+    },
+    "mumbai_MMOCL_metro": {
+      "routes": 4,
+      "stops": 38,
+      "patterns": 4,
+      "route_stop_mappings": 40
+    },
+    "mumbai_MMRCL_metro": {
+      "routes": 1,
+      "stops": 27,
+      "patterns": 1,
+      "route_stop_mappings": 27
     },
     "mumbai_suburban": {
       "routes": 2,
