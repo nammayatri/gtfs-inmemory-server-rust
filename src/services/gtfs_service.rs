@@ -98,6 +98,13 @@ impl GTFSService {
             operator_service: std::sync::OnceLock::new(),
         };
 
+        if let Err(e) = service.load_initial_data().await {
+            warn!(
+                "Failed to load initial GTFS data (starting with empty data): {}",
+                e
+            );
+        }
+
         Ok(service)
     }
 

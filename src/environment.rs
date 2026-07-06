@@ -188,18 +188,11 @@ impl AppState {
                 match create_database_pool(&app_config).await {
                     Ok(pool) => {
                         info!("Successfully connected to the local database.");
-                        let vehicle_reader =
-                            Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                        // operator and internal reader use ONLY the internal pool
-                        let (
-                            operator_svc,
-                            vehicle_reader_internal,
-                            fleet_op_svc,
-                            internal_pool_opt,
-                        ): (
+                        // Resolve internal pool first so vehicle_reader, employee_reader,
+                        // and fleet_op_svc can all share it.
+                        let (operator_svc, vehicle_reader_internal, internal_pool_opt): (
                             Arc<dyn OperatorService>,
                             Arc<dyn VehicleDataReaderInternal>,
-                            Arc<dyn FleetOperatorService>,
                             Option<PgPool>,
                         ) = if let Some(internal_url) = &app_config.internal_database_url {
                             info!("Connecting to internal database (local)...");
@@ -211,9 +204,6 @@ impl AppState {
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
                                         )),
-                                        Arc::new(DBFleetOperatorService::new(
-                                            internal_pool.clone(),
-                                        )),
                                         Some(internal_pool),
                                     )
                                 }
@@ -223,8 +213,6 @@ impl AppState {
                                         Arc::new(MockOperatorService::new()),
                                         Arc::new(MockDBVehicleReaderInternal::new())
                                             as Arc<dyn VehicleDataReaderInternal>,
-                                        Arc::new(MockFleetOperatorService::new())
-                                            as Arc<dyn FleetOperatorService>,
                                         None,
                                     )
                                 }
@@ -235,16 +223,27 @@ impl AppState {
                                 Arc::new(MockOperatorService::new()),
                                 Arc::new(MockDBVehicleReaderInternal::new())
                                     as Arc<dyn VehicleDataReaderInternal>,
-                                Arc::new(MockFleetOperatorService::new())
-                                    as Arc<dyn FleetOperatorService>,
                                 None,
                             )
                         };
-                        let employee_reader = Arc::new(DBEmployeeReader::new(
+                        let vehicle_reader = Arc::new(DBVehicleReader::new(
                             pool.clone(),
-                            internal_pool_opt,
+                            internal_pool_opt.clone(),
                             &app_config,
                         ));
+                        let employee_reader = Arc::new(DBEmployeeReader::new(
+                            pool.clone(),
+                            internal_pool_opt.clone(),
+                            &app_config,
+                        ));
+                        let fleet_op_svc: Arc<dyn FleetOperatorService> = match &internal_pool_opt {
+                            Some(internal_pool) => Arc::new(DBFleetOperatorService::new(
+                                internal_pool.clone(),
+                                employee_reader.clone(),
+                                vehicle_reader.clone(),
+                            )),
+                            None => Arc::new(MockFleetOperatorService::new()),
+                        };
                         (
                             vehicle_reader,
                             employee_reader,
@@ -272,12 +271,11 @@ impl AppState {
                 let pool = create_database_pool(&app_config)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
-                let vehicle_reader = Arc::new(DBVehicleReader::new(pool.clone(), &app_config));
-                // operator and internal reader use ONLY the internal pool
-                let (operator_svc, vehicle_reader_internal, fleet_op_svc, internal_pool_opt): (
+                // Resolve internal pool first so vehicle_reader, employee_reader,
+                // and fleet_op_svc can all share it.
+                let (operator_svc, vehicle_reader_internal, internal_pool_opt): (
                     Arc<dyn OperatorService>,
                     Arc<dyn VehicleDataReaderInternal>,
-                    Arc<dyn FleetOperatorService>,
                     Option<PgPool>,
                 ) = if let Some(internal_url) = &app_config.internal_database_url {
                     info!("Connecting to internal database (production)...");
@@ -289,7 +287,6 @@ impl AppState {
                     (
                         Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone(), app_config.gen_int_for_id.unwrap_or(false))),
                         Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
-                        Arc::new(DBFleetOperatorService::new(internal_pool.clone())),
                         Some(internal_pool),
                     )
                 } else {
@@ -298,15 +295,27 @@ impl AppState {
                         Arc::new(MockOperatorService::new()),
                         Arc::new(MockDBVehicleReaderInternal::new())
                             as Arc<dyn VehicleDataReaderInternal>,
-                        Arc::new(MockFleetOperatorService::new()) as Arc<dyn FleetOperatorService>,
                         None,
                     )
                 };
-                let employee_reader = Arc::new(DBEmployeeReader::new(
+                let vehicle_reader = Arc::new(DBVehicleReader::new(
                     pool.clone(),
-                    internal_pool_opt,
+                    internal_pool_opt.clone(),
                     &app_config,
                 ));
+                let employee_reader = Arc::new(DBEmployeeReader::new(
+                    pool.clone(),
+                    internal_pool_opt.clone(),
+                    &app_config,
+                ));
+                let fleet_op_svc: Arc<dyn FleetOperatorService> = match &internal_pool_opt {
+                    Some(internal_pool) => Arc::new(DBFleetOperatorService::new(
+                        internal_pool.clone(),
+                        employee_reader.clone(),
+                        vehicle_reader.clone(),
+                    )),
+                    None => Arc::new(MockFleetOperatorService::new()),
+                };
                 (
                     vehicle_reader,
                     employee_reader,

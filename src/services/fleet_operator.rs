@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::tools::error::{AppError, AppResult};
 
@@ -95,27 +95,92 @@ pub struct CurrentTripDetailsResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub enum AuthType {
     Email,
+    MobileNumber,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Driver,
     Conductor,
+    Manager,
+    #[serde(rename = "driver_conductor")]
+    DriverConductor,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EmployeeLoginError {
+    PersonNotFound,
+    TokenMismatch,
+    EmailAuthFailed,
+    MissingMobileNo,
+    MissingEmailHash,
+    MissingPasswordHash,
+    MissingAuthType,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EmployeeLoginRequest {
     pub auth_type: Option<AuthType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mobile_no: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_no: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct EmployeeLoginResponse {
     pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<EmployeeLoginError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::models::EmployeeMetadata>,
+}
+
+/// Maps a designation_name (case-insensitive) to a `Role`.
+///
+/// Real-world designations seen so far:
+/// - primary `designations`: "Driver", "Conductor", "Driver-Conductor", "Admin Manager", "Admin Staff"
+/// - `designations_internal`: "driver", "conductor", "depot_manager"
+///
+/// Rules:
+/// 1. Empty / missing → `None`.
+/// 2. Dual-role ("driver-conductor" / "driver_conductor") is recognised *before* the
+///    single-role substrings so it doesn't get swallowed by the "conductor" branch.
+/// 3. Any title containing "admin" → `None`. This intentionally excludes office roles
+///    like "Admin Manager" and "Admin Staff" from the operational `Role::Manager` bucket
+///    (which is reserved for depot managers).
+/// 4. Otherwise substring match on "conductor" → Conductor, "driver" → Driver,
+///    "manager" → Manager. Anything else → `None`.
+fn map_designation_to_role(designation_name: Option<&str>) -> Option<Role> {
+    let name = designation_name?.trim().to_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    if name.contains("driver-conductor") || name.contains("driver_conductor") {
+        return Some(Role::DriverConductor);
+    }
+    if name.contains("admin") {
+        return None;
+    }
+    if name.contains("conductor") {
+        Some(Role::Conductor)
+    } else if name.contains("driver") {
+        Some(Role::Driver)
+    } else if name.contains("manager") {
+        Some(Role::Manager)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -177,6 +242,7 @@ pub trait FleetOperatorService: Send + Sync {
         &self,
         gtfs_id: &str,
         req: &EmployeeLoginRequest,
+        with_metadata: bool,
     ) -> AppResult<EmployeeLoginResponse>;
 
     async fn register(
@@ -264,6 +330,7 @@ impl FleetOperatorService for MockFleetOperatorService {
         &self,
         _gtfs_id: &str,
         _req: &EmployeeLoginRequest,
+        _with_metadata: bool,
     ) -> AppResult<EmployeeLoginResponse> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -288,14 +355,211 @@ const ROUTE_CACHE_TTL_SECS: u64 = 6 * 3600;
 pub struct DBFleetOperatorService {
     pool: PgPool,
     route_info_cache: Arc<RwLock<HashMap<String, (RouteInfo, SystemTime)>>>,
+    employee_reader: Arc<dyn crate::services::db_employee_reader::EmployeeReader>,
+    vehicle_reader: Arc<dyn crate::services::db_vehicle_reader::VehicleDataReader>,
 }
 
 impl DBFleetOperatorService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(
+        pool: PgPool,
+        employee_reader: Arc<dyn crate::services::db_employee_reader::EmployeeReader>,
+        vehicle_reader: Arc<dyn crate::services::db_vehicle_reader::VehicleDataReader>,
+    ) -> Self {
         Self {
             pool,
             route_info_cache: Arc::new(RwLock::new(HashMap::new())),
+            employee_reader,
+            vehicle_reader,
         }
+    }
+
+    async fn login_email(
+        &self,
+        gtfs_id: &str,
+        req: &EmployeeLoginRequest,
+    ) -> AppResult<EmployeeLoginResponse> {
+        let email_hash = match req.email_hash.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Ok(EmployeeLoginResponse {
+                    verified: false,
+                    token: None,
+                    role: None,
+                    error: Some(EmployeeLoginError::MissingEmailHash),
+                    metadata: None,
+                });
+            }
+        };
+        let password_hash = match req.password_hash.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Ok(EmployeeLoginResponse {
+                    verified: false,
+                    token: None,
+                    role: None,
+                    error: Some(EmployeeLoginError::MissingPasswordHash),
+                    metadata: None,
+                });
+            }
+        };
+
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT e.token_no, LOWER(d.designation_name)
+            FROM employees_internal e
+            LEFT JOIN designations_internal d
+              ON d.designation_id = e.designation_id
+             AND d.gtfs_id = e.gtfs_id
+             AND d.deleted = false
+            WHERE e.email_hash = $1
+              AND e.password_hash = $2
+              AND e.gtfs_id = $3
+              AND e.deleted = false
+            LIMIT 1
+            "#,
+        )
+        .bind(email_hash)
+        .bind(password_hash)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!("login failed for gtfs_id={}: {}", gtfs_id, e);
+            AppError::Internal(e.to_string())
+        })?;
+
+        match row {
+            Some((token, designation_name)) => {
+                // Email auth currently masks Manager and DriverConductor → None until the
+                // driver-app Haskell side (Registration.hs:`Just GimsConductor → BUS_CONDUCTOR;
+                // _ → BUS_DRIVER`) is updated to handle the new variants. Remove these filters
+                // once that lands.
+                let role = match map_designation_to_role(designation_name.as_deref()) {
+                    Some(Role::Manager) | Some(Role::DriverConductor) => None,
+                    other => other,
+                };
+                Ok(EmployeeLoginResponse {
+                    verified: true,
+                    token: Some(token),
+                    role,
+                    error: None,
+                    metadata: None,
+                })
+            }
+            None => Ok(EmployeeLoginResponse {
+                verified: false,
+                token: None,
+                role: None,
+                error: Some(EmployeeLoginError::EmailAuthFailed),
+                metadata: None,
+            }),
+        }
+    }
+
+    async fn login_mobile_number(
+        &self,
+        gtfs_id: &str,
+        req: &EmployeeLoginRequest,
+        with_metadata: bool,
+    ) -> AppResult<EmployeeLoginResponse> {
+        let mobile_no = match req.mobile_no.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Ok(EmployeeLoginResponse {
+                    verified: false,
+                    token: None,
+                    role: None,
+                    error: Some(EmployeeLoginError::MissingMobileNo),
+                    metadata: None,
+                });
+            }
+        };
+
+        // Primary feed → try primary DB first, fall back to internal.
+        // Other gtfs_id → internal only.
+        let row = if gtfs_id == crate::services::PRIMARY_GTFS_ID {
+            match self
+                .employee_reader
+                .lookup_by_mobile_primary(mobile_no)
+                .await?
+            {
+                Some(r) => Some(r),
+                None => {
+                    self.employee_reader
+                        .lookup_by_mobile_internal(gtfs_id, mobile_no)
+                        .await?
+                }
+            }
+        } else {
+            self.employee_reader
+                .lookup_by_mobile_internal(gtfs_id, mobile_no)
+                .await?
+        };
+
+        let row = match row {
+            Some(r) => r,
+            None => {
+                return Ok(EmployeeLoginResponse {
+                    verified: false,
+                    token: None,
+                    role: None,
+                    error: Some(EmployeeLoginError::PersonNotFound),
+                    metadata: None,
+                });
+            }
+        };
+
+        // Optional token verification
+        if let Some(req_token) = req.token_no.as_deref().map(str::trim) {
+            if !req_token.is_empty() && row.token_no.as_deref() != Some(req_token) {
+                return Ok(EmployeeLoginResponse {
+                    verified: false,
+                    token: None,
+                    role: None,
+                    error: Some(EmployeeLoginError::TokenMismatch),
+                    metadata: None,
+                });
+            }
+        }
+
+        let role = map_designation_to_role(row.designation_name.as_deref());
+
+        let metadata = if with_metadata {
+            // Depot lookup is optional context; never fail the login because of it.
+            // Surface the failure in logs instead of swallowing silently so a
+            // backend outage doesn't masquerade as "employee has no depot".
+            let depot = match self
+                .vehicle_reader
+                .get_depot_info(gtfs_id, row.entity_id)
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "depot lookup failed for gtfs_id={} entity_id={}: {}",
+                        gtfs_id, row.entity_id, e
+                    );
+                    None
+                }
+            };
+            Some(crate::models::EmployeeMetadata {
+                first_name: row.first_name.clone(),
+                last_name: row.last_name.clone(),
+                mobile_no: row.mobile_no.clone(),
+                depot_name: depot.as_ref().map(|d| d.name.clone()),
+                depot_code: depot.and_then(|d| d.code),
+            })
+        } else {
+            None
+        };
+
+        Ok(EmployeeLoginResponse {
+            verified: true,
+            token: row.token_no,
+            role,
+            error: None,
+            metadata,
+        })
     }
 
     // ── Waybill resolution ───────────────────────────────────────────────────
@@ -1185,65 +1449,19 @@ impl FleetOperatorService for DBFleetOperatorService {
         &self,
         gtfs_id: &str,
         req: &EmployeeLoginRequest,
+        with_metadata: bool,
     ) -> AppResult<EmployeeLoginResponse> {
         match req.auth_type {
-            Some(AuthType::Email) => {
-                let email_hash = req.email_hash.as_ref().ok_or_else(|| {
-                    AppError::BadRequest("email_hash is required for email auth".into())
-                })?;
-                let password_hash = req.password_hash.as_ref().ok_or_else(|| {
-                    AppError::BadRequest("password_hash is required for email auth".into())
-                })?;
-
-                let row: Option<(String, Option<String>)> = sqlx::query_as(
-                    r#"
-                    SELECT e.token_no, LOWER(d.designation_name)
-                    FROM employees_internal e
-                    LEFT JOIN designations_internal d
-                      ON d.designation_id = e.designation_id
-                     AND d.gtfs_id = e.gtfs_id
-                     AND d.deleted = false
-                    WHERE e.email_hash = $1
-                      AND e.password_hash = $2
-                      AND e.gtfs_id = $3
-                      AND e.deleted = false
-                    LIMIT 1
-                    "#,
-                )
-                .bind(email_hash)
-                .bind(password_hash)
-                .bind(gtfs_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| {
-                    error!("login failed for gtfs_id={}: {}", gtfs_id, e);
-                    AppError::Internal(e.to_string())
-                })?;
-
-                match row {
-                    Some((token, designation_name)) => {
-                        let role = designation_name.as_deref().and_then(|n| match n {
-                            "driver" => Some(Role::Driver),
-                            "conductor" => Some(Role::Conductor),
-                            _ => None,
-                        });
-                        Ok(EmployeeLoginResponse {
-                            verified: true,
-                            token: Some(token),
-                            role,
-                        })
-                    }
-                    None => Ok(EmployeeLoginResponse {
-                        verified: false,
-                        token: None,
-                        role: None,
-                    }),
-                }
+            Some(AuthType::Email) => self.login_email(gtfs_id, req).await,
+            Some(AuthType::MobileNumber) => {
+                self.login_mobile_number(gtfs_id, req, with_metadata).await
             }
-            _ => Ok(EmployeeLoginResponse {
+            None => Ok(EmployeeLoginResponse {
                 verified: false,
                 token: None,
                 role: None,
+                error: Some(EmployeeLoginError::MissingAuthType),
+                metadata: None,
             }),
         }
     }
@@ -1258,6 +1476,8 @@ impl FleetOperatorService for DBFleetOperatorService {
                 let name = match role {
                     Role::Driver => "driver",
                     Role::Conductor => "conductor",
+                    Role::Manager => "manager",
+                    Role::DriverConductor => "driver-conductor",
                 };
                 let id: Option<String> = sqlx::query_scalar(
                     r#"
@@ -1342,5 +1562,512 @@ impl FleetOperatorService for DBFleetOperatorService {
             success: true,
             token_no: req.token_no.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::db_employee_reader::{EmployeeLookupRow, EmployeeReader};
+    use crate::services::db_vehicle_reader::{DepotInfo, MockDBVehicleReader, VehicleDataReader};
+    use crate::services::PRIMARY_GTFS_ID;
+    use async_trait::async_trait;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── Stubs ────────────────────────────────────────────────────────────────
+
+    /// Records call counts and returns canned rows per lookup function.
+    struct StubEmployeeReader {
+        primary_row: Option<EmployeeLookupRow>,
+        internal_row: Option<EmployeeLookupRow>,
+        primary_calls: AtomicUsize,
+        internal_calls: AtomicUsize,
+    }
+
+    impl StubEmployeeReader {
+        fn new(primary: Option<EmployeeLookupRow>, internal: Option<EmployeeLookupRow>) -> Self {
+            Self {
+                primary_row: primary,
+                internal_row: internal,
+                primary_calls: AtomicUsize::new(0),
+                internal_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmployeeReader for StubEmployeeReader {
+        async fn get_employee_by_phone(
+            &self,
+            _phone: &str,
+        ) -> AppResult<Option<crate::models::MinimalEmployee>> {
+            Ok(None)
+        }
+        async fn lookup_by_mobile_primary(
+            &self,
+            _mobile_no: &str,
+        ) -> AppResult<Option<EmployeeLookupRow>> {
+            self.primary_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.primary_row.clone())
+        }
+        async fn lookup_by_mobile_internal(
+            &self,
+            _gtfs_id: &str,
+            _mobile_no: &str,
+        ) -> AppResult<Option<EmployeeLookupRow>> {
+            self.internal_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.internal_row.clone())
+        }
+    }
+
+    struct StubVehicleReader {
+        depot: Option<DepotInfo>,
+    }
+
+    #[async_trait]
+    impl VehicleDataReader for StubVehicleReader {
+        // Only get_depot_info is exercised; everything else proxies to the mock's behaviour.
+        async fn get_depot_info(
+            &self,
+            _gtfs_id: &str,
+            _entity_id: i64,
+        ) -> AppResult<Option<DepotInfo>> {
+            Ok(self.depot.clone())
+        }
+        // Delegate the rest to MockDBVehicleReader's stub responses by re-implementing as
+        // "not used in these tests" stubs.
+        async fn get_vehicle_data(
+            &self,
+            _vehicle_no: &str,
+            _trip_number: Option<i32>,
+        ) -> AppResult<crate::models::VehicleDataWithRouteId> {
+            unreachable!("not used in login tests")
+        }
+        async fn get_vehicles_by_ids(
+            &self,
+            _vehicle_nos: Vec<String>,
+        ) -> AppResult<Vec<crate::models::VehicleDataWithRouteId>> {
+            Ok(Vec::new())
+        }
+        async fn get_all_vehicles(&self) -> AppResult<Vec<crate::models::VehicleData>> {
+            Ok(Vec::new())
+        }
+        async fn get_vehicles_by_service_type(
+            &self,
+            _service_type: &str,
+        ) -> AppResult<Vec<crate::models::VehicleData>> {
+            Ok(Vec::new())
+        }
+        async fn search_vehicles(
+            &self,
+            _query: &str,
+        ) -> AppResult<Vec<crate::models::VehicleData>> {
+            Ok(Vec::new())
+        }
+        async fn get_vehicle_count(&self) -> AppResult<i64> {
+            Ok(0)
+        }
+        async fn get_vehicles_by_depot_name(
+            &self,
+            _depot_name: &str,
+        ) -> AppResult<Vec<crate::models::DepotVehicleSummary>> {
+            Ok(Vec::new())
+        }
+        async fn get_vehicles_by_depot_id(
+            &self,
+            _depot_id: &str,
+        ) -> AppResult<Vec<crate::models::DepotVehicleSummary>> {
+            Ok(Vec::new())
+        }
+        async fn get_depot_names(&self) -> AppResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_depot_ids(&self) -> AppResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_depot_name_by_id(&self, _depot_id: String) -> AppResult<String> {
+            Err(AppError::NotFound("n/a".into()))
+        }
+        async fn clear_depot_cache(&self) -> AppResult<()> {
+            Ok(())
+        }
+        async fn get_vehicle_operation_data(
+            &self,
+            _fleet_no: &str,
+        ) -> AppResult<crate::models::VehicleOperationData> {
+            Err(AppError::NotFound("n/a".into()))
+        }
+        async fn verify_vehicle(&self, _vehicle_no: &str) -> AppResult<bool> {
+            Ok(false)
+        }
+        async fn get_chennai_waybills_by_route_id(
+            &self,
+            _route_id: &str,
+            _vehicle_number: Option<&str>,
+        ) -> AppResult<Vec<crate::models::VehicleData>> {
+            Ok(Vec::new())
+        }
+        async fn get_chennai_waybill_by_waybill_and_trip(
+            &self,
+            _waybill_no: &str,
+            _trip_number: i32,
+        ) -> AppResult<Vec<crate::models::VehicleData>> {
+            Ok(Vec::new())
+        }
+        async fn get_routes_served_today(
+            &self,
+        ) -> AppResult<Vec<crate::models::RouteLastScheduleTime>> {
+            Ok(Vec::new())
+        }
+        async fn get_vehicles_by_service_tier(
+            &self,
+            _gtfs_id: &str,
+            _service_tier: &str,
+        ) -> AppResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn lookup_row(token: &str, designation: Option<&str>, entity_id: i64) -> EmployeeLookupRow {
+        EmployeeLookupRow {
+            token_no: Some(token.to_string()),
+            first_name: "Test".to_string(),
+            last_name: None,
+            mobile_no: Some("9000000000".to_string()),
+            entity_id,
+            designation_name: designation.map(|s| s.to_string()),
+        }
+    }
+
+    fn build_service(
+        emp: StubEmployeeReader,
+        veh: StubVehicleReader,
+    ) -> (Arc<StubEmployeeReader>, DBFleetOperatorService) {
+        // `pool` is never touched by the mobile-number path; a lazy pool against an
+        // unreachable host is fine for these tests. (Email path is exercised by manual
+        // curl tests against a real DB elsewhere.)
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody:none@127.0.0.1:1/none")
+            .expect("lazy pool builds");
+        let emp_arc = Arc::new(emp);
+        let svc = DBFleetOperatorService::new(
+            pool,
+            emp_arc.clone() as Arc<dyn EmployeeReader>,
+            Arc::new(veh) as Arc<dyn VehicleDataReader>,
+        );
+        (emp_arc, svc)
+    }
+
+    fn mobile_req(mobile: Option<&str>, token: Option<&str>) -> EmployeeLoginRequest {
+        EmployeeLoginRequest {
+            auth_type: Some(AuthType::MobileNumber),
+            email_hash: None,
+            password_hash: None,
+            mobile_no: mobile.map(|s| s.to_string()),
+            token_no: token.map(|s| s.to_string()),
+        }
+    }
+
+    // ── map_designation_to_role ─────────────────────────────────────────────
+
+    #[test]
+    fn role_mapper_handles_real_designations() {
+        // primary `designations` (LOWER()-ed in SQL)
+        assert_eq!(map_designation_to_role(Some("driver")), Some(Role::Driver));
+        assert_eq!(
+            map_designation_to_role(Some("conductor")),
+            Some(Role::Conductor)
+        );
+        assert_eq!(
+            map_designation_to_role(Some("driver-conductor")),
+            Some(Role::DriverConductor),
+            "primary 'Driver-Conductor' must NOT be swallowed by the conductor branch"
+        );
+        assert_eq!(
+            map_designation_to_role(Some("admin manager")),
+            None,
+            "Admin Manager is office staff, not a depot manager"
+        );
+        assert_eq!(map_designation_to_role(Some("admin staff")), None);
+
+        // designations_internal
+        assert_eq!(
+            map_designation_to_role(Some("depot_manager")),
+            Some(Role::Manager)
+        );
+
+        // misc / edge cases
+        assert_eq!(map_designation_to_role(None), None);
+        assert_eq!(map_designation_to_role(Some("")), None);
+        assert_eq!(map_designation_to_role(Some("   ")), None);
+        assert_eq!(
+            map_designation_to_role(Some("DRIVER")),
+            Some(Role::Driver),
+            "case-insensitive"
+        );
+        assert_eq!(
+            map_designation_to_role(Some("ticket inspector")),
+            None,
+            "unknown designations should not be force-bucketed"
+        );
+    }
+
+    // ── login dispatch ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn missing_auth_type_returns_typed_error() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(None, None),
+            StubVehicleReader { depot: None },
+        );
+        let req = EmployeeLoginRequest {
+            auth_type: None,
+            email_hash: None,
+            password_hash: None,
+            mobile_no: None,
+            token_no: None,
+        };
+        let resp = svc.login("kolkata_bus", &req, false).await.unwrap();
+        assert!(!resp.verified);
+        assert_eq!(resp.error, Some(EmployeeLoginError::MissingAuthType));
+        assert!(resp.token.is_none());
+        assert!(resp.role.is_none());
+    }
+
+    #[tokio::test]
+    async fn mobile_missing_mobile_no_returns_typed_error() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(None, None),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login("kolkata_bus", &mobile_req(None, Some("KDEMP001")), false)
+            .await
+            .unwrap();
+        assert!(!resp.verified);
+        assert_eq!(resp.error, Some(EmployeeLoginError::MissingMobileNo));
+    }
+
+    #[tokio::test]
+    async fn mobile_blank_mobile_no_returns_typed_error() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(None, None),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login("kolkata_bus", &mobile_req(Some("   "), None), false)
+            .await
+            .unwrap();
+        assert_eq!(resp.error, Some(EmployeeLoginError::MissingMobileNo));
+    }
+
+    #[tokio::test]
+    async fn chennai_primary_hit_short_circuits_internal() {
+        let (emp_arc, svc) = build_service(
+            StubEmployeeReader::new(
+                Some(lookup_row("O30007", Some("driver"), 42)),
+                Some(lookup_row("OTHER", Some("conductor"), 99)), // must not be reached
+            ),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9361392963"), Some("O30007")),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(resp.verified);
+        assert_eq!(resp.token.as_deref(), Some("O30007"));
+        assert_eq!(resp.role, Some(Role::Driver));
+        assert_eq!(emp_arc.primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emp_arc.internal_calls.load(Ordering::SeqCst),
+            0,
+            "internal lookup must not run when primary hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn chennai_primary_miss_falls_through_to_internal() {
+        let (emp_arc, svc) = build_service(
+            StubEmployeeReader::new(None, Some(lookup_row("MGR_TEST", Some("depot_manager"), 2))),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9000000001"), Some("MGR_TEST")),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(resp.verified);
+        assert_eq!(resp.role, Some(Role::Manager));
+        assert_eq!(emp_arc.primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(emp_arc.internal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_chennai_skips_primary() {
+        let (emp_arc, svc) = build_service(
+            StubEmployeeReader::new(
+                Some(lookup_row("MUST_NOT_BE_USED", Some("driver"), 1)),
+                Some(lookup_row("KDEMP001", Some("driver"), 5)),
+            ),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                "kolkata_bus",
+                &mobile_req(Some("7397438357"), Some("KDEMP001")),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(resp.verified);
+        assert_eq!(resp.token.as_deref(), Some("KDEMP001"));
+        assert_eq!(
+            emp_arc.primary_calls.load(Ordering::SeqCst),
+            0,
+            "primary must not run for non-chennai feeds"
+        );
+        assert_eq!(emp_arc.internal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_mismatch_returns_typed_error() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(Some(lookup_row("REAL_TOKEN", Some("driver"), 1)), None),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9361392963"), Some("WRONG")),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!resp.verified);
+        assert_eq!(resp.error, Some(EmployeeLoginError::TokenMismatch));
+        assert!(resp.token.is_none());
+        assert!(resp.role.is_none());
+    }
+
+    #[tokio::test]
+    async fn token_absent_skips_verification() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(Some(lookup_row("REAL_TOKEN", Some("driver"), 1)), None),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9361392963"), None),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(resp.verified);
+        assert_eq!(resp.token.as_deref(), Some("REAL_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn person_not_found_returns_typed_error() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(None, None),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("0000000001"), Some("X")),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!resp.verified);
+        assert_eq!(resp.error, Some(EmployeeLoginError::PersonNotFound));
+    }
+
+    #[tokio::test]
+    async fn with_metadata_populates_depot() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(Some(lookup_row("O30007", Some("driver"), 42)), None),
+            StubVehicleReader {
+                depot: Some(DepotInfo {
+                    name: "Poonamallee Depot EV".into(),
+                    code: Some("PN".into()),
+                }),
+            },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9361392963"), Some("O30007")),
+                true,
+            )
+            .await
+            .unwrap();
+        let meta = resp
+            .metadata
+            .expect("metadata populated when with_metadata=true");
+        assert_eq!(meta.depot_name.as_deref(), Some("Poonamallee Depot EV"));
+        assert_eq!(meta.depot_code.as_deref(), Some("PN"));
+    }
+
+    #[tokio::test]
+    async fn with_metadata_missing_depot_is_tolerated() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(Some(lookup_row("O30007", Some("driver"), 9999)), None),
+            StubVehicleReader { depot: None },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9361392963"), Some("O30007")),
+                true,
+            )
+            .await
+            .unwrap();
+        let meta = resp
+            .metadata
+            .expect("metadata still populated, depot fields null");
+        assert_eq!(meta.depot_name, None);
+        assert_eq!(meta.depot_code, None);
+    }
+
+    #[tokio::test]
+    async fn without_metadata_omits_metadata_field() {
+        let (_, svc) = build_service(
+            StubEmployeeReader::new(Some(lookup_row("O30007", Some("driver"), 42)), None),
+            StubVehicleReader {
+                depot: Some(DepotInfo {
+                    name: "X".into(),
+                    code: Some("X".into()),
+                }),
+            },
+        );
+        let resp = svc
+            .login(
+                PRIMARY_GTFS_ID,
+                &mobile_req(Some("9361392963"), Some("O30007")),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(resp.metadata.is_none());
+    }
+
+    // Suppress dead-code warning on MockDBVehicleReader so this test module can import it freely.
+    #[allow(dead_code)]
+    fn _ensure_mock_visible() -> MockDBVehicleReader {
+        MockDBVehicleReader::new()
     }
 }
