@@ -1,4 +1,4 @@
-clet LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
+let LogLevel = < TRACE | DEBUG | INFO | WARN | ERROR | OFF >
 
 let logger_cfg = {
     level = LogLevel.INFO,
