@@ -445,6 +445,7 @@ impl DBFleetOperatorService {
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id::text = $1
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                 ORDER BY trip_number
                 "#,
             )
@@ -468,6 +469,7 @@ impl DBFleetOperatorService {
                 FROM bus_schedule_trip_detail_internal
                 WHERE schedule_trip_id::text = $1
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number
                 "#,
@@ -506,6 +508,7 @@ impl DBFleetOperatorService {
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id::text = $1
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                 ORDER BY trip_number ASC
                 "#,
             )
@@ -535,6 +538,7 @@ impl DBFleetOperatorService {
                 FROM bus_schedule_trip_detail_internal
                 WHERE schedule_trip_id::text = $1
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
                 "#,
@@ -564,6 +568,7 @@ impl DBFleetOperatorService {
                 WHERE waybill_id::text = $1
                   AND trip_number = $2
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                 LIMIT 1
                 "#,
             )
@@ -584,6 +589,7 @@ impl DBFleetOperatorService {
                 WHERE schedule_trip_id::text = $1
                   AND trip_number = $2
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 LIMIT 1
                 "#,
@@ -629,6 +635,7 @@ impl DBFleetOperatorService {
                                 sync_start_time = CASE WHEN trip_number = $2 THEN $4 ELSE sync_start_time END
                             WHERE waybill_id::text = $1
                               AND trip_type != 'dead-trip'
+                              AND deleted = false
                             "#,
                         )
                         .bind(&waybill.waybill_id)
@@ -652,6 +659,7 @@ impl DBFleetOperatorService {
                                 is_completed   = CASE WHEN trip_number >= $2 THEN false ELSE is_completed END
                             WHERE waybill_id::text = $1
                               AND trip_type != 'dead-trip'
+                              AND deleted = false
                             "#,
                         )
                         .bind(&waybill.waybill_id)
@@ -681,6 +689,7 @@ impl DBFleetOperatorService {
                             WHERE schedule_trip_id::text = $1
                               AND trip_type != 'dead-trip'
                               AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                              AND deleted = false
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -705,6 +714,7 @@ impl DBFleetOperatorService {
                             WHERE schedule_trip_id::text = $1
                               AND trip_type != 'dead-trip'
                               AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                              AND deleted = false
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -731,6 +741,7 @@ impl DBFleetOperatorService {
                                 trip_end_time  = CASE WHEN is_active_trip THEN $2 ELSE trip_end_time END,
                                 sync_end_time  = CASE WHEN is_active_trip THEN $3 ELSE sync_end_time END
                             WHERE waybill_id::text = $1
+                              AND deleted = false
                             "#,
                         )
                         .bind(&waybill.waybill_id)
@@ -751,6 +762,7 @@ impl DBFleetOperatorService {
                             UPDATE bus_schedule_trip_flexi_internal
                             SET is_active_trip = false
                             WHERE waybill_id::text = $1
+                              AND deleted = false
                             "#,
                         )
                         .bind(&waybill.waybill_id)
@@ -777,6 +789,7 @@ impl DBFleetOperatorService {
                                 trip_end_time  = CASE WHEN is_active_trip THEN $2 ELSE trip_end_time END,
                                 sync_end_time  = CASE WHEN is_active_trip THEN $3 ELSE sync_end_time END
                             WHERE schedule_trip_id::text = $1
+                              AND deleted = false
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -799,6 +812,7 @@ impl DBFleetOperatorService {
                             SET is_active_trip = false,
                                 is_completed   = CASE WHEN trip_number = $2 AND is_active_trip THEN true ELSE is_completed END
                             WHERE schedule_trip_id::text = $1
+                              AND deleted = false
                             "#,
                         )
                         .bind(&schedule_trip_id)
@@ -823,6 +837,7 @@ impl DBFleetOperatorService {
                         SET is_active_trip = false,
                             is_completed   = false
                         WHERE waybill_id::text = $1
+                          AND deleted = false
                         "#,
                     )
                     .bind(&waybill.waybill_id)
@@ -845,6 +860,7 @@ impl DBFleetOperatorService {
                         SET is_active_trip = false,
                             is_completed   = false
                         WHERE schedule_trip_id::text = $1
+                          AND deleted = false
                         "#,
                     )
                     .bind(&schedule_trip_id)
@@ -871,6 +887,7 @@ impl DBFleetOperatorService {
                         WHERE waybill_id::text = $1
                           AND trip_number = $2
                           AND trip_type != 'dead-trip'
+                          AND deleted = false
                         "#,
                     )
                     .bind(&waybill.waybill_id)
@@ -897,6 +914,7 @@ impl DBFleetOperatorService {
                           AND trip_number = $2
                           AND trip_type != 'dead-trip'
                           AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                          AND deleted = false
                         "#,
                     )
                     .bind(&schedule_trip_id)
