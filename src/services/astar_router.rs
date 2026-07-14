@@ -377,11 +377,26 @@ mod tests {
 
     #[test]
     fn test_heuristic_admissible() {
-        // Two points ~10km apart
-        let h = heuristic(28.6139, 77.2090, 28.7041, 77.1025);
-        // At 80 km/h, 10km should take ~450 seconds
-        // Heuristic should be <= actual travel time
+        // Two points ~14.4 km apart in Delhi.
+        let (lat1, lon1, lat2, lon2) = (28.6139, 77.2090, 28.7041, 77.1025);
+        let h = heuristic(lat1, lon1, lat2, lon2);
+        let dist = haversine_distance_meters(lat1, lon1, lat2, lon2);
+
+        // Positive for distinct points, zero for identical ones.
         assert!(h > 0);
-        assert!(h < 600); // Should be reasonable lower bound
+        assert_eq!(heuristic(lat1, lon1, lat1, lon1), 0);
+
+        // Spec: the heuristic is exactly the straight-line time at the MAX possible
+        // metro speed. That is what makes it admissible — real edges are capped at
+        // MAX_METRO_SPEED_MPS, so no actual path can be faster than this.
+        assert_eq!(h, (dist / MAX_METRO_SPEED_MPS) as i64);
+
+        // Admissibility as a property: at any realistic (slower-than-max) speed the
+        // same straight-line distance takes longer, so h never overestimates.
+        let realistic_speed_mps = 10.0; // ~36 km/h, typical metro incl. dwell time
+        assert!(h <= (dist / realistic_speed_mps) as i64);
+
+        // The metric is symmetric.
+        assert_eq!(h, heuristic(lat2, lon2, lat1, lon1));
     }
 }
