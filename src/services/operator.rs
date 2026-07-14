@@ -682,7 +682,10 @@ async fn enrich_stops(
 
 /// Call OSRM `/route` with all stop coords (lat, lon) → (encoded polyline, per-leg (distance_m, duration_s)).
 /// Returns None if `base` is None/empty, fewer than 2 coords, or any request/parse error.
-async fn osrm_route(base: Option<&str>, coords: &[(f64, f64)]) -> Option<(String, Vec<(f64, f64)>)> {
+async fn osrm_route(
+    base: Option<&str>,
+    coords: &[(f64, f64)],
+) -> Option<(String, Vec<(f64, f64)>)> {
     let base = base.filter(|s| !s.is_empty())?;
     if coords.len() < 2 {
         return None;
@@ -697,13 +700,12 @@ async fn osrm_route(base: Option<&str>, coords: &[(f64, f64)]) -> Option<(String
         base.trim_end_matches('/'),
         coord_str
     );
-    let json: serde_json::Value =
-        tokio::time::timeout(Duration::from_secs(5), async {
-            reqwest::get(&url).await?.json::<serde_json::Value>().await
-        })
-        .await
-        .ok()?
-        .ok()?;
+    let json: serde_json::Value = tokio::time::timeout(Duration::from_secs(5), async {
+        reqwest::get(&url).await?.json::<serde_json::Value>().await
+    })
+    .await
+    .ok()?
+    .ok()?;
     let route0 = json.get("routes")?.as_array()?.first()?;
     let geometry = route0.get("geometry")?.as_str()?.to_string();
     let legs = route0
@@ -1280,11 +1282,8 @@ pub trait OperatorService: Send + Sync {
     ) -> AppResult<BulkReplaceResult>;
 
     /// Route points joined with stop details, ordered by route_order (editor feed).
-    async fn get_route_stops(
-        &self,
-        gtfs_id: &str,
-        route_id: &str,
-    ) -> AppResult<RouteStopsResponse>;
+    async fn get_route_stops(&self, gtfs_id: &str, route_id: &str)
+        -> AppResult<RouteStopsResponse>;
 
     /// Insert a stop at position `position`, shifting existing route_order up by 1.
     async fn insert_route_stop(
@@ -1304,10 +1303,7 @@ pub trait OperatorService: Send + Sync {
     ) -> AppResult<Vec<ReprocessResult>>;
 
     /// Full route-stop-mapping across all routes (for CSV export).
-    async fn export_route_stop_mapping(
-        &self,
-        gtfs_id: &str,
-    ) -> AppResult<Vec<Value>>;
+    async fn export_route_stop_mapping(&self, gtfs_id: &str) -> AppResult<Vec<Value>>;
 
     /// Returns the underlying pool for streaming responses. None for mock implementations.
     fn pool(&self) -> Option<&PgPool> {
@@ -1531,10 +1527,7 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
-    async fn export_route_stop_mapping(
-        &self,
-        _gtfs_id: &str,
-    ) -> AppResult<Vec<Value>> {
+    async fn export_route_stop_mapping(&self, _gtfs_id: &str) -> AppResult<Vec<Value>> {
         mock_err!()
     }
 }
@@ -1892,7 +1885,11 @@ impl OperatorService for DBOperatorService {
                 .or_else(|| n.as_f64().map(|f| f.to_string()))
                 .ok_or_else(|| AppError::BadRequest("ID must be a number".to_string()))?,
             Value::String(s) => s.clone(),
-            _ => return Err(AppError::BadRequest("ID must be a string or number".to_string())),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "ID must be a string or number".to_string(),
+                ))
+            }
         };
 
         // `::text` cast so the id predicate works whether the column is still
@@ -1960,7 +1957,9 @@ impl OperatorService for DBOperatorService {
         // read path requires a non-null schedule_number, so we backfill here for all callers.
         if table == "bus_schedule_trip_detail_internal" {
             for val in arr.iter_mut() {
-                let Some(obj) = val.as_object_mut() else { continue };
+                let Some(obj) = val.as_object_mut() else {
+                    continue;
+                };
                 let needs_enrich = ["schedule_number", "org_name", "shift_type_name"]
                     .iter()
                     .any(|k| obj.get(*k).map_or(true, |v| v.is_null()));
@@ -2743,7 +2742,10 @@ impl OperatorService for DBOperatorService {
         let stage_name = data.get("stage_name").and_then(|v| v.as_str());
         let travel_time = data.get("travel_time").and_then(|v| v.as_str());
         // New route stops are visible and active by default.
-        let is_visible = data.get("is_visible").and_then(|v| v.as_bool()).unwrap_or(true);
+        let is_visible = data
+            .get("is_visible")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let new_id = field_generator::gen_random_id();
 
         let mut tx = self
@@ -2936,7 +2938,10 @@ impl OperatorService for DBOperatorService {
                         polyline_out = Some(geom);
                     }
                     None => {
-                        warn!("reprocess_routes: OSRM unavailable for route {}, polyline not updated", route_id);
+                        warn!(
+                            "reprocess_routes: OSRM unavailable for route {}, polyline not updated",
+                            route_id
+                        );
                     }
                 }
             }
