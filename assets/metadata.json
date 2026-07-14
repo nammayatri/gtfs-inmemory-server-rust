@@ -1,7 +1,7 @@
 {
-  "version": "16637cdeb4b7",
-  "build_commit": "beb75a",
-  "generated_at": "2026-07-14T11:34:26Z",
+  "version": "9ab228425121",
+  "build_commit": "3b3541",
+  "generated_at": "2026-07-14T14:27:22Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
@@ -30,11 +30,11 @@
       "count": 32036
     },
     "patterns.json": {
-      "sha256": "2a1ea57da38f49db4f34f67fc0eeb75fc6c4e0c9412f7d60e700c31b2239dfce",
+      "sha256": "2bb26745cfc1837dbd974ef70b31a7aff3a7c1ce013e5fd3a1331d5aefa9112c",
       "count": 8426
     },
     "route_stops.json": {
-      "sha256": "3c5cba1cc9a4a210e88dd425fa058d417328bf6d9fdd85804d3888d4b959a8fc",
+      "sha256": "cc021770bec5686d5b2759dc01cc241462c4b0f69d160056925f05d739c72bcd",
       "count": 209402
     },
     "trip_stoptimes/bangalore_metro.json": {
@@ -74,7 +74,7 @@
       "count": 450
     },
     "trip_stoptimes/kolkata_bus.json": {
-      "sha256": "985e38be3a87d41be9d803d68b5ad7dfd73a59bb93aac45f205aadd213f039cc",
+      "sha256": "38248a6da5a90674f1f2595a8af04d3e6e5934b35ea7e8e622e7fe58994f98c4",
       "count": 17227
     },
     "trip_stoptimes/kolkata_metro.json": {
