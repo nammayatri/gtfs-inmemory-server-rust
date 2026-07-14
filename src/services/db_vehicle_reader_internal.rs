@@ -628,6 +628,7 @@ impl DBVehicleReaderInternal {
                 WHERE waybill_id::text = $1
                   AND trip_number >= {}
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                 ORDER BY trip_number ASC
                 "#,
                 trip_num
@@ -651,6 +652,7 @@ impl DBVehicleReaderInternal {
                 FROM bus_schedule_trip_flexi_internal
                 WHERE waybill_id::text = $1
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                 ORDER BY trip_number ASC
             "#
             .to_string()
@@ -707,6 +709,7 @@ impl DBVehicleReaderInternal {
                 WHERE schedule_trip_id::text = $1
                   AND trip_number >= {}
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
                 "#,
@@ -736,9 +739,11 @@ impl DBVehicleReaderInternal {
                            WHERE schedule_trip_id::text = $1
                              AND is_active_trip = true
                              AND trip_type != 'dead-trip'
+                             AND deleted = false
                              AND LOWER(COALESCE(status, 'active')) <> 'inactive'),
                           1))
                   AND trip_type != 'dead-trip'
+                  AND deleted = false
                   AND LOWER(COALESCE(status, 'active')) <> 'inactive'
                 ORDER BY trip_number ASC
             "#
@@ -987,12 +992,14 @@ impl DBVehicleReaderInternal {
                         AND bstf.route_number_id::text = $1
                         AND bstf.gtfs_id = $2
                         AND bstf.trip_type <> 'dead-trip'
+                        AND bstf.deleted = false
                     LEFT JOIN bus_schedule_trip_detail_internal bstd
                         ON w.is_flexi = false
                         AND bstd.schedule_trip_id = w.schedule_trip_id
                         AND bstd.route_number_id::text = $1
                         AND bstd.gtfs_id = $2
                         AND bstd.trip_type <> 'dead-trip'
+                        AND bstd.deleted = false
                         AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
                     WHERE
                         w.status in ('online', 'upcoming')
@@ -1058,12 +1065,14 @@ impl DBVehicleReaderInternal {
                         AND bstf.route_number_id::text = $1
                         AND bstf.gtfs_id = $2
                         AND bstf.trip_type <> 'dead-trip'
+                        AND bstf.deleted = false
                     LEFT JOIN bus_schedule_trip_detail_internal bstd
                         ON w.is_flexi = false
                         AND bstd.schedule_trip_id = w.schedule_trip_id
                         AND bstd.route_number_id::text = $1
                         AND bstd.gtfs_id = $2
                         AND bstd.trip_type <> 'dead-trip'
+                        AND bstd.deleted = false
                         AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
                     WHERE
                         w.status in ('online', 'upcoming')
@@ -1168,12 +1177,14 @@ impl DBVehicleReaderInternal {
                 AND bstf.trip_number = $2
                 AND bstf.gtfs_id = $3
                 AND bstf.trip_type <> 'dead-trip'
+                AND bstf.deleted = false
             LEFT JOIN bus_schedule_trip_detail_internal bstd
                 ON w.is_flexi = false
                 AND bstd.schedule_trip_id = w.schedule_trip_id
                 AND bstd.trip_number = $2
                 AND bstd.gtfs_id = $3
                 AND bstd.trip_type <> 'dead-trip'
+                AND bstd.deleted = false
                 AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
             WHERE
                 w.waybill_no::text = $1
