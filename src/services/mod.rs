@@ -6,7 +6,7 @@ pub mod db_vehicle_reader_internal;
 pub mod field_generator;
 pub mod fleet_operator;
 pub mod gtfs_service;
+pub mod metro_graph;
 pub mod operator;
 pub mod osrtc_station_cache;
-pub mod metro_graph;
 pub mod trip_service;
