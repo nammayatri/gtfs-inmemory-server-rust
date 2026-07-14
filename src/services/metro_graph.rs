@@ -9,7 +9,6 @@
 /// preprocessor pipeline. All graph building is done at preprocessing time.
 ///
 /// Supports time-dependent routing by storing departure schedules per edge.
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
