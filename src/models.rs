@@ -108,9 +108,9 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for IdValue {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use sqlx::{TypeInfo, ValueRef};
         match value.type_info().name() {
-            "INT8" => Ok(IdValue::Int(
-                <i64 as sqlx::Decode<sqlx::Postgres>>::decode(value)?,
-            )),
+            "INT8" => Ok(IdValue::Int(<i64 as sqlx::Decode<sqlx::Postgres>>::decode(
+                value,
+            )?)),
             "INT4" => Ok(IdValue::Int(
                 <i32 as sqlx::Decode<sqlx::Postgres>>::decode(value)? as i64,
             )),
@@ -596,11 +596,7 @@ pub struct GTFSStop {
     pub regional_name: Option<String>,
     #[serde(default, skip_serializing)]
     pub info_json: Option<String>,
-    #[serde(
-        rename = "clusterId",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
 }
 

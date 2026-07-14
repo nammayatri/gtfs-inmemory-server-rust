@@ -223,7 +223,11 @@ impl AppState {
                                 Ok(internal_pool) => {
                                     info!("Internal database pool created successfully.");
                                     (
-                                        Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone(), app_config.gen_int_for_id.unwrap_or(false))),
+                                        Arc::new(DBOperatorService::new(
+                                            internal_pool.clone(),
+                                            app_config.osrm_url.clone(),
+                                            app_config.gen_int_for_id.unwrap_or(false),
+                                        )),
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
                                         )),
@@ -303,7 +307,11 @@ impl AppState {
                             anyhow::anyhow!("Failed to create internal database pool: {}", e)
                         })?;
                     (
-                        Arc::new(DBOperatorService::new(internal_pool.clone(), app_config.osrm_url.clone(), app_config.gen_int_for_id.unwrap_or(false))),
+                        Arc::new(DBOperatorService::new(
+                            internal_pool.clone(),
+                            app_config.osrm_url.clone(),
+                            app_config.gen_int_for_id.unwrap_or(false),
+                        )),
                         Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
                         Arc::new(DBFleetOperatorService::new(internal_pool.clone())),
                         Some(internal_pool),
@@ -642,8 +650,8 @@ impl AppState {
     /// If the file doesn't exist, returns an empty map (metro routing won't
     /// be available but all other APIs work fine).
     fn load_metro_graphs(config: &AppConfig) -> HashMap<String, MetroGraph> {
-        let graph_file = std::path::Path::new(&config.preprocessed_data_dir)
-            .join("metro_graph.json");
+        let graph_file =
+            std::path::Path::new(&config.preprocessed_data_dir).join("metro_graph.json");
 
         if !graph_file.exists() {
             info!(
@@ -653,10 +661,7 @@ impl AppState {
             return HashMap::new();
         }
 
-        info!(
-            "Loading metro graphs from {}",
-            graph_file.display()
-        );
+        info!("Loading metro graphs from {}", graph_file.display());
 
         match std::fs::read_to_string(&graph_file) {
             Ok(json) => match serde_json::from_str::<HashMap<String, MetroGraph>>(&json) {

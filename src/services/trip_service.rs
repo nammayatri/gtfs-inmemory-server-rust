@@ -152,13 +152,21 @@ impl TripService {
         }
 
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            AppError::Internal(format!("Failed to read trip shard {}: {}", path.display(), e))
+            AppError::Internal(format!(
+                "Failed to read trip shard {}: {}",
+                path.display(),
+                e
+            ))
         })?;
         // Shard is a JSON object: { trip_id -> ShardTrip }. Deserialize the
         // whole feed's trips, then pick the one we need. The shard is per-feed
         // so this is bounded by one feed's size, not the global dataset.
         let trips: HashMap<String, ShardTrip> = serde_json::from_slice(&bytes).map_err(|e| {
-            AppError::Internal(format!("Failed to parse trip shard {}: {}", path.display(), e))
+            AppError::Internal(format!(
+                "Failed to parse trip shard {}: {}",
+                path.display(),
+                e
+            ))
         })?;
 
         let trip = match trips.get(trip_id) {
