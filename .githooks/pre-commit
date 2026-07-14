@@ -1,63 +1,115 @@
 #!/bin/bash
 
-# Pre-commit hook for Rust formatting
-# This hook will format all Rust files before committing
+# Pre-commit hook — mirrors every check the old .pre-commit-config.yaml ran, but with
+# zero external dependencies (only git + the rust toolchain everyone already has).
+# gitleaks and clippy are *enforced* in CI (.github/workflows/ci.yml); this hook is the
+# fast local pass so problems are caught before push. Any non-zero exit blocks the commit.
 
 set -e
 
-echo "🔧 Running pre-commit hook..."
+echo "🔧 Running pre-commit checks..."
 
-# Check if rustfmt is installed and install if not
-if ! command -v rustfmt &> /dev/null; then
-    echo "🔧 rustfmt not found. Installing rustfmt..."
-    if command -v rustup &> /dev/null; then
-        rustup component add rustfmt
-        echo "✅ rustfmt installed successfully!"
-    else
-        echo "❌ rustup not found. Please install rustup first:"
-        echo "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+# ── Staged files (added/copied/modified only — deletions aren't worth checking) ──
+STAGED_ALL=$(git diff --cached --name-only --diff-filter=ACM)
+STAGED_RS=$(echo "$STAGED_ALL" | grep '\.rs$' || true)
+
+# ── 1. Rust formatting (was: pre-commit-rust `fmt`) ──────────────────────────────
+if [ -n "$STAGED_RS" ]; then
+    if ! command -v rustfmt &> /dev/null; then
+        if command -v rustup &> /dev/null; then
+            echo "🔧 Installing rustfmt..."
+            rustup component add rustfmt
+        else
+            echo "❌ rustfmt/rustup not found. Install rustup: https://rustup.rs"
+            exit 1
+        fi
+    fi
+
+    NEEDED_FMT=""
+    for file in $STAGED_RS; do
+        [ -f "$file" ] || continue
+        # --check first so we only touch (and re-stage) files that aren't formatted.
+        if ! rustfmt --edition 2021 --check "$file" &> /dev/null; then
+            echo "  📝 formatting $file"
+            rustfmt --edition 2021 "$file"
+            git add "$file"
+            NEEDED_FMT=1
+        fi
+    done
+    if [ -n "$NEEDED_FMT" ]; then
+        echo "❌ rustfmt reformatted files and re-staged them. Review, then commit again."
         exit 1
     fi
 fi
 
-# Get list of staged Rust files
-STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
-
-if [ -z "$STAGED_FILES" ]; then
-    echo "✅ No Rust files to format"
-    exit 0
+# ── 2. Trailing whitespace + leftover conflict markers ───────────────────────────
+#    (was: trailing-whitespace + check-merge-conflict). `git diff --cached --check`
+#    inspects only staged *text* content, so binaries are never touched.
+if ! git diff --cached --check; then
+    echo "❌ Whitespace errors or conflict markers in staged changes (see above)."
+    exit 1
 fi
 
-echo "📝 Formatting Rust files..."
-
-# Store original content hash to detect changes
-ORIGINAL_HASH=$(git diff --cached | sha256sum)
-
-# Format each staged Rust file
-for file in $STAGED_FILES; do
-    if [ -f "$file" ]; then
-        echo "  Formatting: $file"
-        rustfmt --edition 2021 "$file"
-        # Stage the formatted file
-        git add "$file"
+# ── 3. Final newline at end of file (was: end-of-file-fixer) ─────────────────────
+for file in $STAGED_ALL; do
+    [ -f "$file" ] || continue
+    grep -Iq . "$file" || continue          # skip empty and binary files (-I)
+    if [ -n "$(tail -c1 "$file")" ]; then
+        echo "❌ Missing newline at end of file: $file"
+        exit 1
     fi
 done
 
-echo "✅ Rust formatting complete!"
+# ── 4. Large files (was: check-added-large-files --maxkb=1000) ───────────────────
+MAX_KB=1000
+for file in $STAGED_ALL; do
+    [ -f "$file" ] || continue
+    size_kb=$(( $(wc -c < "$file") / 1024 ))
+    if [ "$size_kb" -gt "$MAX_KB" ]; then
+        echo "❌ $file is ${size_kb}KB (limit ${MAX_KB}KB). Use Git LFS or exclude it."
+        exit 1
+    fi
+done
 
-# Check if any files were actually changed by rustfmt
-NEW_HASH=$(git diff --cached | sha256sum)
-if [ "$ORIGINAL_HASH" != "$NEW_HASH" ]; then
-    echo "❌ Some files were reformatted by rustfmt and re-staged."
-    echo "   Please review the changes, run 'git add .' if needed, and commit again."
+# ── 5. Case-only filename conflicts (was: check-case-conflict) ───────────────────
+#    Paths differing only in case break case-insensitive filesystems (macOS/Windows).
+DUPES=$(git ls-files | tr 'A-Z' 'a-z' | sort | uniq -d)
+if [ -n "$DUPES" ]; then
+    echo "❌ Filenames that collide on case-insensitive filesystems:"
+    echo "$DUPES"
     exit 1
 fi
 
-# Run cargo check to ensure code still compiles
-echo "🔍 Running cargo check..."
-if ! cargo check --quiet --message-format=short; then
-    echo "❌ Cargo check failed. Please fix compilation errors before committing."
-    exit 1
+# ── 6. YAML validity (was: check-yaml) — best effort, needs python3+pyyaml ───────
+STAGED_YAML=$(echo "$STAGED_ALL" | grep -E '\.ya?ml$' || true)
+if [ -n "$STAGED_YAML" ] && command -v python3 &> /dev/null && python3 -c 'import yaml' 2> /dev/null; then
+    for file in $STAGED_YAML; do
+        [ -f "$file" ] || continue
+        if ! python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$file"; then
+            echo "❌ Invalid YAML: $file"
+            exit 1
+        fi
+    done
 fi
 
-echo "✅ Pre-commit hook completed successfully!"
+# ── 7. Secret scan (was: gitleaks) — best effort locally, hard-enforced in CI ────
+if command -v gitleaks &> /dev/null; then
+    echo "🔍 gitleaks (staged)..."
+    if ! gitleaks protect --staged --redact; then
+        echo "❌ gitleaks flagged a potential secret in staged changes."
+        exit 1
+    fi
+else
+    echo "ℹ️  gitleaks not installed locally — the secret scan still runs in CI."
+fi
+
+# ── 8. Compilation (was: pre-commit-rust `cargo-check`) ──────────────────────────
+if [ -n "$STAGED_RS" ]; then
+    echo "🔍 cargo check..."
+    if ! cargo check --quiet --message-format=short; then
+        echo "❌ cargo check failed. Fix compilation errors before committing."
+        exit 1
+    fi
+fi
+
+echo "✅ All pre-commit checks passed!"
