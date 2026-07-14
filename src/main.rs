@@ -8,7 +8,7 @@ use std::{env, net::Ipv4Addr};
 use tracing::{error, info};
 use tracing_actix_web::TracingLogger;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,7 +63,16 @@ async fn main() -> anyhow::Result<()> {
             .wrap(TracingLogger::<DomainRootSpanBuilder>::new())
             .wrap(prometheus.clone())
             .service(
-                SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
+                // The spec is *served* at the app-relative "/api-docs/openapi.json", but the
+                // frontend is told to *fetch* it via a relative "../api-docs/openapi.json".
+                // The browser resolves that against whatever subpath the UI is actually
+                // mounted under (e.g. "/gtfs-inmem/swagger-ui/" behind the reverse proxy ->
+                // "/gtfs-inmem/api-docs/openapi.json"), so no prefix has to be hardcoded and
+                // it still works when served at the root. See Config::new docs: it only
+                // changes the fetch URL, not where SwaggerUi::url exposes the document.
+                SwaggerUi::new("/swagger-ui/{_:.*}")
+                    .url("/api-docs/openapi.json", openapi.clone())
+                    .config(Config::new(["../api-docs/openapi.json"])),
             )
             .configure(routes::create_routes)
     })

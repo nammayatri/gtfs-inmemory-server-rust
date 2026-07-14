@@ -1140,7 +1140,6 @@ pub async fn get_cluster_destinations(
     Ok(HttpResponse::Ok().json(destinations))
 }
 
-
 #[utoipa::path(
     get,
     path = "/routes/{gtfs_id}/fuzzy/{query}",
@@ -3046,8 +3045,7 @@ pub async fn get_bus_route_schedule(
 
         // Fetch from external tables unless the query forces internal-only
         // or the gtfs_id is listed as internal-only.
-        let fetch_external =
-            !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let fetch_external = !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         if fetch_external {
             let mut ext_rows = app_state
                 .db_vehicle_reader
@@ -3058,8 +3056,7 @@ pub async fn get_bus_route_schedule(
 
         // Fetch from internal tables unless the query forces external-only
         // or the gtfs_id is listed as external-only.
-        let fetch_internal =
-            !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let fetch_internal = !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         if fetch_internal {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
@@ -3756,7 +3753,12 @@ pub async fn search_stops(
     let limit = query.limit.unwrap_or(20).clamp(1, 200);
     let res = app_state
         .operator_service
-        .search_stops(&gtfs_id, &query.q, limit, query.with_routes.unwrap_or(false))
+        .search_stops(
+            &gtfs_id,
+            &query.q,
+            limit,
+            query.with_routes.unwrap_or(false),
+        )
         .await?;
     Ok(HttpResponse::Ok().json(res))
 }
@@ -3883,7 +3885,11 @@ pub async fn reprocess_routes(
     let body = body.into_inner();
     let res = app_state
         .operator_service
-        .reprocess_routes(&gtfs_id, &body.route_ids, body.recompute_polyline.unwrap_or(false))
+        .reprocess_routes(
+            &gtfs_id,
+            &body.route_ids,
+            body.recompute_polyline.unwrap_or(false),
+        )
         .await?;
     Ok(HttpResponse::Ok().json(res))
 }
@@ -4615,16 +4621,13 @@ async fn metro_route_plan(
     let gtfs_id = path.into_inner();
     let params = query.into_inner();
 
-    let graph = app_state
-        .metro_graphs
-        .get(&gtfs_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No metro graph found for gtfs_id: {}. Available: {:?}",
-                gtfs_id,
-                app_state.metro_graphs.keys().collect::<Vec<_>>()
-            ))
-        })?;
+    let graph = app_state.metro_graphs.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "No metro graph found for gtfs_id: {}. Available: {:?}",
+            gtfs_id,
+            app_state.metro_graphs.keys().collect::<Vec<_>>()
+        ))
+    })?;
 
     let departure_time = params
         .departure_time
@@ -4653,15 +4656,9 @@ async fn metro_nearby_stops(
     let params = query.into_inner();
     let radius = params.radius_m.unwrap_or(1000.0);
 
-    let graph = app_state
-        .metro_graphs
-        .get(&gtfs_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No metro graph found for gtfs_id: {}",
-                gtfs_id
-            ))
-        })?;
+    let graph = app_state.metro_graphs.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!("No metro graph found for gtfs_id: {}", gtfs_id))
+    })?;
 
     let nearby = graph.find_nearby_stops(params.lat, params.lon, radius);
 
@@ -4669,10 +4666,7 @@ async fn metro_nearby_stops(
         .iter()
         .map(|node| {
             let dist = crate::services::metro_graph::haversine_distance_meters(
-                params.lat,
-                params.lon,
-                node.lat,
-                node.lon,
+                params.lat, params.lon, node.lat, node.lon,
             );
             serde_json::json!({
                 "stopId": node.stop_id,
@@ -4697,15 +4691,9 @@ async fn metro_graph_info(
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
 
-    let graph = app_state
-        .metro_graphs
-        .get(&gtfs_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "No metro graph found for gtfs_id: {}",
-                gtfs_id
-            ))
-        })?;
+    let graph = app_state.metro_graphs.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!("No metro graph found for gtfs_id: {}", gtfs_id))
+    })?;
 
     let total_edges: usize = graph.adjacency.values().map(|v| v.len()).sum();
     let transfer_edges: usize = graph
