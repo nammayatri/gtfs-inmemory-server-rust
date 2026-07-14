@@ -1,0 +1,60 @@
+name: CI
+
+# The real, non-bypassable gate. Local hooks are best-effort (a clone may not have
+# them installed, and `--no-verify` skips them); these checks run on PRs into the
+# protected branches and, once marked as required in branch protection, block merge
+# until they pass. The `pull_request` filter matches the PR's *target* branch.
+on:
+  pull_request:
+    branches: [main, master-gims]
+  push:
+    branches: [main, master-gims]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: fmt · check · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Deterministic and currently green — safe to gate on.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Compile
+        run: cargo check --all-targets
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      # Advisory for now: the tree has pre-existing clippy lints. Once those are
+      # cleaned up, drop `continue-on-error` and add `-- -D warnings` to make it a
+      # hard gate too.
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets
+        continue-on-error: true
+
+  gitleaks:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the same gitleaks version as .pre-commit-config.yaml. Uses the
+      # binary directly (no license needed, unlike gitleaks-action on org repos).
+      - name: Scan working tree for secrets
+        run: |
+          version=8.28.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks detect --no-git --redact --verbose --source .
