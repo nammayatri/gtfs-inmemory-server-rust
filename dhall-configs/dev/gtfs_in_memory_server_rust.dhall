@@ -65,7 +65,6 @@ in {
   osrtc_username = secrets.osrtc_username,
   osrtc_secret_key = secrets.osrtc_secret_key,
   osrtc_station_refresh_interval_hours = 1,
-  osrtc_feed_key = Some "odisha_osrtc"
   osrtc_feed_key = Some "odisha_osrtc",
 
     -- Preprocessed data configuration

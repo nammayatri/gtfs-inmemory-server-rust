@@ -1,3 +1,4 @@
+pub mod astar_router;
 pub mod chalo_vehicle_cache;
 pub mod db_employee_reader;
 pub mod db_vehicle_reader;
@@ -7,4 +8,5 @@ pub mod fleet_operator;
 pub mod gtfs_service;
 pub mod operator;
 pub mod osrtc_station_cache;
+pub mod metro_graph;
 pub mod trip_service;

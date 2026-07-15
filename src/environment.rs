@@ -19,6 +19,7 @@ use crate::services::{
     },
     fleet_operator::{DBFleetOperatorService, FleetOperatorService, MockFleetOperatorService},
     gtfs_service::GTFSService,
+    metro_graph::MetroGraph,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
     osrtc_station_cache::OsrtcStationCache,
     trip_service::TripService,
@@ -70,6 +71,15 @@ pub struct AppConfig {
     pub ignored_trip_ids: Vec<String>,
     pub bhubaneswar_cache_update_interval: u64,
     pub bhubaneswar_external_auth: Option<String>,
+    /// When true, load GTFS data from preprocessed JSON files (produced by
+    /// Nandi preprocessor) instead of calling Nandi/OTP APIs.
+    #[serde(default)]
+    pub use_preprocessed_data: bool,
+    /// Directory containing preprocessed JSON files (routes.json, stops.json,
+    /// patterns.json, route_stops.json, metadata.json).
+    /// Defaults to "./assets" if not set.
+    #[serde(default = "default_preprocessed_data_dir")]
+    pub preprocessed_data_dir: String,
     pub phone_number_hash_key: String,
     /// Enable schedule-based active trip reconciliation (default: false)
     pub enable_schedule_reconciliation: bool,
@@ -88,6 +98,10 @@ pub struct AppConfig {
     /// id columns are migrated to text, so new PKs become UUIDs. None ⇒ false.
     #[serde(default)]
     pub gen_int_for_id: Option<bool>,
+}
+
+fn default_preprocessed_data_dir() -> String {
+    "./assets".to_string()
 }
 
 impl OtpConfig {
@@ -158,6 +172,8 @@ pub struct AppState {
     pub bus_registration_mapping: Arc<HashMap<String, HashMap<String, String>>>,
     pub fleet_list: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
+    /// Metro transit graphs loaded from preprocessed JSON (gtfs_id -> MetroGraph)
+    pub metro_graphs: Arc<HashMap<String, MetroGraph>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
@@ -367,6 +383,7 @@ impl AppState {
 
         // Load bus registration mapping from CSV
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
+        let metro_graphs = Arc::new(Self::load_metro_graphs(&app_config));
 
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
@@ -385,6 +402,7 @@ impl AppState {
             bus_registration_mapping,
             fleet_list: Arc::new(Self::load_fleet_list().await?),
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
+            metro_graphs,
             depot_manager_details,
             fleet_tag_list: Arc::new(Self::load_fleet_tag_list().await?),
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -615,6 +633,61 @@ impl AppState {
         );
 
         Ok(sub_types_map)
+    }
+
+    /// Load metro transit graphs from preprocessed JSON files in the
+    /// preprocessed data directory.
+    ///
+    /// Looks for `metro_graph.json` which contains a map of gtfs_id -> MetroGraph.
+    /// If the file doesn't exist, returns an empty map (metro routing won't
+    /// be available but all other APIs work fine).
+    fn load_metro_graphs(config: &AppConfig) -> HashMap<String, MetroGraph> {
+        let graph_file = std::path::Path::new(&config.preprocessed_data_dir)
+            .join("metro_graph.json");
+
+        if !graph_file.exists() {
+            info!(
+                "No metro_graph.json found in {}, metro routing will not be available",
+                config.preprocessed_data_dir
+            );
+            return HashMap::new();
+        }
+
+        info!(
+            "Loading metro graphs from {}",
+            graph_file.display()
+        );
+
+        match std::fs::read_to_string(&graph_file) {
+            Ok(json) => match serde_json::from_str::<HashMap<String, MetroGraph>>(&json) {
+                Ok(graphs) => {
+                    for (gtfs_id, graph) in &graphs {
+                        info!(
+                            "Loaded metro graph for {}: {} nodes, {} routes",
+                            gtfs_id,
+                            graph.nodes.len(),
+                            graph.route_stop_sequences.len()
+                        );
+                    }
+                    info!("Loaded {} metro transit graphs", graphs.len());
+                    graphs
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to deserialize metro_graph.json: {}. Metro routing will not be available.",
+                        e
+                    );
+                    HashMap::new()
+                }
+            },
+            Err(e) => {
+                error!(
+                    "Failed to read metro_graph.json: {}. Metro routing will not be available.",
+                    e
+                );
+                HashMap::new()
+            }
+        }
     }
 
     async fn load_depot_manager_details(
