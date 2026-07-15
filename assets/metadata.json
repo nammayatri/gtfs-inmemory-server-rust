@@ -1,7 +1,7 @@
 {
-  "version": "13117e6f49ec",
-  "build_commit": "04f378",
-  "generated_at": "2026-07-15T09:45:46Z",
+  "version": "809d55cf37aa",
+  "build_commit": "60662f",
+  "generated_at": "2026-07-15T15:28:01Z",
   "gtfs_feeds": [
     "bangalore_metro",
     "bhubaneshwar_bus",
@@ -22,20 +22,20 @@
   ],
   "files": {
     "routes.json": {
-      "sha256": "b9d6161221689b5f690cb9e93313d4f803a9bfcb0ab9049b5c3097b4181f9540",
+      "sha256": "f725e5b5f30a75ad9899fae789e625cf169994af825d3c5719cb9da11d9751d3",
       "count": 8314
     },
     "stops.json": {
-      "sha256": "179157570d12fa9fef0c7b643966fa2186b64f5343c1d0e1df6075f12fc5d68c",
-      "count": 32036
+      "sha256": "ae25b5f810f3a649dbd08b7f1ab59773770e2edb097e3475d8a6d9348ccda51f",
+      "count": 32103
     },
     "patterns.json": {
-      "sha256": "59cd274b1f85001e466ad29866ff47254fb19c4ad4bacd038876d38c73db96f7",
+      "sha256": "8f2c8e8a7590b24e3748d84565347496491e6b4167f319d7c8780de7e916b012",
       "count": 8426
     },
     "route_stops.json": {
-      "sha256": "f52a4f651862e1162a5096a4ff7682cd0569d21310232f7d1fffb9e74acb179a",
-      "count": 209402
+      "sha256": "aea87d659b2c8e29f6558d3adba9011d88de63e09d843381881415bdd199fdba",
+      "count": 209412
     },
     "trip_stoptimes/bangalore_metro.json": {
       "sha256": "e639d9a639c089d51cfd85efadcda52c2b5a277e8c6a77b159d5b4c4ea8a17f4",
@@ -46,8 +46,8 @@
       "count": 4199
     },
     "trip_stoptimes/chennai_bus.json": {
-      "sha256": "9d3040873c111247201c0f253080248bd3d4945fa648ed6d9aca9c9feaca18ae",
-      "count": 51127
+      "sha256": "ea6b3c9e275579cee97db211c006d0a8829518c4d8dea4cda675ecae1e78acac",
+      "count": 51149
     },
     "trip_stoptimes/chennai_metro.json": {
       "sha256": "19433454474303f58dc3428ccd33aa8c32239d9b2956a4299a539dc28e34a9a1",
@@ -117,9 +117,9 @@
     },
     "chennai_bus": {
       "routes": 4184,
-      "stops": 18185,
+      "stops": 18252,
       "patterns": 4184,
-      "route_stop_mappings": 72390
+      "route_stop_mappings": 72400
     },
     "chennai_metro": {
       "routes": 44,
