@@ -93,6 +93,7 @@ use crate::services::operator::QueryBody;
         routes::get_tablet_ids,
         routes::get_operators,
         routes::update_waybill_status,
+        routes::update_waybill_status_v2,
         routes::update_waybill_fleet,
         routes::update_waybill_tablet,
         routes::get_waybills,
