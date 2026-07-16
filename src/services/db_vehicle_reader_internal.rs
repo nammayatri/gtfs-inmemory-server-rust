@@ -975,6 +975,7 @@ impl DBVehicleReaderInternal {
                             ELSE bstd.trip_number::int
                         END AS trip_number,
                         CASE
+                            WHEN w.status <> 'online' THEN false
                             WHEN w.is_flexi THEN bstf.is_active_trip
                             ELSE bstd.is_active_trip
                         END AS is_active_trip,
@@ -1048,6 +1049,7 @@ impl DBVehicleReaderInternal {
                             ELSE bstd.trip_number::int
                         END AS trip_number,
                         CASE
+                            WHEN w.status <> 'online' THEN false
                             WHEN w.is_flexi THEN bstf.is_active_trip
                             ELSE bstd.is_active_trip
                         END AS is_active_trip,
@@ -1166,7 +1168,11 @@ impl DBVehicleReaderInternal {
                 CASE
                     WHEN w.is_flexi THEN bstf.trip_number::int
                     ELSE bstd.trip_number::int
-                END AS trip_number
+                END AS trip_number,
+                CASE
+                    WHEN w.is_flexi THEN NULL
+                    ELSE bstd.is_completed
+                END AS is_completed
             FROM waybills_internal w
             LEFT JOIN entities_internal e
                 ON e.entity_id = w.entity_id
@@ -1191,6 +1197,7 @@ impl DBVehicleReaderInternal {
                 AND w.gtfs_id = $3
                 AND w.status in ('online', 'upcoming')
                 AND w.deleted = false
+                AND (w.status <> 'online' OR w.is_flexi OR bstd.is_completed IS NOT TRUE)
                 AND (
                     (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                     OR
