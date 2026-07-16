@@ -130,6 +130,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/tablet-ids", web::get().to(get_tablet_ids))
                     .route("/operators", web::get().to(get_operators))
                     .route("/waybill/status", web::post().to(update_waybill_status))
+                    .route(
+                        "/waybill/status/v2",
+                        web::post().to(update_waybill_status_v2),
+                    )
                     .route("/waybill/fleet", web::post().to(update_waybill_fleet))
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
                     .route("/waybills", web::get().to(get_waybills))
@@ -3521,6 +3525,11 @@ pub struct UpdateWaybillStatusBody {
     pub status: String,
 }
 
+#[derive(Deserialize)]
+pub struct ResetTripsQuery {
+    pub reset_trips: Option<bool>,
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateWaybillFleetBody {
     #[schema(value_type = String)]
@@ -4223,6 +4232,43 @@ pub async fn update_waybill_status(
     let rows = app_state
         .operator_service
         .update_waybill_status(&gtfs_id, body.waybill_id.to_string(), &body.status)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "waybill status updated",
+        "rows_affected": rows,
+        "valid_statuses": waybill_statuses()
+    })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill/status/v2",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("reset_trips" = Option<bool>, Query, description = "When true, also reset this waybill's trips (is_active_trip=false, is_completed=false). Defaults to false."),
+    ),
+    request_body = UpdateWaybillStatusBody,
+    responses((status = 200, description = "Waybill status updated"))
+)]
+pub async fn update_waybill_status_v2(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<ResetTripsQuery>,
+    body: Json<UpdateWaybillStatusBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows = app_state
+        .operator_service
+        .update_waybill_status_v2(
+            &gtfs_id,
+            body.waybill_id.to_string(),
+            &body.status,
+            query.reset_trips.unwrap_or(false),
+        )
         .await?;
 
     Ok(HttpResponse::Ok().json(json!({

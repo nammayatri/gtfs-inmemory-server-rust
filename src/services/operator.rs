@@ -1223,6 +1223,13 @@ pub trait OperatorService: Send + Sync {
         waybill_id: String,
         status: &str,
     ) -> AppResult<u64>;
+    async fn update_waybill_status_v2(
+        &self,
+        gtfs_id: &str,
+        waybill_id: String,
+        status: &str,
+        reset_trips: bool,
+    ) -> AppResult<u64>;
     async fn update_waybill_fleet_number(
         &self,
         gtfs_id: &str,
@@ -1429,6 +1436,16 @@ impl OperatorService for MockOperatorService {
         _gtfs_id: &str,
         _waybill_id: String,
         _status: &str,
+    ) -> AppResult<u64> {
+        mock_err!()
+    }
+
+    async fn update_waybill_status_v2(
+        &self,
+        _gtfs_id: &str,
+        _waybill_id: String,
+        _status: &str,
+        _reset_trips: bool,
     ) -> AppResult<u64> {
         mock_err!()
     }
@@ -2442,6 +2459,59 @@ impl OperatorService for DBOperatorService {
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::DbError(format!("Failed to update is_active_trip/is_completed: {}", e)))?;
+        }
+
+        Ok(result.rows_affected())
+    }
+
+    async fn update_waybill_status_v2(
+        &self,
+        gtfs_id: &str,
+        waybill_id: String,
+        status: &str,
+        reset_trips: bool,
+    ) -> AppResult<u64> {
+        if !waybill_statuses().contains(&status) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid status '{}'. Valid: {:?}",
+                status,
+                waybill_statuses()
+            )));
+        }
+
+        let schedule_trip_id: Option<String> = sqlx::query_scalar(
+            "SELECT schedule_trip_id::text FROM public.waybills_internal WHERE waybill_id::text = $1 AND gtfs_id = $2",
+        )
+        .bind(&waybill_id)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("Failed to get schedule_trip_id: {}", e)))?;
+
+        let query_str = if status == "audited" {
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now(), audited_date = now() WHERE waybill_id::text = $2 AND gtfs_id = $3"
+        } else {
+            "UPDATE public.waybills_internal SET status = $1, updated_at = now() WHERE waybill_id::text = $2 AND gtfs_id = $3"
+        };
+        let result = sqlx::query(query_str)
+            .bind(status)
+            .bind(&waybill_id)
+            .bind(gtfs_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("update_waybill_status_v2: {}", e)))?;
+
+        if reset_trips {
+            if let Some(stid) = schedule_trip_id {
+                sqlx::query(
+                    "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
+                )
+                .bind(stid)
+                .bind(gtfs_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AppError::DbError(format!("reset_trips update failed: {}", e)))?;
+            }
         }
 
         Ok(result.rows_affected())
