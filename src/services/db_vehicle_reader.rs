@@ -1476,6 +1476,9 @@ impl VehicleDataReader for DBVehicleReader {
                     .resolve_trip_data(vehicle_data.clone(), waybill_status.clone(), trip_number)
                     .await?;
 
+                let is_active_trip =
+                    is_active_trip && matches!(waybill_status, WaybillStatus::Online);
+
                 // Populate schedule_map for backward compatibility
                 if let Some(ref remaining) = remaining_trip_details {
                     for row in remaining.iter() {
