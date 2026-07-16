@@ -620,6 +620,9 @@ struct ReprocessPointRow {
     route_points_id: String,
     stop_type: Option<String>,
     stop_name: Option<String>,
+    /// Current stored stage_name — used to detect a user override so reprocess
+    /// doesn't clobber a manually-set stage name.
+    existing_stage_name: Option<String>,
     lat: f64,
     lon: f64,
 }
@@ -2479,15 +2482,6 @@ impl OperatorService for DBOperatorService {
             )));
         }
 
-        let schedule_trip_id: Option<String> = sqlx::query_scalar(
-            "SELECT schedule_trip_id::text FROM public.waybills_internal WHERE waybill_id::text = $1 AND gtfs_id = $2",
-        )
-        .bind(&waybill_id)
-        .bind(gtfs_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| AppError::DbError(format!("Failed to get schedule_trip_id: {}", e)))?;
-
         let query_str = if status == "audited" {
             "UPDATE public.waybills_internal SET status = $1, updated_at = now(), audited_date = now() WHERE waybill_id::text = $2 AND gtfs_id = $3"
         } else {
@@ -2502,6 +2496,16 @@ impl OperatorService for DBOperatorService {
             .map_err(|e| AppError::DbError(format!("update_waybill_status_v2: {}", e)))?;
 
         if reset_trips {
+            // Only look up the schedule_trip_id when we actually need to reset trips.
+            let schedule_trip_id: Option<String> = sqlx::query_scalar(
+                "SELECT schedule_trip_id::text FROM public.waybills_internal WHERE waybill_id::text = $1 AND gtfs_id = $2",
+            )
+            .bind(&waybill_id)
+            .bind(gtfs_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("Failed to get schedule_trip_id: {}", e)))?;
+
             if let Some(stid) = schedule_trip_id {
                 sqlx::query(
                     "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
@@ -2872,6 +2876,7 @@ impl OperatorService for DBOperatorService {
         for route_id in route_ids {
             let pts = sqlx::query_as::<_, ReprocessPointRow>(
                 "SELECT rp.route_points_id, rp.stop_type, s.bus_stop_name AS stop_name, \
+                    rp.stage_name AS existing_stage_name, \
                     COALESCE(s.latitude_current,0) AS lat, COALESCE(s.longitude_current,0) AS lon \
                  FROM route_point_internal rp \
                  LEFT JOIN stop_internal s ON s.bus_stop_id = rp.bus_stop_id AND s.gtfs_id = rp.gtfs_id AND s.deleted=false \
@@ -2895,26 +2900,44 @@ impl OperatorService for DBOperatorService {
                 continue;
             }
 
+            // Pass 1: assign each point a stage number. A new stage opens at the first
+            // point and at every stage stop.
             let mut stage = 1i64;
-            let mut current_stage_name = pts[0].stop_name.clone().unwrap_or_default();
             let mut max_stage = 1i64;
-            // (route_points_id, new_order, stage_no, stage_name)
-            let mut updates: Vec<(String, i64, i64, String)> = Vec::with_capacity(pts.len());
+            let mut point_stage: Vec<i64> = Vec::with_capacity(pts.len());
             for (i, p) in pts.iter().enumerate() {
                 let st = StopType::from_opt(p.stop_type.as_deref());
                 if i == 0 {
-                    current_stage_name = p.stop_name.clone().unwrap_or_default();
+                    stage = 1;
                 } else if st == StopType::StageStop {
                     stage += 1;
-                    current_stage_name = p.stop_name.clone().unwrap_or_default();
                 }
                 max_stage = max_stage.max(stage);
-                updates.push((
-                    p.route_points_id.clone(),
-                    (i as i64) + 1,
-                    stage,
-                    current_stage_name.clone(),
-                ));
+                point_stage.push(stage);
+            }
+
+            // Stage names are always manual — never derived from the stop name. A stage's
+            // name is the stored stage_name of the first point in that stage that has one;
+            // stages nobody named stay blank until set manually.
+            let mut stage_name_map: HashMap<i64, String> = HashMap::new();
+            for (i, p) in pts.iter().enumerate() {
+                if let Some(existing) = p.existing_stage_name.as_deref() {
+                    let e = existing.trim();
+                    if !e.is_empty() {
+                        stage_name_map
+                            .entry(point_stage[i])
+                            .or_insert_with(|| e.to_string());
+                    }
+                }
+            }
+
+            // Pass 2: build the per-point updates, propagating each stage's manual name.
+            // (route_points_id, new_order, stage_no, stage_name)
+            let mut updates: Vec<(String, i64, i64, String)> = Vec::with_capacity(pts.len());
+            for (i, p) in pts.iter().enumerate() {
+                let s = point_stage[i];
+                let name = stage_name_map.get(&s).cloned().unwrap_or_default();
+                updates.push((p.route_points_id.clone(), (i as i64) + 1, s, name));
             }
 
             // route_name = "<first stop> - <last stop>". Fall back to whichever endpoint

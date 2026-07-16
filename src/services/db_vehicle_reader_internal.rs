@@ -1197,7 +1197,6 @@ impl DBVehicleReaderInternal {
                 AND w.gtfs_id = $3
                 AND w.status in ('online', 'upcoming')
                 AND w.deleted = false
-                AND (w.status <> 'online' OR w.is_flexi OR bstd.is_completed IS NOT TRUE)
                 AND (
                     (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                     OR
