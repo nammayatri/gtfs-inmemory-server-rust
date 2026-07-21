@@ -594,7 +594,7 @@ pub struct GTFSStop {
     pub hindi_name: Option<String>,
     #[serde(rename = "regionalName")]
     pub regional_name: Option<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(rename = "infoJson", default, skip_serializing)]
     pub info_json: Option<String>,
     #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
