@@ -2036,7 +2036,8 @@ async fn get_service_type_by_vehicle_impl(
             return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
                 vehicle_no: cached_data.vehicle_no,
                 service_type: cached_data.service_type,
-                waybill_id: cached_data.waybill_no,
+                waybill_id: cached_data.waybill_no.clone(),
+                waybill_no: cached_data.waybill_no,
                 schedule_no: cached_data.schedule_no,
                 last_updated: cached_data.last_updated,
                 route_id: cached_data.route_id,
@@ -2081,6 +2082,7 @@ async fn get_service_type_by_vehicle_impl(
                     vehicle_no: vehicle_no.to_string(),
                     service_type: Some(service_type),
                     waybill_id: None,
+                    waybill_no: None,
                     schedule_no: None,
                     last_updated: None,
                     route_id: None,
@@ -2205,7 +2207,8 @@ async fn get_service_type_by_vehicle_impl(
         let mut response = VehicleServiceTypeResponse {
             vehicle_no: vehicle_data.vehicle_no,
             service_type,
-            waybill_id: vehicle_data.waybill_no,
+            waybill_id: vehicle_data.waybill_no.clone(),
+            waybill_no: vehicle_data.waybill_no,
             schedule_no: vehicle_data.schedule_no,
             last_updated: vehicle_data.last_updated,
             route_id: vehicle_data.route_id,
@@ -2402,7 +2405,8 @@ async fn get_service_type_by_vehicle_impl(
     let mut response = VehicleServiceTypeResponse {
         vehicle_no: vehicle_data.vehicle_no,
         service_type,
-        waybill_id: vehicle_data.waybill_no,
+        waybill_id: vehicle_data.waybill_no.clone(),
+        waybill_no: vehicle_data.waybill_no,
         schedule_no: vehicle_data.schedule_no,
         last_updated: vehicle_data.last_updated,
         route_id: vehicle_data.route_id,
