@@ -463,6 +463,12 @@ pub struct NandiStop {
     pub departure_time: Option<i32>,
     #[serde(rename = "stopSequence", default)]
     pub stop_sequence: Option<i32>,
+    /// GTFS platform_code for this stop (verbatim from the preprocessor's
+    /// patterns.json / stops.txt). Absent in OTP responses and in older
+    /// preprocessed data, so default to None. Mirrors the platformCode the
+    /// GraphQL example-trip path reads from OTP.
+    #[serde(rename = "platformCode", default)]
+    pub platform_code: Option<String>,
     /// stop_headsign verbatim from GTFS. For Chennai-style feeds this is a
     /// Python-dict-shaped string like
     /// "{'fareStageNumber': '3', 'isStageStop': true}" that the backend's
