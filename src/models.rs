@@ -515,6 +515,10 @@ pub struct NandiRoutesRes {
     pub mode: String,
     #[serde(rename = "agencyName")]
     pub agency_name: Option<String>,
+    /// GTFS route_color, normalized to "#RRGGBB" by the preprocessor. Absent
+    /// in OTP responses and in older preprocessed data, so default to None.
+    #[serde(default)]
+    pub color: Option<String>,
     #[serde(rename = "tripCount")]
     pub trip_count: Option<i32>,
     #[serde(rename = "stopCount")]

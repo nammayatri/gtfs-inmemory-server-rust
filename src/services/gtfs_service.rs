@@ -997,6 +997,7 @@ impl GTFSService {
                 long_name: route.long_name,
                 mode: cast_vehicle_type(&route.mode),
                 agency_name: route.agency_name,
+                color: route.color,
                 trip_count: route
                     .trip_count
                     .or_else(|| trip_counts.get(route_code).copied()),
