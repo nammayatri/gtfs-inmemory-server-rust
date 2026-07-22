@@ -348,7 +348,9 @@ pub struct BusSchedule {
 pub struct VehicleServiceTypeResponse {
     pub vehicle_no: String,
     pub service_type: Option<String>,
+    /// Deprecated: holds the waybill *number*, not the waybill id. Use `waybill_no`.
     pub waybill_id: Option<String>,
+    pub waybill_no: Option<String>,
     pub schedule_no: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub route_id: Option<String>,
