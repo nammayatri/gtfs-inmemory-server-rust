@@ -2658,7 +2658,7 @@ impl GTFSService {
                     stop_id: s.id.clone(),
                     stop_code: s.code.clone(),
                     stop_name: Some(s.name.clone()),
-                    platform_code: None,
+                    platform_code: s.platform_code.clone(),
                     lat: s.lat,
                     lon: s.lon,
                     scheduled_arrival: s.arrival_time.unwrap_or(0),
