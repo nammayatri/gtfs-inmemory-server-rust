@@ -22,8 +22,13 @@ reqwest = { version = "0.11", features = ["json", "gzip", "deflate"] }
 tokio = { version = "1.0", features = ["full"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+# Self-describing binary (de)serialization for the preprocessed boot snapshot.
+# MessagePack with map-encoded structs is used so serde field attributes
+# (skip_serializing_if / skip_serializing / rename / default) round-trip exactly
+# like the JSON path the loader already relies on.
+rmp-serde = "1.1"
 
 # Error handling
 anyhow = "1.0"
