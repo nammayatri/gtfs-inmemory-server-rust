@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::graphql::{
     get_trip_query, TripApiResponse, TripCacheEntry, TripCacheStats, TripGraphQLResponse,
@@ -92,32 +92,41 @@ impl TripService {
             return Ok(cached_data);
         }
 
-        // Preprocessed mode: try the per-feed trip_stoptimes shard before OTP.
-        // We cache the parsed trip so the shard file is only read on a cold
-        // miss for that feed; warm trips come from `cache` above. Falls through
-        // to GraphQL if the shard or trip isn't found (e.g. unknown trip_id, or
-        // a feed not covered by preprocessed data).
+        // Preprocessed mode: serve /trip only from shards, never Nandi — a miss is NotFound.
         if self.use_preprocessed_data {
-            if let Some(gid) = gtfs_id.as_deref() {
-                match self.load_trip_from_shard(trip_id, gid).await {
-                    Ok(Some(trip_data)) => {
-                        let mut cached_data = trip_data.clone();
-                        cached_data.source = "cache".to_string();
-                        self.store_in_cache(&cache_key, &cached_data).await?;
-                        return Ok(trip_data);
-                    }
-                    Ok(None) => {
-                        info!(
-                            "Trip {} not in preprocessed shard for {}, falling back to GraphQL",
-                            trip_id, gid
-                        );
-                    }
-                    Err(e) => {
-                        info!(
-                            "Preprocessed shard read failed for {} ({}): {} — falling back to GraphQL",
-                            trip_id, gid, e
-                        );
-                    }
+            let gid = gtfs_id.as_deref().ok_or_else(|| {
+                AppError::NotFound(
+                    "gtfs_id is required to look up a trip in preprocessed mode".to_string(),
+                )
+            })?;
+            match self.load_trip_from_shard(trip_id, gid).await {
+                Ok(Some(trip_data)) => {
+                    let mut cached_data = trip_data.clone();
+                    cached_data.source = "cache".to_string();
+                    self.store_in_cache(&cache_key, &cached_data).await?;
+                    return Ok(trip_data);
+                }
+                Ok(None) => {
+                    warn!(
+                        "Trip {} not in preprocessed shard for {}; not calling Nandi \
+                         (use_preprocessed_data=true)",
+                        trip_id, gid
+                    );
+                    return Err(AppError::NotFound(format!(
+                        "Trip {} not found in preprocessed data",
+                        trip_id
+                    )));
+                }
+                Err(e) => {
+                    warn!(
+                        "Preprocessed shard read failed for {} ({}): {}; not calling Nandi \
+                         (use_preprocessed_data=true)",
+                        trip_id, gid, e
+                    );
+                    return Err(AppError::NotFound(format!(
+                        "Trip {} not found in preprocessed data",
+                        trip_id
+                    )));
                 }
             }
         }

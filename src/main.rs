@@ -23,6 +23,15 @@ async fn main() -> anyhow::Result<()> {
 
     let _guard = setup_tracing(app_config.logger_cfg);
 
+    // Build-snapshot mode (image-build time): serialize preprocessed data to snapshot.bin and exit.
+    if env::args().any(|a| a == "--build-snapshot") {
+        use gtfs_routes_service::services::gtfs_service::GTFSService;
+        let service = GTFSService::new(app_config.clone()).await?;
+        let path = service.build_snapshot().await?;
+        info!("Snapshot build complete: {}", path.display());
+        return Ok(());
+    }
+
     // Create application state
     let port = app_config.port;
     let polling_enabled = app_config.polling_enabled;
