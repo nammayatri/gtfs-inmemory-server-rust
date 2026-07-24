@@ -2607,6 +2607,7 @@ pub struct GraphQLRequest {
     request_body = GraphQLRequest,
     responses((status = 200, description = "GraphQL query result"))
 )]
+// The one deliberate exception: this endpoint proxies to Nandi even in preprocessed mode.
 pub async fn graphql_query(
     app_state: Data<AppState>,
     payload: Json<GraphQLRequest>,
