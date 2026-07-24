@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use futures::future::join_all;
 use reqwest::Method;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
 use shared::call_external_api;
@@ -69,6 +69,19 @@ struct PreprocessedManifest {
     gtfs_feeds: Vec<String>,
     #[serde(default)]
     files: HashMap<String, ManifestFile>,
+}
+
+const SNAPSHOT_FILE: &str = "snapshot.bin";
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Fully-built, ready-to-serve data baked at image-build time; `gated_sha` (metadata.json hash) gates staleness.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    format_version: u32,
+    manifest_version: String,
+    gated_sha: String,
+    data: GTFSData,
+    trip_details_cache: HashMap<String, HashMap<String, TripDetails>>,
 }
 
 /// SHA-256 of a file's bytes on disk (hex). Used to verify preprocessed data
@@ -139,7 +152,31 @@ impl GTFSService {
         info!("Loading initial GTFS data...");
         let start_time = std::time::Instant::now();
 
-        let temp_data = self.fetch_and_process_data().await?;
+        // Preprocessed mode: load the pre-built snapshot; fall back to JSON if absent/stale.
+        let temp_data = if self.config.use_preprocessed_data {
+            match self.try_load_snapshot().await {
+                Ok(Some(data)) => {
+                    info!(
+                        "Loaded pre-built snapshot in {:?} (skipped JSON parse + index build)",
+                        start_time.elapsed()
+                    );
+                    data
+                }
+                Ok(None) => {
+                    info!("No usable snapshot found; building data from preprocessed JSON");
+                    self.fetch_and_process_data().await?
+                }
+                Err(e) => {
+                    warn!(
+                        "Snapshot load failed ({}); building data from preprocessed JSON",
+                        e
+                    );
+                    self.fetch_and_process_data().await?
+                }
+            }
+        } else {
+            self.fetch_and_process_data().await?
+        };
 
         self.data.store(Arc::new(temp_data));
 
@@ -155,6 +192,102 @@ impl GTFSService {
         let duration = start_time.elapsed();
         info!("Initial data load complete in {:?}", duration);
         Ok(())
+    }
+
+    /// Parse+index once and serialize `GTFSData` (+ trip cache) to snapshot.bin (for `--build-snapshot`). No Nandi; DB polylines re-applied at boot.
+    pub async fn build_snapshot(&self) -> AppResult<std::path::PathBuf> {
+        if !self.config.use_preprocessed_data {
+            return Err(AppError::Internal(
+                "build_snapshot requires use_preprocessed_data=true".to_string(),
+            ));
+        }
+        let dir = std::path::Path::new(&self.config.preprocessed_data_dir);
+        let manifest = self.verify_preprocessed_manifest(dir).await?;
+        let gated_sha = sha256_of_file(&dir.join("metadata.json")).await?;
+
+        info!("Building snapshot: parsing preprocessed JSON and constructing indices...");
+        let build_start = std::time::Instant::now();
+        let data = self.fetch_and_process_data().await?;
+        let trip_details_cache = self.trip_details_cache.read().await.clone();
+        info!(
+            "Snapshot data built in {:?}, serializing...",
+            build_start.elapsed()
+        );
+
+        let snapshot = Snapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            manifest_version: manifest.version,
+            gated_sha,
+            data,
+            trip_details_cache,
+        };
+        // Map-encoded MessagePack: keyed fields round-trip skip/rename/default like JSON.
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut ser = rmp_serde::Serializer::new(&mut bytes).with_struct_map();
+        snapshot
+            .serialize(&mut ser)
+            .map_err(|e| AppError::Internal(format!("Failed to serialize snapshot: {}", e)))?;
+        let out_path = dir.join(SNAPSHOT_FILE);
+        tokio::fs::write(&out_path, &bytes)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to write snapshot: {}", e)))?;
+        info!(
+            "Snapshot written: {} ({:.1} MB)",
+            out_path.display(),
+            bytes.len() as f64 / 1_048_576.0
+        );
+        Ok(out_path)
+    }
+
+    /// Load snapshot.bin: `Some` if valid+current (populates trip cache, re-applies polylines); `None` if absent/stale.
+    async fn try_load_snapshot(&self) -> AppResult<Option<GTFSData>> {
+        let dir = std::path::Path::new(&self.config.preprocessed_data_dir);
+        let snap_path = dir.join(SNAPSHOT_FILE);
+        if !snap_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = tokio::fs::read(&snap_path)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read snapshot: {}", e)))?;
+        let snapshot: Snapshot = rmp_serde::from_slice(&bytes)
+            .map_err(|e| AppError::Internal(format!("Failed to decode snapshot: {}", e)))?;
+
+        if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
+            warn!(
+                "Snapshot format {} != expected {}; ignoring snapshot",
+                snapshot.format_version, SNAPSHOT_FORMAT_VERSION
+            );
+            return Ok(None);
+        }
+
+        // Staleness gate: metadata.json must be byte-identical to build time.
+        let current_sha = sha256_of_file(&dir.join("metadata.json")).await?;
+        if current_sha != snapshot.gated_sha {
+            warn!(
+                "Snapshot is stale (metadata.json changed since build: {} != {}); ignoring snapshot",
+                current_sha, snapshot.gated_sha
+            );
+            return Ok(None);
+        }
+
+        info!(
+            "Snapshot accepted (manifest version={}); populating trip-details cache",
+            snapshot.manifest_version
+        );
+        *self.trip_details_cache.write().await = snapshot.trip_details_cache;
+
+        let mut data = snapshot.data;
+        // Re-apply DB polylines (not Nandi) so a snapshot boot matches a JSON boot.
+        self.enrich_routes_with_polylines(&mut data.routes_by_gtfs)
+            .await;
+        // Recompute hash after enrich.
+        data.data_hash = self.compute_all_data_hashes(&data.routes_by_gtfs);
+        // Rebuild the #[serde(skip)] field.
+        data.pre_computed_stops_by_gtfs =
+            Self::pre_compute_stops(&data.route_data_by_gtfs, &data.stop_regional_names_by_gtfs);
+
+        Ok(Some(data))
     }
 
     async fn fetch_and_process_data(&self) -> AppResult<GTFSData> {
@@ -1290,7 +1423,10 @@ impl GTFSService {
                 .push(pattern);
         }
 
-        // Process only the longest pattern for each route
+        // Longest pattern per route, in sorted key order so route_data is deterministic (stable /stops across boots).
+        let mut patterns_by_route: Vec<(String, Vec<&NandiPatternDetails>)> =
+            patterns_by_route.into_iter().collect();
+        patterns_by_route.sort_by(|a, b| a.0.cmp(&b.0));
         for (_route_key, patterns) in patterns_by_route {
             // Find the pattern with the most stops
             let longest_pattern = patterns
@@ -2310,6 +2446,19 @@ impl GTFSService {
         }
 
         drop(data);
+
+        // Preprocessed mode: never call Nandi — a cache miss is NotFound.
+        if self.config.use_preprocessed_data {
+            warn!(
+                "Example trip details for gtfs_id={} route={} (trip_feed={}) not in preprocessed cache; \
+                 not calling Nandi (use_preprocessed_data=true)",
+                clean_gtfs, clean_route, trip_feed
+            );
+            return Err(AppError::NotFound(format!(
+                "Example trip details not found for route {}",
+                route_code
+            )));
+        }
 
         // Query trip details by trip_feed
         let query = "query Trip($id: String!) { trip(id: $id) { gtfsId stoptimes { stop { id lat lon code platformCode name } scheduledArrival scheduledDeparture headsign stopPosition } } }";

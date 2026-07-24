@@ -519,7 +519,11 @@ pub struct NandiRoutesRes {
     pub end_point: Option<LatLong>,
     #[serde(rename = "serviceTierType")]
     pub service_tier_type: Option<ServiceTierType>,
-    #[serde(rename = "encodedPolyline", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "encodedPolyline",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub encoded_polyline: Option<String>,
 }
 
@@ -611,21 +615,21 @@ pub struct StopGeojson {
     pub gates: Option<Vec<Gate>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GTFSRouteData {
     pub mappings: Vec<Arc<RouteStopMapping>>,
     pub by_route: HashMap<String, Vec<usize>>,
     pub by_stop: HashMap<String, Vec<usize>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GTFSStopData {
     pub stops: HashMap<String, GTFSStop>,
     #[serde(default)]
     pub by_cluster_id: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GTFSAlternateStopData {
     pub alternate_stops: HashMap<String, Vec<String>>,
 }
@@ -649,7 +653,7 @@ pub struct CachedDataResponse {
     pub stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>>,
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct GTFSData {
     pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
