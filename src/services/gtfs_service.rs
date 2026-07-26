@@ -6,7 +6,7 @@ use crate::models::{
     ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord,
     StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
-use crate::models::{GTFSAlternateStopData, TripDetails};
+use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
 use crate::services::operator::OperatorService;
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
@@ -39,8 +39,8 @@ fn get_sha256_hash<T: Serialize>(val: &T) -> String {
 
 const SENTINEL_CLUSTER_ID: &str = "INVALID_SENTINEL";
 
-fn parse_cluster_id_from_desc(desc: Option<&str>) -> Option<String> {
-    let raw = desc?.trim();
+fn parse_cluster_id_from_info_json(info_json: Option<&str>) -> Option<String> {
+    let raw = info_json?.trim();
     if raw.is_empty() || raw == "{}" {
         return None;
     }
@@ -50,6 +50,36 @@ fn parse_cluster_id_from_desc(desc: Option<&str>) -> Option<String> {
         return None;
     }
     Some(cid.to_string())
+}
+
+/// Per-file entry in the preprocessed-data manifest (`metadata.json`).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ManifestFile {
+    sha256: String,
+    count: i64,
+}
+
+/// `metadata.json` produced by the Nandi GTFS preprocessor. The preprocessor
+/// writes this file last, so its presence means every data file is complete.
+/// Unknown fields (build_commit, stats, generated_at, ...) are ignored.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PreprocessedManifest {
+    version: String,
+    #[serde(default)]
+    gtfs_feeds: Vec<String>,
+    #[serde(default)]
+    files: HashMap<String, ManifestFile>,
+}
+
+/// SHA-256 of a file's bytes on disk (hex). Used to verify preprocessed data
+/// against the checksum the preprocessor recorded in `metadata.json`.
+async fn sha256_of_file(path: &std::path::Path) -> AppResult<String> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read {}: {}", path.display(), e)))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn normalize_stop_name(name: &str) -> String {
@@ -134,20 +164,68 @@ impl GTFSService {
         let mut all_stops = Vec::new();
         let mut already_visited: HashSet<String> = HashSet::new();
 
-        for otp_instance in self.config.otp_instances.get_all_instances() {
-            let base_url = &otp_instance.url;
-            if !already_visited.insert(base_url.to_string()) {
-                continue;
+        // Track which gtfs_ids have been loaded from preprocessed files
+        let mut preprocessed_gtfs_ids: HashSet<String> = HashSet::new();
+
+        // ── When use_preprocessed_data is true: prefer preprocessed files; fall back to Nandi only on issue ──
+        if self.config.use_preprocessed_data {
+            let preprocessed_dir = &self.config.preprocessed_data_dir;
+            info!(
+                "Loading GTFS data from preprocessed files in {} (priority source)",
+                preprocessed_dir
+            );
+
+            match self.load_preprocessed_data(preprocessed_dir).await {
+                Ok((routes, patterns, stops, loaded_gtfs_ids)) => {
+                    if loaded_gtfs_ids.is_empty() {
+                        warn!(
+                            "Preprocessed data directory had no feeds. Falling back to Nandi APIs."
+                        );
+                    } else {
+                        preprocessed_gtfs_ids = loaded_gtfs_ids;
+                        all_routes.extend(routes);
+                        all_pattern_details.extend(patterns);
+                        all_stops.extend(stops);
+                        info!(
+                            "Using preprocessed data only for {} GTFS feeds: {:?} (Nandi not called)",
+                            preprocessed_gtfs_ids.len(),
+                            preprocessed_gtfs_ids
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load preprocessed data: {}. Falling back to Nandi APIs for all feeds.",
+                        e
+                    );
+                }
             }
-            let patterns = self.fetch_patterns(base_url).await?;
-            let pattern_details = self
-                .fetch_pattern_details_batch(base_url, &patterns)
-                .await?;
-            all_pattern_details.extend(pattern_details);
-            all_routes.extend(self.fetch_routes(base_url).await?);
-            all_stops.extend(self.fetch_stops(base_url).await?);
         }
-        info!("Fetched {} patterns", all_pattern_details.len());
+
+        // ── Fetch from Nandi/OTP APIs only when we have no preprocessed data ─────────────────
+        // (i.e. use_preprocessed_data is false, or preprocessed load failed, or returned no feeds)
+        if preprocessed_gtfs_ids.is_empty() {
+            info!("Fetching GTFS data from Nandi/OTP APIs...");
+            for otp_instance in self.config.otp_instances.get_all_instances() {
+                let base_url = &otp_instance.url;
+                if !already_visited.insert(base_url.to_string()) {
+                    continue;
+                }
+    
+                let patterns = self.fetch_patterns(base_url).await?;
+                let pattern_details = self
+                    .fetch_pattern_details_batch(base_url, &patterns)
+                    .await?;
+                all_pattern_details.extend(pattern_details);
+
+                let routes = self.fetch_routes(base_url).await?;
+                all_routes.extend(routes);
+
+                let stops = self.fetch_stops(base_url).await?;
+                all_stops.extend(stops);
+            }
+        }
+        info!("Fetched {} patterns total", all_pattern_details.len());
 
         // Read stop geojsons CSV file
         let stop_geojsons_by_gtfs = self.read_stop_geojsons_csv().await?;
@@ -231,7 +309,39 @@ impl GTFSService {
         );
 
         // Fetch example trip mapping per route for all GTFS feeds
-        let route_example_trip_by_gtfs = self.fetch_route_example_trip_for_all_feeds().await?;
+        // Only fetch from Nandi for feeds NOT loaded from preprocessed files
+        let route_example_trip_by_gtfs = if preprocessed_gtfs_ids.is_empty() {
+            self.fetch_route_example_trip_for_all_feeds().await?
+        } else {
+            // For preprocessed feeds, build example trip map from patterns (no GraphQL)
+            let (preprocessed_trip_map, preprocessed_trip_details) =
+                Self::build_example_trip_from_patterns(&all_pattern_details, &preprocessed_gtfs_ids);
+
+            let mut trip_map = preprocessed_trip_map;
+
+            // Still fetch from Nandi for non-preprocessed feeds
+            if self.config.otp_instances.get_all_instances().iter().any(|inst| {
+                !preprocessed_gtfs_ids.contains(&inst.identifier)
+            }) {
+                match self.fetch_route_example_trip_for_all_feeds().await {
+                    Ok(api_trips) => {
+                        for (gtfs_id, trips) in api_trips {
+                            if !preprocessed_gtfs_ids.contains(&gtfs_id) {
+                                trip_map.insert(gtfs_id, trips);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch example trips from Nandi: {}. Continuing without trip data.", e);
+                    }
+                }
+            }
+
+            // Cache trip details for preprocessed feeds so get_example_trip returns without GraphQL
+            *self.trip_details_cache.write().await = preprocessed_trip_details;
+
+            trip_map
+        };
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
@@ -276,6 +386,188 @@ impl GTFSService {
         );
 
         Ok(temp_data)
+    }
+
+    /// Load GTFS data from preprocessed JSON files produced by the Nandi
+    /// preprocessor pipeline. Returns (routes, patterns, stops, loaded_gtfs_ids).
+    async fn load_preprocessed_data(
+        &self,
+        preprocessed_dir: &str,
+    ) -> AppResult<(
+        Vec<NandiRoutesRes>,
+        Vec<NandiPatternDetails>,
+        Vec<GTFSStop>,
+        HashSet<String>,
+    )> {
+        let dir = std::path::Path::new(preprocessed_dir);
+
+        // Check if directory exists
+        if !dir.exists() {
+            return Err(AppError::Internal(format!(
+                "Preprocessed data directory not found: {}",
+                preprocessed_dir
+            )));
+        }
+
+        let manifest = self.verify_preprocessed_manifest(dir).await?;
+        info!(
+            "Preprocessed manifest verified: version={}, {} feeds",
+            manifest.version,
+            manifest.gtfs_feeds.len()
+        );
+
+        let mut all_routes = Vec::new();
+        let mut all_patterns = Vec::new();
+        let mut all_stops = Vec::new();
+        let mut loaded_gtfs_ids = HashSet::new();
+
+        // Load routes.json
+        let routes_path = dir.join("routes.json");
+        if routes_path.exists() {
+            let json = tokio::fs::read_to_string(&routes_path).await.map_err(|e| {
+                AppError::Internal(format!("Failed to read routes.json: {}", e))
+            })?;
+            let routes_by_gtfs: HashMap<String, Vec<NandiRoutesRes>> =
+                serde_json::from_str(&json).map_err(|e| {
+                    AppError::Internal(format!("Failed to parse routes.json: {}", e))
+                })?;
+            for (gtfs_id, routes) in routes_by_gtfs {
+                loaded_gtfs_ids.insert(gtfs_id.clone());
+                info!(
+                    "Loaded {} routes for gtfs_id={} from preprocessed files",
+                    routes.len(),
+                    gtfs_id
+                );
+                all_routes.extend(routes);
+            }
+        } else {
+            warn!("routes.json not found in {}", preprocessed_dir);
+        }
+
+        // Load stops.json
+        let stops_path = dir.join("stops.json");
+        if stops_path.exists() {
+            let json = tokio::fs::read_to_string(&stops_path).await.map_err(|e| {
+                AppError::Internal(format!("Failed to read stops.json: {}", e))
+            })?;
+            let stops_by_gtfs: HashMap<String, Vec<GTFSStop>> =
+                serde_json::from_str(&json).map_err(|e| {
+                    AppError::Internal(format!("Failed to parse stops.json: {}", e))
+                })?;
+            for (gtfs_id, stops) in stops_by_gtfs {
+                loaded_gtfs_ids.insert(gtfs_id.clone());
+                info!(
+                    "Loaded {} stops for gtfs_id={} from preprocessed files",
+                    stops.len(),
+                    gtfs_id
+                );
+                all_stops.extend(stops);
+            }
+        } else {
+            warn!("stops.json not found in {}", preprocessed_dir);
+        }
+
+        // Load patterns.json
+        let patterns_path = dir.join("patterns.json");
+        if patterns_path.exists() {
+            let json = tokio::fs::read_to_string(&patterns_path)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to read patterns.json: {}", e))
+                })?;
+            let patterns_by_gtfs: HashMap<String, Vec<NandiPatternDetails>> =
+                serde_json::from_str(&json).map_err(|e| {
+                    AppError::Internal(format!("Failed to parse patterns.json: {}", e))
+                })?;
+            for (gtfs_id, patterns) in patterns_by_gtfs {
+                loaded_gtfs_ids.insert(gtfs_id.clone());
+                info!(
+                    "Loaded {} patterns for gtfs_id={} from preprocessed files",
+                    patterns.len(),
+                    gtfs_id
+                );
+                all_patterns.extend(patterns);
+            }
+        } else {
+            warn!("patterns.json not found in {}", preprocessed_dir);
+        }
+
+
+        let missing_feeds: Vec<&String> = manifest
+            .gtfs_feeds
+            .iter()
+            .filter(|f| !loaded_gtfs_ids.contains(*f))
+            .collect();
+        if !missing_feeds.is_empty() {
+            return Err(AppError::Internal(format!(
+                "Preprocessed data incomplete: manifest lists feeds not found in data: {:?}",
+                missing_feeds
+            )));
+        }
+
+        info!(
+            "Preprocessed data loaded: {} routes, {} stops, {} patterns for {} GTFS feeds (manifest version={})",
+            all_routes.len(),
+            all_stops.len(),
+            all_patterns.len(),
+            loaded_gtfs_ids.len(),
+            manifest.version
+        );
+
+        Ok((all_routes, all_patterns, all_stops, loaded_gtfs_ids))
+    }
+
+
+    async fn verify_preprocessed_manifest(
+        &self,
+        dir: &std::path::Path,
+    ) -> AppResult<PreprocessedManifest> {
+        let manifest_path = dir.join("metadata.json");
+        if !manifest_path.exists() {
+            return Err(AppError::Internal(format!(
+                "metadata.json not found in {} — preprocessed copy is incomplete",
+                dir.display()
+            )));
+        }
+
+        let raw = tokio::fs::read_to_string(&manifest_path)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read metadata.json: {}", e)))?;
+        let manifest: PreprocessedManifest = serde_json::from_str(&raw)
+            .map_err(|e| AppError::Internal(format!("Failed to parse metadata.json: {}", e)))?;
+
+        if manifest.files.is_empty() {
+            return Err(AppError::Internal(
+                "metadata.json lists no files".to_string(),
+            ));
+        }
+
+        for (name, meta) in &manifest.files {
+            let file_path = dir.join(name);
+            if !file_path.exists() {
+                return Err(AppError::Internal(format!(
+                    "metadata.json lists {} but it is missing on disk",
+                    name
+                )));
+            }
+            if meta.count <= 0 {
+                return Err(AppError::Internal(format!(
+                    "Preprocessed file {} has zero records per manifest",
+                    name
+                )));
+            }
+            let actual = sha256_of_file(&file_path).await?;
+            if actual != meta.sha256 {
+                return Err(AppError::Internal(format!(
+                    "Checksum mismatch for {}: manifest={}, actual={} — corrupt or truncated copy",
+                    name,
+                    &meta.sha256.get(..12).unwrap_or(&meta.sha256),
+                    &actual.get(..12).unwrap_or(&actual),
+                )));
+            }
+        }
+
+        Ok(manifest)
     }
 
     async fn read_stop_geojsons_csv(
@@ -706,14 +998,16 @@ impl GTFSService {
                 long_name: route.long_name,
                 mode: cast_vehicle_type(&route.mode),
                 agency_name: route.agency_name,
-                trip_count: trip_counts.get(route_code).copied(),
-                stop_count: stop_counts
-                    .get(gtfs_id)
-                    .and_then(|r| r.get(route_code))
-                    .copied()
-                    .map(|c| c as i32),
-                start_point: None,
-                end_point: None,
+                trip_count: route.trip_count.or_else(|| trip_counts.get(route_code).copied()),
+                stop_count: route.stop_count.or_else(|| {
+                    stop_counts
+                        .get(gtfs_id)
+                        .and_then(|r| r.get(route_code))
+                        .copied()
+                        .map(|c| c as i32)
+                }),
+                start_point: route.start_point,
+                end_point: route.end_point,
                 service_tier_type,
                 encoded_polyline: None,
             };
@@ -809,14 +1103,20 @@ impl GTFSService {
                 continue;
             }
             let gtfs_id = parts[0];
-            let stop_code = parts[1];
+            // Key the stops map by the stop *code*, not the id segment. OTP
+            // stop ids happen to carry the code as their second segment, but
+            // preprocessed data builds ids from the raw GTFS stop_id — for
+            // metro platforms that stop_id differs from the stop_code, so the
+            // id segment is unsafe as a key. `stop.code` is the real code on
+            // every path.
+            let stop_code = stop.code.as_str();
 
             let stop_data = stops_by_gtfs.entry(gtfs_id.to_string()).or_default();
             let regional_name = stop_regional_names_by_gtfs
                 .get(gtfs_id)
                 .and_then(|m| m.get(stop_code));
 
-            let cluster_id = parse_cluster_id_from_desc(stop.desc.as_deref());
+            let cluster_id = parse_cluster_id_from_info_json(stop.info_json.as_deref());
 
             // Create a new GTFSStop with the clean stop code
             let stop_res = GTFSStop {
@@ -829,7 +1129,7 @@ impl GTFSService {
                 cluster: stop.cluster.clone(),
                 hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                 regional_name: regional_name.map(|r| r.regional_name.clone()),
-                desc: None,
+                info_json: None,
                 cluster_id: cluster_id.clone(),
             };
             if stop.cluster.is_some() {
@@ -843,7 +1143,7 @@ impl GTFSService {
                     cluster: stop.cluster.clone(),
                     hindi_name: regional_name.map(|r| r.hindi_name.clone()),
                     regional_name: regional_name.map(|r| r.regional_name.clone()),
-                    desc: None,
+                    info_json: None,
                     cluster_id: None,
                 };
                 stop_data
@@ -860,7 +1160,30 @@ impl GTFSService {
                     .insert(stop_code.to_string());
             }
 
-            stop_data.stops.insert(stop_code.to_string(), stop_res);
+            if let Some(cid) = &cluster_id {
+                by_cluster_set
+                    .entry(gtfs_id.to_string())
+                    .or_default()
+                    .entry(cid.clone())
+                    .or_default()
+                    .insert(stop_code.to_string());
+            }
+
+
+            // A station and its child platforms share one stop_code. Keep the
+            // entry that carries a station_id (a child pointing at its parent)
+            // so parent_stop_code resolution works — a bare station entry has
+            // no station_id and must not clobber a resolved child.
+            match stop_data.stops.get(stop_code) {
+                Some(existing)
+                    if existing.station_id.is_some() && stop_res.station_id.is_none() =>
+                {
+                    // Existing entry already resolves a parent; don't clobber it.
+                }
+                _ => {
+                    stop_data.stops.insert(stop_code.to_string(), stop_res);
+                }
+            }
         }
 
         for (gtfs_id, per_cluster) in by_cluster_set {
@@ -870,6 +1193,30 @@ impl GTFSService {
                     v.sort();
                     stop_data.by_cluster_id.insert(cid, v);
                 }
+            }
+        }
+
+        for (gtfs_id, data) in &stops_by_gtfs {
+            let total = data.stops.len();
+            let clustered = data
+                .stops
+                .values()
+                .filter(|s| s.cluster_id.is_some())
+                .count();
+            if clustered == 0 {
+                warn!(
+                    gtfs_id = %gtfs_id,
+                    total_stops = total,
+                    "No stops have a cluster_id; cluster destinations endpoint will fall back to single-stop walks for every request",
+                );
+            } else {
+                info!(
+                    gtfs_id = %gtfs_id,
+                    total_stops = total,
+                    clustered_stops = clustered,
+                    distinct_clusters = data.by_cluster_id.len(),
+                    "cluster_id coverage after build",
+                );
             }
         }
 
@@ -1007,6 +1354,11 @@ impl GTFSService {
                         .and_then(|gtfs_stop| gtfs_stop.station_id.as_ref())
                         .and_then(|station_id| station_id.split(':').next_back())
                         .filter(|s| !s.is_empty())
+                        .map(Arc::from),
+                    cluster_id: stops_by_gtfs
+                        .get(gtfs_id)
+                        .and_then(|stops_data| stops_data.stops.get(&stop.code))
+                        .and_then(|gtfs_stop| gtfs_stop.cluster_id.as_deref())
                         .map(Arc::from),
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
@@ -1314,6 +1666,16 @@ impl GTFSService {
 
     pub async fn is_ready(&self) -> bool {
         *self.is_ready.read().await
+    }
+
+    /// Whether the service is configured to serve from preprocessed data.
+    pub fn use_preprocessed_data(&self) -> bool {
+        self.config.use_preprocessed_data
+    }
+
+    /// Directory containing the preprocessed JSON files (and trip_stoptimes/ shards).
+    pub fn preprocessed_data_dir(&self) -> String {
+        self.config.preprocessed_data_dir.clone()
     }
 
     pub async fn get_route(&self, gtfs_id: &str, route_id: &str) -> AppResult<NandiRoutesRes> {
@@ -2243,6 +2605,85 @@ impl GTFSService {
             "Finished building example trip map"
         );
         Ok(mapping)
+    }
+
+    /// Build route → example trip and trip details from pattern data for preprocessed feeds.
+    /// This allows example-trip API to work without calling Nandi GraphQL when using preprocessed data.
+    fn build_example_trip_from_patterns(
+        all_pattern_details: &[NandiPatternDetails],
+        preprocessed_gtfs_ids: &HashSet<String>,
+    ) -> (
+        HashMap<String, HashMap<String, String>>,
+        HashMap<String, HashMap<String, TripDetails>>,
+    ) {
+        let mut trip_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut details_map: HashMap<String, HashMap<String, TripDetails>> = HashMap::new();
+
+        for pattern in all_pattern_details {
+            let (gtfs_id, route_code) = match pattern.route_id.split_once(':') {
+                Some((g, r)) => (g.to_string(), r.to_string()),
+                None => continue,
+            };
+            if !preprocessed_gtfs_ids.contains(&gtfs_id) {
+                continue;
+            }
+            let clean_gtfs = clean_identifier(&gtfs_id);
+            let clean_route = clean_identifier(&route_code);
+
+            let trip_id = match pattern.trips.first() {
+                Some(t) => clean_identifier(&t.id),
+                None => continue,
+            };
+            if trip_id.is_empty() {
+                continue;
+            }
+
+            // One example per route: first pattern wins
+            trip_map
+                .entry(clean_gtfs.clone())
+                .or_default()
+                .entry(clean_route.clone())
+                .or_insert_with(|| trip_id.clone());
+
+            // Build trip details from pattern stops so get_example_trip can
+            // return without GraphQL. Schedule times come from the example
+            // trip the preprocessor recorded (seconds since midnight, matching
+            // OTP's scheduledArrival/Departure). Older data without times
+            // defaults to 0 — same as before this field existed.
+            let stops: Vec<TripStopDetail> = pattern
+                .stops
+                .iter()
+                .enumerate()
+                .map(|(i, s)| TripStopDetail {
+                    stop_id: s.id.clone(),
+                    stop_code: s.code.clone(),
+                    stop_name: Some(s.name.clone()),
+                    platform_code: None,
+                    lat: s.lat,
+                    lon: s.lon,
+                    scheduled_arrival: s.arrival_time.unwrap_or(0),
+                    scheduled_departure: s.departure_time.unwrap_or(0),
+                    headsign: s
+                        .headsign
+                        .as_deref()
+                        .map(|h| serde_json::Value::String(h.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                    stop_position: s.stop_sequence.unwrap_or(i as i32),
+                })
+                .collect();
+
+            let details = TripDetails {
+                trip_id: trip_id.clone(),
+                stops,
+            };
+            details_map
+                .entry(clean_gtfs.clone())
+                .or_default()
+                .entry(clean_route.clone())
+                .or_insert(details);
+        }
+
+        (trip_map, details_map)
     }
 
     pub async fn get_seat_layout_id(&self, gtfs_id: &str, fleet_id: &str) -> Option<String> {
