@@ -2665,10 +2665,18 @@ pub async fn get_waybill_metadata(
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, waybill_no) = path.into_inner();
 
-    let waybill_metadata = app_state
+    let mut waybill_metadata = app_state
         .db_vehicle_reader_internal
         .get_waybill_metadata(&gtfs_id, &waybill_no)
         .await?;
+
+    // Enrich with the bus tag number for the waybill's current vehicle, so a bus swap on the waybill
+    // reflects the new tag downstream (same fleet_tag_list lookup as the /vehicle metadata endpoint).
+    waybill_metadata.bus_tag_number = app_state
+        .fleet_tag_list
+        .get(&gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(&waybill_metadata.vehicle_no))
+        .cloned();
 
     Ok(HttpResponse::Ok().json(waybill_metadata))
 }

@@ -1392,6 +1392,8 @@ impl DBVehicleReaderInternal {
             driver_id: waybill_row.driver_token_no,
             driver_name,
             driver_mobile_number,
+            // Enriched by the handler from the in-memory fleet tag list (keyed by vehicle_no).
+            bus_tag_number: None,
         };
 
         Ok(response)
