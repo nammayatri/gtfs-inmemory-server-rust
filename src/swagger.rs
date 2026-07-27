@@ -63,7 +63,6 @@ use crate::services::operator::QueryBody;
         routes::get_memory_stats,
         routes::get_version,
         routes::get_all_cached_data,
-        routes::get_config,
         routes::graphql_query,
         routes::get_connection_stats,
         routes::get_trip_cache_stats,

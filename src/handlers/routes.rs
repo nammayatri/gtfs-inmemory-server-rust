@@ -237,7 +237,6 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/cached-data",
                 actix_web::web::get().to(get_all_cached_data),
             )
-            .route("/config", actix_web::web::get().to(get_config))
             .route("/graphql", actix_web::web::post().to(graphql_query))
             .route(
                 "/connection-stats",
@@ -2540,24 +2539,6 @@ pub async fn get_all_cached_data(app_state: Data<AppState>) -> AppResult<HttpRes
         .body(bytes.to_vec()))
 }
 
-#[utoipa::path(
-    get,
-    path = "/config",
-    tag = "System",
-    responses((status = 200, description = "Current server configuration"))
-)]
-pub async fn get_config(app_state: Data<AppState>) -> AppResult<HttpResponse> {
-    // Get feeds loaded in memory from routes
-    let feeds_in_memory = app_state.gtfs_service.get_feeds_in_memory().await;
-
-    let response = serde_json::json!({
-        "config": app_state.config.clone(),
-        "feeds_loaded": feeds_in_memory
-    });
-
-    Ok(HttpResponse::Ok().json(response))
-}
-
 #[derive(Debug, serde::Deserialize, ToSchema)]
 pub struct GraphQLRequest {
     pub query: String,
@@ -3002,8 +2983,7 @@ pub async fn get_bus_route_schedule(
 
         // Fetch from external tables unless the query forces internal-only
         // or the gtfs_id is listed as internal-only.
-        let fetch_external =
-            !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let fetch_external = !just_internal && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         if fetch_external {
             let mut ext_rows = app_state
                 .db_vehicle_reader
@@ -3014,8 +2994,7 @@ pub async fn get_bus_route_schedule(
 
         // Fetch from internal tables unless the query forces external-only
         // or the gtfs_id is listed as external-only.
-        let fetch_internal =
-            !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+        let fetch_internal = !just_external && !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
         if fetch_internal {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
@@ -3712,7 +3691,12 @@ pub async fn search_stops(
     let limit = query.limit.unwrap_or(20).clamp(1, 200);
     let res = app_state
         .operator_service
-        .search_stops(&gtfs_id, &query.q, limit, query.with_routes.unwrap_or(false))
+        .search_stops(
+            &gtfs_id,
+            &query.q,
+            limit,
+            query.with_routes.unwrap_or(false),
+        )
         .await?;
     Ok(HttpResponse::Ok().json(res))
 }
@@ -3839,7 +3823,11 @@ pub async fn reprocess_routes(
     let body = body.into_inner();
     let res = app_state
         .operator_service
-        .reprocess_routes(&gtfs_id, &body.route_ids, body.recompute_polyline.unwrap_or(false))
+        .reprocess_routes(
+            &gtfs_id,
+            &body.route_ids,
+            body.recompute_polyline.unwrap_or(false),
+        )
         .await?;
     Ok(HttpResponse::Ok().json(res))
 }
