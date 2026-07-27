@@ -402,6 +402,8 @@ pub struct WaybillMetadataResponse {
     pub driver_name: Option<String>,
     #[serde(rename = "driverMobileNumber")]
     pub driver_mobile_number: Option<String>,
+    #[serde(rename = "busTagNumber")]
+    pub bus_tag_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
