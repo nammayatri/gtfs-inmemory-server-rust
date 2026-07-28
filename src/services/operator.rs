@@ -1239,6 +1239,12 @@ pub trait OperatorService: Send + Sync {
         waybill_id: String,
         fleet_no: &str,
     ) -> AppResult<u64>;
+    /// Granular update of a waybill's mutable operational fields (crew/fleet/devices) and optional status.
+    async fn update_waybill_details(
+        &self,
+        gtfs_id: &str,
+        body: &crate::models::UpdateWaybillDetailsBody,
+    ) -> AppResult<u64>;
     async fn update_waybill_tablet_id(
         &self,
         gtfs_id: &str,
@@ -1458,6 +1464,14 @@ impl OperatorService for MockOperatorService {
         _gtfs_id: &str,
         _waybill_id: String,
         _fleet_no: &str,
+    ) -> AppResult<u64> {
+        mock_err!()
+    }
+
+    async fn update_waybill_details(
+        &self,
+        _gtfs_id: &str,
+        _body: &crate::models::UpdateWaybillDetailsBody,
     ) -> AppResult<u64> {
         mock_err!()
     }
@@ -2536,6 +2550,53 @@ impl OperatorService for DBOperatorService {
         .execute(&self.pool)
         .await
         .map_err(|e| AppError::DbError(format!("update_waybill_fleet_number: {}", e)))?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn update_waybill_details(
+        &self,
+        gtfs_id: &str,
+        body: &crate::models::UpdateWaybillDetailsBody,
+    ) -> AppResult<u64> {
+        if let Some(status) = body.status.as_deref() {
+            if !waybill_statuses().contains(&status) {
+                return Err(AppError::BadRequest(format!(
+                    "Invalid status '{}'. Valid: {:?}",
+                    status,
+                    waybill_statuses()
+                )));
+            }
+        }
+        // COALESCE => only provided (non-null) fields change; identity/schedule columns are never listed,
+        // so they cannot be modified through this endpoint.
+        let result = sqlx::query(
+            "UPDATE public.waybills_internal SET \
+               vehicle_no = COALESCE($1, vehicle_no), \
+               driver_token_no = COALESCE($2, driver_token_no), \
+               driver_name = COALESCE($3, driver_name), \
+               conductor_token_no = COALESCE($4, conductor_token_no), \
+               conductor_name = COALESCE($5, conductor_name), \
+               no_of_device = COALESCE($6, no_of_device), \
+               device_serial_number = COALESCE($7, device_serial_number), \
+               status = COALESCE($8, status), \
+               audited_date = CASE WHEN $8 = 'audited' THEN now() ELSE audited_date END, \
+               updated_at = now() \
+             WHERE waybill_id::text = $9 AND gtfs_id = $10",
+        )
+        .bind(body.vehicle_no.as_deref())
+        .bind(body.driver_token_no.as_deref())
+        .bind(body.driver_name.as_deref())
+        .bind(body.conductor_token_no.as_deref())
+        .bind(body.conductor_name.as_deref())
+        .bind(body.no_of_device)
+        .bind(body.device_serial_number.as_deref())
+        .bind(body.status.as_deref())
+        .bind(body.waybill_id.to_string())
+        .bind(gtfs_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("update_waybill_details: {}", e)))?;
 
         Ok(result.rows_affected())
     }
