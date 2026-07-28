@@ -406,6 +406,24 @@ pub struct WaybillMetadataResponse {
     pub bus_tag_number: Option<String>,
 }
 
+/// Granular, update-only body for editing a waybill's mutable operational fields (crew, fleet, devices)
+/// and optionally its status. Every field is optional -> only provided (non-null) fields are written
+/// (COALESCE), and identity/schedule columns (schedule_no, trip_name, duty_date, ...) are never touched,
+/// so they are immutable by construction. `waybill_id` selects the row (its internal PK).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateWaybillDetailsBody {
+    #[schema(value_type = String)]
+    pub waybill_id: IdValue,
+    pub vehicle_no: Option<String>,
+    pub driver_token_no: Option<String>,
+    pub driver_name: Option<String>,
+    pub conductor_token_no: Option<String>,
+    pub conductor_name: Option<String>,
+    pub no_of_device: Option<i64>,
+    pub device_serial_number: Option<String>,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct WaybillTripInfo {
     pub waybill_no: String,

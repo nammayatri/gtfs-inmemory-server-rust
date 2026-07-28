@@ -25,7 +25,8 @@ use crate::graphql::TripQueryParams;
 use crate::models::{
     BusScheduleDetail, BusScheduleDetails, GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee,
     NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
-    VehicleData, VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
+    UpdateWaybillDetailsBody, VehicleData, VehicleMetadataResponse, VehicleOperationData,
+    VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
@@ -141,6 +142,11 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route(
                         "/export/route-stop-mapping",
                         web::get().to(export_route_stop_mapping),
+                    )
+                    // V2 granular queries + mutations
+                    .route(
+                        "/waybill/details/v2",
+                        web::post().to(update_waybill_details),
                     ),
             )
             .service(
@@ -4201,6 +4207,33 @@ pub async fn update_waybill_fleet(
 
     Ok(HttpResponse::Ok().json(json!({
         "message": "waybill fleet number updated",
+        "rows_affected": rows
+    })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill/details/v2",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = UpdateWaybillDetailsBody,
+    responses((status = 200, description = "Waybill operational details updated"))
+)]
+pub async fn update_waybill_details(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<UpdateWaybillDetailsBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows = app_state
+        .operator_service
+        .update_waybill_details(&gtfs_id, &body)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "waybill details updated",
         "rows_affected": rows
     })))
 }
