@@ -2,9 +2,7 @@ use utoipa::OpenApi;
 
 use crate::handlers::routes;
 use crate::models;
-use crate::services::fleet_operator::{
-    EmployeeLoginRequest, EmployeeLoginResponse, EmployeeRegisterRequest, EmployeeRegisterResponse,
-};
+use crate::services::fleet_operator::{EmployeeLoginRequest, EmployeeLoginResponse};
 use crate::services::operator::QueryBody;
 
 #[derive(OpenApi)]
@@ -75,7 +73,7 @@ use crate::services::operator::QueryBody;
         routes::get_all_rows,
         routes::query_rows_handler,
         routes::delete_one_row,
-        routes::upsert_one_row,
+        routes::upsert_many_rows,
         routes::get_service_types,
         routes::get_operator_routes,
         routes::get_depots,
@@ -102,7 +100,6 @@ use crate::services::operator::QueryBody;
         routes::fleet_operator_current_trip_details,
         routes::fleet_operator_verify,
         routes::fleet_operator_employee_login,
-        routes::fleet_operator_employee_register,
         routes::get_waybill_metadata,
     ),
     components(schemas(
@@ -147,8 +144,6 @@ use crate::services::operator::QueryBody;
         routes::FleetVerifyRequest,
         EmployeeLoginRequest,
         EmployeeLoginResponse,
-        EmployeeRegisterRequest,
-        EmployeeRegisterResponse,
         crate::services::fleet_operator::AuthType,
         crate::services::fleet_operator::Role,
         QueryBody,

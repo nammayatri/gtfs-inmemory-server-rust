@@ -1,6 +1,5 @@
 use crate::services::fleet_operator::{
-    EmployeeLoginRequest, EmployeeLoginResponse, EmployeeRegisterRequest, EmployeeRegisterResponse,
-    TripAction, WaybillAnchor,
+    EmployeeLoginRequest, EmployeeLoginResponse, TripAction, WaybillAnchor,
 };
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
@@ -107,7 +106,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/crud/{table}/all", web::get().to(get_all_rows))
                     .route("/crud/{table}/query", web::post().to(query_rows_handler))
                     .route("/crud/{table}/delete", web::post().to(delete_one_row))
-                    .route("/crud/{table}/upsert", web::post().to(upsert_one_row))
+                    .route("/crud/{table}/upsert", web::post().to(upsert_many_rows))
                     .route("/service-types", web::get().to(get_service_types))
                     .route("/routes", web::get().to(get_operator_routes))
                     .route("/depots", web::get().to(get_depots))
@@ -158,10 +157,6 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route(
                         "/employee/login",
                         web::post().to(fleet_operator_employee_login),
-                    )
-                    .route(
-                        "/employee/register",
-                        web::post().to(fleet_operator_employee_register),
                     ),
             )
             .route(
@@ -3601,7 +3596,7 @@ pub async fn delete_one_row(
     request_body = serde_json::Value,
     responses((status = 200, description = "Row upserted"))
 )]
-pub async fn upsert_one_row(
+pub async fn upsert_many_rows(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
     body: Json<Value>,
@@ -3627,7 +3622,7 @@ pub async fn upsert_one_row(
 
     let result = app_state
         .operator_service
-        .upsert_one_row(&table, &gtfs_id, body_value, to_regen)
+        .upsert_many_rows(&table, &gtfs_id, body_value, to_regen)
         .await?;
 
     Ok(HttpResponse::Ok().json(result))
@@ -4501,30 +4496,6 @@ pub async fn fleet_operator_employee_login(
     let response = app_state
         .fleet_operator_service
         .login(&gtfs_id, &req)
-        .await?;
-
-    Ok(HttpResponse::Ok().json(response))
-}
-
-#[utoipa::path(
-    post,
-    path = "/internal/fleet-operator/{gtfs_id}/employee/register",
-    tag = "Fleet Operator",
-    params(("gtfs_id" = String, Path, description = "GTFS dataset identifier")),
-    request_body = EmployeeRegisterRequest,
-    responses((status = 200, description = "Registration response", body = EmployeeRegisterResponse))
-)]
-pub async fn fleet_operator_employee_register(
-    app_state: Data<AppState>,
-    path: Path<String>,
-    body: Json<EmployeeRegisterRequest>,
-) -> AppResult<HttpResponse> {
-    let gtfs_id = path.into_inner();
-    let req = body.into_inner();
-
-    let response = app_state
-        .fleet_operator_service
-        .register(&gtfs_id, &req)
         .await?;
 
     Ok(HttpResponse::Ok().json(response))
