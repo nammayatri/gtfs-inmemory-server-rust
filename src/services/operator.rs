@@ -1747,10 +1747,15 @@ impl OperatorService for DBOperatorService {
         offset: i64,
     ) -> AppResult<Vec<InternalRow>> {
         validate_table(table)?;
+        // PKs are text UUIDs now, so `ORDER BY 1` is no longer newest-first; order by
+        // created_at with the PK as a unique tiebreaker for stable LIMIT/OFFSET
+        // pagination. Served by (gtfs_id, created_at DESC, pk DESC) partial indexes.
+        let pk = table_pk(table)
+            .ok_or_else(|| AppError::BadRequest(format!("No PK mapping for table: {}", table)))?;
 
         let sql = format!(
-            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY 1 desc LIMIT $2 OFFSET $3) t",
-            table
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY created_at DESC, {} DESC LIMIT $2 OFFSET $3) t",
+            table, pk
         );
 
         let vals: Vec<Value> = sqlx::query_scalar::<_, Value>(&sql)
@@ -1862,10 +1867,16 @@ impl OperatorService for DBOperatorService {
         let limit = body.limit.unwrap_or(15).min(MAX_QUERY_LIMIT);
         let offset = body.offset.unwrap_or(0);
 
+        // Same ordering rationale as get_all_rows: created_at + PK tiebreaker
+        // instead of `ORDER BY 1` on a text-UUID primary key.
+        let pk = table_pk(table)
+            .ok_or_else(|| AppError::BadRequest(format!("No PK mapping for table: {}", table)))?;
+
         let sql = format!(
-            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY 1 DESC LIMIT ${} OFFSET ${}) t",
+            "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY created_at DESC, {} DESC LIMIT ${} OFFSET ${}) t",
             table,
             where_parts.join(" AND "),
+            pk,
             param_idx,
             param_idx + 1,
         );
