@@ -230,6 +230,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/cluster/{gtfs_id}/destinations/{stop_code}",
                 actix_web::web::get().to(get_cluster_destinations),
             )
+            .route(
+                "/cluster/{gtfs_id}/routes/{source_cluster_id}/{destination_cluster_id}",
+                actix_web::web::get().to(get_routes_between_clusters),
+            )
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
             .route(
@@ -1147,6 +1151,43 @@ pub async fn get_cluster_destinations(
         .gtfs_service
         .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
     Ok(HttpResponse::Ok().json(destinations))
+}
+
+#[utoipa::path(
+    get,
+    path = "/cluster/{gtfs_id}/routes/{source_cluster_id}/{destination_cluster_id}",
+    tag = "Cluster",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("source_cluster_id" = String, Path, description = "Source H3 cluster id"),
+        ("destination_cluster_id" = String, Path, description = "Destination H3 cluster id"),
+    ),
+    responses((
+        status = 200,
+        description = "Routes serving both clusters with the destination downstream of the source, \
+                       each with the stop_codes the two clusters resolve to on that route. Where a \
+                       cluster has several stops on one route, the earliest boarding point and the \
+                       earliest qualifying alighting point downstream of it are returned — one entry \
+                       per route. Computed against the server's precomputed representative pattern \
+                       per route (the longest pattern observed for each route at build time — see \
+                       build_route_data), so patterns shorter than the longest for the same route are \
+                       not walked. DIRECT routes only — journeys requiring a transfer are not returned. \
+                       Returns 404 on unknown gtfs_id; returns [] for an unknown cluster id, for \
+                       identical source and destination clusters, or when no direct route connects them.",
+        body = Vec<crate::models::ClusterRouteConnection>,
+    ))
+)]
+pub async fn get_routes_between_clusters(
+    app_state: Data<AppState>,
+    path: Path<(String, String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, source_cluster_id, destination_cluster_id) = path.into_inner();
+    let connections = app_state.gtfs_service.get_routes_between_clusters(
+        &gtfs_id,
+        &source_cluster_id,
+        &destination_cluster_id,
+    )?;
+    Ok(HttpResponse::Ok().json(connections))
 }
 
 #[utoipa::path(

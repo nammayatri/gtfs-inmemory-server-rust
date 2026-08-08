@@ -52,6 +52,7 @@ use crate::services::operator::QueryBody;
         routes::get_all_route_stop_mappings_by_route_codes,
         routes::get_all_route_stop_mappings_by_stop_codes,
         routes::get_cluster_destinations,
+        routes::get_routes_between_clusters,
         routes::get_all_vehicles_by_ids,
         routes::get_routes_by_ids,
         // Trip
@@ -112,6 +113,7 @@ use crate::services::operator::QueryBody;
         models::LatLong,
         models::GTFSStop,
         models::RouteStopMapping,
+        models::ClusterRouteConnection,
         models::Gate,
         models::Stop,
         models::ServiceTierType,
