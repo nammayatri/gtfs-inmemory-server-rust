@@ -230,6 +230,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 "/cluster/{gtfs_id}/destinations/{stop_code}",
                 actix_web::web::get().to(get_cluster_destinations),
             )
+            .route(
+                "/cluster/{gtfs_id}/routes/{from_stop_code}/{to_stop_code}",
+                actix_web::web::get().to(get_routes_between_stops),
+            )
             .route("/ready", actix_web::web::get().to(readiness_probe))
             .route("/version/{gtfs_id}", actix_web::web::get().to(get_version))
             .route(
@@ -1147,6 +1151,48 @@ pub async fn get_cluster_destinations(
         .gtfs_service
         .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
     Ok(HttpResponse::Ok().json(destinations))
+}
+
+#[utoipa::path(
+    get,
+    path = "/cluster/{gtfs_id}/routes/{from_stop_code}/{to_stop_code}",
+    tag = "Cluster",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("from_stop_code" = String, Path, description = "Source stop code"),
+        ("to_stop_code" = String, Path, description = "Destination stop code"),
+    ),
+    responses((
+        status = 200,
+        description = "Direct routes from the source stop to the destination stop, matched at H3 \
+                       cluster granularity: each stop is widened to its cluster siblings first, so a \
+                       route serving the same physical stop under a different stop_code (typically the \
+                       opposite direction of a corridor) still matches. A stop with no cluster_id falls \
+                       back to matching on its own code, so results are never worse than an exact \
+                       stop_code join. Each entry names the route and the stop_codes the two ends \
+                       resolve to on it; where a cluster has several stops on one route, the earliest \
+                       boarding point and the earliest qualifying alighting point downstream of it are \
+                       returned — one entry per route. Computed against the server's precomputed \
+                       representative pattern per route (the longest pattern observed for each route \
+                       at build time — see build_route_data), so patterns shorter than the longest for \
+                       the same route are not walked. DIRECT routes only — journeys requiring a \
+                       transfer are not returned. Returns 404 on unknown gtfs_id; returns [] for an \
+                       unknown stop_code, when both stops resolve to the same cluster, or when no \
+                       direct route connects them.",
+        body = Vec<crate::models::ClusterRouteConnection>,
+    ))
+)]
+pub async fn get_routes_between_stops(
+    app_state: Data<AppState>,
+    path: Path<(String, String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, from_stop_code, to_stop_code) = path.into_inner();
+    let connections = app_state.gtfs_service.get_routes_between_stops(
+        &gtfs_id,
+        &from_stop_code,
+        &to_stop_code,
+    )?;
+    Ok(HttpResponse::Ok().json(connections))
 }
 
 #[utoipa::path(

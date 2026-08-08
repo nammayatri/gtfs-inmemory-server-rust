@@ -602,6 +602,22 @@ pub struct RouteStopMapping {
     pub cluster_id: Option<Arc<str>>,
 }
 
+/// One direct route connecting a source cluster to a destination cluster, with
+/// the specific stop_codes on that route that each cluster resolves to.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClusterRouteConnection {
+    #[serde(rename = "routeCode")]
+    pub route_code: String,
+    #[serde(rename = "sourceStopCode")]
+    pub source_stop_code: String,
+    #[serde(rename = "sourceSequenceNum")]
+    pub source_sequence_num: i32,
+    #[serde(rename = "destinationStopCode")]
+    pub destination_stop_code: String,
+    #[serde(rename = "destinationSequenceNum")]
+    pub destination_sequence_num: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Stop {
     #[serde(rename = "stopCode")]
