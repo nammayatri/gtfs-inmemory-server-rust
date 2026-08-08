@@ -1,10 +1,10 @@
 use crate::environment::AppConfig;
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
-    GTFSStopData, LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, PlatformInfo,
-    ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping, SeatLayoutMappingRecord,
-    ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord,
-    StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, ClusterRouteConnection, GTFSData,
+    GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern, NandiPatternDetails,
+    NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping,
+    SeatLayoutMappingRecord, ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
+    StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
 use crate::services::operator::OperatorService;
@@ -2172,6 +2172,187 @@ impl GTFSService {
             stop_code = %stop_code,
             destinations = out.len(),
             "destinations: result",
+        );
+        Ok(out)
+    }
+
+    /// Direct routes from one stop to another, matched at cluster granularity.
+    ///
+    /// Takes stop_codes rather than cluster ids: callers hold stop codes (see the
+    /// rider-app's fetchPossibleRoutes), so resolving the cluster here saves them a
+    /// lookup per request and keeps their cache keys on stop codes.
+    ///
+    /// Each stop is widened to its cluster siblings via `by_cluster_id`, then each
+    /// sibling is resolved to `(route_code, sequence_num)` pairs through `by_stop`.
+    /// A route qualifies when it serves both ends and the destination sits
+    /// downstream of the source. No `by_route` scan is needed — `by_stop` already
+    /// carries the sequence numbers.
+    ///
+    /// A stop with no cluster_id (unclustered, or at the sentinel coord) falls back
+    /// to a single-stop match on its own code, so the result is never worse than an
+    /// exact stop_code join.
+    ///
+    /// Direct routes only; transfers are not considered. Like the destinations
+    /// endpoint, this walks the representative (longest) pattern per route built at
+    /// startup, so shorter patterns on the same route are not enumerated.
+    pub fn get_routes_between_stops(
+        &self,
+        gtfs_id: &str,
+        from_stop_code: &str,
+        to_stop_code: &str,
+    ) -> AppResult<Vec<ClusterRouteConnection>> {
+        let data = self.data.load_full();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let from_stop_code = clean_identifier(from_stop_code);
+        let to_stop_code = clean_identifier(to_stop_code);
+
+        // Unknown gtfs_id is a configuration error → 404. Unknown stop_codes
+        // inside a known feed are semantically "no connecting routes" → 200 [].
+        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
+            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
+        })?;
+
+        // Widen a stop to its cluster siblings, or to just itself when it carries
+        // no cluster_id. An unknown stop_code yields nothing to match on.
+        let widen = |stop_code: &str, side: &str| -> Option<(Vec<String>, Option<String>)> {
+            let stop = match stops_data.stops.get(stop_code) {
+                Some(s) => s,
+                None => {
+                    info!(
+                        gtfs_id = %gtfs_id,
+                        stop_code = %stop_code,
+                        side = %side,
+                        "routes between stops: stop not found in feed",
+                    );
+                    return None;
+                }
+            };
+            match stop.cluster_id.as_ref() {
+                Some(cid) => stops_data
+                    .by_cluster_id
+                    .get(cid)
+                    .cloned()
+                    .map(|siblings| (siblings, Some(cid.clone())))
+                    .or_else(|| Some((vec![stop_code.to_string()], Some(cid.clone())))),
+                None => {
+                    debug!(
+                        gtfs_id = %gtfs_id,
+                        stop_code = %stop_code,
+                        side = %side,
+                        "routes between stops: no cluster_id, falling back to single-stop match",
+                    );
+                    Some((vec![stop_code.to_string()], None))
+                }
+            }
+        };
+
+        let (src_siblings, src_cluster) = match widen(&from_stop_code, "source") {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        let (dst_siblings, dst_cluster) = match widen(&to_stop_code, "destination") {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+
+        // Same cluster (or literally the same stop) is not a journey. Compared on
+        // cluster identity so the two sides of one junction don't count either.
+        let same_place = match (&src_cluster, &dst_cluster) {
+            (Some(a), Some(b)) => a == b,
+            _ => from_stop_code == to_stop_code,
+        };
+        if same_place {
+            info!(
+                gtfs_id = %gtfs_id,
+                from_stop_code = %from_stop_code,
+                to_stop_code = %to_stop_code,
+                "routes between stops: source and destination are the same place, returning empty list",
+            );
+            return Ok(Vec::new());
+        }
+
+        let src_siblings = &src_siblings;
+        let dst_siblings = &dst_siblings;
+
+        let route_data = match data.route_data_by_gtfs.get(&gtfs_id) {
+            Some(r) => r,
+            None => return Ok(Vec::new()),
+        };
+
+        // Earliest stop of the source cluster on each route — boarding as early as
+        // possible maximises what is reachable downstream.
+        let mut src_by_route: HashMap<Arc<str>, (Arc<str>, i32)> = HashMap::new();
+        for sib in src_siblings {
+            if let Some(idxs) = route_data.by_stop.get(sib) {
+                for &i in idxs {
+                    if let Some(m) = route_data.mappings.get(i) {
+                        src_by_route
+                            .entry(m.route_code.clone())
+                            .and_modify(|existing| {
+                                if m.sequence_num < existing.1 {
+                                    *existing = (m.stop_code.clone(), m.sequence_num);
+                                }
+                            })
+                            .or_insert((m.stop_code.clone(), m.sequence_num));
+                    }
+                }
+            }
+        }
+
+        if src_by_route.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Probe the source index with the destination cluster's stops, keeping the
+        // earliest qualifying alighting point downstream of boarding.
+        let mut best_by_route: HashMap<Arc<str>, ClusterRouteConnection> = HashMap::new();
+        for sib in dst_siblings {
+            let idxs = match route_data.by_stop.get(sib) {
+                Some(v) => v,
+                None => continue,
+            };
+            for &i in idxs {
+                let m = match route_data.mappings.get(i) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let (src_code, src_seq) = match src_by_route.get(&m.route_code) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if m.sequence_num <= *src_seq {
+                    continue;
+                }
+                let candidate = ClusterRouteConnection {
+                    route_code: m.route_code.to_string(),
+                    source_stop_code: src_code.to_string(),
+                    source_sequence_num: *src_seq,
+                    destination_stop_code: m.stop_code.to_string(),
+                    destination_sequence_num: m.sequence_num,
+                };
+                best_by_route
+                    .entry(m.route_code.clone())
+                    .and_modify(|existing| {
+                        if candidate.destination_sequence_num < existing.destination_sequence_num {
+                            *existing = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+
+        let mut out: Vec<ClusterRouteConnection> = best_by_route.into_values().collect();
+        out.sort_by(|a, b| a.route_code.cmp(&b.route_code));
+        info!(
+            gtfs_id = %gtfs_id,
+            from_stop_code = %from_stop_code,
+            to_stop_code = %to_stop_code,
+            source_cluster_id = ?src_cluster,
+            destination_cluster_id = ?dst_cluster,
+            src_siblings = src_siblings.len(),
+            dst_siblings = dst_siblings.len(),
+            routes = out.len(),
+            "routes between stops: result",
         );
         Ok(out)
     }
