@@ -2609,6 +2609,33 @@ impl OperatorService for DBOperatorService {
         .await
         .map_err(|e| AppError::DbError(format!("update_waybill_details: {}", e)))?;
 
+        // Mirror update_waybill_status: closing/auditing a waybill also clears its trips'
+        // runtime flags. Only looked up when the status actually calls for it.
+        let closes_waybill = matches!(body.status.as_deref(), Some("closed") | Some("audited"));
+        if closes_waybill && result.rows_affected() > 0 {
+            let schedule_trip_id: Option<String> = sqlx::query_scalar(
+                "SELECT schedule_trip_id::text FROM public.waybills_internal WHERE waybill_id::text = $1 AND gtfs_id = $2",
+            )
+            .bind(body.waybill_id.to_string())
+            .bind(gtfs_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("Failed to get schedule_trip_id: {}", e)))?;
+
+            if let Some(stid) = schedule_trip_id {
+                sqlx::query(
+                    "UPDATE public.bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
+                )
+                .bind(stid)
+                .bind(gtfs_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    AppError::DbError(format!("Failed to update is_active_trip/is_completed: {}", e))
+                })?;
+            }
+        }
+
         Ok(result.rows_affected())
     }
 
