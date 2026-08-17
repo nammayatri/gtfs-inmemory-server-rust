@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 use sqlx::PgPool;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::models::{
     BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillMetadataResponse, WaybillStatus,
@@ -50,6 +50,12 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
         waybill_no: &str,
     ) -> AppResult<WaybillMetadataResponse>;
+
+    async fn get_vehicle_tag_number(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>>;
 }
 
 // Mock implementation for local testing without a database
@@ -125,6 +131,14 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn get_vehicle_tag_number(
+        &self,
+        _fleet_no: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -132,10 +146,14 @@ pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
+    tag_number_cache: Arc<RwLock<HashMap<(String, String), (Option<String>, SystemTime)>>>,
 }
 
-const WAYBILL_ROUTE_CACHE_DURATION: u64 = 180;
+const WAYBILL_ROUTE_CACHE_DURATION: u64 = 30; // short TTL so bus swaps are reflected quickly
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
+const TAG_NUMBER_CACHE_DURATION: u64 = 43200; // 12 hours — tag_number rarely changes
+const TAG_NUMBER_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
+const TAG_NUMBER_CACHE_MAX_ENTRIES: usize = 4000;
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
@@ -143,6 +161,7 @@ impl DBVehicleReaderInternal {
             pool: Some(pool),
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
+            tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -153,6 +172,7 @@ impl DBVehicleReaderInternal {
             pool: None,
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
+            tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1347,6 +1367,90 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     ) -> AppResult<WaybillMetadataResponse> {
         self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
     }
+
+    async fn get_vehicle_tag_number(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let cache_key = (fleet_no.to_string(), gtfs_id.to_string());
+        {
+            let cache = self.tag_number_cache.read().await;
+            if let Some((tag, fetched_at)) = cache.get(&cache_key) {
+                let ttl = if tag.is_some() {
+                    TAG_NUMBER_CACHE_DURATION
+                } else {
+                    TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                };
+                if fetched_at.elapsed().unwrap_or_default() < Duration::from_secs(ttl) {
+                    return Ok(tag.clone());
+                }
+            }
+        }
+
+        let db_result = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT tag_number FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
+        )
+        .bind(fleet_no)
+        .bind(gtfs_id)
+        .fetch_optional(pool)
+        .await;
+
+        // Blank DB tag_number must not beat a real CSV value at the handler.
+        // On DB error, cache None with the negative TTL so a dead DB is paid once
+        // per window instead of per request.
+        let tag = match db_result {
+            Ok(row) => row.flatten().and_then(|s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            }),
+            Err(e) => {
+                warn!(
+                    "get_vehicle_tag_number: DB failure for ({}, {}): {}; caching negative for {}s",
+                    gtfs_id, fleet_no, e, TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                );
+                None
+            }
+        };
+
+        {
+            let mut cache = self.tag_number_cache.write().await;
+            if cache.len() >= TAG_NUMBER_CACHE_MAX_ENTRIES {
+                cache.retain(|_, (t, stamp)| {
+                    let ttl = if t.is_some() {
+                        TAG_NUMBER_CACHE_DURATION
+                    } else {
+                        TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                    };
+                    stamp.elapsed().unwrap_or_default() < Duration::from_secs(ttl)
+                });
+                while cache.len() >= TAG_NUMBER_CACHE_MAX_ENTRIES {
+                    let oldest = cache
+                        .iter()
+                        .min_by_key(|(_, (_, stamp))| *stamp)
+                        .map(|(key, _)| key.clone());
+                    match oldest {
+                        Some(key) => {
+                            cache.remove(&key);
+                        }
+                        None => break,
+                    }
+                }
+            }
+            cache.insert(cache_key, (tag.clone(), SystemTime::now()));
+        }
+
+        Ok(tag)
+    }
 }
 
 impl DBVehicleReaderInternal {
@@ -1409,7 +1513,6 @@ impl DBVehicleReaderInternal {
             driver_id: waybill_row.driver_token_no,
             driver_name,
             driver_mobile_number,
-            // Enriched by the handler from the in-memory fleet tag list (keyed by vehicle_no).
             bus_tag_number: None,
         };
 
