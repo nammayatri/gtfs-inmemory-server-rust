@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::models::IdValue;
+use crate::models::{IdValue, ServiceTierType};
 use crate::services::field_generator;
 use crate::tools::error::{AppError, AppResult};
 
@@ -291,6 +291,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "created_at",
             "deleted",
             "fleet_no",
+            "tag_number",
             "status",
             "updated_at",
             "vehicle_no",
@@ -741,6 +742,7 @@ pub struct FleetRow {
     pub vehicle_id: IdValue,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -1007,6 +1009,7 @@ pub struct VehiclesInternal {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
@@ -1321,6 +1324,13 @@ pub trait OperatorService: Send + Sync {
     /// Full route-stop-mapping across all routes (for CSV export).
     async fn export_route_stop_mapping(&self, gtfs_id: &str) -> AppResult<Vec<Value>>;
 
+    /// Resolves tier via route_internal → service_type_internal join; never errors (fallback path).
+    async fn get_service_tiers_for_routes(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+    ) -> HashMap<String, ServiceTierType>;
+
     /// Returns the underlying pool for streaming responses. None for mock implementations.
     fn pool(&self) -> Option<&PgPool> {
         None
@@ -1564,6 +1574,14 @@ impl OperatorService for MockOperatorService {
     async fn export_route_stop_mapping(&self, _gtfs_id: &str) -> AppResult<Vec<Value>> {
         mock_err!()
     }
+
+    async fn get_service_tiers_for_routes(
+        &self,
+        _gtfs_id: &str,
+        _route_ids: &[String],
+    ) -> HashMap<String, ServiceTierType> {
+        HashMap::new()
+    }
 }
 
 struct DeviceIdsCache {
@@ -1579,8 +1597,20 @@ struct DesignationCache {
     by_gtfs: HashMap<String, (HashMap<String, String>, SystemTime)>,
 }
 
+// Stringified keys so Int(3) and Text("3") collide during bigint→text migration.
+struct ServiceTypeNameCache {
+    by_gtfs: HashMap<String, (HashMap<String, Option<ServiceTierType>>, SystemTime)>,
+}
+
+// route_internal.bus_service_type_id cache: (gtfs_id, route_id) → (id | None (route absent/NULL), loaded_at)
+struct RouteBusServiceTypeCache {
+    by_route: HashMap<(String, String), (Option<IdValue>, SystemTime)>,
+}
+
 const DEVICE_CACHE_SECS: u64 = 3600; // 1 hour
 const DESIGNATION_CACHE_SECS: u64 = 43200; // 12 hours
+const SERVICE_TYPE_NAME_CACHE_SECS: u64 = 21600; // 6 hours
+const ROUTE_BUS_SERVICE_TYPE_CACHE_SECS: u64 = 1800; // 30 minutes
 
 pub struct DBOperatorService {
     pool: PgPool,
@@ -1591,6 +1621,8 @@ pub struct DBOperatorService {
     device_ids_cache: Arc<RwLock<DeviceIdsCache>>,
     tablet_ids_cache: Arc<RwLock<TabletIdsCache>>,
     designation_cache: Arc<RwLock<DesignationCache>>,
+    service_type_name_cache: Arc<RwLock<ServiceTypeNameCache>>,
+    route_bus_service_type_cache: Arc<RwLock<RouteBusServiceTypeCache>>,
 }
 
 impl DBOperatorService {
@@ -1607,6 +1639,12 @@ impl DBOperatorService {
             })),
             designation_cache: Arc::new(RwLock::new(DesignationCache {
                 by_gtfs: HashMap::new(),
+            })),
+            service_type_name_cache: Arc::new(RwLock::new(ServiceTypeNameCache {
+                by_gtfs: HashMap::new(),
+            })),
+            route_bus_service_type_cache: Arc::new(RwLock::new(RouteBusServiceTypeCache {
+                by_route: HashMap::new(),
             })),
         }
     }
@@ -1669,6 +1707,89 @@ impl DBOperatorService {
                     role, gtfs_id
                 ))
             })
+    }
+
+    fn parse_service_type_name(name: &str) -> Option<ServiceTierType> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_value(serde_json::Value::String(trimmed.to_string())).ok()
+    }
+
+    async fn get_service_type_map(
+        &self,
+        gtfs_id: &str,
+    ) -> HashMap<String, Option<ServiceTierType>> {
+        {
+            let cache = self.service_type_name_cache.read().await;
+            if let Some((m, ts)) = cache.by_gtfs.get(gtfs_id) {
+                if !Self::cache_expired(*ts, SERVICE_TYPE_NAME_CACHE_SECS) {
+                    return m.clone();
+                }
+            }
+        }
+
+        let rows = match self.get_service_types_list(gtfs_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "get_service_type_map: get_service_types_list({}) failed: {}",
+                    gtfs_id, e
+                );
+                return HashMap::new();
+            }
+        };
+
+        let map: HashMap<String, Option<ServiceTierType>> = rows
+            .into_iter()
+            .map(|row| {
+                let tier = row
+                    .service_type_name
+                    .as_deref()
+                    .and_then(Self::parse_service_type_name);
+                if tier.is_none() {
+                    if let Some(name) = row.service_type_name.as_deref() {
+                        if !name.trim().is_empty() {
+                            warn!(
+                                "get_service_type_map({}): service_type_name '{}' (id {}) did not parse to ServiceTierType; cached as None for {}s",
+                                gtfs_id, name, row.service_type_id, SERVICE_TYPE_NAME_CACHE_SECS
+                            );
+                        }
+                    }
+                }
+                (row.service_type_id.to_string(), tier)
+            })
+            .collect();
+
+        {
+            let mut cache = self.service_type_name_cache.write().await;
+            cache
+                .by_gtfs
+                .insert(gtfs_id.to_string(), (map.clone(), SystemTime::now()));
+        }
+        map
+    }
+
+    // Batched raw read of route_internal.bus_service_type_id.
+    async fn fetch_route_bus_service_type_ids(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+    ) -> AppResult<Vec<(String, Option<IdValue>)>> {
+        if route_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, (String, Option<IdValue>)>(
+            "SELECT route_id, bus_service_type_id \
+             FROM route_internal \
+             WHERE gtfs_id = $1 AND deleted = false AND route_id = ANY($2)",
+        )
+        .bind(gtfs_id)
+        .bind(route_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("fetch_route_bus_service_type_ids: {}", e)))
     }
 }
 
@@ -2299,7 +2420,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
         sqlx::query_as::<_, FleetRow>(
-            "SELECT vehicle_id, vehicle_no, fleet_no
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number
              FROM public.vehicles_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY vehicle_no",
@@ -3175,5 +3296,81 @@ impl OperatorService for DBOperatorService {
         .await
         .map_err(|e| AppError::DbError(format!("export_route_stop_mapping: {}", e)))?;
         Ok(rows)
+    }
+
+    async fn get_service_tiers_for_routes(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+    ) -> HashMap<String, ServiceTierType> {
+        if route_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut resolved_ids: HashMap<String, Option<IdValue>> =
+            HashMap::with_capacity(route_ids.len());
+        let mut to_fetch: Vec<String> = Vec::new();
+
+        {
+            let cache = self.route_bus_service_type_cache.read().await;
+            for route_id in route_ids {
+                let key = (gtfs_id.to_string(), route_id.clone());
+                match cache.by_route.get(&key) {
+                    Some((v, ts))
+                        if !Self::cache_expired(*ts, ROUTE_BUS_SERVICE_TYPE_CACHE_SECS) =>
+                    {
+                        resolved_ids.insert(route_id.clone(), v.clone());
+                    }
+                    _ => to_fetch.push(route_id.clone()),
+                }
+            }
+        }
+
+        if !to_fetch.is_empty() {
+            match self
+                .fetch_route_bus_service_type_ids(gtfs_id, &to_fetch)
+                .await
+            {
+                Ok(rows) => {
+                    let returned: HashMap<String, Option<IdValue>> = rows.into_iter().collect();
+                    let now = SystemTime::now();
+                    let mut cache = self.route_bus_service_type_cache.write().await;
+                    for route_id in &to_fetch {
+                        let value = returned.get(route_id).cloned().unwrap_or(None);
+                        cache.by_route.insert(
+                            (gtfs_id.to_string(), route_id.clone()),
+                            (value.clone(), now),
+                        );
+                        resolved_ids.insert(route_id.clone(), value);
+                    }
+                }
+                Err(e) => {
+                    // On DB failure: don't poison the cache. Next refresh retries.
+                    warn!(
+                        "get_service_tiers_for_routes: fetch_route_bus_service_type_ids({}) failed: {}",
+                        gtfs_id, e
+                    );
+                }
+            }
+        }
+
+        if !resolved_ids.values().any(|v| v.is_some()) {
+            return HashMap::new();
+        }
+
+        let name_map = self.get_service_type_map(gtfs_id).await;
+        if name_map.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut result = HashMap::with_capacity(resolved_ids.len());
+        for (route_id, opt_id) in resolved_ids {
+            if let Some(id) = opt_id {
+                if let Some(Some(tier)) = name_map.get(&id.to_string()) {
+                    result.insert(route_id, tier.clone());
+                }
+            }
+        }
+        result
     }
 }

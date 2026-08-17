@@ -60,6 +60,12 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
         waybill_no: &str,
     ) -> AppResult<WaybillMetadataResponse>;
+
+    async fn get_vehicle_tag_number(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>>;
 }
 
 // Mock implementation for local testing without a database
@@ -143,6 +149,14 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn get_vehicle_tag_number(
+        &self,
+        _fleet_no: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -151,9 +165,10 @@ pub struct DBVehicleReaderInternal {
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
     route_leg_time_cache: Arc<RwLock<HashMap<String, (RouteLegTravelTimes, SystemTime)>>>,
+    tag_number_cache: Arc<RwLock<HashMap<(String, String), (Option<String>, SystemTime)>>>,
 }
 
-const WAYBILL_ROUTE_CACHE_DURATION: u64 = 180;
+const WAYBILL_ROUTE_CACHE_DURATION: u64 = 30; // short TTL so bus swaps are reflected quickly
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 const ROUTE_LEG_TIME_CACHE_DURATION: u64 = 1800; // 30 mins
 /// This cache holds one entry per (gtfs_id, route_id) rather than per gtfs_id,
@@ -267,6 +282,8 @@ fn parse_leg_travel_seconds(raw: Option<&str>) -> Option<i64> {
     );
     None
 }
+const TAG_NUMBER_CACHE_DURATION: u64 = 43200; // 12 hours — tag_number rarely changes
+const TAG_NUMBER_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
@@ -275,6 +292,7 @@ impl DBVehicleReaderInternal {
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             route_leg_time_cache: Arc::new(RwLock::new(HashMap::new())),
+            tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -286,6 +304,7 @@ impl DBVehicleReaderInternal {
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             route_leg_time_cache: Arc::new(RwLock::new(HashMap::new())),
+            tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1688,6 +1707,59 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     ) -> AppResult<WaybillMetadataResponse> {
         self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
     }
+
+    async fn get_vehicle_tag_number(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let cache_key = (fleet_no.to_string(), gtfs_id.to_string());
+        {
+            let cache = self.tag_number_cache.read().await;
+            if let Some((tag, fetched_at)) = cache.get(&cache_key) {
+                let ttl = if tag.is_some() {
+                    TAG_NUMBER_CACHE_DURATION
+                } else {
+                    TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                };
+                if fetched_at.elapsed().unwrap_or_default() < Duration::from_secs(ttl) {
+                    return Ok(tag.clone());
+                }
+            }
+        }
+
+        let raw = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT tag_number FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
+        )
+        .bind(fleet_no)
+        .bind(gtfs_id)
+        .fetch_optional(pool)
+        .await
+        .map(|r| r.flatten())
+        .map_err(|e| AppError::DbError(format!("get_vehicle_tag_number: {}", e)))?;
+
+        // Blank DB tag_number must not beat a real CSV value at the handler.
+        let tag = raw.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+
+        self.tag_number_cache
+            .write()
+            .await
+            .insert(cache_key, (tag.clone(), SystemTime::now()));
+
+        Ok(tag)
+    }
 }
 
 impl DBVehicleReaderInternal {
@@ -1750,7 +1822,6 @@ impl DBVehicleReaderInternal {
             driver_id: waybill_row.driver_token_no,
             driver_name,
             driver_mobile_number,
-            // Enriched by the handler from the in-memory fleet tag list (keyed by vehicle_no).
             bus_tag_number: None,
         };
 

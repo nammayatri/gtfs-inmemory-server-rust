@@ -7,7 +7,7 @@ use crate::models::{
     StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
-use crate::services::operator::OperatorService;
+use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -281,6 +281,8 @@ impl GTFSService {
         // Re-apply DB polylines (not Nandi) so a snapshot boot matches a JSON boot.
         self.enrich_routes_with_polylines(&mut data.routes_by_gtfs)
             .await;
+        self.enrich_routes_with_db_service_tiers(&mut data.routes_by_gtfs)
+            .await;
         // Recompute hash after enrich.
         data.data_hash = self.compute_all_data_hashes(&data.routes_by_gtfs);
         // Rebuild the #[serde(skip)] field.
@@ -398,9 +400,16 @@ impl GTFSService {
             info!("No static fleet info loaded from CSV");
         }
 
-        let route_service_tiers_by_gtfs = self.read_route_service_tiers_csv().await?;
+        let csv_route_service_tiers = self.read_route_service_tiers_csv().await?;
         info!(
             "Loaded route service tiers for {} GTFS IDs from CSV",
+            csv_route_service_tiers.len()
+        );
+        let route_service_tiers_by_gtfs = self
+            .build_route_service_tiers(csv_route_service_tiers, &all_routes)
+            .await;
+        info!(
+            "Resolved route service tiers for {} GTFS IDs",
             route_service_tiers_by_gtfs.len()
         );
 
@@ -950,6 +959,62 @@ impl GTFSService {
         Ok(static_fleet_info_by_gtfs)
     }
 
+    async fn build_route_service_tiers(
+        &self,
+        csv_map: HashMap<String, HashMap<String, ServiceTierType>>,
+        all_routes: &[NandiRoutesRes],
+    ) -> HashMap<String, HashMap<String, ServiceTierType>> {
+        let Some(op_svc) = self.operator_service.get() else {
+            return csv_map;
+        };
+
+        let mut routes_by_gtfs: HashMap<String, HashSet<String>> = HashMap::new();
+        for route in all_routes {
+            let Some((gtfs_id, route_code)) = route.id.split_once(':') else {
+                continue;
+            };
+            routes_by_gtfs
+                .entry(gtfs_id.to_string())
+                .or_default()
+                .insert(route_code.to_string());
+        }
+
+        let mut merged = csv_map;
+        for (gtfs_id, all_route_ids) in routes_by_gtfs {
+            if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
+                continue;
+            }
+            let uncovered: Vec<String> = match merged.get(&gtfs_id) {
+                Some(csv_inner) => all_route_ids
+                    .into_iter()
+                    .filter(|r| !csv_inner.contains_key(r))
+                    .collect(),
+                None => all_route_ids.into_iter().collect(),
+            };
+            if uncovered.is_empty() {
+                continue;
+            }
+
+            let db_map = op_svc
+                .get_service_tiers_for_routes(&gtfs_id, &uncovered)
+                .await;
+            info!(
+                "Route service tiers for {}: DB fallback resolved {}/{} uncovered routes",
+                gtfs_id,
+                db_map.len(),
+                uncovered.len()
+            );
+            if db_map.is_empty() {
+                continue;
+            }
+            let inner = merged.entry(gtfs_id).or_default();
+            for (route_id, tier) in db_map {
+                inner.entry(route_id).or_insert(tier);
+            }
+        }
+        merged
+    }
+
     async fn read_route_service_tiers_csv(
         &self,
     ) -> AppResult<HashMap<String, HashMap<String, ServiceTierType>>> {
@@ -1179,6 +1244,43 @@ impl GTFSService {
                 let route_key = row.route_id.to_string();
                 if let Some(route) = routes.get_mut(&route_key) {
                     route.encoded_polyline = row.encoded_polyline;
+                }
+            }
+        }
+    }
+
+    // Snapshot-boot equivalent of build_route_service_tiers: fills service_tier_type
+    // on routes that shipped without one from CSV, so snapshot boots match a JSON boot.
+    async fn enrich_routes_with_db_service_tiers(
+        &self,
+        routes_by_gtfs: &mut HashMap<String, HashMap<String, NandiRoutesRes>>,
+    ) {
+        let Some(op_svc) = self.operator_service.get() else {
+            return;
+        };
+        for (gtfs_id, routes) in routes_by_gtfs.iter_mut() {
+            if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
+                continue;
+            }
+            let uncovered: Vec<String> = routes
+                .iter()
+                .filter_map(|(rid, r)| r.service_tier_type.is_none().then(|| rid.clone()))
+                .collect();
+            if uncovered.is_empty() {
+                continue;
+            }
+            let db_map = op_svc
+                .get_service_tiers_for_routes(gtfs_id, &uncovered)
+                .await;
+            info!(
+                "enrich_routes_with_db_service_tiers({}): resolved {}/{} uncovered routes",
+                gtfs_id,
+                db_map.len(),
+                uncovered.len()
+            );
+            for (route_id, tier) in db_map {
+                if let Some(route) = routes.get_mut(&route_id) {
+                    route.service_tier_type = Some(tier);
                 }
             }
         }
