@@ -1542,6 +1542,33 @@ pub async fn get_service_type_by_vehicle_by_gtfs_id(
     .await
 }
 
+// DB-first with CSV fallback; gate skips guaranteed-None DB round-trip on non-operator feeds.
+async fn resolve_tag_number(
+    app_state: &AppState,
+    gtfs_id: &str,
+    vehicle_no: &str,
+) -> Option<String> {
+    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+        match app_state
+            .db_vehicle_reader_internal
+            .get_vehicle_tag_number(vehicle_no, gtfs_id)
+            .await
+        {
+            Ok(Some(tag)) => return Some(tag),
+            Ok(None) => {}
+            Err(e) => warn!(
+                "resolve_tag_number: DB lookup failed for ({}, {}): {}; falling back to fleet_tag_list.csv",
+                gtfs_id, vehicle_no, e
+            ),
+        }
+    }
+    app_state
+        .fleet_tag_list
+        .get(gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
+        .cloned()
+}
+
 #[utoipa::path(
     get,
     path = "/vehicle/{gtfs_id}/metadata/{vehicle_no}",
@@ -1569,11 +1596,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         .cloned()
         .unwrap_or(path_vehicle);
 
-    let vehicle_tag_number = app_state
-        .fleet_tag_list
-        .get(&gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(&vehicle_no))
-        .cloned();
+    let vehicle_tag_number = resolve_tag_number(&app_state, &gtfs_id, &vehicle_no).await;
 
     let service_sub_types = app_state
         .vehicle_service_sub_types
@@ -1999,11 +2022,7 @@ async fn get_service_type_by_vehicle_impl(
         path
     };
 
-    let tag_number = app_state
-        .fleet_tag_list
-        .get(gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
-        .cloned();
+    let tag_number = resolve_tag_number(&app_state, gtfs_id, vehicle_no).await;
 
     // Get vehicle verification if requested
     let is_valid = if pass_verify_req {
@@ -2779,13 +2798,8 @@ pub async fn get_waybill_metadata(
         .get_waybill_metadata(&gtfs_id, &waybill_no)
         .await?;
 
-    // Enrich with the bus tag number for the waybill's current vehicle, so a bus swap on the waybill
-    // reflects the new tag downstream (same fleet_tag_list lookup as the /vehicle metadata endpoint).
-    waybill_metadata.bus_tag_number = app_state
-        .fleet_tag_list
-        .get(&gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(&waybill_metadata.vehicle_no))
-        .cloned();
+    waybill_metadata.bus_tag_number =
+        resolve_tag_number(&app_state, &gtfs_id, &waybill_metadata.vehicle_no).await;
 
     Ok(HttpResponse::Ok().json(waybill_metadata))
 }
