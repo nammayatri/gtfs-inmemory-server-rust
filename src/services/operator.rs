@@ -3109,7 +3109,12 @@ impl OperatorService for DBOperatorService {
                         {
                             error!("reprocess_routes: failed to persist polyline for route {}: {}", route_id, e);
                         }
-                        // leg[i] is between pts[i] and pts[i+1] → assign to pts[i+1]
+                        // leg[i] is between pts[i] and pts[i+1] → assign to pts[i+1].
+                        // travel_distance is metres, travel_time is SECONDS -
+                        // OSRM gives both in those units already, and seconds is
+                        // the convention the ETA reader and the transit editor
+                        // use. Older rows may still hold milliseconds;
+                        // parse_leg_travel_seconds reads either.
                         for (i, (dist, dur)) in legs.iter().enumerate() {
                             if let Some(p) = pts.get(i + 1) {
                                 if let Err(e) = sqlx::query(
@@ -3118,7 +3123,7 @@ impl OperatorService for DBOperatorService {
                                 )
                                 .bind(&p.route_points_id)
                                 .bind(*dist as i64)
-                                .bind(format!("{}", (*dur * 1000.0) as i64))
+                                .bind(format!("{}", dur.round() as i64))
                                 .bind(gtfs_id)
                                 .execute(&self.pool)
                                 .await
