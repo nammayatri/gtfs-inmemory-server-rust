@@ -37,6 +37,16 @@ pub trait VehicleDataReaderInternal: Send + Sync {
 
     async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>>;
 
+    /// Per-route stop-to-stop travel times in seconds, derived from
+    /// `route_point_internal.travel_time`. Keyed by (previous stop, current stop).
+    /// Each pair is registered under both `bus_stop_id` and `bus_stop_code` so the
+    /// lookup succeeds whichever identifier the GTFS feed exposes as `stopCode`.
+    async fn get_route_leg_travel_times(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<RouteLegTravelTimes>;
+
     async fn upsert_station_eta(
         &self,
         gtfs_id: &str,
@@ -106,6 +116,14 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         Ok(HashMap::new())
     }
 
+    async fn get_route_leg_travel_times(
+        &self,
+        _gtfs_id: &str,
+        _route_id: &str,
+    ) -> AppResult<RouteLegTravelTimes> {
+        Ok(RouteLegTravelTimes::default())
+    }
+
     async fn upsert_station_eta(
         &self,
         _gtfs_id: &str,
@@ -132,10 +150,123 @@ pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
+    route_leg_time_cache: Arc<RwLock<HashMap<String, (RouteLegTravelTimes, SystemTime)>>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 180;
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
+const ROUTE_LEG_TIME_CACHE_DURATION: u64 = 1800; // 30 mins
+/// This cache holds one entry per (gtfs_id, route_id) rather than per gtfs_id,
+/// so it grows with the route count. Bounded so a large feed cannot pin an
+/// unbounded number of maps for the lifetime of the process.
+const ROUTE_LEG_TIME_CACHE_MAX_ENTRIES: usize = 2000;
+
+/// Stop-to-stop leg durations for one route, in seconds.
+///
+/// The two halves are kept apart on purpose. `bus_stop_id` is a numeric-looking
+/// text id and `bus_stop_code` is an operator code from a different name space;
+/// merging them lets one feed's code collide with another feed's id and
+/// silently inject an unrelated route's leg time. Callers try `by_stop_id`
+/// first and fall back to `by_stop_code` only when the id does not match, which
+/// is what lets a GTFS feed keyed on either identifier work unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct RouteLegTravelTimes {
+    pub by_stop_id: HashMap<(String, String), i32>,
+    pub by_stop_code: HashMap<(String, String), i32>,
+}
+
+impl RouteLegTravelTimes {
+    pub fn is_empty(&self) -> bool {
+        self.by_stop_id.is_empty() && self.by_stop_code.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_stop_id.len() + self.by_stop_code.len()
+    }
+
+    /// Seconds for the leg between two stops, preferring the id match.
+    pub fn get(&self, previous: &str, current: &str) -> Option<i32> {
+        let key = (previous.to_string(), current.to_string());
+        self.by_stop_id
+            .get(&key)
+            .or_else(|| self.by_stop_code.get(&key))
+            .copied()
+    }
+}
+
+/// Plausible bounds for a single stop-to-stop leg on a city bus route.
+/// Anything outside this band is treated as garbage and the leg falls back to
+/// `station_eta` / haversine.
+const MIN_LEG_TRAVEL_SECONDS: i64 = 10;
+const MAX_LEG_TRAVEL_SECONDS: i64 = 5400; // 90 mins
+
+/// Parses one `route_point_internal.travel_time` value into whole seconds.
+///
+/// The column is `text` with no CHECK constraint and has two known producers
+/// that disagree on units:
+///   - `reprocess_routes` writes OSRM's leg duration as whole **milliseconds**
+///     (`operator.rs`: `(dur * 1000.0) as i64`).
+///   - the rows imported from the upstream ITMS feed, and anything an operator
+///     passes to `insert_route_stop`, are believed to be **seconds** - matching
+///     every other duration in this service (`station_eta.eta_in_seconds`,
+///     `BusStopETA.eta_seconds`).
+///
+/// Both are accepted. For a leg of ordinary length the readings do not collide,
+/// because `[10, 5400]` seconds encodes to `[10000, 5400000]` milliseconds:
+///
+/// | value     | seconds  | milliseconds | read as |
+/// |-----------|----------|--------------|---------|
+/// | `180`     | 3 min    | 0.18 s       | seconds |
+/// | `180000`  | 50 h     | 3 min        | millis  |
+///
+/// The bands are NOT disjoint at the bottom, though. A millisecond value of
+/// 10..=5400 - which the old OSRM writer emitted for legs under 5.4s, as
+/// happens between near-duplicate adjacent stops - is indistinguishable here
+/// from a genuine seconds value and is read as seconds. Since offsets
+/// accumulate, one such misread would shift every later stop on the route, so
+/// `build_stop_offsets` cross-checks each leg against the straight-line
+/// distance between its stops and discards times implying an absurd speed.
+/// That check, not this function, is what makes the ambiguity safe.
+///
+/// A value outside both bands is plausible under neither reading and is
+/// rejected rather than guessed at, as are NULL, empty, negative, non-finite
+/// and non-numeric values.
+fn parse_leg_travel_seconds(raw: Option<&str>) -> Option<i64> {
+    let text = raw?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let value: f64 = match text.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            debug!("travel_time rejected: not a number ({:?})", text);
+            return None;
+        }
+    };
+
+    if !value.is_finite() || value < 0.0 {
+        debug!("travel_time rejected: non-finite or negative ({:?})", text);
+        return None;
+    }
+
+    let as_seconds = value.round() as i64;
+    if (MIN_LEG_TRAVEL_SECONDS..=MAX_LEG_TRAVEL_SECONDS).contains(&as_seconds) {
+        return Some(as_seconds);
+    }
+
+    let as_millis = (value / 1000.0).round() as i64;
+    if (MIN_LEG_TRAVEL_SECONDS..=MAX_LEG_TRAVEL_SECONDS).contains(&as_millis) {
+        return Some(as_millis);
+    }
+
+    debug!(
+        "travel_time rejected: {:?} is implausible as seconds ({}s) or as millis ({}s), \
+         expected a leg of [{}, {}] seconds",
+        text, as_seconds, as_millis, MIN_LEG_TRAVEL_SECONDS, MAX_LEG_TRAVEL_SECONDS
+    );
+    None
+}
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
@@ -143,6 +274,7 @@ impl DBVehicleReaderInternal {
             pool: Some(pool),
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
+            route_leg_time_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -153,6 +285,7 @@ impl DBVehicleReaderInternal {
             pool: None,
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
+            route_leg_time_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -178,6 +311,15 @@ impl DBVehicleReaderInternal {
 
     fn get_station_eta_cache_key(&self, gtfs_id: &str) -> String {
         format!("eta_map_{}", gtfs_id)
+    }
+
+    fn is_route_leg_time_cache_expired(&self, timestamp: SystemTime) -> bool {
+        let elapsed = timestamp.elapsed().unwrap_or_default();
+        elapsed >= Duration::from_secs(ROUTE_LEG_TIME_CACHE_DURATION)
+    }
+
+    fn get_route_leg_time_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
+        format!("leg_time_{}_{}", gtfs_id, route_id)
     }
 
     /// Returns true if vehicle_no exists in vehicles_internal for the given gtfs_id.
@@ -271,6 +413,196 @@ impl DBVehicleReaderInternal {
         }
 
         Ok(eta_map)
+    }
+
+    /// Reads `route_point_internal` for one route and turns the per-point
+    /// `travel_time` (leg from the previous stop) into a
+    /// (previous stop, current stop) -> seconds map.
+    ///
+    /// One query per (gtfs_id, route_id), memoised for
+    /// `ROUTE_LEG_TIME_CACHE_DURATION`. Never fails the caller: a DB error
+    /// yields an empty map so ETA computation falls back to `station_eta` /
+    /// haversine.
+    pub async fn get_route_leg_travel_times_impl(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<RouteLegTravelTimes> {
+        let cache_key = self.get_route_leg_time_cache_key(gtfs_id, route_id);
+
+        {
+            let cache = self.route_leg_time_cache.read().await;
+            if let Some((legs, timestamp)) = cache.get(&cache_key) {
+                if !self.is_route_leg_time_cache_expired(*timestamp) {
+                    debug!(
+                        "route_leg_time_cache HIT for gtfs_id={} route_id={}",
+                        gtfs_id, route_id
+                    );
+                    return Ok(legs.clone());
+                }
+            }
+        }
+
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(RouteLegTravelTimes::default()),
+        };
+
+        // travel_time is selected raw and validated in Rust by
+        // parse_leg_travel_seconds. Casting it in SQL would abort the whole
+        // query - and so lose every leg on the route - on a single bad row.
+        let query = r#"
+            SELECT rp.route_order::bigint AS route_order,
+                   rp.bus_stop_id,
+                   s.bus_stop_code,
+                   rp.travel_time
+            FROM route_point_internal rp
+            LEFT JOIN stop_internal s
+              ON s.bus_stop_id = rp.bus_stop_id
+             AND s.gtfs_id     = rp.gtfs_id
+             AND s.deleted     = false
+            WHERE rp.gtfs_id = $1
+              AND rp.route_id = $2
+              AND rp.deleted  = false
+            ORDER BY rp.route_order, rp.created_at, rp.route_points_id
+        "#;
+
+        let rows = match sqlx::query(query)
+            .bind(gtfs_id)
+            .bind(route_id)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!(
+                    "get_route_leg_travel_times failed for gtfs_id={} route_id={}: {} - falling back",
+                    gtfs_id, route_id, e
+                );
+                return Ok(RouteLegTravelTimes::default());
+            }
+        };
+
+        use sqlx::Row;
+        let mut leg_map = RouteLegTravelTimes::default();
+        // (bus_stop_id, bus_stop_code) of the previous point in route_order.
+        let mut prev: Option<(String, Option<String>)> = None;
+        let mut prev_order: Option<i64> = None;
+        let mut skipped = 0usize;
+
+        for row in rows {
+            // Decoding route_order must never fall back to a default: a silent 0
+            // would make every row compare equal and drop the whole route.
+            let order: i64 = match row.try_get::<i64, &str>("route_order") {
+                Ok(value) => value,
+                Err(e) => {
+                    error!(
+                        "route_order decode failed on route_id={} gtfs_id={}: {} - \
+                         abandoning leg times for this route",
+                        route_id, gtfs_id, e
+                    );
+                    return Ok(RouteLegTravelTimes::default());
+                }
+            };
+            let stop_id: String = match row.try_get::<Option<String>, &str>("bus_stop_id") {
+                Ok(Some(id)) if !id.is_empty() => id,
+                _ => {
+                    // A point without a stop breaks the chain - drop the
+                    // adjacency rather than bridging across it.
+                    prev = None;
+                    prev_order = None;
+                    continue;
+                }
+            };
+            let stop_code: Option<String> = row
+                .try_get::<Option<String>, &str>("bus_stop_code")
+                .unwrap_or(None)
+                .filter(|c| !c.is_empty());
+            let travel_time_raw: Option<String> = row
+                .try_get::<Option<String>, &str>("travel_time")
+                .unwrap_or(None);
+            let travel_secs = parse_leg_travel_seconds(travel_time_raw.as_deref());
+
+            // route_order is not unique (rp_route_order_idx is a plain index), so
+            // ties are expected. The query breaks them on created_at then
+            // route_points_id, which makes the sequence deterministic - a tie is
+            // a valid adjacency, only a decrease means the ordering is broken.
+            let ordered = prev_order.map(|p| order >= p).unwrap_or(true);
+
+            match (prev.as_ref(), travel_secs, ordered) {
+                (Some(_), _, false) => {
+                    // Ambiguous ordering - pairing this row with the previous one
+                    // would be arbitrary, so drop the leg.
+                    debug!(
+                        "route leg skipped: non-increasing route_order {} on route_id={} gtfs_id={}",
+                        order, route_id, gtfs_id
+                    );
+                    skipped += 1;
+                }
+                (Some((prev_id, prev_code)), Some(secs), true) => {
+                    // Keyed twice, in separate name spaces rather than as a
+                    // cross product, so a stop code can never collide with some
+                    // other stop's id. A circular route can visit the same pair
+                    // twice; keep the first (lowest route_order) so the result
+                    // is deterministic.
+                    leg_map
+                        .by_stop_id
+                        .entry((prev_id.clone(), stop_id.clone()))
+                        .or_insert(secs as i32);
+                    if let (Some(from_code), Some(to_code)) = (prev_code, stop_code.as_ref()) {
+                        leg_map
+                            .by_stop_code
+                            .entry((from_code.clone(), to_code.clone()))
+                            .or_insert(secs as i32);
+                    }
+                }
+                (Some(_), None, true) => {
+                    // travel_time absent or rejected - parse_leg_travel_seconds
+                    // has already logged why.
+                    skipped += 1;
+                }
+                (None, _, _) => {}
+            }
+
+            prev = Some((stop_id, stop_code));
+            prev_order = Some(order);
+        }
+
+        info!(
+            "route_leg_travel_times gtfs_id={} route_id={}: {} legs usable, {} rejected",
+            gtfs_id,
+            route_id,
+            leg_map.len(),
+            skipped
+        );
+
+        {
+            let mut cache = self.route_leg_time_cache.write().await;
+            // Drop anything already stale before inserting, and if the cache is
+            // still at its bound shed the oldest entry. Without this the map
+            // only ever grows: expiry is checked on read but never reclaims.
+            if cache.len() >= ROUTE_LEG_TIME_CACHE_MAX_ENTRIES {
+                cache.retain(|_, (_, stamp)| {
+                    stamp.elapsed().unwrap_or_default()
+                        < Duration::from_secs(ROUTE_LEG_TIME_CACHE_DURATION)
+                });
+                while cache.len() >= ROUTE_LEG_TIME_CACHE_MAX_ENTRIES {
+                    let oldest = cache
+                        .iter()
+                        .min_by_key(|(_, (_, stamp))| *stamp)
+                        .map(|(key, _)| key.clone());
+                    match oldest {
+                        Some(key) => {
+                            cache.remove(&key);
+                        }
+                        None => break,
+                    }
+                }
+            }
+            cache.insert(cache_key, (leg_map.clone(), SystemTime::now()));
+        }
+
+        Ok(leg_map)
     }
 
     /// Full vehicle data fetch against _internal tables, mirroring DBVehicleReader::get_vehicle_data.
@@ -1324,6 +1656,15 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         self.get_station_etas_impl(gtfs_id).await
     }
 
+    async fn get_route_leg_travel_times(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<RouteLegTravelTimes> {
+        self.get_route_leg_travel_times_impl(gtfs_id, route_id)
+            .await
+    }
+
     async fn upsert_station_eta(
         &self,
         gtfs_id: &str,
@@ -1414,5 +1755,83 @@ impl DBVehicleReaderInternal {
         };
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod leg_travel_time_tests {
+    use super::parse_leg_travel_seconds;
+
+    #[test]
+    fn accepts_seconds() {
+        // The convention every other duration in this service uses.
+        assert_eq!(parse_leg_travel_seconds(Some("180")), Some(180));
+        assert_eq!(parse_leg_travel_seconds(Some("180.0")), Some(180));
+        assert_eq!(parse_leg_travel_seconds(Some("  180  ")), Some(180));
+        assert_eq!(parse_leg_travel_seconds(Some("180.6")), Some(181));
+    }
+
+    #[test]
+    fn accepts_milliseconds() {
+        // What reprocess_routes writes: OSRM duration * 1000.
+        assert_eq!(parse_leg_travel_seconds(Some("180000")), Some(180));
+        assert_eq!(parse_leg_travel_seconds(Some("180000.0")), Some(180));
+        assert_eq!(parse_leg_travel_seconds(Some("180600")), Some(181));
+    }
+
+    #[test]
+    fn the_two_units_never_collide() {
+        // A 3 min leg is unambiguous in either encoding.
+        assert_eq!(
+            parse_leg_travel_seconds(Some("180")),
+            parse_leg_travel_seconds(Some("180000"))
+        );
+        // Band edges resolve to the same leg both ways.
+        assert_eq!(parse_leg_travel_seconds(Some("10")), Some(10));
+        assert_eq!(parse_leg_travel_seconds(Some("10000")), Some(10));
+        assert_eq!(parse_leg_travel_seconds(Some("5400")), Some(5400));
+        assert_eq!(parse_leg_travel_seconds(Some("5400000")), Some(5400));
+    }
+
+    #[test]
+    fn rejects_absent_and_empty() {
+        assert_eq!(parse_leg_travel_seconds(None), None);
+        assert_eq!(parse_leg_travel_seconds(Some("")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("   ")), None);
+    }
+
+    #[test]
+    fn rejects_malformed_text() {
+        // Would have aborted the whole query under an SQL-side cast.
+        assert_eq!(parse_leg_travel_seconds(Some("1.2.3")), None);
+        assert_eq!(parse_leg_travel_seconds(Some(".")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("abc")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("00:03:00")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("PT3M")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("1,200")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("null")), None);
+    }
+
+    #[test]
+    fn rejects_negative_and_non_finite() {
+        assert_eq!(parse_leg_travel_seconds(Some("-5000")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("NaN")), None);
+        assert_eq!(parse_leg_travel_seconds(Some("inf")), None);
+    }
+
+    #[test]
+    fn rejects_values_implausible_under_both_readings() {
+        assert_eq!(parse_leg_travel_seconds(Some("0")), None);
+        // Under 10s as seconds, and only 9ms as millis.
+        assert_eq!(parse_leg_travel_seconds(Some("9")), None);
+        // The gap between the bands: implausibly long as seconds, implausibly
+        // short as millis.
+        assert_eq!(parse_leg_travel_seconds(Some("5401")), None); // 1.5h  / 5.4s
+        assert_eq!(parse_leg_travel_seconds(Some("7000")), None); // 1.9h  / 7s
+        assert_eq!(parse_leg_travel_seconds(Some("9000")), None); // 2.5h  / 9s
+                                                                  // Just inside the millis band - 9999ms rounds to a legitimate 10s leg.
+        assert_eq!(parse_leg_travel_seconds(Some("9999")), Some(10));
+        // Beyond 90 min even read as millis.
+        assert_eq!(parse_leg_travel_seconds(Some("5500000")), None);
     }
 }
