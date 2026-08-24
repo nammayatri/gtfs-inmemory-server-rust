@@ -4,7 +4,7 @@ use crate::services::fleet_operator::{
 };
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
-    EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
+    EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, REPLICA_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
 };
 use actix_web::{
     web::{self, Data, Json, Path, Query},
@@ -56,6 +56,15 @@ pub struct DirectionQuery {
 pub struct IncludeClusterIdQuery {
     #[serde(rename = "includeClusterId")]
     include_cluster_id: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetRouteQuery {
+    /// Opt in to the waybill-derived `applicableServiceTypes` field. Off by
+    /// default: it costs a database round trip on a cache miss, and the
+    /// endpoint is otherwise served entirely from the in-memory GTFS snapshot.
+    #[serde(rename = "returnApplicableServiceTypes")]
+    return_applicable_service_types: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -414,19 +423,120 @@ pub async fn get_example_trip_map(app_state: Data<AppState>) -> AppResult<HttpRe
     params(
         ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
         ("route_id" = String, Path, description = "Route identifier"),
+        ("returnApplicableServiceTypes" = Option<bool>, Query,
+            description = "Include applicableServiceTypes, the tiers this route actually ran in over the last 45 days"),
     ),
     responses((status = 200, description = "Route details", body = NandiRoutesRes))
 )]
 pub async fn get_route(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    // Optional so a query string this endpoint never used to read cannot turn a
+    // request that previously returned the route into a 400: anything that does
+    // not deserialize is treated as the flag being absent.
+    query: Option<Query<GetRouteQuery>>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
-    let route = app_state
+    let mut route = app_state
         .gtfs_service
         .get_route(&gtfs_id, &route_id)
         .await?;
+    let want_service_types = query
+        .as_ref()
+        .and_then(|q| q.return_applicable_service_types)
+        .unwrap_or(false);
+    if want_service_types {
+        route.applicable_service_types =
+            applicable_service_types(&app_state, &gtfs_id, &route_id).await;
+    }
     Ok(HttpResponse::Ok().json(route))
+}
+
+/// Service tiers a route was actually operated in over the recent lookback
+/// window, from the waybill tables.
+///
+/// Both readers are consulted, because a feed may live in either database, but
+/// the internal answer wins whenever it has one rather than being merged with
+/// the replica's. The two databases number their routes independently, so the
+/// same `route_number_id` can name unrelated routes in each; unioning them
+/// would let one operator's tiers leak onto another operator's route.
+///
+/// Returns `None` rather than `Some([])` whenever the answer is not known:
+/// nothing found, both lookups failed, or every value the operator wrote is one
+/// this service has no mapping for. Consumers filter on the tier list, so an
+/// empty list read as fact would make the route unbookable; `None` tells them
+/// to leave quotes alone. Lookup errors are logged and swallowed for the same
+/// reason - a database blip must not remove a route from search.
+async fn applicable_service_types(
+    app_state: &AppState,
+    gtfs_id: &str,
+    route_id: &str,
+) -> Option<Vec<crate::models::ServiceTierType>> {
+    // Both identifiers are normalised the same way `gtfs_service::get_route`
+    // normalises them, so a prefixed or percent-encoded gtfs_id that resolves
+    // against the snapshot resolves against the waybill tables too.
+    let gtfs_id = crate::models::clean_identifier(gtfs_id);
+    let gtfs_id = gtfs_id.as_str();
+    let route_code = crate::models::clean_identifier(route_id);
+
+    // The replica is queried by route number alone, so it is only meaningful
+    // for the feeds it actually holds; for anything else it would answer with
+    // an unrelated operator's route of the same number.
+    let replica_lookup = async {
+        if REPLICA_GTFS_IDS.contains(&gtfs_id) {
+            app_state
+                .db_vehicle_reader
+                .get_applicable_service_types(&route_code)
+                .await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+
+    let (internal, replica) = tokio::join!(
+        app_state
+            .db_vehicle_reader_internal
+            .get_applicable_service_types(gtfs_id, &route_code),
+        replica_lookup,
+    );
+
+    let unwrap_source = |source: &str, result: AppResult<Vec<String>>| match result {
+        Ok(types) => types,
+        Err(e) => {
+            warn!(
+                "applicable service types: {} lookup failed for {}/{}: {}",
+                source, gtfs_id, route_code, e
+            );
+            Vec::new()
+        }
+    };
+
+    let raw = match unwrap_source("internal", internal) {
+        types if !types.is_empty() => types,
+        _ => unwrap_source("replica", replica),
+    };
+
+    let mut tiers: Vec<crate::models::ServiceTierType> = raw
+        .iter()
+        .filter_map(|value| {
+            let tier = crate::models::ServiceTierType::from_db_str(value);
+            if tier.is_none() {
+                warn!(
+                    "applicable service types: no tier mapping for {:?} on {}/{}",
+                    value, gtfs_id, route_code
+                );
+            }
+            tier
+        })
+        .collect();
+    tiers.sort();
+    tiers.dedup();
+
+    if tiers.is_empty() {
+        None
+    } else {
+        Some(tiers)
+    }
 }
 
 #[utoipa::path(

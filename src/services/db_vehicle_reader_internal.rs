@@ -11,6 +11,7 @@ use crate::models::{
     BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillMetadataResponse, WaybillStatus,
     WaybillTripInfo,
 };
+use crate::services::db_vehicle_reader::applicable_service_types_cutoff;
 use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
@@ -60,6 +61,18 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
         waybill_no: &str,
     ) -> AppResult<WaybillMetadataResponse>;
+
+    /// Distinct raw `service_type` values on waybills that ran this route
+    /// within the applicable-service-type lookback window.
+    ///
+    /// Returns the operator's own strings, unmapped. An empty vector means
+    /// "nothing found", which callers must treat as "unknown", not as
+    /// "runs nothing".
+    async fn get_applicable_service_types(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<Vec<String>>;
 }
 
 // Mock implementation for local testing without a database
@@ -143,6 +156,14 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn get_applicable_service_types(
+        &self,
+        _gtfs_id: &str,
+        _route_id: &str,
+    ) -> AppResult<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -151,9 +172,13 @@ pub struct DBVehicleReaderInternal {
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
     route_leg_time_cache: Arc<RwLock<HashMap<String, (RouteLegTravelTimes, SystemTime)>>>,
+    /// Raw `waybills_internal.service_type` values seen on a route, keyed by
+    /// "{gtfs_id}:{route_id}".
+    applicable_service_types_cache: Arc<RwLock<HashMap<String, (Vec<String>, SystemTime)>>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 180;
+const APPLICABLE_SERVICE_TYPES_CACHE_DURATION: u64 = 1800; // 30 mins
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 const ROUTE_LEG_TIME_CACHE_DURATION: u64 = 1800; // 30 mins
 /// This cache holds one entry per (gtfs_id, route_id) rather than per gtfs_id,
@@ -275,6 +300,7 @@ impl DBVehicleReaderInternal {
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             route_leg_time_cache: Arc::new(RwLock::new(HashMap::new())),
+            applicable_service_types_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -286,6 +312,7 @@ impl DBVehicleReaderInternal {
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             route_leg_time_cache: Arc::new(RwLock::new(HashMap::new())),
+            applicable_service_types_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1687,6 +1714,90 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         waybill_no: &str,
     ) -> AppResult<WaybillMetadataResponse> {
         self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
+    }
+
+    async fn get_applicable_service_types(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+    ) -> AppResult<Vec<String>> {
+        let cache_key = format!("{}:{}", gtfs_id, route_id);
+        {
+            let cache = self.applicable_service_types_cache.read().await;
+            if let Some((types, timestamp)) = cache.get(&cache_key) {
+                if timestamp.elapsed().unwrap_or_default()
+                    < Duration::from_secs(APPLICABLE_SERVICE_TYPES_CACHE_DURATION)
+                {
+                    debug!("Applicable service types cache HIT for {}", cache_key);
+                    return Ok(types.clone());
+                }
+            }
+        }
+
+        let pool = self.pool()?;
+        let cutoff = applicable_service_types_cutoff();
+
+        // Every table here is shared across feeds, so gtfs_id has to be on each
+        // reference including both sides of the join - route_number_id is not
+        // unique across feeds on its own.
+        //
+        // Scheduled trips reach their waybill through schedule_trip_id, flexi
+        // trips through waybill_id; a flexi waybill's trips are not reachable
+        // from schedule_trip_id, so both branches are needed.
+        let query = r#"
+            SELECT w.service_type
+            FROM public.bus_schedule_trip_detail_internal bstd
+            JOIN public.waybills_internal w
+                ON w.schedule_trip_id = bstd.schedule_trip_id
+                AND w.gtfs_id = $2
+            WHERE bstd.gtfs_id = $2
+                AND bstd.route_number_id::text = $1
+                AND bstd.deleted = false
+                AND bstd.trip_type <> 'dead-trip'
+                AND w.deleted = false
+                AND w.service_type IS NOT NULL
+                AND w.duty_date >= $3
+            UNION
+            SELECT w.service_type
+            FROM public.bus_schedule_trip_flexi_internal bstf
+            JOIN public.waybills_internal w
+                ON w.waybill_id = bstf.waybill_id
+                AND w.gtfs_id = $2
+            WHERE bstf.gtfs_id = $2
+                AND bstf.route_number_id::text = $1
+                AND bstf.deleted = false
+                AND bstf.trip_type <> 'dead-trip'
+                AND w.deleted = false
+                AND w.service_type IS NOT NULL
+                AND w.duty_date >= $3
+            ORDER BY service_type
+        "#;
+
+        let types: Vec<String> = sqlx::query_scalar(query)
+            .bind(route_id)
+            .bind(gtfs_id)
+            .bind(&cutoff)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to query applicable service types for {}: {}",
+                    cache_key, e
+                );
+                AppError::DbError(format!("get_applicable_service_types: {}", e))
+            })?;
+
+        info!(
+            "Applicable service types for {} since {}: {:?}",
+            cache_key, cutoff, types
+        );
+
+        {
+            let mut cache = self.applicable_service_types_cache.write().await;
+            cache.insert(cache_key, (types.clone(), SystemTime::now()));
+        }
+
+        Ok(types)
     }
 }
 

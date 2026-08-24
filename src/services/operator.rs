@@ -51,6 +51,14 @@ pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"]
 /// gtfs_ids that should only use the internal reader (no external fetch)
 pub const INTERNAL_ONLY_GTFS_IDS: &[&str] = &["kolkata_bus"];
 
+/// gtfs_ids the external replica actually holds data for.
+///
+/// The replica's waybill and schedule tables have no feed column, so a lookup
+/// there can only be filtered by route number - a route number that names an
+/// unrelated route in every other feed. Anything not listed here must not reach
+/// the replica at all, or that feed's routes come back wearing Chennai's tiers.
+pub const REPLICA_GTFS_IDS: &[&str] = &["chennai_bus"];
+
 /// gtfs_ids that should only use the external reader (no internal fetch)
 pub const EXTERNAL_ONLY_GTFS_IDS: &[&str] = &[];
 

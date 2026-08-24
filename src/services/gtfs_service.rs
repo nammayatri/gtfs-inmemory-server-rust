@@ -1145,6 +1145,9 @@ impl GTFSService {
                 end_point: route.end_point,
                 service_tier_type,
                 encoded_polyline: None,
+                // Waybill-derived; filled in per request by the handler, never
+                // held in the in-memory GTFS snapshot.
+                applicable_service_types: None,
             };
             routes_by_gtfs
                 .entry(gtfs_id.to_string())
