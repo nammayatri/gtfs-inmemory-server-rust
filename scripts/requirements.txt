@@ -1,0 +1,18 @@
+# Python dependencies for the scripts in this directory.
+#
+# There are none. Every script here (sync_relations.py,
+# backfill_route_travel_times.py) is deliberately standard-library only, so
+# `python3 scripts/<name>.py` works with no virtualenv and no pip install.
+#
+# What they DO need is on the system, not in pip:
+#
+#   python3 >= 3.8          (uses `from __future__ import annotations`)
+#   postgresql-client       provides psql and pg_dump, both shelled out to
+#                           (macOS:  brew install libpq   # then add to PATH
+#                            debian: apt-get install postgresql-client)
+#
+# sync_relations.py additionally needs network access to both databases in the
+# GIMS config - on VPN for the 10.x addresses.
+#
+# If you add a script here that genuinely needs a third-party package, list it
+# below with a pinned version and delete this paragraph.

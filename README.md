@@ -127,6 +127,35 @@ cargo run --release
 | `GTFS_CPU_THRESHOLD`    | `80.0`                  | CPU usage threshold percentage       |
 | `GTFS_MEMORY_THRESHOLD` | `5000`                  | Memory usage threshold in MB         |
 
+## Database Schema
+
+`relations/` is a checked-in mirror of the schema of the two Postgres databases
+the service talks to, dumped by `scripts/sync_relations.py`:
+
+```
+relations/
+  external_replica/                # master/replica DB  (config: database_url)
+  internal/                        # internal DB        (config: internal_database_url)
+    bus_schedule_internal/
+      schema.sql                   # the bare CREATE TABLE, regenerated every sync
+      migrations/                  # one numbered file per ALTER TABLE
+      indexes/                     # one numbered file per CREATE INDEX
+```
+
+Refresh it against a live database with:
+
+```bash
+./scripts/sync_relations.py --config dhall-configs/dev/<your-config>.dhall
+./scripts/sync_relations.py --config <cfg> --dry-run     # report only, non-zero on drift
+```
+
+Needs `python3` and `pg_dump`/`psql` on PATH; no pip packages. Files under
+`migrations/` and `indexes/` are append-only — the script never rewrites or
+renumbers an existing file, so a number that has been applied stays put.
+
+See [`relations/README.md`](relations/README.md) for the full layout and the
+rules on adding a change.
+
 ## API Endpoints
 
 ### Health Check
@@ -393,7 +422,10 @@ The service provides several monitoring endpoints:
 2. Create a feature branch
 3. Make your changes
 4. Add tests
-5. Submit a pull request
+5. If you changed a database schema, ship the change with the PR: add the
+   numbered file under `relations/<db>/<table>/migrations/` (or `indexes/`),
+   then re-run the sync so `schema.sql` catches up, and commit both together
+6. Submit a pull request
 
 ## License
 
