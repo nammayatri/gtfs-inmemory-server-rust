@@ -1,0 +1,23 @@
+CREATE TABLE public.bus_route (
+    route_id bigint NOT NULL,
+    created_at timestamp(6) without time zone,
+    deleted boolean DEFAULT false NOT NULL,
+    description character varying(255),
+    effective_from character varying(255),
+    effective_till character varying(255),
+    no_of_schedule integer DEFAULT 0,
+    route_alias character varying(50) DEFAULT 0,
+    route_direction character varying(255),
+    route_group character varying(50) DEFAULT 0,
+    route_name character varying(255),
+    route_number character varying(255),
+    route_string character varying(255),
+    route_type_id integer DEFAULT 3 NOT NULL,
+    status character varying(255),
+    updated_at timestamp(6) without time zone,
+    via character varying(255),
+    bus_service_type_id bigint NOT NULL,
+    end_point_id bigint NOT NULL,
+    start_point_id bigint NOT NULL,
+    route_distance real DEFAULT 0
+);

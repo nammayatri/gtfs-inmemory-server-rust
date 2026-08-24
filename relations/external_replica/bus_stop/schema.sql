@@ -1,0 +1,22 @@
+CREATE TABLE public.bus_stop (
+    bus_stop_id bigint NOT NULL,
+    bus_stop_code character varying(255),
+    bus_stop_name character varying(255),
+    bus_stop_name_local_lang character varying(255),
+    created_at timestamp(6) without time zone,
+    deleted boolean DEFAULT false NOT NULL,
+    description character varying(255),
+    fare_stage character varying(5) DEFAULT 'N'::character varying,
+    landmark character varying(255),
+    latitude_current double precision NOT NULL,
+    longitude_current double precision NOT NULL,
+    route_status character varying(1) DEFAULT 'Y'::character varying,
+    status character varying(255),
+    stop_direction character varying(255),
+    stop_group_id integer DEFAULT 0,
+    stop_type_id integer DEFAULT 0 NOT NULL,
+    sub_stage character varying(5) DEFAULT 'N'::character varying,
+    toll_fee integer DEFAULT 0,
+    toll_zone character varying(1) DEFAULT 'N'::character varying,
+    updated_at timestamp(6) without time zone
+);

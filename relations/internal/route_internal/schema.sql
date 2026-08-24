@@ -1,0 +1,21 @@
+CREATE TABLE public.route_internal (
+    route_id text DEFAULT nextval('public.bus_route_route_id_seq'::regclass) NOT NULL,
+    created_at timestamp(6) with time zone DEFAULT now(),
+    description character varying(255),
+    route_direction character varying(255),
+    route_group character varying(50) DEFAULT 0,
+    route_name character varying(255),
+    route_number character varying(255),
+    route_string character varying(255),
+    route_type_id text DEFAULT 3 NOT NULL,
+    status character varying(255) DEFAULT 'active'::character varying,
+    updated_at timestamp(6) with time zone DEFAULT now(),
+    via character varying(255),
+    bus_service_type_id text DEFAULT nextval('public.bus_route_bus_service_type_id_seq'::regclass) NOT NULL,
+    end_point_id text DEFAULT nextval('public.bus_route_end_point_id_seq'::regclass) NOT NULL,
+    start_point_id text DEFAULT nextval('public.bus_route_start_point_id_seq'::regclass) NOT NULL,
+    route_distance real DEFAULT 0,
+    gtfs_id character varying(100) DEFAULT 'chennai_bus'::character varying NOT NULL,
+    deleted boolean DEFAULT false NOT NULL,
+    encoded_polyline text
+);
