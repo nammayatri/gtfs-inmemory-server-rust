@@ -1,0 +1,1 @@
+CREATE INDEX bus_schedule_trip_flexi_schedule_trip_id_idx ON public.bus_schedule_trip_flexi USING btree (schedule_trip_id);
