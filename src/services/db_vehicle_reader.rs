@@ -15,6 +15,31 @@ use crate::tools::error::{AppError, AppResult};
 
 pub use crate::services::chalo_vehicle_cache::{chalo_gtfs_ids, is_chalo_gtfs_id};
 
+/// How far back the applicable-service-type lookup scans waybills.
+///
+/// Long enough to survive a tier that only runs on some weekdays or a depot
+/// that pauses a service for a few weeks; short enough that a route genuinely
+/// converted from one tier to another stops advertising the old one within a
+/// couple of months.
+pub const APPLICABLE_SERVICE_TYPES_LOOKBACK_DAYS: i64 = 45;
+
+/// Lower bound for the `duty_date` filter, as the `YYYY-MM-DD` text the column
+/// actually stores.
+///
+/// `duty_date` is a text column in both databases (it decodes into
+/// `VehicleData.duty_date: Option<String>`, and `get_routes_served_today`
+/// matches it against a `%Y-%m-%d`-formatted string). Zero-padded ISO dates
+/// sort lexicographically in chronological order, so a plain `>=` on the text
+/// is exactly equivalent to `duty_date::date >= …` while still being able to
+/// use an ordinary btree index - the cast version cannot.
+pub fn applicable_service_types_cutoff() -> String {
+    let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    (chrono::Utc::now().with_timezone(&ist).date_naive()
+        - chrono::Duration::days(APPLICABLE_SERVICE_TYPES_LOOKBACK_DAYS))
+    .format("%Y-%m-%d")
+    .to_string()
+}
+
 // Depot cache structure
 struct DepotCache {
     depot_names: Option<(Vec<String>, SystemTime)>,
@@ -37,6 +62,12 @@ struct WaybillsByRouteCache {
 // Routes served today cache structure (30 min TTL)
 struct RoutesServedTodayCache {
     data: Option<(Vec<RouteLastScheduleTime>, SystemTime)>,
+}
+
+/// Raw `waybills.service_type` values seen on a route, keyed by route id.
+/// One entry per route queried, so it is bounded by the feed's route count.
+struct ApplicableServiceTypesCache {
+    by_route: HashMap<String, (Vec<String>, SystemTime)>,
 }
 
 #[async_trait]
@@ -83,6 +114,14 @@ pub trait VehicleDataReader: Send + Sync {
         trip_number: i32,
     ) -> AppResult<Vec<VehicleData>>;
     async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>>;
+
+    /// Distinct raw `service_type` values on waybills that ran this route
+    /// within `APPLICABLE_SERVICE_TYPES_LOOKBACK_DAYS`.
+    ///
+    /// Returns the operator's own strings, unmapped - the caller decides how to
+    /// interpret them. An empty vector means "nothing found", which callers
+    /// must treat as "unknown", not as "runs nothing".
+    async fn get_applicable_service_types(&self, route_id: &str) -> AppResult<Vec<String>>;
 }
 
 // Mock implementation for local testing without a database
@@ -219,6 +258,9 @@ impl VehicleDataReader for MockDBVehicleReader {
     async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>> {
         Ok(Vec::new())
     }
+    async fn get_applicable_service_types(&self, _route_id: &str) -> AppResult<Vec<String>> {
+        Ok(Vec::new())
+    }
     async fn get_vehicles_by_service_tier(
         &self,
         _gtfs_id: &str,
@@ -257,6 +299,8 @@ pub struct DBVehicleReader {
     waybills_by_route_cache_duration: Duration,
     routes_served_today_cache: Arc<RwLock<RoutesServedTodayCache>>,
     routes_served_today_cache_duration: Duration,
+    applicable_service_types_cache: Arc<RwLock<ApplicableServiceTypesCache>>,
+    applicable_service_types_cache_duration: Duration,
 }
 
 impl DBVehicleReader {
@@ -282,6 +326,10 @@ impl DBVehicleReader {
             waybills_by_route_cache_duration: Duration::from_secs(180), // 3 minutes TTL
             routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache { data: None })),
             routes_served_today_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
+            applicable_service_types_cache: Arc::new(RwLock::new(ApplicableServiceTypesCache {
+                by_route: HashMap::new(),
+            })),
+            applicable_service_types_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
         }
     }
 
@@ -2555,5 +2603,91 @@ impl VehicleDataReader for DBVehicleReader {
         }
 
         Ok(routes)
+    }
+
+    async fn get_applicable_service_types(&self, route_id: &str) -> AppResult<Vec<String>> {
+        {
+            let cache = self.applicable_service_types_cache.read().await;
+            if let Some((types, timestamp)) = cache.by_route.get(route_id) {
+                if timestamp.elapsed().unwrap_or_default()
+                    < self.applicable_service_types_cache_duration
+                {
+                    debug!("Applicable service types cache HIT for route {}", route_id);
+                    return Ok(types.clone());
+                }
+            }
+        }
+
+        // Replica route ids are integers. Comparing them as text would defeat
+        // any index on route_number_id, so bind the parsed integer instead and
+        // bail out early on a non-numeric id rather than issuing a query that
+        // cannot match.
+        let route_number_id: i64 = match route_id.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                debug!(
+                    "Applicable service types: route id {} is not numeric, skipping replica lookup",
+                    route_id
+                );
+                return Ok(Vec::new());
+            }
+        };
+        let cutoff = applicable_service_types_cutoff();
+
+        // Scheduled trips join the waybill through schedule_trip_id, flexi
+        // trips through waybill_id - a flexi waybill's trips are not reachable
+        // from schedule_trip_id, so leaving the second branch out would silently
+        // under-report every flexi route.
+        let query = r#"
+            SELECT w.service_type
+            FROM public.bus_schedule_trip_detail bstd
+            JOIN public.waybills w
+                ON w.schedule_trip_id::bigint = bstd.schedule_trip_id
+            WHERE bstd.route_number_id = $1
+                AND bstd.deleted = false
+                AND bstd.trip_type <> 'dead-trip'
+                AND w.deleted = false
+                AND w.service_type IS NOT NULL
+                AND w.duty_date >= $2
+            UNION
+            SELECT w.service_type
+            FROM public.bus_schedule_trip_flexi bstf
+            JOIN public.waybills w
+                ON w.waybill_id = bstf.waybill_id
+            WHERE bstf.route_number_id = $1
+                AND bstf.deleted = false
+                AND bstf.trip_type <> 'dead-trip'
+                AND w.deleted = false
+                AND w.service_type IS NOT NULL
+                AND w.duty_date >= $2
+            ORDER BY service_type
+        "#;
+
+        let types: Vec<String> = sqlx::query_scalar(query)
+            .bind(route_number_id)
+            .bind(&cutoff)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to query applicable service types for route {}: {}",
+                    route_id, e
+                );
+                AppError::DbError(format!("get_applicable_service_types: {}", e))
+            })?;
+
+        info!(
+            "Applicable service types for route {} since {}: {:?}",
+            route_id, cutoff, types
+        );
+
+        {
+            let mut cache = self.applicable_service_types_cache.write().await;
+            cache
+                .by_route
+                .insert(route_id.to_string(), (types.clone(), SystemTime::now()));
+        }
+
+        Ok(types)
     }
 }
