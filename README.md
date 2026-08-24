@@ -153,8 +153,11 @@ Needs `python3` and `pg_dump`/`psql` on PATH; no pip packages. Files under
 `migrations/` and `indexes/` are append-only — the script never rewrites or
 renumbers an existing file, so a number that has been applied stays put.
 
-See [`relations/README.md`](relations/README.md) for the full layout and the
-rules on adding a change.
+A hand-written file must be named after the object it creates - the index or
+constraint name exactly as Postgres has it, or `default_<column>` - since that name is how the next sync
+matches the file to what it dumped. See
+[`relations/README.md`](relations/README.md) for the full layout and naming
+rules.
 
 ## API Endpoints
 

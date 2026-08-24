@@ -471,15 +471,39 @@ Needs `python3` and `pg_dump`/`psql` on PATH, and no pip packages - see
 Add a file to the right directory, numbered from the highest one already there:
 
 ```
-relations/internal/route_internal/migrations/0002_add_gtfs_id_col.sql
-relations/internal/route_internal/indexes/0003_route_internal_gtfs_id_idx.sql
+relations/internal/route_internal/migrations/0002_route_internal_gtfs_id_key.sql
+relations/internal/route_internal/indexes/0003_idx_route_internal_gtfs_id.sql
 ```
 
 - One logical change per file. Forward-only; no down-migrations.
-- Four-digit prefix, then a short snake_case description.
 - Plain SQL, runnable as-is against that database.
 - Once it is applied, re-run the sync so `schema.sql` catches up, and commit
   both together.
+
+### Naming
+
+The four-digit prefix is only ordering: take the next free number in that
+directory. The rest of the name is not free-form - it has to be the object's
+own name in Postgres, because that is the key the sync matches a file to a
+dumped object on:
+
+| Object                              | Name to use                        | Example                          |
+| ----------------------------------- | ---------------------------------- | -------------------------------- |
+| index                               | the index name                     | `0008_waybill_duty_date_idx.sql` |
+| constraint - primary key, unique, foreign key, check | the constraint name, exactly as Postgres has it | `0007_waybills_pkey.sql` |
+| column default                      | `default_<column>`                 | `0002_default_entity_id.sql`     |
+
+Anything that is not a letter, digit or underscore collapses to `_`, and the
+whole name is lowercased.
+
+Getting this wrong fails quietly rather than loudly: the next sync does not
+recognise your file as the object it just dumped, so it writes a second
+numbered file for the same thing.
+
+A change with no counterpart in the dump - `ALTER TABLE ... ADD COLUMN`, say,
+since columns are part of `schema.sql` rather than objects of their own - has
+no name to match on, and the sync reports it as `no longer in the database` on
+every run.
 
 ## Scope
 
