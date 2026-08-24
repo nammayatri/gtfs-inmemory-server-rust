@@ -1,0 +1,1 @@
+CREATE INDEX idx_waybills_vehicle_status_wise_priority ON public.waybills USING btree (vehicle_no, status, updated_at DESC) WHERE ((status)::text = ANY (ARRAY[('Online'::character varying)::text, ('New'::character varying)::text, ('Processed'::character varying)::text]));
