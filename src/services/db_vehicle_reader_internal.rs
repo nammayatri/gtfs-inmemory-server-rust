@@ -1502,6 +1502,11 @@ impl DBVehicleReaderInternal {
                     ELSE bstd.trip_number::int
                 END AS trip_number,
                 CASE
+                    WHEN w.status <> 'online' THEN false
+                    WHEN w.is_flexi THEN bstf.is_active_trip
+                    ELSE bstd.is_active_trip
+                END AS is_active_trip,
+                CASE
                     WHEN w.is_flexi THEN NULL
                     ELSE bstd.is_completed
                 END AS is_completed
