@@ -299,6 +299,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "created_at",
             "deleted",
             "fleet_no",
+            "tag_number",
             "status",
             "updated_at",
             "vehicle_no",
@@ -393,26 +394,34 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-pub fn table_pk(table: &str) -> Option<&'static str> {
+pub fn table_pk(table: &str) -> Option<&'static [&'static str]> {
     match table {
-        "route_internal" => Some("route_id"),
-        "route_point_internal" => Some("route_points_id"),
-        "bus_schedule_internal" => Some("schedule_id"),
-        "bus_schedule_trip_internal" => Some("schedule_trip_id"),
-        "bus_schedule_trip_detail_internal" => Some("schedule_trip_detail_id"),
-        "bus_schedule_trip_flexi_internal" => Some("schedule_trip_flexi_id"),
-        "service_type_internal" => Some("service_type_id"),
-        "stop_internal" => Some("bus_stop_id"),
-        "designations_internal" => Some("designation_id"),
-        "employees_internal" => Some("emp_id"),
-        "entities_internal" => Some("entity_id"),
-        "vehicles_internal" => Some("vehicle_id"),
-        "waybill_device_internal" => Some("waybill_device_id"),
-        "fleet_etm_mapping_internal" => Some("fleet_etm_mapping_id"),
-        "fleet_obu_mapping_internal" => Some("fleet_obu_mapping_id"),
-        "waybills_internal" => Some("waybill_id"),
-        "bus_shift_type_internal" => Some("shift_type_id"),
-        "bus_schedule_type_internal" => Some("schedule_type_id"),
+        "route_internal" => Some(&["route_id"]),
+        "route_point_internal" => Some(&["route_points_id"]),
+        "bus_schedule_internal" => Some(&["schedule_id"]),
+        "bus_schedule_trip_internal" => Some(&["schedule_trip_id"]),
+        "bus_schedule_trip_detail_internal" => Some(&["schedule_trip_detail_id"]),
+        "bus_schedule_trip_flexi_internal" => Some(&["schedule_trip_flexi_id"]),
+        "service_type_internal" => Some(&["service_type_id"]),
+        "stop_internal" => Some(&["bus_stop_id"]),
+        "designations_internal" => Some(&["designation_id"]),
+        "employees_internal" => Some(&["emp_id"]),
+        "entities_internal" => Some(&["entity_id"]),
+        "vehicles_internal" => Some(&["gtfs_id", "fleet_no"]),
+        "waybill_device_internal" => Some(&["waybill_device_id"]),
+        "fleet_etm_mapping_internal" => Some(&["fleet_etm_mapping_id"]),
+        "fleet_obu_mapping_internal" => Some(&["fleet_obu_mapping_id"]),
+        "waybills_internal" => Some(&["waybill_id"]),
+        "bus_shift_type_internal" => Some(&["shift_type_id"]),
+        "bus_schedule_type_internal" => Some(&["schedule_type_id"]),
+        _ => None,
+    }
+}
+
+// Must stay byte-identical to the partial unique index's WHERE for Postgres to infer it.
+fn table_conflict_predicate(table: &str) -> Option<&'static str> {
+    match table {
+        "vehicles_internal" => Some("deleted = false"),
         _ => None,
     }
 }
@@ -749,6 +758,7 @@ pub struct FleetRow {
     pub vehicle_id: IdValue,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -1015,6 +1025,7 @@ pub struct VehiclesInternal {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
@@ -1777,7 +1788,7 @@ impl OperatorService for DBOperatorService {
 
         let sql = format!(
             "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false ORDER BY created_at DESC, {} DESC LIMIT $2 OFFSET $3) t",
-            table, pk
+            table, pk.join(" DESC, ")
         );
 
         let vals: Vec<Value> = sqlx::query_scalar::<_, Value>(&sql)
@@ -1898,7 +1909,7 @@ impl OperatorService for DBOperatorService {
             "SELECT row_to_json(t) FROM (SELECT * FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND {} ORDER BY created_at DESC, {} DESC LIMIT ${} OFFSET ${}) t",
             table,
             where_parts.join(" AND "),
-            pk,
+            pk.join(" DESC, "),
             param_idx,
             param_idx + 1,
         );
@@ -1927,34 +1938,52 @@ impl OperatorService for DBOperatorService {
             .as_object()
             .ok_or_else(|| AppError::BadRequest("Body must be a JSON object".to_string()))?;
 
-        let pk_value = obj.get(pk).ok_or_else(|| {
-            AppError::BadRequest(format!("Body must contain the primary key: {}", pk))
-        })?;
+        let mut body_values: Vec<String> = Vec::new();
+        let mut where_parts: Vec<String> = Vec::with_capacity(pk.len());
+        let mut param_idx = 1usize;
 
-        let id = match pk_value {
-            Value::Number(n) => n
-                .as_i64()
-                .map(|i| i.to_string())
-                .or_else(|| n.as_f64().map(|f| f.to_string()))
-                .ok_or_else(|| AppError::BadRequest("ID must be a number".to_string()))?,
-            Value::String(s) => s.clone(),
-            _ => {
-                return Err(AppError::BadRequest(
-                    "ID must be a string or number".to_string(),
-                ))
+        for col in pk {
+            if *col == "gtfs_id" {
+                continue;
             }
-        };
+            let raw = obj.get(*col).ok_or_else(|| {
+                AppError::BadRequest(format!("Body must contain the primary key column: {}", col))
+            })?;
+            let val = match raw {
+                Value::Number(n) => n
+                    .as_i64()
+                    .map(|i| i.to_string())
+                    .or_else(|| n.as_f64().map(|f| f.to_string()))
+                    .ok_or_else(|| AppError::BadRequest(format!("'{}' must be a number", col)))?,
+                Value::String(s) => s.clone(),
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "'{}' must be a string or number",
+                        col
+                    )))
+                }
+            };
+            // `::text` cast keeps the predicate correct across the bigint->text id migration.
+            where_parts.push(format!("{}::text = ${}", col, param_idx));
+            body_values.push(val);
+            param_idx += 1;
+        }
 
-        // `::text` cast so the id predicate works whether the column is still
-        // `bigint` (prod) or already migrated to `text` — bind the string either way.
+        where_parts.push(format!("gtfs_id = ${}", param_idx));
+
         let sql = format!(
-            "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {}::text = $1 AND gtfs_id = $2 AND deleted = false",
-            table, pk
+            "UPDATE public.{} SET deleted = true, updated_at = now() WHERE {} AND deleted = false",
+            table,
+            where_parts.join(" AND "),
         );
 
-        let result = sqlx::query(&sql)
-            .bind(&id)
-            .bind(gtfs_id)
+        let mut q = sqlx::query(&sql);
+        for v in &body_values {
+            q = q.bind(v);
+        }
+        q = q.bind(gtfs_id);
+
+        let result = q
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::DbError(format!("delete_one_row {}: {}", table, e)))?;
@@ -1988,18 +2017,32 @@ impl OperatorService for DBOperatorService {
             return Err(AppError::BadRequest("Body is empty".to_string()));
         }
 
-        // Auto-inject PK with a random ID if missing or null
-        for val in arr.iter_mut() {
-            if let Some(obj) = val.as_object_mut() {
-                let missing = obj.get(pk).map_or(true, |v| v.is_null());
-                if missing {
-                    // numeric id for still-`bigint` columns (pre-migration), else UUID
-                    let id = if self.gen_int_for_id {
-                        Value::from(field_generator::gen_random_int_id())
-                    } else {
-                        Value::String(field_generator::gen_random_id())
+        // vehicle_id is DB-managed; strip caller input so a fresh id is assigned and PK can't collide.
+        if table == "vehicles_internal" {
+            for val in arr.iter_mut() {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.remove("vehicle_id");
+                }
+            }
+        }
+
+        if let [key_col] = pk {
+            if *key_col != "gtfs_id" {
+                for val in arr.iter_mut() {
+                    let Some(obj) = val.as_object_mut() else {
+                        return Err(AppError::BadRequest(
+                            "Array must contain JSON objects".to_string(),
+                        ));
                     };
-                    obj.insert(pk.to_string(), id);
+                    let missing = obj.get(*key_col).map_or(true, |v| v.is_null());
+                    if missing {
+                        let id = if self.gen_int_for_id {
+                            Value::from(field_generator::gen_random_int_id())
+                        } else {
+                            Value::String(field_generator::gen_random_id())
+                        };
+                        obj.insert(key_col.to_string(), id);
+                    }
                 }
             }
         }
@@ -2072,6 +2115,7 @@ impl OperatorService for DBOperatorService {
 
         let update_set: Vec<String> = cols
             .iter()
+            .filter(|c| !pk.contains(c))
             .map(|c| format!("{} = EXCLUDED.{}", c, c))
             .collect();
 
@@ -2089,13 +2133,30 @@ impl OperatorService for DBOperatorService {
             placeholders.push(format!("({})", row_placeholders.join(", ")));
         }
 
+        // Self-assign no-op when the caller sent only key columns, so RETURNING still yields a row.
+        let update_clause = if update_set.is_empty() {
+            let anchor = pk
+                .iter()
+                .find(|c| **c != "gtfs_id")
+                .copied()
+                .unwrap_or("gtfs_id");
+            format!("{} = {}.{}", anchor, table, anchor)
+        } else {
+            update_set.join(", ")
+        };
+
+        let conflict_where = table_conflict_predicate(table)
+            .map(|p| format!(" WHERE {}", p))
+            .unwrap_or_default();
+
         let sql = format!(
-            "INSERT INTO public.{} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} RETURNING row_to_json({}) AS result",
+            "INSERT INTO public.{} ({}) VALUES {} ON CONFLICT ({}){} DO UPDATE SET {} RETURNING row_to_json({}) AS result",
             table,
             cols.join(", "),
             placeholders.join(", "),
-            pk,
-            update_set.join(", "),
+            pk.join(", "),
+            conflict_where,
+            update_clause,
             table
         );
 
@@ -2307,7 +2368,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
         sqlx::query_as::<_, FleetRow>(
-            "SELECT vehicle_id, vehicle_no, fleet_no
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number
              FROM public.vehicles_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY vehicle_no",
