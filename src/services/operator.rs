@@ -299,6 +299,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "created_at",
             "deleted",
             "fleet_no",
+            "tag_number",
             "status",
             "updated_at",
             "vehicle_no",
@@ -749,6 +750,7 @@ pub struct FleetRow {
     pub vehicle_id: IdValue,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -1015,6 +1017,7 @@ pub struct VehiclesInternal {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
@@ -2307,7 +2310,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
         sqlx::query_as::<_, FleetRow>(
-            "SELECT vehicle_id, vehicle_no, fleet_no
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number
              FROM public.vehicles_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY vehicle_no",
