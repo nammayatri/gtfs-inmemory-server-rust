@@ -56,6 +56,7 @@ pub const EXTERNAL_ONLY_GTFS_IDS: &[&str] = &[];
 
 pub const MAX_QUERY_LIMIT: i64 = 1000;
 pub const MAX_QUERY_FILTERS: usize = 5;
+pub const MAX_UPSERT_BATCH_SIZE: usize = 500;
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct QueryBody {
@@ -291,6 +292,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "created_at",
             "deleted",
             "fleet_no",
+            "tag_number",
             "status",
             "updated_at",
             "vehicle_no",
@@ -736,11 +738,25 @@ pub struct ScheduleNumberRow {
     pub schedule_number: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+/// `#[sqlx(default)]` on the trailing fields lets narrower SELECTs still decode; `skip_serializing_if` drops NULL columns from the JSON so the /fleets response stays additive vs its pre-merge shape.
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone, utoipa::ToSchema)]
 pub struct FleetRow {
+    // vehicle_id serialises as a JSON number when the value fits an i64, otherwise as a string — expose it to OpenAPI as the untyped Value so clients don't fail on the number case.
+    #[schema(value_type = serde_json::Value)]
     pub vehicle_id: IdValue,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
+    #[sqlx(default)]
+    pub tag_number: Option<String>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -1007,6 +1023,7 @@ pub struct VehiclesInternal {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub deleted: bool,
     pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
@@ -1014,6 +1031,15 @@ pub struct VehiclesInternal {
     pub entity_id: IdValue,
     pub organization_id: IdValue,
     pub gtfs_id: String,
+}
+
+/// Upsert body: `vehicle_no` is the natural identity (conflict key) and is required. `fleet_no` is required when creating a new vehicle; on update, `None` preserves the existing value. `tag_number` and `status` are always optional; `None` preserves existing on UPDATE.
+#[derive(Debug, serde::Deserialize, Clone, utoipa::ToSchema)]
+pub struct VehicleUpsertRequest {
+    pub vehicle_no: String,
+    pub fleet_no: Option<String>,
+    pub tag_number: Option<String>,
+    pub status: Option<String>,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillDeviceInternal {
@@ -1198,6 +1224,22 @@ pub trait OperatorService: Send + Sync {
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>>;
     async fn get_depot_names_and_ids(&self, gtfs_id: &str) -> AppResult<Vec<DepotRow>>;
 
+    async fn query_vehicles(
+        &self,
+        gtfs_id: &str,
+        vehicle_no: Option<&str>,
+        tag_number: Option<&str>,
+        fleet_no: Option<&str>,
+    ) -> AppResult<Vec<FleetRow>>;
+
+    async fn upsert_vehicles(
+        &self,
+        gtfs_id: &str,
+        items: Vec<VehicleUpsertRequest>,
+    ) -> AppResult<Vec<FleetRow>>;
+
+    async fn delete_vehicle_by_id(&self, gtfs_id: &str, vehicle_id: &str) -> AppResult<u64>;
+
     async fn get_schedule_numbers(&self, gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>>;
 
     async fn get_schedule_trip_details_by_schedule_number(
@@ -1206,7 +1248,12 @@ pub trait OperatorService: Send + Sync {
         schedule_number: &str,
     ) -> AppResult<Vec<TripDetailRow>>;
 
-    async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>>;
+    async fn get_fleets(
+        &self,
+        gtfs_id: &str,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> AppResult<Vec<FleetRow>>;
 
     async fn get_conductor_data(
         &self,
@@ -1396,6 +1443,28 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
+    async fn query_vehicles(
+        &self,
+        _gtfs_id: &str,
+        _vehicle_no: Option<&str>,
+        _tag_number: Option<&str>,
+        _fleet_no: Option<&str>,
+    ) -> AppResult<Vec<FleetRow>> {
+        mock_err!()
+    }
+
+    async fn upsert_vehicles(
+        &self,
+        _gtfs_id: &str,
+        _items: Vec<VehicleUpsertRequest>,
+    ) -> AppResult<Vec<FleetRow>> {
+        mock_err!()
+    }
+
+    async fn delete_vehicle_by_id(&self, _gtfs_id: &str, _vehicle_id: &str) -> AppResult<u64> {
+        mock_err!()
+    }
+
     async fn get_schedule_numbers(&self, _gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>> {
         mock_err!()
     }
@@ -1408,7 +1477,12 @@ impl OperatorService for MockOperatorService {
         mock_err!()
     }
 
-    async fn get_fleets(&self, _gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
+    async fn get_fleets(
+        &self,
+        _gtfs_id: &str,
+        _limit: Option<i64>,
+        _offset: Option<i64>,
+    ) -> AppResult<Vec<FleetRow>> {
         mock_err!()
     }
 
@@ -2247,6 +2321,306 @@ impl OperatorService for DBOperatorService {
         .map_err(|e| AppError::DbError(format!("get_depot_names_and_ids: {}", e)))
     }
 
+    async fn query_vehicles(
+        &self,
+        gtfs_id: &str,
+        vehicle_no: Option<&str>,
+        tag_number: Option<&str>,
+        fleet_no: Option<&str>,
+    ) -> AppResult<Vec<FleetRow>> {
+        if vehicle_no.is_none() && tag_number.is_none() && fleet_no.is_none() {
+            return Err(AppError::BadRequest(
+                "queryVehicle: at least one of vehicle_no, tag_number, or fleet_no must be provided"
+                    .to_string(),
+            ));
+        }
+
+        let mut where_parts: Vec<String> =
+            vec!["gtfs_id = $1".to_string(), "deleted = false".to_string()];
+        let mut param_idx = 2usize;
+        if vehicle_no.is_some() {
+            where_parts.push(format!("vehicle_no = ${}", param_idx));
+            param_idx += 1;
+        }
+        if tag_number.is_some() {
+            where_parts.push(format!("tag_number = ${}", param_idx));
+            param_idx += 1;
+        }
+        if fleet_no.is_some() {
+            where_parts.push(format!("fleet_no = ${}", param_idx));
+        }
+
+        let sql = format!(
+            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no \
+             FROM public.vehicles_internal \
+             WHERE {} \
+             ORDER BY created_at DESC NULLS LAST, vehicle_id DESC \
+             LIMIT {}",
+            where_parts.join(" AND "),
+            MAX_QUERY_LIMIT,
+        );
+
+        let mut q = sqlx::query_as::<_, FleetRow>(&sql).bind(gtfs_id);
+        if let Some(v) = vehicle_no {
+            q = q.bind(v);
+        }
+        if let Some(t) = tag_number {
+            q = q.bind(t);
+        }
+        if let Some(f) = fleet_no {
+            q = q.bind(f);
+        }
+        q.fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("query_vehicles: {}", e)))
+    }
+
+    async fn upsert_vehicles(
+        &self,
+        gtfs_id: &str,
+        mut items: Vec<VehicleUpsertRequest>,
+    ) -> AppResult<Vec<FleetRow>> {
+        if items.is_empty() {
+            return Err(AppError::BadRequest(
+                "upsertVehicles: body must contain at least one vehicle".to_string(),
+            ));
+        }
+        if items.len() > MAX_UPSERT_BATCH_SIZE {
+            return Err(AppError::BadRequest(format!(
+                "upsertVehicles: batch size {} exceeds max {}",
+                items.len(),
+                MAX_UPSERT_BATCH_SIZE
+            )));
+        }
+
+        let mut seen_vehicle_no: HashMap<String, usize> = HashMap::with_capacity(items.len());
+        let mut seen_fleet: HashMap<String, usize> = HashMap::new();
+        let mut vehicle_nos: Vec<String> = Vec::with_capacity(items.len());
+        // Trim + length-cap here so canonical form flows into dedup, pre-check maps, and the unique indexes; varchar(N) breaches surface as 400 instead of 22001 500.
+        for (i, v) in items.iter_mut().enumerate() {
+            let vehicle_no = v.vehicle_no.trim().to_string();
+            if vehicle_no.is_empty() {
+                return Err(AppError::BadRequest(format!(
+                    "upsertVehicles: items[{}].vehicle_no must be non-empty",
+                    i
+                )));
+            }
+            let vn_chars = vehicle_no.chars().count();
+            if vn_chars > 12 {
+                return Err(AppError::BadRequest(format!(
+                    "upsertVehicles: items[{}].vehicle_no exceeds 12 chars (got {})",
+                    i, vn_chars
+                )));
+            }
+            v.vehicle_no = vehicle_no.clone();
+
+            if let Some(fn_raw) = v.fleet_no.as_deref() {
+                let fleet_no = fn_raw.trim().to_string();
+                if fleet_no.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "upsertVehicles: items[{}].fleet_no, when provided, must be non-empty",
+                        i
+                    )));
+                }
+                let fn_chars = fleet_no.chars().count();
+                if fn_chars > 25 {
+                    return Err(AppError::BadRequest(format!(
+                        "upsertVehicles: items[{}].fleet_no exceeds 25 chars (got {})",
+                        i, fn_chars
+                    )));
+                }
+                if let Some(prev_i) = seen_fleet.insert(fleet_no.clone(), i) {
+                    return Err(AppError::BadRequest(format!(
+                        "upsertVehicles: duplicate fleet_no '{}' at items[{}] and items[{}]",
+                        fleet_no, prev_i, i
+                    )));
+                }
+                v.fleet_no = Some(fleet_no);
+            }
+
+            if let Some(tn_raw) = v.tag_number.as_deref() {
+                let tn = tn_raw.trim().to_string();
+                if tn.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "upsertVehicles: items[{}].tag_number, when provided, must be non-empty",
+                        i
+                    )));
+                }
+                v.tag_number = Some(tn);
+            }
+
+            if let Some(st_raw) = v.status.as_deref() {
+                let st = st_raw.trim().to_string();
+                if st.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "upsertVehicles: items[{}].status, when provided, must be non-empty",
+                        i
+                    )));
+                }
+                let st_chars = st.chars().count();
+                if st_chars > 50 {
+                    return Err(AppError::BadRequest(format!(
+                        "upsertVehicles: items[{}].status exceeds 50 chars (got {})",
+                        i, st_chars
+                    )));
+                }
+                v.status = Some(st);
+            }
+
+            if let Some(prev_i) = seen_vehicle_no.insert(vehicle_no.clone(), i) {
+                return Err(AppError::BadRequest(format!(
+                    "upsertVehicles: duplicate vehicle_no '{}' at items[{}] and items[{}]",
+                    vehicle_no, prev_i, i
+                )));
+            }
+            vehicle_nos.push(vehicle_no);
+        }
+
+        // The column list built below is shared across every row, so all items must have the same optional-field pattern — otherwise mismatched items either silently drop columns or bind NULL through a NOT NULL column.
+        let shape = |v: &VehicleUpsertRequest| {
+            (
+                v.fleet_no.is_some(),
+                v.tag_number.is_some(),
+                v.status.is_some(),
+            )
+        };
+        let shape0 = shape(&items[0]);
+        for (i, item) in items.iter().enumerate().skip(1) {
+            if shape(item) != shape0 {
+                return Err(AppError::BadRequest(format!(
+                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status as items[0]",
+                    i
+                )));
+            }
+        }
+
+        // Generate vehicle_id in app code — every other insert path uses field_generator, so the schema's DEFAULT nextval() sequence is stale (bulk CSV imports skip it) and relying on it 23505s the pkey. Excluded from UPDATE SET so ON CONFLICT preserves the existing vehicle_id.
+        let mut cols: Vec<&str> = vec!["vehicle_id", "vehicle_no"];
+        if shape0.0 {
+            cols.push("fleet_no");
+        }
+        if shape0.1 {
+            cols.push("tag_number");
+        }
+        if shape0.2 {
+            cols.push("status");
+        }
+        cols.push("gtfs_id");
+
+        let per_row = cols.len() - 1;
+        let gtfs_param = items.len() * per_row + 1;
+        let mut placeholders = Vec::with_capacity(items.len());
+        let mut idx = 1usize;
+        for _ in 0..items.len() {
+            let row: Vec<String> = (0..per_row)
+                .map(|_| {
+                    let p = format!("${}", idx);
+                    idx += 1;
+                    p
+                })
+                .chain(std::iter::once(format!("${}", gtfs_param)))
+                .collect();
+            placeholders.push(format!("({})", row.join(", ")));
+        }
+
+        let update_set: String = cols
+            .iter()
+            .filter(|c| **c != "vehicle_no" && **c != "gtfs_id" && **c != "vehicle_id")
+            .map(|c| format!("{} = EXCLUDED.{}", c, c))
+            .chain(std::iter::once("updated_at = now()".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO public.vehicles_internal ({}) VALUES {} \
+             ON CONFLICT (gtfs_id, vehicle_no) WHERE deleted = false \
+             DO UPDATE SET {} \
+             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at",
+            cols.join(", "),
+            placeholders.join(", "),
+            update_set
+        );
+
+        let mut q = sqlx::query_as::<_, FleetRow>(&sql);
+        for item in &items {
+            let vid: String = if self.gen_int_for_id {
+                field_generator::gen_random_int_id().to_string()
+            } else {
+                field_generator::gen_random_id()
+            };
+            q = q.bind(vid);
+            q = q.bind(item.vehicle_no.clone());
+            if cols.contains(&"fleet_no") {
+                q = q.bind(item.fleet_no.clone());
+            }
+            if cols.contains(&"tag_number") {
+                q = q.bind(item.tag_number.clone());
+            }
+            if cols.contains(&"status") {
+                q = q.bind(item.status.clone());
+            }
+        }
+        q = q.bind(gtfs_id);
+
+        // 23505 (unique_violation), 23502 (not_null_violation), 42P10 (undefined_object — the (gtfs_id, vehicle_no) unique index is missing or INVALID after a failed CONCURRENTLY build). Rewrite all three as 400 so ops sees an actionable message rather than a 500.
+        let returned = match q.fetch_all(&self.pool).await {
+            Ok(rows) => rows,
+            Err(sqlx::Error::Database(db_err))
+                if matches!(
+                    db_err.code().as_deref(),
+                    Some("23505") | Some("23502") | Some("42P10")
+                ) =>
+            {
+                return Err(AppError::BadRequest(format!(
+                    "upsertVehicles: {} ({})",
+                    db_err.message(),
+                    db_err.code().as_deref().unwrap_or("?"),
+                )));
+            }
+            Err(e) => return Err(AppError::DbError(format!("upsert_vehicles: {}", e))),
+        };
+
+        // RETURNING order isn't guaranteed for multi-row upsert — restore input order by vehicle_no.
+        let mut by_vn: HashMap<String, FleetRow> = returned
+            .into_iter()
+            .filter_map(|r| r.vehicle_no.clone().map(|vn| (vn, r)))
+            .collect();
+        vehicle_nos
+            .iter()
+            .enumerate()
+            .map(|(i, vn)| {
+                by_vn.remove(vn).ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "upsert_vehicles: no returned row for items[{}] vehicle_no '{}'",
+                        i, vn
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_vehicle_by_id(&self, gtfs_id: &str, vehicle_id: &str) -> AppResult<u64> {
+        if vehicle_id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "deleteVehicle: vehicle_id path segment is required".to_string(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE public.vehicles_internal \
+                SET deleted = true, updated_at = now() \
+              WHERE vehicle_id = $1 \
+                AND gtfs_id = $2 \
+                AND deleted = false",
+        )
+        .bind(vehicle_id)
+        .bind(gtfs_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("delete_vehicle_by_id: {}", e)))?;
+
+        Ok(result.rows_affected())
+    }
+
     async fn get_schedule_numbers(&self, gtfs_id: &str) -> AppResult<Vec<ScheduleNumberRow>> {
         sqlx::query_as::<_, ScheduleNumberRow>(
             "SELECT schedule_id, schedule_number
@@ -2297,17 +2671,36 @@ impl OperatorService for DBOperatorService {
         .map_err(|e| AppError::DbError(format!("get_schedule_trip_details: {}", e)))
     }
 
-    async fn get_fleets(&self, gtfs_id: &str) -> AppResult<Vec<FleetRow>> {
-        sqlx::query_as::<_, FleetRow>(
-            "SELECT vehicle_id, vehicle_no, fleet_no
-             FROM public.vehicles_internal
-             WHERE deleted = false AND gtfs_id = $1
+    async fn get_fleets(
+        &self,
+        gtfs_id: &str,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> AppResult<Vec<FleetRow>> {
+        let mut sql = String::from(
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at \
+             FROM public.vehicles_internal \
+             WHERE deleted = false AND gtfs_id = $1 \
              ORDER BY vehicle_no",
-        )
-        .bind(gtfs_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AppError::DbError(format!("get_fleets: {}", e)))
+        );
+        let mut param_idx = 2usize;
+        if limit.is_some() {
+            sql.push_str(&format!(" LIMIT ${}", param_idx));
+            param_idx += 1;
+        }
+        if offset.is_some() {
+            sql.push_str(&format!(" OFFSET ${}", param_idx));
+        }
+        let mut q = sqlx::query_as::<_, FleetRow>(&sql).bind(gtfs_id);
+        if let Some(l) = limit {
+            q = q.bind(l);
+        }
+        if let Some(o) = offset {
+            q = q.bind(o);
+        }
+        q.fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("get_fleets: {}", e)))
     }
 
     async fn get_conductor_data(
