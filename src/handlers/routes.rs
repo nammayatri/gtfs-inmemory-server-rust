@@ -3,8 +3,9 @@ use crate::services::fleet_operator::{
     TripAction, WaybillAnchor,
 };
 use crate::services::operator::{
-    break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
-    EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
+    break_types, day_types, shift_types, trip_types, waybill_statuses, FleetRow, QueryBody,
+    VehicleUpsertRequest, EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, MAX_QUERY_LIMIT,
+    SUPPORTED_OPERATOR_GTFS_IDS,
 };
 use actix_web::{
     web::{self, Data, Json, Path, Query},
@@ -140,6 +141,9 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
                     .route("/waybills", web::get().to(get_waybills))
                     .route("/station-eta/upsert", web::post().to(upsert_station_eta))
+                    .route("/vehicles/upsert", web::post().to(upsert_vehicles))
+                    .route("/vehicles/query", web::get().to(query_vehicles))
+                    .route("/vehicles/{vehicle_id}", web::delete().to(delete_vehicle))
                     // stop & route management (clubber / editor)
                     .route("/stops/search", web::get().to(search_stops))
                     .route("/stops/nearby", web::get().to(nearby_stops))
@@ -3845,6 +3849,124 @@ pub async fn get_operator_routes(
     Ok(HttpResponse::Ok().json(list))
 }
 
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/vehicles/upsert",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = Vec<VehicleUpsertRequest>,
+    responses(
+        (status = 200, description = "Upserted vehicles", body = Vec<FleetRow>),
+        (status = 400, description = "Invalid body or unsupported gtfs_id"),
+    )
+)]
+pub async fn upsert_vehicles(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<Vec<VehicleUpsertRequest>>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let items = body.into_inner();
+    let rows = app_state
+        .operator_service
+        .upsert_vehicles(&gtfs_id, items)
+        .await?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct QueryVehicleParams {
+    pub vehicle_no: Option<String>,
+    pub tag_number: Option<String>,
+    pub fleet_no: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/vehicles/query",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_no" = Option<String>, Query, description = "Exact match on vehicle_no"),
+        ("tag_number" = Option<String>, Query, description = "Exact match on tag_number"),
+        ("fleet_no" = Option<String>, Query, description = "Exact match on fleet_no"),
+    ),
+    responses(
+        (status = 200, description = "Matching vehicles (equality filters, AND-combined)", body = Vec<FleetRow>),
+        (status = 400, description = "No filter provided or unsupported gtfs_id"),
+    )
+)]
+pub async fn query_vehicles(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<QueryVehicleParams>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    // Treat empty / whitespace-only filter values as absent so a bare `?fleet_no=` isn't matched against literal ''.
+    let normalize = |v: &Option<String>| -> Option<String> {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let vehicle_no = normalize(&query.vehicle_no);
+    let tag_number = normalize(&query.tag_number);
+    let fleet_no = normalize(&query.fleet_no);
+
+    let rows = app_state
+        .operator_service
+        .query_vehicles(
+            &gtfs_id,
+            vehicle_no.as_deref(),
+            tag_number.as_deref(),
+            fleet_no.as_deref(),
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/internal/operator/{gtfs_id}/vehicles/{vehicle_id}",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_id" = String, Path, description = "Vehicle id to soft-delete"),
+    ),
+    responses(
+        (status = 200, description = "Vehicle soft-deleted"),
+        (status = 404, description = "Vehicle not found or already deleted"),
+    )
+)]
+pub async fn delete_vehicle(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, vehicle_id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows_affected = app_state
+        .operator_service
+        .delete_vehicle_by_id(&gtfs_id, &vehicle_id)
+        .await?;
+
+    if rows_affected == 0 {
+        return Ok(HttpResponse::NotFound().json(json!({
+            "error": "Vehicle not found or already deleted",
+            "vehicle_id": vehicle_id,
+        })));
+    }
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "Vehicle deleted successfully",
+        "rows_affected": rows_affected,
+    })))
+}
+
 // ===== Stop & route management (clubber / editor) =====
 
 #[derive(Debug, Deserialize)]
@@ -4187,13 +4309,26 @@ pub async fn get_trip_details(
     get,
     path = "/internal/operator/{gtfs_id}/fleets",
     tag = "Internal Operator",
-    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
-    responses((status = 200, description = "List of fleets"))
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("limit" = Option<i64>, Query, description = "Page size (default 100, max 1000)"),
+        ("offset" = Option<i64>, Query, description = "Row offset (optional)"),
+    ),
+    responses((status = 200, description = "List of fleets", body = Vec<FleetRow>))
 )]
-pub async fn get_fleets(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+pub async fn get_fleets(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<PaginationQuery>,
+) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
-    let list = app_state.operator_service.get_fleets(&gtfs_id).await?;
+    let limit = Some(query.limit.unwrap_or(100).min(MAX_QUERY_LIMIT));
+    let offset = query.offset.map(|o| o.max(0));
+    let list = app_state
+        .operator_service
+        .get_fleets(&gtfs_id, limit, offset)
+        .await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
