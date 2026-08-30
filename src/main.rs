@@ -60,6 +60,29 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Keep the service-hopper indexes in step with the GTFS feed.
+    //
+    // The initial load happens in AppState::new. The Nandi preprocessor writes
+    // metro_hops.json in the same run that produces the rest of the
+    // preprocessed data, so a GTFS refresh is the signal that a newer artifact
+    // may be on disk — watch the update timestamp and re-read when it moves.
+    // Readers pick up the new indexes through a single atomic swap.
+    if polling_enabled {
+        let hopper_state = app_state.clone();
+        tokio::spawn(async move {
+            let mut seen = hopper_state.gtfs_service.last_updated_at().await;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let latest = hopper_state.gtfs_service.last_updated_at().await;
+                if latest != seen {
+                    seen = latest;
+                    info!("GTFS data refreshed; reloading service hopper indexes");
+                    hopper_state.rebuild_service_hopper();
+                }
+            }
+        });
+    }
+
     let prometheus = prometheus_metrics();
 
     let openapi = ApiDoc::openapi();

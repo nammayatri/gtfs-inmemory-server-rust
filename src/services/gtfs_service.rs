@@ -1808,6 +1808,12 @@ impl GTFSService {
         *self.is_ready.read().await
     }
 
+    /// When the data snapshot was last replaced. Used by background tasks to
+    /// detect a refresh and reload derived indexes.
+    pub async fn last_updated_at(&self) -> DateTime<Utc> {
+        *self.last_update.read().await
+    }
+
     /// Whether the service is configured to serve from preprocessed data.
     pub fn use_preprocessed_data(&self) -> bool {
         self.config.use_preprocessed_data

@@ -9,4 +9,5 @@ pub mod gtfs_service;
 pub mod metro_graph;
 pub mod operator;
 pub mod osrtc_station_cache;
+pub mod service_hopper;
 pub mod trip_service;

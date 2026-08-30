@@ -22,10 +22,12 @@ use crate::services::{
     metro_graph::MetroGraph,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
     osrtc_station_cache::OsrtcStationCache,
+    service_hopper::{load_all as load_service_hopper, FeedHoppers},
     trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
 use crate::tools::error::AppError;
+use arc_swap::ArcSwap;
 use shared::tools::logger::LoggerConfig;
 use tracing::{error, info};
 
@@ -174,6 +176,13 @@ pub struct AppState {
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     /// Metro transit graphs loaded from preprocessed JSON (gtfs_id -> MetroGraph)
     pub metro_graphs: Arc<HashMap<String, MetroGraph>>,
+    /// Precomputed metro interchange indexes (gtfs_id -> per-day-type graphs).
+    ///
+    /// Loaded at startup from the Nandi planner's `metro_hops.json` and swapped
+    /// wholesale when the preprocessed data refreshes, so readers never block
+    /// and never observe a half-loaded index. See
+    /// [`crate::services::service_hopper`].
+    pub service_hopper: Arc<ArcSwap<HashMap<String, Arc<FeedHoppers>>>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
@@ -393,6 +402,10 @@ impl AppState {
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
         let metro_graphs = Arc::new(Self::load_metro_graphs(&app_config));
 
+        let service_hopper = Arc::new(ArcSwap::from_pointee(load_service_hopper(
+            &app_config.preprocessed_data_dir,
+        )));
+
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
 
@@ -411,12 +424,25 @@ impl AppState {
             fleet_list: Arc::new(Self::load_fleet_list().await?),
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
             metro_graphs,
+            service_hopper,
             depot_manager_details,
             fleet_tag_list: Arc::new(Self::load_fleet_tag_list().await?),
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Ok(app_state)
+    }
+
+    /// Re-read `metro_hops.json` and swap the indexes in atomically.
+    ///
+    /// Called by the background watcher after the feed refreshes. The planner
+    /// writes the artifact in the same preprocessor run that produces the rest
+    /// of the preprocessed data, so a GTFS refresh is the signal that a newer
+    /// artifact may be on disk. Reloading is milliseconds for a metro-sized
+    /// feed, so this is cheaper than reasoning about what changed.
+    pub fn rebuild_service_hopper(&self) {
+        let indexes = load_service_hopper(&self.config.preprocessed_data_dir);
+        self.service_hopper.store(Arc::new(indexes));
     }
 
     async fn load_fleet_tag_list() -> Result<HashMap<String, HashMap<String, String>>> {

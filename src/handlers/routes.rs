@@ -10,7 +10,7 @@ use actix_web::{
     web::{self, Data, Json, Path, Query},
     HttpResponse,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use utoipa::ToSchema;
 
@@ -379,7 +379,8 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/metro/graph-info/{gtfs_id}",
                 actix_web::web::get().to(metro_graph_info),
-            ),
+            )
+            .route("/metro/hop/{gtfs_id}", actix_web::web::get().to(metro_hop)),
     );
 }
 
@@ -4895,6 +4896,130 @@ pub struct MetroNearbyStopsQuery {
     pub lon: f64,
     /// Search radius in meters (default: 1000)
     pub radius_m: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetroHopQuery {
+    /// Origin stop code, e.g. "SCC|0201". Bare code — not `gtfs_id:code`.
+    /// Percent-encode it: the `|` is not URL-safe.
+    pub from: String,
+    /// Destination stop code, same form as `from`.
+    pub to: String,
+    /// Service date as `YYYYMMDD`, defaulting to today in IST. Selects which
+    /// day type's graph answers the query — a journey that is one seated ride
+    /// on a weekday can need an interchange on a Sunday. Mainly for testing and
+    /// for planning ahead; callers asking about now should omit it.
+    pub date: Option<String>,
+}
+
+/// Response for `GET /metro/hop/{gtfs_id}`.
+///
+/// Field names mirror `RouteDetails` in the rider-app backend so a leg maps
+/// straight onto one row: `srcStopCode`/`destStopCode` → `fromStopCode`/
+/// `toStopCode`, `routeCode` → `routeCode`, `lineName` → `routeShortName`,
+/// `alternateRouteCodes` → `alternateRouteIds`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetroHopResponse {
+    pub gtfs_id: String,
+    pub src_stop_code: String,
+    pub dest_stop_code: String,
+    /// Day type this answer is for: `WD`, `SAT` or `SUN`.
+    pub day_type: String,
+    /// Representative service date the planner built this graph from,
+    /// `YYYYMMDD`. Makes it obvious which timetable produced the answer.
+    pub service_date: String,
+    pub total_stops: u32,
+    pub num_interchanges: usize,
+    /// `null` when both stops exist but nothing connects them — distinct from a
+    /// 404, which means a stop code is unknown to this feed.
+    pub legs: Option<Vec<crate::services::service_hopper::HopLeg>>,
+}
+
+/// GET /metro/hop/{gtfs_id}?from={stop_code}&to={stop_code}
+///
+/// Returns the precomputed minimum-stop journey between two metro stations,
+/// split into one leg per seated ride with an interchange at each boundary.
+///
+/// The answer is day-type specific: the Nandi planner builds one graph per
+/// `WD` / `SAT` / `SUN` from the feed's service calendar, so a pair joined by a
+/// weekday-only through-service correctly needs an interchange on a Sunday.
+/// `date` selects the day type; it defaults to today in IST.
+///
+/// O(1): a dense array index into the graph loaded at startup from
+/// `metro_hops.json`. No search happens at request time.
+///
+/// Status codes are deliberately distinct — the backend needs to tell these
+/// apart:
+/// * `404` — unknown `gtfs_id`, or a stop code this feed does not contain
+/// * `400` — `date` is not `YYYYMMDD`
+/// * `200` with `legs: null` — both stops exist, nothing connects them
+/// * `200` with `legs: []` — source and destination are the same station
+async fn metro_hop(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<MetroHopQuery>,
+) -> AppResult<HttpResponse> {
+    use crate::services::service_hopper::{today_ist, HopLeg, HopLookup};
+
+    let gtfs_id = path.into_inner();
+    let params = query.into_inner();
+
+    let date = match params.date.as_deref() {
+        None => today_ist(),
+        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y%m%d")
+            .map_err(|_| AppError::BadRequest(format!("date must be YYYYMMDD, got: {:?}", d)))?,
+    };
+
+    let feeds = app_state.service_hopper.load();
+    let feed = feeds.get(&gtfs_id).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "No service hopper index for gtfs_id: {}. Available: {:?}",
+            gtfs_id,
+            feeds.keys().collect::<Vec<_>>()
+        ))
+    })?;
+
+    // Only None if the artifact has no day types at all, which `from_artifact`
+    // already rejects — so this is a 404 rather than a panic purely for safety.
+    let index = feed.index_for(date).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "No service hopper graph for gtfs_id {} on {}",
+            gtfs_id, date
+        ))
+    })?;
+
+    let respond = |total_stops: u32, legs: Option<Vec<HopLeg>>| {
+        // Legs are joined by interchanges, so N legs means N-1 changes.
+        let num_interchanges = legs
+            .as_ref()
+            .map(|l| l.len().saturating_sub(1))
+            .unwrap_or(0);
+        HttpResponse::Ok().json(MetroHopResponse {
+            gtfs_id: gtfs_id.clone(),
+            src_stop_code: params.from.clone(),
+            dest_stop_code: params.to.clone(),
+            day_type: index.day_type().to_string(),
+            service_date: index.service_date().to_string(),
+            total_stops,
+            num_interchanges,
+            legs,
+        })
+    };
+
+    Ok(match index.lookup(&params.from, &params.to) {
+        HopLookup::UnknownStop(code) => {
+            return Err(AppError::NotFound(format!(
+                "Unknown stop code for gtfs_id {}: {}",
+                gtfs_id, code
+            )))
+        }
+        // A real, zero-length journey — neither an error nor a missing path,
+        // so an empty leg list rather than null.
+        HopLookup::SameStop => respond(0, Some(Vec::new())),
+        HopLookup::NoPath => respond(0, None),
+        HopLookup::Found { total_stops, legs } => respond(total_stops, Some(legs)),
+    })
 }
 
 /// GET /metro/route-plan/{gtfs_id}?from={stop_id}&to={stop_id}&departure_time={HH:MM:SS}
