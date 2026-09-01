@@ -2502,8 +2502,8 @@ impl OperatorService for DBOperatorService {
             }
         }
 
-        // vehicle_id is omitted so the schema's DEFAULT nextval(...) assigns it.
-        let mut cols: Vec<&str> = vec!["vehicle_no"];
+        // Generate vehicle_id in app code — every other insert path uses field_generator, so the schema's DEFAULT nextval() sequence is stale (bulk CSV imports skip it) and relying on it 23505s the pkey. Excluded from UPDATE SET so ON CONFLICT preserves the existing vehicle_id.
+        let mut cols: Vec<&str> = vec!["vehicle_id", "vehicle_no"];
         if shape0.0 {
             cols.push("fleet_no");
         }
@@ -2533,7 +2533,7 @@ impl OperatorService for DBOperatorService {
 
         let update_set: String = cols
             .iter()
-            .filter(|c| **c != "vehicle_no" && **c != "gtfs_id")
+            .filter(|c| **c != "vehicle_no" && **c != "gtfs_id" && **c != "vehicle_id")
             .map(|c| format!("{} = EXCLUDED.{}", c, c))
             .chain(std::iter::once("updated_at = now()".to_string()))
             .collect::<Vec<_>>()
@@ -2551,6 +2551,12 @@ impl OperatorService for DBOperatorService {
 
         let mut q = sqlx::query_as::<_, FleetRow>(&sql);
         for item in &items {
+            let vid: String = if self.gen_int_for_id {
+                field_generator::gen_random_int_id().to_string()
+            } else {
+                field_generator::gen_random_id()
+            };
+            q = q.bind(vid);
             q = q.bind(item.vehicle_no.clone());
             if cols.contains(&"fleet_no") {
                 q = q.bind(item.fleet_no.clone());
