@@ -6,23 +6,6 @@ pub fn gen_random_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Generate a compact, JS-safe `i64` id for auto-injecting PKs into id columns
-/// that are still `bigint` (pre bigint->text migration).
-///
-/// Layout: `seconds_since_2024_epoch * 100_000 + 5_random_digits` (~13 digits).
-/// - **Stays well under 2^53**, so it survives a round-trip through the JS frontend
-///   (and old `Int64` consumers) without precision loss — which is why ids can keep
-///   being sent as JSON numbers instead of strings.
-/// - **Time-ordered** and far above the small sequence ids already in the column,
-///   so it won't collide with existing data; the 5 random digits avoid clashes
-///   within the same second. Gated by the `gen_int_for_id` config.
-pub fn gen_random_int_id() -> i64 {
-    const EPOCH_2024_SECS: i64 = 1_704_067_200; // 2024-01-01T00:00:00Z
-    let secs = (chrono::Utc::now().timestamp() - EPOCH_2024_SECS).max(0);
-    let rand5 = (Uuid::new_v4().as_u128() as u64 % 100_000) as i64; // 0..99_999
-    secs * 100_000 + rand5
-}
-
 pub fn generate_waybill_number() -> String {
     let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let random_suffix = Uuid::new_v4()
