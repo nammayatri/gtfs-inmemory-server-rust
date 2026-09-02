@@ -489,8 +489,8 @@ pub struct RouteRow {
     pub route_number: Option<String>,
     pub route_name: Option<String>,
     pub route_direction: Option<String>,
-    pub start_point_id: IdValue,
-    pub end_point_id: IdValue,
+    pub start_point_id: Option<IdValue>,
+    pub end_point_id: Option<IdValue>,
     pub encoded_polyline: Option<String>,
 }
 
@@ -788,9 +788,9 @@ pub struct TripDetailRow {
     pub break_type: Option<String>,
     pub shift_type_name: Option<String>,
     pub distance: f32,
-    pub schedule_trip_id: IdValue,
+    pub schedule_trip_id: Option<IdValue>,
     pub is_active_trip: bool,
-    pub route_id: IdValue,
+    pub route_id: Option<IdValue>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -807,9 +807,9 @@ pub struct RouteInternal {
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub via: Option<String>,
-    pub bus_service_type_id: IdValue,
-    pub end_point_id: IdValue,
-    pub start_point_id: IdValue,
+    pub bus_service_type_id: Option<IdValue>,
+    pub end_point_id: Option<IdValue>,
+    pub start_point_id: Option<IdValue>,
     pub route_distance: Option<f64>,
     pub encoded_polyline: Option<String>,
     pub gtfs_id: String,
@@ -830,8 +830,8 @@ pub struct RoutePointInternal {
     pub travel_distance: Option<i64>,
     pub travel_time: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub bus_stop_id: IdValue,
-    pub route_id: IdValue,
+    pub bus_stop_id: Option<IdValue>,
+    pub route_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -848,10 +848,10 @@ pub struct BusScheduleInternal {
     pub schedule_type_code: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub entity_id: IdValue,
-    pub route_id: IdValue,
-    pub service_type_id: IdValue,
-    pub schedule_type_id: IdValue,
+    pub entity_id: Option<IdValue>,
+    pub route_id: Option<IdValue>,
+    pub service_type_id: Option<IdValue>,
+    pub schedule_type_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -866,8 +866,8 @@ pub struct BusScheduleTripInternal {
     pub start_time: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: IdValue,
-    pub schedule_id: IdValue,
+    pub calendar_id: Option<IdValue>,
+    pub schedule_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -889,9 +889,9 @@ pub struct BusScheduleTripDetailInternal {
     pub trip_order: i64,
     pub trip_type: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: IdValue,
-    pub route_number_id: IdValue,
-    pub schedule_trip_id: IdValue,
+    pub calendar_id: Option<IdValue>,
+    pub route_number_id: Option<IdValue>,
+    pub schedule_trip_id: Option<IdValue>,
     pub is_active_trip: bool,
     pub is_completed: bool,
     pub trip_end_time: Option<i64>,
@@ -920,10 +920,10 @@ pub struct BusScheduleTripFlexiInternal {
     pub trip_order: i64,
     pub trip_type: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub calendar_id: IdValue,
-    pub route_number_id: IdValue,
-    pub schedule_trip_id: IdValue,
-    pub waybill_id: IdValue,
+    pub calendar_id: Option<IdValue>,
+    pub route_number_id: Option<IdValue>,
+    pub schedule_trip_id: Option<IdValue>,
+    pub waybill_id: Option<IdValue>,
     pub is_active_trip: bool,
     pub trip_end_time: Option<i64>,
     pub trip_start_time: Option<i64>,
@@ -1003,10 +1003,10 @@ pub struct EmployeesInternal {
     pub token_no: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub week_off: Option<String>,
-    pub department_id: IdValue,
-    pub designation_id: IdValue,
-    pub entity_id: IdValue,
-    pub organization_id: IdValue,
+    pub department_id: Option<IdValue>,
+    pub designation_id: Option<IdValue>,
+    pub entity_id: Option<IdValue>,
+    pub organization_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -1022,7 +1022,7 @@ pub struct EntitiesInternal {
     pub entity_remark: Option<String>,
     pub entity_status: String,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub organization_id: IdValue,
+    pub organization_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -1035,9 +1035,9 @@ pub struct VehiclesInternal {
     pub status: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
-    pub bus_service_type_id: IdValue,
-    pub entity_id: IdValue,
-    pub organization_id: IdValue,
+    pub bus_service_type_id: Option<IdValue>,
+    pub entity_id: Option<IdValue>,
+    pub organization_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 
@@ -1059,7 +1059,7 @@ pub struct WaybillDeviceInternal {
     pub is_primary: Option<bool>,
     pub is_uploaded: Option<bool>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub waybill_id: IdValue,
+    pub waybill_id: Option<IdValue>,
     pub gtfs_id: String,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
@@ -1110,10 +1110,10 @@ pub struct WaybillsInternal {
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub vehicle_no: Option<String>,
     pub waybill_no: Option<String>,
-    pub entity_id: IdValue,
-    pub schedule_trip_id: IdValue,
-    pub service_type_id: IdValue,
-    pub shift_type_id: IdValue,
+    pub entity_id: Option<IdValue>,
+    pub schedule_trip_id: Option<IdValue>,
+    pub service_type_id: Option<IdValue>,
+    pub shift_type_id: Option<IdValue>,
     pub tablet_id: Option<IdValue>,
     pub gtfs_id: String,
 }
@@ -1695,9 +1695,6 @@ const ROUTE_BUS_SERVICE_TYPE_CACHE_SECS: u64 = 1800; // 30 minutes
 pub struct DBOperatorService {
     pool: PgPool,
     osrm_url: Option<String>,
-    /// When true, auto-injected PKs are numeric (i64) instead of UUID — for DBs
-    /// whose id columns are still `bigint` (pre bigint->text migration).
-    gen_int_for_id: bool,
     device_ids_cache: Arc<RwLock<DeviceIdsCache>>,
     tablet_ids_cache: Arc<RwLock<TabletIdsCache>>,
     designation_cache: Arc<RwLock<DesignationCache>>,
@@ -1706,11 +1703,10 @@ pub struct DBOperatorService {
 }
 
 impl DBOperatorService {
-    pub fn new(pool: PgPool, osrm_url: Option<String>, gen_int_for_id: bool) -> Self {
+    pub fn new(pool: PgPool, osrm_url: Option<String>) -> Self {
         Self {
             pool,
             osrm_url: osrm_url.filter(|s| !s.is_empty()),
-            gen_int_for_id,
             device_ids_cache: Arc::new(RwLock::new(DeviceIdsCache {
                 etm_ids: HashMap::new(),
             })),
@@ -2169,13 +2165,10 @@ impl OperatorService for DBOperatorService {
             if let Some(obj) = val.as_object_mut() {
                 let missing = obj.get(pk).map_or(true, |v| v.is_null());
                 if missing {
-                    // numeric id for still-`bigint` columns (pre-migration), else UUID
-                    let id = if self.gen_int_for_id {
-                        Value::from(field_generator::gen_random_int_id())
-                    } else {
-                        Value::String(field_generator::gen_random_id())
-                    };
-                    obj.insert(pk.to_string(), id);
+                    obj.insert(
+                        pk.to_string(),
+                        Value::String(field_generator::gen_random_id()),
+                    );
                 }
             }
         }
@@ -2653,11 +2646,7 @@ impl OperatorService for DBOperatorService {
 
         let mut q = sqlx::query_as::<_, FleetRow>(&sql);
         for item in &items {
-            let vid: String = if self.gen_int_for_id {
-                field_generator::gen_random_int_id().to_string()
-            } else {
-                field_generator::gen_random_id()
-            };
+            let vid: String = field_generator::gen_random_id();
             q = q.bind(vid);
             q = q.bind(item.vehicle_no.clone());
             if cols.contains(&"fleet_no") {
