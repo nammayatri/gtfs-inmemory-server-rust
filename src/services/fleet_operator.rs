@@ -64,6 +64,20 @@ pub struct TripActionResponse {
     pub success: bool,
 }
 
+/// Just the active trip for a waybill, resolved directly off `is_active_trip` -- no
+/// `previous_trip_number` needed, so unlike `current_trip_details` it can't be poisoned by a
+/// caller's stale cache of what it last thought was current. `active_trip_number`/`route_id`
+/// are `None` when no trip is currently active (between trips).
+#[derive(Debug, Serialize)]
+pub struct ActiveTripResponse {
+    pub waybill_no: String,
+    pub vehicle_number: String,
+    pub conductor_token: Option<String>,
+    pub driver_token: Option<String>,
+    pub active_trip_number: Option<i32>,
+    pub route_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub verified: bool,
@@ -188,6 +202,12 @@ pub trait FleetOperatorService: Send + Sync {
         previous_trip_number: i32,
     ) -> AppResult<CurrentTripDetailsResponse>;
 
+    async fn active_trip(
+        &self,
+        gtfs_id: &str,
+        anchor: WaybillAnchor,
+    ) -> AppResult<ActiveTripResponse>;
+
     async fn verify(
         &self,
         gtfs_id: &str,
@@ -262,6 +282,16 @@ impl FleetOperatorService for MockFleetOperatorService {
         _anchor: WaybillAnchor,
         _previous_trip_number: i32,
     ) -> AppResult<CurrentTripDetailsResponse> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn active_trip(
+        &self,
+        _gtfs_id: &str,
+        _anchor: WaybillAnchor,
+    ) -> AppResult<ActiveTripResponse> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -554,6 +584,64 @@ impl DBFleetOperatorService {
                 AppError::Internal(e.to_string())
             })?;
             Ok(rows)
+        }
+    }
+
+    // ── Active trip only ─────────────────────────────────────────────────────
+
+    /// The single row with `is_active_trip = true` for this waybill, if any -- returns
+    /// `(trip_number, route_id)`. No `previous_trip_number` input, unlike `get_all_trips`'s
+    /// bucketing: this reads GIMS's own live flag directly, so it can't be misled by a stale
+    /// caller-supplied reference point.
+    async fn get_active_trip(&self, waybill: &WaybillRow) -> AppResult<Option<(i32, String)>> {
+        if waybill.is_flexi {
+            sqlx::query_as(
+                r#"
+                SELECT trip_number, route_number_id::text AS route_id
+                FROM bus_schedule_trip_flexi_internal
+                WHERE waybill_id::text = $1
+                  AND is_active_trip = true
+                  AND trip_type != 'dead-trip'
+                  AND deleted = false
+                LIMIT 1
+                "#,
+            )
+            .bind(&waybill.waybill_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "get_active_trip (flexi) failed for waybill_id={}: {}",
+                    waybill.waybill_id, e
+                );
+                AppError::Internal(e.to_string())
+            })
+        } else {
+            let schedule_trip_id = waybill.schedule_trip_id.clone().ok_or_else(|| {
+                AppError::NotFound("Waybill has no schedule_trip_id.".to_string())
+            })?;
+            sqlx::query_as(
+                r#"
+                SELECT trip_number, route_number_id::text AS route_id
+                FROM bus_schedule_trip_detail_internal
+                WHERE schedule_trip_id::text = $1
+                  AND is_active_trip = true
+                  AND trip_type != 'dead-trip'
+                  AND deleted = false
+                  AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                LIMIT 1
+                "#,
+            )
+            .bind(&schedule_trip_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "get_active_trip (detail) failed for schedule_trip_id={}: {}",
+                    schedule_trip_id, e
+                );
+                AppError::Internal(e.to_string())
+            })
         }
     }
 
@@ -1099,6 +1187,24 @@ impl FleetOperatorService for DBFleetOperatorService {
             history,
             current,
             upcoming,
+        })
+    }
+
+    async fn active_trip(
+        &self,
+        gtfs_id: &str,
+        anchor: WaybillAnchor,
+    ) -> AppResult<ActiveTripResponse> {
+        let waybill = self.resolve_waybill(gtfs_id, &anchor).await?;
+        let active = self.get_active_trip(&waybill).await?;
+
+        Ok(ActiveTripResponse {
+            waybill_no: waybill.waybill_no,
+            vehicle_number: waybill.vehicle_no,
+            conductor_token: waybill.conductor_token_no,
+            driver_token: waybill.driver_token_no,
+            active_trip_number: active.as_ref().map(|(n, _)| *n),
+            route_id: active.map(|(_, r)| r),
         })
     }
 
