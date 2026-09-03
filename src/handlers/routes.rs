@@ -184,6 +184,7 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                         "/currentTripDetails",
                         web::post().to(fleet_operator_current_trip_details),
                     )
+                    .route("/activeTrip", web::post().to(fleet_operator_active_trip))
                     .route("/verify", web::post().to(fleet_operator_verify))
                     .route(
                         "/employee/login",
@@ -4949,6 +4950,29 @@ pub async fn fleet_operator_current_trip_details(
     let response = app_state
         .fleet_operator_service
         .current_trip_details(&gtfs_id, anchor, req.previous_trip_number)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/activeTrip",
+    tag = "Internal Fleet Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = FleetAnchorRequest,
+    responses((status = 200, description = "The waybill's currently active trip, if any"))
+)]
+pub async fn fleet_operator_active_trip(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<FleetAnchorRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let req = body.into_inner();
+    let anchor = parse_fleet_anchor(req.conductor_token, req.driver_token, req.vehicle_number)?;
+    let response = app_state
+        .fleet_operator_service
+        .active_trip(&gtfs_id, anchor)
         .await?;
     Ok(HttpResponse::Ok().json(response))
 }

@@ -106,6 +106,7 @@ use crate::services::operator::QueryBody;
         routes::fleet_operator_current_operation,
         routes::fleet_operator_trip_action,
         routes::fleet_operator_current_trip_details,
+        routes::fleet_operator_active_trip,
         routes::fleet_operator_verify,
         routes::fleet_operator_employee_login,
         routes::fleet_operator_employee_register,
