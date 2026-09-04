@@ -185,41 +185,49 @@ impl Serialize for ServiceTierType {
     }
 }
 
+impl ServiceTierType {
+    /// Maps one raw operator service-type string to a tier.
+    ///
+    /// Accepts both the canonical SCREAMING_CASE spellings and the free-form
+    /// values the depot systems write into `waybills.service_type` ("A/C",
+    /// "Deluxe EV", ...). Returns `None` for anything unrecognised: callers
+    /// reading free-form DB text must skip an unmapped value rather than fail
+    /// the whole request over it.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "Deluxe EV" => Some(ServiceTierType::Executive),
+            "Small Bus Express" => Some(ServiceTierType::Express),
+            "Small Bus Ordinary" => Some(ServiceTierType::NonAc),
+            "A/C" | "A/C EV" | "AC" => Some(ServiceTierType::Ac),
+            "Ordinary" | "ORDINARY" => Some(ServiceTierType::Ordinary),
+            "Express" | "EXPRESS" => Some(ServiceTierType::Express),
+            "Deluxe" | "EXECUTIVE" => Some(ServiceTierType::Executive),
+            "NON_AC" => Some(ServiceTierType::NonAc),
+            "SPECIAL" => Some(ServiceTierType::Special),
+            "FIRST_CLASS" => Some(ServiceTierType::FirstClass),
+            "SECOND_CLASS" => Some(ServiceTierType::SecondClass),
+            "THIRD_CLASS" => Some(ServiceTierType::ThirdClass),
+            "ASHOK_LEYLAND_AC" => Some(ServiceTierType::AshokLeylandAc),
+            "MIDI_AC" => Some(ServiceTierType::MidiAc),
+            "VOLVO_AC" => Some(ServiceTierType::VolvoAc),
+            "ELECTRIC_V" => Some(ServiceTierType::ElectricV),
+            "ELECTRIC_V_PMI" => Some(ServiceTierType::ElectricVPmi),
+            "AC_EMU_FIRST_CLASS" => Some(ServiceTierType::AcEmuFirstClass),
+            "PREMIUM" | "Premium" => Some(ServiceTierType::PREMIUM),
+            "SHUTTLE" | "Shuttle" => Some(ServiceTierType::SHUTTLE),
+            _ => None,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for ServiceTierType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let s: String = Deserialize::deserialize(deserializer)?;
-        match s.trim() {
-            "Deluxe EV" => Ok(ServiceTierType::Executive),
-            "Small Bus Express" => Ok(ServiceTierType::Express),
-            "Small Bus Ordinary" => Ok(ServiceTierType::NonAc),
-            "A/C" | "A/C EV" | "AC" => Ok(ServiceTierType::Ac),
-            "Ordinary" | "ORDINARY" => Ok(ServiceTierType::Ordinary),
-            "Express" | "EXPRESS" => Ok(ServiceTierType::Express),
-            "Deluxe" | "EXECUTIVE" => Ok(ServiceTierType::Executive),
-            "NON_AC" => Ok(ServiceTierType::NonAc),
-            "SPECIAL" => Ok(ServiceTierType::Special),
-            "FIRST_CLASS" => Ok(ServiceTierType::FirstClass),
-            "SECOND_CLASS" => Ok(ServiceTierType::SecondClass),
-            "THIRD_CLASS" => Ok(ServiceTierType::ThirdClass),
-            "ASHOK_LEYLAND_AC" => Ok(ServiceTierType::AshokLeylandAc),
-            "MIDI_AC" => Ok(ServiceTierType::MidiAc),
-            "VOLVO_AC" => Ok(ServiceTierType::VolvoAc),
-            "ELECTRIC_V" => Ok(ServiceTierType::ElectricV),
-            "ELECTRIC_V_PMI" => Ok(ServiceTierType::ElectricVPmi),
-            "AC_EMU_FIRST_CLASS" => Ok(ServiceTierType::AcEmuFirstClass),
-            "PREMIUM" | "Premium" => Ok(ServiceTierType::PREMIUM),
-            "SHUTTLE" | "Shuttle" => Ok(ServiceTierType::SHUTTLE),
-            _ => {
-                // Return Ordinary as default if parsing fails like some lenient setups or log warning? Let's just fail
-                Err(serde::de::Error::custom(format!(
-                    "Invalid Service Tier Type: {}",
-                    s
-                )))
-            }
-        }
+        ServiceTierType::from_db_str(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("Invalid Service Tier Type: {}", s)))
     }
 }
 
@@ -644,7 +652,7 @@ pub struct GTFSStop {
     pub hindi_name: Option<String>,
     #[serde(rename = "regionalName")]
     pub regional_name: Option<String>,
-    #[serde(rename = "infoJson", default, skip_serializing)]
+    #[serde(rename = "infoJson", alias = "info_json", default, skip_serializing)]
     pub info_json: Option<String>,
     #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,

@@ -92,12 +92,14 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
-    /// When Some(true), auto-generated PKs for PK-less upserts are numeric (i64)
-    /// instead of UUIDs. Set true for environments whose id columns are still
-    /// `bigint` (pre-migration); leave None/false (the end state) once that DB's
-    /// id columns are migrated to text, so new PKs become UUIDs. None ⇒ false.
+    /// Use `route_point_internal.travel_time` as the first source for the
+    /// inter-stop ETAs on the *-route-schedule endpoints (default: false).
+    /// Only worth turning on for a feed whose route points have been
+    /// backfilled with OSRM leg times and whose stop ids match the GTFS stop
+    /// codes; when false those endpoints keep the older behaviour of
+    /// station_eta first, haversine second.
     #[serde(default)]
-    pub gen_int_for_id: Option<bool>,
+    pub use_route_point_travel_times: bool,
 }
 
 fn default_preprocessed_data_dir() -> String {
@@ -226,7 +228,6 @@ impl AppState {
                                         Arc::new(DBOperatorService::new(
                                             internal_pool.clone(),
                                             app_config.osrm_url.clone(),
-                                            app_config.gen_int_for_id.unwrap_or(false),
                                         )),
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
@@ -310,7 +311,6 @@ impl AppState {
                         Arc::new(DBOperatorService::new(
                             internal_pool.clone(),
                             app_config.osrm_url.clone(),
-                            app_config.gen_int_for_id.unwrap_or(false),
                         )),
                         Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
                         Arc::new(DBFleetOperatorService::new(internal_pool.clone())),

@@ -74,4 +74,8 @@ in {
   -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
   osrm_url = Some "http://localhost:5050",
   gen_int_for_id = Some True,
+
+  -- Use route_point_internal.travel_time for the *-route-schedule inter-stop
+  -- ETAs. Off ⇒ station_eta first, haversine second (pre-a60f513 behaviour).
+  use_route_point_travel_times = True,
 }

@@ -3,8 +3,9 @@ use crate::services::fleet_operator::{
     TripAction, WaybillAnchor,
 };
 use crate::services::operator::{
-    break_types, day_types, shift_types, trip_types, waybill_statuses, QueryBody,
-    EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
+    break_types, day_types, shift_types, trip_types, waybill_statuses, FleetRow, QueryBody,
+    VehicleUpsertRequest, EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, MAX_QUERY_LIMIT,
+    SUPPORTED_OPERATOR_GTFS_IDS,
 };
 use actix_web::{
     web::{self, Data, Json, Path, Query},
@@ -18,7 +19,7 @@ use chrono::Timelike;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
@@ -29,6 +30,7 @@ use crate::models::{
     VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
+use crate::services::db_vehicle_reader_internal::RouteLegTravelTimes;
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -139,6 +141,9 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
                     .route("/waybills", web::get().to(get_waybills))
                     .route("/station-eta/upsert", web::post().to(upsert_station_eta))
+                    .route("/vehicles/upsert", web::post().to(upsert_vehicles))
+                    .route("/vehicles/query", web::get().to(query_vehicles))
+                    .route("/vehicles/{vehicle_id}", web::delete().to(delete_vehicle))
                     // stop & route management (clubber / editor)
                     .route("/stops/search", web::get().to(search_stops))
                     .route("/stops/nearby", web::get().to(nearby_stops))
@@ -1537,6 +1542,33 @@ pub async fn get_service_type_by_vehicle_by_gtfs_id(
     .await
 }
 
+// DB-first with CSV fallback; gate skips guaranteed-None DB round-trip on non-operator feeds.
+async fn resolve_tag_number(
+    app_state: &AppState,
+    gtfs_id: &str,
+    vehicle_no: &str,
+) -> Option<String> {
+    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+        match app_state
+            .db_vehicle_reader_internal
+            .get_vehicle_tag_number(vehicle_no, gtfs_id)
+            .await
+        {
+            Ok(Some(tag)) => return Some(tag),
+            Ok(None) => {}
+            Err(e) => warn!(
+                "resolve_tag_number: DB lookup failed for ({}, {}): {}; falling back to fleet_tag_list.csv",
+                gtfs_id, vehicle_no, e
+            ),
+        }
+    }
+    app_state
+        .fleet_tag_list
+        .get(gtfs_id)
+        .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
+        .cloned()
+}
+
 #[utoipa::path(
     get,
     path = "/vehicle/{gtfs_id}/metadata/{vehicle_no}",
@@ -1564,11 +1596,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         .cloned()
         .unwrap_or(path_vehicle);
 
-    let vehicle_tag_number = app_state
-        .fleet_tag_list
-        .get(&gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(&vehicle_no))
-        .cloned();
+    let vehicle_tag_number = resolve_tag_number(&app_state, &gtfs_id, &vehicle_no).await;
 
     let service_sub_types = app_state
         .vehicle_service_sub_types
@@ -1994,11 +2022,7 @@ async fn get_service_type_by_vehicle_impl(
         path
     };
 
-    let tag_number = app_state
-        .fleet_tag_list
-        .get(gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
-        .cloned();
+    let tag_number = resolve_tag_number(&app_state, gtfs_id, vehicle_no).await;
 
     // Get vehicle verification if requested
     let is_valid = if pass_verify_req {
@@ -2774,18 +2798,60 @@ pub async fn get_waybill_metadata(
         .get_waybill_metadata(&gtfs_id, &waybill_no)
         .await?;
 
-    // Enrich with the bus tag number for the waybill's current vehicle, so a bus swap on the waybill
-    // reflects the new tag downstream (same fleet_tag_list lookup as the /vehicle metadata endpoint).
-    waybill_metadata.bus_tag_number = app_state
-        .fleet_tag_list
-        .get(&gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(&waybill_metadata.vehicle_no))
-        .cloned();
+    waybill_metadata.bus_tag_number =
+        resolve_tag_number(&app_state, &gtfs_id, &waybill_metadata.vehicle_no).await;
 
     Ok(HttpResponse::Ok().json(waybill_metadata))
 }
 
 const SPEED_KM_PER_HOUR: f64 = 25.0;
+
+/// A stored leg time is cross-checked against the straight-line distance
+/// between its two stops before it is trusted. The bounds exist to catch a
+/// misread unit or a corrupt row, not to second-guess traffic.
+///
+/// The case that matters is a legacy millisecond value small enough to pass as
+/// seconds (see parse_leg_travel_seconds): two stops 45 m apart whose OSRM leg
+/// was 5.0 s were stored as "5000", which reads back as 5000 seconds and would
+/// push every later stop on the route out by 83 minutes.
+///
+/// That misread only happens when the OSRM duration was under 5.4 s, which in
+/// turn only happens between stops a few tens of metres apart - so the short
+/// distances are exactly where the guard has to bite. Two thresholds cover it:
+///
+///   - stops far enough apart to imply a meaningful speed are checked on speed;
+///   - stops closer than that carry no speed signal, so they are checked
+///     against an absolute ceiling instead.
+///
+/// The speed floor is deliberately very low. Leg times from the backfill are
+/// arrival-to-arrival and include dwell at the origin stop, so a terminus
+/// layover over a short hop legitimately implies a fraction of a km/h; a
+/// stricter floor would discard real measurements on precisely the legs where
+/// the haversine fallback is least accurate.
+const MIN_PLAUSIBLE_LEG_SPEED_KMPH: f64 = 0.1;
+const MAX_PLAUSIBLE_LEG_SPEED_KMPH: f64 = 100.0;
+/// Below this the stops are effectively co-located and the implied speed
+/// carries no information.
+const MIN_SPEED_CHECK_DISTANCE_KM: f64 = 0.02;
+/// Ceiling applied to co-located stops in place of the speed check. Generous
+/// enough for a dwell, far below the 5400 s that parse_leg_travel_seconds
+/// allows through.
+const MAX_COLOCATED_LEG_SECONDS: i32 = 300;
+
+/// Whether `seconds` is a believable time to cover `distance_km`.
+fn leg_speed_is_plausible(distance_km: f64, seconds: i32) -> bool {
+    if seconds <= 0 {
+        return true;
+    }
+    if distance_km < MIN_SPEED_CHECK_DISTANCE_KM {
+        // No usable speed signal - fall back to an absolute ceiling rather than
+        // accepting anything, which is the gap a misread millisecond value on
+        // near-duplicate stops would otherwise walk straight through.
+        return seconds <= MAX_COLOCATED_LEG_SECONDS;
+    }
+    let kmph = distance_km / (seconds as f64 / 3600.0);
+    (MIN_PLAUSIBLE_LEG_SPEED_KMPH..=MAX_PLAUSIBLE_LEG_SPEED_KMPH).contains(&kmph)
+}
 const EARTH_RADIUS_KM: f64 = 6371.0; // Earth radius in kilometers
 
 // Haversine formula to calculate distance between two points
@@ -2800,101 +2866,27 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_KM * c
 }
 
-fn calculate_eta_from_db(
+/// Cumulative travel time, in seconds, from the first stop of the route to each
+/// stop in `route_stop_mappings`. Index `i` lines up with mapping `i`; index 0 is
+/// always 0.
+///
+/// Per-leg source, in order of preference:
+///   1. `route_point_internal.travel_time` for this exact route (`leg_times`)
+///   2. the global `station_eta` stop-pair table (`db_etas`)
+///   3. haversine distance at `SPEED_KM_PER_HOUR`
+///
+/// Computed once per route and reused across every waybill on it, so the
+/// per-stop work does not repeat for each vehicle.
+fn build_stop_offsets(
     route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
-    trip_start_time: Option<i64>,
+    leg_times: &RouteLegTravelTimes,
     db_etas: &HashMap<(String, String), i32>,
-) -> Vec<crate::models::BusStopETA> {
-    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
-    let now = chrono::Utc::now();
-
-    // Calculate cumulative travel time to each stop
+) -> Vec<i64> {
+    let mut offsets = Vec::with_capacity(route_stop_mappings.len());
     let mut cumulative_time_seconds: f64 = 0.0;
 
     for (idx, mapping) in route_stop_mappings.iter().enumerate() {
         if idx > 0 {
-            let prev_mapping = &route_stop_mappings[idx - 1];
-            let pair = (
-                prev_mapping.stop_code.to_string(),
-                mapping.stop_code.to_string(),
-            );
-
-            let time_seconds = if let Some(&eta_secs) = db_etas.get(&pair) {
-                // Get ETA for this consecutive pair from DB (value is already in seconds)
-                let prev_eta = eta_secs as f64;
-                info!(
-                    "calculate_eta_from_db - using DB pair ({}, {}): {} secs",
-                    prev_mapping.stop_code, mapping.stop_code, eta_secs
-                );
-                prev_eta
-            } else {
-                // If not found (new stop inserted), calculate distance from previous stop to current stop
-                let distance_km = haversine_distance(
-                    prev_mapping.stop_point.lat,
-                    prev_mapping.stop_point.lon,
-                    mapping.stop_point.lat,
-                    mapping.stop_point.lon,
-                );
-
-                // Calculate time to travel this distance at 25 km/hr
-                let time_hours = distance_km / SPEED_KM_PER_HOUR;
-                let haversine_eta = time_hours * 3600.0;
-                info!(
-                    "calculate_eta_from_db - fallback haversine pair ({}, {}): {} km -> {} secs",
-                    prev_mapping.stop_code, mapping.stop_code, distance_km, haversine_eta
-                );
-                haversine_eta
-            };
-
-            cumulative_time_seconds += time_seconds;
-        }
-
-        // Calculate arrival time
-        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
-            // Calculate arrival time from trip start time
-            let start_utc =
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
-            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        } else {
-            // If no start time, use current time + cumulative time
-            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        };
-
-        let arrival_epoch = arrival_time.timestamp();
-
-        // Calculate ETA in seconds (time until arrival)
-        let eta_seconds = if arrival_time > now {
-            Some((arrival_time - now).num_seconds())
-        } else {
-            None
-        };
-
-        bus_stop_etas.push(crate::models::BusStopETA {
-            stop_code: mapping.stop_code.to_string(),
-            arrival_time: arrival_epoch,
-            eta_seconds,
-            stop_name: Some(mapping.stop_name.to_string()),
-        });
-    }
-
-    bus_stop_etas
-}
-
-/// Calculate arrival time and ETA based on haversine distance between stops
-/// Assumes constant speed of 25 km/hr
-fn calculate_eta_from_haversine_distance(
-    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
-    trip_start_time: Option<i64>,
-) -> Vec<crate::models::BusStopETA> {
-    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
-    let now = chrono::Utc::now();
-
-    // Calculate cumulative travel time to each stop
-    let mut cumulative_time_seconds: f64 = 0.0;
-
-    for (idx, mapping) in route_stop_mappings.iter().enumerate() {
-        if idx > 0 {
-            // Calculate distance from previous stop to current stop
             let prev_mapping = &route_stop_mappings[idx - 1];
             let distance_km = haversine_distance(
                 prev_mapping.stop_point.lat,
@@ -2903,41 +2895,108 @@ fn calculate_eta_from_haversine_distance(
                 mapping.stop_point.lon,
             );
 
-            // Calculate time to travel this distance at 25 km/hr
-            let time_hours = distance_km / SPEED_KM_PER_HOUR;
-            let time_seconds = time_hours * 3600.0;
+            // route_point_internal is keyed on the operator's stop ids, which
+            // need not be the codes this GTFS feed uses. A miss just means the
+            // next source is consulted.
+            let leg_secs = leg_times
+                .get(&prev_mapping.stop_code, &mapping.stop_code)
+                .filter(|&secs| {
+                    let ok = leg_speed_is_plausible(distance_km, secs);
+                    if !ok {
+                        warn!(
+                            "build_stop_offsets - discarding leg ({}, {}): {} secs over {:.3} km \
+                             is an implausible speed, falling back",
+                            prev_mapping.stop_code, mapping.stop_code, secs, distance_km
+                        );
+                    }
+                    ok
+                });
+
+            let time_seconds = if let Some(secs) = leg_secs {
+                debug!(
+                    "build_stop_offsets - route_point leg ({}, {}): {} secs",
+                    prev_mapping.stop_code, mapping.stop_code, secs
+                );
+                secs as f64
+            } else {
+                let pair = (
+                    prev_mapping.stop_code.to_string(),
+                    mapping.stop_code.to_string(),
+                );
+                if let Some(&eta_secs) = db_etas.get(&pair) {
+                    debug!(
+                        "build_stop_offsets - station_eta pair ({}, {}): {} secs",
+                        prev_mapping.stop_code, mapping.stop_code, eta_secs
+                    );
+                    eta_secs as f64
+                } else {
+                    let haversine_eta = (distance_km / SPEED_KM_PER_HOUR) * 3600.0;
+                    debug!(
+                        "build_stop_offsets - haversine fallback ({}, {}): {} km -> {} secs",
+                        prev_mapping.stop_code, mapping.stop_code, distance_km, haversine_eta
+                    );
+                    haversine_eta
+                }
+            };
+
             cumulative_time_seconds += time_seconds;
         }
 
-        // Calculate arrival time
-        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
-            // Calculate arrival time from trip start time
-            let start_utc =
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
-            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        } else {
-            // If no start time, use current time + cumulative time
-            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        };
-
-        let arrival_epoch = arrival_time.timestamp();
-
-        // Calculate ETA in seconds (time until arrival)
-        let eta_seconds = if arrival_time > now {
-            Some((arrival_time - now).num_seconds())
-        } else {
-            None
-        };
-
-        bus_stop_etas.push(crate::models::BusStopETA {
-            stop_code: mapping.stop_code.to_string(),
-            arrival_time: arrival_epoch,
-            eta_seconds,
-            stop_name: Some(mapping.stop_name.to_string()),
-        });
+        offsets.push(cumulative_time_seconds as i64);
     }
 
-    bus_stop_etas
+    offsets
+}
+
+/// Turns per-stop cumulative offsets into absolute arrival times for one trip.
+/// `offsets` must be the vector `build_stop_offsets` produced for the same
+/// `route_stop_mappings`.
+fn etas_from_offsets(
+    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
+    offsets: &[i64],
+    trip_start_time: Option<i64>,
+) -> Vec<crate::models::BusStopETA> {
+    let now = chrono::Utc::now();
+    // No trip start time: anchor the whole trip at "now" so the offsets still
+    // describe the sequence, matching the previous behaviour.
+    let anchor = trip_start_time
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or(now);
+
+    route_stop_mappings
+        .iter()
+        .enumerate()
+        .map(|(idx, mapping)| {
+            let offset = offsets.get(idx).copied().unwrap_or(0);
+            let arrival_time = anchor + chrono::Duration::seconds(offset);
+            let eta_seconds = if arrival_time > now {
+                Some((arrival_time - now).num_seconds())
+            } else {
+                None
+            };
+
+            crate::models::BusStopETA {
+                stop_code: mapping.stop_code.to_string(),
+                arrival_time: arrival_time.timestamp(),
+                eta_seconds,
+                stop_name: Some(mapping.stop_name.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Calculate arrival time and ETA based on haversine distance between stops.
+/// Assumes a constant speed of 25 km/hr.
+fn calculate_eta_from_haversine_distance(
+    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
+    trip_start_time: Option<i64>,
+) -> Vec<crate::models::BusStopETA> {
+    let offsets = build_stop_offsets(
+        route_stop_mappings,
+        &RouteLegTravelTimes::default(),
+        &HashMap::new(),
+    );
+    etas_from_offsets(route_stop_mappings, &offsets, trip_start_time)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3003,6 +3062,28 @@ pub async fn get_bus_trip_schedule(
         .chain(internal_rows.into_iter())
         .collect();
 
+    // Both ETA sources depend only on the route, not on the waybill, so resolve
+    // them once and reuse the cumulative offsets for every row below.
+    let stop_offsets = if all.is_empty() {
+        Vec::new()
+    } else {
+        let leg_times = if app_state.config.use_route_point_travel_times {
+            app_state
+                .db_vehicle_reader_internal
+                .get_route_leg_travel_times(&gtfs_id, &route_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            RouteLegTravelTimes::default()
+        };
+        let db_etas = app_state
+            .db_vehicle_reader_internal
+            .get_station_etas(&gtfs_id)
+            .await
+            .unwrap_or_default();
+        build_stop_offsets(&route_stop_mappings, &leg_times, &db_etas)
+    };
+
     let mut schedule_details: BusScheduleDetails = Vec::new();
     for row in all {
         let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
@@ -3030,18 +3111,7 @@ pub async fn get_bus_trip_schedule(
                 .and_then(|s| s.parse::<i64>().ok())
         };
 
-        // Calculate ETAs
-
-        let bus_stop_etas = match app_state
-            .db_vehicle_reader_internal
-            .get_station_etas(&gtfs_id)
-            .await
-        {
-            Ok(db_etas) if !db_etas.is_empty() => {
-                calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
-            }
-            _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
-        };
+        let bus_stop_etas = etas_from_offsets(&route_stop_mappings, &stop_offsets, trip_start_time);
 
         schedule_details.push(crate::models::BusScheduleDetail {
             eta: bus_stop_etas,
@@ -3115,6 +3185,28 @@ pub async fn get_bus_route_schedule(
             all_rows.append(&mut int_rows);
         }
 
+        // Both ETA sources depend only on the route, not on the waybill, so resolve
+        // them once and reuse the cumulative offsets for every row below.
+        let stop_offsets = if all_rows.is_empty() {
+            Vec::new()
+        } else {
+            let leg_times = if app_state.config.use_route_point_travel_times {
+                app_state
+                    .db_vehicle_reader_internal
+                    .get_route_leg_travel_times(&gtfs_id, &route_id)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                RouteLegTravelTimes::default()
+            };
+            let db_etas = app_state
+                .db_vehicle_reader_internal
+                .get_station_etas(&gtfs_id)
+                .await
+                .unwrap_or_default();
+            build_stop_offsets(&route_stop_mappings, &leg_times, &db_etas)
+        };
+
         let mut schedule_details: BusScheduleDetails = Vec::new();
         for row in all_rows {
             // Resolve trip start time from (db_start_time HH:MM + duty_date) or
@@ -3144,16 +3236,8 @@ pub async fn get_bus_route_schedule(
                     .and_then(|s| s.parse::<i64>().ok())
             };
 
-            let bus_stop_etas = match app_state
-                .db_vehicle_reader_internal
-                .get_station_etas(&gtfs_id)
-                .await
-            {
-                Ok(db_etas) if !db_etas.is_empty() => {
-                    calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
-                }
-                _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
-            };
+            let bus_stop_etas =
+                etas_from_offsets(&route_stop_mappings, &stop_offsets, trip_start_time);
 
             let is_upcoming = row
                 .status
@@ -3787,6 +3871,124 @@ pub async fn get_operator_routes(
     Ok(HttpResponse::Ok().json(list))
 }
 
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/vehicles/upsert",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = Vec<VehicleUpsertRequest>,
+    responses(
+        (status = 200, description = "Upserted vehicles", body = Vec<FleetRow>),
+        (status = 400, description = "Invalid body or unsupported gtfs_id"),
+    )
+)]
+pub async fn upsert_vehicles(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<Vec<VehicleUpsertRequest>>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let items = body.into_inner();
+    let rows = app_state
+        .operator_service
+        .upsert_vehicles(&gtfs_id, items)
+        .await?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct QueryVehicleParams {
+    pub vehicle_no: Option<String>,
+    pub tag_number: Option<String>,
+    pub fleet_no: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/vehicles/query",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_no" = Option<String>, Query, description = "Exact match on vehicle_no"),
+        ("tag_number" = Option<String>, Query, description = "Exact match on tag_number"),
+        ("fleet_no" = Option<String>, Query, description = "Exact match on fleet_no"),
+    ),
+    responses(
+        (status = 200, description = "Matching vehicles (equality filters, AND-combined)", body = Vec<FleetRow>),
+        (status = 400, description = "No filter provided or unsupported gtfs_id"),
+    )
+)]
+pub async fn query_vehicles(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<QueryVehicleParams>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    // Treat empty / whitespace-only filter values as absent so a bare `?fleet_no=` isn't matched against literal ''.
+    let normalize = |v: &Option<String>| -> Option<String> {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let vehicle_no = normalize(&query.vehicle_no);
+    let tag_number = normalize(&query.tag_number);
+    let fleet_no = normalize(&query.fleet_no);
+
+    let rows = app_state
+        .operator_service
+        .query_vehicles(
+            &gtfs_id,
+            vehicle_no.as_deref(),
+            tag_number.as_deref(),
+            fleet_no.as_deref(),
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/internal/operator/{gtfs_id}/vehicles/{vehicle_id}",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("vehicle_id" = String, Path, description = "Vehicle id to soft-delete"),
+    ),
+    responses(
+        (status = 200, description = "Vehicle soft-deleted"),
+        (status = 404, description = "Vehicle not found or already deleted"),
+    )
+)]
+pub async fn delete_vehicle(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, vehicle_id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let rows_affected = app_state
+        .operator_service
+        .delete_vehicle_by_id(&gtfs_id, &vehicle_id)
+        .await?;
+
+    if rows_affected == 0 {
+        return Ok(HttpResponse::NotFound().json(json!({
+            "error": "Vehicle not found or already deleted",
+            "vehicle_id": vehicle_id,
+        })));
+    }
+
+    Ok(HttpResponse::Ok().json(json!({
+        "message": "Vehicle deleted successfully",
+        "rows_affected": rows_affected,
+    })))
+}
+
 // ===== Stop & route management (clubber / editor) =====
 
 #[derive(Debug, Deserialize)]
@@ -4129,13 +4331,26 @@ pub async fn get_trip_details(
     get,
     path = "/internal/operator/{gtfs_id}/fleets",
     tag = "Internal Operator",
-    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
-    responses((status = 200, description = "List of fleets"))
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("limit" = Option<i64>, Query, description = "Page size (default 100, max 1000)"),
+        ("offset" = Option<i64>, Query, description = "Row offset (optional)"),
+    ),
+    responses((status = 200, description = "List of fleets", body = Vec<FleetRow>))
 )]
-pub async fn get_fleets(app_state: Data<AppState>, path: Path<String>) -> AppResult<HttpResponse> {
+pub async fn get_fleets(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<PaginationQuery>,
+) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
     check_gtfs_id(&gtfs_id)?;
-    let list = app_state.operator_service.get_fleets(&gtfs_id).await?;
+    let limit = Some(query.limit.unwrap_or(100).min(MAX_QUERY_LIMIT));
+    let offset = query.offset.map(|o| o.max(0));
+    let list = app_state
+        .operator_service
+        .get_fleets(&gtfs_id, limit, offset)
+        .await?;
     Ok(HttpResponse::Ok().json(list))
 }
 
@@ -4849,4 +5064,211 @@ async fn metro_graph_info(
         "routes": route_info,
         "availableStops": graph.nodes.len(),
     })))
+}
+
+#[cfg(test)]
+mod eta_offset_tests {
+    use super::*;
+
+    fn mapping(code: &str, lat: f64, lon: f64, seq: i32) -> Arc<RouteStopMapping> {
+        Arc::new(RouteStopMapping {
+            stop_code: Arc::from(code),
+            stop_name: Arc::from(code),
+            stop_point: LatLong { lat, lon },
+            estimated_travel_time_from_previous_stop: None,
+            geo_json: None,
+            gates: None,
+            provider_code: Arc::from("GTFS"),
+            route_code: Arc::from("R1"),
+            vehicle_type: Arc::from("BUS"),
+            sequence_num: seq,
+            hindi_name: None,
+            regional_name: None,
+            platform: None,
+            parent_stop_code: None,
+            cluster_id: None,
+        })
+    }
+
+    // Three stops ~1.1 km apart, so the haversine fallback is ~160s per leg.
+    fn route() -> Vec<Arc<RouteStopMapping>> {
+        vec![
+            mapping("A", 13.0000, 80.2000, 1),
+            mapping("B", 13.0100, 80.2000, 2),
+            mapping("C", 13.0200, 80.2000, 3),
+        ]
+    }
+
+    /// Leg times keyed on stop id, the way route_point_internal supplies them.
+    fn legs_by_id(entries: &[(&str, &str, i32)]) -> RouteLegTravelTimes {
+        let mut out = RouteLegTravelTimes::default();
+        for (from, to, secs) in entries {
+            out.by_stop_id
+                .insert((from.to_string(), to.to_string()), *secs);
+        }
+        out
+    }
+
+    #[test]
+    fn first_stop_offset_is_always_zero() {
+        let offsets =
+            build_stop_offsets(&route(), &RouteLegTravelTimes::default(), &HashMap::new());
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets[0], 0);
+    }
+
+    #[test]
+    fn route_point_leg_times_win_over_station_eta() {
+        let legs = legs_by_id(&[("A", "B", 100)]);
+        let mut etas = HashMap::new();
+        etas.insert(("A".to_string(), "B".to_string()), 900);
+        etas.insert(("B".to_string(), "C".to_string()), 200);
+
+        let offsets = build_stop_offsets(&route(), &legs, &etas);
+        assert_eq!(offsets[1], 100, "leg time should beat station_eta");
+        assert_eq!(
+            offsets[2], 300,
+            "station_eta fills the leg with no leg time"
+        );
+    }
+
+    #[test]
+    fn missing_pairs_fall_back_to_haversine() {
+        let legs = legs_by_id(&[("A", "B", 100)]);
+
+        let offsets = build_stop_offsets(&route(), &legs, &HashMap::new());
+        assert_eq!(offsets[1], 100);
+        // ~1.11 km at 25 km/h ≈ 160s.
+        let leg_bc = offsets[2] - offsets[1];
+        assert!(
+            (150..=175).contains(&leg_bc),
+            "expected ~160s haversine leg, got {}",
+            leg_bc
+        );
+    }
+
+    #[test]
+    fn offsets_are_reused_across_trips_with_different_start_times() {
+        let route = route();
+        let legs = legs_by_id(&[("A", "B", 100), ("B", "C", 200)]);
+        let offsets = build_stop_offsets(&route, &legs, &HashMap::new());
+
+        let start = 1_700_000_000_000i64;
+        let etas = etas_from_offsets(&route, &offsets, Some(start));
+        assert_eq!(etas.len(), 3);
+        assert_eq!(etas[0].arrival_time, start / 1000);
+        assert_eq!(etas[1].arrival_time, start / 1000 + 100);
+        assert_eq!(etas[2].arrival_time, start / 1000 + 300);
+        // Trip is in the past, so no stop has a live ETA.
+        assert!(etas.iter().all(|e| e.eta_seconds.is_none()));
+    }
+
+    /// Two stops `metres` apart on the same meridian.
+    fn pair_metres_apart(metres: f64) -> Vec<Arc<RouteStopMapping>> {
+        let degrees = metres / 111_320.0;
+        vec![
+            mapping("A", 13.0, 80.2, 1),
+            mapping("B", 13.0 + degrees, 80.2, 2),
+        ]
+    }
+
+    #[test]
+    fn implausible_leg_times_are_discarded() {
+        // The concrete misread: stops 45 m apart whose 5.0s OSRM leg was stored
+        // as "5000" and reads back as 5000 seconds - an implied 0.03 km/h.
+        let stops = pair_metres_apart(45.0);
+        let legs = legs_by_id(&[("A", "B", 5000)]);
+        let mut etas = HashMap::new();
+        etas.insert(("A".to_string(), "B".to_string()), 240);
+
+        let offsets = build_stop_offsets(&stops, &legs, &etas);
+        assert_eq!(offsets[1], 240, "should fall through to station_eta");
+    }
+
+    #[test]
+    fn plausible_leg_times_survive_the_speed_check() {
+        // 1.11 km at 100s is 40 km/h.
+        let legs = legs_by_id(&[("A", "B", 100)]);
+        let offsets = build_stop_offsets(&route(), &legs, &HashMap::new());
+        assert_eq!(offsets[1], 100);
+    }
+
+    #[test]
+    fn co_located_stops_allow_a_dwell_sized_leg() {
+        // No usable speed signal at zero distance, but a dwell must still be
+        // honoured.
+        let stops = pair_metres_apart(0.0);
+        let legs = legs_by_id(&[("A", "B", 45)]);
+        let offsets = build_stop_offsets(&stops, &legs, &HashMap::new());
+        assert_eq!(offsets[1], 45);
+    }
+
+    #[test]
+    fn co_located_stops_still_reject_an_absurd_leg() {
+        // 15 m apart with a legacy "2000" (a 2.0s OSRM leg in milliseconds)
+        // misread as 2000 seconds. Too close to imply a speed, so the absolute
+        // ceiling has to catch it - otherwise 33 minutes lands on every
+        // downstream stop of the route.
+        let stops = pair_metres_apart(15.0);
+        let legs = legs_by_id(&[("A", "B", 2000)]);
+        let offsets = build_stop_offsets(&stops, &legs, &HashMap::new());
+        assert!(
+            offsets[1] < 60,
+            "expected the haversine fallback, got {}s",
+            offsets[1]
+        );
+    }
+
+    #[test]
+    fn short_slow_legs_with_dwell_are_kept() {
+        // 150 m with a 10 minute terminus layover is ~0.09 km/h. Backfilled
+        // times are arrival-to-arrival and include dwell at the origin stop, so
+        // this is real data and must not be traded for a haversine guess.
+        let stops = pair_metres_apart(150.0);
+        let legs = legs_by_id(&[("A", "B", 600)]);
+        let offsets = build_stop_offsets(&stops, &legs, &HashMap::new());
+        assert_eq!(offsets[1], 600);
+    }
+
+    #[test]
+    fn absurdly_fast_legs_are_still_rejected() {
+        // 150 m in 1 second is 540 km/h.
+        let stops = pair_metres_apart(150.0);
+        let legs = legs_by_id(&[("A", "B", 1)]);
+        let offsets = build_stop_offsets(&stops, &legs, &HashMap::new());
+        assert_ne!(offsets[1], 1);
+    }
+
+    #[test]
+    fn stop_code_keys_are_used_only_when_the_id_misses() {
+        // The GTFS feed's stopCode need not be the operator's bus_stop_id.
+        let mut legs = RouteLegTravelTimes::default();
+        legs.by_stop_id
+            .insert(("X".to_string(), "Y".to_string()), 999);
+        legs.by_stop_code
+            .insert(("A".to_string(), "B".to_string()), 100);
+
+        let offsets = build_stop_offsets(&route(), &legs, &HashMap::new());
+        assert_eq!(offsets[1], 100, "code-keyed leg should be found");
+    }
+
+    #[test]
+    fn id_keys_win_over_code_keys() {
+        let mut legs = RouteLegTravelTimes::default();
+        legs.by_stop_id
+            .insert(("A".to_string(), "B".to_string()), 100);
+        legs.by_stop_code
+            .insert(("A".to_string(), "B".to_string()), 300);
+
+        let offsets = build_stop_offsets(&route(), &legs, &HashMap::new());
+        assert_eq!(offsets[1], 100);
+    }
+
+    #[test]
+    fn short_offsets_do_not_panic() {
+        let route = route();
+        let etas = etas_from_offsets(&route, &[0], Some(1_700_000_000_000));
+        assert_eq!(etas.len(), 3);
+        assert_eq!(etas[2].arrival_time, etas[0].arrival_time);
+    }
 }

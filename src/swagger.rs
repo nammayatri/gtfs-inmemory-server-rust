@@ -99,6 +99,9 @@ use crate::services::operator::QueryBody;
         routes::update_waybill_tablet,
         routes::get_waybills,
         routes::upsert_station_eta,
+        routes::upsert_vehicles,
+        routes::query_vehicles,
+        routes::delete_vehicle,
         // Internal Fleet Operator
         routes::fleet_operator_current_operation,
         routes::fleet_operator_trip_action,
@@ -157,6 +160,9 @@ use crate::services::operator::QueryBody;
         crate::services::fleet_operator::AuthType,
         crate::services::fleet_operator::Role,
         QueryBody,
+        crate::services::operator::FleetRow,
+        crate::services::operator::VehicleUpsertRequest,
+        routes::QueryVehicleParams,
     )),
     tags(
         (name = "Routes", description = "Route information endpoints"),
