@@ -3067,11 +3067,15 @@ pub async fn get_bus_trip_schedule(
     let stop_offsets = if all.is_empty() {
         Vec::new()
     } else {
-        let leg_times = app_state
-            .db_vehicle_reader_internal
-            .get_route_leg_travel_times(&gtfs_id, &route_id)
-            .await
-            .unwrap_or_default();
+        let leg_times = if app_state.config.use_route_point_travel_times {
+            app_state
+                .db_vehicle_reader_internal
+                .get_route_leg_travel_times(&gtfs_id, &route_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            RouteLegTravelTimes::default()
+        };
         let db_etas = app_state
             .db_vehicle_reader_internal
             .get_station_etas(&gtfs_id)
@@ -3186,11 +3190,15 @@ pub async fn get_bus_route_schedule(
         let stop_offsets = if all_rows.is_empty() {
             Vec::new()
         } else {
-            let leg_times = app_state
-                .db_vehicle_reader_internal
-                .get_route_leg_travel_times(&gtfs_id, &route_id)
-                .await
-                .unwrap_or_default();
+            let leg_times = if app_state.config.use_route_point_travel_times {
+                app_state
+                    .db_vehicle_reader_internal
+                    .get_route_leg_travel_times(&gtfs_id, &route_id)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                RouteLegTravelTimes::default()
+            };
             let db_etas = app_state
                 .db_vehicle_reader_internal
                 .get_station_etas(&gtfs_id)

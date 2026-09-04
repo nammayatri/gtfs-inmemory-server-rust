@@ -92,6 +92,14 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
+    /// Use `route_point_internal.travel_time` as the first source for the
+    /// inter-stop ETAs on the *-route-schedule endpoints (default: false).
+    /// Only worth turning on for a feed whose route points have been
+    /// backfilled with OSRM leg times and whose stop ids match the GTFS stop
+    /// codes; when false those endpoints keep the older behaviour of
+    /// station_eta first, haversine second.
+    #[serde(default)]
+    pub use_route_point_travel_times: bool,
 }
 
 fn default_preprocessed_data_dir() -> String {
