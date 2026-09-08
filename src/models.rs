@@ -597,6 +597,9 @@ pub struct RouteStopMapping {
     #[serde(rename = "parentStopCode")]
     #[schema(value_type = Option<String>)]
     pub parent_stop_code: Option<Arc<str>>,
+    #[serde(rename = "locationType", default = "default_location_type")]
+    #[schema(value_type = String)]
+    pub location_type: String,
     #[serde(rename = "clusterId")]
     #[schema(value_type = Option<String>)]
     pub cluster_id: Option<Arc<str>>,
@@ -630,6 +633,13 @@ pub struct Stop {
     pub vehicle_type: String,
 }
 
+/// GTFS treats a blank location_type as 0 (a boardable stop). Feeds published
+/// before the station layer existed carry no value at all, so both the stop and
+/// the mapping default to platform rather than failing to deserialise.
+pub(crate) fn default_location_type() -> String {
+    "0".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GTFSStop {
     pub id: String,
@@ -639,6 +649,18 @@ pub struct GTFSStop {
     pub lon: f64,
     #[serde(rename = "stationId")]
     pub station_id: Option<String>,
+    /// GTFS location_type: "0" platform, "1" station. Riders are shown stations
+    /// and platforms are grouped beneath them, so consumers need to tell them
+    /// apart. Defaults to platform for feeds published before this field existed.
+    #[serde(rename = "locationType", default = "default_location_type")]
+    pub location_type: String,
+    /// Compass direction buses head when leaving this platform (N, SW, ...).
+    #[serde(
+        rename = "platformCode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub platform_code: Option<String>,
     pub cluster: Option<String>,
     #[serde(rename = "hindiName")]
     pub hindi_name: Option<String>,

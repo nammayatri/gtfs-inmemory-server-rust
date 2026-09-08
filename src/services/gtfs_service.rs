@@ -1,10 +1,11 @@
 use crate::environment::AppConfig;
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, ClusterRouteConnection, GTFSData,
-    GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern, NandiPatternDetails,
-    NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord, RouteServiceTierRecord, RouteStopMapping,
-    SeatLayoutMappingRecord, ServiceTierType, StaticFleetInfo, StaticFleetInfoRecord, StopGeojson,
-    StopGeojsonRecord, StopRegionalNameRecord, SuburbanStopInfo, SuburbanStopInfoRecord,
+    cast_vehicle_type, clean_identifier, default_location_type, CachedDataResponse,
+    ClusterRouteConnection, GTFSData, GTFSRouteData, GTFSStop, GTFSStopData, LatLong, NandiPattern,
+    NandiPatternDetails, NandiRoutesRes, PlatformInfo, ProviderStopCodeRecord,
+    RouteServiceTierRecord, RouteStopMapping, SeatLayoutMappingRecord, ServiceTierType,
+    StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
+    SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
 use crate::services::operator::OperatorService;
@@ -284,8 +285,11 @@ impl GTFSService {
         // Recompute hash after enrich.
         data.data_hash = self.compute_all_data_hashes(&data.routes_by_gtfs);
         // Rebuild the #[serde(skip)] field.
-        data.pre_computed_stops_by_gtfs =
-            Self::pre_compute_stops(&data.route_data_by_gtfs, &data.stop_regional_names_by_gtfs);
+        data.pre_computed_stops_by_gtfs = Self::pre_compute_stops(
+            &data.route_data_by_gtfs,
+            &data.stop_regional_names_by_gtfs,
+            &data.stops_by_gtfs,
+        );
 
         Ok(Some(data))
     }
@@ -496,8 +500,11 @@ impl GTFSService {
         let data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
 
         // Pre-compute unique stops list per GTFS feed (avoids recomputation on /stops requests)
-        let pre_computed_stops_by_gtfs =
-            Self::pre_compute_stops(&route_data_by_gtfs, &stop_regional_names_by_gtfs);
+        let pre_computed_stops_by_gtfs = Self::pre_compute_stops(
+            &route_data_by_gtfs,
+            &stop_regional_names_by_gtfs,
+            &stops_by_gtfs,
+        );
 
         temp_data.route_data_by_gtfs = route_data_by_gtfs;
         temp_data.stops_by_gtfs = stops_by_gtfs;
@@ -1266,6 +1273,8 @@ impl GTFSService {
                 regional_name: regional_name.map(|r| r.regional_name.clone()),
                 info_json: None,
                 cluster_id: cluster_id.clone(),
+                location_type: stop.location_type.clone(),
+                platform_code: stop.platform_code.clone(),
             };
             if stop.cluster.is_some() {
                 let cluster_stop_res = GTFSStop {
@@ -1280,6 +1289,8 @@ impl GTFSService {
                     regional_name: regional_name.map(|r| r.regional_name.clone()),
                     info_json: None,
                     cluster_id: None,
+                    location_type: stop.location_type.clone(),
+                    platform_code: stop.platform_code.clone(),
                 };
                 stop_data
                     .stops
@@ -1463,7 +1474,11 @@ impl GTFSService {
                     .map(|s| Arc::from(*s))
                     .unwrap_or_else(|| Arc::from("GTFS"));
 
-                // Get platform from suburban stop info if available
+                // Platform label, preferring the hand-maintained suburban-rail
+                // table where one exists; otherwise the feed's own platform_code
+                // (for buses, the compass direction services leave the kerb on).
+                // Without the fallback a bus platform reports no platform at all,
+                // which is exactly what the station layer exists to expose.
                 let platform: Option<Arc<str>> = suburban_stop_info_by_gtfs
                     .get(gtfs_id)
                     .and_then(|stops| stops.get(&stop.code))
@@ -1472,6 +1487,14 @@ impl GTFSService {
                             .platforms
                             .first()
                             .map(|platform_info| Arc::from(platform_info.platforms.as_str()))
+                    })
+                    .or_else(|| {
+                        stops_by_gtfs
+                            .get(gtfs_id)
+                            .and_then(|stops_data| stops_data.stops.get(&stop.code))
+                            .and_then(|gtfs_stop| gtfs_stop.platform_code.as_deref())
+                            .filter(|p| !p.is_empty())
+                            .map(Arc::from)
                     });
 
                 let mapping = Arc::new(RouteStopMapping {
@@ -1497,6 +1520,11 @@ impl GTFSService {
                         .and_then(|stops_data| stops_data.stops.get(&stop.code))
                         .and_then(|gtfs_stop| gtfs_stop.cluster_id.as_deref())
                         .map(Arc::from),
+                    location_type: stops_by_gtfs
+                        .get(gtfs_id)
+                        .and_then(|stops_data| stops_data.stops.get(&stop.code))
+                        .map(|gtfs_stop| gtfs_stop.location_type.clone())
+                        .unwrap_or_else(default_location_type),
                     vehicle_type: vehicle_type.clone(),
                     geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
                     gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
@@ -1588,6 +1616,7 @@ impl GTFSService {
     fn pre_compute_stops(
         route_data_by_gtfs: &HashMap<String, GTFSRouteData>,
         stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
+        stops_by_gtfs: &HashMap<String, GTFSStopData>,
     ) -> HashMap<String, Vec<Arc<RouteStopMapping>>> {
         let mut result = HashMap::new();
         for (gtfs_id, route_data) in route_data_by_gtfs {
@@ -1612,6 +1641,46 @@ impl GTFSService {
                     }
                 }
             }
+            // Stations carry no route-stop mappings -- nothing stops AT a
+            // station, only at its platforms -- so the loop above can never
+            // surface them. The app lists stations and folds platforms beneath
+            // them, so they have to be in this payload; synthesise a mapping
+            // per station, marked with the sentinel route the stop endpoints
+            // already use for a stop that belongs to no route.
+            if let Some(stop_data) = stops_by_gtfs.get(gtfs_id) {
+                for stop in stop_data.stops.values() {
+                    if stop.location_type != "1" {
+                        continue;
+                    }
+                    let regional = regional_names.and_then(|names| names.get(stop.code.as_str()));
+                    stops.push(Arc::new(RouteStopMapping {
+                        estimated_travel_time_from_previous_stop: None,
+                        provider_code: Arc::from("GTFS"),
+                        route_code: Arc::from("UNKNOWN"),
+                        sequence_num: 0,
+                        stop_code: Arc::from(stop.code.as_str()),
+                        stop_name: Arc::from(stop.name.as_str()),
+                        stop_point: LatLong {
+                            lat: stop.lat,
+                            lon: stop.lon,
+                        },
+                        vehicle_type: Arc::from("BUS"),
+                        geo_json: None,
+                        gates: None,
+                        hindi_name: regional
+                            .map(|r| Arc::from(r.hindi_name.as_str()))
+                            .or_else(|| stop.hindi_name.as_deref().map(Arc::from)),
+                        regional_name: regional
+                            .map(|r| Arc::from(r.regional_name.as_str()))
+                            .or_else(|| stop.regional_name.as_deref().map(Arc::from)),
+                        platform: None,
+                        parent_stop_code: None,
+                        cluster_id: stop.cluster_id.as_deref().map(Arc::from),
+                        location_type: stop.location_type.clone(),
+                    }));
+                }
+            }
+
             result.insert(gtfs_id.clone(), stops);
         }
         result
@@ -1948,7 +2017,18 @@ impl GTFSService {
         let stop_code = clean_identifier(stop_code);
 
         if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            if let Some(indices) = route_data.by_stop.get(&stop_code) {
+            // A parent station fans out to its platforms; a platform resolves to
+            // itself. Collect the union of their mapping indices so the rest of
+            // the function is unchanged by which kind of code arrived.
+            let codes = self.resolve_stop_codes(&data, &gtfs_id, &stop_code);
+            let indices: Vec<usize> = codes
+                .iter()
+                .filter_map(|c| route_data.by_stop.get(c.as_str()))
+                .flatten()
+                .copied()
+                .collect();
+            if !indices.is_empty() {
+                let indices = &indices;
                 let mut mappings = Vec::new();
                 let mut found_direction_match = false;
 
@@ -2458,12 +2538,21 @@ impl GTFSService {
             .route_data_by_gtfs
             .get(clean_identifier(gtfs_id).as_str())
         {
+            let clean_gtfs_id = clean_identifier(gtfs_id);
+            let mut seen: HashSet<usize> = HashSet::new();
             for stop_code in stop_codes {
                 let clean_stop_code = clean_identifier(&stop_code);
-                if let Some(indices) = route_data.by_stop.get(clean_stop_code.as_str()) {
-                    for &i in indices {
-                        if let Some(mapping) = route_data.mappings.get(i) {
-                            found_mappings.push(mapping.clone());
+                // Same fan-out as the singular endpoint. De-duplicate by index:
+                // asking for a station and one of its platforms in the same
+                // request must not return that platform's mappings twice.
+                for code in self.resolve_stop_codes(&data, &clean_gtfs_id, &clean_stop_code) {
+                    if let Some(indices) = route_data.by_stop.get(code.as_str()) {
+                        for &i in indices {
+                            if seen.insert(i) {
+                                if let Some(mapping) = route_data.mappings.get(i) {
+                                    found_mappings.push(mapping.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -2471,6 +2560,34 @@ impl GTFSService {
         }
 
         Ok(found_mappings)
+    }
+
+    /// Resolve a stop code to the codes that trips actually call at.
+    ///
+    /// Callers send whatever the rider picked. When that is a parent station
+    /// (one place — e.g. all 17 kerbs of Parry's Corner) no trip references it
+    /// directly, because stop_times only ever names platforms. So a station has
+    /// to fan out to its children before any `by_stop` lookup, or it matches
+    /// nothing at all.
+    ///
+    /// A platform has no children and resolves to itself, so callers never need
+    /// to know which kind of code they are holding.
+    fn resolve_stop_codes(&self, data: &GTFSData, gtfs_id: &str, stop_code: &str) -> Vec<String> {
+        let children = data
+            .children_by_parent
+            .get(gtfs_id)
+            .and_then(|p| p.get(stop_code));
+        match children {
+            Some(kids) if !kids.is_empty() => {
+                // Keep the parent in the list: a feed may legitimately carry
+                // mappings against it, and including it costs one missed lookup.
+                let mut codes = Vec::with_capacity(kids.len() + 1);
+                codes.push(stop_code.to_string());
+                codes.extend(kids.iter().cloned());
+                codes
+            }
+            _ => vec![stop_code.to_string()],
+        }
     }
 
     pub async fn get_station_children(
