@@ -276,6 +276,9 @@ impl OsrtcStationCache {
 pub fn osrtc_station_to_route_stop_mapping(station: &OsrtcStation) -> RouteStopMapping {
     let id_str: Arc<str> = station.station_id.to_string().into();
     RouteStopMapping {
+        // OSRTC stations come from their own API, not a GTFS feed, so there is
+        // no station layer here — every one is a boardable stop.
+        location_type: "0".to_string(),
         stop_code: id_str.clone(),
         provider_code: id_str,
         stop_name: station.station_name.as_str().into(),
