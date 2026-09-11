@@ -53,6 +53,14 @@ pub struct DirectionQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StopRouteStopMappingQuery {
+    direction: Option<String>,
+    /// Widen the lookup to every stop in the queried stop's H3 cluster.
+    #[serde(rename = "allowClusters")]
+    allow_clusters: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct IncludeClusterIdQuery {
     #[serde(rename = "includeClusterId")]
     include_cluster_id: Option<bool>,
@@ -717,23 +725,32 @@ pub async fn get_route_stop_mapping_by_route(
         ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
         ("stop_code" = String, Path, description = "Stop code"),
         ("direction" = Option<String>, Query, description = "Direction filter"),
+        ("allowClusters" = Option<bool>, Query, description = "If true, widen the lookup to every stop \
+                           in this stop's H3 cluster and return the passing routes deduped to one \
+                           mapping per routeCode — the earliest sequenceNum at which the route serves \
+                           the cluster. Defaults to false (exact stop_code match). A stop with no \
+                           cluster_id falls back to the exact match."),
     ),
     responses((status = 200, description = "Route-stop mappings for stop", body = Vec<RouteStopMapping>))
 )]
 pub async fn get_route_stop_mapping_by_stop(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
-    query: Query<DirectionQuery>,
+    query: Query<StopRouteStopMappingQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, stop_code) = path.into_inner();
-    let mappings = app_state
-        .gtfs_service
-        .get_route_stop_mapping_by_stop_with_direction(
-            &gtfs_id,
-            &stop_code,
-            query.direction.as_deref(),
-        )
-        .await?;
+    let direction = query.direction.as_deref();
+    let mappings = if query.allow_clusters.unwrap_or(false) {
+        app_state
+            .gtfs_service
+            .get_route_stop_mapping_by_stop_across_cluster(&gtfs_id, &stop_code, direction)
+            .await?
+    } else {
+        app_state
+            .gtfs_service
+            .get_route_stop_mapping_by_stop_with_direction(&gtfs_id, &stop_code, direction)
+            .await?
+    };
     Ok(HttpResponse::Ok().json(mappings))
 }
 
