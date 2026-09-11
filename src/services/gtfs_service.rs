@@ -2138,6 +2138,106 @@ impl GTFSService {
         Err(AppError::NotFound("Stop not found".to_string()))
     }
 
+    /// Routes passing through the queried stop's whole H3 cluster, deduped to one
+    /// mapping per route.
+    ///
+    /// The stop is widened to its cluster siblings via `by_cluster_id` — the same
+    /// widening the cluster endpoints use — so the two sides of a corridor, or a
+    /// junction split across several stop_codes, answer as one place. Each sibling
+    /// is resolved through the plain single-stop lookup, so the `direction` filter
+    /// behaves exactly as it does without clustering.
+    ///
+    /// Dedup keeps one representative per route_code: the earliest `sequence_num`,
+    /// i.e. where the route first serves the cluster (matching how
+    /// `get_routes_between_stops` picks a representative), with stop_code breaking
+    /// ties so the result is stable across rebuilds.
+    ///
+    /// A stop with no cluster_id, a cluster of one, or a feed with no stop data
+    /// falls back to the plain lookup, so the result is never worse than an exact
+    /// stop_code join.
+    pub async fn get_route_stop_mapping_by_stop_across_cluster(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+        direction: Option<&str>,
+    ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = clean_identifier(stop_code);
+
+        let (cluster_id, siblings) = {
+            let data = self.data.load_full();
+            data.stops_by_gtfs
+                .get(&gtfs_id)
+                .and_then(|stops_data| {
+                    let cid = stops_data.stops.get(&stop_code)?.cluster_id.clone()?;
+                    let siblings = stops_data.by_cluster_id.get(&cid).cloned()?;
+                    Some((cid, siblings))
+                })
+                .unzip()
+        };
+
+        let siblings = match siblings {
+            Some(siblings) if siblings.len() > 1 => siblings,
+            _ => {
+                debug!(
+                    gtfs_id = %gtfs_id,
+                    stop_code = %stop_code,
+                    "route-stop-mapping by cluster: no cluster siblings, falling back to single-stop lookup",
+                );
+                return self
+                    .get_route_stop_mapping_by_stop_with_direction(&gtfs_id, &stop_code, direction)
+                    .await;
+            }
+        };
+
+        let mut best_by_route: HashMap<Arc<str>, Arc<RouteStopMapping>> = HashMap::new();
+        for sibling in &siblings {
+            let mappings = match self
+                .get_route_stop_mapping_by_stop_with_direction(&gtfs_id, sibling, direction)
+                .await
+            {
+                Ok(mappings) => mappings,
+                // A sibling serving no route is not an error for the cluster.
+                Err(AppError::NotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+
+            for mapping in mappings {
+                let is_better = match best_by_route.get(&mapping.route_code) {
+                    Some(current) => {
+                        (mapping.sequence_num, mapping.stop_code.as_ref())
+                            < (current.sequence_num, current.stop_code.as_ref())
+                    }
+                    None => true,
+                };
+                if is_better {
+                    best_by_route.insert(mapping.route_code.clone(), mapping);
+                }
+            }
+        }
+
+        if best_by_route.is_empty() {
+            return Err(AppError::NotFound("Stop not found".to_string()));
+        }
+
+        let mut mappings: Vec<Arc<RouteStopMapping>> = best_by_route.into_values().collect();
+        mappings.sort_by(|a, b| {
+            a.route_code
+                .cmp(&b.route_code)
+                .then(a.sequence_num.cmp(&b.sequence_num))
+        });
+
+        info!(
+            gtfs_id = %gtfs_id,
+            stop_code = %stop_code,
+            cluster_id = ?cluster_id,
+            siblings = siblings.len(),
+            routes = mappings.len(),
+            "route-stop-mapping by cluster: result",
+        );
+        Ok(mappings)
+    }
+
     pub async fn get_stops(&self, gtfs_id: &str) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
