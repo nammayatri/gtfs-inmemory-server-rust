@@ -174,7 +174,7 @@ rules.
 ### Route-Stop Mappings
 
 - `GET /route-stop-mapping/{gtfs_id}/route/{route_code}?direction={direction}` - Get stops for a route (with optional direction filter)
-- `GET /route-stop-mapping/{gtfs_id}/stop/{stop_code}?direction={direction}` - Get routes for a stop (with optional direction filter)
+- `GET /route-stop-mapping/{gtfs_id}/stop/{stop_code}?direction={direction}&allowClusters={bool}` - Get routes for a stop (with optional direction filter). With `allowClusters=true` the lookup widens to every stop in the stop's H3 cluster and the passing routes are deduped to one mapping per `routeCode` — the earliest `sequenceNum` at which that route serves the cluster. A stop with no cluster falls back to the exact stop_code match.
 
 ### Stops
 
