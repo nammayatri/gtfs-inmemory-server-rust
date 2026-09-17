@@ -2,6 +2,9 @@
 // server if the ops network cannot reach openstreetmap.org.
 export const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 export const TILE_ATTRIBUTION = "&copy; OpenStreetMap contributors";
+// OSM's tile servers answer a request with no Referer with a "403 Access blocked"
+// tile, so tiles must carry at least the page origin.
+export const TILE_REFERRER_POLICY = "strict-origin-when-cross-origin";
 
 // Chennai, where the first feed lives.
 export const DEFAULT_VIEW = { lat: 13.0569, lon: 80.2425, zoom: 12 };

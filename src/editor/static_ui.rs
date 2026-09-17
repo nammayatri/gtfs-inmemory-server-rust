@@ -119,7 +119,10 @@ pub async fn serve(req: HttpRequest, state: web::Data<EditorState>) -> HttpRespo
                     },
                 ))
                 .insert_header(("X-Content-Type-Options", "nosniff"))
-                .insert_header(("Referrer-Policy", "same-origin"))
+                // strict-origin-when-cross-origin, not same-origin: the map tiles come
+                // from tile.openstreetmap.org, which blocks tile requests that carry no
+                // Referer ("403 Access blocked"). This sends only the origin cross-site.
+                .insert_header(("Referrer-Policy", "strict-origin-when-cross-origin"))
                 .body(bytes)
         }
         Err(_) if path.file_name().is_some_and(|n| n == "index.html") => HttpResponse::Ok()

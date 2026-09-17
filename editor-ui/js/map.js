@@ -1,6 +1,6 @@
 // The one Leaflet map, and the few modes screens put it in: browsing stops,
 // showing a route, dragging a stop, picking a stop, selecting stops for a station.
-import { TILE_URL, TILE_ATTRIBUTION, DEFAULT_VIEW, STOPS_MIN_ZOOM } from "./config.js";
+import { TILE_URL, TILE_ATTRIBUTION, TILE_REFERRER_POLICY, DEFAULT_VIEW, STOPS_MIN_ZOOM } from "./config.js";
 import { get, enc } from "./api.js";
 import { state, pref, setPref } from "./state.js";
 import { debounce, decodePolyline, h } from "./util.js";
@@ -20,7 +20,7 @@ export function initMap() {
     saved ? [saved.lat, saved.lon] : [DEFAULT_VIEW.lat, DEFAULT_VIEW.lon],
     saved ? saved.zoom : DEFAULT_VIEW.zoom);
   renderer = L.canvas({ padding: 0.3 });
-  L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION }).addTo(map);
+  L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
   for (const name of ["stops", "route", "proposal", "focus", "edit", "select"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
@@ -231,7 +231,7 @@ export function stationPin(lat, lon, onMove) {
 // A small read-only map for a diff: markers and lines, fitted.
 export function inset(el, { points = [], lines = [] }) {
   const m = L.map(el, { zoomControl: false, attributionControl: false, dragging: true, scrollWheelZoom: false });
-  L.tileLayer(TILE_URL, { maxZoom: 19 }).addTo(m);
+  L.tileLayer(TILE_URL, { maxZoom: 19, referrerPolicy: TILE_REFERRER_POLICY }).addTo(m);
   const all = [];
   for (const ln of lines) {
     if (ln.pts.length > 1) {
