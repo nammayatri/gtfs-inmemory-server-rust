@@ -130,12 +130,28 @@ const ACTION_LABEL = {
   change_set_committed: "Committed (live)",
   change_set_reopened: "Reopened",
   change_set_discarded: "Discarded",
+  change_set_bulk_imported: "Imported a CSV file",
+  station_proposal_approved: "Approved a suggested station into a draft",
+  station_proposals_approved: "Approved the suggested stations in an area",
+  station_proposal_rejected: "Rejected a suggested station",
+  station_proposal_reopened: "Reopened a suggested station",
+  station_proposal_returned: "A suggested station went back to review",
+  station_proposal_committed: "A suggested station went live",
 };
+
+// An action this page has no words for yet still reads as words.
+const actionLabel = (action) => ACTION_LABEL[action] || (action.charAt(0).toUpperCase() + action.slice(1)).replace(/_/g, " ");
 
 function detailText(a) {
   const d = a.detail || {};
   const parts = [];
   if (d.title) parts.push(`"${d.title}"`);
+  if (d.name) parts.push(d.name);
+  if (d.proposal_id) parts.push(`suggestion #${d.proposal_id}`);
+  if (d.kind) parts.push(`${d.kind.replace("_", " ")}: ${d.rows} rows, ${d.changes} changes`);
+  if (d.approved !== undefined) parts.push(`${d.approved} approved, ${d.skipped} skipped`);
+  if (d.note) parts.push(`note: ${d.note}`);
+  if (d.reason) parts.push(d.reason);
   if (d.entity) parts.push(`${d.entity.replace("_", " ")} ${d.entity_key || ""}`.trim());
   if (d.email) parts.push(d.email);
   if (d.role) parts.push(`role ${d.role}`);
@@ -157,7 +173,7 @@ export async function showHistory(changeSet) {
       res.items.forEach((a) => rows.appendChild(h("tr",
         h("td", fmtDate(a.at)),
         h("td", a.actor_email || "system"),
-        h("td", ACTION_LABEL[a.action] || a.action),
+        h("td", actionLabel(a.action)),
         h("td", a.change_set_id ? h("a", { href: `#/drafts/${enc(a.change_set_id)}` }, "draft") : ""),
         h("td", detailText(a)))));
       cursor = res.next_cursor;

@@ -1,15 +1,21 @@
 // Boot, the top bar and the hash router.
 import { get, enc } from "./api.js";
-import { state, set, subscribe, pref, setPref, can } from "./state.js";
+import { state, set, subscribe, pref, setPref, can, leaveMessage, setLeaveGuard } from "./state.js";
 import { ensureSignedIn, signOut } from "./auth.js";
-import { h, toast, ROLE_LABEL } from "./util.js";
+import { h, toast, confirmDialog, ROLE_LABEL } from "./util.js";
 import * as map from "./map.js";
 import { initSearch, showHome, showStop, showRoute } from "./explore.js";
-import { loadActiveDraft, renderDraftChip, chooseDraft } from "./drafts.js";
+import { loadActiveDraft, renderDraftChip, chooseDraft, requireDraft, createdStops } from "./drafts.js";
 import { showDraftList, showDraft } from "./review.js";
 import { showPeople, showHistory } from "./admin.js";
+import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
+import { newStop, newRoute } from "./create.js";
+import { editStation } from "./editors.js";
+import { showMerge } from "./merge.js";
+import { showImport } from "./importer.js";
 
 let reauthing = false;
+let currentHash = location.hash || "#/";
 
 async function boot() {
   const me = await ensureSignedIn();
@@ -32,6 +38,8 @@ async function boot() {
     set({ feedId: select.value });
     await loadActiveDraft();
     map.refreshStops();
+    refreshStationCount();
+    setLeaveGuard(null);
     location.hash = "#/";
     route();
   });
@@ -41,15 +49,35 @@ async function boot() {
   document.getElementById("sign-out").addEventListener("click", signOut);
   document.querySelector('[data-nav="admin"]').hidden = !can("admin");
   document.getElementById("draft-chip").addEventListener("click", chooseDraftAndGo);
+  initNewMenu();
 
   subscribe(renderDraftChip);
   await loadActiveDraft();
   renderDraftChip();
 
   map.initMap();
+  // stops the draft creates are drawn on the map, and offered by the stop pickers
+  subscribe(() => map.setDraftStops(createdStops()));
+  map.setDraftStops(createdStops());
   initSearch();
-  window.addEventListener("hashchange", route);
+  refreshStationCount();
+  window.addEventListener("hashchange", onHashChange);
+  window.addEventListener("beforeunload", (ev) => {
+    if (leaveMessage()) { ev.preventDefault(); ev.returnValue = ""; }
+  });
   route();
+}
+
+// The New menu: a small disclosure that closes on a choice, Escape or a click away.
+function initNewMenu() {
+  const menu = document.getElementById("new-menu");
+  menu.hidden = !can("editor");
+  const close = () => { menu.open = false; };
+  menu.querySelectorAll("a").forEach((a) => a.addEventListener("click", close));
+  menu.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && menu.open) { close(); menu.querySelector("summary").focus(); }
+  });
+  document.addEventListener("click", (ev) => { if (menu.open && !menu.contains(ev.target)) close(); });
 }
 
 async function chooseDraftAndGo() {
@@ -73,7 +101,43 @@ function markNav(name) {
   });
 }
 
+// Leaving a screen with unsaved edits asks first; staying puts the address back.
+async function onHashChange() {
+  const target = location.hash || "#/";
+  if (target === currentHash) return;
+  const message = leaveMessage();
+  if (message) {
+    history.replaceState(null, "", currentHash);
+    const leave = await confirmDialog("Leave without saving?", `${message} If you leave now, those changes are lost.`, { confirm: "Leave without saving", danger: true });
+    if (!leave) return;
+    setLeaveGuard(null);
+    history.pushState(null, "", target);
+  }
+  currentHash = target;
+  route();
+}
+
+async function newStation() {
+  if (!(await requireDraft("New stations are added to a draft. Nothing changes for passengers until someone else approves it and it is committed."))) {
+    location.hash = "#/";
+    return;
+  }
+  editStation(null, []);
+}
+
+function editorsOnly(what, fn) {
+  if (can("editor")) return fn();
+  document.getElementById("panel").replaceChildren(h("section.section",
+    h("a.crumb", { href: "#/" }, "Back to the map"),
+    h("h1", what),
+    h("p.notice", "This needs the editor role. Ask an admin if you should be making changes.")));
+  return null;
+}
+
 function route() {
+  currentHash = location.hash || "#/";
+  leaveStations();
+  setLeaveGuard(null);
   if (!state.feedId) {
     showWorkspace(false);
     document.getElementById("page").replaceChildren(h("div.page-inner", h("h1", "No feeds"), h("p.notice", "The editor has no feeds to show. Ask an engineer to load one.")));
@@ -89,6 +153,18 @@ function route() {
     markNav("map"); showWorkspace(true); showStop(parts[1]);
   } else if (parts[0] === "route" && parts[1]) {
     markNav("map"); showWorkspace(true); showRoute(parts[1], { preview: params.get("draft") === "1" });
+  } else if (parts[0] === "stations" && parts[1]) {
+    markNav("stations"); showWorkspace(true); showProposal(parts[1]);
+  } else if (parts[0] === "stations") {
+    markNav("stations"); showWorkspace(true); showStationsList();
+  } else if (parts[0] === "new" && ["stop", "route", "station"].includes(parts[1])) {
+    markNav("map"); showWorkspace(true);
+    const [title, fn] = { stop: ["New stop", newStop], route: ["New route", newRoute], station: ["New station", newStation] }[parts[1]];
+    editorsOnly(title, () => fn());
+  } else if (parts[0] === "merge" && parts[1]) {
+    markNav("map"); showWorkspace(true); showMerge(parts[1], params.get("with"));
+  } else if (parts[0] === "import") {
+    markNav("import"); showWorkspace(false); showImport(params.get("kind"));
   } else if (parts[0] === "drafts" && parts[1]) {
     markNav("drafts"); showWorkspace(false); showDraft(parts[1]);
   } else if (parts[0] === "drafts") {

@@ -1,19 +1,24 @@
 // Drafts: the list by status, and one draft's page with its diff and the actions
-// the signed-in person may take.
+// the signed-in person may take. A draft can hold thousands of changes (a bulk
+// import), so its changes are filtered and paged, and maps are made only for
+// the changes on screen.
 import { get, post, del, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
 import {
-  h, clear, toast, modal, confirmDialog, fmtDate, fmtCoord, fmtMetres, haversine, decodePolyline,
+  h, clear, toast, modal, confirmDialog, fmtDate, fmtCoord, fmtMetres, fmtCount, plural, haversine, decodePolyline,
   STATUS_LABEL, STOP_TYPE_LABEL, diffRows,
 } from "./util.js";
 import * as map from "./map.js";
 import { useDraft, refreshDraft, chooseDraft } from "./drafts.js";
+import { pager } from "./importer.js";
 
 const page = () => document.getElementById("page");
 const TABS = [
   ["draft", "Drafts"], ["submitted", "Waiting for review"], ["approved", "Approved"],
   ["committed", "Live"], ["rejected", "Rejected"], ["discarded", "Discarded"],
 ];
+const PAGE_SIZE = 50;
+const NOTICE_MAX = 8;
 
 // ------------------------------------------------------------------ list
 export async function showDraftList(status = "draft") {
@@ -48,7 +53,7 @@ export async function showDraftList(status = "draft") {
       h("tbody", res.items.map((cs) => {
         const tr = h("tr.linkrow",
           h("td", h("a", { href: `#/drafts/${enc(cs.change_set_id)}` }, cs.title)),
-          h("td.num", String(cs.change_count)),
+          h("td.num", fmtCount(cs.change_count)),
           h("td", cs.created_by_email || ""),
           h("td", fmtDate(cs.updated_at)),
           h("td", h("span", { class: `chip ${cs.status}` }, STATUS_LABEL[cs.status])));
@@ -61,7 +66,30 @@ export async function showDraftList(status = "draft") {
 }
 
 // ------------------------------------------------------------------ one draft
+const KIND_LABEL = {
+  "stop:create": ["new stop", "new stops"], "stop:update": ["stop edit", "stop edits"], "stop:delete": ["stop deleted", "stops deleted"],
+  "stop:merge": ["stop merge", "stop merges"], "route:create": ["new route", "new routes"], "route:update": ["route edit", "route edits"],
+  "route:delete": ["route deleted", "routes deleted"], "route_stops:replace": ["stop list change", "stop list changes"],
+  "station:create": ["new station", "new stations"], "station:update": ["station edit", "station edits"], "station:delete": ["station dissolved", "stations dissolved"],
+};
+const kindOf = (ch) => `${ch.entity}:${ch.op}`;
+const kindText = (key, n) => {
+  const [one, many] = KIND_LABEL[key] || [key, key];
+  return `${fmtCount(n)} ${n === 1 ? one : many}`;
+};
+
+// what the page shows, kept while the same draft is open
+const pageState = { id: null, page: 1, filter: "all" };
+let openInsets = [];
+
+function dropInsets() {
+  openInsets.forEach((m) => { try { m.remove(); } catch { /* already gone */ } });
+  openInsets = [];
+}
+
 export async function showDraft(id, { conflicts = null } = {}) {
+  dropInsets();
+  if (pageState.id !== id) Object.assign(pageState, { id, page: 1, filter: "all" });
   clear(page(), h("div.page-inner", h("p.empty", "Loading draft…")));
   let cs;
   try {
@@ -127,15 +155,16 @@ export async function showDraft(id, { conflicts = null } = {}) {
   const reasons = [];
   const button = (label, { style = "", reason = null, onClick, hideIfNot = false }) => {
     if (reason && hideIfNot) return null;
-    const id = `why-${label.replace(/\W/g, "")}`;
-    if (reason) reasons.push(h("li.why-not", { id }, `${label}: ${reason}`));
-    return h("button.btn", { type: "button", class: style, disabled: !!reason, "aria-describedby": reason ? id : null, on: { click: onClick } }, label);
+    const bid = `why-${label.replace(/\W/g, "")}`;
+    if (reason) reasons.push(h("li.why-not", { id: bid }, `${label}: ${reason}`));
+    return h("button.btn", { type: "button", class: style, disabled: !!reason, "aria-describedby": reason ? bid : null, on: { click: onClick } }, label);
   };
   const actions = [];
   const roleReason = (role) => (can(role) ? null : `Needs the ${role} role.`);
+  const n = cs.changes.length;
   if (cs.status === "draft") {
     actions.push(button("Submit for review", {
-      reason: roleReason("editor") || (!cs.changes.length ? "Add a change first." : errors.length ? `Fix the ${errors.length} problem${errors.length === 1 ? "" : "s"} below first.` : null),
+      reason: roleReason("editor") || (!n ? "Add a change first." : errors.length ? `Fix the ${plural(errors.length, "problem")} below first.` : null),
       onClick: async () => {
         if (await confirmDialog("Submit this draft for review?", "It can no longer be edited unless it is reopened. Someone other than you must approve it.", { confirm: "Submit for review" })) {
           act("submit", undefined, "Submitted for review.");
@@ -155,7 +184,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
     actions.push(button("Commit and go live", {
       reason: roleReason("approver") || (isSubmitter ? "You submitted this change, so someone else must commit it." : null),
       onClick: async () => {
-        if (await confirmDialog("Commit this draft?", `The ${cs.changes.length} change${cs.changes.length === 1 ? "" : "s"} go live for passengers within a minute. This is recorded in the history.`, { confirm: "Commit and go live" })) {
+        if (await confirmDialog("Commit this draft?", `The ${plural(n, "change")} go live for passengers within a minute. This is recorded in the history.`, { confirm: "Commit and go live" })) {
           act("commit", undefined, "Committed. The changes are live.");
         }
       },
@@ -168,7 +197,8 @@ export async function showDraft(id, { conflicts = null } = {}) {
   if (!["committed", "discarded"].includes(cs.status)) {
     actions.push(button("Discard", { style: "danger", hideIfNot: true, reason: isAuthor || me.role === "admin" ? null : "Only the person who started this draft, or an admin, can discard it.",
       onClick: async () => {
-        if (await confirmDialog("Discard this draft?", "Its changes are thrown away. The draft stays in the history.", { confirm: "Discard draft", danger: true })) {
+        const fromProposals = cs.changes.some((c) => c.entity === "station" && c.after && c.after.proposal_id);
+        if (await confirmDialog("Discard this draft?", `Its changes are thrown away. The draft stays in the history.${fromProposals ? " Suggested stations approved into it go back to the review list." : ""}`, { confirm: "Discard draft", danger: true })) {
           act("discard", undefined, "Draft discarded.");
         }
       } }));
@@ -182,7 +212,45 @@ export async function showDraft(id, { conflicts = null } = {}) {
     cs.status === "discarded" ? "Discarded." : null,
   ].filter(Boolean);
 
+  const kinds = new Map();
+  cs.changes.forEach((c) => kinds.set(kindOf(c), (kinds.get(kindOf(c)) || 0) + 1));
+  const withProblems = new Set([...byChange.keys(), ...conflictByChange.keys()]);
+  const showProblemChanges = () => { pageState.filter = "problems"; pageState.page = 1; renderChanges(); changesBox.scrollIntoView({ block: "start" }); };
+  const capped = (list, cls, heading) => (list.length ? h("div.notice", { class: cls },
+    h("p", h("strong", heading)),
+    h("ul", list.slice(0, NOTICE_MAX).map((v) => h("li", v.message))),
+    list.length > NOTICE_MAX ? h("p", `and ${fmtCount(list.length - NOTICE_MAX)} more. `, h("button.linklike", { type: "button", on: { click: showProblemChanges } }, "Show the changes with problems")) : null) : null);
+
   const canRemove = cs.status === "draft" && can("editor");
+  const changesBox = h("section.changes", { id: "draft-changes", "aria-label": "Changes" });
+  const names = draftStopNames(cs);
+
+  function renderChanges() {
+    dropInsets();
+    const filter = pageState.filter;
+    const filtered = cs.changes.filter((c) => filter === "all" || (filter === "problems" ? withProblems.has(c.change_id) : kindOf(c) === filter));
+    const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    pageState.page = Math.min(Math.max(1, pageState.page), pages);
+    const from = (pageState.page - 1) * PAGE_SIZE;
+    const slice = filtered.slice(from, from + PAGE_SIZE);
+    const go = (p) => { pageState.page = p; renderChanges(); changesBox.scrollIntoView({ block: "start" }); };
+    const select = h("select", { id: "change-filter", on: { change: (ev) => { pageState.filter = ev.target.value; pageState.page = 1; renderChanges(); document.getElementById("change-filter")?.focus(); } } },
+      h("option", { value: "all", selected: filter === "all" }, `All changes (${fmtCount(n)})`),
+      withProblems.size ? h("option", { value: "problems", selected: filter === "problems" }, `With problems (${fmtCount(withProblems.size)})`) : null,
+      [...kinds.entries()].map(([key, count]) => h("option", { value: key, selected: filter === key }, kindText(key, count))));
+    clear(changesBox,
+      h("div.changes-head",
+        h("h2", plural(n, "change")),
+        n ? h("label.field.inline-field", { for: "change-filter" }, h("span", "Show"), select) : null),
+      n > 1 ? h("p.hint", [...kinds.entries()].map(([key, count]) => kindText(key, count)).join(", ") + ".") : null,
+      filtered.length > PAGE_SIZE ? h("p.hint", `Showing ${fmtCount(from + 1)} to ${fmtCount(from + slice.length)} of ${fmtCount(filtered.length)}.`) : null,
+      pages > 1 ? pager(pageState.page, pages, go) : null,
+      n ? (slice.length ? slice.map((ch) => changeView(cs, ch, byChange.get(ch.change_id) || [], conflictByChange.get(ch.change_id), canRemove, names))
+        : h("p.empty", "No change matches."))
+        : h("p.empty", "This draft has no changes yet. Open a stop or route and choose Edit, or use New."),
+      pages > 1 ? pager(pageState.page, pages, go) : null);
+  }
+
   clear(page(), h("div.page-inner",
     h("a", { href: "#/drafts" }, "All drafts"),
     h("div.page-head",
@@ -195,26 +263,36 @@ export async function showDraft(id, { conflicts = null } = {}) {
     allConflicts.length ? h("div.notice.error", { role: "alert" },
       h("p", h("strong", "These changes were overtaken by another commit")),
       h("p", "Someone committed a change to the same stop or route after this draft was made, so committing would overwrite their work. Reopen the draft, open each item below, redo the edit on top of what is live now, and submit again."),
-      h("ul", allConflicts.map((c) => h("li", c.message)))) : null,
-    errors.length ? h("div.notice.error", h("p", h("strong", `${errors.length} problem${errors.length === 1 ? "" : "s"} to fix before submitting`)), h("ul", errors.map((v) => h("li", v.message)))) : null,
-    warnings.length ? h("div.notice.warning", h("p", h("strong", "Please check")), h("ul", warnings.map((v) => h("li", v.message)))) : null,
-    h("h2", `${cs.changes.length} change${cs.changes.length === 1 ? "" : "s"}`),
-    cs.changes.length ? cs.changes.map((ch) => changeView(cs, ch, byChange.get(ch.change_id) || [], conflictByChange.get(ch.change_id), canRemove))
-      : h("p.empty", "This draft has no changes yet. Open a stop or route and choose Edit."),
+      h("ul", allConflicts.slice(0, NOTICE_MAX).map((c) => h("li", c.message))),
+      allConflicts.length > NOTICE_MAX ? h("p", `and ${fmtCount(allConflicts.length - NOTICE_MAX)} more.`) : null) : null,
+    capped(errors, "error", `${plural(errors.length, "problem")} to fix before submitting`),
+    capped(warnings, "warning", "Please check"),
+    changesBox,
   ));
+  renderChanges();
+}
+
+// Names of stops the draft creates, for stop lists that use them.
+function draftStopNames(cs) {
+  return new Map(cs.changes.filter((c) => c.entity === "stop" && c.op === "create" && c.after).map((c) => [c.entity_key, c.after.name]));
 }
 
 // ------------------------------------------------------------------ change views
 const ENTITY_LABEL = { stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station" };
-const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed" };
+const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged" };
 
-function changeView(cs, ch, problems, conflict, canRemove) {
-  const title = ch.entity === "route_stops" || ch.entity === "route"
-    ? `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}`
-    : `${ENTITY_LABEL[ch.entity]} ${(ch.after && ch.after.name) || (ch.before && ch.before.name) || ch.entity_key}`;
-  const link = ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
+function changeView(cs, ch, problems, conflict, canRemove, names) {
+  const a = ch.after || {}, b = ch.before || {};
+  let title;
+  if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
+  else if (ch.entity === "route_stops" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
+  else title = `${ENTITY_LABEL[ch.entity]} ${a.name || b.name || ch.entity_key}`;
+  const link = ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
+    : ch.op === "merge" ? `#/stop/${enc(a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
+  const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
-    if (!(await confirmDialog("Remove this change from the draft?", `${title} goes back to what is live.`, { confirm: "Remove change", danger: true }))) return;
+    const extra = fromProposal ? " The suggested station goes back to the list of stations to review." : ch.op === "create" ? " Anything else in the draft that uses it will show a problem." : "";
+    if (!(await confirmDialog("Remove this change from the draft?", `${title} goes back to what is live.${extra}`, { confirm: "Remove change", danger: true }))) return;
     try {
       await del(`change-sets/${enc(cs.change_set_id)}/changes/${ch.change_id}`);
       await refreshDraft();
@@ -224,15 +302,19 @@ function changeView(cs, ch, problems, conflict, canRemove) {
     }
   };
   let body;
-  if (ch.entity === "stop") body = stopDiff(ch);
+  if (ch.entity === "stop" && ch.op === "merge") body = mergeDiff(ch);
+  else if (ch.entity === "stop") body = stopDiff(ch);
+  else if (ch.entity === "route" && ch.op === "create") body = routeCreateDiff(ch, cs);
+  else if (ch.entity === "route" && ch.op === "delete") body = h("p", `Route ${b.short_name || ch.entity_key} is deleted: it no longer appears in the feed.`);
   else if (ch.entity === "route") body = routeDiff(ch);
-  else if (ch.entity === "route_stops") body = rowsDiff(ch, cs);
+  else if (ch.entity === "route_stops") body = rowsDiff(ch, cs, names);
   else body = stationDiff(ch);
+  const showOpen = !(ch.op === "delete" && ch.entity === "stop") && !(ch.op === "create" && ch.entity === "station" && cs.status !== "committed");
   return h("article.change",
     h("div.change-head",
-      h("h3", title, " ", h("span.chip", OP_LABEL[ch.op])),
+      h("h3", title, " ", h("span.chip", OP_LABEL[ch.op] || ch.op)),
       h("div.btn-row",
-        ch.op !== "delete" || ch.entity !== "stop" ? h("a.crumb", { href: link }, "Open") : null,
+        showOpen ? h("a.crumb", { href: link }, "Open") : null,
         canRemove ? h("button.btn.quiet.small", { type: "button", on: { click: remove } }, "Remove from draft") : null)),
     h("div.change-body",
       conflict ? h("p.notice.error", conflict.message) : null,
@@ -245,9 +327,23 @@ function fieldRows(before, after, fields) {
     h("tr", h("th", label), h("td.before", before ? String(fmt(before[k])) : ""), h("td.after", String(fmt(after[k])))));
 }
 
+// A map for one change, made only when it scrolls into view and removed when the
+// page of changes is replaced.
 function insetEl(spec) {
   const el = h("div.inset");
-  requestAnimationFrame(() => map.inset(el, spec));
+  const make = () => {
+    if (el.dataset.made || !document.body.contains(el)) return;
+    el.dataset.made = "1";
+    openInsets.push(map.inset(el, spec));
+  };
+  if ("IntersectionObserver" in window) {
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) { io.disconnect(); make(); }
+    }, { rootMargin: "200px" });
+    requestAnimationFrame(() => io.observe(el));
+  } else {
+    requestAnimationFrame(make);
+  }
   return el;
 }
 
@@ -256,7 +352,11 @@ function stopDiff(ch) {
   if (ch.op === "delete") return h("p", `${b ? b.name : ch.entity_key} is removed from the feed.`);
   if (ch.op === "create") {
     return h("div.change-grid",
-      h("dl.facts", h("dt", "Name"), h("dd", a.name), h("dt", "Stop id"), h("dd", a.stop_id || ch.entity_key), h("dt", "Position"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)),
+      h("dl.facts",
+        h("dt", "Name"), h("dd", a.name),
+        h("dt", "Stop id"), h("dd", ch.entity_key || a.stop_id || "made when added"),
+        h("dt", "Position"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`),
+        a.platform_code ? [h("dt", "Platform"), h("dd", a.platform_code)] : null),
       insetEl({ points: [{ lat: a.lat, lon: a.lon, kind: "after", label: "new" }] }));
   }
   const movedPos = b && a.lat != null && (a.lat !== b.lat || a.lon !== b.lon);
@@ -273,6 +373,54 @@ function stopDiff(ch) {
     points: [{ lat: b.lat, lon: b.lon, kind: "before" }, { lat: a.lat, lon: a.lon, kind: "after" }],
     lines: [{ pts: [[b.lat, b.lon], [a.lat, a.lon]], color: "#0b6660", dashed: true, weight: 2 }],
   }));
+}
+
+const routeLabel = (r) => (r.short_name && r.short_name !== r.route_id ? `${r.short_name} (${r.route_id})` : r.route_id);
+const stopsWord = (seqs) => (seqs.length === 1 ? `stop ${seqs[0]}` : `stops ${seqs.join(", ")}`);
+
+function mergeDiff(ch) {
+  const b = ch.before || {}, a = ch.after || {};
+  const from = b.from || { stop_id: ch.entity_key }, into = b.into || { stop_id: a.into_stop_id };
+  const affected = b.affected || [];
+  const keptName = a.keep_name === "from" ? from.name : into.name;
+  const keptAt = a.keep_position === "from" ? from : into;
+  const both = from.lat != null && into.lat != null;
+  return h("div.change-grid",
+    h("div", { style: "display:grid;gap:10px" },
+      h("p", h("strong", `${from.name || from.stop_id} (${from.stop_id}) merged into ${into.name || into.stop_id} (${into.stop_id})`), `, ${plural(affected.length, "route")} updated.`),
+      h("dl.facts",
+        h("dt", "Stays"), h("dd", `${into.stop_id}, named ${keptName || into.stop_id}`),
+        keptAt.lat != null ? [h("dt", "At"), h("dd", `${fmtCoord(keptAt.lat)}, ${fmtCoord(keptAt.lon)}, the position of ${keptAt.stop_id}`)] : null,
+        both ? [h("dt", "Apart"), h("dd", fmtMetres(haversine(from.lat, from.lon, into.lat, into.lon)))] : null,
+        h("dt", "Removed"), h("dd", from.stop_id)),
+      affected.length
+        ? h("ul.list.route-switch", affected.slice(0, 40).map((r) => h("li.list-item",
+            h("span.key", r.short_name || r.route_id),
+            h("a", { href: `#/route/${enc(r.route_id)}` }, r.long_name || `Route ${routeLabel(r)}`),
+            h("span.hint", stopsWord(r.sequences || [])))))
+        : h("p.empty", "No route used the removed stop."),
+      affected.length > 40 ? h("p.hint", `and ${fmtCount(affected.length - 40)} more routes.`) : null),
+    both ? insetEl({
+      points: [{ lat: from.lat, lon: from.lon, color: "#b42318", label: `goes: ${from.stop_id}` }, { lat: into.lat, lon: into.lon, label: `stays: ${into.stop_id}` }],
+      lines: [{ pts: [[from.lat, from.lon], [into.lat, into.lon]], color: "#14252a", dashed: true, weight: 2 }],
+      maxZoom: 19,
+    }) : null);
+}
+
+function routeCreateDiff(ch, cs) {
+  const a = ch.after || {};
+  const stopsChange = cs.changes.find((c) => c.entity === "route_stops" && c.entity_key === ch.entity_key);
+  const count = stopsChange && stopsChange.after && Array.isArray(stopsChange.after.rows) ? stopsChange.after.rows.length : 0;
+  return h("div", { style: "display:grid;gap:10px" },
+    h("dl.facts",
+      h("dt", "Route id"), h("dd", ch.entity_key),
+      h("dt", "Route number"), h("dd", a.short_name || ""),
+      a.long_name ? [h("dt", "Name"), h("dd", a.long_name)] : null,
+      a.color ? [h("dt", "Colour"), h("dd", h("span.swatch", { style: `background:${/^#[0-9a-f]{6}$/i.test(a.color) ? a.color : "transparent"}` }), a.color)] : null,
+      h("dt", "Stop list"), h("dd", stopsChange ? `${plural(count, "stop")}, in this draft` : "None in this draft yet.")),
+    h("p.notice", cs.status === "committed"
+      ? "Saved. Passengers see this route only once the nightly GTFS build gives it trips from the MTC schedule."
+      : "When this draft is committed the route is saved, but passengers see it only once the nightly GTFS build gives it trips from the MTC schedule."));
 }
 
 function routeDiff(ch) {
@@ -294,11 +442,11 @@ function rowLabel(r) {
   return `${r.stop_name || r.stop_id} (${r.stop_id})`;
 }
 
-function rowsDiff(ch, cs) {
+function rowsDiff(ch, cs, draftNames) {
   const before = ch.before || [];
   const names = new Map(before.map((r) => [r.stop_id, r.stop_name]));
   const live = cs.stop_names || {};
-  const after = ((ch.after && ch.after.rows) || []).map((r) => ({ ...r, stop_name: r.stop_name || r.stop_name_override || names.get(r.stop_id) || live[r.stop_id] }));
+  const after = ((ch.after && ch.after.rows) || []).map((r) => ({ ...r, stop_name: r.stop_name || r.stop_name_override || names.get(r.stop_id) || live[r.stop_id] || draftNames.get(r.stop_id) }));
   const diff = diffRows(before, after);
   const counts = { added: 0, removed: 0, moved: 0, changed: 0 };
   diff.forEach((d) => { if (d.kind in counts) counts[d.kind]++; });
@@ -330,9 +478,9 @@ function rowsDiff(ch, cs) {
     }
   });
   flush();
-  const summary = Object.entries(counts).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(", ") || "no differences";
+  const summary = Object.entries(counts).filter(([, k]) => k).map(([k, v]) => `${v} ${k}`).join(", ") || "no differences";
   return h("div", { style: "display:grid;gap:8px" },
-    h("p", `${before.length} stops before, ${after.length} after: ${summary}.`),
+    h("p", `${plural(before.length, "stop")} before, ${after.length} after: ${summary}.`),
     h("ol.rowdiff", items));
 }
 
@@ -341,19 +489,24 @@ function stationDiff(ch) {
   if (ch.op === "delete") {
     return h("p", `The station ${b ? b.name : ch.entity_key} is dissolved. Its ${b && b.member_stop_ids ? b.member_stop_ids.length : ""} stops stay; only the grouping goes.`);
   }
+  const labels = new Map((Array.isArray(a.members) ? a.members : []).map((m) => [m.stop_id, m.platform_code]));
+  const listed = Array.isArray(a.members) ? a.members.map((m) => m.stop_id) : Array.isArray(a.member_stop_ids) ? a.member_stop_ids : null;
   const was = new Set((b && b.member_stop_ids) || []);
-  const now = new Set(a.member_stop_ids || [...was]);
+  const now = new Set(listed || [...was]);
   const added = [...now].filter((x) => !was.has(x)), removed = [...was].filter((x) => !now.has(x));
+  const label = (x) => (labels.get(x) ? `, platform “${labels.get(x)}”` : "");
   const table = h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody",
     fieldRows(b, a, [["name", "Name"]]),
     b && a.lat != null && (a.lat !== b.lat || a.lon !== b.lon)
       ? h("tr", h("th", "Position"), h("td.before", `${fmtCoord(b.lat)}, ${fmtCoord(b.lon)}`), h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)) : null,
     !b ? h("tr", h("th", "Position"), h("td.before", ""), h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)) : null));
   return h("div.change-grid",
-    h("div", { style: "display:grid;gap:10px" }, table,
+    h("div", { style: "display:grid;gap:10px" },
+      a.proposal_id ? h("p", "From ", h("a", { href: `#/stations/${enc(a.proposal_id)}` }, `suggested station #${a.proposal_id}`), ".") : null,
+      table,
       h("ol.rowdiff",
-        added.map((x) => h("li.added", h("span.mark", "+"), h("span", ""), h("span", `${x} joins the station`))),
+        added.map((x) => h("li.added", h("span.mark", "+"), h("span", ""), h("span", `${x} joins the station${label(x)}`))),
         removed.map((x) => h("li.removed", h("span.mark", "−"), h("span", ""), h("span", `${x} leaves the station`))),
-        [...now].filter((x) => was.has(x)).map((x) => h("li", h("span.mark", ""), h("span", ""), h("span", `${x} stays`))))),
+        [...now].filter((x) => was.has(x)).map((x) => h("li", h("span.mark", ""), h("span", ""), h("span", `${x} stays${label(x)}`))))),
     a.lat != null ? insetEl({ points: [...(b && b.lat != null ? [{ lat: b.lat, lon: b.lon, kind: "before" }] : []), { lat: a.lat, lon: a.lon, kind: "after", label: a.name }] }) : null);
 }

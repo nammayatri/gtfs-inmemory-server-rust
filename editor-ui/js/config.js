@@ -9,8 +9,13 @@ export const TILE_REFERRER_POLICY = "strict-origin-when-cross-origin";
 // Chennai, where the first feed lives.
 export const DEFAULT_VIEW = { lat: 13.0569, lon: 80.2425, zoom: 12 };
 
-// Stops are fetched by map area only from this zoom level in.
+// Stops are fetched by map area only from this zoom level in, and carry a
+// permanent name label from LABELS_MIN_ZOOM. Same-named stops closer than
+// LABEL_GROUP_METRES (the two kerbs of a road) share one label, as do the
+// platforms of one station.
 export const STOPS_MIN_ZOOM = 15;
+export const LABELS_MIN_ZOOM = 17;
+export const LABEL_GROUP_METRES = 80;
 
 // The API is the directory above the dashboard: /internal/gtfs-editor/ui/ calls
 // /internal/gtfs-editor/, and behind Pomerium /  calls /api/ the same way.
