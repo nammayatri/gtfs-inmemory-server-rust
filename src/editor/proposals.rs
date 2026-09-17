@@ -201,12 +201,19 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn error(code: &'static str, stop_id: Option<&str>, message: String) -> Problem {
+    pub fn error(code: &'static str, stop_id: Option<&str>, message: String) -> Problem {
         Problem {
             level: Level::Error,
             code,
             stop_id: stop_id.map(str::to_string),
             message,
+        }
+    }
+
+    pub fn warning(code: &'static str, stop_id: Option<&str>, message: String) -> Problem {
+        Problem {
+            level: Level::Warning,
+            ..Problem::error(code, stop_id, message)
         }
     }
 }
@@ -332,6 +339,12 @@ pub fn problems(
 // ---------------------------------------------------------------- reads
 
 fn parse_statuses(status: Option<&str>) -> EditorResult<Vec<String>> {
+    parse_status_list(status, &STATUSES)
+}
+
+/// A list's `status` filter: a comma list of `allowed` values, `pending` when
+/// none is given (400 `invalid_status` for any other value).
+pub fn parse_status_list(status: Option<&str>, allowed: &[&str]) -> EditorResult<Vec<String>> {
     let mut list: Vec<String> = status
         .unwrap_or("")
         .split(',')
@@ -342,15 +355,16 @@ fn parse_statuses(status: Option<&str>) -> EditorResult<Vec<String>> {
     if list.is_empty() {
         list.push("pending".into());
     }
-    if let Some(bad) = list.iter().find(|s| !STATUSES.contains(&s.as_str())) {
+    if let Some(bad) = list.iter().find(|s| !allowed.contains(&s.as_str())) {
         return Err(EditorError::bad_request(
             "invalid_status",
-            format!("unknown status {bad:?} (statuses: {})", STATUSES.join(", ")),
+            format!("unknown status {bad:?} (statuses: {})", allowed.join(", ")),
         ));
     }
     Ok(list)
 }
 
+/// The station proposal list's filters; the position review list takes the same.
 pub struct ListQuery {
     pub status: Option<String>,
     pub bbox: Option<(f64, f64, f64, f64)>,

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const STOP_TYPES: [&str; 5] = [
     "NEW STOP",
@@ -342,6 +342,76 @@ pub fn grade_against_live(new: Vec<Finding>, live: &[Finding]) -> Vec<Finding> {
         .collect()
 }
 
+/// Stops an edit re-points and nothing else: new stop id -> the stop the live
+/// row had, for rows that differ from the live row at the same place only in
+/// their stop. Empty unless both lists are the same length; a new id the live
+/// list already calls at, or one standing for two live stops, is left out.
+pub fn repointed_stops(live: &[RouteRow], rows: &[RouteRow]) -> HashMap<String, String> {
+    if live.len() != rows.len() {
+        return HashMap::new();
+    }
+    let called: HashSet<&str> = live.iter().filter_map(|l| l.stop_id.as_deref()).collect();
+    let mut seen: HashMap<String, Option<String>> = HashMap::new();
+    for (l, r) in live.iter().zip(rows) {
+        let (Some(old), Some(new)) = (l.stop_id.as_deref(), r.stop_id.as_deref()) else {
+            continue;
+        };
+        if called.contains(new) {
+            continue;
+        }
+        let same_row = RouteRow {
+            stop_id: None,
+            ..l.clone()
+        } == RouteRow {
+            stop_id: None,
+            ..r.clone()
+        };
+        if old == new || !same_row {
+            continue;
+        }
+        let entry = seen.entry(new.to_string()).or_insert(Some(old.to_string()));
+        if entry.as_deref() != Some(old) {
+            *entry = None;
+        }
+    }
+    seen.into_iter()
+        .filter_map(|(new, old)| Some((new, old?)))
+        .collect()
+}
+
+/// [`grade_against_live`] for a stop list whose re-pointed rows (see
+/// [`repointed_stops`]) are the same rows as before: a problem such a row
+/// already had under its old stop counts as already present, as a split of a
+/// stop's routes onto a new stop needs. Keys name the row's stop first, as
+/// `id`, `id|...` or `Some("id")|...`.
+pub fn grade_repointed(rows: &[RouteRow], live: &[RouteRow]) -> Vec<Finding> {
+    let renames = repointed_stops(live, rows);
+    let rekey = |key: &str| -> Option<String> {
+        let (head, tail) = match key.split_once('|') {
+            Some((h, t)) => (h, Some(t)),
+            None => (key, None),
+        };
+        let old = match renames.get(head) {
+            Some(old) => old.clone(),
+            None => {
+                let id = head.strip_prefix("Some(\"")?.strip_suffix("\")")?;
+                format!("Some({:?})", renames.get(id)?)
+            }
+        };
+        Some(match tail {
+            Some(t) => format!("{old}|{t}"),
+            None => old,
+        })
+    };
+    let mut new = check_route_rows(rows);
+    for f in new.iter_mut() {
+        if let Some(key) = rekey(&f.key) {
+            f.key = key;
+        }
+    }
+    grade_against_live(new, &check_route_rows(live))
+}
+
 pub fn valid_lat_lon(lat: f64, lon: f64) -> bool {
     lat.is_finite()
         && lon.is_finite()
@@ -569,6 +639,20 @@ fn req_string<'a>(map: &'a Map<String, Value>, key: &str, what: &str) -> Result<
     }
 }
 
+/// The coordinate review a change was made for (docs/gtfs-editor.md section 8):
+/// absent or null, or a positive whole number. The apply ignores it.
+fn position_review_id(map: &Map<String, Value>, what: &str) -> Result<Option<i64>, Finding> {
+    match map.get("position_review_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) if v.as_i64().is_some_and(|n| n > 0) => Ok(v.as_i64()),
+        _ => Err(Finding::error(
+            "invalid_payload",
+            "position_review_id",
+            format!("{what}: position_review_id must be a positive whole number"),
+        )),
+    }
+}
+
 fn lat_lon(map: &Map<String, Value>, required: bool, what: &str) -> Result<(), Finding> {
     let lat = map.get("lat");
     let lon = map.get("lon");
@@ -663,9 +747,10 @@ pub fn check_payload(
                 "cluster_id",
                 "regional_name",
                 "hindi_name",
+                "position_review_id",
             ];
             allow_only(m, &allowed, what)?;
-            if m.is_empty() {
+            if m.keys().all(|k| k == "position_review_id") {
                 return Err(Finding::error(
                     "invalid_payload",
                     "",
@@ -686,6 +771,14 @@ pub fn check_payload(
             for k in ["platform_code", "cluster_id", "regional_name", "hindi_name"] {
                 opt_string(m, k, what)?;
             }
+            // a coordinate review's stop update is its move, never anything else
+            if position_review_id(m, what)?.is_some() && !m.contains_key("lat") {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "position_review_id",
+                    format!("{what}: a change for a position review moves the stop (lat and lon)"),
+                ));
+            }
             Ok(())
         }
         ("stop", "create") => {
@@ -702,9 +795,11 @@ pub fn check_payload(
                     "cluster_id",
                     "regional_name",
                     "hindi_name",
+                    "position_review_id",
                 ],
                 what,
             )?;
+            position_review_id(m, what)?;
             let id = req_string(m, "stop_id", what)?;
             check_entity_id("stop_id", id)?;
             if id != entity_key {
@@ -911,7 +1006,8 @@ pub fn check_payload(
         }
         ("route_stops", "replace") => {
             let m = obj(after, what)?;
-            allow_only(m, &["rows", "base_rows_hash"], what)?;
+            allow_only(m, &["rows", "base_rows_hash", "position_review_id"], what)?;
+            position_review_id(m, what)?;
             req_string(m, "base_rows_hash", what)?;
             let rows = m.get("rows").ok_or_else(|| {
                 Finding::error(
@@ -1228,6 +1324,83 @@ mod tests {
     }
 
     #[test]
+    fn a_split_keeps_old_problems_old() {
+        // S is called back to back with the wrong fare stage; C's stage is wrong too
+        let live = vec![
+            row("A", "NEW STOP", 1, "ADYAR"),
+            row("S", "INTERMEDIATE STOP", 1, "WRONG"),
+            row("S", "INTERMEDIATE STOP", 1, "WRONG"),
+            row("C", "INTERMEDIATE STOP", 2, "ADYAR"),
+            row("B", "NEW STOP", 2, "GUINDY"),
+        ];
+        let point = |rows: &[RouteRow], from: &str, to: &str| -> Vec<RouteRow> {
+            rows.iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    if r.stop_id.as_deref() == Some(from) {
+                        r.stop_id = Some(to.into());
+                    }
+                    r
+                })
+                .collect()
+        };
+        let split = point(&live, "S", "ed_new");
+        assert_eq!(
+            repointed_stops(&live, &split),
+            HashMap::from([("ed_new".to_string(), "S".to_string())])
+        );
+        // graded plainly, S's old problems look new under its new id
+        let plain = grade_against_live(check_route_rows(&split), &check_route_rows(&live));
+        assert_eq!(
+            codes(&plain),
+            vec![
+                "fare_stage_mismatch",
+                "fare_stage_mismatch",
+                "stop_repeated"
+            ]
+        );
+        // as a re-pointing, all four are what the route already had
+        let graded = grade_repointed(&split, &live);
+        assert!(codes(&graded).is_empty(), "{graded:?}");
+        assert_eq!(graded.len(), 4, "{graded:?}");
+        // a row that changes more than its stop brings its own problem
+        let mut worse = split.clone();
+        worse[3].stage_name = "OTHER".into();
+        assert_eq!(
+            codes(&grade_repointed(&worse, &live)),
+            vec!["fare_stage_mismatch"]
+        );
+        // pointing a row at a stop the route already calls is no re-pointing:
+        // the repeat it makes is new
+        let onto_a = vec![
+            row("A", "NEW STOP", 1, "ADYAR"),
+            row("A", "NEW STOP", 2, "GUINDY"),
+        ];
+        let before = vec![
+            row("A", "NEW STOP", 1, "ADYAR"),
+            row("B", "NEW STOP", 2, "GUINDY"),
+        ];
+        assert!(repointed_stops(&before, &onto_a).is_empty());
+        assert_eq!(
+            codes(&grade_repointed(&onto_a, &before)),
+            vec!["stop_repeated"]
+        );
+        // one new id for two live stops is not a re-pointing either
+        let mut two = live.clone();
+        two[3].stop_id = Some("ed_new".into());
+        two[1].stop_id = Some("ed_new".into());
+        two[2].stop_id = Some("ed_new".into());
+        assert!(repointed_stops(&live, &two).is_empty());
+        // nor a list of another length
+        assert!(repointed_stops(&live, &split[1..]).is_empty());
+        // a stage name missing names the stop as Some("id")
+        let mut unnamed = live.clone();
+        unnamed[1].stage_name = " ".into();
+        let graded = grade_repointed(&point(&unnamed, "S", "ed_new"), &unnamed);
+        assert!(codes(&graded).is_empty(), "{graded:?}");
+    }
+
+    #[test]
     fn payload_shapes() {
         assert!(check_payload("stop", "update", "A", &json!({"name": "ADYAR"})).is_ok());
         assert!(check_payload("stop", "update", "A", &json!({"lat": 13.0, "lon": 80.2})).is_ok());
@@ -1236,6 +1409,41 @@ mod tests {
         assert!(check_payload("stop", "update", "A", &json!({"stop_type": "x"})).is_err());
         assert!(check_payload("stop", "update", "A", &json!({})).is_err());
         assert!(check_payload("stop", "update", "A", &json!({"name": "  "})).is_err());
+        // a move made from a position review names it
+        let update = |after: Value| check_payload("stop", "update", "A", &after);
+        assert!(update(json!({"lat": 13.0, "lon": 80.2, "position_review_id": 7})).is_ok());
+        assert!(update(json!({"lat": 13.0, "lon": 80.2, "position_review_id": null})).is_ok());
+        for bad in [
+            json!({"position_review_id": 7}),
+            json!({"name": "ADYAR", "position_review_id": 7}),
+            json!({"lat": 13.0, "lon": 80.2, "position_review_id": "7"}),
+            json!({"lat": 13.0, "lon": 80.2, "position_review_id": 0}),
+            json!({"lat": 13.0, "lon": 80.2, "position_review_id": 7.5}),
+        ] {
+            assert!(update(bad.clone()).is_err(), "{bad}");
+        }
+        // and a split's new stop and stop lists carry it too, stored and ignored
+        let create = |review: Value| {
+            check_payload(
+                "stop",
+                "create",
+                "ed_0000000001",
+                &json!({"stop_id": "ed_0000000001", "name": "New", "lat": 13.0, "lon": 80.0, "position_review_id": review}),
+            )
+        };
+        assert!(create(json!(7)).is_ok() && create(Value::Null).is_ok());
+        assert!(create(json!("7")).is_err() && create(json!(-1)).is_err());
+        let replace = |review: Value| {
+            check_payload(
+                "route_stops",
+                "replace",
+                "R",
+                &json!({"base_rows_hash": "abc", "position_review_id": review,
+                        "rows": [{"stop_id": "A", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "X"}]}),
+            )
+        };
+        assert!(replace(json!(7)).is_ok() && replace(Value::Null).is_ok());
+        assert!(replace(json!(true)).is_err());
         assert!(check_payload(
             "stop",
             "create",

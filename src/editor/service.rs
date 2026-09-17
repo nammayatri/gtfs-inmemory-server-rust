@@ -12,9 +12,9 @@
 use super::auth::{self, Ctx};
 use super::error::{EditorError, EditorResult};
 use super::validation::{
-    check_payload, check_route_rows, create_id_field, grade_against_live, haversine_m,
-    merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level, MemberSpec,
-    RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES, ROUTE_RULE_CODES,
+    check_payload, check_route_rows, create_id_field, grade_against_live, grade_repointed,
+    haversine_m, merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level,
+    MemberSpec, RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES, ROUTE_RULE_CODES,
 };
 use super::EditorState;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -67,7 +67,7 @@ impl Page {
     }
 }
 
-fn like_pattern(q: &str) -> String {
+pub fn like_pattern(q: &str) -> String {
     let escaped = q
         .replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -1828,6 +1828,9 @@ async fn stop_merge(
 #[derive(Deserialize)]
 struct RouteStopsPayload {
     rows: Vec<RouteRow>,
+    /// Set when the stop list was split off a reviewed stop (section 8.1).
+    #[serde(default)]
+    position_review_id: Option<i64>,
 }
 
 async fn route_stops_replace(
@@ -1906,10 +1909,16 @@ async fn route_stops_replace(
         }
     }
     let live = load_route_rows(conn, g, route_id).await?;
-    findings.extend(grade_against_live(
-        check_route_rows(&rows),
-        &check_route_rows(&live),
-    ));
+    if payload.position_review_id.is_some() {
+        // a split points the reviewed stop's rows at a new stop: what those rows
+        // already had wrong under the old stop is not the split's doing
+        findings.extend(grade_repointed(&rows, &live));
+    } else {
+        findings.extend(grade_against_live(
+            check_route_rows(&rows),
+            &check_route_rows(&live),
+        ));
+    }
     // A stop that cannot be used, or a row the table refuses, stops the change
     // here. A broken fare or stop-order rule does not: the rows are written, so
     // the draft's preview (and every later change in it) sees the stop list as
@@ -2743,6 +2752,12 @@ pub async fn update_change(
             m.insert("into_row_version".into(), json!(v));
         }
     }
+    // a change made for a coordinate review stays that review's
+    super::position_reviews::keep_review_link(&json_col(&row, "after")?, &mut update.after)
+        .map_err(|why| {
+            EditorError::bad_request("invalid_change", why)
+                .with_details(json!({"code": "position_review_mismatch"}))
+        })?;
     check_payload(&entity, &op, &key, &update.after).map_err(|f| {
         EditorError::bad_request("invalid_change", f.message.clone())
             .with_details(json!({"code": f.code}))
@@ -2807,6 +2822,15 @@ pub async fn delete_change(
     )
     .await?;
     super::proposals::return_to_pending(
+        &mut tx,
+        ctx,
+        &set.gtfs_id,
+        id,
+        Some(change_id),
+        "change_removed",
+    )
+    .await?;
+    super::position_reviews::return_to_pending(
         &mut tx,
         ctx,
         &set.gtfs_id,
@@ -3016,6 +3040,15 @@ pub async fn discard(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
         "change_set_discarded",
     )
     .await?;
+    super::position_reviews::return_to_pending(
+        &mut tx,
+        ctx,
+        &set.gtfs_id,
+        id,
+        None,
+        "change_set_discarded",
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -3109,6 +3142,7 @@ pub async fn commit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Va
     )
     .await?;
     super::proposals::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
+    super::position_reviews::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
     tx.commit().await?;
     Ok(json!({"change_set_id": id, "status": "committed", "feed_version": version}))
 }

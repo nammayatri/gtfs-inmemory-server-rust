@@ -4,8 +4,10 @@ use super::auth::{self, Role};
 use super::bulk;
 use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
+use super::position_reviews;
 use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
+use super::validation::valid_lat_lon;
 use super::EditorState;
 use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use actix_web::error::{JsonPayloadError, PathError, QueryPayloadError};
@@ -672,6 +674,7 @@ pub async fn bulk_import(
 
 // ---------------------------------------------------------------- station proposals
 
+/// The query of a review list: station proposals and position reviews.
 #[derive(Deserialize)]
 pub struct ProposalsQuery {
     status: Option<String>,
@@ -679,6 +682,21 @@ pub struct ProposalsQuery {
     q: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
+}
+
+impl ProposalsQuery {
+    fn filters(&self) -> EditorResult<proposals::ListQuery> {
+        Ok(proposals::ListQuery {
+            status: self.status.clone(),
+            bbox: self
+                .bbox
+                .as_deref()
+                .filter(|b| !b.is_empty())
+                .map(parse_bbox)
+                .transpose()?,
+            q: self.q.clone(),
+        })
+    }
 }
 
 pub async fn station_proposals(
@@ -689,17 +707,7 @@ pub async fn station_proposals(
 ) -> EditorResult<HttpResponse> {
     auth::require(&req, &st, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
-    let query = proposals::ListQuery {
-        status: q.status.clone(),
-        bbox: q
-            .bbox
-            .as_deref()
-            .filter(|b| !b.is_empty())
-            .map(parse_bbox)
-            .transpose()?,
-        q: q.q.clone(),
-    };
-    ok(proposals::list(&st, &path, &query, &page).await?)
+    ok(proposals::list(&st, &path, &q.filters()?, &page).await?)
 }
 
 pub async fn station_proposal_summary(
@@ -766,6 +774,108 @@ pub async fn station_proposal_reopen(
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Editor).await?;
     ok(proposals::reopen(&st, &ctx, *path).await?)
+}
+
+// ---------------------------------------------------------------- position reviews
+
+pub async fn position_reviews(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<ProposalsQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    ok(position_reviews::list(&st, &path, &q.filters()?, &page).await?)
+}
+
+pub async fn position_review_summary(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(position_reviews::summary(&st, &path).await?)
+}
+
+/// `lat` and `lon` ask what detour a point would give, over the routes in
+/// `route_ids` (a comma list) or over every route.
+#[derive(Deserialize)]
+pub struct ReviewDetailQuery {
+    lat: Option<f64>,
+    lon: Option<f64>,
+    route_ids: Option<String>,
+}
+
+pub async fn position_review(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    q: web::Query<ReviewDetailQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let route_ids = q.route_ids.as_deref().map(|ids| {
+        ids.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    let what_if = match (q.lat, q.lon) {
+        (None, None) if route_ids.is_none() => None,
+        (Some(lat), Some(lon)) if valid_lat_lon(lat, lon) && (lat, lon) != (0.0, 0.0) => {
+            Some(position_reviews::WhatIf {
+                at: (lat, lon),
+                route_ids,
+            })
+        }
+        _ => return Err(EditorError::bad_request(
+            "invalid_position",
+            "lat and lon are sent together, with route_ids if any, and must be a valid position",
+        )),
+    };
+    let mut conn = st.pool.acquire().await?;
+    ok(position_reviews::detail(&mut conn, *path, what_if.as_ref()).await?)
+}
+
+pub async fn position_review_move(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<position_reviews::MoveBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(position_reviews::move_stop(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+pub async fn position_review_split(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<position_reviews::SplitBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(position_reviews::split(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+pub async fn position_review_confirm(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: Option<web::Json<NoteBody>>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    ok(position_reviews::confirm(&st, &ctx, *path, body.note.as_deref()).await?)
+}
+
+pub async fn position_review_reopen(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(position_reviews::reopen(&st, &ctx, *path).await?)
 }
 
 // ---------------------------------------------------------------- admin

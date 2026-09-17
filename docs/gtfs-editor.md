@@ -19,8 +19,8 @@ ops ─VPN─▶ gtfs.sso.c2.integ.internal.svc.movingtech.net   (Pomerium, namm
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0006*.sql` (applied to master `mtc_internal_master`;
-`0006` lets a change's `op` be `merge`).
+Schema: `db/gtfs_editor/0001..0007*.sql` (applied to master `mtc_internal_master`;
+`0006` lets a change's `op` be `merge`, `0007` holds coordinate reviews).
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -174,9 +174,13 @@ routes, rows, keep_name, keep_position}`), `station_proposal_approved`,
 `change_set_discarded`) and `station_proposal_committed`. Approving an area
 writes one `station_proposal_approved` per station (`detail.bulk = true`). nandi's
 scripts write `seed`, `release` and `station_proposals_built` (`{batch, proposals,
-platforms, diameter_m, base_version}`). The dashboard's history has words for every
-one of these (`ACTION_LABEL` in `editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks
-each action in the database has a label).
+platforms, diameter_m, base_version}`). Coordinate reviews (section 8) write
+`position_review_moved`, `position_review_split`, `position_review_confirmed`,
+`position_review_reopened`, `position_review_returned` and
+`position_review_committed`, and nandi's loader `position_reviews_loaded`. The
+dashboard's history has words for every one of these (`ACTION_LABEL` in
+`editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks each action in the database has a
+label).
 
 ### Drafts
 
@@ -542,3 +546,160 @@ stop → next legs with their detour; the stops sharing its point; the reason an
 Chalo hint. Actions: drag the pin or click the map (or "Use suggestion" / "Use raw
 point") to set a new position, see the detour it would give, "Add move to draft";
 "Position is correct" (note optional); "Next".
+
+Settled while implementing:
+
+- Items also carry `change_id`, `gtfs_id`, `created_at`, `updated_at`. `status`
+  values are checked (400 `invalid_status`); `superseded` may be listed too. The
+  summary counts only the four statuses above. `q` is exact on `stop_id` or
+  `original_stop_id`. The list orders an exact id match first, then name
+  similarity, then status (pending, approved, committed, confirmed, superseded),
+  then `review_id`. List, detail and summary are viewer+.
+- Detail: `stop` is the stop row in read shape, or `null`. `routes` has one entry
+  per call of a live (not deleted) route at the stop, in `route_id, sequence`
+  order: a route calling twice is listed twice, and a JUMP STOP call counts. Each
+  entry also carries `stop_type` and its own `detour_m` (`null` at either end of
+  the route). `prev`/`next` skip ROUTE CORRECTION, JUMP STOP and HIDDEN STOP rows;
+  their `name` is the stop's own. `detour_m` is the median over the calls that have
+  both neighbours (`null` when none has), in metres to one decimal; a neighbour
+  that is the reviewed stop itself moves with it. The route context is one query
+  of key lookups: 16-20 ms at a stop on 319 routes.
+- `problems[]` are `{level, code, message}`. Errors (the stop cannot be changed
+  now): `stop_missing`, `stop_deleted`, `stop_merged_away` (the stop is deleted and
+  its provenance names `merged_into`; on a move, also a merge in the draft), and
+  `stop_is_station`. Warning: `moved_since_load` (not reported once committed: the
+  review's own move is expected to move it).
+- The detail also carries `new_position` (`{lat, lon}`: where the review's change
+  puts the stop, or the new stop of a split; `null` without a change),
+  `new_stop_id` and `split_route_ids` (a split's, else `null`), and
+  `detour_m_after`: the median detour at `new_position`, over every call for a
+  move and over the split routes for a split; `null` without a change.
+- Before drafting anything, `GET /position-reviews/{id}?lat=&lon=` (optionally
+  `&route_ids=a,b`) answers `detour_m_after` for that point, over those routes'
+  calls or every call, and changes nothing - the detour a dragged pin would give.
+  `lat` without `lon`, `route_ids` without a point, or a point out of range is 400
+  `invalid_position`.
+- Move refusals: 400 `invalid_position` (out of range, or `0,0`), 400 `invalid_json`
+  (a field that is not in the body above), 404 `review_not_found` /
+  `change_set_not_found`, 400 `feed_mismatch`, 409 `change_set_not_draft`, 409
+  `review_not_pending` (`details.status`, `details.change_set_id`), 400
+  `review_has_problems` (`details.problems`; the live data plus the draft, taken as
+  applying; only errors refuse), 400 `position_unchanged` (within 0.5 m of where
+  the stop is: confirm instead). The change's `before` is the stop row; the note is
+  the review's `review_note`.
+- Confirm is from `pending` only (409 `review_not_pending`); the body may be left
+  out, and a blank note is none. Reopen is from `confirmed` only (409
+  `review_not_confirmed`), clears the review fields, and is 409 `review_superseded`
+  when another open review already covers the stop. Move, confirm and reopen
+  return the review detail.
+- A draft edit (`PUT /change-sets/{id}/changes/{change_id}`) of a change made for a
+  review keeps its `position_review_id`: left out or `null`, it is put back;
+  another id is 400 `invalid_change` with `details.code = "position_review_mismatch"`.
+  A `stop/update` with `position_review_id` must move the stop (`lat` and `lon`),
+  so a review's move cannot be edited into a rename. The id added to a change
+  through `POST /change-sets/{id}/changes` is stored and ignored: only `/move` and
+  `/split` tie a review to a draft.
+- Back to pending, `change_set_id`, `change_id`, `reviewed_by`, `reviewed_at` and
+  `review_note` are cleared; committed keeps the change's ids.
+- Audit details: `position_review_moved` `{review_id, stop_id, change_id, from,
+  to, moved_m, detour_m, detour_m_after, note}`; `position_review_confirmed`
+  `{review_id, stop_id, position, note}`; `position_review_reopened` `{review_id,
+  stop_id, note}` (the note it had); `position_review_returned` `{review_id,
+  stop_id, reason, removed_change_ids?}` (`reason` is `change_removed` or
+  `change_set_discarded`); `position_review_committed` `{review_id, stop_id,
+  change_id, feed_version}`.
+
+### 8.1 Splitting routes off a stop
+
+**Why.** The real data showed 54+ of the ~396 queued stops carry routes from more
+than one original stop. The cleanup merged same-named stops on one (wrong) point
+and moved routes onto the kerb stop they pass. Example: `29db2391b0` THIRUPORUR
+THANDALAM serves 525/549/553K/553W/554B/565 of its own, plus 515/515A that came
+from a Thiruporur-area stop and 592/593CT from a Thandalam near Athupakkam. Moving
+that stop is wrong for most of its routes, so a reviewer must be able to split some
+routes off onto a new stop.
+
+**Evidence** (the loader writes this; the API returns `evidence` as stored):
+
+- `evidence.route_groups: [{origin_stop_id, origin_name, suspect: bool, reason?,
+  raw_lat?, raw_lon?, route_ids: [..], route_numbers: [..]}]`: which routes on the
+  stop, at load time, came from which stop id in the published mapping.
+- `evidence.mixed_origins: bool`: true when there is more than one group.
+- Groups are a load-time snapshot. The detail's live `routes` stays authoritative.
+
+**Endpoint.** `POST /position-reviews/{id}/split`, editor+.
+Body: `{change_set_id, route_ids: [text], lat, lon, name?, note?}`.
+It appends to the draft, in order:
+
+1. `stop/create` `{name (default: the reviewed stop's current name), lat, lon,
+   position_review_id}`. The id is left out so the server mints the `ed_` id as for
+   any create.
+2. For each route in `route_ids` order, one `route_stops` / `replace`: that route's
+   current rows with EVERY row whose stop_id is the reviewed stop pointed at the new
+   stop id. All other row fields stay unchanged, `base_rows_hash` is the current
+   hash, and `after.position_review_id` is set.
+
+Review → `approved`, with `change_set_id` and `change_id` = the stop/create change
+id. Response: the review detail, plus `new_stop_id` and `detour_m_after` (median
+over the split routes, computed at the new point with their prev/next served
+stops).
+
+**Rules.**
+
+- 400 `invalid_split` with `details.problems: [{code, message, route_id?}]` for:
+  - `route_ids` empty or containing duplicates;
+  - `route_not_at_stop`: the route doesn't currently call at the stop, or is
+    deleted;
+  - `would_empty_stop`: `route_ids` covers every non-deleted route that calls at
+    the stop, so the reviewer should use /move;
+  - lat/lon invalid by the same rules as stop create.
+- 409 `draft_conflict` with `details.change_ids` when the draft already has a
+  `route_stops` change for one of those routes, or any change to the reviewed stop.
+- The review must be `pending`, same as /move. The draft must be open and editable
+  by the caller, same as /move.
+- Returning to pending: removing the `stop/create` from the draft also removes that
+  draft's `route_stops` changes carrying the same `position_review_id`, and the
+  review goes back to `pending`. Discarding the draft does the same. Removing just
+  one of the route changes leaves the others, and the review stays approved.
+- Committing marks the review `committed`, as for move.
+- Audit `position_review_split`, detail `{new_stop_id, route_ids, change_set_id}`.
+- The new stop inherits nothing else: no station, platform_code or codes.
+- `route_stops/replace` accepts and ignores (stores) an optional
+  `position_review_id` in `after`, the same way `stop/update` and `stop/create` do.
+
+Settled while implementing:
+
+- Codes in `invalid_split`: `route_ids_required`, `route_listed_twice` (once per
+  route, with `route_id`), `invalid_position`, `route_not_at_stop` (with
+  `route_id`), `would_empty_stop`. Route ids are trimmed. Checks run in this
+  order, each stopping the request: the request's own problems; the draft and
+  review as for move (404, 400 `feed_mismatch`, 409 `change_set_not_draft`, 409
+  `review_not_pending`); 409 `draft_conflict`; 400 `review_has_problems` (the stop
+  is missing, deleted, merged away or a station); then the route problems, listed
+  together.
+- "A change to the reviewed stop" is a `stop` change keyed on it (update, delete,
+  or merging it away) or a `stop/merge` into it. A station change listing it as a
+  member does not conflict: the new stop joins no station.
+- A route calls at the stop on any row naming it, a JUMP STOP included; a deleted
+  route never does. A blank `name` is the default. The new stop's `stop_code` is its
+  minted id, as for any create; nothing is copied from the reviewed stop.
+- Each `route_stops` change's `before` is the route's rows in read shape; its rows
+  keep `stop_name_override` and `provider_id`. A problem a split row already had
+  under the reviewed stop (a fare stage defect, the stop called twice in a row) is
+  a warning "already present before this edit", as for any stop list, although
+  the row now names the new stop: rows that differ from the live rows only in their
+  stop are matched to their old selves. Anything else is graded as usual.
+- Removing the `stop/create` removes the stop lists carrying the review's id, each
+  audited as `change_removed` `{change_id, review_id, reason:
+  "position_review_returned"}`, and `position_review_returned` lists them in
+  `removed_change_ids`. Discarding the draft returns the review to `pending` and
+  leaves the discarded draft's changes as they were (a discarded draft never
+  applies, and proposals' changes stay in theirs too).
+- The detail of a split review: `new_stop_id`; `split_route_ids`, the draft's stop
+  lists that carry the review's id, in draft order; `new_position`, the new stop's
+  point; `detour_m_after` over those routes at that point (once committed, from
+  their calls at the new stop). The live `routes` are the reviewed stop's, so a
+  committed split's routes are no longer in them.
+- Audit `position_review_split` detail also has `review_id`, `stop_id`,
+  `change_id`, `route_change_ids`, `name`, `lat`, `lon`, `detour_m_after` and
+  `note`.
