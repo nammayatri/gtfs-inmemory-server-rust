@@ -725,8 +725,11 @@ try {
     if (!reviewDetails.has(id)) reviewDetails.set(id, await api(`position-reviews/${id}`));
     return reviewDetails.get(id);
   };
+  // needs 2 DISTINCT raw-bearing suspect groups (for group A and group B below) plus
+  // a non-suspect group; real loaded data varies, the mock's synthetic fixture guarantees it
   const mixed = pendingReviews.find((r) => r.evidence?.mixed_origins && !touched.has(r.stop_id)
-    && r.evidence.route_groups.some((g) => g.suspect && g.raw_lat != null) && r.evidence.route_groups.some((g) => !g.suspect));
+    && r.evidence.route_groups.filter((g) => g.suspect && g.raw_lat != null).length >= 2
+    && r.evidence.route_groups.some((g) => !g.suspect));
   const fx = mixed ? await reviewDetail(mixed.review_id) : null;
   check(!!fx, "there is a stop whose routes came from several original stops (the THANDALAM fixture)");
   (fx ? fx.routes : []).forEach((l) => touchedRoutes.add(l.route_id));
@@ -897,7 +900,7 @@ try {
   // an approved review in ANOTHER draft is refused with a link to the one it is in
   const groupA = groupsFx.find((g) => g.suspect && g.raw_lat != null);
   const splitIdsA = liveIds.filter((id) => groupA.route_ids.includes(id)).sort();
-  const groupElA = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupA.origin_name)}))`;
+  const groupElA = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupA.origin_stop_id)}))`;
   await ensureGroupChecked(groupElA, true);
   await waitFor(`document.querySelectorAll(".split-route input:checked").length === ${splitIdsA.length}`, "group A's routes checked");
   await evaluate(`${groupElA}.querySelector("button").click(); true`);
@@ -955,7 +958,7 @@ try {
   check(await evaluate(`document.querySelector(".draft-actions")?.innerText.includes("Split")`), "the actions list shows the split");
 
   // group A's routes are now locked: no checkbox, and a "split off" badge
-  const groupElA2 = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupA.origin_name)}))`;
+  const groupElA2 = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupA.origin_stop_id)}))`;
   check(await evaluate(`${groupElA2}.querySelectorAll(".split-route input").length === 0`), "group A's routes have no checkbox any more");
   check(await evaluate(`${groupElA2}.innerText.includes("Split off") && ${groupElA2}.innerText.includes(${JSON.stringify(splitStopIdA)})`), `group A's routes show "Split off" naming the new stop (${splitStopIdA})`);
   check(!(await evaluate(`[...document.querySelectorAll(".split-route input")].some((i) => ${JSON.stringify(splitIdsA)}.includes(i.id.replace("split-route-", "")))`)), "group A's routes cannot be checked again");
@@ -963,7 +966,11 @@ try {
   // group B, split into the same draft as a second action
   const groupB = groupsFx.find((g) => g.suspect && g.raw_lat != null && g !== groupA);
   const splitIdsB = liveIds.filter((id) => groupB.route_ids.includes(id)).sort();
-  const groupElB = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupB.origin_name)}))`;
+  const groupElB = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupB.origin_stop_id)}))`;
+  // the reload after group A's split pre-checks EVERY still-open suspect group, not just
+  // "the next one" - a review with a third raw suspect group (real data has some) leaves it
+  // checked too, so start from nothing rather than assume only group B came back checked
+  await clickAllChecked(".split-route input");
   await ensureGroupChecked(groupElB, true);
   await waitFor(`document.querySelectorAll(".split-route input:checked").length === ${splitIdsB.length}`, "group B's routes checked");
   await evaluate(`${groupElB}.querySelector("button").click(); true`);
@@ -988,6 +995,12 @@ try {
   await setView(fxNow.lat, fxNow.lon, 17);
   await clickMapAt(target.lat, target.lon);
   await waitFor(`!!document.getElementById("review-move") && !document.getElementById("review-move").disabled`, "Move ready for the stop's own routes");
+  // this move is for the stop's OWN remaining routes, not a further split - but the
+  // reload after group B's split pre-checks any suspect group still un-split (here,
+  // the third one this test never splits), and moving with routes checked asks the
+  // reviewer to confirm "move every route?" first (correctly - see splitBox's own
+  // warning for the same case). Clear that so the move goes straight through.
+  await clickAllChecked(".split-route input");
   await click("Add move to draft", ".sticky-actions");
   await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes(${JSON.stringify(`Moved ${fx.stop.name}`)})`, "a third toast confirms the move");
   await waitFor(`document.getElementById("panel").innerText.includes("In draft")`, "the review with all three actions");
