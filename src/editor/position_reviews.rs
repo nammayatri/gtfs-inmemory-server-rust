@@ -8,11 +8,13 @@
 //!   - confirms that the position is right, which closes the review and changes
 //!     nothing.
 //!
-//! A draft goes live only when someone else approves and commits it. The server
-//! keeps the lifecycle, as for station proposals: removing the review's change
-//! from its draft (for a split, its new stop - its stop lists go with it), or
-//! discarding the draft, puts the review back to pending; committing the draft
-//! marks it committed. Every transition is audited.
+//! A draft goes live only when someone else approves and commits it. A stop can
+//! need several of these at once - two splits and a move of the stop itself - so
+//! a review collects any number of actions, all in one draft. The server keeps
+//! the lifecycle, as for station proposals: removing a split's new stop from the
+//! draft takes that split's stop lists with it; a review whose draft holds none
+//! of its changes any more, or whose draft is discarded, is pending again;
+//! committing the draft marks it committed. Every action is audited.
 //!
 //! A position is judged by the routes through it: for every call at the stop,
 //! the served stops either side and how far the bus goes out of its way to call
@@ -30,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use uuid::Uuid;
 
 pub const STATUSES: [&str; 5] = [
@@ -152,17 +154,162 @@ pub enum Transition {
 }
 
 /// The status a review in `status` takes on `t`; `None` when `t` does not apply
-/// to a review in that status. Return and commit act on every approved review
-/// of a draft at once, in [`return_to_pending`] and [`mark_committed`].
+/// to a review in that status. An approved review takes further actions only in
+/// its own draft ([`may_add_action`]). Return and commit act on the approved
+/// reviews of a draft, in [`change_removed`], [`draft_discarded`] and
+/// [`mark_committed`].
 pub fn next_status(status: &str, t: Transition) -> Option<&'static str> {
     match (status, t) {
-        ("pending", Transition::Move | Transition::Split) => Some("approved"),
+        ("pending" | "approved", Transition::Move | Transition::Split) => Some("approved"),
         ("pending", Transition::Confirm) => Some("confirmed"),
         ("confirmed", Transition::Reopen) => Some("pending"),
         ("approved", Transition::Return) => Some("pending"),
         ("approved", Transition::Commit) => Some("committed"),
         _ => None,
     }
+}
+
+/// Why a move or split cannot go into a draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// the review is closed: committed, confirmed or superseded
+    NotPending,
+    /// its actions are in another draft
+    InOtherDraft(Uuid),
+}
+
+/// Whether a move or split may go into draft `into` for a review in `status`
+/// whose actions are in `draft`: a pending review takes its first action, an
+/// approved one more actions in the same draft only.
+pub fn may_add_action(status: &str, draft: Option<Uuid>, into: Uuid) -> Result<(), Refusal> {
+    match (status, draft) {
+        ("pending", _) => Ok(()),
+        ("approved", Some(d)) if d == into => Ok(()),
+        ("approved", Some(d)) => Err(Refusal::InOtherDraft(d)),
+        _ => Err(Refusal::NotPending),
+    }
+}
+
+// ---------------------------------------------------------------- a review's actions in its draft
+
+/// A change a draft holds for a review, as its actions are read from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewChange {
+    pub change_id: i64,
+    pub entity: String,
+    pub op: String,
+    pub entity_key: String,
+    /// the point a stop update or create sets
+    pub at: Option<(f64, f64)>,
+    /// the stops a stop list's rows call at
+    pub row_stops: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActionKind {
+    /// the reviewed stop moves to the point
+    Move,
+    /// a new stop at the point takes these routes off the reviewed stop
+    Split {
+        new_stop_id: String,
+        route_ids: Vec<String>,
+    },
+}
+
+/// One move or split a review has in its draft.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    pub change_id: i64,
+    pub at: (f64, f64),
+    pub kind: ActionKind,
+}
+
+/// A review's actions, in change order: each stop update is a move, each stop
+/// create a split whose routes are the stop lists that call at its new stop.
+pub fn actions(changes: &[ReviewChange]) -> Vec<Action> {
+    changes
+        .iter()
+        .filter_map(|c| {
+            let at = c.at?;
+            let kind = match (c.entity.as_str(), c.op.as_str()) {
+                ("stop", "update") => ActionKind::Move,
+                ("stop", "create") => ActionKind::Split {
+                    new_stop_id: c.entity_key.clone(),
+                    route_ids: changes
+                        .iter()
+                        .filter(|x| {
+                            x.entity == "route_stops" && x.row_stops.contains(&c.entity_key)
+                        })
+                        .map(|x| x.entity_key.clone())
+                        .collect(),
+                },
+                _ => return None,
+            };
+            Some(Action {
+                change_id: c.change_id,
+                at,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// The change a review is known by in its draft: its earliest action, or its
+/// earliest change when only stop lists are left; `None` when nothing is.
+pub fn first_change(changes: &[ReviewChange]) -> Option<i64> {
+    changes
+        .iter()
+        .find(|c| c.entity == "stop" && matches!(c.op.as_str(), "update" | "create"))
+        .or(changes.first())
+        .map(|c| c.change_id)
+}
+
+/// The routes a review's splits in the draft take off its stop.
+pub fn split_off(changes: &[ReviewChange]) -> Vec<String> {
+    let mut routes: Vec<String> = changes
+        .iter()
+        .filter(|c| c.entity == "route_stops")
+        .map(|c| c.entity_key.clone())
+        .collect();
+    routes.sort();
+    routes.dedup();
+    routes
+}
+
+/// The changes draft `change_set_id` holds for review `review_id`, in change
+/// order.
+async fn review_changes(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    review_id: i64,
+) -> Result<Vec<ReviewChange>, sqlx::Error> {
+    sqlx::query(
+        "SELECT c.change_id, c.entity, c.op, c.entity_key, \
+                (c.after->>'lat')::float8 AS lat, (c.after->>'lon')::float8 AS lon, \
+                ARRAY(SELECT DISTINCT x->>'stop_id' FROM jsonb_array_elements( \
+                          CASE WHEN jsonb_typeof(c.after->'rows') = 'array' THEN c.after->'rows' \
+                               ELSE '[]'::jsonb END) x \
+                      WHERE x->>'stop_id' IS NOT NULL) AS row_stops \
+         FROM gtfs_change c \
+         WHERE c.change_set_id = $1 AND c.after->>'position_review_id' = $2 ORDER BY c.position",
+    )
+    .bind(change_set_id)
+    .bind(review_id.to_string())
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<ReviewChange, sqlx::Error> {
+        let (lat, lon): (Option<f64>, Option<f64>) = (r.try_get("lat")?, r.try_get("lon")?);
+        Ok(ReviewChange {
+            change_id: r.try_get("change_id")?,
+            entity: r.try_get("entity")?,
+            op: r.try_get("op")?,
+            entity_key: r.try_get("entity_key")?,
+            at: lat.zip(lon),
+            row_stops: r.try_get("row_stops")?,
+        })
+    })
+    .collect()
 }
 
 // ---------------------------------------------------------------- problems
@@ -423,64 +570,6 @@ fn neighbour_json(n: Option<&Neighbour>) -> Value {
     }
 }
 
-/// What a review's change does, read from the draft that carries it.
-#[derive(Debug, Clone, PartialEq)]
-enum Resolution {
-    /// the stop moves to the point
-    Move((f64, f64)),
-    /// a new stop at the point takes these routes
-    Split {
-        at: (f64, f64),
-        new_stop_id: String,
-        route_ids: Vec<String>,
-    },
-}
-
-async fn resolution(conn: &mut PgConnection, r: &Review) -> EditorResult<Option<Resolution>> {
-    let (Some(change_set_id), Some(change_id)) = (r.change_set_id, r.change_id) else {
-        return Ok(None);
-    };
-    let Some(row) = sqlx::query(
-        "SELECT entity, op, entity_key, (after->>'lat')::float8 AS lat, (after->>'lon')::float8 AS lon \
-         FROM gtfs_change WHERE change_id = $1",
-    )
-    .bind(change_id)
-    .fetch_optional(&mut *conn)
-    .await?
-    else {
-        return Ok(None);
-    };
-    let (Some(lat), Some(lon)) = (
-        row.try_get::<Option<f64>, _>("lat")?,
-        row.try_get::<Option<f64>, _>("lon")?,
-    ) else {
-        return Ok(None);
-    };
-    let (entity, op): (String, String) = (row.try_get("entity")?, row.try_get("op")?);
-    Ok(match (entity.as_str(), op.as_str()) {
-        ("stop", "update") => Some(Resolution::Move((lat, lon))),
-        ("stop", "create") => {
-            let route_ids = sqlx::query(
-                "SELECT entity_key FROM gtfs_change WHERE change_set_id = $1 \
-                   AND entity = 'route_stops' AND after->>'position_review_id' = $2 ORDER BY position",
-            )
-            .bind(change_set_id)
-            .bind(r.review_id.to_string())
-            .fetch_all(&mut *conn)
-            .await?
-            .iter()
-            .map(|x| x.try_get("entity_key"))
-            .collect::<Result<Vec<String>, _>>()?;
-            Some(Resolution::Split {
-                at: (lat, lon),
-                new_stop_id: row.try_get("entity_key")?,
-                route_ids,
-            })
-        }
-        _ => None,
-    })
-}
-
 // ---------------------------------------------------------------- reads
 
 pub async fn list(
@@ -552,10 +641,12 @@ pub struct WhatIf {
 }
 
 /// The review with its stop as it is now, every call a route makes there with
-/// its detour, the median detour, and what stands in the way of changing it.
-/// `detour_m_after` answers `what_if` when given; otherwise, for a review whose
-/// change is in a draft (or committed), the point that change sets: over every
-/// call for a move, over the split routes for a split.
+/// its detour, the median detour, what stands in the way of changing it, and
+/// its actions in its draft (`draft_actions`, in change order), each with the
+/// detour it gives: a split over its own routes at its new stop's point, a move
+/// over the routes the review's splits leave at the stop. The singular
+/// `new_position`, `new_stop_id`, `split_route_ids` and `detour_m_after` are the
+/// latest action's; `what_if`, when given, answers `detour_m_after` instead.
 pub async fn detail(
     conn: &mut PgConnection,
     id: i64,
@@ -565,7 +656,10 @@ pub async fn detail(
     let stop = service::stop_row(conn, &r.gtfs_id, &r.stop_id).await?;
     let now = stop.as_ref().and_then(StopNow::from_row);
     let calls = calls(conn, &r.gtfs_id, &r.stop_id).await?;
-    let resolution = resolution(conn, &r).await?;
+    let changes = match r.change_set_id {
+        Some(set) => review_changes(conn, set, r.review_id).await?,
+        None => vec![],
+    };
     let found = problems(
         &r.stop_id,
         (r.lat, r.lon),
@@ -589,40 +683,58 @@ pub async fn detail(
         })
         .collect();
     let detour = here.and_then(|p| median_detour(&calls, None, &r.stop_id, p));
-    let detour_after = match (what_if, &resolution) {
-        (Some(w), _) => median_detour(&calls, w.route_ids.as_deref(), &r.stop_id, w.at),
-        (None, Some(Resolution::Move(at))) => median_detour(&calls, None, &r.stop_id, *at),
-        (
-            None,
-            Some(Resolution::Split {
-                at,
+
+    let gone = split_off(&changes);
+    let kept: Vec<Call> = calls
+        .iter()
+        .filter(|c| !gone.contains(&c.route_id))
+        .cloned()
+        .collect();
+    let mut draft_actions = Vec::new();
+    let mut latest = (Value::Null, Value::Null, Value::Null, None);
+    for a in actions(&changes) {
+        let mut entry =
+            json!({"kind": "move", "change_id": a.change_id, "lat": a.at.0, "lon": a.at.1});
+        let after = match &a.kind {
+            ActionKind::Move => {
+                latest = (
+                    json!({"lat": a.at.0, "lon": a.at.1}),
+                    Value::Null,
+                    Value::Null,
+                    None,
+                );
+                median_detour(&kept, None, &r.stop_id, a.at)
+            }
+            ActionKind::Split {
                 new_stop_id,
                 route_ids,
-            }),
-        ) if r.status == "committed" => {
-            // the split routes call at the new stop now
-            let moved = self::calls(conn, &r.gtfs_id, new_stop_id).await?;
-            median_detour(&moved, Some(route_ids.as_slice()), new_stop_id, *at)
-        }
-        (None, Some(Resolution::Split { at, route_ids, .. })) => {
-            median_detour(&calls, Some(route_ids.as_slice()), &r.stop_id, *at)
-        }
-        (None, None) => None,
-    };
-    let (new_position, new_stop_id, split_route_ids) = match &resolution {
-        None => (Value::Null, Value::Null, Value::Null),
-        Some(Resolution::Move((lat, lon))) => {
-            (json!({"lat": lat, "lon": lon}), Value::Null, Value::Null)
-        }
-        Some(Resolution::Split {
-            at: (lat, lon),
-            new_stop_id,
-            route_ids,
-        }) => (
-            json!({"lat": lat, "lon": lon}),
-            json!(new_stop_id),
-            json!(route_ids),
-        ),
+            } => {
+                entry["kind"] = json!("split");
+                entry["new_stop_id"] = json!(new_stop_id);
+                entry["route_ids"] = json!(route_ids);
+                latest = (
+                    json!({"lat": a.at.0, "lon": a.at.1}),
+                    json!(new_stop_id),
+                    json!(route_ids),
+                    None,
+                );
+                if r.status == "committed" {
+                    // the split routes call at the new stop now
+                    let there = self::calls(conn, &r.gtfs_id, new_stop_id).await?;
+                    median_detour(&there, Some(route_ids.as_slice()), new_stop_id, a.at)
+                } else {
+                    median_detour(&calls, Some(route_ids.as_slice()), &r.stop_id, a.at)
+                }
+            }
+        };
+        entry["detour_m_after"] = json!(after.map(metres));
+        latest.3 = after;
+        draft_actions.push(entry);
+    }
+    let (new_position, new_stop_id, split_route_ids, latest_after) = latest;
+    let detour_after = match what_if {
+        Some(w) => median_detour(&calls, w.route_ids.as_deref(), &r.stop_id, w.at),
+        None => latest_after,
     };
     let mut out = r.json;
     out["stop"] = stop.unwrap_or(Value::Null);
@@ -632,6 +744,7 @@ pub async fn detail(
     out["new_stop_id"] = new_stop_id;
     out["split_route_ids"] = split_route_ids;
     out["detour_m_after"] = json!(detour_after.map(metres));
+    out["draft_actions"] = json!(draft_actions);
     out["problems"] = json!(found);
     Ok(out)
 }
@@ -667,14 +780,15 @@ fn invalid_change(f: Finding) -> EditorError {
         .with_details(json!({"code": f.code}))
 }
 
-/// The draft a reviewer's change goes into, and the review, both locked: the
-/// same feed, the draft still a draft, the review still pending.
+/// The draft a reviewer's action goes into, and the review, both locked: the
+/// same feed, the draft still a draft, the review pending or approved in that
+/// same draft. Also the changes the draft already holds for the review.
 async fn open_for_change(
     conn: &mut PgConnection,
     change_set_id: Uuid,
     id: i64,
     t: Transition,
-) -> EditorResult<(service::ChangeSet, Review, &'static str)> {
+) -> EditorResult<(service::ChangeSet, Review, Vec<ReviewChange>)> {
     let set = service::load_set(conn, change_set_id, true).await?;
     let r = load(conn, id, true).await?;
     if r.gtfs_id != set.gtfs_id {
@@ -687,26 +801,58 @@ async fn open_for_change(
         ));
     }
     service::editable(&set)?;
-    let status = next_status(&r.status, t).ok_or_else(|| not_pending(&r))?;
-    Ok((set, r, status))
+    next_status(&r.status, t).ok_or_else(|| not_pending(&r))?;
+    may_add_action(&r.status, r.change_set_id, set.change_set_id).map_err(
+        |refusal| match refusal {
+            Refusal::InOtherDraft(other) => EditorError::conflict(
+                "review_in_other_draft",
+                format!(
+                    "position review {id} already has changes in draft {other}; add to that \
+                     draft, or take them out of it first"
+                ),
+            )
+            .with_details(json!({"change_set_id": other})),
+            Refusal::NotPending => not_pending(&r),
+        },
+    )?;
+    let changes = review_changes(conn, set.change_set_id, id).await?;
+    Ok((set, r, changes))
 }
 
-/// Mark a review `status` (approved) with the change that carries it.
+fn draft_conflict(change_ids: Vec<i64>, what: String) -> EditorError {
+    EditorError::conflict(
+        "draft_conflict",
+        format!(
+            "change(s) {} in this draft already {what}",
+            change_ids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .with_details(json!({"change_ids": change_ids}))
+}
+
+/// Mark a review approved with an action in `change_set_id`. Its first action
+/// makes `change_id` the review's change; a later one keeps the earlier change,
+/// and the earlier note unless it brings its own.
 async fn mark_approved(
     conn: &mut PgConnection,
     ctx: &Ctx,
     id: i64,
-    status: &str,
     change_set_id: Uuid,
     change_id: i64,
     note: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE gtfs_position_review SET status = $2, change_set_id = $3, change_id = $4, \
-            reviewed_by = $5, reviewed_at = now(), review_note = $6 WHERE review_id = $1",
+        "UPDATE gtfs_position_review SET status = 'approved', change_set_id = $2, \
+            change_id = CASE WHEN status = 'approved' THEN change_id ELSE $3 END, \
+            reviewed_by = $4, reviewed_at = now(), \
+            review_note = CASE WHEN status = 'approved' THEN coalesce($5, review_note) ELSE $5 END \
+         WHERE review_id = $1",
     )
     .bind(id)
-    .bind(status)
     .bind(change_set_id)
     .bind(change_id)
     .bind(ctx.user.user_id)
@@ -737,8 +883,23 @@ pub async fn move_stop(
     }
     let note = note_text(body.note.as_deref());
     let mut tx = state.pool.begin().await?;
-    let (set, r, status) =
+    let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Move).await?;
+    // one move per review per draft: a second point is an edit of the first
+    let moves: Vec<i64> = changes
+        .iter()
+        .filter(|c| c.entity == "stop" && c.op == "update")
+        .map(|c| c.change_id)
+        .collect();
+    if !moves.is_empty() {
+        return Err(draft_conflict(
+            moves,
+            format!(
+                "move stop {} for this review; edit that change instead",
+                r.stop_id
+            ),
+        ));
+    }
     let row = service::stop_row(&mut tx, &r.gtfs_id, &r.stop_id).await?;
     let now = row.as_ref().and_then(StopNow::from_row);
     let draft = DraftView::load(&mut tx, set.change_set_id).await?;
@@ -765,7 +926,13 @@ pub async fn move_stop(
     }
     let after = json!({"lat": body.lat, "lon": body.lon, "position_review_id": id});
     check_payload("stop", "update", &r.stop_id, &after).map_err(invalid_change)?;
-    let route_calls = calls(&mut tx, &r.gtfs_id, &r.stop_id).await?;
+    // the stop keeps the routes the review's splits in this draft leave it
+    let gone = split_off(&changes);
+    let route_calls: Vec<Call> = calls(&mut tx, &r.gtfs_id, &r.stop_id)
+        .await?
+        .into_iter()
+        .filter(|c| !gone.contains(&c.route_id))
+        .collect();
     let change_id = service::insert_changes(
         &mut tx,
         set.change_set_id,
@@ -784,7 +951,6 @@ pub async fn move_stop(
         &mut tx,
         ctx,
         id,
-        status,
         set.change_set_id,
         change_id,
         note.as_deref(),
@@ -973,15 +1139,21 @@ pub fn split_request_problems(route_ids: &[String], lat: f64, lon: f64) -> Vec<S
 
 /// What stands in the way of splitting `route_ids` off stop `stop_id`, which
 /// the live routes `calling` call at: a route that does not call there (a
-/// deleted route never does), and taking every route away - that is a move.
+/// deleted route never does), and taking away every route the review's earlier
+/// splits in the draft (`gone`) leave it - that is a move.
 pub fn split_route_problems(
     stop_id: &str,
     route_ids: &[String],
     calling: &BTreeSet<&str>,
+    gone: &[String],
 ) -> Vec<SplitProblem> {
+    // a route this review already split off in this draft is not at the stop
+    // any more either; in practice `split_conflicts` refuses re-splitting it
+    // first (its route_stops change is already there), but this is the rule if
+    // that check is ever bypassed
     let mut out: Vec<SplitProblem> = route_ids
         .iter()
-        .filter(|id| !calling.contains(id.as_str()))
+        .filter(|id| !calling.contains(id.as_str()) || gone.iter().any(|g| g == *id))
         .map(|id| {
             SplitProblem::new(
                 "route_not_at_stop",
@@ -990,7 +1162,12 @@ pub fn split_route_problems(
             )
         })
         .collect();
-    if !calling.is_empty() && calling.iter().all(|c| route_ids.iter().any(|r| r == c)) {
+    let left: Vec<&str> = calling
+        .iter()
+        .copied()
+        .filter(|c| !gone.iter().any(|g| g == c))
+        .collect();
+    if !left.is_empty() && left.iter().all(|c| route_ids.iter().any(|r| r == c)) {
         out.push(SplitProblem::new(
             "would_empty_stop",
             None,
@@ -1015,24 +1192,28 @@ pub fn split_rows(rows: &[RouteRow], from: &str, to: &str) -> Vec<RouteRow> {
 }
 
 /// Changes in the draft a split would collide with: a stop list change of one
-/// of the routes, or a change to the reviewed stop (its update, delete or
-/// merge, or a merge into it).
+/// of the routes - a route this review already split off included - or a
+/// change to the reviewed stop (its update, delete or merge, or a merge into
+/// it) that was not made for this review.
 async fn split_conflicts(
     conn: &mut PgConnection,
     change_set_id: Uuid,
+    review_id: i64,
     stop_id: &str,
     route_ids: &[String],
 ) -> EditorResult<Vec<i64>> {
     Ok(sqlx::query(
         "SELECT change_id FROM gtfs_change WHERE change_set_id = $1 AND ( \
              (entity = 'route_stops' AND entity_key = ANY($2)) \
-             OR (entity = 'stop' AND entity_key = $3) \
+             OR (entity = 'stop' AND entity_key = $3 \
+                 AND (after->>'position_review_id') IS DISTINCT FROM $4) \
              OR (entity = 'stop' AND op = 'merge' AND btrim(after->>'into_stop_id') = $3)) \
          ORDER BY position",
     )
     .bind(change_set_id)
     .bind(route_ids)
     .bind(stop_id)
+    .bind(review_id.to_string())
     .fetch_all(&mut *conn)
     .await?
     .iter()
@@ -1062,23 +1243,14 @@ pub async fn split(
     let name = note_text(body.name.as_deref());
     let note = note_text(body.note.as_deref());
     let mut tx = state.pool.begin().await?;
-    let (set, r, status) =
+    let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Split).await?;
-    let conflicts = split_conflicts(&mut tx, set.change_set_id, &r.stop_id, &route_ids).await?;
+    let conflicts = split_conflicts(&mut tx, set.change_set_id, id, &r.stop_id, &route_ids).await?;
     if !conflicts.is_empty() {
-        return Err(EditorError::conflict(
-            "draft_conflict",
-            format!(
-                "change(s) {} in this draft already change stop {} or these routes' stop lists",
-                conflicts
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                r.stop_id
-            ),
-        )
-        .with_details(json!({"change_ids": conflicts})));
+        return Err(draft_conflict(
+            conflicts,
+            format!("change stop {} or these routes' stop lists", r.stop_id),
+        ));
     }
     let row = service::stop_row(&mut tx, &r.gtfs_id, &r.stop_id).await?;
     let now = row.as_ref().and_then(StopNow::from_row);
@@ -1089,7 +1261,7 @@ pub async fn split(
     };
     let route_calls = calls(&mut tx, &r.gtfs_id, &r.stop_id).await?;
     let calling: BTreeSet<&str> = route_calls.iter().map(|c| c.route_id.as_str()).collect();
-    let found = split_route_problems(&r.stop_id, &route_ids, &calling);
+    let found = split_route_problems(&r.stop_id, &route_ids, &calling, &split_off(&changes));
     if !found.is_empty() {
         return Err(invalid_split(found));
     }
@@ -1136,7 +1308,6 @@ pub async fn split(
         &mut tx,
         ctx,
         id,
-        status,
         set.change_set_id,
         change_ids[0],
         note.as_deref(),
@@ -1171,74 +1342,150 @@ pub async fn split(
 
 // ---------------------------------------------------------------- lifecycle
 
-/// A review whose change left its draft is pending again: every review with a
-/// change in `change_set_id` (only the one whose change is `change_id`, if
-/// given). A split's stop lists go with its new stop when that is taken out of
-/// an open draft; a discarded draft keeps its changes as they were.
-pub async fn return_to_pending(
+/// A change taken out of an open draft, as the review lifecycle needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemovedChange {
+    pub change_id: i64,
+    pub entity: String,
+    pub op: String,
+    pub entity_key: String,
+    pub position_review_id: Option<i64>,
+}
+
+/// What pending again means for a review: no draft, no change, no reviewer.
+const BACK_TO_PENDING: &str =
+    "UPDATE gtfs_position_review SET status = 'pending', change_set_id = NULL, change_id = NULL, \
+        reviewed_by = NULL, reviewed_at = NULL, review_note = NULL";
+
+/// A change left an open draft. A split's new stop takes that split's stop
+/// lists (the ones calling at it) with it. A review whose draft then holds none
+/// of its changes is pending again; otherwise it stays approved, known by its
+/// earliest remaining action.
+pub async fn change_removed(
     conn: &mut PgConnection,
     ctx: &Ctx,
     gtfs_id: &str,
     change_set_id: Uuid,
-    change_id: Option<i64>,
-    reason: &str,
+    removed: &RemovedChange,
 ) -> Result<(), sqlx::Error> {
-    let returned: Vec<(i64, String)> = sqlx::query(
-        "UPDATE gtfs_position_review SET status = 'pending', change_set_id = NULL, change_id = NULL, \
-            reviewed_by = NULL, reviewed_at = NULL, review_note = NULL \
-         WHERE change_set_id = $1 AND status = 'approved' AND ($2::int8 IS NULL OR change_id = $2) \
-         RETURNING review_id, stop_id",
+    let reviews: Vec<(i64, String, Option<i64>)> = sqlx::query(
+        "SELECT review_id, stop_id, change_id FROM gtfs_position_review \
+         WHERE change_set_id = $1 AND status = 'approved' AND (change_id = $2 OR review_id = $3) \
+         ORDER BY review_id FOR UPDATE",
     )
     .bind(change_set_id)
-    .bind(change_id)
+    .bind(removed.change_id)
+    .bind(removed.position_review_id)
     .fetch_all(&mut *conn)
     .await?
     .iter()
-    .map(|r| -> Result<(i64, String), sqlx::Error> {
-        Ok((r.try_get("review_id")?, r.try_get("stop_id")?))
+    .map(|r| -> Result<(i64, String, Option<i64>), sqlx::Error> {
+        Ok((
+            r.try_get("review_id")?,
+            r.try_get("stop_id")?,
+            r.try_get("change_id")?,
+        ))
     })
     .collect::<Result<_, _>>()?;
-    let mut removed: HashMap<i64, Vec<i64>> = HashMap::new();
-    if change_id.is_some() && !returned.is_empty() {
-        let ids: Vec<String> = returned.iter().map(|(id, _)| id.to_string()).collect();
-        let gone = sqlx::query(
-            "DELETE FROM gtfs_change WHERE change_set_id = $1 AND entity = 'route_stops' \
-               AND after->>'position_review_id' = ANY($2) \
-             RETURNING change_id, (after->>'position_review_id')::int8 AS review_id",
-        )
-        .bind(change_set_id)
-        .bind(&ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        let mut details = Vec::with_capacity(gone.len());
-        for g in &gone {
-            let (cid, rid): (i64, i64) = (g.try_get("change_id")?, g.try_get("review_id")?);
-            removed.entry(rid).or_default().push(cid);
-            details.push(
-                json!({"change_id": cid, "review_id": rid, "reason": "position_review_returned"}),
-            );
+    for (review_id, stop_id, change_id) in reviews {
+        let mut cascaded: Vec<i64> = Vec::new();
+        if removed.position_review_id == Some(review_id)
+            && removed.entity == "stop"
+            && removed.op == "create"
+        {
+            cascaded = sqlx::query(
+                "DELETE FROM gtfs_change c WHERE c.change_set_id = $1 AND c.entity = 'route_stops' \
+                   AND c.after->>'position_review_id' = $2 \
+                   AND EXISTS (SELECT 1 FROM jsonb_array_elements(c.after->'rows') x \
+                               WHERE x->>'stop_id' = $3) \
+                 RETURNING c.change_id",
+            )
+            .bind(change_set_id)
+            .bind(review_id.to_string())
+            .bind(&removed.entity_key)
+            .fetch_all(&mut *conn)
+            .await?
+            .iter()
+            .map(|r| r.try_get("change_id"))
+            .collect::<Result<_, _>>()?;
+            cascaded.sort_unstable();
+            let details: Vec<Value> = cascaded
+                .iter()
+                .map(|cid| {
+                    json!({"change_id": cid, "review_id": review_id,
+                           "new_stop_id": removed.entity_key, "reason": "split_removed"})
+                })
+                .collect();
+            auth::audit_many(
+                &mut *conn,
+                Some(ctx.user.user_id),
+                Some(&ctx.user.email),
+                "change_removed",
+                Some(gtfs_id),
+                Some(change_set_id),
+                &details,
+            )
+            .await?;
         }
-        auth::audit_many(
-            &mut *conn,
-            Some(ctx.user.user_id),
-            Some(&ctx.user.email),
-            "change_removed",
-            Some(gtfs_id),
-            Some(change_set_id),
-            &details,
-        )
-        .await?;
-    }
-    let details: Vec<Value> = returned
-        .iter()
-        .map(|(review_id, stop_id)| {
-            let mut d = json!({"review_id": review_id, "stop_id": stop_id, "reason": reason});
-            if let Some(ids) = removed.get(review_id) {
-                d["removed_change_ids"] = json!(ids);
+        let left = review_changes(conn, change_set_id, review_id).await?;
+        match first_change(&left) {
+            None => {
+                sqlx::query(&format!("{BACK_TO_PENDING} WHERE review_id = $1"))
+                    .bind(review_id)
+                    .execute(&mut *conn)
+                    .await?;
+                let mut detail =
+                    json!({"review_id": review_id, "stop_id": stop_id, "reason": "change_removed"});
+                if !cascaded.is_empty() {
+                    detail["removed_change_ids"] = json!(cascaded);
+                }
+                auth::audit(
+                    &mut *conn,
+                    Some(ctx.user.user_id),
+                    Some(&ctx.user.email),
+                    "position_review_returned",
+                    Some(gtfs_id),
+                    Some(change_set_id),
+                    detail,
+                )
+                .await?;
             }
-            d
-        })
-        .collect();
+            Some(first) if Some(first) != change_id => {
+                sqlx::query("UPDATE gtfs_position_review SET change_id = $2 WHERE review_id = $1")
+                    .bind(review_id)
+                    .bind(first)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A discarded draft returns every review approved in it to pending. Its
+/// changes stay as they were: a discarded draft never applies.
+pub async fn draft_discarded(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    gtfs_id: &str,
+    change_set_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let details = sqlx::query(&format!(
+        "{BACK_TO_PENDING} WHERE change_set_id = $1 AND status = 'approved' RETURNING review_id, stop_id"
+    ))
+    .bind(change_set_id)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        Ok(json!({
+            "review_id": r.try_get::<i64, _>("review_id")?,
+            "stop_id": r.try_get::<String, _>("stop_id")?,
+            "reason": "change_set_discarded",
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     auth::audit_many(
         &mut *conn,
         Some(ctx.user.user_id),
@@ -1371,6 +1618,8 @@ mod tests {
                 ("pending", Move, "approved"),
                 ("pending", Split, "approved"),
                 ("pending", Confirm, "confirmed"),
+                ("approved", Move, "approved"),
+                ("approved", Split, "approved"),
                 ("approved", Return, "pending"),
                 ("approved", Commit, "committed"),
                 ("confirmed", Reopen, "pending"),
@@ -1566,12 +1815,18 @@ mod tests {
             ]
         );
         let calling: BTreeSet<&str> = ["R1", "R2", "R3"].into_iter().collect();
-        assert!(split_route_problems("S", &ids(&["R1", "R3"]), &calling).is_empty());
+        let none: Vec<String> = vec![];
+        assert!(split_route_problems("S", &ids(&["R1", "R3"]), &calling, &none).is_empty());
         assert_eq!(
-            code(&split_route_problems("S", &ids(&["R1", "R9"]), &calling)),
+            code(&split_route_problems(
+                "S",
+                &ids(&["R1", "R9"]),
+                &calling,
+                &none
+            )),
             vec![("route_not_at_stop", Some("R9".into()))]
         );
-        let every = split_route_problems("S", &ids(&["R3", "R2", "R1"]), &calling);
+        let every = split_route_problems("S", &ids(&["R3", "R2", "R1"]), &calling, &none);
         assert_eq!(code(&every), vec![("would_empty_stop", None)]);
         assert_eq!(
             every[0].message,
@@ -1579,8 +1834,24 @@ mod tests {
         );
         // a stop no route calls at has nothing to empty; every route named is wrong
         assert_eq!(
-            code(&split_route_problems("S", &ids(&["R1"]), &BTreeSet::new())),
+            code(&split_route_problems(
+                "S",
+                &ids(&["R1"]),
+                &BTreeSet::new(),
+                &none
+            )),
             vec![("route_not_at_stop", Some("R1".into()))]
+        );
+        // a route this review already split off in the draft is gone: splitting
+        // the last remaining route would empty the stop too
+        let gone = ids(&["R1", "R2"]);
+        let found = split_route_problems("S", &ids(&["R3"]), &calling, &gone);
+        assert_eq!(code(&found), vec![("would_empty_stop", None)]);
+        // asking to split an already-gone route again is refused (in practice
+        // split_conflicts catches this first, with its own change already there)
+        assert_eq!(
+            code(&split_route_problems("S", &ids(&["R2"]), &calling, &gone)),
+            vec![("route_not_at_stop", Some("R2".into()))]
         );
     }
 

@@ -231,6 +231,8 @@ fn seed() -> Vec<String> {
         ("M2", "MERGED M", 13.0351, 80.2),
         ("N", "CONFIRM N", 13.05, 80.2),
         ("X", "SPARE X", 13.06, 80.2),
+        // a stop several splits and a move act on in one draft, together
+        ("KOL", "KOLATHUR", 13.07, 80.22),
     ];
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, platform_code) VALUES {}",
@@ -249,9 +251,12 @@ fn seed() -> Vec<String> {
          ('{FEED}', 'R5', '5', 'E To F', 'TESTAG', false), ('{FEED}', 'R6', '6', 'E To F', 'TESTAG', false), \
          ('{FEED}', 'R7', '7', 'G To H', 'TESTAG', false), ('{FEED}', 'R8', '8', 'GONE', 'TESTAG', true), \
          ('{FEED}', 'RM1', 'M1', 'K1 To K2', 'TESTAG', false), ('{FEED}', 'RM2', 'M2', 'K1 To K2', 'TESTAG', false), \
-         ('{FEED}', 'RN', 'N', 'N To X', 'TESTAG', false)"
+         ('{FEED}', 'RN', 'N', 'N To X', 'TESTAG', false), \
+         ('{FEED}', 'RKA', '583D', 'A To B via Kolathur', 'TESTAG', false), \
+         ('{FEED}', 'RKB', '500V', 'A To B via Kolathur', 'TESTAG', false), \
+         ('{FEED}', 'RKC', 'KC', 'A To B via Kolathur', 'TESTAG', false)"
     ));
-    let stop_rows: [(&str, i32, &str, &str, i32, &str); 29] = [
+    let stop_rows: [(&str, i32, &str, &str, i32, &str); 38] = [
         ("R1", 1, "A", "NEW STOP", 1, "STOP A"),
         ("R1", 2, "S", "INTERMEDIATE STOP", 1, "STOP A"),
         ("R1", 3, "B", "NEW STOP", 2, "STOP B"),
@@ -282,6 +287,16 @@ fn seed() -> Vec<String> {
         ("RM2", 1, "K1", "NEW STOP", 1, "STOP K1"),
         ("RM2", 2, "M2", "NEW STOP", 2, "MERGED M"),
         ("RM2", 3, "K2", "NEW STOP", 3, "STOP K2"),
+        // three routes calling KOL, one per group a split or the final move acts on
+        ("RKA", 1, "A", "NEW STOP", 1, "STOP A"),
+        ("RKA", 2, "KOL", "INTERMEDIATE STOP", 1, "STOP A"),
+        ("RKA", 3, "B", "NEW STOP", 2, "STOP B"),
+        ("RKB", 1, "A", "NEW STOP", 1, "STOP A"),
+        ("RKB", 2, "KOL", "INTERMEDIATE STOP", 1, "STOP A"),
+        ("RKB", 3, "B", "NEW STOP", 2, "STOP B"),
+        ("RKC", 1, "A", "NEW STOP", 1, "STOP A"),
+        ("RKC", 2, "KOL", "INTERMEDIATE STOP", 1, "STOP A"),
+        ("RKC", 3, "B", "NEW STOP", 2, "STOP B"),
     ];
     s.push(format!(
         "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, \
@@ -311,6 +326,18 @@ fn seed() -> Vec<String> {
         {"origin_stop_id": "T", "origin_name": "SPLIT T", "suspect": false, "route_ids": ["R7"], "route_numbers": ["7"]},
         {"origin_stop_id": "T_WEST", "origin_name": "SPLIT T", "suspect": true, "reason": "west road",
          "raw_lat": 13.011, "raw_lon": 80.2, "route_ids": ["R5", "R6"], "route_numbers": ["5", "6"]}]});
+    // four groups, one per action a reviewer takes: the stop's own (moved),
+    // two split off (583D, 500V), and one already resolved upstream - a
+    // load-time snapshot the live routes no longer confirm
+    let kol_groups = json!({"mixed_origins": true, "route_groups": [
+        {"origin_stop_id": "KOL", "origin_name": "KOLATHUR", "suspect": false,
+         "route_ids": ["RKC"], "route_numbers": ["KC"]},
+        {"origin_stop_id": "KOL_A", "origin_name": "KOLATHUR NEAR A", "suspect": true,
+         "reason": "583D area", "route_ids": ["RKA"], "route_numbers": ["583D"]},
+        {"origin_stop_id": "KOL_B", "origin_name": "KOLATHUR NEAR B", "suspect": true,
+         "reason": "500V area", "route_ids": ["RKB"], "route_numbers": ["500V"]},
+        {"origin_stop_id": "KOL_OLD", "origin_name": "KOLATHUR OLD", "suspect": true,
+         "reason": "already resolved upstream", "route_ids": ["RKD"], "route_numbers": ["300X"]}]});
     s.push(format!(
         "INSERT INTO gtfs_position_review (gtfs_id, batch, stop_id, original_stop_id, stop_name, reason, lat, lon, \
                                            raw_lat, raw_lon, suggested_lat, suggested_lon, suggested_source, evidence, status) VALUES \
@@ -320,6 +347,8 @@ fn seed() -> Vec<String> {
           NULL, '{groups}', 'pending'), \
          ('{FEED}', 'test-batch', 'M1', 'M1', 'MERGED M', 'a duplicate', 13.035, 80.2, NULL, NULL, NULL, NULL, NULL, '{{}}', 'pending'), \
          ('{FEED}', 'test-batch', 'N', 'N', 'CONFIRM N', 'looks right', 13.05045, 80.2, NULL, NULL, NULL, NULL, NULL, '{{}}', 'pending'), \
+         ('{FEED}', 'test-batch', 'KOL', 'KOL', 'KOLATHUR', 'routes from several places on one point', 13.07, 80.22, \
+          NULL, NULL, NULL, NULL, NULL, '{kol_groups}', 'pending'), \
          ('{FEED}', 'old-batch', 'A', 'A', 'STOP A', 'an older load', 13.0, 80.2, NULL, NULL, NULL, NULL, NULL, '{{}}', 'superseded')"
     ));
     s.extend(reset_accounts(&[ADMIN, EDITOR, APPROVER]));
@@ -428,11 +457,12 @@ async fn review_move_split_confirm_and_release() {
             format!("SELECT version FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
         )
     };
-    let (rs, rt, rm, rn) = (
+    let (rs, rt, rm, rn, rk) = (
         review_id(&pool, "S").await,
         review_id(&pool, "T").await,
         review_id(&pool, "M1").await,
         review_id(&pool, "N").await,
+        review_id(&pool, "KOL").await,
     );
     let get = |c: &Caller, id: i64| c.req("GET", &format!("/position-reviews/{id}"));
     let post = |c: &Caller, id: i64, action: &str, body: Value| {
@@ -459,7 +489,7 @@ async fn review_move_split_confirm_and_release() {
         .iter()
         .map(|x| x["stop_id"].as_str().unwrap())
         .collect();
-    assert_eq!(listed, vec!["S", "T", "M1", "N"]);
+    assert_eq!(listed, vec!["S", "T", "M1", "N", "KOL"]);
     let first = &list["items"][0];
     for field in [
         "review_id",
@@ -497,7 +527,7 @@ async fn review_move_split_confirm_and_release() {
     );
     assert_eq!(
         summary,
-        json!({"pending": 4, "approved": 0, "committed": 0, "confirmed": 0})
+        json!({"pending": 5, "approved": 0, "committed": 0, "confirmed": 0})
     );
     let find = |q: &str| editor_c.req("GET", &format!("/feeds/{FEED}/position-reviews?{q}"));
     let (_, found, _) = call!(&app, find("status=superseded"));
@@ -642,6 +672,7 @@ async fn review_move_split_confirm_and_release() {
     assert_eq!(change["before"]["stop_id"], "S");
     assert!(errors(&set_now).is_empty(), "{set_now}");
     assert_eq!(set_now["can_submit"], true, "{set_now}");
+    // a second move in the SAME draft is a repeat action, not a re-approval
     let (s, b, _) = call!(
         &app,
         post(
@@ -651,7 +682,8 @@ async fn review_move_split_confirm_and_release() {
             json!({"change_set_id": d1, "lat": 13.0012, "lon": 80.2})
         )
     );
-    assert_eq!((s, code_of(&b)), (409, "review_not_pending"), "{b}");
+    assert_eq!((s, code_of(&b)), (409, "draft_conflict"), "{b}");
+    assert_eq!(b["error"]["details"]["change_ids"], json!([move_change]));
     let (_, summary, _) = call!(
         &app,
         editor_c.req("GET", &format!("/feeds/{FEED}/position-reviews/summary"))
@@ -940,12 +972,14 @@ async fn review_move_split_confirm_and_release() {
     );
     assert_eq!(s, 201, "{b}");
     let rename = b["change_id"].as_i64().unwrap();
-    // T's review is approved in p1: the review check comes first
+    // T's review is approved in p1: a different draft is refused before the
+    // conflict with c1's own rename is even checked
     let (s, b, _) = call!(
         &app,
         post(&editor_c, rt, "split", split(&c1, json!(["R5"])))
     );
-    assert_eq!((s, code_of(&b)), (409, "review_not_pending"), "{b}");
+    assert_eq!((s, code_of(&b)), (409, "review_in_other_draft"), "{b}");
+    assert_eq!(b["error"]["details"]["change_set_id"], p1.as_str());
     // removing one of the stop lists leaves the rest, and the review approved
     let r6_change = changes[1]["change_id"].as_i64().unwrap();
     let (s, b, _) = call!(
@@ -1218,6 +1252,310 @@ async fn review_move_split_confirm_and_release() {
     );
     assert_eq!(s, 200);
 
+    // ======================================================== several actions, one review
+    // KOLATHUR carries three groups: 583D (RKA) and 500V (RKB) from elsewhere,
+    // and its own KC (RKC). A reviewer splits the first two off and moves the
+    // stop itself for the third, all before releasing one draft.
+    let (_, dk1, _) = call!(&app, new_set(&editor_c, "kolathur: split, split, move"));
+    let dk1 = dk1["change_set_id"].as_str().unwrap().to_string();
+    let kol_split = |set: &str, route_id: &str, lat: f64, lon: f64, name: &str| json!({"change_set_id": set, "route_ids": [route_id], "lat": lat, "lon": lon, "name": name});
+
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "split",
+            kol_split(&dk1, "RKA", 13.071, 80.221, "KOLATHUR (583D)")
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["status"], "approved");
+    let new_a = b["new_stop_id"].as_str().unwrap().to_string();
+    assert!(new_a.starts_with("ed_"), "{new_a}");
+
+    // a second split in the same draft: the review is already approved there
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "split",
+            kol_split(&dk1, "RKB", 13.072, 80.223, "KOLATHUR (500V)")
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["status"], "approved");
+    let new_b = b["new_stop_id"].as_str().unwrap().to_string();
+    assert!(new_b.starts_with("ed_") && new_b != new_a, "{new_b}");
+
+    // a different draft may not act on this review while it has changes in dk1
+    let (_, dk2, _) = call!(&app, new_set(&editor_c, "kolathur: a second draft"));
+    let dk2 = dk2["change_set_id"].as_str().unwrap().to_string();
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "move",
+            json!({"change_set_id": dk2, "lat": 13.075, "lon": 80.225})
+        )
+    );
+    assert_eq!((s, code_of(&b)), (409, "review_in_other_draft"), "{b}");
+    assert_eq!(b["error"]["details"]["change_set_id"], dk1.as_str());
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "split",
+            kol_split(&dk2, "RKC", 13.08, 80.23, "no")
+        )
+    );
+    assert_eq!((s, code_of(&b)), (409, "review_in_other_draft"), "{b}");
+    assert_eq!(b["error"]["details"]["change_set_id"], dk1.as_str());
+    let (s, _, _) = call!(
+        &app,
+        editor_c.req("POST", &format!("/change-sets/{dk2}/discard"))
+    );
+    assert_eq!(s, 200);
+
+    // move the stop itself, in the same draft as the two splits
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "move",
+            json!({"change_set_id": dk1, "lat": 13.075, "lon": 80.225})
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["status"], "approved");
+
+    // the draft has 2 creates, their route replaces, and 1 stop/update, in order
+    let (_, set_now, _) = call!(&app, editor_c.req("GET", &format!("/change-sets/{dk1}")));
+    assert_eq!(set_now["change_count"], 5, "{set_now}");
+    assert!(errors(&set_now).is_empty(), "{set_now}");
+    let kol_changes = set_now["changes"].as_array().unwrap();
+    let shape: Vec<(String, String, String)> = kol_changes
+        .iter()
+        .map(|c| {
+            (
+                c["entity"].as_str().unwrap().into(),
+                c["op"].as_str().unwrap().into(),
+                c["entity_key"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("stop".into(), "create".into(), new_a.clone()),
+            ("route_stops".into(), "replace".into(), "RKA".into()),
+            ("stop".into(), "create".into(), new_b.clone()),
+            ("route_stops".into(), "replace".into(), "RKB".into()),
+            ("stop".into(), "update".into(), "KOL".into()),
+        ]
+    );
+    let create_a_id = kol_changes[0]["change_id"].as_i64().unwrap();
+    let replace_a_id = kol_changes[1]["change_id"].as_i64().unwrap();
+    let create_b_id = kol_changes[2]["change_id"].as_i64().unwrap();
+    let replace_b_id = kol_changes[3]["change_id"].as_i64().unwrap();
+    let move_id = kol_changes[4]["change_id"].as_i64().unwrap();
+
+    // the review's draft_actions list all three, in change order; the singular
+    // fields are the latest action's (the move)
+    let (_, detail, _) = call!(&app, get(&editor_c, rk));
+    assert_eq!(detail["status"], "approved", "{detail}");
+    assert_eq!(detail["change_id"], create_a_id, "{detail}");
+    let kol_actions = detail["draft_actions"].as_array().unwrap();
+    assert_eq!(kol_actions.len(), 3, "{kol_actions:?}");
+    assert_eq!(
+        (
+            kol_actions[0]["kind"].clone(),
+            kol_actions[0]["change_id"].clone()
+        ),
+        (json!("split"), json!(create_a_id))
+    );
+    assert_eq!(kol_actions[0]["route_ids"], json!(["RKA"]));
+    assert_eq!(
+        (
+            kol_actions[1]["kind"].clone(),
+            kol_actions[1]["change_id"].clone()
+        ),
+        (json!("split"), json!(create_b_id))
+    );
+    assert_eq!(kol_actions[1]["route_ids"], json!(["RKB"]));
+    assert_eq!(
+        (
+            kol_actions[2]["kind"].clone(),
+            kol_actions[2]["change_id"].clone()
+        ),
+        (json!("move"), json!(move_id))
+    );
+    assert_eq!(
+        detail["new_position"],
+        json!({"lat": 13.075, "lon": 80.225})
+    );
+    assert_eq!(detail["new_stop_id"], Value::Null);
+    assert_eq!(detail["split_route_ids"], Value::Null);
+
+    // removing split A's create takes only its own route replace with it
+    let (s, b, _) = call!(
+        &app,
+        editor_c.req(
+            "DELETE",
+            &format!("/change-sets/{dk1}/changes/{create_a_id}")
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["change_count"], 3, "{b}");
+    let remaining_ids: Vec<i64> = b["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["change_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(remaining_ids, vec![create_b_id, replace_b_id, move_id]);
+    let (_, detail, _) = call!(&app, get(&editor_c, rk));
+    assert_eq!(detail["status"], "approved", "{detail}");
+    assert_eq!(detail["change_id"], create_b_id, "{detail}");
+    let cascade_audit = scalar_i64(
+        &pool,
+        format!(
+            "SELECT count(*) FROM gtfs_audit_log WHERE change_set_id = '{dk1}' AND action = 'change_removed' \
+             AND detail->>'change_id' = '{replace_a_id}' AND detail->>'review_id' = '{rk}' \
+             AND detail->>'new_stop_id' = '{new_a}' AND detail->>'reason' = 'split_removed'"
+        ),
+    )
+    .await;
+    assert_eq!(cascade_audit, 1);
+
+    // remove everything left: split B's create (cascading its replace), then the move
+    let (s, b, _) = call!(
+        &app,
+        editor_c.req(
+            "DELETE",
+            &format!("/change-sets/{dk1}/changes/{create_b_id}")
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["change_count"], 1, "{b}");
+    let (_, detail, _) = call!(&app, get(&editor_c, rk));
+    assert_eq!(
+        (detail["status"].clone(), detail["change_id"].clone()),
+        (json!("approved"), json!(move_id)),
+        "{detail}"
+    );
+    let (s, b, _) = call!(
+        &app,
+        editor_c.req("DELETE", &format!("/change-sets/{dk1}/changes/{move_id}"))
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["change_count"], 0, "{b}");
+    let (_, detail, _) = call!(&app, get(&editor_c, rk));
+    assert_eq!(
+        (
+            detail["status"].clone(),
+            detail["change_set_id"].clone(),
+            detail["change_id"].clone(),
+            detail["draft_actions"].clone(),
+        ),
+        (json!("pending"), Value::Null, Value::Null, json!([])),
+        "{detail}"
+    );
+    // dk1 is now empty (nothing left to submit); tidy it away
+    let (s, _, _) = call!(
+        &app,
+        editor_c.req("POST", &format!("/change-sets/{dk1}/discard"))
+    );
+    assert_eq!(s, 200);
+
+    // rebuild the same three actions in a fresh draft, and release it
+    let (_, dk3, _) = call!(&app, new_set(&editor_c, "kolathur: commit"));
+    let dk3 = dk3["change_set_id"].as_str().unwrap().to_string();
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "split",
+            kol_split(&dk3, "RKA", 13.071, 80.221, "KOLATHUR (583D)")
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    let new_a = b["new_stop_id"].as_str().unwrap().to_string();
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "split",
+            kol_split(&dk3, "RKB", 13.072, 80.223, "KOLATHUR (500V)")
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    let new_b = b["new_stop_id"].as_str().unwrap().to_string();
+    let (s, b, _) = call!(
+        &app,
+        post(
+            &editor_c,
+            rk,
+            "move",
+            json!({"change_set_id": dk3, "lat": 13.075, "lon": 80.225})
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+
+    let kolathur_version_before = feed_version().await;
+    for (who, path) in release(dk3.clone()) {
+        let c = if who == 0 { &editor_c } else { &approver };
+        let (s, b, _) = call!(&app, c.req("POST", &path));
+        assert_eq!(s, 200, "{path}: {b}");
+    }
+    assert_eq!(feed_version().await, kolathur_version_before + 1);
+
+    // RKA and RKB call the new stops now; RKC, never split, still calls KOL -
+    // at the point the move set
+    let kol_rows: Vec<(String, Option<String>)> = sqlx::query(&format!(
+        "SELECT route_id, stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' \
+         AND route_id IN ('RKA', 'RKB', 'RKC') AND sequence = 2 ORDER BY route_id"
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| (r.get("route_id"), r.get("stop_id")))
+    .collect();
+    assert_eq!(
+        kol_rows,
+        vec![
+            ("RKA".into(), Some(new_a.clone())),
+            ("RKB".into(), Some(new_b.clone())),
+            ("RKC".into(), Some("KOL".into())),
+        ]
+    );
+    let kol_stop = sqlx::query(&format!(
+        "SELECT lat, lon, deleted FROM gtfs_stop WHERE gtfs_id = '{FEED}' AND stop_id = 'KOL'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (kol_stop.get::<f64, _>("lat"), kol_stop.get::<f64, _>("lon")),
+        (13.075, 80.225)
+    );
+    assert!(!kol_stop.get::<bool, _>("deleted"));
+    let (_, detail, _) = call!(&app, get(&editor_c, rk));
+    assert_eq!(detail["status"], "committed", "{detail}");
+    assert!(detail["change_id"].is_i64(), "{detail}");
+    assert_eq!(detail["change_set_id"], dk3.as_str());
+    assert_eq!(
+        detail["new_position"],
+        json!({"lat": 13.075, "lon": 80.225})
+    );
+
     // ======================================================== summary and audit
     let (_, summary, _) = call!(
         &app,
@@ -1225,7 +1563,7 @@ async fn review_move_split_confirm_and_release() {
     );
     assert_eq!(
         summary,
-        json!({"pending": 1, "approved": 0, "committed": 2, "confirmed": 1})
+        json!({"pending": 1, "approved": 0, "committed": 3, "confirmed": 1})
     );
     let actions: Vec<String> = sqlx::query(&format!(
         "SELECT DISTINCT action FROM gtfs_audit_log WHERE gtfs_id = '{FEED}' AND action LIKE 'position_review_%'"

@@ -521,22 +521,28 @@ whose coordinate is suspected wrong: nandi's
 as carrying another stop's coordinate, or found off their own routes), loaded by
 `scripts/chennai-bus/editor/load_position_reviews.py`. A reviewer checks each one
 and either **moves** the stop — a `stop/update` change `{lat, lon, position_review_id}`
-into a draft, released through the normal submit / approve (someone else) / commit
-— or **confirms** the position is right, which closes it with no change.
+into a draft — or **splits** some of its routes onto a new stop (section 8.1), or
+**confirms** the position is right, which closes it with no change. A stop can need
+more than one of these: a busy stop can carry routes from several original places,
+so a review may collect several moves and splits — never more than one move — in
+one draft before it is released through the normal submit / approve (someone else)
+/ commit.
 
 | method | path | body / rule |
 |---|---|---|
 | GET | `/feeds/{g}/position-reviews?status=&bbox=&q=&limit=&cursor=` | `status` comma list (default `pending`); `bbox` on the loaded position; `q` trigram on name, exact on stop id. Item: `{review_id, stop_id, original_stop_id, stop_name, reason, lat, lon, raw_lat, raw_lon, suggested_lat, suggested_lon, suggested_source, evidence, status, change_set_id, change_set_title, reviewed_by_email, reviewed_at, review_note, batch}` |
 | GET | `/feeds/{g}/position-reviews/summary` | `{pending, approved, committed, confirmed}` |
 | GET | `/position-reviews/{id}` | the item plus, computed now from the tables: `stop` (current row), `routes: [{route_id, short_name, sequence, prev: {stop_id, name, lat, lon} \| null, next: {...} \| null}]` (every route that calls at the stop, previous and next SERVED stop), `detour_m` (median over routes of d(prev,stop)+d(stop,next)−d(prev,next)), and `problems: [{code, message}]` (`stop_deleted`, `stop_merged_away`, `moved_since_load` when the stop is > 25 m from the loaded position) |
-| POST | `/position-reviews/{id}/move` | editor+. `{change_set_id, lat, lon, note?}` → appends `stop/update` `{lat, lon, position_review_id}` (base_row_version = the stop's current) to the draft; review → `approved`. The response is the review detail, with `detour_m_after` for the new point |
+| POST | `/position-reviews/{id}/move` | editor+. `{change_set_id, lat, lon, note?}` → appends `stop/update` `{lat, lon, position_review_id}` (base_row_version = the stop's current) to the draft; review → `approved` (or stays `approved`, gaining this action, if it already has splits in the same draft). The response is the review detail, with `detour_m_after` for the new point |
 | POST | `/position-reviews/{id}/confirm` | editor+. `{note?}` pending → `confirmed` |
 | POST | `/position-reviews/{id}/reopen` | editor+. confirmed → pending |
 
 `stop/update` accepts an optional `position_review_id`. Lifecycle, as for station
-proposals: removing the change or discarding the draft returns the review to
-`pending`; committing marks it `committed`. Every transition is audited
-(`position_review_moved`, `position_review_confirmed`, `position_review_reopened`,
+proposals, but a review's draft can hold several of its changes at once (section
+8.1): removing one leaves the rest and the review `approved`; removing the last one,
+or discarding the draft, returns the review to `pending`; committing marks it
+`committed`. Every action is audited (`position_review_moved`,
+`position_review_split`, `position_review_confirmed`, `position_review_reopened`,
 `position_review_committed`, `position_review_returned`).
 
 Dashboard — "Coordinates to review" page: the list (pending first, counts, search,
@@ -569,24 +575,36 @@ Settled while implementing:
   its provenance names `merged_into`; on a move, also a merge in the draft), and
   `stop_is_station`. Warning: `moved_since_load` (not reported once committed: the
   review's own move is expected to move it).
-- The detail also carries `new_position` (`{lat, lon}`: where the review's change
-  puts the stop, or the new stop of a split; `null` without a change),
-  `new_stop_id` and `split_route_ids` (a split's, else `null`), and
-  `detour_m_after`: the median detour at `new_position`, over every call for a
-  move and over the split routes for a split; `null` without a change.
+- The detail also carries `draft_actions: [{kind: "move" | "split", change_id,
+  lat, lon, new_stop_id?, route_ids?, detour_m_after}]`, one entry per action the
+  review has in its current draft, in change order (empty without a draft): a
+  split's `detour_m_after` is the median over its own `route_ids`, computed at its
+  point; a move's is the median over the routes the review's splits in the same
+  draft leave at the stop. `new_position`, `new_stop_id`, `split_route_ids` and
+  `detour_m_after` are the same fields for the **latest** action (`new_position`
+  `{lat, lon}`; `new_stop_id`/`split_route_ids` are `null` for a move; all four are
+  `null` without a draft). `?lat=&lon=` (below) overrides `detour_m_after` only,
+  not `draft_actions`.
 - Before drafting anything, `GET /position-reviews/{id}?lat=&lon=` (optionally
   `&route_ids=a,b`) answers `detour_m_after` for that point, over those routes'
   calls or every call, and changes nothing - the detour a dragged pin would give.
   `lat` without `lon`, `route_ids` without a point, or a point out of range is 400
   `invalid_position`.
+- `/move` and `/split` both admit a review that is `pending`, or `approved` with
+  its existing changes in the body's own `change_set_id` (`may_add_action`); an
+  `approved` review with its changes in a **different** draft is 409
+  `review_in_other_draft` with `details.change_set_id`. A second `/move` on a
+  review that already has a `stop/update` in this draft is 409 `draft_conflict`
+  naming that change - edit it instead of adding another.
 - Move refusals: 400 `invalid_position` (out of range, or `0,0`), 400 `invalid_json`
   (a field that is not in the body above), 404 `review_not_found` /
   `change_set_not_found`, 400 `feed_mismatch`, 409 `change_set_not_draft`, 409
-  `review_not_pending` (`details.status`, `details.change_set_id`), 400
-  `review_has_problems` (`details.problems`; the live data plus the draft, taken as
-  applying; only errors refuse), 400 `position_unchanged` (within 0.5 m of where
-  the stop is: confirm instead). The change's `before` is the stop row; the note is
-  the review's `review_note`.
+  `review_not_pending` / `review_in_other_draft` (`details.status`,
+  `details.change_set_id`), 409 `draft_conflict` (`details.change_ids`; a repeat
+  move), 400 `review_has_problems` (`details.problems`; the live data plus the
+  draft, taken as applying; only errors refuse), 400 `position_unchanged` (within
+  0.5 m of where the stop is: confirm instead). A move keeps the review's earlier
+  note unless this call brings its own. The change's `before` is the stop row.
 - Confirm is from `pending` only (409 `review_not_pending`); the body may be left
   out, and a blank note is none. Reopen is from `confirmed` only (409
   `review_not_confirmed`), clears the review fields, and is 409 `review_superseded`
@@ -599,15 +617,21 @@ Settled while implementing:
   so a review's move cannot be edited into a rename. The id added to a change
   through `POST /change-sets/{id}/changes` is stored and ignored: only `/move` and
   `/split` tie a review to a draft.
-- Back to pending, `change_set_id`, `change_id`, `reviewed_by`, `reviewed_at` and
-  `review_note` are cleared; committed keeps the change's ids.
+- A review's `change_id` is its earliest remaining action's change (a move, or a
+  split's `stop/create`); removing that change moves `change_id` on to whatever is
+  now earliest, without touching the review's status. Back to pending -
+  `change_set_id`, `change_id`, `reviewed_by`, `reviewed_at` and `review_note` are
+  cleared; committed keeps the change's ids.
 - Audit details: `position_review_moved` `{review_id, stop_id, change_id, from,
-  to, moved_m, detour_m, detour_m_after, note}`; `position_review_confirmed`
-  `{review_id, stop_id, position, note}`; `position_review_reopened` `{review_id,
-  stop_id, note}` (the note it had); `position_review_returned` `{review_id,
-  stop_id, reason, removed_change_ids?}` (`reason` is `change_removed` or
-  `change_set_discarded`); `position_review_committed` `{review_id, stop_id,
-  change_id, feed_version}`.
+  to, moved_m, detour_m, detour_m_after, note}` (`detour_m`/`detour_m_after` over
+  the routes the review's splits in that draft leave at the stop, not every call);
+  `position_review_confirmed` `{review_id, stop_id, position, note}`;
+  `position_review_reopened` `{review_id, stop_id, note}` (the note it had);
+  `position_review_returned` `{review_id, stop_id, reason, removed_change_ids?}`
+  (`reason` is `change_removed` or `change_set_discarded`; one entry per review
+  actually emptied, not per change removed); `position_review_committed`
+  `{review_id, stop_id, change_id, feed_version}` (one per review with changes in
+  the committed draft, whatever their `change_id`).
 
 ### 8.1 Splitting routes off a stop
 
@@ -639,10 +663,12 @@ It appends to the draft, in order:
    stop id. All other row fields stay unchanged, `base_rows_hash` is the current
    hash, and `after.position_review_id` is set.
 
-Review → `approved`, with `change_set_id` and `change_id` = the stop/create change
-id. Response: the review detail, plus `new_stop_id` and `detour_m_after` (median
-over the split routes, computed at the new point with their prev/next served
-stops).
+Review → `approved` (or stays `approved`, gaining this action, if it already has a
+move or other splits in the same draft), with `change_set_id` set and `change_id`
+its earliest action's change (the stop/create, unless an earlier move or split is
+already there). Response: the review detail, plus `new_stop_id` and
+`detour_m_after` (median over the split routes, computed at the new point with
+their prev/next served stops).
 
 **Rules.**
 
@@ -654,15 +680,25 @@ stops).
     the stop, so the reviewer should use /move;
   - lat/lon invalid by the same rules as stop create.
 - 409 `draft_conflict` with `details.change_ids` when the draft already has a
-  `route_stops` change for one of those routes, or any change to the reviewed stop.
-- The review must be `pending`, same as /move. The draft must be open and editable
-  by the caller, same as /move.
-- Returning to pending: removing the `stop/create` from the draft also removes that
-  draft's `route_stops` changes carrying the same `position_review_id`, and the
-  review goes back to `pending`. Discarding the draft does the same. Removing just
-  one of the route changes leaves the others, and the review stays approved.
+  `route_stops` change for one of those routes, or a change to the reviewed stop
+  that was **not** made for this review (its own earlier move, or a station change
+  listing it as a member, do not conflict). `would_empty_stop` treats a route this
+  same review already split off in this draft as gone too, so two splits that
+  together take every route are refused on the second one, not silently allowed.
+- The review must be `pending`, or `approved` with its changes already in this same
+  draft (409 `review_in_other_draft` with `details.change_set_id` otherwise). The
+  draft must be open and editable by the caller, same as /move.
+- Returning to pending: removing a split's `stop/create` from the draft also
+  removes that split's `route_stops` changes (the ones whose rows call its new
+  stop id - a review's other split, or its move, is untouched). If the draft then
+  holds no more of the review's changes, it goes back to `pending`; otherwise it
+  stays `approved`, known by its earliest remaining action. Discarding the draft
+  always returns every review it left `approved` to `pending`. Removing just one
+  of a split's route changes (not its create) leaves the others, and the review
+  stays approved with that split short one route.
 - Committing marks the review `committed`, as for move.
-- Audit `position_review_split`, detail `{new_stop_id, route_ids, change_set_id}`.
+- Audit `position_review_split`, detail `{new_stop_id, route_ids, change_set_id}`,
+  one entry per split action (never merged across actions).
 - The new stop inherits nothing else: no station, platform_code or codes.
 - `route_stops/replace` accepts and ignores (stores) an optional
   `position_review_id` in `after`, the same way `stop/update` and `stop/create` do.
@@ -689,17 +725,68 @@ Settled while implementing:
   a warning "already present before this edit", as for any stop list, although
   the row now names the new stop: rows that differ from the live rows only in their
   stop are matched to their old selves. Anything else is graded as usual.
-- Removing the `stop/create` removes the stop lists carrying the review's id, each
-  audited as `change_removed` `{change_id, review_id, reason:
-  "position_review_returned"}`, and `position_review_returned` lists them in
-  `removed_change_ids`. Discarding the draft returns the review to `pending` and
-  leaves the discarded draft's changes as they were (a discarded draft never
-  applies, and proposals' changes stay in theirs too).
-- The detail of a split review: `new_stop_id`; `split_route_ids`, the draft's stop
-  lists that carry the review's id, in draft order; `new_position`, the new stop's
-  point; `detour_m_after` over those routes at that point (once committed, from
-  their calls at the new stop). The live `routes` are the reviewed stop's, so a
-  committed split's routes are no longer in them.
+- Removing a split's `stop/create` removes only **that split's** stop lists - the
+  draft's `route_stops` changes carrying the review's id whose rows call the
+  removed stop's id - each cascade-audited as `change_removed` `{change_id,
+  review_id, new_stop_id, reason: "split_removed"}`. A review's other split, or its
+  move, is a separate `stop/create` or `stop/update` and is untouched. Discarding
+  the draft returns every review it left `approved` to `pending` and leaves the
+  discarded draft's changes as they were (a discarded draft never applies, and
+  proposals' changes stay in theirs too).
+- The detail of a split review (`draft_actions`, section 8's detail bullet): each
+  split entry has `new_stop_id`; `route_ids`, that split's stop lists in draft
+  order; `lat`/`lon`, the new stop's point; `detour_m_after` over those routes at
+  that point (once committed, from their calls at the new stop, which is why a
+  committed split's routes are no longer in the live `routes` - those are the
+  reviewed stop's).
 - Audit `position_review_split` detail also has `review_id`, `stop_id`,
-  `change_id`, `route_change_ids`, `name`, `lat`, `lon`, `detour_m_after` and
-  `note`.
+  `change_id` (the split's own `stop/create`), `route_change_ids`, `name`, `lat`,
+  `lon`, `detour_m_after` and `note`.
+
+**Several actions on one review.** A stop can need more than one action - two
+splits and a move, or two splits alone: `29db2391b0` THIRUPORUR THANDALAM needs a
+Thiruporur split and a north-Thandalam split; KOLATHUR `bb3042f4cf` needs a 583D
+split, a 500V split, and possibly a move for a kerb issue. Settled while
+implementing this:
+
+1. `/move` and `/split` accept a review that is `pending`, or `approved` with its
+   `change_set_id` equal to the body's, in an editable draft (`may_add_action` in
+   `src/editor/position_reviews.rs`). Approved in a **different** draft is 409
+   `review_in_other_draft` with `details.change_set_id`.
+2. The `draft_conflict` checks ignore changes carrying this review's own
+   `position_review_id`, so a move plus later splits of the same stop coexist in
+   one draft. A second `/move` on a review that already has a `stop/update` in
+   this draft is 409 `draft_conflict`; edit that change in the draft instead of
+   adding another. Splitting a route that already has a `route_stops` change in
+   the draft is 409 `draft_conflict` too, which covers splitting the same route
+   twice (including by a different review, and including re-splitting a route
+   this same review already split off, though `would_empty_stop` would usually
+   refuse that request first).
+3. `would_empty_stop` counts the routes this review has already split off in this
+   draft (`split_off`) as gone, on top of `route_ids`: two splits that between
+   them would take every route are refused on the second call, naming
+   `would_empty_stop` rather than letting the stop empty silently. A `route_ids`
+   entry that repeats an already-split-off route is `route_not_at_stop` -
+   dead code in practice, since `draft_conflict` (rule 2) refuses it first, but
+   documented as the rule if that check is ever bypassed.
+4. The review's `change_id` is the earliest remaining action's change (a move
+   sorts by its `stop/update`'s position, a split by its `stop/create`'s;
+   `first_change` falls back to the earliest change of any kind if no action
+   remains but a stray stop list somehow does, which should not happen in
+   practice). Removing one split's `stop/create` removes only that split's route
+   changes - the ones whose rows call that new stop id - via `change_removed`. The
+   review returns to `pending` only when the draft is left holding none of its
+   changes (`first_change` is `None`); otherwise it stays `approved` and its
+   `change_id` moves to the new earliest action if that changed. Discarding the
+   draft returns it to pending as now, regardless of how many actions it had.
+5. Detail keeps the singular fields `new_position`, `new_stop_id`,
+   `split_route_ids` and `detour_m_after` as "the latest action" (last in change
+   order), and adds `draft_actions: [{kind: "move" | "split", change_id, lat, lon,
+   new_stop_id?, route_ids?, detour_m_after}]` for the review's current draft, in
+   change order. Each split's `detour_m_after` is over its own `route_ids`; a
+   move's is over the routes the review's splits in the same draft leave at the
+   stop (so a move added after a split answers against what the stop still
+   serves, not what it served before the split).
+6. Audit: one entry per action, exactly as a single-action review already wrote
+   (`position_review_moved` per move, `position_review_split` per split) - never
+   merged into one entry for a review with several actions in one draft.

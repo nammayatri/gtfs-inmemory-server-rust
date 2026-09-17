@@ -2799,18 +2799,24 @@ pub async fn delete_change(
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
-    let n = sqlx::query("DELETE FROM gtfs_change WHERE change_set_id = $1 AND change_id = $2")
-        .bind(id)
-        .bind(change_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if n == 0 {
-        return Err(EditorError::not_found(
-            "change_not_found",
-            "no such change in this set",
-        ));
-    }
+    let removed = sqlx::query(
+        "DELETE FROM gtfs_change WHERE change_set_id = $1 AND change_id = $2 \
+         RETURNING entity, op, entity_key, after->>'position_review_id' AS position_review_id",
+    )
+    .bind(id)
+    .bind(change_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| EditorError::not_found("change_not_found", "no such change in this set"))?;
+    let removed = super::position_reviews::RemovedChange {
+        change_id,
+        entity: removed.try_get("entity")?,
+        op: removed.try_get("op")?,
+        entity_key: removed.try_get("entity_key")?,
+        position_review_id: removed
+            .try_get::<Option<String>, _>("position_review_id")?
+            .and_then(|v| v.parse().ok()),
+    };
     auth::audit(
         &mut *tx,
         Some(ctx.user.user_id),
@@ -2830,15 +2836,7 @@ pub async fn delete_change(
         "change_removed",
     )
     .await?;
-    super::position_reviews::return_to_pending(
-        &mut tx,
-        ctx,
-        &set.gtfs_id,
-        id,
-        Some(change_id),
-        "change_removed",
-    )
-    .await?;
+    super::position_reviews::change_removed(&mut tx, ctx, &set.gtfs_id, id, &removed).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -3040,15 +3038,7 @@ pub async fn discard(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
         "change_set_discarded",
     )
     .await?;
-    super::position_reviews::return_to_pending(
-        &mut tx,
-        ctx,
-        &set.gtfs_id,
-        id,
-        None,
-        "change_set_discarded",
-    )
-    .await?;
+    super::position_reviews::draft_discarded(&mut tx, ctx, &set.gtfs_id, id).await?;
     tx.commit().await?;
     Ok(())
 }
