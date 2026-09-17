@@ -14,8 +14,10 @@
 // click and drag, position is correct and reopen, splitting routes off a stop
 // with routes from three original stops and its draft conflict, a stop merged
 // away); importing CSV files into a draft of 1,200 changes; submit, approve and
-// commit by a second person, a commit conflict, people and history; the
-// "Stations to review" link hiding once nothing is left to review.
+// commit by a second person, a commit conflict, people and history; a feed's
+// data source switched through a draft, approved by the admin who submitted it
+// (the override, its confirm, badge and history row); the "Stations to review"
+// link hiding once nothing is left to review.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1213,14 +1215,78 @@ try {
   await waitFor(`document.querySelectorAll("#page table tbody tr").length >= 1`, "feed settings table");
   const beforeConfig = await api("feeds/chennai_bus/config");
   check(["db", "preprocessed"].includes(beforeConfig.data_source), `chennai_bus config readable (${beforeConfig.data_source})`);
-  await click("Switch to");
-  await waitFor(`document.querySelector("dialog")?.innerText.includes("takes effect immediately")`, "the confirm dialog warns this is immediate, with no draft");
-  await click("Switch", "dialog");
-  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes("now serves from")`, "a toast confirms the switch");
-  const afterConfig = await api("feeds/chennai_bus/config");
-  check(afterConfig.data_source !== beforeConfig.data_source, `chennai_bus data_source flipped (${beforeConfig.data_source} -> ${afterConfig.data_source})`);
-  check(afterConfig.version === beforeConfig.version + 1, "the switch bumped the feed version");
+
+  // ---- policy: the switch goes through a draft (docs section 3, "Feed data source")
+  check(Array.isArray(beforeConfig.pending) && beforeConfig.pending.length === 0, "the feed config lists no pending draft yet");
+  check((await text("#page")).includes("approved by someone else and committed"), "the page says a switch goes through a draft");
+  const directWrite = await apiSend("POST", "feeds/chennai_bus/config", { data_source: "db" });
+  check(directWrite.status === 404 && directWrite.body?.error?.code === "endpoint_not_found", "the direct POST of a feed's config is gone");
+  await click("Add to draft: switch to");
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("only after the draft is submitted, approved by someone else and committed")`, "the confirm dialog says the switch waits for submit, approval and commit");
+  check(!(await text("dialog")).includes("immediately"), "the confirm dialog no longer says the switch is immediate");
+  await click("Add to draft", "dialog");
+  await chooseNewDraft("Smoke: switch the feed's data source");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes("Added to")`, "a toast says the switch went into the draft");
+  const configDraft = await activeDraftId();
+  const drafted = await api("feeds/chennai_bus/config");
+  check(drafted.data_source === beforeConfig.data_source && drafted.version === beforeConfig.version, "drafting the switch changed nothing live");
+  check(drafted.pending.length === 1 && drafted.pending[0].change_set_id === configDraft && drafted.pending[0].status === "draft"
+    && drafted.pending[0].data_source !== beforeConfig.data_source, "the feed config lists the draft as pending");
+  await waitFor(`!!document.querySelector('#page .feed-pending a[href="#/drafts/${configDraft}"]')`, "the feed settings row links to the draft carrying the switch");
   await shot("21-feed-settings");
+  const asEditor = await apiSend("PUT", `change-sets/${configDraft}/changes/${drafted.pending[0].change_id}`, { after: { data_source: "nonsense" } });
+  check(asEditor.status === 400 && asEditor.body?.error?.details?.code === "invalid_data_source", "a bad data source is refused as an invalid change");
+  await go(`#/drafts/${configDraft}`);
+  await waitFor(`document.getElementById("page").innerText.includes("Data source of feed chennai_bus")`, "the draft shows the data source switch");
+  check((await text("#page")).includes("Served from") && (await text("#page")).includes("keeps serving this feed as it does now"), "the change reads as a before and after that waits for the commit");
+  await click("Submit for review");
+  await click("Submit for review", "dialog");
+  await waitFor(`!!document.getElementById("self-approve")`, "the submitted draft, for the admin who submitted it");
+
+  // ---- policy: admin self-approval (docs section 2)
+  check(await evaluate(`[...document.querySelectorAll("#page .actionbar button")].some((b) => b.textContent.trim() === "Approve" && b.disabled)`), "the ordinary Approve stays off for the submitter, admin or not");
+  check(await evaluate(`(() => { const b = document.getElementById("self-approve"); return b.textContent.includes("Approve it myself (admin override)") && b.classList.contains("danger"); })()`), "an admin sees a separate override button on their own draft, not the main action");
+  const noFlag = await apiSend("POST", `change-sets/${configDraft}/approve`, {});
+  check(noFlag.status === 403 && noFlag.body?.error?.code === "own_change_set" && noFlag.body.error.details.can_self_approve === true, "without self_approve the admin is refused, and told the override exists");
+  await clickSel("#self-approve", "Approve it myself (admin override)");
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("You submitted this draft. Approving it yourself skips the second reviewer. Continue?")`, "the override asks first, in the agreed words");
+  await click("Approve it myself", "dialog");
+  await waitFor(`!!document.querySelector("#page .page-head .chip.self-approved")`, "the draft's header carries a self-approved badge");
+  check((await text("#page .timeline")).includes("admin override"), "the draft's timeline says it was an admin override");
+  const approvedSelf = await api(`change-sets/${configDraft}`);
+  check(approvedSelf.status === "approved" && approvedSelf.self_approved === true, "the draft is approved and marked self_approved");
+  check((await api("feeds/chennai_bus/config")).data_source === beforeConfig.data_source, "approval alone switches nothing");
+  await go("#/drafts?status=approved");
+  await waitFor(`!!document.querySelector("#page tbody .chip.self-approved")`, "the drafts list marks the self-approved draft");
+  await go(`#/drafts/${configDraft}`);
+  await waitFor(`document.body.innerText.includes("Commit and go live")`, "commit button for the admin's self-approved draft");
+  await click("Commit and go live");
+  await click("Commit and go live", "dialog");
+  await waitFor(`document.getElementById("page").innerText.includes("is live")`, "the self-approved draft committed by the same admin");
+  const afterConfig = await api("feeds/chennai_bus/config");
+  check(afterConfig.data_source !== beforeConfig.data_source, `chennai_bus data_source flipped at commit (${beforeConfig.data_source} -> ${afterConfig.data_source})`);
+  check(afterConfig.version === beforeConfig.version + 1, "the commit bumped the feed version once");
+  check(afterConfig.pending.length === 0, "nothing is pending once committed");
+  await go("#/audit");
+  await waitFor(`document.body.innerText.includes("Approved their own draft (admin override")`, "history names the self-approval for what it was");
+  check(await evaluate(`(() => { const tr = document.querySelector("#page tr.audit-override"); return !!tr && !!tr.querySelector(".chip.override") && tr.innerText.includes("no second reviewer"); })()`), "the self-approval row stands out in the history, with a badge");
+  const policyHistory = await text("#page");
+  check(policyHistory.includes("Changed a feed's data source"), "history shows the data source change, written at commit");
+  check(policyHistory.includes("self-approved (admin override)"), "the commit's history row says it was self-approved");
+  await shot("21b-self-approved-history");
+
+  // nobody but an admin has the override
+  await signIn("approver1@nammayatri.in");
+  const ownSet = (await apiSend("POST", "feeds/chennai_bus/change-sets", { title: "Smoke: an approver's own draft" })).body;
+  const anyStop = (await api("feeds/chennai_bus/stops?limit=1")).items[0];
+  await apiSend("POST", `change-sets/${ownSet.change_set_id}/changes`, { entity: "stop", op: "update", entity_key: anyStop.stop_id, after: { platform_code: "Smoke kerb" } });
+  await apiSend("POST", `change-sets/${ownSet.change_set_id}/submit`);
+  const notAdmin = await apiSend("POST", `change-sets/${ownSet.change_set_id}/approve`, { self_approve: true });
+  check(notAdmin.status === 403 && notAdmin.body?.error?.code === "own_change_set" && notAdmin.body.error.details.can_self_approve === false, "an approver cannot self-approve, flag or not");
+  await go(`#/drafts/${ownSet.change_set_id}`);
+  await waitFor(`document.getElementById("page").innerText.includes("Smoke: an approver's own draft")`, "the approver's own submitted draft");
+  check(!(await has("#self-approve")), "a non-admin never sees the override button");
+  await apiSend("POST", `change-sets/${ownSet.change_set_id}/discard`);
 
   // a non-admin never sees the nav entry, or the page's controls by address
   await signIn("editor1@nammayatri.in");

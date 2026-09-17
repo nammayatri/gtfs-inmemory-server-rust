@@ -2,6 +2,7 @@
 
 use super::auth::{self, Role};
 use super::bulk;
+use super::context;
 use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
 use super::position_reviews;
@@ -355,22 +356,6 @@ pub async fn feed_config(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeedConfigPatch {
-    data_source: String,
-}
-
-pub async fn feed_config_update(
-    req: HttpRequest,
-    st: Data,
-    path: web::Path<String>,
-    body: web::Json<FeedConfigPatch>,
-) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
-    ok(svc::set_feed_data_source(&st, &ctx, &path, &body.data_source).await?)
-}
-
-#[derive(Deserialize)]
 pub struct StopsQuery {
     q: Option<String>,
     bbox: Option<String>,
@@ -450,6 +435,29 @@ pub async fn route(
     let (g, id) = path.into_inner();
     let mut conn = st.pool.acquire().await?;
     ok(svc::route_detail(&mut conn, &g, &id).await?)
+}
+
+/// What a person cleaning up a stop wants beside it (docs section 9).
+pub async fn stop_context(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let (g, id) = path.into_inner();
+    let mut conn = st.pool.acquire().await?;
+    ok(context::stop(&mut conn, &g, &id).await?)
+}
+
+pub async fn route_context(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let (g, id) = path.into_inner();
+    let mut conn = st.pool.acquire().await?;
+    ok(context::route(&mut conn, &g, &id).await?)
 }
 
 #[derive(Deserialize)]
@@ -643,6 +651,9 @@ pub async fn reopen(
 pub struct ReviewBody {
     #[serde(default)]
     comment: Option<String>,
+    /// Approve only: an admin approving a set they submitted says so here.
+    #[serde(default)]
+    self_approve: bool,
 }
 
 pub async fn approve(
@@ -653,7 +664,15 @@ pub async fn approve(
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Approver).await?;
     let body = body.map(|b| b.into_inner()).unwrap_or_default();
-    svc::review(&st, &ctx, *path, true, body.comment.as_deref()).await?;
+    svc::review(
+        &st,
+        &ctx,
+        *path,
+        true,
+        body.comment.as_deref(),
+        body.self_approve,
+    )
+    .await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
 
@@ -664,7 +683,7 @@ pub async fn reject(
     body: web::Json<ReviewBody>,
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Approver).await?;
-    svc::review(&st, &ctx, *path, false, body.comment.as_deref()).await?;
+    svc::review(&st, &ctx, *path, false, body.comment.as_deref(), false).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
 
@@ -705,6 +724,8 @@ pub struct ProposalsQuery {
     status: Option<String>,
     bbox: Option<String>,
     q: Option<String>,
+    /// position reviews only: what the advisory tool suggests (section 8.2)
+    auto_fix: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -811,7 +832,7 @@ pub async fn position_reviews(
 ) -> EditorResult<HttpResponse> {
     auth::require(&req, &st, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
-    ok(position_reviews::list(&st, &path, &q.filters()?, &page).await?)
+    ok(position_reviews::list(&st, &path, &q.filters()?, q.auto_fix.as_deref(), &page).await?)
 }
 
 pub async fn position_review_summary(
@@ -824,12 +845,16 @@ pub async fn position_review_summary(
 }
 
 /// `lat` and `lon` ask what detour a point would give, over the routes in
-/// `route_ids` (a comma list) or over every route.
+/// `route_ids` (a comma list) or over every route. `stop_id` asks instead what
+/// merging the reviewed stop into that stop would give, and what the merge's
+/// validation says - on top of draft `change_set`, when given.
 #[derive(Deserialize)]
 pub struct ReviewDetailQuery {
     lat: Option<f64>,
     lon: Option<f64>,
     route_ids: Option<String>,
+    stop_id: Option<String>,
+    change_set: Option<Uuid>,
 }
 
 pub async fn position_review(
@@ -838,7 +863,7 @@ pub async fn position_review(
     path: web::Path<i64>,
     q: web::Query<ReviewDetailQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    let ctx = auth::require(&req, &st, Role::Viewer).await?;
     let route_ids = q.route_ids.as_deref().map(|ids| {
         ids.split(',')
             .map(str::trim)
@@ -846,10 +871,29 @@ pub async fn position_review(
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
-    let what_if = match (q.lat, q.lon) {
-        (None, None) if route_ids.is_none() => None,
-        (Some(lat), Some(lon)) if valid_lat_lon(lat, lon) && (lat, lon) != (0.0, 0.0) => {
-            Some(position_reviews::WhatIf {
+    let into = q
+        .stop_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let what_if = match (q.lat, q.lon, into) {
+        (None, None, Some(stop_id)) if route_ids.is_none() => {
+            Some(position_reviews::WhatIf::MergeInto {
+                stop_id: stop_id.to_string(),
+                change_set: q.change_set,
+            })
+        }
+        (_, _, Some(_)) => {
+            return Err(EditorError::bad_request(
+                "invalid_query",
+                "stop_id asks about a merge and is sent without lat, lon or route_ids",
+            ))
+        }
+        (None, None, None) if route_ids.is_none() && q.change_set.is_none() => None,
+        (Some(lat), Some(lon), None)
+            if valid_lat_lon(lat, lon) && (lat, lon) != (0.0, 0.0) && q.change_set.is_none() =>
+        {
+            Some(position_reviews::WhatIf::Point {
                 at: (lat, lon),
                 route_ids,
             })
@@ -860,7 +904,7 @@ pub async fn position_review(
         )),
     };
     let mut conn = st.pool.acquire().await?;
-    ok(position_reviews::detail(&mut conn, *path, what_if.as_ref()).await?)
+    ok(position_reviews::detail(&mut conn, *path, what_if.as_ref(), &ctx.user.email).await?)
 }
 
 pub async fn position_review_move(
@@ -881,6 +925,16 @@ pub async fn position_review_split(
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Editor).await?;
     ok(position_reviews::split(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+pub async fn position_review_merge(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<position_reviews::MergeBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(position_reviews::merge(&st, &ctx, *path, body.into_inner()).await?)
 }
 
 pub async fn position_review_confirm(

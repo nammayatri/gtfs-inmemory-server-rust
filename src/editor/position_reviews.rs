@@ -4,7 +4,9 @@
 //!
 //!   - moves the stop: a `stop/update` of its position goes into a draft,
 //!   - splits some routes off it: a new stop at another point, and those routes'
-//!     stop lists pointed at it, go into a draft, or
+//!     stop lists pointed at it, go into a draft,
+//!   - merges it into another stop of the same name (section 8.2): a `stop/merge`
+//!     goes into a draft, by the same code path any merge is added by, or
 //!   - confirms that the position is right, which closes the review and changes
 //!     nothing.
 //!
@@ -143,6 +145,8 @@ pub enum Transition {
     Move,
     /// a reviewer adds a split of some routes onto a new stop to a draft
     Split,
+    /// a reviewer adds a merge of the stop into another stop to a draft
+    Merge,
     /// a reviewer says the position is right
     Confirm,
     /// a confirmed review is opened again
@@ -160,7 +164,9 @@ pub enum Transition {
 /// [`mark_committed`].
 pub fn next_status(status: &str, t: Transition) -> Option<&'static str> {
     match (status, t) {
-        ("pending" | "approved", Transition::Move | Transition::Split) => Some("approved"),
+        ("pending" | "approved", Transition::Move | Transition::Split | Transition::Merge) => {
+            Some("approved")
+        }
         ("pending", Transition::Confirm) => Some("confirmed"),
         ("confirmed", Transition::Reopen) => Some("pending"),
         ("approved", Transition::Return) => Some("pending"),
@@ -199,10 +205,15 @@ pub struct ReviewChange {
     pub entity: String,
     pub op: String,
     pub entity_key: String,
-    /// the point a stop update or create sets
+    /// the point a stop update or create sets; for a merge, where the stop it
+    /// merges into is
     pub at: Option<(f64, f64)>,
     /// the stops a stop list's rows call at
     pub row_stops: Vec<String>,
+    /// the stop a merge merges into
+    pub into_stop_id: Option<String>,
+    /// the routes a merge moves to that stop (its `before.affected`)
+    pub merged_routes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,9 +225,14 @@ pub enum ActionKind {
         new_stop_id: String,
         route_ids: Vec<String>,
     },
+    /// the reviewed stop goes away: its routes call at this stop, at the point
+    Merge {
+        into_stop_id: String,
+        route_ids: Vec<String>,
+    },
 }
 
-/// One move or split a review has in its draft.
+/// One move, split or merge a review has in its draft.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub change_id: i64,
@@ -225,7 +241,8 @@ pub struct Action {
 }
 
 /// A review's actions, in change order: each stop update is a move, each stop
-/// create a split whose routes are the stop lists that call at its new stop.
+/// create a split whose routes are the stop lists that call at its new stop, a
+/// stop merge a merge (the only action of a review that has one).
 pub fn actions(changes: &[ReviewChange]) -> Vec<Action> {
     changes
         .iter()
@@ -243,6 +260,10 @@ pub fn actions(changes: &[ReviewChange]) -> Vec<Action> {
                         .map(|x| x.entity_key.clone())
                         .collect(),
                 },
+                ("stop", "merge") => ActionKind::Merge {
+                    into_stop_id: c.into_stop_id.clone()?,
+                    route_ids: c.merged_routes.clone(),
+                },
                 _ => return None,
             };
             Some(Action {
@@ -259,7 +280,7 @@ pub fn actions(changes: &[ReviewChange]) -> Vec<Action> {
 pub fn first_change(changes: &[ReviewChange]) -> Option<i64> {
     changes
         .iter()
-        .find(|c| c.entity == "stop" && matches!(c.op.as_str(), "update" | "create"))
+        .find(|c| c.entity == "stop" && matches!(c.op.as_str(), "update" | "create" | "merge"))
         .or(changes.first())
         .map(|c| c.change_id)
 }
@@ -277,7 +298,8 @@ pub fn split_off(changes: &[ReviewChange]) -> Vec<String> {
 }
 
 /// The changes draft `change_set_id` holds for review `review_id`, in change
-/// order.
+/// order. A merge's point is the live position of the stop it merges into, or
+/// the one the draft creates that stop at.
 async fn review_changes(
     conn: &mut PgConnection,
     change_set_id: Uuid,
@@ -285,12 +307,24 @@ async fn review_changes(
 ) -> Result<Vec<ReviewChange>, sqlx::Error> {
     sqlx::query(
         "SELECT c.change_id, c.entity, c.op, c.entity_key, \
-                (c.after->>'lat')::float8 AS lat, (c.after->>'lon')::float8 AS lon, \
+                coalesce((c.after->>'lat')::float8, i.lat, (k.after->>'lat')::float8) AS lat, \
+                coalesce((c.after->>'lon')::float8, i.lon, (k.after->>'lon')::float8) AS lon, \
+                CASE WHEN c.op = 'merge' THEN btrim(c.after->>'into_stop_id') END AS into_stop_id, \
                 ARRAY(SELECT DISTINCT x->>'stop_id' FROM jsonb_array_elements( \
                           CASE WHEN jsonb_typeof(c.after->'rows') = 'array' THEN c.after->'rows' \
                                ELSE '[]'::jsonb END) x \
-                      WHERE x->>'stop_id' IS NOT NULL) AS row_stops \
+                      WHERE x->>'stop_id' IS NOT NULL) AS row_stops, \
+                ARRAY(SELECT x->>'route_id' FROM jsonb_array_elements( \
+                          CASE WHEN c.op = 'merge' AND jsonb_typeof(c.before->'affected') = 'array' \
+                               THEN c.before->'affected' ELSE '[]'::jsonb END) x \
+                      WHERE x->>'route_id' IS NOT NULL) AS merged_routes \
          FROM gtfs_change c \
+         JOIN gtfs_change_set cs ON cs.change_set_id = c.change_set_id \
+         LEFT JOIN gtfs_stop i ON c.op = 'merge' AND i.gtfs_id = cs.gtfs_id \
+              AND i.stop_id = btrim(c.after->>'into_stop_id') \
+         LEFT JOIN gtfs_change k ON c.op = 'merge' AND k.change_set_id = c.change_set_id \
+              AND k.entity = 'stop' AND k.op = 'create' \
+              AND k.entity_key = btrim(c.after->>'into_stop_id') \
          WHERE c.change_set_id = $1 AND c.after->>'position_review_id' = $2 ORDER BY c.position",
     )
     .bind(change_set_id)
@@ -307,6 +341,8 @@ async fn review_changes(
             entity_key: r.try_get("entity_key")?,
             at: lat.zip(lon),
             row_stops: r.try_get("row_stops")?,
+            into_stop_id: r.try_get("into_stop_id")?,
+            merged_routes: r.try_get("merged_routes")?,
         })
     })
     .collect()
@@ -572,13 +608,26 @@ fn neighbour_json(n: Option<&Neighbour>) -> Value {
 
 // ---------------------------------------------------------------- reads
 
+/// What nandi's advisory tool suggests for a review, in
+/// `evidence.auto_fix.action` (section 8.2); the list filters on it and the
+/// summary counts it.
+pub const AUTO_FIX_ACTIONS: [&str; 4] = ["merge", "move", "choose", "none"];
+
 pub async fn list(
     state: &EditorState,
     gtfs_id: &str,
     query: &ListQuery,
+    auto_fix: Option<&str>,
     page: &Page,
 ) -> EditorResult<Value> {
     let statuses = parse_status_list(query.status.as_deref(), &STATUSES)?;
+    let auto_fix = auto_fix.map(str::trim).filter(|a| !a.is_empty());
+    if auto_fix.is_some_and(|a| !AUTO_FIX_ACTIONS.contains(&a)) {
+        return Err(EditorError::bad_request(
+            "invalid_auto_fix",
+            format!("auto_fix is one of {}", AUTO_FIX_ACTIONS.join(", ")),
+        ));
+    }
     let q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let (min_lat, min_lon, max_lat, max_lon) = match query.bbox {
         Some((a, b, c, d)) => (Some(a), Some(b), Some(c), Some(d)),
@@ -590,6 +639,7 @@ pub async fn list(
            AND ($3::float8 IS NULL OR (r.lat BETWEEN $3 AND $5 AND r.lon BETWEEN $4 AND $6)) \
            AND ($7::text IS NULL OR r.stop_id = $7 OR r.original_stop_id = $7 \
                 OR r.stop_name ILIKE $8 OR r.stop_name % $7) \
+           AND ($12::text IS NULL OR r.evidence->'auto_fix'->>'action' = $12) \
          ORDER BY (r.stop_id = $7 OR r.original_stop_id = $7) DESC NULLS LAST, \
                   similarity(r.stop_name, coalesce($7, '')) DESC, \
                   array_position($9::text[], r.status), r.review_id \
@@ -606,6 +656,7 @@ pub async fn list(
     .bind(&STATUSES[..])
     .bind(page.limit + 1)
     .bind(page.offset)
+    .bind(auto_fix)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -629,28 +680,83 @@ pub async fn summary(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> 
             out[status] = json!(r.try_get::<i64, _>("n")?);
         }
     }
+    // what the advisory tool suggests for the reviews still waiting
+    let rows = sqlx::query(
+        "SELECT evidence->'auto_fix'->>'action' AS action, count(*) AS n FROM gtfs_position_review \
+         WHERE gtfs_id = $1 AND status = 'pending' AND evidence->'auto_fix'->>'action' IS NOT NULL \
+         GROUP BY 1",
+    )
+    .bind(gtfs_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut auto_fix = json!({"merge": 0, "move": 0, "choose": 0, "none": 0});
+    for r in &rows {
+        let action: String = r.try_get("action")?;
+        if auto_fix.get(&action).is_some() {
+            auto_fix[action] = json!(r.try_get::<i64, _>("n")?);
+        }
+    }
+    out["auto_fix"] = auto_fix;
     Ok(out)
 }
 
-/// A point to ask the detour at, before moving or splitting anything: at `at`,
-/// over the calls of `route_ids` when given, otherwise over every call.
+/// What to ask the detour of before drafting anything.
 #[derive(Debug, Clone, PartialEq)]
-pub struct WhatIf {
-    pub at: (f64, f64),
-    pub route_ids: Option<Vec<String>>,
+pub enum WhatIf {
+    /// the stop at `at`, over the calls of `route_ids` when given, otherwise
+    /// over every call: a move, or a split
+    Point {
+        at: (f64, f64),
+        route_ids: Option<Vec<String>>,
+    },
+    /// the stop merged into `stop_id`: every call measured where that stop is,
+    /// and what the `stop/merge` validation says - on top of draft
+    /// `change_set`, when given
+    MergeInto {
+        stop_id: String,
+        change_set: Option<Uuid>,
+    },
+}
+
+/// The `after` of the merge of a reviewed stop into `into`, as `/merge` drafts
+/// it and as the dry question asks about it.
+fn merge_after(into: &str, into_row_version: Option<i64>, keep_name: &str, id: i64) -> Value {
+    json!({
+        "into_stop_id": into, "into_row_version": into_row_version, "keep_name": keep_name,
+        "keep_position": "into", "position_review_id": id,
+    })
+}
+
+/// Where stop `id` is once `draft` applies: where the draft puts it, else where
+/// it is now; `None` when there is no such stop.
+async fn stop_point(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    draft: Option<&DraftView>,
+) -> EditorResult<Option<(f64, f64)>> {
+    if let Some(at) = draft.and_then(|d| d.stop_position(id)) {
+        return Ok(Some(at));
+    }
+    Ok(service::stop_row(conn, g, id)
+        .await?
+        .and_then(|s| Some((s["lat"].as_f64()?, s["lon"].as_f64()?))))
 }
 
 /// The review with its stop as it is now, every call a route makes there with
 /// its detour, the median detour, what stands in the way of changing it, and
 /// its actions in its draft (`draft_actions`, in change order), each with the
 /// detour it gives: a split over its own routes at its new stop's point, a move
-/// over the routes the review's splits leave at the stop. The singular
-/// `new_position`, `new_stop_id`, `split_route_ids` and `detour_m_after` are the
-/// latest action's; `what_if`, when given, answers `detour_m_after` instead.
+/// over the routes the review's splits leave at the stop, a merge over every
+/// call, at the point of the stop it merges into. The singular `new_position`,
+/// `new_stop_id`, `split_route_ids`, `merge_into_stop_id` and `detour_m_after`
+/// are the latest action's; `what_if`, when given, answers `detour_m_after`
+/// instead - and, for a merge, `merge_problems`. `actor` is who asks.
 pub async fn detail(
     conn: &mut PgConnection,
     id: i64,
     what_if: Option<&WhatIf>,
+    actor: &str,
 ) -> EditorResult<Value> {
     let r = load(conn, id, false).await?;
     let stop = service::stop_row(conn, &r.gtfs_id, &r.stop_id).await?;
@@ -691,18 +797,15 @@ pub async fn detail(
         .cloned()
         .collect();
     let mut draft_actions = Vec::new();
-    let mut latest = (Value::Null, Value::Null, Value::Null, None);
+    // (new_position, new_stop_id, split_route_ids, merge_into_stop_id, detour after)
+    let mut latest = (Value::Null, Value::Null, Value::Null, Value::Null, None);
     for a in actions(&changes) {
         let mut entry =
             json!({"kind": "move", "change_id": a.change_id, "lat": a.at.0, "lon": a.at.1});
+        let at = json!({"lat": a.at.0, "lon": a.at.1});
         let after = match &a.kind {
             ActionKind::Move => {
-                latest = (
-                    json!({"lat": a.at.0, "lon": a.at.1}),
-                    Value::Null,
-                    Value::Null,
-                    None,
-                );
+                latest = (at, Value::Null, Value::Null, Value::Null, None);
                 median_detour(&kept, None, &r.stop_id, a.at)
             }
             ActionKind::Split {
@@ -712,12 +815,7 @@ pub async fn detail(
                 entry["kind"] = json!("split");
                 entry["new_stop_id"] = json!(new_stop_id);
                 entry["route_ids"] = json!(route_ids);
-                latest = (
-                    json!({"lat": a.at.0, "lon": a.at.1}),
-                    json!(new_stop_id),
-                    json!(route_ids),
-                    None,
-                );
+                latest = (at, json!(new_stop_id), json!(route_ids), Value::Null, None);
                 if r.status == "committed" {
                     // the split routes call at the new stop now
                     let there = self::calls(conn, &r.gtfs_id, new_stop_id).await?;
@@ -726,14 +824,66 @@ pub async fn detail(
                     median_detour(&calls, Some(route_ids.as_slice()), &r.stop_id, a.at)
                 }
             }
+            ActionKind::Merge {
+                into_stop_id,
+                route_ids,
+            } => {
+                entry["kind"] = json!("merge");
+                entry["into_stop_id"] = json!(into_stop_id);
+                latest = (at, Value::Null, Value::Null, json!(into_stop_id), None);
+                if r.status == "committed" {
+                    // the merged stop's routes call at the kept stop now
+                    let there = self::calls(conn, &r.gtfs_id, into_stop_id).await?;
+                    median_detour(&there, Some(route_ids.as_slice()), into_stop_id, a.at)
+                } else {
+                    median_detour(&calls, None, &r.stop_id, a.at)
+                }
+            }
         };
         entry["detour_m_after"] = json!(after.map(metres));
-        latest.3 = after;
+        latest.4 = after;
         draft_actions.push(entry);
     }
-    let (new_position, new_stop_id, split_route_ids, latest_after) = latest;
+    let (new_position, new_stop_id, split_route_ids, merge_into_stop_id, latest_after) = latest;
+    let mut merge_problems = Value::Null;
     let detour_after = match what_if {
-        Some(w) => median_detour(&calls, w.route_ids.as_deref(), &r.stop_id, w.at),
+        Some(WhatIf::Point { at, route_ids }) => {
+            median_detour(&calls, route_ids.as_deref(), &r.stop_id, *at)
+        }
+        Some(WhatIf::MergeInto {
+            stop_id: into,
+            change_set,
+        }) => {
+            // asked of the real validator, in a transaction that is rolled back
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            let (draft, drafted) = match change_set {
+                Some(set) => {
+                    let set = service::load_set(&mut tx, *set, false).await?;
+                    if set.gtfs_id != r.gtfs_id {
+                        return Err(feed_mismatch(&set.gtfs_id, &r.gtfs_id));
+                    }
+                    (
+                        Some(DraftView::load(&mut tx, set.change_set_id).await?),
+                        service::load_changes(&mut tx, set.change_set_id).await?,
+                    )
+                }
+                None => (None, vec![]),
+            };
+            let at = stop_point(&mut tx, &r.gtfs_id, into, draft.as_ref()).await?;
+            merge_problems = json!(
+                service::findings_for(
+                    &mut tx,
+                    &r.gtfs_id,
+                    &drafted,
+                    ("stop", "merge", &r.stop_id),
+                    &merge_after(into, None, "into", id),
+                    actor,
+                )
+                .await?
+            );
+            tx.rollback().await?;
+            at.and_then(|p| median_detour(&calls, None, &r.stop_id, p))
+        }
         None => latest_after,
     };
     let mut out = r.json;
@@ -743,9 +893,11 @@ pub async fn detail(
     out["new_position"] = new_position;
     out["new_stop_id"] = new_stop_id;
     out["split_route_ids"] = split_route_ids;
+    out["merge_into_stop_id"] = merge_into_stop_id;
     out["detour_m_after"] = json!(detour_after.map(metres));
     out["draft_actions"] = json!(draft_actions);
     out["problems"] = json!(found);
+    out["merge_problems"] = merge_problems;
     Ok(out)
 }
 
@@ -775,6 +927,13 @@ fn not_pending(r: &Review) -> EditorError {
     .with_details(json!({"status": r.status, "change_set_id": r.json["change_set_id"]}))
 }
 
+fn feed_mismatch(draft: &str, review: &str) -> EditorError {
+    EditorError::bad_request(
+        "feed_mismatch",
+        format!("the draft is for feed {draft} and the review for feed {review}"),
+    )
+}
+
 fn invalid_change(f: Finding) -> EditorError {
     EditorError::bad_request("invalid_change", f.message.clone())
         .with_details(json!({"code": f.code}))
@@ -792,13 +951,7 @@ async fn open_for_change(
     let set = service::load_set(conn, change_set_id, true).await?;
     let r = load(conn, id, true).await?;
     if r.gtfs_id != set.gtfs_id {
-        return Err(EditorError::bad_request(
-            "feed_mismatch",
-            format!(
-                "the draft is for feed {} and the review for feed {}",
-                set.gtfs_id, r.gtfs_id
-            ),
-        ));
+        return Err(feed_mismatch(&set.gtfs_id, &r.gtfs_id));
     }
     service::editable(&set)?;
     next_status(&r.status, t).ok_or_else(|| not_pending(&r))?;
@@ -817,6 +970,26 @@ async fn open_for_change(
     )?;
     let changes = review_changes(conn, set.change_set_id, id).await?;
     Ok((set, r, changes))
+}
+
+/// A review's merge in the draft takes its stop away: nothing else - a move, a
+/// split - can be added to the review beside it.
+fn merged_in_draft(r: &Review, changes: &[ReviewChange]) -> Result<(), EditorError> {
+    let merges: Vec<i64> = changes
+        .iter()
+        .filter(|c| c.entity == "stop" && c.op == "merge")
+        .map(|c| c.change_id)
+        .collect();
+    if merges.is_empty() {
+        return Ok(());
+    }
+    Err(draft_conflict(
+        merges,
+        format!(
+            "merge stop {} into another stop for this review; remove that change first",
+            r.stop_id
+        ),
+    ))
 }
 
 fn draft_conflict(change_ids: Vec<i64>, what: String) -> EditorError {
@@ -885,6 +1058,7 @@ pub async fn move_stop(
     let mut tx = state.pool.begin().await?;
     let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Move).await?;
+    merged_in_draft(&r, &changes)?;
     // one move per review per draft: a second point is an edit of the first
     let moves: Vec<i64> = changes
         .iter()
@@ -974,7 +1148,7 @@ pub async fn move_stop(
     .await?;
     tx.commit().await?;
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, id, None).await
+    detail(&mut conn, id, None, &ctx.user.email).await
 }
 
 /// The position is right: close the review without changing anything.
@@ -1013,7 +1187,7 @@ pub async fn confirm(
     .await?;
     tx.commit().await?;
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, id, None).await
+    detail(&mut conn, id, None, &ctx.user.email).await
 }
 
 /// A confirmed review is pending again, its review fields cleared.
@@ -1060,7 +1234,7 @@ pub async fn reopen(state: &EditorState, ctx: &Ctx, id: i64) -> EditorResult<Val
     .await?;
     tx.commit().await?;
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, id, None).await
+    detail(&mut conn, id, None, &ctx.user.email).await
 }
 
 // ---------------------------------------------------------------- split
@@ -1245,6 +1419,7 @@ pub async fn split(
     let mut tx = state.pool.begin().await?;
     let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Split).await?;
+    merged_in_draft(&r, &changes)?;
     let conflicts = split_conflicts(&mut tx, set.change_set_id, id, &r.stop_id, &route_ids).await?;
     if !conflicts.is_empty() {
         return Err(draft_conflict(
@@ -1337,7 +1512,172 @@ pub async fn split(
     .await?;
     tx.commit().await?;
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, id, None).await
+    detail(&mut conn, id, None, &ctx.user.email).await
+}
+
+// ---------------------------------------------------------------- merge
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeBody {
+    pub change_set_id: Uuid,
+    pub into_stop_id: String,
+    #[serde(default)]
+    pub keep_name: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Changes in the draft a merge of `stop_id` into `into` would collide with:
+/// any change to the reviewed stop (a stop change keyed on it, or a merge into
+/// it - the review's own move or split included, which `changes` lists), and a
+/// change that moves, deletes or merges away the stop it would merge into. One
+/// more merge into that same stop is no conflict: several duplicates are merged
+/// into one stop in one draft.
+async fn merge_conflicts(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    changes: &[ReviewChange],
+    stop_id: &str,
+    into: &str,
+) -> EditorResult<Vec<i64>> {
+    let mut ids: Vec<i64> = sqlx::query(
+        "SELECT change_id FROM gtfs_change WHERE change_set_id = $1 AND entity = 'stop' AND ( \
+             entity_key = $2 \
+             OR (op = 'merge' AND btrim(after->>'into_stop_id') = $2) \
+             OR (entity_key = $3 AND op IN ('update', 'delete', 'merge'))) \
+         ORDER BY position",
+    )
+    .bind(change_set_id)
+    .bind(stop_id)
+    .bind(into)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| r.try_get("change_id"))
+    .collect::<Result<_, _>>()?;
+    ids.extend(changes.iter().map(|c| c.change_id));
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Merge the review's stop into another stop, into a draft: one `stop/merge`,
+/// added by [`service::add_change_to`] - the code path every merge is added by -
+/// after [`service::findings_for`] has asked the merge's own validation what it
+/// would say. An error there refuses the merge; its warnings come back in the
+/// response. The review is `approved`, and it is the review's only action: a
+/// merge takes the stop away, so nothing else can be done to it beside one.
+pub async fn merge(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: i64,
+    body: MergeBody,
+) -> EditorResult<Value> {
+    let into = body.into_stop_id.trim().to_string();
+    let keep_name = body.keep_name.as_deref().unwrap_or("into");
+    if into.is_empty() || !["into", "from"].contains(&keep_name) {
+        return Err(EditorError::bad_request(
+            "invalid_merge",
+            "into_stop_id is required, and keep_name is \"into\" or \"from\"",
+        ));
+    }
+    let note = note_text(body.note.as_deref());
+    let mut tx = state.pool.begin().await?;
+    let (set, r, changes) =
+        open_for_change(&mut tx, body.change_set_id, id, Transition::Merge).await?;
+    let conflicts =
+        merge_conflicts(&mut tx, set.change_set_id, &changes, &r.stop_id, &into).await?;
+    if !conflicts.is_empty() {
+        return Err(draft_conflict(
+            conflicts,
+            format!("change stop {} or stop {into}", r.stop_id),
+        ));
+    }
+    let row = service::stop_row(&mut tx, &r.gtfs_id, &r.stop_id).await?;
+    let now = row.as_ref().and_then(StopNow::from_row);
+    let draft = DraftView::load(&mut tx, set.change_set_id).await?;
+    let found = problems(
+        &r.stop_id,
+        (r.lat, r.lon),
+        false,
+        now.as_ref(),
+        Some(&draft),
+    );
+    let now = match now {
+        Some(now) if !has_errors(&found) => now,
+        _ => return Err(review_has_problems(found)),
+    };
+    // what the merge's own validation says, before anything is stored
+    let drafted = service::load_changes(&mut tx, set.change_set_id).await?;
+    let mut after = merge_after(&into, None, keep_name, id);
+    let findings = service::findings_for(
+        &mut tx,
+        &r.gtfs_id,
+        &drafted,
+        ("stop", "merge", &r.stop_id),
+        &after,
+        &ctx.user.email,
+    )
+    .await?;
+    if findings.iter().any(|f| f["level"] == "error") {
+        return Err(EditorError::bad_request(
+            "review_has_problems",
+            "the stop cannot be merged into that stop; see the problems",
+        )
+        .with_details(json!({"problems": findings})));
+    }
+    let into_at = stop_point(&mut tx, &r.gtfs_id, &into, Some(&draft)).await?;
+    let route_calls = calls(&mut tx, &r.gtfs_id, &r.stop_id).await?;
+    // the live version is filled in by the add, as for any merge
+    if let Some(m) = after.as_object_mut() {
+        m.remove("into_row_version");
+    }
+    let change_id = service::add_change_to(
+        &mut tx,
+        ctx,
+        &set,
+        service::NewChange {
+            entity: "stop".into(),
+            op: "merge".into(),
+            entity_key: r.stop_id.clone(),
+            after,
+            base_row_version: Some(now.row_version as i32),
+        },
+    )
+    .await?;
+    mark_approved(
+        &mut tx,
+        ctx,
+        id,
+        set.change_set_id,
+        change_id,
+        note.as_deref(),
+    )
+    .await?;
+    let detour = |p: (f64, f64)| median_detour(&route_calls, None, &r.stop_id, p).map(metres);
+    auth::audit(
+        &mut *tx,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "position_review_merged",
+        Some(&r.gtfs_id),
+        Some(set.change_set_id),
+        json!({
+            "review_id": id, "stop_id": r.stop_id, "into_stop_id": into,
+            "change_id": change_id, "change_set_id": set.change_set_id,
+            "detour_m": detour((now.lat, now.lon)),
+            "detour_m_after": into_at.and_then(detour),
+            "moved_m": into_at.map(|p| metres(haversine_m(now.lat, now.lon, p.0, p.1))),
+            "note": note,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let mut out = detail(&mut conn, id, None, &ctx.user.email).await?;
+    out["warnings"] = json!(findings);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -1606,7 +1946,7 @@ mod tests {
     #[test]
     fn statuses_follow_the_lifecycle() {
         use Transition::*;
-        let all = [Move, Split, Confirm, Reopen, Return, Commit];
+        let all = [Move, Split, Merge, Confirm, Reopen, Return, Commit];
         let allowed: Vec<(&str, Transition, &str)> = STATUSES
             .iter()
             .flat_map(|s| all.iter().map(move |t| (*s, *t)))
@@ -1617,9 +1957,11 @@ mod tests {
             vec![
                 ("pending", Move, "approved"),
                 ("pending", Split, "approved"),
+                ("pending", Merge, "approved"),
                 ("pending", Confirm, "confirmed"),
                 ("approved", Move, "approved"),
                 ("approved", Split, "approved"),
+                ("approved", Merge, "approved"),
                 ("approved", Return, "pending"),
                 ("approved", Commit, "committed"),
                 ("confirmed", Reopen, "pending"),
@@ -1630,6 +1972,42 @@ mod tests {
             assert_eq!(next_status("committed", t), None, "{t:?}");
             assert_eq!(next_status("superseded", t), None, "{t:?}");
         }
+    }
+
+    #[test]
+    fn a_merge_is_an_action_and_the_change_a_review_is_known_by() {
+        let change = |id: i64, entity: &str, op: &str, key: &str| ReviewChange {
+            change_id: id,
+            entity: entity.into(),
+            op: op.into(),
+            entity_key: key.into(),
+            at: None,
+            row_stops: vec![],
+            into_stop_id: None,
+            merged_routes: vec![],
+        };
+        let merge = ReviewChange {
+            at: Some((13.0, 80.2)),
+            into_stop_id: Some("C".into()),
+            merged_routes: ids(&["R1", "R2"]),
+            ..change(4, "stop", "merge", "S")
+        };
+        assert_eq!(
+            actions(std::slice::from_ref(&merge)),
+            vec![Action {
+                change_id: 4,
+                at: (13.0, 80.2),
+                kind: ActionKind::Merge {
+                    into_stop_id: "C".into(),
+                    route_ids: ids(&["R1", "R2"]),
+                },
+            }]
+        );
+        assert_eq!(first_change(std::slice::from_ref(&merge)), Some(4));
+        // a merge into a stop that is nowhere has no point to show, and is no action
+        let nowhere = ReviewChange { at: None, ..merge };
+        assert!(actions(&[nowhere]).is_empty());
+        assert!(split_off(&[change(5, "stop", "merge", "S")]).is_empty());
     }
 
     #[test]

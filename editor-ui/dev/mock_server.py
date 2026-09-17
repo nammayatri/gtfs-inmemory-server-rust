@@ -1254,16 +1254,6 @@ class Handler(BaseHTTPRequestHandler):
             if rest == ["config"] and method == "GET":
                 return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
                              "version": s.feeds[g]["version"]}
-            if rest == ["config"] and method == "POST":
-                self.require_role(u, "admin")
-                to = self._body().get("data_source")
-                if to not in ("db", "preprocessed"):
-                    raise ApiError(400, "invalid_data_source", "data_source is 'db' or 'preprocessed'.")
-                frm = s.feeds[g].get("data_source")
-                s.feeds[g]["data_source"] = to
-                s.feeds[g]["version"] += 1
-                s.add_audit(u, "feed_data_source_changed", g, None, {"gtfs_id": g, "from": frm, "to": to})
-                return 200, {"gtfs_id": g, "data_source": to, "version": s.feeds[g]["version"]}
             if rest == ["stops"] and method == "GET":
                 return 200, self.list_stops(g, q)
             if len(rest) == 2 and rest[0] == "stops" and method == "GET":
@@ -2605,6 +2595,161 @@ class Handler(BaseHTTPRequestHandler):
             self.store.add_audit(u, "position_review_returned", rv["gtfs_id"], cs["change_set_id"],
                                  {"review_id": rv["review_id"], "stop_id": rv["stop_id"], "reason": reason})
 
+# ================================================================== policy (docs sections 2 and 3)
+# Two rules added on top of the handler above, kept together in this one block
+# so they read as the contract does:
+#
+#   - No direct feed writes. `POST /feeds/{g}/config` is gone; a feed's data
+#     source is switched by a `feed_config/update` change in a draft (admin
+#     only), applied - and audited as `feed_data_source_changed` - at commit.
+#     `GET /feeds/{g}/config` lists the open drafts carrying one as `pending`.
+#   - Admin self-approval. `approve` with `{self_approve: true}` lets an admin
+#     approve a draft they submitted (403 `own_change_set` without it, with
+#     `details.can_self_approve`), audited as `change_set_self_approved`; the
+#     same admin may then commit it. Reopening or resubmitting clears the mark.
+DATA_SOURCES = ("db", "preprocessed")
+
+
+def feed_config_changes(cs):
+    return [c for c in cs["changes"] if c["entity"] == "feed_config"]
+
+
+def feed_config_pending(store, g):
+    items = [cs for cs in store.change_sets.values()
+             if cs["gtfs_id"] == g and cs["status"] in ("draft", "submitted", "approved")]
+    items.sort(key=lambda cs: cs["updated_at"], reverse=True)
+    return [{"change_set_id": cs["change_set_id"], "change_set_title": cs["title"], "status": cs["status"],
+             "change_id": c["change_id"], "data_source": (c.get("after") or {}).get("data_source")}
+            for cs in items for c in feed_config_changes(cs)]
+
+
+_validate_set = validate_set
+_conflicts_for = conflicts_for
+
+
+def validate_set(store, cs):
+    """As above, plus: a switch to the data source the feed already has - earlier
+    changes of the draft taken as applied - is a warning."""
+    out = _validate_set(store, cs)
+    current = store.feeds[cs["gtfs_id"]].get("data_source", "preprocessed")
+    for c in feed_config_changes(cs):
+        to = (c.get("after") or {}).get("data_source")
+        if to == current:
+            out.append({"change_id": c["change_id"], "level": "warning", "code": "data_source_unchanged",
+                        "message": f"feed {cs['gtfs_id']} is already served from '{to}'; this change switches nothing",
+                        "details": {}})
+        current = to
+    return out
+
+
+def conflicts_for(store, cs):
+    """As above, plus: the base of a data source switch is the data source it was
+    made against (`before.data_source`)."""
+    out = _conflicts_for(store, cs)
+    live = store.feeds[cs["gtfs_id"]].get("data_source", "preprocessed")
+    for c in feed_config_changes(cs):
+        expected = (c.get("before") or {}).get("data_source")
+        if expected != live:
+            out.append({"change_id": c["change_id"], "entity": "feed_config", "entity_key": c["entity_key"],
+                        "reason": "changed", "expected": expected, "actual": live,
+                        "message": f"The data source of feed {c['entity_key']} was changed by another commit "
+                                   f"after this edit was made."})
+    return out
+
+
+def _check_data_source(after):
+    if not isinstance(after, dict) or set(after) != {"data_source"} or after["data_source"] not in DATA_SOURCES:
+        raise ApiError(400, "invalid_change", "feed_config/update: data_source is 'db' or 'preprocessed'",
+                       {"code": "invalid_data_source"})
+
+
+class PolicyHandler(Handler):
+    def _api(self, method, path, q):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        if len(parts) == 3 and parts[0] == "feeds" and parts[2] == "config":
+            self.session_user()
+            self.require_mutation(method)
+            g, s = parts[1], self.store
+            if method != "GET":
+                raise ApiError(404, "endpoint_not_found", "no such editor endpoint")
+            if g not in s.feeds:
+                raise ApiError(404, "feed_not_found", f"no feed {g}")
+            return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
+                         "version": s.feeds[g]["version"], "pending": feed_config_pending(s, g)}
+        return super()._api(method, path, q)
+
+    def set_summary(self, cs):
+        return super().set_summary(cs) | {"self_approved": bool(cs.get("self_approved"))}
+
+    def add_change(self, u, cs, b):
+        if b.get("entity") != "feed_config":
+            return super().add_change(u, cs, b)
+        self.require_role(u, "admin")
+        self.require_draft(u, cs)
+        if b.get("op") != "update":
+            raise ApiError(400, "invalid_change", f"unsupported change feed_config/{b.get('op')}",
+                           {"code": "invalid_change"})
+        _check_data_source(b.get("after"))
+        g = cs["gtfs_id"]
+        if str(b.get("entity_key") or "").strip() != g:
+            raise ApiError(400, "invalid_change",
+                           f"feed_config/update: entity_key must be the change set's feed, {g}",
+                           {"code": "feed_mismatch"})
+        feed = self.store.feeds[g]
+        before = {"gtfs_id": g, "data_source": feed.get("data_source", "preprocessed"), "version": feed["version"]}
+        ch = self.append_change(u, cs, "feed_config", "update", g, dict(b["after"]), before, None)
+        return self.set_full(cs) | {"change_id": ch["change_id"]}
+
+    def edit_change(self, u, cs, change_id, method):
+        ch = next((c for c in cs["changes"] if c["change_id"] == change_id), None)
+        if ch and ch["entity"] == "feed_config" and method == "PUT":
+            self.require_role(u, "admin")
+            self.require_draft(u, cs)
+            _check_data_source(self._body().get("after"))
+        return super().edit_change(u, cs, change_id, method)
+
+    def transition(self, u, cs, action, b):
+        s = self.store
+        own = u["user_id"] == cs["submitted_by"]
+        admin = u["role"] == "admin"
+        if action == "approve" and own and admin and b.get("self_approve") is True and cs["status"] == "submitted":
+            comment = (b.get("comment") or "").strip() or None
+            t = iso(now())
+            cs.update(status="approved", reviewed_by=u["user_id"], reviewed_at=t, review_comment=comment,
+                      self_approved=True, updated_at=t)
+            s.add_audit(u, "change_set_self_approved", cs["gtfs_id"], cs["change_set_id"],
+                        {"submitted_by": cs["submitted_by"], "submitted_by_email": u["email"], "comment": comment})
+            return self.set_full(cs)
+        # the override covers the commit of a set so approved
+        overridden = action == "commit" and own and admin and cs.get("self_approved")
+        submitter = cs["submitted_by"]
+        if overridden:
+            cs["submitted_by"] = None
+        try:
+            out = super().transition(u, cs, action, b)
+        except ApiError as e:
+            if e.code == "own_change_set":
+                e.details = {"can_self_approve": action == "approve" and admin}
+            raise
+        finally:
+            if overridden:
+                cs["submitted_by"] = submitter
+        if action in ("submit", "reopen"):
+            cs["self_approved"] = False
+        if action == "commit":
+            # the commit's audit row is the last one written
+            s.audit[-1]["detail"]["self_approved"] = bool(cs.get("self_approved"))
+            feed = s.feeds[cs["gtfs_id"]]
+            for c in feed_config_changes(cs):
+                frm, to = feed.get("data_source", "preprocessed"), c["after"]["data_source"]
+                if frm != to:
+                    feed["data_source"] = to
+                    s.add_audit(u, "feed_data_source_changed", cs["gtfs_id"], cs["change_set_id"],
+                                {"gtfs_id": cs["gtfs_id"], "from": frm, "to": to, "change_id": c["change_id"],
+                                 "change_set_id": cs["change_set_id"]})
+        return self.set_full(cs) if (overridden or action in ("submit", "reopen", "commit")) else out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -2615,7 +2760,7 @@ def main():
     with gzip.open(args.sample, "rt", encoding="utf-8") as fh:
         Handler.store = Store(json.load(fh))
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), PolicyHandler).serve_forever()
 
 
 if __name__ == "__main__":
