@@ -39,6 +39,8 @@ pub const PLATFORM_CODE_MAX_CHARS: usize = 120;
 pub const STATION_MIN_MEMBERS: usize = 2;
 /// Stop ids the server mints: `ed_` + 10 lower-case hex digits.
 pub const MINTED_STOP_PREFIX: &str = "ed_";
+/// The two `gtfs_feed.data_source` values a `feed_config` change may set.
+pub const DATA_SOURCES: [&str; 2] = ["db", "preprocessed"];
 
 /// Why a station of `members` stops is too small to be one, if it is.
 pub fn too_few_members(station_id: &str, members: usize) -> Option<String> {
@@ -842,9 +844,11 @@ pub fn check_payload(
                     "into_row_version",
                     "keep_name",
                     "keep_position",
+                    "position_review_id",
                 ],
                 what,
             )?;
+            position_review_id(m, what)?;
             let into = req_string(m, "into_stop_id", what)?;
             if into == entity_key.trim() {
                 return Err(Finding::error(
@@ -1187,6 +1191,18 @@ pub fn check_payload(
             }
             Ok(())
         }
+        ("feed_config", "update") => {
+            let m = obj(after, what)?;
+            allow_only(m, &["data_source"], what)?;
+            match m.get("data_source").and_then(Value::as_str) {
+                Some(s) if DATA_SOURCES.contains(&s) => Ok(()),
+                _ => Err(Finding::error(
+                    "invalid_data_source",
+                    "data_source",
+                    format!("{what}: data_source is 'db' or 'preprocessed'"),
+                )),
+            }
+        }
         _ => Err(Finding::error(
             "invalid_change",
             format!("{entity}/{op}"),
@@ -1199,6 +1215,42 @@ pub fn check_payload(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn feed_config_payloads() {
+        let check = |after: Value| check_payload("feed_config", "update", "feed", &after);
+        assert!(check(json!({"data_source": "db"})).is_ok());
+        assert!(check(json!({"data_source": "preprocessed"})).is_ok());
+        for bad in [
+            json!({"data_source": "nonsense"}),
+            json!({"data_source": null}),
+            json!({}),
+        ] {
+            assert_eq!(check(bad).unwrap_err().code, "invalid_data_source");
+        }
+        // nothing else about a feed is a change
+        let stray = check(json!({"data_source": "db", "version": 9})).unwrap_err();
+        assert_eq!(stray.code, "invalid_payload");
+        assert_eq!(
+            check_payload("feed_config", "delete", "feed", &Value::Null)
+                .unwrap_err()
+                .code,
+            "invalid_change"
+        );
+    }
+
+    #[test]
+    fn a_merge_may_carry_its_position_review() {
+        let merge = |after: Value| check_payload("stop", "merge", "S", &after);
+        assert!(merge(json!({"into_stop_id": "C", "position_review_id": 7})).is_ok());
+        assert!(merge(json!({"into_stop_id": "C", "position_review_id": null})).is_ok());
+        assert_eq!(
+            merge(json!({"into_stop_id": "C", "position_review_id": 0}))
+                .unwrap_err()
+                .code,
+            "invalid_payload"
+        );
+    }
 
     fn row(stop: &str, t: &str, no: i32, name: &str) -> RouteRow {
         RouteRow {

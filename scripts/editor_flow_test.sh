@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end test of the GTFS editor API against a LOCAL Postgres that holds the
 # editor schema (db/gtfs_editor/*.sql). Runs tests/editor_flow.rs,
-# tests/editor_create_flow.rs and tests/editor_position_review_flow.rs, which use
+# tests/editor_create_flow.rs, tests/editor_position_review_flow.rs,
+# tests/editor_review_merge_flow.rs and tests/editor_feed_config_flow.rs, which use
 # their own feeds and accounts, then proves the chennai_bus rows were not touched -
-# reseeding them from nandi if they were - and that its station proposals and
-# position reviews were not touched either.
+# reseeding them from nandi if they were - and that its station proposals, its
+# position reviews and its feed row (data source and version) were not touched
+# either.
 #
 #   scripts/editor_flow_test.sh
 #   EDITOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55432/mtc_internal_master scripts/editor_flow_test.sh
@@ -45,14 +47,20 @@ reviews() {
       FROM gtfs_position_review WHERE gtfs_id = 'chennai_bus'"
 }
 
+feed() {
+  "$PSQL" "$DB_URL" -Atc "SELECT data_source || ' v' || version FROM gtfs_feed WHERE gtfs_id = 'chennai_bus'"
+}
+
 "$PSQL" "$DB_URL" -Atc "SELECT 1 FROM gtfs_feed LIMIT 1" >/dev/null
+feed_before="$(feed)"
 before="$(fingerprint)"
 proposals_before="$(proposals)"
 reviews_before="$(reviews)"
 
 status=0
 EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow --test editor_create_flow \
-  --test editor_position_review_flow -- --nocapture || status=$?
+  --test editor_position_review_flow --test editor_review_merge_flow --test editor_feed_config_flow \
+  -- --nocapture || status=$?
 
 proposals_after="$(proposals)"
 if [ "$proposals_before" != "$proposals_after" ]; then
@@ -64,6 +72,11 @@ if [ "$reviews_before" != "$reviews_after" ]; then
   echo "chennai_bus position reviews changed during the test" >&2
   status=1
 fi
+feed_after="$(feed)"
+if [ "$feed_before" != "$feed_after" ]; then
+  echo "chennai_bus feed row changed during the test: $feed_before -> $feed_after" >&2
+  status=1
+fi
 after="$(fingerprint)"
 if [ "$before" != "$after" ]; then
   echo "chennai_bus rows changed during the test; reseeding from $SEEDER" >&2
@@ -72,4 +85,5 @@ fi
 echo "chennai_bus untouched: $([ "$before" = "$after" ] && echo yes || echo 'no (reseeded)')"
 echo "chennai_bus station proposals untouched: $([ "$proposals_before" = "$proposals_after" ] && echo yes || echo no)"
 echo "chennai_bus position reviews untouched: $([ "$reviews_before" = "$reviews_after" ] && echo yes || echo no)"
+echo "chennai_bus feed row untouched: $([ "$feed_before" = "$feed_after" ] && echo yes || echo no) ($feed_after)"
 exit $status

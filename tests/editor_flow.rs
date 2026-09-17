@@ -807,6 +807,215 @@ async fn editor_end_to_end() {
             > 0
     );
 
+    // ---- admin self-approval: only an admin, only in so many words
+    let draft_with_stop = |c: &Caller, title: &str| {
+        (
+            c.req("POST", &format!("/feeds/{FEED}/change-sets"))
+                .set_json(json!({"title": title})),
+            json!({"entity": "stop", "op": "create",
+                   "after": {"name": title, "lat": 13.2, "lon": 80.2}}),
+        )
+    };
+    let mut sets = Vec::new();
+    for (c, title) in [(&admin, "ADMIN OWN"), (&approver, "APPROVER OWN")] {
+        let (create, change) = draft_with_stop(c, title);
+        let (s, b, _) = call!(&app, create);
+        assert_eq!(s, 201, "{b}");
+        assert_eq!(b["self_approved"], false, "{b}");
+        let id = b["change_set_id"].as_str().unwrap().to_string();
+        let (s, b, _) = call!(
+            &app,
+            c.req("POST", &format!("/change-sets/{id}/changes"))
+                .set_json(change)
+        );
+        assert_eq!(s, 201, "{b}");
+        let (s, b, _) = call!(&app, c.req("POST", &format!("/change-sets/{id}/submit")));
+        assert_eq!(s, 200, "{b}");
+        sets.push(id);
+    }
+    let (own, theirs) = (sets[0].clone(), sets[1].clone());
+    let approve = |c: &Caller, id: &str, body: Value| {
+        c.req("POST", &format!("/change-sets/{id}/approve"))
+            .set_json(body)
+    };
+    // without the flag an admin is refused like anyone, and told the override exists
+    for body in [json!({}), json!({"self_approve": false, "comment": "mine"})] {
+        let (s, b, _) = call!(&app, approve(&admin, &own, body));
+        assert_eq!((s, code_of(&b)), (403, "own_change_set"), "{b}");
+        assert_eq!(b["error"]["details"]["can_self_approve"], true, "{b}");
+    }
+    // nobody else has the override, flag or not; and there is none for a reject
+    let (s, b, _) = call!(
+        &app,
+        approve(&approver, &theirs, json!({"self_approve": true}))
+    );
+    assert_eq!((s, code_of(&b)), (403, "own_change_set"), "{b}");
+    assert_eq!(b["error"]["details"]["can_self_approve"], false, "{b}");
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("POST", &format!("/change-sets/{own}/reject"))
+            .set_json(json!({"comment": "no", "self_approve": true}))
+    );
+    assert_eq!((s, code_of(&b)), (403, "own_change_set"), "{b}");
+    assert_eq!(b["error"]["details"]["can_self_approve"], false, "{b}");
+    // a body that does not parse counts as no body: never the override
+    let (s, b, _) = call!(&app, approve(&admin, &own, json!({"self_approve": "yes"})));
+    assert_eq!((s, code_of(&b)), (403, "own_change_set"), "{b}");
+    let (_, b, _) = call!(&app, admin.req("GET", &format!("/change-sets/{own}")));
+    assert_eq!(
+        (&b["status"], &b["self_approved"]),
+        (&json!("submitted"), &json!(false))
+    );
+
+    // on someone else's set the flag is an ordinary approval
+    let (s, b, _) = call!(
+        &app,
+        approve(&admin, &theirs, json!({"self_approve": true}))
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        (&b["status"], &b["self_approved"]),
+        (&json!("approved"), &json!(false))
+    );
+    let (s, b, _) = call!(
+        &app,
+        approver.req("POST", &format!("/change-sets/{theirs}/commit"))
+    );
+    assert_eq!((s, code_of(&b)), (403, "own_change_set"), "{b}");
+    assert_eq!(b["error"]["details"]["can_self_approve"], false, "{b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{theirs}/commit"))
+    );
+    assert_eq!(s, 200, "{b}");
+
+    // the override: approved, marked, and audited as what it was
+    let (s, b, _) = call!(
+        &app,
+        approve(
+            &admin,
+            &own,
+            json!({"self_approve": true, "comment": "urgent fix"})
+        )
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        (&b["status"], &b["self_approved"]),
+        (&json!("approved"), &json!(true))
+    );
+    assert_eq!(b["reviewed_by_email"], ADMIN);
+    assert_eq!(b["submitted_by_email"], ADMIN);
+    let (_, listed, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/feeds/{FEED}/change-sets?status=approved"))
+    );
+    let item = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["change_set_id"] == own.as_str())
+        .unwrap();
+    assert_eq!(item["self_approved"], true, "{item}");
+    let audit_of = |id: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "SELECT action, detail::text AS detail FROM gtfs_audit_log WHERE change_set_id = $1::uuid \
+                 AND action IN ('change_set_approved', 'change_set_self_approved', 'change_set_committed') \
+                 ORDER BY audit_id",
+            )
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let detail: Value = serde_json::from_str(&r.get::<String, _>("detail")).unwrap();
+                (r.get::<String, _>("action"), detail)
+            })
+            .collect::<Vec<_>>()
+        }
+    };
+    let rows = audit_of(own.clone()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "change_set_self_approved");
+    assert_eq!(rows[0].1["comment"], "urgent fix");
+    assert_eq!(rows[0].1["submitted_by_email"], ADMIN);
+    assert!(rows[0].1["submitted_by"].is_string(), "{rows:?}");
+    let rows = audit_of(theirs.clone()).await;
+    let actions: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(actions, vec!["change_set_approved", "change_set_committed"]);
+    assert_eq!(rows[1].1["self_approved"], false);
+
+    // reopening clears the mark; approved by someone else, its submitter - admin
+    // or not - still cannot commit it
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{own}/reopen"))
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        (&b["status"], &b["self_approved"]),
+        (&json!("draft"), &json!(false))
+    );
+    assert!(b["reviewed_by"].is_null(), "{b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{own}/submit"))
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = call!(&app, approve(&approver, &own, json!({})));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["self_approved"], false, "{b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{own}/commit"))
+    );
+    assert_eq!((s, code_of(&b)), (403, "own_change_set"), "{b}");
+
+    // the override covers the commit too
+    let (s, _, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{own}/reopen"))
+    );
+    assert_eq!(s, 200);
+    let (s, _, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{own}/submit"))
+    );
+    assert_eq!(s, 200);
+    let (s, b, _) = call!(&app, approve(&admin, &own, json!({"self_approve": true})));
+    assert_eq!(s, 200, "{b}");
+    let before_commit = feed_version(&pool).await;
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{own}/commit"))
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["feed_version"].as_i64().unwrap(), before_commit + 1);
+    let (_, b, _) = call!(&app, admin.req("GET", &format!("/change-sets/{own}")));
+    assert_eq!(
+        (&b["status"], &b["self_approved"]),
+        (&json!("committed"), &json!(true))
+    );
+    assert_eq!(
+        (&b["committed_by_email"], &b["reviewed_by_email"]),
+        (&json!(ADMIN), &json!(ADMIN))
+    );
+    let rows = audit_of(own.clone()).await;
+    let actions: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "change_set_self_approved",
+            "change_set_approved",
+            "change_set_self_approved",
+            "change_set_committed"
+        ]
+    );
+    assert_eq!(rows[3].1["self_approved"], true);
+
     // ---- sign out
     let (s, _, _) = call!(&app, editor_c.req("DELETE", "/auth/session"));
     assert_eq!(s, 204);
