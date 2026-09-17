@@ -19,10 +19,14 @@ ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0008*.sql` (applied to master `mtc_internal_master`;
-`0006` lets a change's `op` be `merge`, `0007` holds coordinate reviews, `0008`
-makes `gtfs_feed.data_source` live and backfills `chennai_bus` to `'db'` — see
-section 3's "Feed data source").
+Schema: `db/gtfs_editor/0001..0011*.sql` (`0001..0008` applied to master
+`mtc_internal_master`; `0006` lets a change's `op` be `merge`, `0007` holds
+coordinate reviews, `0008` makes `gtfs_feed.data_source` live and backfills
+`chennai_bus` to `'db'` — see section 3's "Feed data source". **Not yet on
+master, applied to the local database only:** `0009` lets a change's `entity` be
+`feed_config`, `0010` adds `gtfs_change_set.self_approved` and relaxes the
+maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
+behind the cleanup context reads (section 9). All three are safe to run twice.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -115,7 +119,20 @@ feed in `gtfs_db_feeds` and one without.
 - **Roles are ordered** `viewer < editor < approver < admin`; each includes the
   ones below (an approver can also edit). `viewer` reads · `editor` drafts and
   submits · `approver` approves, rejects and commits — **never a set they
-  submitted, neither approve nor commit** · `admin` everything plus users.
+  submitted, neither approve nor commit** · `admin` everything plus users, the
+  feed's data source (a `feed_config` change, section 3), and the override below.
+- **Admin self-approval (the one exception to maker-checker).** An admin may
+  approve a set they submitted by saying so: `POST /change-sets/{id}/approve`
+  with `{self_approve: true}`. Without the flag the admin gets the same 403
+  `own_change_set` as anyone, so it never happens by accident;
+  `details.can_self_approve` tells the dashboard whether the override is open to
+  the caller. The set is marked `self_approved`, the same admin may then commit
+  it (the override covers approve **and** commit), and the audit log records it
+  as `change_set_self_approved` — never as `change_set_approved` — with the
+  later `change_set_committed` carrying `self_approved: true`. The dashboard
+  shows a "self-approved" badge on the draft and its list row, and the history
+  row stands out. Nobody but an admin has it, and there is no such override for
+  reject.
 - Logs never contain the JWT, cookie, TOTP code or secret (the request-header
   logger redacts `x-pomerium-jwt-assertion`, `cookie`, `set-cookie`, `token`,
   `authorization`).
@@ -165,14 +182,17 @@ account · 404 · 409 conflict or wrong status · 429 locked. Every list is
 | GET | `/feeds/{g}/routes?q=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows) |
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change |
+| GET | `/feeds/{g}/stops/{stop_id}/context`, `/feeds/{g}/routes/{route_id}/context` | what is known about a stop or a route for cleanup: detours, coordinate reviews, same-named stops, its audit rows, the open drafts touching it — section 9 |
 | GET | `/feeds/{g}/audit?change_set=&limit=&cursor=` | newest first: `{audit_id, at, actor, actor_email, action, gtfs_id, change_set_id, detail}` |
 
 Audit actions: `seed`, `release`, `user_bootstrapped`, `user_created`,
 `user_updated`, `user_totp_reset`, `totp_enroll_started`, `totp_confirmed`,
 `totp_failed`, `session_created`, `change_set_created`, `change_added`,
 `change_updated`, `change_removed`, `change_set_submitted`, `change_set_approved`,
-`change_set_rejected`, `change_set_reopened`, `change_set_discarded`,
-`change_set_committed` (detail `{feed_version, changes, applied}`), and from
+`change_set_self_approved` (an admin approved a set they submitted, section 2:
+`{submitted_by, submitted_by_email, comment}`), `change_set_rejected`,
+`change_set_reopened`, `change_set_discarded`, `change_set_committed` (detail
+`{feed_version, changes, applied, self_approved}`), and from
 sections 5 and 6: `bulk_imported` (`{kind, rows, changes, first_change_id,
 last_change_id}`), `stop_merged` (one per merge at commit: `{change_id, from, into,
 routes, rows, keep_name, keep_position}`), `station_proposal_approved`,
@@ -182,28 +202,70 @@ routes, rows, keep_name, keep_position}`), `station_proposal_approved`,
 writes one `station_proposal_approved` per station (`detail.bulk = true`). nandi's
 scripts write `seed`, `release` and `station_proposals_built` (`{batch, proposals,
 platforms, diameter_m, base_version}`). Coordinate reviews (section 8) write
-`position_review_moved`, `position_review_split`, `position_review_confirmed`,
-`position_review_reopened`, `position_review_returned` and
-`position_review_committed`, and nandi's loader `position_reviews_loaded`. The
-"Feed data source" endpoint below writes `feed_data_source_changed`, detail
-`{gtfs_id, from, to}`. The dashboard's history has words for every one of these
+`position_review_moved`, `position_review_split`, `position_review_merged`
+(section 8.2), `position_review_confirmed`, `position_review_reopened`,
+`position_review_returned` and `position_review_committed`, nandi's loader
+`position_reviews_loaded`, and nandi's `editor/autofix_same_name.py`
+`position_reviews_autofix_planned` (`{tool, reviews, fits_m, off_route_m, merge,
+move, choose, none}`) when it stores its candidates on the reviews (section 8.2).
+Committing a `feed_config` change ("Feed data source"
+below) writes `feed_data_source_changed`, detail `{gtfs_id, from, to, change_id,
+change_set_id}`. The dashboard's history has words for every one of these
 (`ACTION_LABEL` in `editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks each action in
 the database has a label).
 
 ### Feed data source
 
 Whether GIMS serves a feed from these tables or from its preprocessed data —
-section 1's `gtfs_feed.data_source` — read and changed here. **The POST here has
-no relationship to a draft or change-set: it takes effect immediately**, for
-everyone, without submit/approve/commit, unlike every other mutation in this
-document. Every GIMS pod picks it up on its next `gtfs_version_poll_seconds`
-poll (default 5 s) — no restart.
+section 1's `gtfs_feed.data_source`. **Nothing writes it directly.** It is
+changed like everything else in this document: a `feed_config` / `update` change
+in a draft (the change table below), submitted, approved by someone else and
+committed. Every GIMS pod picks the committed value up on its next
+`gtfs_version_poll_seconds` poll (default 5 s) — no restart.
 
 | method | path | body → response |
 |---|---|---|
-| GET | `/feeds/{g}/config` | viewer+ → `{gtfs_id, data_source: "db"\|"preprocessed", version}` — same vocabulary as `/feeds`' `data_source` (the raw `gtfs_feed.data_source` value). 404 `feed_not_found` if `g` has no `gtfs_feed` row at all |
-| POST | `/feeds/{g}/config` | **admin only.** `{data_source: "db"\|"preprocessed"}` → the same shape as GET. 400 `invalid_data_source` for any other value. No row yet (first time this feed is switched to `db`) → inserts one, `version` starting at 1; a row already exists → updates `data_source` and bumps `version` the same way a change-set commit does. Audited as `feed_data_source_changed`, detail `{gtfs_id, from, to}` |
+| GET | `/feeds/{g}/config` | viewer+ → `{gtfs_id, data_source: "db"\|"preprocessed", version, pending: [{change_set_id, change_set_title, status, change_id, data_source}]}` — `data_source` is the raw `gtfs_feed.data_source` value, the vocabulary of `/feeds`; `pending` lists the `feed_config` changes of the feed's open change sets (`draft`, `submitted`, `approved`), latest-edited set first. 404 `feed_not_found` if `g` has no `gtfs_feed` row at all |
 
+`POST /feeds/{g}/config`, which used to switch the data source at once, is
+**removed** (404 `endpoint_not_found`, as for any unknown path). The dashboard's
+Feed settings page adds the change through `POST /change-sets/{id}/changes`.
+
+Settled while implementing:
+
+- The change: `{entity: "feed_config", op: "update", entity_key: <gtfs_id>,
+  after: {data_source}}`. **Admin only** to add or edit (403 `role_required`
+  otherwise, whoever's draft it is); anyone who may edit the draft may remove it.
+  Submitting, approving and committing a set that carries one follow the normal
+  rules — editor+ submits, approver+ approves and commits, never the submitter
+  (unless section 2's admin override is used). The admin's say is in drafting it.
+- Refused when added or edited, 400 `invalid_change`: a value other than `db` /
+  `preprocessed`, or any other field in `after` (`details.code =
+  "invalid_data_source"`); an `entity_key` that is not the change set's feed
+  (`details.code = "feed_mismatch"`); any `op` but `update`.
+- `before` is the read shape `{gtfs_id, data_source, version}` at the time the
+  change was added. **`base_row_version` does not carry the base** (it stays
+  `null`): the only version a feed has moves with every commit, so a change based
+  on it would conflict with every unrelated commit. The base is
+  `before.data_source`: if the live value at submit or commit differs, that is 409
+  `change_set_conflicts` with the usual conflict entry (`entity: "feed_config"`,
+  `entity_key` the feed, `reason: "changed"`, `expected` / `actual` the two
+  values, "The data source of feed … was changed by another commit …") — also when
+  the live value already is what the change wants.
+- A change to the value the feed already has is the validation **warning**
+  `data_source_unchanged`; it does not block submit, and at commit it switches and
+  audits nothing. Earlier changes of the same draft count as applied, so of two
+  switches to `db` in one draft the second is the warning.
+- Commit applies it inside the commit transaction (`UPDATE gtfs_feed SET
+  data_source`); the commit's own `version = version + 1` is the only bump.
+  `feed_data_source_changed` is written at commit (actor: whoever commits), one
+  row per change that switched something; drafting it writes the usual
+  `change_added`.
+- A draft's route preview and every other draft read ignore the change; `GET
+  /change-sets/{id}` shows it with its `before` / `after` like any other.
+- A change set needs a `gtfs_feed` row to exist (`POST /feeds/{g}/change-sets` is
+  404 `feed_not_found` without one), so the old "first switch creates the row" is
+  gone: a feed's row is created by nandi's seed, never by the dashboard.
 
 ### Drafts
 
@@ -211,19 +273,36 @@ poll (default 5 s) — no restart.
 |---|---|---|
 | GET | `/feeds/{g}/change-sets?status=` | `status` may be a comma list (`draft,submitted,approved`) |
 | POST | `/feeds/{g}/change-sets` | `{title, description?}` → 201 draft, `base_version` = current feed version |
-| GET | `/change-sets/{id}` | the set (`change_set_id, gtfs_id, title, description, status, created_by(_email), submitted_by(_email), reviewed_by(_email), committed_by(_email), *_at, review_comment, base_version, committed_version, change_count`) + `changes` + `validation: [{change_id, level: error\|warning, code, message}]` + `conflicts: [{change_id, entity, entity_key, reason, expected, actual, message}]` + `can_submit` + `stop_names` (`{stop_id: name}` for every stop a `route_stops` change references) |
+| GET | `/change-sets/{id}` | the set (`change_set_id, gtfs_id, title, description, status, created_by(_email), submitted_by(_email), reviewed_by(_email), committed_by(_email), *_at, review_comment, self_approved, base_version, committed_version, change_count` — the list items carry the same fields) + `changes` + `validation: [{change_id, level: error\|warning, code, message}]` + `conflicts: [{change_id, entity, entity_key, reason, expected, actual, message}]` + `can_submit` + `stop_names` (`{stop_id: name}` for every stop a `route_stops` change references) |
 | POST | `/change-sets/{id}/changes` | append one change (below); draft only; editor+ → 201 the set, plus `change_id` |
 | PUT | `/change-sets/{id}/changes/{change_id}` | `{after, base_row_version?}` replaces a change's `after` → the set |
 | DELETE | `/change-sets/{id}/changes/{change_id}` | → the set |
 | GET | `/change-sets/{id}/preview/routes/{route_id}` | the route detail (same shape as above) with the draft applied, plus `validation` and `conflicts` |
 | POST | `/change-sets/{id}/submit` | draft → submitted; 400 `validation_failed` with errors, 409 `change_set_conflicts` |
-| POST | `/change-sets/{id}/reopen` | submitted/rejected/approved → draft; its creator, its submitter, or an admin |
-| POST | `/change-sets/{id}/approve` | `{comment?}` submitted → approved; approver+, 403 `own_change_set` for the submitter |
-| POST | `/change-sets/{id}/reject` | `{comment}` (required) submitted → rejected; same rule |
-| POST | `/change-sets/{id}/commit` | approved → committed; approver+, 403 `own_change_set` for the submitter; see below |
+| POST | `/change-sets/{id}/reopen` | submitted/rejected/approved → draft; its creator, its submitter, or an admin. Clears `self_approved` |
+| POST | `/change-sets/{id}/approve` | `{comment?, self_approve?: bool}` submitted → approved; approver+, 403 `own_change_set` for the submitter (`details.can_self_approve`) — **unless** the submitter is an admin and sends `self_approve: true` (section 2), which approves it, marks it `self_approved` and audits `change_set_self_approved` |
+| POST | `/change-sets/{id}/reject` | `{comment}` (required) submitted → rejected; approver+, 403 `own_change_set` for the submitter, no override |
+| POST | `/change-sets/{id}/commit` | approved → committed; approver+, 403 `own_change_set` for the submitter — unless the set is `self_approved` and they are (still) an admin; see below |
 | POST | `/change-sets/{id}/discard` | not committed/discarded → discarded; its creator or an admin |
 
 Editing a set that is not a draft is 409 `change_set_not_draft`.
+
+Settled while implementing (self-approval):
+
+- `self_approve: true` on **someone else's** set is an ordinary approval: the flag
+  is ignored, the set is not marked, the audit row is `change_set_approved`.
+- A non-admin sending `self_approve: true` on their own set is 403
+  `own_change_set` with `details.can_self_approve: false`; an admin without the
+  flag (or with `false`) the same with `true`. Reject and commit refusals carry
+  `can_self_approve: false`: the override is asked for on approve only.
+- The body of approve is optional, and a body that does not parse counts as none —
+  so a malformed `self_approve` (`"yes"`) is never the override: 403.
+- Commit of an own set that someone **else** approved stays 403 for its submitter,
+  admin or not: the override is the explicit approval, not the role. An admin
+  demoted after self-approving can no longer commit it.
+- `self_approved` is cleared by reopen and by submit, and stays on the set once
+  committed. The table enforces it (`0010`): the submitter may be the reviewer
+  only on a `self_approved` set, and only such a set may be so marked.
 
 A change is `{entity, op, entity_key, after, base_row_version?}`. Its `before` is
 a snapshot in read shape: the stop or route row; for a station, the row plus
@@ -239,6 +318,7 @@ a snapshot in read shape: the stop or route row; for a station, the row plus
 | `station` / `create` | `{station_id, name, lat, lon, member_stop_ids: [...]}` | `entity_key` = `station_id`; at least two members (`too_few_members`, refused when added: 400 `invalid_change`); members exist, are location_type 0, have no other parent |
 | `station` / `update` | `{name?, lat?, lon?, member_stop_ids?}` | same; members, when sent, are at least two (to ungroup a station, delete it) |
 | `station` / `delete` | `null` | clears members' `parent_station` |
+| `feed_config` / `update` | `{data_source: "db"\|"preprocessed"}` | **admin only**; `entity_key` = the change set's feed; see "Feed data source" above |
 
 A `route_stops` row is `{stop_id, stop_type, stage_no, stage_name, marker_id?,
 marker_name?, marker_lat?, marker_lon?, stop_name_override?, provider_id?}` —
@@ -264,8 +344,8 @@ without that change.
 
 **Commit** — one transaction: `SELECT … FROM gtfs_feed WHERE gtfs_id = $g FOR
 UPDATE`; for each change in `position` order check the target's current
-`row_version` (stop, route) or `rows_hash` (route_stops) against the change's base
-— any mismatch aborts with 409 `change_set_conflicts` and `details.conflicts`;
+`row_version` (stop, route), `rows_hash` (route_stops) or `data_source`
+(feed_config) against the change's base — any mismatch aborts with 409 `change_set_conflicts` and `details.conflicts`;
 apply; re-run validation on the result; `version = version + 1`; set
 `committed_version`; audit. Nothing is applied if anything fails.
 
@@ -285,6 +365,18 @@ Dockerfile), no build step, vendored libraries (no CDN). The API base is
 relative (`../`), so it works wherever the UI directory is mounted. For the ops
 team: search a stop or route, see it on a map, edit, collect edits into a draft,
 submit, and — as a different person — review the diff and commit.
+
+Feed settings (admin): each feed's data source, the drafts already carrying a
+switch of it (from `GET /feeds/{g}/config`'s `pending`, linked), and "Add to
+draft: switch to …", which adds a `feed_config` change to the current draft —
+for the feed chosen in the top bar, since a draft belongs to one feed — after a
+confirm that says it takes effect only once the draft is submitted, approved by
+someone else and committed. Drafts: an admin looking at a draft they submitted
+gets "Approve it myself (admin override)" beside the disabled Approve, behind the
+confirm "You submitted this draft. Approving it yourself skips the second
+reviewer. Continue?"; a self-approved draft carries a "self-approved" badge in its
+header and list row, and its history row is highlighted with an "admin override"
+badge.
 
 Tests: `editor-ui/dev/mock_server.py` + `dev/ui_smoke.mjs` (UI against an
 in-memory mock of this contract), and `dev/ui_e2e.mjs` (the real UI, the real
@@ -306,7 +398,7 @@ back afterwards. `--only map,stations,...` runs a subset.
 | `route` / `create` | `{route_id, short_name, long_name?, route_type?, color?, agency_id?}` | `entity_key` = `route_id`; id unused (409-style row error `route_exists`); same id charset as stops; `route_type` defaults to 3, `agency_id` to the feed's usual one; `short_name` required |
 | `route` / `delete` | `null` | soft delete (`deleted = true`); refused while another pending change in the set edits the route |
 | `station` / `create`, `update` | may carry `members: [{stop_id, platform_code?}]` instead of `member_stop_ids` | as before; `platform_code` ≤ 120 chars; a station change that came from a proposal carries `proposal_id` |
-| `stop` / `merge` | `{into_stop_id, into_row_version, keep_name?: "into"\|"from", keep_position?: "into"\|"from"}` | see *Merging duplicate stops* below |
+| `stop` / `merge` | `{into_stop_id, into_row_version, keep_name?: "into"\|"from", keep_position?: "into"\|"from", position_review_id?}` | see *Merging duplicate stops* below; `position_review_id` is stored and ignored, as on `stop/update` (section 8.2) |
 
 Settled while implementing:
 
@@ -545,7 +637,9 @@ as carrying another stop's coordinate, or found off their own routes), loaded by
 `scripts/chennai-bus/editor/load_position_reviews.py`. A reviewer checks each one
 and either **moves** the stop — a `stop/update` change `{lat, lon, position_review_id}`
 into a draft — or **splits** some of its routes onto a new stop (section 8.1), or
-**confirms** the position is right, which closes it with no change. A stop can need
+**merges** it into a stop of the same name that stands where its routes pass
+(section 8.2; a merge is a review's only action), or **confirms** the position is
+right, which closes it with no change. A stop can need
 more than one of these: a busy stop can carry routes from several original places,
 so a review may collect several moves and splits — never more than one move — in
 one draft before it is released through the normal submit / approve (someone else)
@@ -553,10 +647,11 @@ one draft before it is released through the normal submit / approve (someone els
 
 | method | path | body / rule |
 |---|---|---|
-| GET | `/feeds/{g}/position-reviews?status=&bbox=&q=&limit=&cursor=` | `status` comma list (default `pending`); `bbox` on the loaded position; `q` trigram on name, exact on stop id. Item: `{review_id, stop_id, original_stop_id, stop_name, reason, lat, lon, raw_lat, raw_lon, suggested_lat, suggested_lon, suggested_source, evidence, status, change_set_id, change_set_title, reviewed_by_email, reviewed_at, review_note, batch}` |
-| GET | `/feeds/{g}/position-reviews/summary` | `{pending, approved, committed, confirmed}` |
+| GET | `/feeds/{g}/position-reviews?status=&bbox=&q=&auto_fix=&limit=&cursor=` | `auto_fix` = `merge`\|`move`\|`choose`\|`none` filters on `evidence.auto_fix.action` (section 8.2). `status` comma list (default `pending`); `bbox` on the loaded position; `q` trigram on name, exact on stop id. Item: `{review_id, stop_id, original_stop_id, stop_name, reason, lat, lon, raw_lat, raw_lon, suggested_lat, suggested_lon, suggested_source, evidence, status, change_set_id, change_set_title, reviewed_by_email, reviewed_at, review_note, batch}` |
+| GET | `/feeds/{g}/position-reviews/summary` | `{pending, approved, committed, confirmed, auto_fix: {merge, move, choose, none}}` — `auto_fix` counts the **pending** reviews by `evidence.auto_fix.action` |
 | GET | `/position-reviews/{id}` | the item plus, computed now from the tables: `stop` (current row), `routes: [{route_id, short_name, sequence, prev: {stop_id, name, lat, lon} \| null, next: {...} \| null}]` (every route that calls at the stop, previous and next SERVED stop), `detour_m` (median over routes of d(prev,stop)+d(stop,next)−d(prev,next)), and `problems: [{code, message}]` (`stop_deleted`, `stop_merged_away`, `moved_since_load` when the stop is > 25 m from the loaded position) |
 | POST | `/position-reviews/{id}/move` | editor+. `{change_set_id, lat, lon, note?}` → appends `stop/update` `{lat, lon, position_review_id}` (base_row_version = the stop's current) to the draft; review → `approved` (or stays `approved`, gaining this action, if it already has splits in the same draft). The response is the review detail, with `detour_m_after` for the new point |
+| POST | `/position-reviews/{id}/merge` | editor+. `{change_set_id, into_stop_id, keep_name?, note?}` → appends one `stop/merge` of the reviewed stop into a same-named stop; section 8.2 |
 | POST | `/position-reviews/{id}/confirm` | editor+. `{note?}` pending → `confirmed` |
 | POST | `/position-reviews/{id}/reopen` | editor+. confirmed → pending |
 
@@ -565,7 +660,8 @@ proposals, but a review's draft can hold several of its changes at once (section
 8.1): removing one leaves the rest and the review `approved`; removing the last one,
 or discarding the draft, returns the review to `pending`; committing marks it
 `committed`. Every action is audited (`position_review_moved`,
-`position_review_split`, `position_review_confirmed`, `position_review_reopened`,
+`position_review_split`, `position_review_merged`, `position_review_confirmed`,
+`position_review_reopened`,
 `position_review_committed`, `position_review_returned`).
 
 Dashboard — "Coordinates to review" page: the list (pending first, counts, search,
@@ -813,3 +909,281 @@ implementing this:
 6. Audit: one entry per action, exactly as a single-action review already wrote
    (`position_review_moved` per move, `position_review_split` per split) - never
    merged into one entry for a review with several actions in one draft.
+
+### 8.2 Merging a reviewed stop into a same-named stop
+
+**Why.** Many suspects are duplicates: another stop of the same name already
+stands where the suspect's routes pass. nandi's advisory tool looks, for each
+pending review, for other stops of the same name and tests whether pointing the
+suspect's calls at the candidate removes the detour. It stores what it found in
+the review's `evidence`, and drafts the clear cases through this API; nothing is
+live until the draft goes through submit / approve (someone else) / commit.
+
+**Evidence** (the tool writes it; the API returns `evidence` as stored and does
+nothing else with it, beyond the list filter and summary counts of section 8):
+
+- `evidence.same_name_candidates: [{stop_id, name, lat, lon, distance_m,
+  name_similarity, route_count, detour_m_after, shares_route: bool, verdict:
+  "fits"|"no_fit"}]`
+- `evidence.auto_fix: {action: "merge"|"move"|"choose"|"none", into_stop_id?,
+  lat?, lon?, detour_m, detour_m_after?, reason, tool, threshold_m}`
+- As nandi's `editor/autofix_same_name.py` writes them (2026-09-17): a candidate
+  also has `same_words` (the two names are the same words once case, initials and
+  abbreviations are read away - only such a candidate is ever picked; one name
+  inside the other is listed only) and `runs_opposite` (its buses head the other
+  way: the facing kerb, never a fit); on a review with `mixed_origins` each
+  candidate names the route group it fits, `fits_route_ids` and
+  `fits_origin_stop_id`, and the action is `choose` - those routes need a split,
+  not a move of the whole stop. `auto_fix` also has `off_route_m`: a review whose
+  stop is closer to its routes than that is `none`, whatever namesakes it has.
+  `move` means "same place, but the id must survive" (a station platform, or the
+  survivor of an earlier merge): `lat`/`lon` are the candidate's point.
+
+**Endpoint.** `POST /position-reviews/{id}/merge`, editor+. Body
+`{change_set_id, into_stop_id, keep_name?: "into"|"from", note?}`. It appends ONE
+`stop/merge` to the draft: `entity_key` the reviewed stop, `base_row_version` its
+current version, `after` = `{into_stop_id, into_row_version (live), keep_name
+(default "into"), keep_position: "into", position_review_id}`. Review →
+`approved` with `change_set_id` / `change_id`. Response: the review detail, plus
+`warnings: [{level, code, message}]`.
+
+**Rules.**
+
+- The change is added by the code path `POST /change-sets/{id}/changes` uses
+  (`service::add_change_to`), and judged by the merge's own validation
+  (`service::findings_for` runs the draft plus this merge through `evaluate`, in a
+  savepoint that is rolled back, before anything is stored). An **error** there —
+  `merge_would_repeat_stop`, `merge_prm_stop`, `merge_same_stop`,
+  `stop_is_station`, `stop_not_found`, `stop_deleted`, `stop_merged_away` —
+  refuses the call: 400 `review_has_problems`, `details.problems: [{level, code,
+  message}]` (the warnings are listed there too). **Warnings** —
+  `merge_far_apart`, `merge_names_differ`, `merge_same_route_twice` — do not, and
+  come back as `warnings`.
+- Status goes the way `/move` and `/split` go, by the same code
+  (`may_add_action`, 409 `review_in_other_draft`, 409 `review_not_pending`,
+  pending again when the change is removed or the draft discarded, `committed` on
+  commit).
+- 409 `draft_conflict` (`details.change_ids`) when the draft already has **any
+  change of this review** — a merge takes the stop away, so it is a review's only
+  action — or a change to the reviewed stop (a `stop` change keyed on it, or a
+  `stop/merge` into it), or a `stop` update, delete or merge **of the stop it
+  would merge into**. A later `/move`, `/split` or second `/merge` on a review
+  that has a merge in the draft is 409 `draft_conflict` naming that merge.
+- Audit `position_review_merged`, detail `{review_id, stop_id, into_stop_id,
+  change_id, change_set_id, detour_m, detour_m_after, moved_m, note}`:
+  `detour_m_after` is the reviewed stop's calls measured where the into stop is,
+  `moved_m` the distance between the two stops.
+- A draft edit (PUT) of the change keeps its `position_review_id`, by the rule a
+  move's edit follows (400 `invalid_change`, `position_review_mismatch`).
+
+**Detail.** `draft_actions` gains `{kind: "merge", change_id, into_stop_id, lat,
+lon, detour_m_after}` (`lat`/`lon` the into stop's). The latest-action fields:
+`new_position` the into stop's point, `new_stop_id` and `split_route_ids` `null`,
+and the new `merge_into_stop_id` (`null` unless the latest action is a merge).
+
+**The dry question.** `GET /position-reviews/{id}?stop_id=<candidate>` answers
+`detour_m_after` as if the reviewed stop's calls were at that stop's position,
+and `merge_problems: [{level, code, message}]` — what the `stop/merge` validation
+would say, from the real validator, changing nothing. `merge_problems` is `null`
+without `?stop_id=`.
+
+Settled while implementing:
+
+- **One more merge into the same stop is no conflict.** The brief's "any change
+  to either stop" would have refused merging a second duplicate into the stop a
+  first was just merged into, in one draft — the tool's main case (S and S2 both
+  into C). So for the into stop only a change that moves, deletes or merges
+  **it** away conflicts; its creation in the same draft, or another merge into
+  it, does not. Two merges into one stop commit cleanly: conflicts are checked
+  against the live rows before anything applies.
+- Because it goes through the add path, the merge also writes the ordinary
+  `change_added` (`/move` and `/split` insert their changes directly and do not).
+  `before` is the merge's usual `{from, into, affected}`.
+- Request refusals: 400 `invalid_merge` (blank `into_stop_id`, a `keep_name` that
+  is not `into` / `from`), 400 `invalid_json` (an unknown field), 404
+  `review_not_found` / `change_set_not_found`, 400 `feed_mismatch`, 409
+  `change_set_not_draft`. Checks run in this order: the request; the draft and
+  review as for move; 409 `draft_conflict`; 400 `review_has_problems` for the
+  reviewed stop itself (missing, deleted, merged away, a station — the live data
+  plus the draft); 400 `review_has_problems` from the merge's validation.
+- `into_stop_id` is trimmed. The into stop's point is where the draft puts it
+  (created in it), else where it is live. The note rule is move's.
+- `?stop_id=` is sent without `lat`, `lon` or `route_ids` (400 `invalid_query`
+  otherwise) and may carry `&change_set=<id>`: the question is then asked on top
+  of that draft's changes (404 `change_set_not_found`, 400 `feed_mismatch`). A
+  candidate that does not exist answers `merge_problems: [stop_not_found]` and
+  `detour_m_after: null`, not a 404. The reviewed stop itself answers
+  `merge_same_stop`.
+- A committed merge's `draft_actions[].detour_m_after` is measured over the into
+  stop's calls of the routes the merge moved (`before.affected`), since the
+  merged stop has none left; its review's `problems` then say `stop_merged_away`
+  and its `routes` are empty.
+- `?auto_fix=` with any other value is 400 `invalid_auto_fix`; blank is no
+  filter. A review without `evidence.auto_fix` matches no value, `none` included
+  (`none` is the tool saying so), and is in no `auto_fix` count.
+- Cost: the merge's validation applies the whole draft once per call (as `GET
+  /change-sets/{id}` does), so a draft of N merges costs O(N) per added merge.
+  The dry question on chennai_bus, without a draft: 6–8 ms.
+
+## 9. Cleanup context — what is known about a stop or a route (2026-09-17)
+
+Two reads for the dashboard's cleanup panels, viewer+, changing nothing.
+
+| method | path | response |
+|---|---|---|
+| GET | `/feeds/{g}/stops/{stop_id}/context` | `{stop_id, detour_m, routes_measured, position_reviews: {pending, approved, committed, confirmed, items: [{review_id, status, reason}]}, same_name: [{stop_id, name, lat, lon, distance_m, route_count, parent_station, similarity}], audit: [{audit_id, at, actor_email, action, change_set_id, detail}], open_drafts: [{change_set_id, title, status, change_id, entity, op}]}`. 404 `stop_not_found` |
+| GET | `/feeds/{g}/routes/{route_id}/context` | `{route_id, stops_with_reviews: [{stop_id, sequence, review_id, status}], worst_detours: [{stop_id, name, sequence, detour_m}], audit: [...], open_drafts: [...]}` (same `audit` / `open_drafts` shapes). 404 `route_not_found` |
+
+- `detour_m` is section 8's: the median over the stop's calls that have a served
+  stop either side, by the same code (`position_reviews::calls`,
+  `median_detour`); `null` when no call has. `routes_measured` is how many calls
+  that median is over.
+- `same_name`: other live stops (`location_type` 0, not deleted) within 5 km
+  whose name has pg_trgm similarity ≥ 0.6 to this stop's, **or** is equal
+  ignoring case and everything that is not a letter or digit; nearest first
+  (`stop_id` breaks ties), at most 20. `similarity` is to two decimals — it can be
+  under 0.6 for a name that matched by the second rule (`A N N A NAGAR`).
+- `worst_detours`: the route's served calls whose own detour (between the served
+  stops either side) is over 300 m, worst first, at most 5.
+
+Settled while implementing:
+
+- `position_reviews` counts and lists the stop's reviews in those four statuses,
+  newest first; a `superseded` review was never looked at and is left out of
+  both. `stops_with_reviews` has one entry per (row, review) in those statuses,
+  in `sequence`, `review_id` order.
+- `audit` is the latest 10 of, for a stop: every row naming it in
+  `detail.stop_id` (all the `position_review_*` actions), `change_added` rows
+  whose `detail.entity_key` is the stop (entity `stop` or `station`),
+  `stop_merged` rows with it on either side, and the `change_set_committed` row
+  of every change set holding a `stop` / `station` change keyed on it. For a
+  route: `change_added` rows keyed on it (entity `route` or `route_stops`), and —
+  of the change sets holding such a change — `change_set_committed` and the
+  `position_review_split` rows whose `route_ids` name it. `change_updated` and
+  `change_removed` rows carry only a change id and are not found.
+- `open_drafts` is one entry per change, in the feed's `draft` / `submitted` /
+  `approved` sets, latest-edited set first. For a stop: a `stop` or `station`
+  change keyed on it, a `stop/merge` **into** it, or a `station` create / update
+  listing it as a member. A `route_stops` change whose rows call at it is not
+  listed (that would read every open stop list). For a route: a `route` or
+  `route_stops` change keyed on it.
+- A deleted stop still answers (its reviews and history are the point): no
+  calls, so `detour_m: null` and `routes_measured: 0`.
+- Indexes (`0011_context_indexes.sql`): the audit log by `detail->>'stop_id'`, by
+  `detail->>'entity_key'`, and `stop_merged` by either side; the review queue by
+  `(gtfs_id, stop_id)`. Same-named stops come from `gtfs_stop_latlon_idx` (a box a
+  little over 5 km each way, then the true distance).
+- Timing on the local chennai_bus data (debug build, warm): the stop context
+  4–8 ms — 8 ms at the busiest stop (234 measured calls), 4–5 ms at the names the
+  most stops share (10–12 same-named within 5 km); the route context 1.6–3 ms on
+  the longest routes. `tests/editor_review_merge_flow.rs` prints them.
+
+<!-- ===== section 10 begins: dashboard round 4 (UX). Self-contained; sections 2, 3 and 8 are edited elsewhere. ===== -->
+## 10. Dashboard requirements added 2026-09-17, round 4 (reviewer UX)
+
+Dashboard only (`editor-ui/`), apart from the read endpoints and the merge action
+in 10.5, which the API provides. Every item has checks in `dev/ui_smoke.mjs`
+(`round4Flows`; `node dev/ui_smoke.mjs --round4` runs only these) against
+`dev/mock_server.py` (its block "round 4 (UX)").
+
+1. **What the map shows.** A "Show" control under the zoom buttons ticks
+   Stations, Routes and Stops on or off, each on its own. The choice is a
+   per-browser preference (`localStorage`, key `mapLayers` of the editor's
+   preferences; the page works when storage throws, it then simply starts with
+   everything shown). A hidden kind stays hidden as the map moves, zooms and loads
+   new stops, its name labels and count badges included. What the panel is about
+   is never lost: the open stop (or station) is still drawn when its kind is off,
+   every stop is drawn while one has to be clicked (picking a stop, choosing a
+   station's stops), and an open route that is hidden is named as hidden; the
+   control says which of these applies.
+2. **A station once, not each of its platforms.** Where a panel lists stops near
+   or on a stop's point — "Other stops within 60 m" on the stop page, "Stops that
+   shared its point" on a coordinate review, the same-named stops of 10.5, the
+   suggestions in the station editor — a stop that is already a platform of a
+   station is not also a bare entry: the station is listed once, linked, with "N of
+   these are already platforms of <station>", and its platforms fold under it (one
+   click away, with their own Merge… buttons). Station names come from the rows'
+   `parent_station` (`parent` on a stop detail); a name not at hand is read from
+   the stop endpoint once per panel. In the station editor such stops are not
+   offered at all, since a stop has one parent.
+3. **Undo and redo of what is not in a draft.** Ctrl/Cmd+Z undoes, Ctrl/Cmd+
+   Shift+Z and Ctrl/Cmd+Y redo: a pin placed or dragged (stop editor, New stop,
+   coordinate review, station point), ticked routes on a review, a select, every
+   row operation of the stop list editor (add, change stop, move, remove, type,
+   stage, renumber, fix), a station's stops and labels, the choices of a merge,
+   a suggested or discarded map line, and a text field as a whole once it is left.
+   It never touches data: a change already in a draft is removed on the draft
+   page. While the caret is in a text field the shortcut is left to the browser,
+   so typing undoes natively. One in-memory stack per panel (`js/undo.js`;
+   `state.js` had nothing to reuse): the router drops it on every navigation, and
+   a panel clears it when its state is saved into a draft. A short hint says what
+   happened ("Undid: moved the pin"), and Undo / Redo buttons sit wherever a pin
+   or a stop list is edited.
+4. **The trail.** A drill-down (route → stop → another route → …) leaves a trail
+   under the top bar, "Map › 45B › Luz › 12C", with one "‹ Back" control
+   (`js/trail.js`, beside the hash router). It is not the browser history: each
+   place is in it once; opening a place already in it pops back to it; clicking a
+   crumb pops to it; a link in the top bar, the brand or a search result starts a
+   new trail; a top-level page (Map, Coordinates, Stations, Drafts, …) is the root
+   of one. At most 8 places (the oldest after the root go). `sessionStorage` only,
+   so it survives a reload and ends with the tab. A panel keeps its own "Back to
+   search" only when the trail has nowhere to go back to.
+5. **Cleanup context, the tool's verdict, candidates and merge.**
+   - `GET /feeds/{g}/stops/{stop_id}/context` → `{stop_id, detour_m,
+     routes_measured, position_reviews: {pending, approved, committed, confirmed,
+     items: [{review_id, status, reason}]}, same_name: [{stop_id, name, lat, lon,
+     distance_m, route_count, parent_station, similarity}], audit: [{audit_id, at,
+     actor_email, action, change_set_id, detail}], open_drafts: [{change_set_id,
+     title, status, change_id, entity, op}]}`; `GET /feeds/{g}/routes/{route_id}/
+     context` → `{route_id, stops_with_reviews: [{stop_id, sequence, review_id,
+     status}], worst_detours: [{stop_id, name, sequence, detour_m}], audit,
+     open_drafts}`. The stop and route panels show them as "Cleanup context": the
+     detour with what it means in plain words, the coordinate reviews naming the
+     stop (linked into the Coordinates page), same-named stops nearby (listed with
+     distance and route count, drawn faintly on the map, stations once as in 2),
+     open drafts touching it, and recent history in the History page's words
+     (`ACTION_LABEL`). The route's stop list marks rows whose stop has a pending
+     review, and its context lists the longest detours. **A server without these
+     endpoints answers 404: the section is then not shown, with no error.**
+   - A review's `evidence` may carry `same_name_candidates: [{stop_id, name, lat,
+     lon, distance_m, name_similarity, route_count, detour_m_after, shares_route,
+     verdict: "fits" | "no_fit"}]` and `auto_fix: {action: "merge" | "move" |
+     "choose" | "none", into_stop_id?, lat?, lon?, detour_m, detour_m_after?, reason,
+     tool, threshold_m}`. The review panel shows the verdict as a banner ("The tool
+     suggests merging into X — detour 2.4 km → 40 m", with the reason), and the
+     candidates as a numbered list and numbered map markers (teal where the routes
+     fit), each with "Use this position" (sets the pin: a move) and "Merge into
+     this stop…".
+   - `POST /position-reviews/{id}/merge` `{change_set_id, into_stop_id, keep_name?,
+     note?}` → the review detail plus `warnings`; 400 `review_has_problems`
+     (`details.problems`), 409 `draft_conflict`. `draft_actions` may then hold
+     `{kind: "merge", change_id, into_stop_id, lat, lon, detour_m_after}`, drawn
+     and listed like a move or a split; a merged review offers no move or split.
+   - The list filters by `?auto_fix=merge|move|choose|none` with chips that carry
+     the summary's `auto_fix: {merge, move, choose, none}` counts; without those
+     counts (an older server) there are no chips.
+6. **Stops sharing a point.** Stops with exactly the same coordinate (about a
+   thousand points in Chennai, up to 61 stops on one) are one marker with a count
+   badge; clicking it lists them by name, id and route count so any can be chosen,
+   in every mode that clicks a stop (opening, picking, a station's stops). A stop
+   alone opens directly, as does a click that only wants the place (a review's
+   pin). The chooser counts what is shown (10.1), and differently named stops on
+   one point share a label at zoom ≥ 17 ("NAME +2").
+7. **Pending in the draft, on the page it changes.** A change added to the active
+   draft is not live, but its pages show the entity as the draft leaves it,
+   labelled "Pending in draft “<title>”, not live", with the live value beside it
+   ("live: …", struck through): a stop's drafted name, position and labels (the
+   map marks the drafted place and ghosts the live one, and the area stops are
+   drawn where the draft puts them); a stop that will be merged into X, and X
+   saying which stop is merged into it; a stop to be deleted; a stop or a station
+   that exists only in the draft (both can be opened); a station's drafted name,
+   point and members, and a member that joins or leaves; a route's drafted number,
+   name, colour and map line, and its drafted stop list (from `GET
+   /change-sets/{id}/preview/routes/{route_id}`, rows marked added / moved /
+   changed, removed stops named, the live line dashed underneath) with "Show what
+   is live now". It is a read-side overlay in one module, `js/overlay.js`, which
+   the coordinate review panel uses too (its `draft_actions` have the same shape
+   as the overlay's actions). The cache is the active draft the dashboard already
+   holds: every mutation it makes replaces that object, as does choosing another
+   draft, and the overlay rebuilds on that.
+<!-- ===== section 10 ends ===== -->

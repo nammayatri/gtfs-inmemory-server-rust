@@ -9,6 +9,10 @@ import { state, can, setLeaveGuard } from "./state.js";
 import { h, clear, toast, modal, confirmDialog, debounce, fmtCoord, fmtDate, fmtMetres, fmtCount, haversine, plural } from "./util.js";
 import * as map from "./map.js";
 import { requireDraft, refreshDraft, useDraft } from "./drafts.js";
+import { actionsList, draftedPoints, pendingActions } from "./overlay.js";
+import { foldedList, platformsNote } from "./context.js";
+import { undoScope } from "./undo.js";
+import { nameHere } from "./trail.js";
 
 const panel = () => document.getElementById("panel");
 const STATUSES = [["pending", "To review"], ["approved", "In a draft"], ["confirmed", "Confirmed"], ["committed", "Live"]];
@@ -17,10 +21,13 @@ const PAGE = 50;
 const FAR_METRES = 500;          // the server warns about a move this long
 const SAME_POINT_METRES = 3;
 const DRAFT_REASON = "Moves and splits are added to a draft. Nothing changes for passengers until someone else approves the draft and it is committed.";
+// What the clean-up tool made of a review (evidence.auto_fix.action), for the list's filter.
+const AUTO_FIX = [["merge", "Merge"], ["move", "Move"], ["choose", "Choose"], ["none", "No fix"]];
+const AUTO_FIX_TEXT = { merge: "tool: merge", move: "tool: move", choose: "tool: choose one", none: "tool: no fix" };
 const CONFIRM_NOTES = ["Checked on Google Maps: the bus stops here.", "Its routes do pass this point.", "The stops sharing this point are one place."];
 
 // The list survives opening a review and coming back, and gives "Next".
-const list = { feedId: null, status: "pending", q: "", area: false, items: [], cursor: null, counts: null, loaded: false };
+const list = { feedId: null, status: "pending", q: "", area: false, autoFix: "", items: [], cursor: null, counts: null, loaded: false };
 let stopWatching = null;
 // What the last move, split or confirmation did, shown on the next screen.
 let flash = null;
@@ -61,7 +68,7 @@ function parseCoords(value) {
 // ------------------------------------------------------------------ list state
 function resetForFeed() {
   if (list.feedId === state.feedId) return;
-  Object.assign(list, { feedId: state.feedId, status: "pending", q: "", area: false, items: [], cursor: null, counts: null, loaded: false });
+  Object.assign(list, { feedId: state.feedId, status: "pending", q: "", area: false, autoFix: "", items: [], cursor: null, counts: null, loaded: false });
 }
 
 function watchMap(fn) {
@@ -91,6 +98,7 @@ async function fetchPage({ append = false } = {}) {
   const params = new URLSearchParams({ status: list.status, limit: String(PAGE) });
   if (list.q) params.set("q", list.q);
   if (list.area) params.set("bbox", map.bbox());
+  if (list.autoFix) params.set("auto_fix", list.autoFix);
   if (append && list.cursor) params.set("cursor", list.cursor);
   const page = await get(`feeds/${enc(state.feedId)}/position-reviews?${params}`);
   list.items = append ? list.items.concat(page.items) : page.items;
@@ -121,6 +129,7 @@ function reviewMeta(r) {
     Array.isArray(ev.shares_point_with) && ev.shares_point_with.length ? `shares its point with ${plural(ev.shares_point_with.length, "stop")}` : null,
     ev.detour_m ? `detour ${fmtMetres(ev.detour_m)}` : null,
     r.suggested_lat != null ? "has a suggestion" : null,
+    ev.auto_fix && AUTO_FIX_TEXT[ev.auto_fix.action] ? AUTO_FIX_TEXT[ev.auto_fix.action] : null,
   ].filter(Boolean).join(" · ");
 }
 
@@ -134,6 +143,7 @@ export async function showCoordinatesList() {
   const search = h("input", { type: "search", id: "review-search", value: list.q, autocomplete: "off", spellcheck: "false", placeholder: "Stop name or stop id" });
   const area = h("input", { type: "checkbox", id: "review-area", checked: list.area });
   const tabs = h("div.tabs.count-tabs", { role: "group", "aria-label": "Show reviews that are" });
+  const fixes = h("div.filter-chips", { role: "group", "aria-label": "Show reviews where the tool suggests", hidden: true });
   const items = h("div", { "aria-live": "polite" }, h("p.empty", "Loading…"));
   const more = h("button.btn.secondary", { type: "button", hidden: true }, "Show more");
 
@@ -141,6 +151,19 @@ export async function showCoordinatesList() {
     type: "button", "aria-pressed": String(list.status === key),
     on: { click: () => { if (list.status === key) return; list.status = key; renderTabs(); load(); } },
   }, label, list.counts ? h("span.count", fmtCount(list.counts[key] || 0)) : null)));
+
+  // what the clean-up tool suggested, with how many of each; an older server
+  // sends no such counts, and then there is nothing to filter by
+  const renderFixes = () => {
+    const counts = list.counts && list.counts.auto_fix;
+    fixes.hidden = !counts;
+    if (!counts) return;
+    const chip = (key, label, n) => h("button.route-chip", {
+      type: "button", "aria-pressed": String(list.autoFix === key), dataset: { autoFix: key || "any" },
+      on: { click: () => { if (list.autoFix === key) return; list.autoFix = key; renderFixes(); load(); } },
+    }, label, n != null ? h("span.count", fmtCount(n)) : null);
+    clear(fixes, h("span.hint", "The tool suggests:"), chip("", "Anything"), AUTO_FIX.map(([key, label]) => chip(key, label, counts[key] || 0)));
+  };
 
   const renderList = () => {
     more.hidden = !list.cursor;
@@ -189,13 +212,15 @@ export async function showCoordinatesList() {
       h("h1", "Coordinates to review"),
       h("p.hint", "Each stop here may be in the wrong place: it carries another stop's coordinate, or its routes go out of their way to reach it. Open one, check it on the map with its routes, then move it, split the routes that belong elsewhere onto a new stop, or confirm it is right. Nothing goes live until the draft is approved by someone else and committed."),
       tabs,
+      fixes,
       h("label.field", { for: "review-search" }, h("span", "Search"), search),
       h("label.check", { for: "review-area" }, area, " Only in the map area")),
     h("section.section", items, more));
   renderTabs();
+  renderFixes();
   if (list.loaded && list.feedId === state.feedId && !list.area) renderList();
   else load();
-  refreshCoordinateCount().then(renderTabs);
+  refreshCoordinateCount().then(() => { renderTabs(); renderFixes(); });
 }
 
 // ------------------------------------------------------------------ one review
@@ -236,6 +261,11 @@ export async function showCoordinateReview(id) {
   const changeable = editable && alive && !blocking.length;
   const draftActions = Array.isArray(r.draft_actions) ? r.draft_actions : [];
   const hasMove = draftActions.some((a) => a.kind === "move");
+  // merged into another stop in this draft: nothing is left here to move or split
+  const mergeAction = draftActions.find((a) => a.kind === "merge") || null;
+  const candidates = (Array.isArray(ev.same_name_candidates) ? ev.same_name_candidates : []).filter((c) => c && c.stop_id && c.stop_id !== r.stop_id);
+  const autoFix = ev.auto_fix && typeof ev.auto_fix === "object" ? ev.auto_fix : null;
+  nameHere(`Review: ${stop && stop.name ? stop.name : r.stop_name}`);
   // a route a split already took off this stop, in this draft: locked, and drawn
   // as settled rather than a choice to make
   const splitOff = new Map();
@@ -259,7 +289,7 @@ export async function showCoordinateReview(id) {
   const others = [...byRoute.values()].filter((x) => !placed.has(x.route_id));
   const mixed = !!ev.mixed_origins && rawGroups.length > 1;
   const checkable = byRoute.size - splitOff.size;
-  const splittable = changeable && !hasMove && byRoute.size > 1 && checkable > 0;
+  const splittable = changeable && !hasMove && !mergeAction && byRoute.size > 1 && checkable > 0;
   const checked = new Set();
   if (splittable && ev.mixed_origins && rawGroups.some((g) => !g.suspect)) {
     groups.filter((g) => g.suspect).forEach((g) => g.routes.forEach((x) => { if (!splitOff.has(x.route_id)) checked.add(x.route_id); }));
@@ -268,6 +298,11 @@ export async function showCoordinateReview(id) {
   let pin = null;
   let dirty = false;
   setLeaveGuard(() => (dirty ? `The new position for ${r.stop_name} is not in a draft yet.` : null));
+  // The pin and the checked routes are not in a draft until Move or Split: each
+  // placement, finished drag and tick is one step to undo. A reload after an
+  // action starts again with nothing to undo.
+  const history = undoScope("this review");
+  let placedPin = null;
 
   const originPoints = groups.filter((g) => g.suspect && g.raw_lat != null && g.raw_lon != null && g.routes.length)
     .map((g) => ({ lat: g.raw_lat, lon: g.raw_lon, label: `Raw point of ${g.origin_name || g.origin_stop_id}` }));
@@ -275,15 +310,13 @@ export async function showCoordinateReview(id) {
     stopId: r.stop_id, current, loaded: { lat: r.lat, lon: r.lon }, raw, suggestion, origins: originPoints,
     onPlace: changeable ? (la, lo, how) => place(la, lo, how) : null,
   });
-  view.setDrafted(draftActions.map((a) => ({
-    lat: a.lat, lon: a.lon,
-    label: a.kind === "move" ? "Moved here in the draft" : `New stop ${a.new_stop_id}, in the draft`,
-  })));
+  view.setDrafted(draftedPoints(draftActions));
 
   const root = h("div");
   const statusBox = h("div.review-status");
   const pinBox = h("div", { "aria-live": "polite", style: "display:grid;gap:8px" });
   const routesBox = h("section.section", { "aria-label": "Routes at this stop" });
+  const candidatesBox = h("section.section.candidates", { hidden: true });
   const sharingBox = h("section.section", { hidden: true });
   const actionsBox = h("div.sticky-actions");
   const actionProblems = h("div");
@@ -291,6 +324,7 @@ export async function showCoordinateReview(id) {
   const coordsError = h("p.field-error", { role: "alert", hidden: true });
   const noteInput = h("input", { type: "text", id: "review-note", maxlength: "500", autocomplete: "off", placeholder: "What you checked, for the approver" });
   const nameInput = h("input", { type: "text", id: "split-name", maxlength: "200", autocomplete: "off", placeholder: r.stop_name });
+  history.fields([[noteInput, "the note"], [nameInput, "the new stop's name"]]);
 
   // previous and next in the list this came from
   const at = list.items.findIndex((x) => x.review_id === r.review_id);
@@ -340,6 +374,9 @@ export async function showCoordinateReview(id) {
           specs.push({ ...base, via: current, kind: "was" });
           const action = draftActions.find((a) => a.kind === "split" && (a.route_ids || []).includes(route.route_id));
           if (action) specs.push({ ...base, via: { lat: action.lat, lon: action.lon }, kind: "drafted" });
+        } else if (mergeAction && mergeAction.lat != null) {
+          specs.push({ ...base, via: current, kind: "was" });
+          specs.push({ ...base, via: { lat: mergeAction.lat, lon: mergeAction.lon }, kind: "drafted" });
         } else if (hasMove) {
           specs.push({ ...base, via: current, kind: "was" });
           const action = draftActions.find((a) => a.kind === "move");
@@ -370,20 +407,48 @@ export async function showCoordinateReview(id) {
     });
   };
 
-  function place(lat, lon, how) {
-    pin = { lat, lon };
-    dirty = true;
-    coordsError.hidden = true;
-    if (how !== "drag") view.setPin(pin);
-    if (["suggestion", "raw", "origin", "typed"].includes(how)) {
-      view.fit([pin, ...endsOf(checked.size ? checked : null)], { maxZoom: 18 });
-    }
+  // undo and redo put the pin back where it was put down before (or take it off)
+  function putPin(p) {
+    pin = p ? { ...p } : null;
+    placedPin = pin;
+    dirty = !!pin || checked.size > 0;
+    view.setPin(pin);
     redraw();
   }
 
+  function place(lat, lon, how) {
+    // a drag reports every move, then once more when it ends: that end is the step
+    if (how !== "dragend") {
+      pin = { lat, lon };
+      dirty = true;
+      coordsError.hidden = true;
+      if (how !== "drag") view.setPin(pin);
+      if (["suggestion", "raw", "origin", "typed", "candidate"].includes(how)) {
+        view.fit([pin, ...endsOf(checked.size ? checked : null)], { maxZoom: 18 });
+      }
+      redraw();
+    }
+    if (how === "drag") return;
+    const before = placedPin, after = { lat, lon };
+    if (before && before.lat === after.lat && before.lon === after.lon) return;
+    placedPin = after;
+    history.push({ label: before ? "moved the pin" : "placed the pin", undo: () => putPin(before), redo: () => putPin(after) });
+  }
+
   // ---- the panel
+  function setChecked(ids) {
+    checked.clear();
+    ids.forEach((rid) => checked.add(rid));
+    view.setLegs(legSpecs());
+    renderRoutes();
+    renderActions();
+  }
+
   function toggle(routeIds, on, focusId) {
+    const before = [...checked];
     routeIds.forEach((rid) => { if (!splitOff.has(rid)) (on ? checked.add(rid) : checked.delete(rid)); });
+    const after = [...checked];
+    history.push({ label: `${on ? "checked" : "unchecked"} ${plural(routeIds.length, "route")}`, undo: () => setChecked(before), redo: () => setChecked(after) });
     view.setLegs(legSpecs());
     renderRoutes();
     renderActions();
@@ -396,14 +461,12 @@ export async function showCoordinateReview(id) {
     // branch eagerly, so a single shared node would be pulled out of the first
     // place it was appended when a later branch reused it
     const draftLink = () => (r.change_set_id ? h("a", { href: `#/drafts/${enc(r.change_set_id)}` }, `“${r.change_set_title || "untitled"}”`) : "(unknown)");
-    const actionLine = (a) => a.kind === "move"
-      ? h("span", `Moves the stop to ${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}, ${fmtMetres(haversine(current.lat, current.lon, a.lat, a.lon))} from where it was.`)
-      : h("span", `Splits ${plural((a.route_ids || []).length, "route")} (${(a.route_ids || []).map((rid) => routeLabel(byRoute.get(rid) || { route_id: rid })).join(", ")}) onto `,
-          h("a", { href: `#/stop/${enc(a.new_stop_id)}` }, a.new_stop_id), ".");
-    const actionsList = draftActions.length ? h("ul.list.draft-actions", draftActions.map((a) => h("li.list-item",
-      h("span.key", a.kind === "move" ? "Move" : "Split"),
-      actionLine(a),
-      h("span.hint", a.detour_m_after != null ? `detour ${fmtMetres(Math.max(0, a.detour_m_after))}` : "")))) : null;
+    // the same list every panel uses for what a draft does to an entity (overlay.js)
+    const words = { current: { ...current, live: false }, routeLabel: (rid) => routeLabel(byRoute.get(rid) || { route_id: rid }) };
+    const drafted = actionsList(draftActions, words);
+    // what the ACTIVE draft does to this stop outside this review
+    const others = state.draft && state.draft.change_set_id !== r.change_set_id
+      ? pendingActions("stop", r.stop_id).filter((a) => a.review_id !== r.review_id) : [];
     const notice = {
       pending: null,
       approved: h("div.notice.draft",
@@ -419,7 +482,7 @@ export async function showCoordinateReview(id) {
     clear(statusBox,
       statusChip(r),
       notice,
-      actionsList,
+      drafted,
       blocking.length ? h("div.notice.error", { role: "alert" },
         h("p", h("strong", "This stop cannot be moved or split")),
         h("ul", blocking.map((p) => h("li", p.message,
@@ -428,9 +491,55 @@ export async function showCoordinateReview(id) {
       warnings.length ? h("div.notice.warning", h("p", h("strong", "Check first")), h("ul", warnings.map((p) => h("li", p.message)))) : null,
       mixed ? h("div.notice.warning", { role: "note" },
         h("p", h("strong", `This stop serves routes from ${rawGroups.length} original stops — moving it moves all of them. Split the wrong ones off instead.`))) : null,
-      editable && state.draft && state.draft.change_set_id !== r.change_set_id
-        && state.draft.changes.some((c) => c.entity === "stop" && c.entity_key === r.stop_id && !(c.after && c.after.position_review_id === r.review_id))
-        ? h("p.notice.draft", `Your draft “${state.draft.title}” already changes this stop, outside this review.`) : null);
+      editable && others.length
+        ? h("div.notice.draft", h("p", `Your draft “${state.draft.title}” already changes this stop, outside this review.`), actionsList(others, { current })) : null);
+  }
+
+  // what the clean-up tool made of it: its verdict, in words, with the detour it expects
+  function autoFixBanner() {
+    if (!autoFix || !autoFix.action) return null;
+    const target = autoFix.into_stop_id ? candidates.find((c) => c.stop_id === autoFix.into_stop_id) : null;
+    const detour = autoFix.detour_m != null
+      ? ` — detour ${detourText(autoFix.detour_m)}${autoFix.detour_m_after != null ? ` → ${detourText(autoFix.detour_m_after)}` : ""}` : "";
+    const says = {
+      merge: ["The tool suggests merging into ", autoFix.into_stop_id ? h("a", { href: `#/stop/${enc(autoFix.into_stop_id)}` }, target ? `${target.name} (${autoFix.into_stop_id})` : autoFix.into_stop_id) : "a same-named stop", detour, "."],
+      move: [`The tool suggests moving it${autoFix.lat != null ? ` to ${fmtCoord(autoFix.lat)}, ${fmtCoord(autoFix.lon)}` : ""}`, detour, "."],
+      choose: ["The tool found more than one place that would fit and did not choose", detour, ". Pick one of the same-named stops below, or place the pin."],
+      none: ["The tool found no fix", detour, ". Check it by hand."],
+    }[autoFix.action];
+    if (!says) return null;
+    return h("div.notice.auto-fix", { role: "note", dataset: { autoFix: autoFix.action } },
+      h("p", h("strong", says)),
+      autoFix.reason ? h("p", autoFix.reason) : null,
+      h("p.hint", [autoFix.tool ? `From ${autoFix.tool}` : null, autoFix.threshold_m != null ? `it calls a detour under ${fmtMetres(autoFix.threshold_m)} a fit` : null].filter(Boolean).join("; "),
+        ". A suggestion only: nothing is changed until you add it to a draft."),
+      changeable && !mergeAction ? h("div.btn-row",
+        autoFix.action === "move" && autoFix.lat != null
+          ? h("button.btn.secondary.small", { type: "button", id: "use-auto-fix", on: { click: () => place(autoFix.lat, autoFix.lon, "suggestion") } }, "Use this position") : null,
+        autoFix.action === "merge" && target
+          ? h("button.btn.secondary.small", { type: "button", id: "merge-auto-fix", on: { click: () => mergeInto(target) } }, "Merge into this stop…") : null) : null);
+  }
+
+  // same-named stops that may be the right place: move this stop onto one, or merge into it
+  function renderCandidates() {
+    if (!candidates.length) return;
+    candidatesBox.hidden = false;
+    clear(candidatesBox,
+      h("h2", `Same-named stops that may be the right place (${candidates.length})`),
+      h("p.hint", "Numbered on the map: teal where this stop's routes would fit, grey where they would not. Use a position to move this stop there, or merge this stop into the other when they are one stop entered twice."),
+      h("ol.candidate-list", { style: "list-style:none;margin:0;padding:0" }, candidates.map((c, i) => h("li.candidate", { dataset: { stop: c.stop_id } },
+        h("span.picker-no", { class: c.verdict === "fits" ? "fits" : "no_fit", "aria-hidden": "true" }, String(i + 1)),
+        h("div", { style: "display:grid;gap:2px;min-width:0" },
+          h("span", h("a", { href: `#/stop/${enc(c.stop_id)}` }, h("strong", c.name)), " ",
+            c.verdict === "fits" ? h("span.chip.approved", "Routes fit") : h("span.chip.discarded", "Routes do not fit")),
+          h("span.meta", [c.stop_id, c.distance_m != null ? `${fmtMetres(c.distance_m)} away` : null, plural(c.route_count || 0, "route"),
+            c.name_similarity != null && c.name_similarity < 1 ? `name ${Math.round(c.name_similarity * 100)}% alike` : "same name",
+            c.shares_route ? "on one of this stop's routes" : null,
+            c.detour_m_after != null ? `detour there ${detourText(c.detour_m_after)}` : null].filter(Boolean).join(" · "))),
+        changeable && !mergeAction ? h("div.btn-row",
+          h("button.btn.secondary.small", { type: "button", id: `use-candidate-${c.stop_id}`, "aria-label": `Use the position of ${c.name} (${c.stop_id})`, disabled: hasMove, on: { click: () => place(c.lat, c.lon, "candidate") } }, "Use this position"),
+          h("button.btn.secondary.small", { type: "button", id: `merge-candidate-${c.stop_id}`, "aria-label": `Merge into ${c.name} (${c.stop_id})`, disabled: draftActions.length > 0, on: { click: () => mergeInto(c) } }, "Merge into this stop…")) : null))),
+      changeable && draftActions.length && !mergeAction ? h("p.hint", "This review already has a move or a split in its draft, so it cannot also be merged away. Remove those from the draft first.") : null);
   }
 
   function renderPin() {
@@ -531,18 +640,21 @@ export async function showCoordinateReview(id) {
 
   function renderSharing(found) {
     if (!found.length) return;
+    // a stop that has since become a platform of a station is named through it, once
+    const where = (d) => (d <= SAME_POINT_METRES ? "same point" : fmtMetres(d));
+    const names = new Map(found.filter((s) => s.parent).map((s) => [s.parent.stop_id, s.parent.name]));
+    const [listed, stations] = foldedList(found, names, (s) => h("li.list-item",
+      h("span.key", s.missing ? "gone" : s.deleted ? "removed" : where(s.distance_m)),
+      h("a", { href: `#/stop/${enc(s.stop_id)}` }, s.name || s.stop_id),
+      h("span.hint", s.route_count != null ? plural(s.route_count, "route") : ""),
+      h("span.sub", s.missing ? `${s.stop_id}, no longer in the feed` : [s.stop_id, s.platform_code].filter(Boolean).join(", "))),
+    { key: (g, nearest) => (nearest == null ? "" : where(nearest)) });
     sharingBox.hidden = false;
     clear(sharingBox,
       h("h2", `Stops that shared its point (${found.length})`),
       h("p.hint", "When it was flagged, these stops had exactly the same coordinate. This stop's coordinate may have come from one of them."),
-      h("ul.list", found.map((s) => {
-        const d = s.lat != null ? haversine(current.lat, current.lon, s.lat, s.lon) : null;
-        return h("li.list-item",
-          h("span.key", s.missing ? "gone" : s.deleted ? "removed" : d <= SAME_POINT_METRES ? "same point" : fmtMetres(d)),
-          h("a", { href: `#/stop/${enc(s.stop_id)}` }, s.name || s.stop_id),
-          h("span.hint", s.route_count != null ? plural(s.route_count, "route") : ""),
-          h("span.sub", s.missing ? `${s.stop_id}, no longer in the feed` : s.stop_id));
-      })));
+      platformsNote(stations, found.length),
+      listed);
   }
 
   // Move, Split, Position is correct and Next stay in reach at the bottom of the
@@ -550,7 +662,7 @@ export async function showCoordinateReview(id) {
   // not leave the review: several can go into the same draft (docs section 8.1).
   function renderActions() {
     if (!editable) return;
-    const gone = blocking.length ? "the stop is gone (see above)." : null;
+    const gone = blocking.length ? "the stop is gone (see above)." : mergeAction ? `the stop is merged into ${mergeAction.into_stop_id} in this draft.` : null;
     const moveWhy = gone || (hasMove ? "the stop was already moved in this draft."
       : !pin ? "set a new position first."
         : haversine(current.lat, current.lon, pin.lat, pin.lon) < 1 ? "the pin is where the stop is now." : null);
@@ -653,6 +765,39 @@ export async function showCoordinateReview(id) {
     }
   }
 
+  // Merge the reviewed stop into a same-named one: every route moves to that stop
+  // and this one goes away, as a stop/merge change in the draft.
+  async function mergeInto(c) {
+    clear(actionProblems);
+    const namesDiffer = (c.name || "") !== (stop ? stop.name : r.stop_name);
+    const answer = await modal("Merge into this stop?", (close) => {
+      const keep = h("select", { id: "merge-keep-name" },
+        h("option", { value: "into" }, `${c.name} (the stop that stays)`),
+        h("option", { value: "from" }, `${stop ? stop.name : r.stop_name} (this stop)`));
+      return h("form", { style: "display:grid;gap:10px", on: { submit: (e) => { e.preventDefault(); close({ keep_name: keep.value }); } } },
+        h("p", `${stop ? stop.name : r.stop_name} (${r.stop_id}) is merged into ${c.name} (${c.stop_id}). Every route that calls here switches to ${c.stop_id}, and ${r.stop_id} is removed when the draft is committed.`),
+        c.verdict !== "fits" ? h("p.notice.warning", "The tool does not think this stop's routes fit there. Check the map before merging.") : null,
+        namesDiffer ? h("label.field", { for: "merge-keep-name" }, h("span", "Name to keep"), keep) : null,
+        h("div.btn-row", h("button.btn", { type: "submit", id: "merge-confirm" }, "Add merge to draft"), h("button.btn.secondary", { type: "button", on: { click: () => close(undefined) } }, "Cancel")));
+    });
+    if (!answer) return;
+    const draft = await requireDraft(DRAFT_REASON);
+    if (!draft) return;
+    const body = { change_set_id: draft.change_set_id, into_stop_id: c.stop_id };
+    if (namesDiffer) body.keep_name = answer.keep_name;
+    if (noteInput.value.trim()) body.note = noteInput.value.trim();
+    try {
+      const res = await post(`position-reviews/${enc(r.review_id)}/merge`, body);
+      await refreshDraft().catch(() => null);
+      const warned = Array.isArray(res.warnings) ? res.warnings : [];
+      toast(`Merged ${r.stop_name} into ${c.name} (${c.stop_id}) in draft “${draft.title}”.${res.detour_m_after != null ? ` Detour there ${detourText(res.detour_m_after)}.` : ""}`);
+      if (warned.length) flash = { title: "Merge added, with things to check:", text: warned.map((w) => w.message).join(" ") };
+      reload();
+    } catch (e) {
+      failed(e, actionProblems);
+    }
+  }
+
   async function confirmPosition() {
     clear(actionProblems);
     const note = await modal("Position is correct", (close) => {
@@ -718,6 +863,7 @@ export async function showCoordinateReview(id) {
         h("p.ids", [`Stop ${r.stop_id}`, `review #${r.review_id}`, r.original_stop_id && r.original_stop_id !== r.stop_id ? `flagged as ${r.original_stop_id}` : null].filter(Boolean).join(" · "))),
       statusBox,
       h("div.review-why", h("h2", "Why it is flagged"), h("p", r.reason || "No reason was given.")),
+      autoFixBanner(),
       h("dl.facts",
         h("dt", "Detour now"), h("dd", detourNow == null
           ? (legs.length ? "Not measured: its routes start or end here." : "No route calls at it.")
@@ -738,23 +884,29 @@ export async function showCoordinateReview(id) {
       h("label.field", { for: "review-coords" }, h("span", "Or type the coordinates"),
         h("div.picker-bar", coordsInput, h("button.btn.secondary.small", { type: "button", on: { click: useCoords } }, "Put the pin there"))),
       coordsError,
+      history.buttons(),
       h("label.field", { for: "review-note" }, h("span", "Note (optional)"), noteInput)) : null,
+    candidatesBox,
     routesBox,
     sharingBox,
     editable ? actionsBox : null);
 
   renderStatus();
   renderPin();
+  renderCandidates();
   renderRoutes();
   renderActions();
   view.setLegs(legSpecs());
-  view.fit([current, raw, suggestion, ...originPoints, ...draftActions.map((a) => ({ lat: a.lat, lon: a.lon })), ...endsOf(null)].filter(Boolean));
+  view.setCandidates(candidates, changeable && !mergeAction && !hasMove ? (c) => place(c.lat, c.lon, "candidate") : null);
+  view.fit([current, raw, suggestion, ...originPoints, ...candidates.filter((c) => c.lat != null), ...draftActions.filter((a) => a.lat != null).map((a) => ({ lat: a.lat, lon: a.lon })), ...endsOf(null)].filter(Boolean));
 
   // the stops that shared its point, where they are now
   const shares = (Array.isArray(ev.shares_point_with) ? ev.shares_point_with : []).filter((s) => s && s.stop_id && s.stop_id !== r.stop_id).slice(0, 12);
   if (shares.length) {
     const found = await Promise.all(shares.map((s) => get(`feeds/${enc(state.feedId)}/stops/${enc(s.stop_id)}`)
-      .then((d) => ({ stop_id: s.stop_id, name: d.name || s.name, lat: d.lat, lon: d.lon, deleted: !!d.deleted, route_count: d.route_count }))
+      .then((d) => ({ stop_id: s.stop_id, name: d.name || s.name, lat: d.lat, lon: d.lon, deleted: !!d.deleted, route_count: d.route_count,
+        location_type: d.location_type, platform_code: d.platform_code, parent_station: d.deleted ? null : d.parent_station, parent: d.parent || null,
+        distance_m: haversine(current.lat, current.lon, d.lat, d.lon) }))
       .catch(() => ({ stop_id: s.stop_id, name: s.name, missing: true }))));
     if (!document.body.contains(root)) return;
     view.setSharing(found.filter((s) => !s.missing && !s.deleted));

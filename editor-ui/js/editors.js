@@ -10,6 +10,8 @@ import * as map from "./map.js";
 import { addChange, existingChange, createdChange, requireDraft, updateChange } from "./drafts.js";
 import { stopPicker } from "./picker.js";
 import { showStop, showRoute } from "./explore.js";
+import { undoScope } from "./undo.js";
+import { foldPlatforms, stationNames, platformsNote } from "./context.js";
 
 const panel = () => document.getElementById("panel");
 const round7 = (x) => Math.round(x * 1e7) / 1e7;
@@ -68,11 +70,30 @@ export async function editStop(stop) {
   const unsaved = guard(`Your changes to ${stop.name} are not in the draft yet.`);
   const moved = h("p.hint", { "aria-live": "polite" });
   const problems = h("div");
+  // a finished drag of the pin, and each field once left, is one step to undo
+  const history = undoScope("this stop");
+  const syncFields = history.fields([[f.name, "the name"], [f.lat, "the latitude"], [f.lon, "the longitude"],
+    [f.platform_code, "the platform label"], [f.regional_name, "the Tamil name"]]);
+  let placed = { lat: f.lat.value, lon: f.lon.value };     // as text, so undoing restores it exactly
+  const putPin = (p) => {
+    placed = p;
+    f.lat.value = p.lat;
+    f.lon.value = p.lon;
+    syncFields();
+    setPin(Number(p.lat), Number(p.lon));
+    unsaved.touch();
+    showMoved();
+  };
   const setPin = map.dragStop(stop, (lat, lon) => {
     f.lat.value = lat.toFixed(7);
     f.lon.value = lon.toFixed(7);
     unsaved.touch();
     showMoved();
+  }, (lat, lon) => {
+    const before = placed, after = { lat: lat.toFixed(7), lon: lon.toFixed(7) };
+    placed = after;
+    syncFields();
+    history.push({ label: "moved the pin", undo: () => putPin(before), redo: () => putPin(after) });
   });
   function showMoved() {
     const lat = Number(f.lat.value), lon = Number(f.lon.value);
@@ -84,7 +105,7 @@ export async function editStop(stop) {
   }
   const typed = debounce(() => {
     const lat = Number(f.lat.value), lon = Number(f.lon.value);
-    if (Number.isFinite(lat) && Number.isFinite(lon)) setPin(lat, lon);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) { setPin(lat, lon); placed = { lat: f.lat.value, lon: f.lon.value }; }
     showMoved();
   }, 300);
   f.lat.addEventListener("input", typed);
@@ -110,6 +131,7 @@ export async function editStop(stop) {
       const res = await addChange({ entity: "stop", op: "update", entity_key: stop.stop_id, after, base_row_version: stop.row_version });
       if (!res) return;
       unsaved.done();
+      history.clear();
       if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.endModes();
       showStop(stop.stop_id);
@@ -129,6 +151,7 @@ export async function editStop(stop) {
         h("label.field", { for: "stop-lon" }, h("span", "Longitude"), f.lon)),
       moved,
       h("p.hint", "Drag the teal pin on the map to the kerb where the bus stops."),
+      history.buttons(),
       h("div.field-row",
         h("label.field", { for: "stop-platform" }, h("span", "Platform label (optional)"), f.platform_code),
         h("label.field", { for: "stop-regional" }, h("span", "Tamil name (optional)"), f.regional_name)),
@@ -191,7 +214,26 @@ export async function editRouteRows(route, { created = false } = {}) {
   const summary = h("div", { "aria-live": "polite" });
   const fixAllBtn = h("button.btn.secondary.small", { type: "button", hidden: true }, "Set every intermediate stop to its stage");
 
-  const edited = () => { serverProblems = null; unsaved.touch(); };
+  // Every row operation is one step to undo: the list before and after it. The
+  // steps go when the list is saved into the draft.
+  const history = undoScope("the stop list");
+  const copyRows = (from) => from.map((r) => { const c = { ...r }; if (typedName.has(r)) typedName.add(c); return c; });
+  let snap = copyRows(rows);
+  const restore = (to) => {
+    rows = copyRows(to);
+    snap = to;
+    active = null;
+    serverProblems = null;
+    unsaved.touch();
+    redraw();
+  };
+  const edited = (label = "changed the stop list") => {
+    serverProblems = null;
+    unsaved.touch();
+    const before = snap, after = copyRows(rows);
+    snap = after;
+    history.push({ label, undo: () => restore(before), redo: () => restore(after) });
+  };
 
   // stage names this route already uses, in route order, for the stage name choice
   const stageNames = () => {
@@ -294,7 +336,7 @@ export async function editRouteRows(route, { created = false } = {}) {
     };
     rows.splice(at, 0, row);
     active = null;
-    edited();
+    edited(`added ${stop.name} as stop ${at + 1}`);
     redraw({ focus: `row-${at}` });
     toast(`Added ${stop.name} as stop ${at + 1}${row.stop_type === "NEW STOP" ? ", starting a fare stage" : ""}.`);
   }
@@ -307,7 +349,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       stop_name_override: null, draft: !!stop.draft,
     });
     active = null;
-    edited();
+    edited(`changed stop ${i + 1} to ${stop.name}`);
     redraw({ focus: `row-${i}` });
     toast(`Stop ${i + 1} is now ${stop.name} (${stop.stop_id}).${dropped ? ` The route's own spelling "${dropped}" was for the old stop and is removed.` : ""}`);
   }
@@ -326,7 +368,7 @@ export async function editRouteRows(route, { created = false } = {}) {
         }
       }
     }
-    edited();
+    edited(`changed the fare stage at stop ${i + 1}`);
     redraw();
   }
 
@@ -378,7 +420,7 @@ export async function editRouteRows(route, { created = false } = {}) {
         } else {
           Object.assign(rows[i], { stop_type: t });
         }
-        edited();
+        edited(`changed the type of stop ${i + 1}`);
         redraw({ focus: null });
       } } }, ["NEW STOP", "INTERMEDIATE STOP", "JUMP STOP"].map((t) => h("option", { value: t, selected: t === r.stop_type }, STOP_TYPE_LABEL[t])),
       r.stop_type === "HIDDEN STOP" ? h("option", { value: "HIDDEN STOP", selected: true }, STOP_TYPE_LABEL["HIDDEN STOP"]) : null);
@@ -395,7 +437,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       detail = h("div.row-edit-line", line);
     }
     const errs = problems.map((p) => h(p.existing ? "span.row-warning" : "span.row-error", p.message, p.fix
-      ? [" ", h("button.btn.quiet.small", { type: "button", on: { click: () => { Object.assign(rows[i], p.fix); edited(); redraw(); } } }, `Use stage ${p.fix.stage_no}`)]
+      ? [" ", h("button.btn.quiet.small", { type: "button", on: { click: () => { Object.assign(rows[i], p.fix); edited(`set stop ${i + 1} to stage ${p.fix.stage_no}`); redraw(); } } }, `Use stage ${p.fix.stage_no}`)]
       : null));
     const rowState = problems.some((p) => !p.existing) ? "has-error" : problems.length ? "has-warning" : "";
     const changing = active && active.kind === "change" && active.index === i;
@@ -432,7 +474,7 @@ export async function editRouteRows(route, { created = false } = {}) {
     if (j < 0 || j >= rows.length) return;
     [rows[i], rows[j]] = [rows[j], rows[i]];
     active = null;
-    edited();
+    edited(`moved stop ${i + 1} ${delta < 0 ? "up" : "down"}`);
     redraw({ focus: `row-${j}` });
   }
 
@@ -443,7 +485,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       h("button.icon-btn", { type: "button", title: "Remove from the route", "aria-label": `Remove stop ${i + 1}`, on: { click: () => {
         const [gone] = rows.splice(i, 1);
         active = null;
-        edited();
+        edited(`removed ${gone.stop_name || gone.marker_name || "a row"}`);
         redraw({ focus: rows.length ? `row-${Math.min(i, rows.length - 1)}` : "add-0" });
         toast(`Removed ${gone.stop_name || gone.marker_name || "the row"} from the route.`);
       } } }, "×"));
@@ -451,7 +493,7 @@ export async function editRouteRows(route, { created = false } = {}) {
 
   fixAllBtn.addEventListener("click", () => {
     validateRows(rows).filter((p) => p.fix).forEach((p) => Object.assign(rows[p.index], p.fix));
-    edited();
+    edited("set every intermediate stop to its stage");
     redraw();
   });
 
@@ -483,7 +525,7 @@ export async function editRouteRows(route, { created = false } = {}) {
     const { rows: next, changed } = renumberStages(rows, from);
     if (!changed) { toast("The stages were already numbered in order."); return; }
     rows.forEach((r, i) => Object.assign(r, { stage_no: next[i].stage_no, stage_name: next[i].stage_name }));
-    edited();
+    edited("renumbered the stages");
     redraw();
     toast(`Stages renumbered: ${plural(changed, "stop")} changed.`);
   }
@@ -507,6 +549,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       const res = await addChange({ entity: "route_stops", op: "replace", entity_key: route.route_id, after: { rows: payload, base_rows_hash: baseHash } });
       if (!res) return;
       unsaved.done();
+      history.clear();
       serverProblems = res.problems;
       if (res.problems.some((p) => p.level === "error")) {
         redraw();
@@ -529,7 +572,8 @@ export async function editRouteRows(route, { created = false } = {}) {
       created ? h("p.notice.draft", "This route is new in your draft. Add its stops in order: the first stop starts fare stage 1.") : null,
       h("p.hint", "A stage stop starts a fare stage. Every intermediate stop after it carries the same stage number and name, or passengers are charged the wrong fare. Changing a stage stop's number or name updates the stops in its stage."),
       summary,
-      h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: renumber } }, "Renumber stages in order"), fixAllBtn)),
+      h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: renumber } }, "Renumber stages in order"), fixAllBtn),
+      history.buttons()),
     h("section.section", h("div.ladder.editing", list)),
     h("div.sticky-actions", h("div.btn-row",
       h("button.btn", { type: "button", on: { click: save } }, prior ? "Update in draft" : "Add to draft"),
@@ -557,6 +601,16 @@ export async function editRouteDetails(route, { created = false } = {}) {
   f.color.addEventListener("input", () => { if (/^#[0-9a-f]{6}$/i.test(f.color.value)) swatch.value = f.color.value; });
   const lineStatus = h("div");
   const problems = h("div");
+  const history = undoScope("this route");
+  history.fields([[f.short_name, "the route number"], [f.long_name, "the route name"], [f.color, "the colour"]]);
+  // a colour picked from the swatch is one step, like a typed one
+  swatch.addEventListener("change", () => f.color.dispatchEvent(new Event("change", { bubbles: true })));
+  const setLine = (line, label) => {
+    const before = proposed;
+    proposed = line;
+    history.push({ label, undo: () => { proposed = before; unsaved.touch(); showProposal(); }, redo: () => { proposed = line; unsaved.touch(); showProposal(); } });
+    showProposal();
+  };
 
   const showProposal = () => {
     if (!proposed) {
@@ -573,16 +627,15 @@ export async function editRouteDetails(route, { created = false } = {}) {
       km = fmtMetres(d);
     } catch { /* shown as-is */ }
     clear(lineStatus, h("p.notice.ok", `New map line ready (${km}), shown dashed in teal. It is saved when you add these changes to the draft.`),
-      h("button.btn.quiet.small", { type: "button", on: { click: () => { proposed = null; showProposal(); } } }, "Discard the new map line"));
+      h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line"));
   };
 
   const suggest = async () => {
     clear(lineStatus, h("p.hint", "Asking the road router for a line through the stops…"));
     try {
       const res = await post(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/polyline:osrm?change_set=${enc(state.draft.change_set_id)}`);
-      proposed = { encoded_polyline: res.encoded_polyline, polyline_source: res.polyline_source || "osrm" };
       unsaved.touch();
-      showProposal();
+      setLine({ encoded_polyline: res.encoded_polyline, polyline_source: res.polyline_source || "osrm" }, "suggested a map line");
     } catch (e) {
       clear(lineStatus, h("p.notice.error", e.message));
     }
@@ -622,6 +675,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
       }
       if (!res) return;
       unsaved.done();
+      history.clear();
       if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.clearRoute("proposal");
       showRoute(route.route_id, { preview: true });
@@ -638,6 +692,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
       h("label.field", { for: "route-short" }, h("span", "Route number"), f.short_name),
       h("label.field", { for: "route-long" }, h("span", "Route name"), f.long_name),
       h("label.field", { for: "route-color" }, h("span", "Colour on maps (optional)"), h("div.btn-row", swatch, h("div", { style: "flex:1" }, f.color))),
+      history.buttons(),
     ),
     h("section.section",
       h("h2", "Map line"),
@@ -681,14 +736,48 @@ export async function editStation(station, initialStops = []) {
   const finder = h("div");
   const problems = h("div");
 
+  // The stops in the station, their labels and the station point: each change to
+  // them is one step to undo, the whole of it before and after. Name and id are
+  // fields, a step each once left.
+  const history = undoScope("the station");
+  const syncFields = history.fields([[nameInput, "the station name"], [idInput, "the station id"], [latIn, "the latitude"], [lonIn, "the longitude"]]);
+  const names = new Map();         // station names for the suggestions, looked up once
+  const take = () => ({ members: [...members.values()].map((m) => ({ ...m })), lat: latIn.value, lon: lonIn.value, id: idInput.value, name: nameInput.value, placedByHand });
+  let snap = null;
+  const remember = (label) => {
+    if (!snap) return;
+    const before = snap, after = take();
+    snap = after;
+    syncFields();
+    history.push({ label, undo: () => putBack(before), redo: () => putBack(after) });
+  };
+  function putBack(st) {
+    members.clear();
+    st.members.forEach((m) => members.set(m.stop_id, { ...m }));
+    latIn.value = st.lat;
+    lonIn.value = st.lon;
+    idInput.value = st.id;
+    nameInput.value = st.name;
+    placedByHand = st.placedByHand;
+    snap = st;
+    syncFields();
+    selector.set([...members.keys()]);
+    if (st.lat !== "" && st.lon !== "") pin(Number(st.lat), Number(st.lon));
+    unsaved.touch();
+    suggestedFor = null;
+    loadSuggestions();
+    drawMembers();
+  }
+
   let setPin = null;
   const pin = (la, lo) => {
     if (setPin) setPin(la, lo);
-    else setPin = map.stationPin(la, lo, (a, b) => { latIn.value = a.toFixed(7); lonIn.value = b.toFixed(7); placedByHand = true; unsaved.touch(); });
+    else setPin = map.stationPin(la, lo, (a, b) => { latIn.value = a.toFixed(7); lonIn.value = b.toFixed(7); placedByHand = true; unsaved.touch(); },
+      () => remember("moved the station point"));
   };
   const selector = map.selectStops([...members.keys()], (s, added) => {
     if (added) members.set(s.stop_id, { ...s }); else members.delete(s.stop_id);
-    membersChanged();
+    membersChanged(added ? `added ${s.name} to the station` : `took ${s.name} out of the station`);
   });
   if (lat != null) pin(lat, lon);
   [latIn, lonIn].forEach((el) => el.addEventListener("input", debounce(() => {
@@ -704,11 +793,12 @@ export async function editStation(station, initialStops = []) {
     pin(la, lo);
   }
 
-  function membersChanged() {
+  function membersChanged(label = "changed the station's stops") {
     unsaved.touch();
     if (creating && !idTyped) idInput.value = firstId() ? `stn_${firstId()}` : "";
     if (creating && !nameInput.value.trim() && members.size) nameInput.value = [...members.values()][0].name;
     if (creating && !placedByHand) centre();
+    remember(label);
     loadSuggestions();
     drawMembers();
   }
@@ -719,10 +809,10 @@ export async function editStation(station, initialStops = []) {
           h("div.member-row-head",
             h("span", h("strong", m.name), h("span.meta", ` ${m.stop_id}`)),
             h("button.btn.quiet.small", { type: "button", "aria-label": `Take ${m.name} (${m.stop_id}) out of the station`,
-              on: { click: () => { members.delete(m.stop_id); selector.set([...members.keys()]); membersChanged(); } } }, "Take out")),
+              on: { click: () => { members.delete(m.stop_id); selector.set([...members.keys()]); membersChanged(`took ${m.name} out of the station`); } } }, "Take out")),
           h("label.field", { for: `platform-${m.stop_id}` }, h("span", "Platform label (optional)"),
             h("input", { type: "text", id: `platform-${m.stop_id}`, maxlength: "120", value: m.platform_code || "", placeholder: "For example Towards Guindy",
-              on: { input: (ev) => { m.platform_code = ev.target.value; unsaved.touch(); } } }))))
+              on: { input: (ev) => { m.platform_code = ev.target.value; unsaved.touch(); }, change: () => remember(`changed the platform label of ${m.name}`) } }))))
       : h("p.empty", "No stops yet. Click the stops of this place on the map (for example both sides of the road)."));
   }
 
@@ -740,7 +830,7 @@ export async function editStation(station, initialStops = []) {
         members.set(s.stop_id, { ...s });
         selector.set([...members.keys()]);
         clear(finder, finderButton());
-        membersChanged();
+        membersChanged(`added ${s.name} to the station`);
         document.getElementById(`platform-${s.stop_id}`)?.focus();
       },
       onCancel: () => { clear(finder, finderButton()); finder.querySelector("button")?.focus(); },
@@ -755,14 +845,21 @@ export async function editStation(station, initialStops = []) {
     const id = firstId();
     if (!id || id === suggestedFor) { if (!id) clear(suggestions); return; }
     suggestedFor = id;
-    get(`feeds/${enc(state.feedId)}/stops/${enc(id)}`).then((d) => {
-      const near = d.nearby.filter((n) => n.location_type === 0 && !members.has(n.stop_id));
-      if (!near.length) return clear(suggestions);
-      clear(suggestions, h("p.hint", "Stops within 60 m you may want in this station:"),
+    get(`feeds/${enc(state.feedId)}/stops/${enc(id)}`).then(async (d) => {
+      const open = d.nearby.filter((n) => n.location_type === 0 && !members.has(n.stop_id));
+      // a platform of another station cannot join this one: say whose it is, once
+      const taken = open.filter((n) => n.parent_station && (!station || n.parent_station !== station.stop_id));
+      const near = open.filter((n) => !taken.includes(n));
+      await stationNames(taken, names);
+      if (suggestedFor !== id) return null;
+      const note = platformsNote(foldPlatforms(taken, names).stations, open.length);
+      if (!near.length) return clear(suggestions, note);
+      return clear(suggestions, h("p.hint", "Stops within 60 m you may want in this station:"),
         h("ul.list", near.map((n) => h("li.list-item",
           h("span.key", fmtMetres(n.distance_m)), h("span", n.name),
-          h("button.btn.quiet.small", { type: "button", on: { click: (ev) => { members.set(n.stop_id, { ...n }); selector.set([...members.keys()]); membersChanged(); ev.target.closest("li")?.remove(); } } }, "Add"),
-          h("span.sub", `${n.stop_id}${n.parent_station ? `, already in station ${n.parent_station}` : ""}`)))));
+          h("button.btn.quiet.small", { type: "button", on: { click: (ev) => { members.set(n.stop_id, { ...n }); selector.set([...members.keys()]); membersChanged(`added ${n.name} to the station`); ev.target.closest("li")?.remove(); } } }, "Add"),
+          h("span.sub", n.stop_id)))),
+        note);
     }).catch(() => {});
   }
 
@@ -796,6 +893,7 @@ export async function editStation(station, initialStops = []) {
       }, { merge: !creating });
       if (!res) return;
       unsaved.done();
+      history.clear();
       if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.endModes();
       if (station) showStop(station.stop_id);
@@ -818,13 +916,14 @@ export async function editStation(station, initialStops = []) {
       h("p.hint", "Click stops on the map to add or take them out, or find one by name. A platform label tells passengers which way the buses at that stop go."),
       memberList,
       finder,
-      suggestions),
+      suggestions,
+      history.buttons()),
     h("section.section",
       h("h2", "Station point"),
       h("div.field-row",
         h("label.field", { for: "station-lat" }, h("span", "Latitude"), latIn),
         h("label.field", { for: "station-lon" }, h("span", "Longitude"), lonIn)),
-      h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: () => { placedByHand = false; centre(); unsaved.touch(); } } }, "Place in the middle of its stops")),
+      h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: () => { placedByHand = false; centre(); unsaved.touch(); remember("placed the station point in the middle"); } } }, "Place in the middle of its stops")),
       h("p.hint", "Or drag the dark square on the map."),
       problems),
     h("div.sticky-actions", h("div.btn-row",
@@ -835,6 +934,8 @@ export async function editStation(station, initialStops = []) {
   clear(finder, finderButton());
   loadSuggestions();
   if (creating && lat == null) centre();
+  snap = take();
+  syncFields();
   nameInput.focus();
 }
 

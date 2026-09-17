@@ -117,14 +117,51 @@ pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
     Ok(json!({"items": items, "next_cursor": null}))
 }
 
-/// The two `gtfs_feed.data_source` values the API and dashboard accept -
-/// nothing else (`POST /feeds/{g}/config` 400s on anything else).
-const DATA_SOURCES: [&str; 2] = ["db", "preprocessed"];
-
+/// `GET /feeds/{g}/config` (docs/gtfs-editor.md "Feed data source"): which data
+/// source GIMS serves the feed from, and the open change sets that would change
+/// it. Nothing writes it here: a switch is a `feed_config` change in a draft.
 pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> {
     let row = sqlx::query("SELECT gtfs_id, data_source, version FROM gtfs_feed WHERE gtfs_id = $1")
         .bind(gtfs_id)
         .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
+    let pending = sqlx::query(
+        "SELECT cs.change_set_id, cs.title, cs.status, c.change_id, c.after->>'data_source' AS data_source \
+         FROM gtfs_change_set cs \
+         JOIN gtfs_change c ON c.change_set_id = cs.change_set_id \
+         WHERE cs.gtfs_id = $1 AND cs.status IN ('draft', 'submitted', 'approved') \
+           AND c.entity = 'feed_config' AND c.entity_key = $1 \
+         ORDER BY cs.updated_at DESC, cs.change_set_id, c.position",
+    )
+    .bind(gtfs_id)
+    .fetch_all(&state.pool)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        Ok(json!({
+            "change_set_id": r.try_get::<Uuid, _>("change_set_id")?,
+            "change_set_title": r.try_get::<String, _>("title")?,
+            "status": r.try_get::<String, _>("status")?,
+            "change_id": r.try_get::<i64, _>("change_id")?,
+            "data_source": r.try_get::<Option<String>, _>("data_source")?,
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "gtfs_id": row.try_get::<String, _>("gtfs_id")?,
+        "data_source": row.try_get::<String, _>("data_source")?,
+        "version": row.try_get::<i64, _>("version")?,
+        "pending": pending,
+    }))
+}
+
+/// The feed's row as a `feed_config` change snapshots it: `{gtfs_id,
+/// data_source, version}`, the read shape of `GET /feeds/{g}/config`.
+async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<Value> {
+    let row = sqlx::query("SELECT gtfs_id, data_source, version FROM gtfs_feed WHERE gtfs_id = $1")
+        .bind(gtfs_id)
+        .fetch_optional(&mut *conn)
         .await?
         .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
     Ok(json!({
@@ -132,70 +169,6 @@ pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
         "data_source": row.try_get::<String, _>("data_source")?,
         "version": row.try_get::<i64, _>("version")?,
     }))
-}
-
-/// `POST /feeds/{g}/config` (docs/gtfs-editor.md "Feed data source"): flips
-/// which data source GIMS serves this feed from, live - no draft, no
-/// change-set, effective as soon as the next GIMS pod polls. A feed with no
-/// row yet is created (this is how a brand-new feed is switched to `db` for
-/// the first time); an existing row is updated and its version bumped the
-/// same way a change-set commit bumps `gtfs_feed.version`.
-pub async fn set_feed_data_source(
-    state: &EditorState,
-    ctx: &Ctx,
-    gtfs_id: &str,
-    data_source: &str,
-) -> EditorResult<Value> {
-    if !DATA_SOURCES.contains(&data_source) {
-        return Err(EditorError::bad_request(
-            "invalid_data_source",
-            "data_source is 'db' or 'preprocessed'",
-        ));
-    }
-    let mut tx = state.pool.begin().await?;
-    let existing = sqlx::query("SELECT data_source FROM gtfs_feed WHERE gtfs_id = $1")
-        .bind(gtfs_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let (from, version): (Option<String>, i64) = match existing {
-        Some(row) => {
-            let from: String = row.try_get("data_source")?;
-            let version: i64 = sqlx::query(
-                "UPDATE gtfs_feed SET data_source = $2, version = version + 1 \
-                 WHERE gtfs_id = $1 RETURNING version",
-            )
-            .bind(gtfs_id)
-            .bind(data_source)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get("version")?;
-            (Some(from), version)
-        }
-        None => {
-            let version: i64 = sqlx::query(
-                "INSERT INTO gtfs_feed (gtfs_id, display_name, data_source, version) \
-                 VALUES ($1, $1, $2, 1) RETURNING version",
-            )
-            .bind(gtfs_id)
-            .bind(data_source)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get("version")?;
-            (None, version)
-        }
-    };
-    auth::audit(
-        &mut *tx,
-        Some(ctx.user.user_id),
-        Some(&ctx.user.email),
-        "feed_data_source_changed",
-        Some(gtfs_id),
-        None,
-        json!({"gtfs_id": gtfs_id, "from": from, "to": data_source}),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(json!({"gtfs_id": gtfs_id, "data_source": data_source, "version": version}))
 }
 
 // ---------------------------------------------------------------- stops
@@ -709,6 +682,8 @@ pub struct ChangeSet {
     pub status: String,
     pub created_by: Uuid,
     pub submitted_by: Option<Uuid>,
+    /// Approved by the admin who submitted it (docs/gtfs-editor.md section 2).
+    pub self_approved: bool,
     pub json: Value,
 }
 
@@ -716,6 +691,7 @@ const SET_SELECT: &str = "SELECT cs.change_set_id, cs.gtfs_id, cs.title, cs.desc
         cs.created_by, cu.email AS created_by_email, cs.created_at, cs.updated_at, \
         cs.submitted_by, su.email AS submitted_by_email, cs.submitted_at, \
         cs.reviewed_by, ru.email AS reviewed_by_email, cs.reviewed_at, cs.review_comment, \
+        cs.self_approved, \
         cs.committed_by, mu.email AS committed_by_email, cs.committed_at, \
         cs.base_version, cs.committed_version, \
         (SELECT count(*) FROM gtfs_change c WHERE c.change_set_id = cs.change_set_id) AS change_count \
@@ -744,6 +720,7 @@ fn set_from_row(r: &PgRow) -> Result<ChangeSet, sqlx::Error> {
         "reviewed_by_email": r.try_get::<Option<String>, _>("reviewed_by_email")?,
         "reviewed_at": r.try_get::<Ts, _>("reviewed_at")?,
         "review_comment": r.try_get::<Option<String>, _>("review_comment")?,
+        "self_approved": r.try_get::<bool, _>("self_approved")?,
         "committed_by": r.try_get::<Option<Uuid>, _>("committed_by")?,
         "committed_by_email": r.try_get::<Option<String>, _>("committed_by_email")?,
         "committed_at": r.try_get::<Ts, _>("committed_at")?,
@@ -757,6 +734,7 @@ fn set_from_row(r: &PgRow) -> Result<ChangeSet, sqlx::Error> {
         status: r.try_get("status")?,
         created_by: r.try_get("created_by")?,
         submitted_by: r.try_get("submitted_by")?,
+        self_approved: r.try_get("self_approved")?,
         json,
     })
 }
@@ -974,6 +952,9 @@ pub struct Evaluation {
     /// One entry per stop merge that applied: `{change_id, from, into, routes,
     /// rows, keep_name, keep_position}`; commit audits them.
     pub merges: Vec<Value>,
+    /// One entry per `feed_config` change that switched the data source:
+    /// `{gtfs_id, from, to, change_id}`; commit audits them.
+    pub feed_configs: Vec<Value>,
 }
 
 impl Evaluation {
@@ -1044,6 +1025,7 @@ fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: 
         "route_stops" => format!("The stop list of route {key}"),
         "route" => format!("Route {key}"),
         "station" => format!("Station {key}"),
+        "feed_config" => format!("The data source of feed {key}"),
         _ if key != c.entity_key => format!("Stop {key} (kept by the merge of {})", c.entity_key),
         _ => format!("Stop {key}"),
     };
@@ -1135,6 +1117,25 @@ async fn conflict_for(
                 out.push(conflict(c, "exists", Value::Null, json!(key)));
             }
         }
+        ("feed_config", "update") => {
+            // the feed's version moves with every commit, so the base is the
+            // value itself: the data source the change was made against
+            let expected = c.before["data_source"].as_str().unwrap_or("").to_string();
+            let actual: Option<String> =
+                sqlx::query("SELECT data_source FROM gtfs_feed WHERE gtfs_id = $1")
+                    .bind(g)
+                    .fetch_optional(&mut *conn)
+                    .await?
+                    .map(|r| r.try_get("data_source"))
+                    .transpose()?;
+            match actual {
+                None => out.push(conflict(c, "missing", json!(expected), Value::Null)),
+                Some(actual) if actual != expected => {
+                    out.push(conflict(c, "changed", json!(expected), json!(actual)))
+                }
+                Some(_) => {}
+            }
+        }
         ("route_stops", "replace") => {
             // a route created in the draft has no rows: its base is the hash of []
             let expected = c.after["base_rows_hash"].as_str().unwrap_or("").to_string();
@@ -1154,6 +1155,7 @@ struct ApplyState<'a> {
     /// stop merged away by an applied change -> (the stop kept, that change)
     merged_away: HashMap<String, (String, i64)>,
     merges: Vec<Value>,
+    feed_configs: Vec<Value>,
 }
 
 /// Apply every change in order inside `conn`'s transaction; see the module doc.
@@ -1179,6 +1181,7 @@ pub async fn evaluate(
         changes,
         merged_away: HashMap::new(),
         merges: Vec::new(),
+        feed_configs: Vec::new(),
     };
     for c in changes {
         sqlx::query("SAVEPOINT editor_change")
@@ -1209,6 +1212,7 @@ pub async fn evaluate(
         }
     }
     ev.merges = state.merges;
+    ev.feed_configs = state.feed_configs;
     // parent_station is DEFERRABLE: check it now rather than at COMMIT.
     sqlx::query("SAVEPOINT editor_constraints")
         .execute(&mut *conn)
@@ -1233,6 +1237,51 @@ pub async fn evaluate(
         }
     }
     Ok(ev)
+}
+
+/// What [`evaluate`] would find for one more change, `after` on row `key`,
+/// applied after `changes`: that change's findings as `{level, code, message}`,
+/// in a savepoint that is rolled back. The caller is in a transaction. This is
+/// how a merge is asked about before it is drafted (section 8.2) - the same
+/// apply, so the same answer the draft would give once the change is in it.
+pub async fn findings_for(
+    conn: &mut PgConnection,
+    g: &str,
+    changes: &[ChangeRow],
+    (entity, op, key): (&str, &str, &str),
+    after: &Value,
+    actor: &str,
+) -> EditorResult<Vec<Value>> {
+    const PROBE: i64 = 0;
+    let mut all = changes.to_vec();
+    all.push(ChangeRow {
+        change_id: PROBE,
+        position: i32::MAX,
+        entity: entity.into(),
+        entity_key: key.into(),
+        op: op.into(),
+        base_row_version: None,
+        before: Value::Null,
+        after: after.clone(),
+        created_by: Uuid::nil(),
+        created_at: chrono::Utc::now(),
+    });
+    sqlx::query("SAVEPOINT editor_probe")
+        .execute(&mut *conn)
+        .await?;
+    let ev = evaluate(conn, g, &all, actor).await;
+    sqlx::query("ROLLBACK TO SAVEPOINT editor_probe")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT editor_probe")
+        .execute(&mut *conn)
+        .await?;
+    Ok(ev?
+        .validation
+        .into_iter()
+        .filter(|v| v["change_id"] == PROBE)
+        .map(|v| json!({"level": v["level"], "code": v["code"], "message": v["message"]}))
+        .collect())
 }
 
 /// Every stop id a change uses (not the rows it creates).
@@ -1309,6 +1358,7 @@ async fn apply_change(
         ("station", "create") => station_create(conn, g, &c.after, actor).await,
         ("station", "update") => station_update(conn, g, key, &c.after, actor).await,
         ("station", "delete") => station_delete(conn, g, key, actor).await,
+        ("feed_config", "update") => feed_config_update(conn, g, c, state).await,
         (e, o) => Err(fail(
             "invalid_change",
             format!("unsupported change {e}/{o}"),
@@ -2362,6 +2412,51 @@ async fn station_delete(
     Ok(vec![])
 }
 
+/// Switch the data source GIMS serves the feed from. The feed's version is not
+/// touched here: the commit's own bump is what every pod's poll notices. A
+/// change to the value the feed already has - earlier changes of the set taken
+/// as applied - switches nothing and says so.
+async fn feed_config_update(
+    conn: &mut PgConnection,
+    g: &str,
+    c: &ChangeRow,
+    state: &mut ApplyState<'_>,
+) -> Result<Vec<Finding>, ApplyError> {
+    if c.entity_key != g {
+        return Err(fail(
+            "feed_mismatch",
+            format!(
+                "the change is for feed {} and the change set for feed {g}",
+                c.entity_key
+            ),
+        ));
+    }
+    let to = c.after["data_source"].as_str().expect("payload checked");
+    let from: String =
+        sqlx::query("SELECT data_source FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
+            .bind(g)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| fail("feed_not_found", format!("no feed {g}")))?
+            .try_get("data_source")?;
+    if from == to {
+        return Ok(vec![Finding::warning(
+            "data_source_unchanged",
+            g,
+            format!("feed {g} is already served from '{to}'; this change switches nothing"),
+        )]);
+    }
+    sqlx::query("UPDATE gtfs_feed SET data_source = $2 WHERE gtfs_id = $1")
+        .bind(g)
+        .bind(to)
+        .execute(&mut *conn)
+        .await?;
+    state.feed_configs.push(json!({
+        "gtfs_id": g, "from": from, "to": to, "change_id": c.change_id,
+    }));
+    Ok(vec![])
+}
+
 // ---------------------------------------------------------------- set detail
 
 /// The set, its changes, and - unless it is finished - what applying it now
@@ -2650,6 +2745,7 @@ async fn snapshot(
                 })?;
             Ok((created, None))
         }
+        ("feed_config", "update") => Ok((feed_config_row(conn, g).await?, None)),
         ("route_stops", "replace") => {
             if route_row(conn, g, key).await?.is_none() {
                 if created_in_set(conn, change_set_id, true, key)
@@ -2678,6 +2774,26 @@ pub async fn add_change(
     id: Uuid,
     change: NewChange,
 ) -> EditorResult<i64> {
+    let mut tx = state.pool.begin().await?;
+    let set = load_set(&mut tx, id, true).await?;
+    let change_id = add_change_to(&mut tx, ctx, &set, change).await?;
+    tx.commit().await?;
+    Ok(change_id)
+}
+
+/// Append one change to `set`, which the caller has locked, inside the caller's
+/// transaction: the shape checks, a minted id, the defaults, the `before`
+/// snapshot and base version, the row and its `change_added` audit. Everything
+/// that adds a single change goes through here, so a change made for a review
+/// (a merge, section 8.2) is exactly the change `POST /change-sets/{id}/changes`
+/// would have stored.
+pub async fn add_change_to(
+    tx: &mut PgConnection,
+    ctx: &Ctx,
+    set: &ChangeSet,
+    change: NewChange,
+) -> EditorResult<i64> {
+    let id = set.change_set_id;
     let NewChange {
         entity,
         op,
@@ -2685,6 +2801,10 @@ pub async fn add_change(
         mut after,
         base_row_version,
     } = change;
+    // which data source a feed is served from is an admin's call
+    if entity == "feed_config" {
+        ctx.require_role(auth::Role::Admin)?;
+    }
     let mut key = entity_key.trim().to_string();
     settle_create_key(&entity, &op, &mut key, &mut after);
     let mint = entity == "stop" && op == "create" && key.is_empty() && after.is_object();
@@ -2703,14 +2823,21 @@ pub async fn add_change(
         ));
     }
     if !mint {
-        // shape first, before any lock
         check_payload(&entity, &op, &key, &after).map_err(invalid)?;
     }
-    let mut tx = state.pool.begin().await?;
-    let set = load_set(&mut tx, id, true).await?;
-    editable(&set)?;
+    editable(set)?;
+    if entity == "feed_config" && key != set.gtfs_id {
+        return Err(EditorError::bad_request(
+            "invalid_change",
+            format!(
+                "feed_config/update: entity_key must be the change set's feed, {}",
+                set.gtfs_id
+            ),
+        )
+        .with_details(json!({"code": "feed_mismatch"})));
+    }
     if mint {
-        key = mint_stop_ids(&mut tx, &set.gtfs_id, 1).await?.remove(0);
+        key = mint_stop_ids(&mut *tx, &set.gtfs_id, 1).await?.remove(0);
         after["stop_id"] = json!(key);
         check_payload(&entity, &op, &key, &after).map_err(invalid)?;
     }
@@ -2720,13 +2847,13 @@ pub async fn add_change(
             after["route_type"] = json!(3);
         }
         if after["agency_id"].is_null() {
-            if let Some(agency) = usual_agency(&mut tx, &set.gtfs_id).await? {
+            if let Some(agency) = usual_agency(&mut *tx, &set.gtfs_id).await? {
                 after["agency_id"] = json!(agency);
             }
         }
     }
     if entity == "route" && op == "delete" {
-        let others = other_route_changes(&load_changes(&mut tx, id).await?, &key, 0);
+        let others = other_route_changes(&load_changes(&mut *tx, id).await?, &key, 0);
         if !others.is_empty() {
             return Err(EditorError::conflict(
                 "route_has_pending_changes",
@@ -2743,7 +2870,7 @@ pub async fn add_change(
         }
     }
     let (before, live_version) =
-        snapshot(&mut tx, id, &set.gtfs_id, &entity, &op, &key, &mut after).await?;
+        snapshot(&mut *tx, id, &set.gtfs_id, &entity, &op, &key, &mut after).await?;
     let base = base_row_version.or(live_version);
     let change_id: i64 = sqlx::query(
         "INSERT INTO gtfs_change (change_set_id, position, entity, entity_key, op, base_row_version, before, after, created_by) \
@@ -2775,7 +2902,6 @@ pub async fn add_change(
         json!({"change_id": change_id, "entity": entity, "op": op, "entity_key": key}),
     )
     .await?;
-    tx.commit().await?;
     Ok(change_id)
 }
 
@@ -2811,6 +2937,9 @@ pub async fn update_change(
         row.try_get("op")?,
         row.try_get("entity_key")?,
     );
+    if entity == "feed_config" {
+        ctx.require_role(auth::Role::Admin)?;
+    }
     let mut update = update;
     // a create's id is fixed once the change exists; a merge keeps the kept
     // stop's version it was made against unless it names another stop
@@ -2958,7 +3087,7 @@ pub async fn submit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
     }
     sqlx::query(
         "UPDATE gtfs_change_set SET status = 'submitted', submitted_by = $2, submitted_at = now(), \
-            reviewed_by = NULL, reviewed_at = NULL, review_comment = NULL \
+            reviewed_by = NULL, reviewed_at = NULL, review_comment = NULL, self_approved = false \
          WHERE change_set_id = $1 AND status = 'draft'",
     )
     .bind(id)
@@ -2980,16 +3109,16 @@ pub async fn submit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
 }
 
 /// Maker-checker, enforced here as well as by the table's CHECK: nobody reviews
-/// a set they submitted, whatever their role.
-fn not_own(set: &ChangeSet, ctx: &Ctx) -> EditorResult<()> {
-    if set.submitted_by == Some(ctx.user.user_id) {
-        Err(EditorError::forbidden(
-            "own_change_set",
-            "a change set must be reviewed by someone other than the person who submitted it",
-        ))
-    } else {
-        Ok(())
-    }
+/// or commits a set they submitted, whatever their role - except an admin who
+/// says so explicitly ([`review`]'s `self_approve`), which marks the set
+/// `self_approved` and lets that admin commit it too. `details.can_self_approve`
+/// tells the dashboard whether that override is open to the caller.
+fn own_change_set(can_self_approve: bool) -> EditorError {
+    EditorError::forbidden(
+        "own_change_set",
+        "a change set must be reviewed by someone other than the person who submitted it",
+    )
+    .with_details(json!({"can_self_approve": can_self_approve}))
 }
 
 pub async fn review(
@@ -2998,6 +3127,7 @@ pub async fn review(
     id: Uuid,
     approve: bool,
     comment: Option<&str>,
+    self_approve: bool,
 ) -> EditorResult<()> {
     let comment = comment.map(str::trim).filter(|c| !c.is_empty());
     if !approve && comment.is_none() {
@@ -3014,29 +3144,45 @@ pub async fn review(
             format!("the change set is {}", set.status),
         ));
     }
-    not_own(&set, ctx)?;
+    // the override is an approval, by an admin, asked for in so many words; on
+    // someone else's set the flag means nothing
+    let own = set.submitted_by == Some(ctx.user.user_id);
+    let may_override = approve && ctx.user.role() >= auth::Role::Admin;
+    if own && !(may_override && self_approve) {
+        return Err(own_change_set(may_override));
+    }
     sqlx::query(
-        "UPDATE gtfs_change_set SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4 \
+        "UPDATE gtfs_change_set SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4, \
+            self_approved = $5 \
          WHERE change_set_id = $1",
     )
     .bind(id)
     .bind(if approve { "approved" } else { "rejected" })
     .bind(ctx.user.user_id)
     .bind(comment)
+    .bind(own)
     .execute(&mut *tx)
     .await?;
+    let (action, detail) = match (approve, own) {
+        (true, true) => (
+            "change_set_self_approved",
+            json!({
+                "submitted_by": set.submitted_by,
+                "submitted_by_email": set.json["submitted_by_email"],
+                "comment": comment,
+            }),
+        ),
+        (true, false) => ("change_set_approved", json!({"comment": comment})),
+        (false, _) => ("change_set_rejected", json!({"comment": comment})),
+    };
     auth::audit(
         &mut *tx,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
-        if approve {
-            "change_set_approved"
-        } else {
-            "change_set_rejected"
-        },
+        action,
         Some(&set.gtfs_id),
         Some(id),
-        json!({"comment": comment}),
+        detail,
     )
     .await?;
     tx.commit().await?;
@@ -3062,7 +3208,7 @@ pub async fn reopen(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
     }
     sqlx::query(
         "UPDATE gtfs_change_set SET status = 'draft', submitted_by = NULL, submitted_at = NULL, \
-            reviewed_by = NULL, reviewed_at = NULL WHERE change_set_id = $1",
+            reviewed_by = NULL, reviewed_at = NULL, self_approved = false WHERE change_set_id = $1",
     )
     .bind(id)
     .execute(&mut *tx)
@@ -3151,8 +3297,13 @@ pub async fn commit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Va
             ),
         ));
     }
-    // maker-checker covers commit too: whoever submitted cannot put it live
-    not_own(&set, ctx)?;
+    // maker-checker covers commit too: whoever submitted cannot put it live,
+    // unless they are the admin who approved it themselves
+    if set.submitted_by == Some(ctx.user.user_id)
+        && !(set.self_approved && ctx.user.role() >= auth::Role::Admin)
+    {
+        return Err(own_change_set(false));
+    }
     let changes = load_changes(&mut tx, id).await?;
     let ev = evaluate(&mut tx, &gtfs_id, &changes, &ctx.user.email).await?;
     if !ev.conflicts.is_empty() {
@@ -3199,7 +3350,10 @@ pub async fn commit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Va
         "change_set_committed",
         Some(&gtfs_id),
         Some(id),
-        json!({"feed_version": version, "changes": changes.len(), "applied": summary}),
+        json!({
+            "feed_version": version, "changes": changes.len(), "applied": summary,
+            "self_approved": set.self_approved,
+        }),
     )
     .await?;
     auth::audit_many(
@@ -3210,6 +3364,25 @@ pub async fn commit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Va
         Some(&gtfs_id),
         Some(id),
         &ev.merges,
+    )
+    .await?;
+    let switched: Vec<Value> = ev
+        .feed_configs
+        .iter()
+        .cloned()
+        .map(|mut d| {
+            d["change_set_id"] = json!(id);
+            d
+        })
+        .collect();
+    auth::audit_many(
+        &mut *tx,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "feed_data_source_changed",
+        Some(&gtfs_id),
+        Some(id),
+        &switched,
     )
     .await?;
     super::proposals::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;

@@ -1,7 +1,8 @@
 // People (users, roles, two-step reset) and the history of everything done.
 import { get, post, patch, enc } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, toast, confirmDialog, fmtDate, fmtMetres, plural, ROLE_LABEL } from "./util.js";
+import { h, clear, toast, confirmDialog, fmtDate, fmtMetres, plural, ROLE_LABEL, STATUS_LABEL } from "./util.js";
+import { addChange } from "./drafts.js";
 
 const page = () => document.getElementById("page");
 
@@ -111,7 +112,9 @@ function userRow(u, reload) {
 // data_source is GIMS's own vocabulary, straight from gtfs_feed.data_source:
 // 'db' (this feed's metadata is served live from the editor tables) or
 // 'preprocessed' (the nightly build's static files - every feed's default).
-const DATA_SOURCE_LABEL = { db: "Database (live edits)", preprocessed: "Preprocessed build (static)" };
+// Switching it is a change like any other (feed_config/update): it goes into the
+// current draft and is live only once that draft is committed.
+export const DATA_SOURCE_LABEL = { db: "Database (live edits)", preprocessed: "Preprocessed build (static)" };
 
 export async function showFeedSettings() {
   if (!can("admin")) {
@@ -122,11 +125,19 @@ export async function showFeedSettings() {
   const load = async () => {
     try {
       const feeds = (await get("feeds")).items;
+      // the drafts that already carry a switch, per feed
+      const pending = new Map(await Promise.all(feeds.map(async (f) => {
+        try {
+          return [f.gtfs_id, (await get(`feeds/${enc(f.gtfs_id)}/config`)).pending || []];
+        } catch {
+          return [f.gtfs_id, []];
+        }
+      })));
       clear(tableBox, h("div.table-wrap", h("table",
-        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Feed version"), h("th", ""))),
+        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Feed version"), h("th", "Waiting in a draft"), h("th", ""))),
         h("tbody", feeds.length
-          ? feeds.map((f) => feedRow(f, load))
-          : h("tr", h("td", { colspan: "4" }, "No feeds yet."))))));
+          ? feeds.map((f) => feedRow(f, pending.get(f.gtfs_id) || [], load))
+          : h("tr", h("td", { colspan: "5" }, "No feeds yet."))))));
     } catch (e) {
       clear(tableBox, h("p.notice.error", e.message));
     }
@@ -134,35 +145,45 @@ export async function showFeedSettings() {
 
   clear(page(), h("div.page-inner",
     h("div.title-block", h("h1", "Feed settings"), h("p.hint", "Which feeds GIMS serves from the live editor tables instead of the nightly preprocessed build.")),
-    h("p.notice", "Switching a feed here takes effect immediately for everyone, without a draft - it is not reviewed or approved like other edits."),
+    h("p.notice", "Switching a feed adds a change to your current draft. It takes effect only after the draft is submitted, approved by someone else and committed - like every other edit."),
     tableBox,
   ));
   load();
 }
 
-function feedRow(f, reload) {
+function feedRow(f, pending, reload) {
   const isDb = f.data_source === "db";
   const target = isDb ? "preprocessed" : "db";
+  const name = f.display_name || f.gtfs_id;
+  // a draft belongs to one feed: the one chosen in the top bar
+  const current = f.gtfs_id === state.feedId;
   const switchIt = async () => {
     const ok = await confirmDialog(
-      `Switch ${f.display_name || f.gtfs_id} to ${DATA_SOURCE_LABEL[target].toLowerCase()}?`,
-      "This takes effect immediately for everyone, without a draft. Are you sure?",
-      { confirm: "Switch", danger: true },
+      `Add a switch of ${name} to ${DATA_SOURCE_LABEL[target].toLowerCase()} to your draft?`,
+      "This adds a change to your current draft. It takes effect only after the draft is submitted, approved by someone else and committed. Nothing changes for passengers until then.",
+      { confirm: "Add to draft" },
     );
     if (!ok) return;
     try {
-      await post(`feeds/${enc(f.gtfs_id)}/config`, { data_source: target });
-      toast(`${f.display_name || f.gtfs_id} now serves from ${DATA_SOURCE_LABEL[target].toLowerCase()}.`);
+      await addChange({ entity: "feed_config", op: "update", entity_key: f.gtfs_id, after: { data_source: target } });
     } catch (e) {
       toast(e.message, "error");
     }
     reload();
   };
   return h("tr",
-    h("td", h("strong", f.display_name || f.gtfs_id), f.display_name ? h("div.hint", f.gtfs_id) : null),
+    h("td", h("strong", name), f.display_name ? h("div.hint", f.gtfs_id) : null),
     h("td", DATA_SOURCE_LABEL[f.data_source] || f.data_source),
     h("td", f.version),
-    h("td", h("button.btn.quiet.small", { type: "button", on: { click: switchIt } }, `Switch to ${DATA_SOURCE_LABEL[target].toLowerCase()}`)));
+    h("td.feed-pending", pending.length
+      ? h("ul.list", pending.map((p) => h("li",
+          h("a", { href: `#/drafts/${enc(p.change_set_id)}` }, p.change_set_title), " ",
+          h("span", { class: `chip ${p.status}` }, STATUS_LABEL[p.status] || p.status),
+          h("span.hint", ` to ${(DATA_SOURCE_LABEL[p.data_source] || p.data_source || "").toLowerCase()}`))))
+      : h("span.hint", "Nothing waiting")),
+    h("td", current
+      ? h("button.btn.quiet.small", { type: "button", on: { click: switchIt } }, `Add to draft: switch to ${DATA_SOURCE_LABEL[target].toLowerCase()}`)
+      : h("span.hint", "Choose this feed in the top bar to switch it.")));
 }
 
 // ------------------------------------------------------------------ history
@@ -187,6 +208,7 @@ export const ACTION_LABEL = {
   change_removed: "Removed a change",
   change_set_submitted: "Submitted for review",
   change_set_approved: "Approved",
+  change_set_self_approved: "Approved their own draft (admin override — no second reviewer)",
   change_set_rejected: "Rejected",
   change_set_committed: "Committed (live)",
   change_set_reopened: "Reopened",
@@ -200,14 +222,21 @@ export const ACTION_LABEL = {
   station_proposal_returned: "A suggested station went back to review",
   station_proposal_committed: "A suggested station went live",
   position_reviews_loaded: "Coordinates to review were loaded",
+  position_reviews_autofix_planned: "A tool looked for same-named stops that fit the coordinates to review",
   position_review_moved: "Moved a stop from a coordinate review into a draft",
   position_review_split: "Split routes off a stop from a coordinate review into a draft",
+  position_review_merged: "Merged a stop from a coordinate review into another stop, in a draft",
   position_review_confirmed: "Confirmed a stop's position",
   position_review_reopened: "Reopened a coordinate review",
   position_review_returned: "A coordinate review went back to review",
   position_review_committed: "A fix from a coordinate review went live",
   feed_data_source_changed: "Changed a feed's data source",
 };
+
+// Maker-checker set aside: these rows stand out in the history.
+const OVERRIDE_ACTIONS = new Set(["change_set_self_approved"]);
+export const OVERRIDE_CHIP_STYLE = "background:var(--danger-tint);color:var(--danger)";
+const OVERRIDE_ROW_STYLE = "background:var(--danger-tint)";
 
 // An action this page has no words for yet still reads as words.
 const actionLabel = (action) => ACTION_LABEL[action] || (action.charAt(0).toUpperCase() + action.slice(1)).replace(/_/g, " ");
@@ -237,14 +266,18 @@ function detailText(a) {
       return `suggestion #${d.proposal_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
     case "position_reviews_loaded":
       return `${n(d.queued, "stop")} to review${d.batch ? ` (${d.batch})` : ""}`;
+    case "position_reviews_autofix_planned":
+      return `${n(d.reviews, "review")}: ${d.merge} to merge, ${d.move} to move, ${d.choose} with candidates to choose from, ${d.none} not helped`;
     case "position_review_returned":
       return `coordinate review #${d.review_id}, stop ${d.stop_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
     case "position_review_moved":
     case "position_review_split":
+    case "position_review_merged":
     case "position_review_confirmed":
     case "position_review_reopened":
     case "position_review_committed":
       return [`coordinate review #${d.review_id}`, d.stop_id ? `stop ${d.stop_id}` : null,
+        d.into_stop_id ? `merged into ${d.into_stop_id}` : null,
         d.moved_m != null ? `moved ${fmtMetres(d.moved_m)}` : null,
         Array.isArray(d.route_ids) ? `${n(d.route_ids.length, "route")} to new stop ${d.new_stop_id}` : null,
         d.feed_version ? `feed version ${d.feed_version}` : null,
@@ -257,6 +290,8 @@ function detailText(a) {
     }
     case "feed_data_source_changed":
       return `${d.gtfs_id}: ${d.from ? DATA_SOURCE_LABEL[d.from] || d.from : "no row yet"} → ${DATA_SOURCE_LABEL[d.to] || d.to}`;
+    case "change_set_self_approved":
+      return [`submitted by ${d.submitted_by_email || "the same person"}`, d.comment ? `comment: ${d.comment}` : null].filter(Boolean).join(", ");
     default:
       break;
   }
@@ -272,6 +307,7 @@ function detailText(a) {
   if (d.comment) parts.push(`comment: ${d.comment}`);
   if (d.version) parts.push(`feed version ${d.version}`);
   if (d.feed_version) parts.push(`feed version ${d.feed_version}${d.changes !== undefined ? `, ${n(d.changes, "change")}` : ""}`);
+  if (d.self_approved) parts.push("self-approved (admin override)");
   if (d.from) parts.push(`was ${d.from}`);
   return parts.join(", ");
 }
@@ -283,10 +319,10 @@ export async function showHistory(changeSet) {
   const load = async () => {
     try {
       const res = await get(`feeds/${enc(state.feedId)}/audit?limit=100${cursor ? `&cursor=${enc(cursor)}` : ""}${changeSet ? `&change_set=${enc(changeSet)}` : ""}`);
-      res.items.forEach((a) => rows.appendChild(h("tr",
+      res.items.forEach((a) => rows.appendChild(h("tr", OVERRIDE_ACTIONS.has(a.action) ? { class: "audit-override", style: OVERRIDE_ROW_STYLE } : {},
         h("td", fmtDate(a.at)),
         h("td", a.actor_email || "system"),
-        h("td", actionLabel(a.action)),
+        h("td", OVERRIDE_ACTIONS.has(a.action) ? [h("span.chip.override", { style: OVERRIDE_CHIP_STYLE }, "admin override"), " "] : null, actionLabel(a.action)),
         h("td", a.change_set_id ? h("a", { href: `#/drafts/${enc(a.change_set_id)}` }, "draft") : ""),
         h("td", detailText(a)))));
       cursor = res.next_cursor;

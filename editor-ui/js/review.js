@@ -11,6 +11,7 @@ import {
 import * as map from "./map.js";
 import { useDraft, refreshDraft, chooseDraft } from "./drafts.js";
 import { pager } from "./importer.js";
+import { DATA_SOURCE_LABEL, OVERRIDE_CHIP_STYLE } from "./admin.js";
 
 const page = () => document.getElementById("page");
 const TABS = [
@@ -19,6 +20,10 @@ const TABS = [
 ];
 const PAGE_SIZE = 50;
 const NOTICE_MAX = 8;
+// An admin approved a draft they submitted themselves: shown wherever its status is.
+const selfApprovedChip = (cs) => (cs.self_approved
+  ? h("span.chip.self-approved", { style: OVERRIDE_CHIP_STYLE, title: "Approved by the admin who submitted it. No second person reviewed it." }, "self-approved")
+  : null);
 
 // ------------------------------------------------------------------ list
 export async function showDraftList(status = "draft") {
@@ -56,7 +61,7 @@ export async function showDraftList(status = "draft") {
           h("td.num", fmtCount(cs.change_count)),
           h("td", cs.created_by_email || ""),
           h("td", fmtDate(cs.updated_at)),
-          h("td", h("span", { class: `chip ${cs.status}` }, STATUS_LABEL[cs.status])));
+          h("td", h("span", { class: `chip ${cs.status}` }, STATUS_LABEL[cs.status]), " ", selfApprovedChip(cs)));
         tr.addEventListener("click", (ev) => { if (ev.target.tagName !== "A") location.hash = `#/drafts/${enc(cs.change_set_id)}`; });
         return tr;
       })))));
@@ -71,6 +76,7 @@ const KIND_LABEL = {
   "stop:merge": ["stop merge", "stop merges"], "route:create": ["new route", "new routes"], "route:update": ["route edit", "route edits"],
   "route:delete": ["route deleted", "routes deleted"], "route_stops:replace": ["stop list change", "stop list changes"],
   "station:create": ["new station", "new stations"], "station:update": ["station edit", "station edits"], "station:delete": ["station dissolved", "stations dissolved"],
+  "feed_config:update": ["feed data source switch", "feed data source switches"],
 };
 const kindOf = (ch) => `${ch.entity}:${ch.op}`;
 const kindText = (key, n) => {
@@ -186,10 +192,18 @@ export async function showDraft(id, { conflicts = null } = {}) {
     const reviewReason = roleReason("approver") || (isSubmitter ? "You submitted this change, so someone else must review it." : null);
     actions.push(button("Approve", { reason: reviewReason, onClick: () => withComment("Approve this draft", "Comment (optional)", false, "Approve", "approve", "Approved.") }));
     actions.push(button("Reject", { style: "danger", reason: reviewReason, onClick: () => withComment("Reject this draft", "What needs to change", true, "Reject", "reject", "Rejected. The author can reopen it.") }));
+    // the admin override of maker-checker: never the main action, always confirmed
+    if (isSubmitter && me.role === "admin") {
+      actions.push(h("button.btn.danger", { type: "button", id: "self-approve", on: { click: async () => {
+        if (await confirmDialog("Approve your own draft?", "You submitted this draft. Approving it yourself skips the second reviewer. Continue?", { confirm: "Approve it myself", danger: true })) {
+          act("approve", { self_approve: true }, "Approved by you, as an admin override. It is recorded in the history.");
+        }
+      } } }, "Approve it myself (admin override)"));
+    }
   }
   if (cs.status === "approved") {
     actions.push(button("Commit and go live", {
-      reason: roleReason("approver") || (isSubmitter ? "You submitted this change, so someone else must commit it." : null),
+      reason: roleReason("approver") || (isSubmitter && !(cs.self_approved && me.role === "admin") ? "You submitted this change, so someone else must commit it." : null),
       onClick: async () => {
         if (await confirmDialog("Commit this draft?", `The ${plural(n, "change")} go live for passengers within a minute. This is recorded in the history.`, { confirm: "Commit and go live" })) {
           act("commit", undefined, "Committed. The changes are live.");
@@ -215,7 +229,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
   const timeline = [
     `Started by ${cs.created_by_email} on ${fmtDate(cs.created_at)}, from feed version ${cs.base_version}.`,
     cs.submitted_at ? `Submitted by ${cs.submitted_by_email} on ${fmtDate(cs.submitted_at)}.` : null,
-    cs.reviewed_at ? `${cs.status === "rejected" ? "Rejected" : "Approved"} by ${cs.reviewed_by_email} on ${fmtDate(cs.reviewed_at)}${cs.review_comment ? `: "${cs.review_comment}"` : "."}` : null,
+    cs.reviewed_at ? `${cs.status === "rejected" ? "Rejected" : "Approved"} by ${cs.reviewed_by_email} on ${fmtDate(cs.reviewed_at)}${cs.review_comment ? `: "${cs.review_comment}"` : "."}${cs.self_approved ? " This is the person who submitted it: an admin override, with no second reviewer." : ""}` : null,
     cs.committed_at ? `Committed by ${cs.committed_by_email} on ${fmtDate(cs.committed_at)}. Feed version ${cs.committed_version} is live.` : null,
     cs.status === "discarded" ? "Discarded." : null,
   ].filter(Boolean);
@@ -265,7 +279,9 @@ export async function showDraft(id, { conflicts = null } = {}) {
       h("div.title-block",
         h("h1", cs.title),
         cs.description ? h("p", cs.description) : null),
-      h("span", { class: `chip ${cs.status}`, style: "font-size:14px;padding:3px 12px" }, STATUS_LABEL[cs.status])),
+      h("span", { style: "display:inline-flex;gap:6px;align-items:center" },
+        h("span", { class: `chip ${cs.status}`, style: "font-size:14px;padding:3px 12px" }, STATUS_LABEL[cs.status]),
+        selfApprovedChip(cs))),
     h("ul.timeline", timeline.map((t) => h("li", t))),
     actions.filter(Boolean).length ? h("div.actionbar", h("div.btn-row", actions), reasons.length ? h("ul.list", reasons) : null) : null,
     allConflicts.length ? h("div.notice.error", { role: "alert" },
@@ -286,7 +302,7 @@ function draftStopNames(cs) {
 }
 
 // ------------------------------------------------------------------ change views
-const ENTITY_LABEL = { stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station" };
+const ENTITY_LABEL = { stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station", feed_config: "Feed data source" };
 const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged" };
 
 // A stop the draft creates and puts on route stop lists in place of another stop,
@@ -312,17 +328,21 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   // a move made in a coordinate review reads as the move it is
   const reviewMove = ch.entity === "stop" && ch.op === "update" && a.position_review_id != null && a.lat != null && b.lat != null;
   const split = splitOf(cs, ch);
+  // a merge made in a coordinate review (the stop goes into a same-named stop)
+  const reviewMerge = ch.entity === "stop" && ch.op === "merge" && a.position_review_id != null;
+  const feedConfig = ch.entity === "feed_config";
   let title;
-  if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
+  if (feedConfig) title = `Data source of feed ${ch.entity_key}`;
+  else if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
   else if (reviewMove) title = `Moved ${b.name || ch.entity_key} ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))}`;
   else if (ch.entity === "route_stops" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
   else title = `${ENTITY_LABEL[ch.entity]} ${a.name || b.name || ch.entity_key}`;
-  const link = ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
+  const link = feedConfig ? "#/feed-settings" : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
     : ch.op === "merge" ? `#/stop/${enc(a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
   const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
     const extra = fromProposal ? " The suggested station goes back to the list of stations to review."
-      : reviewMove ? " The coordinate review goes back to the list of coordinates to review."
+      : reviewMove || reviewMerge ? " The coordinate review goes back to the list of coordinates to review."
         : split ? ` It takes the place of ${split.from.stop_id} on ${plural(split.routeIds.length, "route")} in this draft. If it was split off in a coordinate review, those route changes are removed with it and the review goes back to the list; otherwise those routes will show a problem.`
           : ch.op === "create" ? " Anything else in the draft that uses it will show a problem." : "";
     if (!(await confirmDialog("Remove this change from the draft?", `${title} goes back to what is live.${extra}`, { confirm: "Remove change", danger: true }))) return;
@@ -335,7 +355,13 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
     }
   };
   let body;
-  if (ch.entity === "stop" && ch.op === "merge") body = mergeDiff(ch);
+  if (feedConfig) body = feedConfigDiff(ch, cs);
+  else if (reviewMerge) {
+    body = h("div", { style: "display:grid;gap:10px" },
+      h("p", "From ", h("a", { href: `#/coordinates/${enc(a.position_review_id)}` }, `coordinate review #${a.position_review_id}`),
+        `: ${(b.from && b.from.name) || ch.entity_key} (${ch.entity_key}) was probably in the wrong place, and a stop of the same name is where its routes pass.`),
+      mergeDiff(ch));
+  } else if (ch.entity === "stop" && ch.op === "merge") body = mergeDiff(ch);
   else if (reviewMove) {
     body = h("div", { style: "display:grid;gap:10px" },
       h("p", "From ", h("a", { href: `#/coordinates/${enc(a.position_review_id)}` }, `coordinate review #${a.position_review_id}`),
@@ -354,7 +380,7 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   const showOpen = !(ch.op === "delete" && ch.entity === "stop") && !(ch.op === "create" && ch.entity === "station" && cs.status !== "committed");
   return h("article.change",
     h("div.change-head",
-      h("h3", title, " ", h("span.chip", reviewMove ? "coordinate review" : OP_LABEL[ch.op] || ch.op)),
+      h("h3", title, " ", h("span.chip", reviewMove || reviewMerge ? "coordinate review" : OP_LABEL[ch.op] || ch.op)),
       h("div.btn-row",
         showOpen ? h("a.crumb", { href: link }, "Open") : null,
         canRemove ? h("button.btn.quiet.small", { type: "button", on: { click: remove } }, "Remove from draft") : null)),
@@ -362,6 +388,18 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
       conflict ? h("p.notice.error", conflict.message) : null,
       problems.length ? h("div.notice", { class: problems.some((p) => p.level === "error") ? "error" : "warning" }, h("ul", problems.map((p) => h("li", p.message)))) : null,
       body));
+}
+
+// Which data GIMS serves the feed from. Nothing moves until the draft is committed.
+function feedConfigDiff(ch, cs) {
+  const b = ch.before || {}, a = ch.after || {};
+  const label = (v) => DATA_SOURCE_LABEL[v] || v || "(unknown)";
+  return h("div", { style: "display:grid;gap:10px" },
+    h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))),
+      h("tbody", h("tr", h("th", "Served from"), h("td.before", label(b.data_source)), h("td.after", label(a.data_source))))),
+    h("p.notice", cs.status === "committed"
+      ? "Committed. Every GIMS server picked the new data source up within seconds."
+      : "GIMS keeps serving this feed as it does now until this draft is submitted, approved by someone else and committed."));
 }
 
 function fieldRows(before, after, fields) {
