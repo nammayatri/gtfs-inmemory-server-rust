@@ -42,6 +42,8 @@ export function problemList(problems) {
 }
 
 // Unsaved work in a panel: asks before the page is left, cleared on save/cancel.
+// A save that the server accepts with problems is still saved: the change is in
+// the draft, so the guard is cleared too, and set again by the next edit.
 function guard(what) {
   let dirty = false;
   setLeaveGuard(() => (dirty ? what : null));
@@ -107,8 +109,8 @@ export async function editStop(stop) {
     try {
       const res = await addChange({ entity: "stop", op: "update", entity_key: stop.stop_id, after, base_row_version: stop.row_version });
       if (!res) return;
-      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       unsaved.done();
+      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.endModes();
       showStop(stop.stop_id);
     } catch (e) {
@@ -504,13 +506,13 @@ export async function editRouteRows(route, { created = false } = {}) {
     try {
       const res = await addChange({ entity: "route_stops", op: "replace", entity_key: route.route_id, after: { rows: payload, base_rows_hash: baseHash } });
       if (!res) return;
+      unsaved.done();
       serverProblems = res.problems;
       if (res.problems.some((p) => p.level === "error")) {
         redraw();
         summary.scrollIntoView({ block: "nearest" });
         return;
       }
-      unsaved.done();
       map.endModes();
       if (created) location.hash = `#/route/${enc(route.route_id)}?draft=1`;
       else showRoute(route.route_id, { preview: true });
@@ -619,8 +621,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
         res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after, base_row_version: route.row_version });
       }
       if (!res) return;
-      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       unsaved.done();
+      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.clearRoute("proposal");
       showRoute(route.route_id, { preview: true });
     } catch (e) {
@@ -793,8 +795,8 @@ export async function editStation(station, initialStops = []) {
         base_row_version: station ? station.row_version : undefined,
       }, { merge: !creating });
       if (!res) return;
-      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       unsaved.done();
+      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.endModes();
       if (station) showStop(station.stop_id);
       else location.hash = `#/stop/${enc(firstId())}`;

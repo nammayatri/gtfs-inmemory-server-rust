@@ -566,6 +566,39 @@ async fn create_merge_bulk_and_proposals() {
         )
     );
     assert_eq!((s, code_of(&b)), (409, "route_has_pending_changes"), "{b}");
+    // the dashboard's shape: a blank or null entity_key also means "mint an id"
+    for key in [json!(""), Value::Null] {
+        let (s, b, _) = call!(
+            &app,
+            add(
+                &editor_c,
+                &c0,
+                json!({"entity": "stop", "op": "create", "entity_key": key, "after": {
+            "name": "BLANK KEY KERB", "lat": 13.0096, "lon": 80.2006}})
+            )
+        );
+        assert_eq!(s, 201, "{key}: {b}");
+        let made = b["changes"].as_array().unwrap().last().unwrap().clone();
+        let id = made["entity_key"].as_str().unwrap();
+        assert!(id.starts_with("ed_") && id.len() == 13, "{made}");
+        assert_eq!(made["after"]["stop_id"], id, "{made}");
+    }
+    // a station groups at least two stops, and the refusal says so
+    let (s, b, _) = call!(
+        &app,
+        add(
+            &editor_c,
+            &c0,
+            json!({"entity": "station", "op": "create", "entity_key": "stn_one", "after": {
+        "station_id": "stn_one", "name": "ONE STOP", "lat": 13.0, "lon": 80.2, "members": [{"stop_id": "S1"}]}})
+        )
+    );
+    assert_eq!((s, code_of(&b)), (400, "invalid_change"), "{b}");
+    assert_eq!(b["error"]["details"]["code"], "too_few_members", "{b}");
+    assert_eq!(
+        b["error"]["message"],
+        "station/create: a station groups at least two stops, and stn_one would have only one"
+    );
     let (s, _, _) = call!(
         &app,
         editor_c.req("POST", &format!("/change-sets/{c0}/discard"))
@@ -1307,13 +1340,31 @@ async fn create_merge_bulk_and_proposals() {
         c.req("POST", &format!("/station-proposals/{id}/approve"))
             .set_json(body)
     };
+    // dropping all but one stop leaves no station: refused, with the reason
+    let (s, b, _) = call!(
+        &app,
+        approve(
+            &editor_c,
+            pa,
+            json!({"change_set_id": p1, "members": [{"stop_id": "P1a"}]})
+        )
+    );
+    assert_eq!((s, code_of(&b)), (400, "proposal_has_problems"), "{b}");
+    assert_eq!(
+        b["error"]["details"]["problems"][0]["code"], "too_few_members",
+        "{b}"
+    );
+    assert_eq!(
+        b["error"]["details"]["problems"][0]["message"],
+        "a station groups at least two stops, and stn_ta would have only one"
+    );
     let (s, b, _) = call!(
         &app,
         approve(
             &editor_c,
             pa,
             json!({"change_set_id": p1, "name": "Place One (edited)", "lat": 13.1001, "lon": 80.3001,
-        "members": [{"stop_id": "P1a", "platform_code": "Towards Edited"}]})
+        "members": [{"stop_id": "P1a", "platform_code": "Towards Edited"}, {"stop_id": "P1b"}]})
         )
     );
     assert_eq!(s, 200, "{b}");
@@ -1334,9 +1385,10 @@ async fn create_merge_bulk_and_proposals() {
     );
     assert_eq!(change["after"]["proposal_id"].as_i64(), Some(pa));
     assert_eq!(change["after"]["name"], "Place One (edited)");
+    // a member sent without platform_code keeps the proposal's label
     assert_eq!(
         change["after"]["members"],
-        json!([{"stop_id": "P1a", "platform_code": "Towards Edited"}])
+        json!([{"stop_id": "P1a", "platform_code": "Towards Edited"}, {"stop_id": "P1b", "platform_code": "Towards Y"}])
     );
     assert!(errors(&set_now).is_empty(), "{set_now}");
     let (s, b, _) = call!(&app, approve(&editor_c, pa, json!({"change_set_id": p1})));

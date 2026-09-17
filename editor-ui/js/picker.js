@@ -9,6 +9,8 @@ import { createdStops } from "./drafts.js";
 
 let seq = 0;
 const NEAR_DEGREES = 0.006;      // about 650 m each way
+const SEARCH_NEAR_DEGREES = 0.045; // about 5 km each way
+const box = (at, d) => [at.lat - d, at.lon - d, at.lat + d, at.lon + d].map((x) => x.toFixed(6)).join(",");
 
 // Returns {el, focus, close}. `near` = {lat, lon, label} ranks and measures
 // results from that place; `exclude` = stop ids not to offer.
@@ -90,9 +92,8 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
     }
     const run = ++mine;
     status.textContent = `Looking for stops near ${near.label || "here"}…`;
-    const box = [near.lat - NEAR_DEGREES, near.lon - NEAR_DEGREES, near.lat + NEAR_DEGREES, near.lon + NEAR_DEGREES].map((x) => x.toFixed(6)).join(",");
     try {
-      const page = await get(`feeds/${enc(state.feedId)}/stops?bbox=${box}&limit=300`);
+      const page = await get(`feeds/${enc(state.feedId)}/stops?bbox=${box(near, NEAR_DEGREES)}&limit=300`);
       if (run !== mine) return;
       const drafts = includeDraft ? createdStops() : [];
       const items = [...drafts, ...page.items]
@@ -113,9 +114,18 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
     if (q.length < 2) return suggestions();
     const run = ++mine;
     try {
-      const page = await get(`feeds/${enc(state.feedId)}/stops?q=${enc(q)}&limit=12`);
+      // The server ranks a name search by similarity over the whole feed, so a
+      // common name (GANDHI NAGAR) fills a page with stops across the city. Near a
+      // place, also search around it, so the kerb meant is among the results.
+      const [page, around] = await Promise.all([
+        get(`feeds/${enc(state.feedId)}/stops?q=${enc(q)}&limit=12`),
+        near ? get(`feeds/${enc(state.feedId)}/stops?q=${enc(q)}&bbox=${box(near, SEARCH_NEAR_DEGREES)}&limit=12`) : null,
+      ]);
       if (run !== mine) return;
-      const live = page.items.filter((s) => s.location_type !== 1 && !excluded.has(s.stop_id));
+      const seen = new Set();
+      const live = [...(around ? around.items : []), ...page.items]
+        .filter((s) => !seen.has(s.stop_id) && seen.add(s.stop_id))
+        .filter((s) => s.location_type !== 1 && !excluded.has(s.stop_id));
       let items = [...draftMatches(q), ...live];
       // near a place, the closest match is usually the kerb meant
       if (near) items = items.map((s, i) => ({ s, i, d: distance(s) ?? Infinity })).sort((a, b) => a.d - b.d || a.i - b.i).map((x) => x.s);

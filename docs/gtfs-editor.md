@@ -171,7 +171,12 @@ last_change_id}`), `stop_merged` (one per merge at commit: `{change_id, from, in
 routes, rows, keep_name, keep_position}`), `station_proposal_approved`,
 `station_proposal_rejected`, `station_proposal_reopened`,
 `station_proposal_returned` (`detail.reason` is `change_removed` or
-`change_set_discarded`) and `station_proposal_committed`.
+`change_set_discarded`) and `station_proposal_committed`. Approving an area
+writes one `station_proposal_approved` per station (`detail.bulk = true`). nandi's
+scripts write `seed`, `release` and `station_proposals_built` (`{batch, proposals,
+platforms, diameter_m, base_version}`). The dashboard's history has words for every
+one of these (`ACTION_LABEL` in `editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks
+each action in the database has a label).
 
 ### Drafts
 
@@ -204,8 +209,8 @@ a snapshot in read shape: the stop or route row; for a station, the row plus
 | `stop` / `delete` | `null` | error if any route row still uses it |
 | `route` / `update` | any of `short_name, long_name, color, text_color, encoded_polyline, polyline_source` | colour `#RRGGBB`; polyline decodes to ≥ 2 points |
 | `route_stops` / `replace` | `{rows: [...], base_rows_hash}` — the whole ordered list | see below |
-| `station` / `create` | `{station_id, name, lat, lon, member_stop_ids: [...]}` | `entity_key` = `station_id`; members exist, are location_type 0, have no other parent |
-| `station` / `update` | `{name?, lat?, lon?, member_stop_ids?}` | same |
+| `station` / `create` | `{station_id, name, lat, lon, member_stop_ids: [...]}` | `entity_key` = `station_id`; at least two members (`too_few_members`, refused when added: 400 `invalid_change`); members exist, are location_type 0, have no other parent |
+| `station` / `update` | `{name?, lat?, lon?, member_stop_ids?}` | same; members, when sent, are at least two (to ungroup a station, delete it) |
 | `station` / `delete` | `null` | clears members' `parent_station` |
 
 A `route_stops` row is `{stop_id, stop_type, stage_no, stage_name, marker_id?,
@@ -220,6 +225,15 @@ stage numbers never decrease; no stop twice in a row; ROUTE CORRECTION rows have
 marker position and no stop id. **Only problems the edit introduces block it**: a
 problem the live route already had is reported as a warning ("already present
 before this edit"), matched by code and stop, counted.
+
+A stop list that breaks only a fare or order rule (`fare_stage_mismatch`,
+`first_stop_not_stage`, `intermediate_before_stage`, `stage_decreases`,
+`stage_name_missing`, `stop_repeated`, `too_few_stops`, `route_empty`) still
+applies in the draft: the preview and every later change in the set see the rows
+as drafted, so the dashboard reopens what the person drafted, and the errors
+block submit and commit. A stop that does not exist, is deleted or is a station,
+or a row the table refuses, does not apply; the preview then shows the route
+without that change.
 
 **Commit** — one transaction: `SELECT … FROM gtfs_feed WHERE gtfs_id = $g FOR
 UPDATE`; for each change in `position` order check the target's current
@@ -247,7 +261,13 @@ submit, and — as a different person — review the diff and commit.
 
 Tests: `editor-ui/dev/mock_server.py` + `dev/ui_smoke.mjs` (UI against an
 in-memory mock of this contract), and `dev/ui_e2e.mjs` (the real UI, the real
-GIMS, the dev Pomerium proxy, a local Postgres).
+GIMS, the dev Pomerium proxy, a local Postgres). The e2e signs in through the
+gate, then drafts, approves and commits one flow per screen - the map (labels,
+clicking stops over a route), stations to review, New stop and New route, the
+stop list editor (Change stop, stage names, a fare error blocking submit), a
+merge, a CSV import - and checks each commit in the database (psql) or the
+public APIs. It needs a freshly seeded local database and changes it; put it
+back afterwards. `--only map,stations,...` runs a subset.
 
 ## 5. Creating things, and bulk import (2026-09-17)
 
@@ -264,9 +284,16 @@ GIMS, the dev Pomerium proxy, a local Postgres).
 Settled while implementing:
 
 - A create may leave out `entity_key`; it is taken from `after`'s id field (and
-  the other way round). A stop create with neither (or a blank / null
-  `after.stop_id`) gets a minted id. An id is "unused" when no row of the feed has
-  it (deleted rows included) and no open draft of the feed creates it.
+  the other way round). `entity_key` sent as `""` or `null` counts as left out -
+  the dashboard's New stop sends `""` when no id is typed. A stop create with
+  neither (or a blank / null `after.stop_id`) gets a minted id. An id is "unused"
+  when no row of the feed has it (deleted rows included) and no open draft of the
+  feed creates it.
+- A station groups at least two stops. `station` / `create` and `update` with
+  fewer members is 400 `invalid_change`, `details.code = "too_few_members"`, and the
+  message says so ("station/create: a station groups at least two stops, and
+  stn_x would have only one"); approving a proposal down to one stop is the
+  `too_few_members` problem below. The dashboard checks the same before sending.
 - `route` / `create`: the defaults are written into the stored change when it is
   added, so a reviewer sees `route_type` and `agency_id`. The feed's usual agency
   is the `agency_id` most of its routes carry. A colour is stored upper-case.
@@ -407,7 +434,7 @@ committed through the normal maker-checker flow.
 | GET | `/feeds/{g}/station-proposals?status=&bbox=&q=&limit=&cursor=` | `status` comma list (default `pending`); `bbox` minLat,minLon,maxLat,maxLon on the station point; `q` trigram on name, exact on station/member stop id. Item: `{proposal_id, station_id, name, lat, lon, spread_m, members: [{stop_id, name, lat, lon, platform_code, route_count}], status, change_set_id, change_set_title, reviewed_by_email, reviewed_at, review_note, batch}` |
 | GET | `/station-proposals/{id}` | the item, with each member's CURRENT stop row (name, position, parent_station) and `problems: [{code, message}]` (e.g. a member now has a parent, was deleted, moved > 100 m) |
 | GET | `/feeds/{g}/station-proposals/summary` | `{pending, approved, rejected, committed}` counts |
-| POST | `/station-proposals/{id}/approve` | editor+. `{change_set_id, name?, lat?, lon?, members?: [{stop_id, platform_code}]}` — the reviewer may rename, move the station point, drop members or relabel platforms (never add a stop that is not a member). Appends one `station/create` change (`after.proposal_id` set) to the draft; proposal → `approved` with `change_set_id`/`change_id`. 400 with `details.problems` if the station would be invalid now |
+| POST | `/station-proposals/{id}/approve` | editor+. `{change_set_id, name?, lat?, lon?, members?: [{stop_id, platform_code}]}` — the reviewer may rename, move the station point, drop members or relabel platforms (never add a stop that is not a member). Appends one `station/create` change (`after.proposal_id` set) to the draft; proposal → `approved` with `change_set_id`/`change_id`. → the proposal detail (below). 400 with `details.problems` if the station would be invalid now |
 | POST | `/feeds/{g}/station-proposals/approve` | editor+. `{change_set_id, proposal_ids: [...]}` — approve several unchanged, one transaction; `{results: [{proposal_id, ok, change_id?, problems?}]}`; proposals with problems are skipped, not fatal |
 | POST | `/station-proposals/{id}/reject` | editor+. `{note}` (required) → `rejected` |
 | POST | `/station-proposals/{id}/reopen` | editor+. rejected → pending |
@@ -427,8 +454,9 @@ Settled while implementing:
   message}`. Errors (the station would be invalid): `member_missing`,
   `member_deleted`, `member_is_station`, `member_has_parent` (another station; its
   own committed station is fine), `station_exists` (the id is taken; not reported
-  once committed), `no_members`, `stop_merged_away`. Warning: `member_moved` (> 100
-  m from where the build saw it).
+  once committed), `no_members`, `too_few_members` (the reviewer dropped all but
+  one stop; not reported once committed), `stop_merged_away`. Warning:
+  `member_moved` (> 100 m from where the build saw it).
 - Approve checks against the live data plus the draft's changes (taken as
   applying), so a member another station in the same draft takes is a problem.
   Only errors refuse it (400 `proposal_has_problems`, `details.problems`); a

@@ -436,7 +436,7 @@ async fn editor_end_to_end() {
             "base_rows_hash": h0,
             "rows": rows(json!({"stop_id": "S6", "stop_type": "INTERMEDIATE STOP", "stage_no": 1, "stage_name": "STOP 1"}))}}),
         json!({"entity": "station", "op": "create", "entity_key": "ST1", "after": {
-            "station_id": "ST1", "name": "STATION ONE", "lat": 13.005, "lon": 80.2, "member_stop_ids": ["S5"]}}),
+            "station_id": "ST1", "name": "STATION ONE", "lat": 13.005, "lon": 80.2, "member_stop_ids": ["S5", "S6"]}}),
     ] {
         let (s, b, _) = call!(
             &app,
@@ -639,6 +639,7 @@ async fn editor_end_to_end() {
     );
     assert_eq!(st1["children"][0]["stop_id"], "S5");
     assert_eq!(st1["children"][0]["route_count"], 1);
+    assert_eq!(st1["children"][1]["stop_id"], "S6");
 
     // ---- B is now stale: approve, then commit is a 409 and nothing changes
     let (s, _, _) = call!(
@@ -683,6 +684,30 @@ async fn editor_end_to_end() {
             .any(|v| v["code"] == "fare_stage_mismatch"),
         "{b}"
     );
+    // the preview shows the stop list as drafted, error and all, so the editor
+    // reopens what was drafted rather than the live list
+    let (s, preview, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/change-sets/{set_d}/preview/routes/R1"))
+    );
+    assert_eq!(s, 200, "{preview}");
+    assert_eq!(
+        (
+            preview["rows"][2]["stop_id"].clone(),
+            preview["rows"][2]["stage_no"].clone()
+        ),
+        (json!("S6"), json!(2)),
+        "{preview}"
+    );
+    assert!(
+        preview["validation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["code"] == "fare_stage_mismatch" && v["level"] == "error"),
+        "{preview}"
+    );
+    assert_eq!(route_len(&pool).await, 6, "the preview wrote nothing");
     let (s, b, _) = call!(
         &app,
         editor_c.req("POST", &format!("/change-sets/{set_d}/submit"))

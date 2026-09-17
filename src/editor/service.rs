@@ -14,7 +14,7 @@ use super::error::{EditorError, EditorResult};
 use super::validation::{
     check_payload, check_route_rows, create_id_field, grade_against_live, haversine_m,
     merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level, MemberSpec,
-    RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES,
+    RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES, ROUTE_RULE_CODES,
 };
 use super::EditorState;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1910,7 +1910,14 @@ async fn route_stops_replace(
         check_route_rows(&rows),
         &check_route_rows(&live),
     ));
-    if findings.iter().any(|f| f.level == Level::Error) {
+    // A stop that cannot be used, or a row the table refuses, stops the change
+    // here. A broken fare or stop-order rule does not: the rows are written, so
+    // the draft's preview (and every later change in it) sees the stop list as
+    // drafted, while the error still blocks submit and commit.
+    if findings
+        .iter()
+        .any(|f| f.level == Level::Error && !ROUTE_RULE_CODES.contains(&f.code.as_str()))
+    {
         return Err(ApplyError::Findings(findings));
     }
 
@@ -2172,16 +2179,9 @@ async fn station_create(
             format!("a stop or station {id} already exists"),
         ));
     }
+    // check_payload has made sure there are at least two members
     join_station(conn, g, id, &specs, actor).await?;
-    Ok(if members.is_empty() {
-        vec![Finding::warning(
-            "station_empty",
-            id,
-            format!("station {id} has no stops"),
-        )]
-    } else {
-        vec![]
-    })
+    Ok(vec![])
 }
 
 async fn live_station(conn: &mut PgConnection, g: &str, id: &str) -> Result<LiveStop, ApplyError> {
@@ -2227,7 +2227,7 @@ async fn station_update(
     .bind(actor)
     .execute(&mut *conn)
     .await?;
-    let mut warnings = Vec::new();
+    // members, when sent, are at least two (check_payload)
     if let Some(specs) = station_members(m) {
         let members: Vec<String> = specs.iter().map(|s| s.stop_id.clone()).collect();
         check_members(conn, g, id, &members).await?;
@@ -2242,15 +2242,8 @@ async fn station_update(
         .execute(&mut *conn)
         .await?;
         join_station(conn, g, id, &specs, actor).await?;
-        if members.is_empty() {
-            warnings.push(Finding::warning(
-                "station_empty",
-                id,
-                format!("station {id} has no stops"),
-            ));
-        }
     }
-    Ok(warnings)
+    Ok(vec![])
 }
 
 async fn station_delete(
@@ -2368,14 +2361,19 @@ pub async fn preview_route(
 pub struct NewChange {
     pub entity: String,
     pub op: String,
-    /// May be left out for a create: it is taken from `after`, and a new stop
-    /// without an id gets one minted.
-    #[serde(default)]
+    /// May be left out for a create - or sent as `""` or `null`, which mean the
+    /// same: it is taken from `after`, and a new stop without an id gets one
+    /// minted.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub entity_key: String,
     #[serde(default)]
     pub after: Value,
     #[serde(default)]
     pub base_row_version: Option<i32>,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 pub fn editable(set: &ChangeSet) -> EditorResult<()> {

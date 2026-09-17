@@ -30,7 +30,7 @@ export async function newStop(change = null) {
   const start = editing ? editing.after : {};
   let lat = start.lat ?? null, lon = start.lon ?? null;
   let dirty = false;
-  setLeaveGuard(() => (dirty ? "The new stop is not in the draft yet." : null));
+  setLeaveGuard(() => (!dirty ? null : editing ? "Your changes to the new stop are not in the draft yet." : "The new stop is not in the draft yet."));
   const touch = () => { dirty = true; };
 
   const f = {
@@ -139,6 +139,7 @@ export async function newStop(change = null) {
         res = await addChange({ entity: "stop", op: "create", entity_key: id, after }, { merge: false });
       }
       if (!res) return;
+      dirty = false;
       const ch = res.draft.changes.find((c) => c.change_id === res.changeId);
       if (res.problems.some((p) => p.level === "error")) {
         // it is in the draft now; further saves update that change
@@ -148,7 +149,6 @@ export async function newStop(change = null) {
         clear(problems, problemList(res.problems));
         return;
       }
-      dirty = false;
       setLeaveGuard(null);
       map.endModes();
       added(ch, !!change);
@@ -298,11 +298,11 @@ export async function newRoute() {
     try {
       const res = await addChange({ entity: "route", op: "create", entity_key: id, after }, { merge: false });
       if (!res) return;
+      dirty = false;
       if (res.problems.some((p) => p.level === "error")) {
         clear(problems, problemList(res.problems), h("p.hint", "The route is in your draft with these problems. Remove it from the draft page, or fix them there."));
         return;
       }
-      dirty = false;
       setLeaveGuard(null);
       let route;
       try {

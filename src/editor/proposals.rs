@@ -13,7 +13,7 @@ use super::draft::DraftView;
 use super::error::{EditorError, EditorResult};
 use super::service::{self, ChangeInsert, Page};
 use super::validation::{
-    check_payload, haversine_m, valid_lat_lon, Level, PLATFORM_CODE_MAX_CHARS,
+    check_payload, haversine_m, too_few_members, valid_lat_lon, Level, PLATFORM_CODE_MAX_CHARS,
 };
 use super::EditorState;
 use serde::{Deserialize, Serialize};
@@ -219,10 +219,10 @@ pub struct MemberCheck<'a> {
 
 /// What stands in the way of creating station `station_id` with `members` now:
 /// errors make the station invalid (a member is gone, deleted, a station, or in
-/// another station; the id is taken; nothing is left), a warning flags evidence
-/// that went stale (a member moved). `live` holds the members' live rows (and,
-/// with a draft, the stops its merges take a station from); `draft` applies the
-/// draft the station would join on top of them.
+/// another station; the id is taken; nothing or only one stop is left), a
+/// warning flags evidence that went stale (a member moved). `live` holds the
+/// members' live rows (and, with a draft, the stops its merges take a station
+/// from); `draft` applies the draft the station would join on top of them.
 pub fn problems(
     station_id: &str,
     committed: bool,
@@ -238,6 +238,10 @@ pub fn problems(
             None,
             format!("station {station_id} would have no stops"),
         ));
+    } else if !committed {
+        if let Some(why) = too_few_members(station_id, members.len()) {
+            out.push(Problem::error("too_few_members", None, why));
+        }
     }
     if station_taken && !committed {
         out.push(Problem::error(
@@ -1201,6 +1205,13 @@ mod tests {
         assert_eq!(
             codes(&problems("stn_1", false, false, &[], &live, None)),
             vec![("no_members", None)]
+        );
+        // one stop is not a station
+        let found = problems("stn_1", false, false, &members[..1], &live, None);
+        assert_eq!(codes(&found), vec![("too_few_members", None)]);
+        assert_eq!(
+            found[0].message,
+            "a station groups at least two stops, and stn_1 would have only one"
         );
     }
 

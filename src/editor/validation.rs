@@ -14,14 +14,41 @@ pub const STOP_TYPES: [&str; 5] = [
 ];
 /// Rows a passenger never boards at: shaping markers and fare-only jump stops.
 pub const UNSERVED_TYPES: [&str; 3] = ["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"];
+/// Findings of [`check_route_rows`] about fares and stop order. Rows that break
+/// only these can still be stored (no table constraint refuses them), so a draft
+/// shows its stop list as drafted while the errors block submit and commit. The
+/// other codes are row shapes the table refuses (a marker with a stop, a stop row
+/// without one, an unknown stop type).
+pub const ROUTE_RULE_CODES: [&str; 8] = [
+    "fare_stage_mismatch",
+    "first_stop_not_stage",
+    "intermediate_before_stage",
+    "route_empty",
+    "stage_decreases",
+    "stage_name_missing",
+    "stop_repeated",
+    "too_few_stops",
+];
 
 pub const MOVE_WARNING_METRES: f64 = 500.0;
 /// A merge of stops further apart than this is a warning.
 pub const MERGE_FAR_METRES: f64 = 150.0;
 /// Longest platform label a station member may carry.
 pub const PLATFORM_CODE_MAX_CHARS: usize = 120;
+/// A station groups the stops of one place; fewer than this is not a station.
+pub const STATION_MIN_MEMBERS: usize = 2;
 /// Stop ids the server mints: `ed_` + 10 lower-case hex digits.
 pub const MINTED_STOP_PREFIX: &str = "ed_";
+
+/// Why a station of `members` stops is too small to be one, if it is.
+pub fn too_few_members(station_id: &str, members: usize) -> Option<String> {
+    (members < STATION_MIN_MEMBERS).then(|| {
+        format!(
+            "a station groups at least two stops, and {station_id} would have {}",
+            if members == 0 { "none" } else { "only one" }
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -994,6 +1021,7 @@ pub fn check_payload(
                 }
                 Ok(())
             };
+            let mut count = None;
             if let Some(members) = m.get("member_stop_ids") {
                 let list = members.as_array().ok_or_else(|| {
                     Finding::error(
@@ -1012,6 +1040,7 @@ pub fn check_payload(
                     })?;
                     member(s)?;
                 }
+                count = Some(list.len());
             } else if let Some(members) = m.get("members") {
                 let list = members.as_array().ok_or_else(|| {
                     Finding::error(
@@ -1044,11 +1073,20 @@ pub fn check_payload(
                         }
                     }
                 }
+                count = Some(list.len());
             } else if create {
                 return Err(Finding::error(
                     "invalid_payload",
                     "members",
                     format!("{what}: members (or member_stop_ids) is required"),
+                ));
+            }
+            // to empty or shrink a station below two stops, dissolve it instead
+            if let Some(why) = count.and_then(|n| too_few_members(entity_key, n)) {
+                return Err(Finding::error(
+                    "too_few_members",
+                    entity_key,
+                    format!("{what}: {why}"),
                 ));
             }
             Ok(())
@@ -1250,8 +1288,29 @@ mod tests {
         assert!(check_payload("station", "create", "S", &json!({"station_id": "S", "name": "Adyar", "lat": 13.0, "lon": 80.2, "member_stop_ids": ["A", "B"]})).is_ok());
         assert!(check_payload("station", "create", "S", &json!({"station_id": "S", "name": "Adyar", "lat": 13.0, "lon": 80.2, "member_stop_ids": ["A", "A"]})).is_err());
         assert!(check_payload("station", "create", "S", &json!({"station_id": "S", "name": "Adyar", "lat": 13.0, "lon": 80.2, "member_stop_ids": ["S"]})).is_err());
-        assert!(
-            check_payload("station", "update", "S", &json!({"member_stop_ids": ["A"]})).is_ok()
+        assert!(check_payload(
+            "station",
+            "update",
+            "S",
+            &json!({"member_stop_ids": ["A", "B"]})
+        )
+        .is_ok());
+        // a station groups at least two stops; dissolving one is station/delete
+        for members in [json!(["A"]), json!([])] {
+            let err = check_payload(
+                "station",
+                "update",
+                "S",
+                &json!({ "member_stop_ids": members }),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "too_few_members", "{members}");
+        }
+        assert_eq!(
+            check_payload("station", "create", "S", &json!({"station_id": "S", "name": "Adyar", "lat": 13.0, "lon": 80.2, "member_stop_ids": ["A"]}))
+                .unwrap_err()
+                .message,
+            "station/create: a station groups at least two stops, and S would have only one"
         );
         assert!(check_payload("trip", "update", "T", &json!({})).is_err());
     }
@@ -1386,12 +1445,22 @@ mod tests {
         let station = |op: &str, after: Value| check_payload("station", op, "S", &after);
         let base = |members: Value| json!({"station_id": "S", "name": "Adyar", "lat": 13.0, "lon": 80.2, "members": members, "proposal_id": 7});
         assert!(station("create", base(json!([{"stop_id": "A", "platform_code": "Towards X"}, {"stop_id": "B"}, {"stop_id": "C", "platform_code": null}]))).is_ok());
-        assert!(station("update", json!({"members": [{"stop_id": "A"}]})).is_ok());
+        assert!(station(
+            "update",
+            json!({"members": [{"stop_id": "A"}, {"stop_id": "B"}]})
+        )
+        .is_ok());
+        assert_eq!(
+            station("update", json!({"members": [{"stop_id": "A"}]}))
+                .unwrap_err()
+                .code,
+            "too_few_members"
+        );
         let long = "x".repeat(PLATFORM_CODE_MAX_CHARS + 1);
         assert_eq!(
             station(
                 "create",
-                base(json!([{"stop_id": "A", "platform_code": long}]))
+                base(json!([{"stop_id": "A", "platform_code": long}, {"stop_id": "B"}]))
             )
             .unwrap_err()
             .code,
@@ -1400,7 +1469,7 @@ mod tests {
         let fits = "é".repeat(PLATFORM_CODE_MAX_CHARS);
         assert!(station(
             "create",
-            base(json!([{"stop_id": "A", "platform_code": fits}]))
+            base(json!([{"stop_id": "A", "platform_code": fits}, {"stop_id": "B"}]))
         )
         .is_ok());
         for bad in [

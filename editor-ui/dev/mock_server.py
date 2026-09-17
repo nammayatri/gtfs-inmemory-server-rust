@@ -1360,6 +1360,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "bad_change", "entity_key is required.")
         if entity == "route_stops" and not isinstance(after.get("rows"), list):
             raise ApiError(400, "bad_change", "after.rows must be the whole ordered stop list.")
+        if entity == "station" and op in ("create", "update"):
+            want, _ = member_spec(after)
+            if want is not None and len(want) < 2:
+                raise ApiError(400, "invalid_change",
+                               f"station/{op}: a station groups at least two stops, and {key} would have "
+                               f"{'only one' if want else 'none'}", {"code": "too_few_members"})
         if entity == "stop" and op == "merge":
             into_id = str(after.get("into_stop_id") or "").strip()
             if not into_id:
@@ -1399,7 +1405,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "DELETE":
             cs["changes"].remove(ch)
             action = "change_removed"
-            self.return_proposals(u, cs, "the change was removed from the draft", change_id=change_id)
+            self.return_proposals(u, cs, "change_removed", change_id=change_id)
         else:
             b = self._body()
             if ch["op"] != "delete" and not isinstance(b.get("after"), dict):
@@ -1478,14 +1484,23 @@ class Handler(BaseHTTPRequestHandler):
                 if p["change_set_id"] == cs["change_set_id"] and p["status"] == "approved":
                     p.update(status="committed", updated_at=t)
                     s.add_audit(u, "station_proposal_committed", p["gtfs_id"], cs["change_set_id"],
-                                {"proposal_id": p["proposal_id"], "name": p["name"]})
+                                {"proposal_id": p["proposal_id"], "station_id": p["station_id"],
+                                 "change_id": p["change_id"], "feed_version": cs["committed_version"]})
+            for ch in cs["changes"]:
+                if ch["entity"] == "stop" and ch["op"] == "merge":
+                    affected = (ch.get("before") or {}).get("affected") or []
+                    s.add_audit(u, "stop_merged", cs["gtfs_id"], cs["change_set_id"], {
+                        "change_id": ch["change_id"], "from": ch["entity_key"], "into": ch["after"]["into_stop_id"],
+                        "routes": len(affected), "rows": sum(len(r.get("sequences") or []) for r in affected),
+                        "keep_name": ch["after"].get("keep_name", "into"),
+                        "keep_position": ch["after"].get("keep_position", "into")})
         elif action == "discard":
             if st in ("committed", "discarded"):
                 raise ApiError(409, "bad_status", f"A {st} draft cannot be discarded.")
             if u["user_id"] != cs["created_by"] and u["role"] != "admin":
                 raise ApiError(403, "not_author", "Only the person who started this draft, or an admin, can discard it.")
             cs.update(status="discarded")
-            self.return_proposals(u, cs, "the draft was discarded")
+            self.return_proposals(u, cs, "change_set_discarded")
         else:
             raise ApiError(404, "not_found", "No such action.")
         cs["updated_at"] = t
@@ -1568,7 +1583,7 @@ class Handler(BaseHTTPRequestHandler):
             running.apply(ch)
             for i in rows_of:
                 results[i]["change"] = {"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"]}
-        s.add_audit(u, "change_set_bulk_imported", g, cs["change_set_id"],
+        s.add_audit(u, "bulk_imported", g, cs["change_set_id"],
                     {"kind": kind, "rows": len(rows), "changes": len(changes)})
         preview = [{"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"], "after": c["after"]}
                    for c in changes]
@@ -1846,8 +1861,11 @@ class Handler(BaseHTTPRequestHandler):
         if proj.stop(p["station_id"]):
             problems.append({"code": "station_id_taken",
                              "message": f"A stop or station with id {p['station_id']} already exists."})
-        if len(members) < 2:
-            problems.append({"code": "too_few_members", "message": "A station groups at least two stops."})
+        if len(members) == 1:
+            problems.append({"code": "too_few_members",
+                             "message": f"a station groups at least two stops, and {p['station_id']} would have only one"})
+        elif not members:
+            problems.append({"code": "no_members", "message": f"station {p['station_id']} would have no stops"})
         for m in members:
             sid = m["stop_id"]
             st = proj.stop(sid)
@@ -1905,11 +1923,14 @@ class Handler(BaseHTTPRequestHandler):
         proj = Projection(s, cs["gtfs_id"], cs["changes"])
         problems = self.proposal_problems(p, proj, name, lat, lon, members)
         if problems:
-            raise ApiError(400, "proposal_invalid", "This station cannot be added as it is now.", {"problems": problems})
+            raise ApiError(400, "proposal_has_problems", "the station would not be valid now; see the problems",
+                           {"problems": problems})
         ch = self.approve_into(u, cs, p, proj, name, lat, lon, members)
         s.add_audit(u, "station_proposal_approved", p["gtfs_id"], cs["change_set_id"],
-                    {"proposal_id": p["proposal_id"], "name": name, "change_id": ch["change_id"]})
-        return {"proposal": self.proposal_detail(p), "change_id": ch["change_id"], "change_set": self.set_full(cs)}
+                    {"proposal_id": p["proposal_id"], "station_id": p["station_id"], "change_id": ch["change_id"],
+                     "renamed": name != p["name"], "moved": "lat" in b, "members": len(members)})
+        # like the API: the proposal detail, now approved with change_set_id and change_id
+        return self.proposal_detail(p)
 
     def approve_many(self, u, g, b):
         s = self.store
@@ -1936,10 +1957,11 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             ch = self.approve_into(u, cs, p, proj, p["name"], p["lat"], p["lon"], members)
             results.append({"proposal_id": pid, "ok": True, "change_id": ch["change_id"]})
+            s.add_audit(u, "station_proposal_approved", g, cs["change_set_id"],
+                        {"proposal_id": pid, "station_id": p["station_id"], "change_id": ch["change_id"], "bulk": True})
         added = sum(1 for r in results if r["ok"])
-        s.add_audit(u, "station_proposals_approved", g, cs["change_set_id"],
-                    {"approved": added, "skipped": len(results) - added})
-        return {"results": results, "change_set": self.set_full(cs)}
+        return {"results": results, "approved": added, "skipped": len(results) - added,
+                "change_set_id": cs["change_set_id"]}
 
     def reject_proposal(self, u, p, b):
         self.require_role(u, "editor")
@@ -1973,7 +1995,7 @@ class Handler(BaseHTTPRequestHandler):
             p.update(status="pending", change_set_id=None, change_id=None, reviewed_by=None, reviewed_at=None,
                      updated_at=iso(now()))
             self.store.add_audit(u, "station_proposal_returned", p["gtfs_id"], cs["change_set_id"],
-                                 {"proposal_id": p["proposal_id"], "name": p["name"], "reason": reason})
+                                 {"proposal_id": p["proposal_id"], "station_id": p["station_id"], "reason": reason})
 
 
 def main():

@@ -1,7 +1,7 @@
 // People (users, roles, two-step reset) and the history of everything done.
 import { get, post, patch, enc } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, toast, confirmDialog, fmtDate, ROLE_LABEL } from "./util.js";
+import { h, clear, toast, confirmDialog, fmtDate, plural, ROLE_LABEL } from "./util.js";
 
 const page = () => document.getElementById("page");
 
@@ -108,8 +108,10 @@ function userRow(u, reload) {
 }
 
 // ------------------------------------------------------------------ history
-// Keys are the audit actions the API writes (src/editor, docs/gtfs-editor.md).
-const ACTION_LABEL = {
+// Keys are the audit actions the API writes (src/editor, docs/gtfs-editor.md),
+// plus the ones nandi's scripts write (seed, release, station_proposals_built).
+// Exported for dev/ui_e2e.mjs, which checks every action in the database has one.
+export const ACTION_LABEL = {
   seed: "Loaded the feed data",
   release: "Released the feed",
   user_bootstrapped: "First admin sign-in",
@@ -130,9 +132,10 @@ const ACTION_LABEL = {
   change_set_committed: "Committed (live)",
   change_set_reopened: "Reopened",
   change_set_discarded: "Discarded",
-  change_set_bulk_imported: "Imported a CSV file",
+  bulk_imported: "Imported a CSV file",
+  stop_merged: "Merged a duplicate stop",
+  station_proposals_built: "Suggested stations were built",
   station_proposal_approved: "Approved a suggested station into a draft",
-  station_proposals_approved: "Approved the suggested stations in an area",
   station_proposal_rejected: "Rejected a suggested station",
   station_proposal_reopened: "Reopened a suggested station",
   station_proposal_returned: "A suggested station went back to review",
@@ -142,23 +145,50 @@ const ACTION_LABEL = {
 // An action this page has no words for yet still reads as words.
 const actionLabel = (action) => ACTION_LABEL[action] || (action.charAt(0).toUpperCase() + action.slice(1)).replace(/_/g, " ");
 
+const RETURNED_BECAUSE = {
+  change_removed: "its change was removed from the draft",
+  change_set_discarded: "its draft was discarded",
+};
+
 function detailText(a) {
   const d = a.detail || {};
+  const n = (count, one) => plural(Number(count) || 0, one);
+  switch (a.action) {
+    case "stop_merged":
+      return `${d.from} merged into ${d.into}, ${n(d.routes, "route")} and ${n(d.rows, "route row")} switched`;
+    case "bulk_imported":
+      return `${String(d.kind || "").replace("_", " ")}: ${n(d.rows, "row")}, ${n(d.changes, "change")}`;
+    case "station_proposals_built":
+      return `${n(d.proposals, "suggested station")} (${d.batch})`;
+    case "seed":
+      return `${n(d.stops, "stop")}, ${n(d.routes, "route")}`;
+    case "change_set_submitted":
+      return n(d.changes, "change");
+    case "station_proposal_committed":
+      return `suggestion #${d.proposal_id}, station ${d.station_id}, feed version ${d.feed_version}`;
+    case "station_proposal_returned":
+      return `suggestion #${d.proposal_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
+    case "station_proposal_approved": {
+      const edits = [d.renamed ? "renamed" : null, d.moved ? "moved" : null,
+        d.relabelled ? `${n(d.relabelled, "platform label")} changed` : null,
+        d.dropped && d.dropped.length ? `${n(d.dropped.length, "stop")} dropped` : null].filter(Boolean);
+      return [`suggestion #${d.proposal_id}, station ${d.station_id}`, d.bulk ? "as suggested, with others in an area" : null, ...edits].filter(Boolean).join(", ");
+    }
+    default:
+      break;
+  }
   const parts = [];
   if (d.title) parts.push(`"${d.title}"`);
   if (d.name) parts.push(d.name);
   if (d.proposal_id) parts.push(`suggestion #${d.proposal_id}`);
-  if (d.kind) parts.push(`${d.kind.replace("_", " ")}: ${d.rows} rows, ${d.changes} changes`);
-  if (d.approved !== undefined) parts.push(`${d.approved} approved, ${d.skipped} skipped`);
   if (d.note) parts.push(`note: ${d.note}`);
-  if (d.reason) parts.push(d.reason);
   if (d.entity) parts.push(`${d.entity.replace("_", " ")} ${d.entity_key || ""}`.trim());
   if (d.email) parts.push(d.email);
   if (d.role) parts.push(`role ${d.role}`);
   if (d.status) parts.push(d.status);
   if (d.comment) parts.push(`comment: ${d.comment}`);
   if (d.version) parts.push(`feed version ${d.version}`);
-  if (d.feed_version) parts.push(`feed version ${d.feed_version}, ${d.changes} change${d.changes === 1 ? "" : "s"}`);
+  if (d.feed_version) parts.push(`feed version ${d.feed_version}${d.changes !== undefined ? `, ${n(d.changes, "change")}` : ""}`);
   if (d.from) parts.push(`was ${d.from}`);
   return parts.join(", ");
 }
