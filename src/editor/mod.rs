@@ -8,10 +8,13 @@
 //! database outage cannot stop GIMS from booting.
 
 pub mod auth;
+pub mod bulk;
 pub mod crypto;
+pub mod draft;
 pub mod error;
 pub mod handlers;
 pub mod jwt;
+pub mod proposals;
 pub mod service;
 pub mod static_ui;
 pub mod validation;
@@ -224,6 +227,36 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/change-sets/{id}/reject", web::post().to(h::reject))
             .route("/change-sets/{id}/commit", web::post().to(h::commit))
             .route("/change-sets/{id}/discard", web::post().to(h::discard))
+            .route("/change-sets/{id}/bulk", web::post().to(h::bulk_import))
+            // station proposals
+            .route(
+                "/feeds/{gtfs_id}/station-proposals",
+                web::get().to(h::station_proposals),
+            )
+            .route(
+                "/feeds/{gtfs_id}/station-proposals/summary",
+                web::get().to(h::station_proposal_summary),
+            )
+            .route(
+                "/feeds/{gtfs_id}/station-proposals/approve",
+                web::post().to(h::station_proposals_approve),
+            )
+            .route(
+                "/station-proposals/{id}",
+                web::get().to(h::station_proposal),
+            )
+            .route(
+                "/station-proposals/{id}/approve",
+                web::post().to(h::station_proposal_approve),
+            )
+            .route(
+                "/station-proposals/{id}/reject",
+                web::post().to(h::station_proposal_reject),
+            )
+            .route(
+                "/station-proposals/{id}/reopen",
+                web::post().to(h::station_proposal_reopen),
+            )
             // admin
             .route("/users", web::get().to(h::users))
             .route("/users", web::post().to(h::user_create))
