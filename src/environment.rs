@@ -92,10 +92,53 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
+    /// Static fallback list of feeds served from the `gtfs_*` tables over
+    /// `internal_database_url` instead of the preprocessed files (trips still
+    /// come from the preprocessed data either way). This is no longer the
+    /// only way to turn DB mode on: `gtfs_feed.data_source` in Postgres is now
+    /// the live, per-feed, authoritative setting (docs/gtfs-editor.md "Feed
+    /// data source"), editable without a restart from the `/internal/gtfs-editor`
+    /// dashboard. This list only matters for a feed that has no `gtfs_feed`
+    /// row yet - it is then treated as `data_source = 'db'` from boot, so an
+    /// operator relying on this old config still gets DB mode without first
+    /// creating a row by hand. Once a row exists for a feed, that row wins,
+    /// even if it says `preprocessed` and the feed is still named here. Empty
+    /// (the default) keeps every feed without a row on preprocessed data.
+    #[serde(default)]
+    pub gtfs_db_feeds: Vec<String>,
+    /// How often each pod checks `gtfs_feed.version` for the DB feeds and
+    /// rebuilds the ones that moved.
+    #[serde(default = "default_gtfs_version_poll_seconds")]
+    pub gtfs_version_poll_seconds: u64,
+    /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
+    /// existing dhall configs still parse; the editor stays off unless enabled.
+    #[serde(default)]
+    pub gtfs_editor_enabled: bool,
+    /// JWKS of the Pomerium that fronts the editor: https://... or file:///...
+    #[serde(default)]
+    pub gtfs_editor_pomerium_jwks_url: Option<String>,
+    /// Expected `aud` of the Pomerium JWT: the dashboard host.
+    #[serde(default)]
+    pub gtfs_editor_audience: Option<String>,
+    /// Emails created as admins on their first authenticated request.
+    #[serde(default)]
+    pub gtfs_editor_bootstrap_admins: Vec<String>,
+    /// Base64 32-byte key that encrypts TOTP secrets (secrets dhall).
+    #[serde(default)]
+    pub gtfs_editor_totp_key: Option<String>,
+    #[serde(default)]
+    pub gtfs_editor_session_hours: Option<u64>,
+    /// Directory the dashboard's static files are served from.
+    #[serde(default)]
+    pub gtfs_editor_ui_dir: Option<String>,
 }
 
 fn default_preprocessed_data_dir() -> String {
     "./assets".to_string()
+}
+
+fn default_gtfs_version_poll_seconds() -> u64 {
+    5
 }
 
 impl OtpConfig {

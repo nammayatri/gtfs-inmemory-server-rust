@@ -71,6 +71,12 @@ in {
   use_preprocessed_data = False,
   preprocessed_data_dir = "./assets",
 
+  -- Feeds whose stops/routes/stop order/polylines/stations come from the gtfs_*
+  -- tables over internal_database_url (trips still from preprocessed data), and
+  -- how often pods check gtfs_feed.version to reload them. Both optional.
+  gtfs_db_feeds = [] : List Text,
+  gtfs_version_poll_seconds = 5,
+
   -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
   osrm_url = Some "http://localhost:5050",
   gen_int_for_id = Some True,

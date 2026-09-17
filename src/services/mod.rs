@@ -5,6 +5,7 @@ pub mod db_vehicle_reader;
 pub mod db_vehicle_reader_internal;
 pub mod field_generator;
 pub mod fleet_operator;
+pub mod gtfs_db_source;
 pub mod gtfs_service;
 pub mod metro_graph;
 pub mod operator;
