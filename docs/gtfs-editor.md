@@ -241,3 +241,100 @@ submit, and — as a different person — review the diff and commit.
 Tests: `editor-ui/dev/mock_server.py` + `dev/ui_smoke.mjs` (UI against an
 in-memory mock of this contract), and `dev/ui_e2e.mjs` (the real UI, the real
 GIMS, the dev Pomerium proxy, a local Postgres).
+
+## 5. Creating things, and bulk import (2026-09-17)
+
+### New change types
+
+| entity / op | `after` | validation |
+|---|---|---|
+| `stop` / `create` | `{stop_id?, name, lat, lon, stop_code?, platform_code?, regional_name?, hindi_name?}` | as above; **`stop_id` may be omitted**: the server mints `ed_` + 10 lower-case hex (unused) and returns it in the change (`entity_key` and `after.stop_id`) |
+| `route` / `create` | `{route_id, short_name, long_name?, route_type?, color?, agency_id?}` | `entity_key` = `route_id`; id unused (409-style row error `route_exists`); same id charset as stops; `route_type` defaults to 3, `agency_id` to the feed's usual one; `short_name` required |
+| `route` / `delete` | `null` | soft delete (`deleted = true`); refused while another pending change in the set edits the route |
+| `station` / `create`, `update` | may carry `members: [{stop_id, platform_code?}]` instead of `member_stop_ids` | as before; `platform_code` ≤ 120 chars; a station change that came from a proposal carries `proposal_id` |
+
+A new route's stop list is a `route_stops` / `replace` change on that route **in
+the same draft**, positioned after the `route` / `create` (its `base_rows_hash` is
+the hash of an empty list). Stops and routes created earlier in the same draft
+count as existing for every later change's validation, preview and commit.
+
+GIMS serves a route in its public APIs only once it has trips, and trips come
+from the nightly GTFS build (MTC schedule). A route created here is in the
+database at commit and in `/routes` after the next build gives it a schedule;
+the dashboard says so on the create form and on the committed route.
+
+### Bulk import — preview, then add to a draft
+
+`POST /change-sets/{id}/bulk` (editor+, draft only), body
+`{kind, rows, dry_run}` with at most 5,000 rows:
+
+| `kind` | row | becomes |
+|---|---|---|
+| `stops` | `{stop_id?, name, lat, lon, platform_code?}` | one `stop/create` per row |
+| `routes` | `{route_id, short_name, long_name?, color?}` | one `route/create` per row |
+| `route_stops` | `{route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`) |
+
+Response (both modes): `{dry_run, summary: {rows, ok, warnings, errors, changes},
+rows: [{row, status: ok|warning|error, messages: [{code, message}], change:
+{entity, op, entity_key}}], changes_preview: [...]}` — `row` is the 1-based
+position in `rows`. Every row is validated exactly as the single change would be
+(ids unused / existing, name and position, fare rules per route), plus duplicates
+within the upload. `route_stops` may reference stops and routes created by an
+earlier import into the same draft or by rows of this draft.
+
+`dry_run: true` changes nothing. `dry_run: false` is refused (400
+`bulk_has_errors`) if any row has an error; otherwise all changes are appended in
+ONE transaction and the response carries the updated set. The draft is then
+reviewed, submitted, approved and committed like any other.
+
+## 6. Station proposals — reviewed, then drafted, then released
+
+`gtfs_station_proposal` (`db/gtfs_editor/0005_station_proposals.sql`) holds
+stations suggested by nandi's `scripts/chennai-bus/editor/build_stations.py`
+(same-named stops within 500 m; platforms labelled "Towards <next stop>").
+Nothing is live until a person approves it into a draft and the draft is
+committed through the normal maker-checker flow.
+
+| method | path | body / rule |
+|---|---|---|
+| GET | `/feeds/{g}/station-proposals?status=&bbox=&q=&limit=&cursor=` | `status` comma list (default `pending`); `bbox` minLat,minLon,maxLat,maxLon on the station point; `q` trigram on name, exact on station/member stop id. Item: `{proposal_id, station_id, name, lat, lon, spread_m, members: [{stop_id, name, lat, lon, platform_code, route_count}], status, change_set_id, change_set_title, reviewed_by_email, reviewed_at, review_note, batch}` |
+| GET | `/station-proposals/{id}` | the item, with each member's CURRENT stop row (name, position, parent_station) and `problems: [{code, message}]` (e.g. a member now has a parent, was deleted, moved > 100 m) |
+| GET | `/feeds/{g}/station-proposals/summary` | `{pending, approved, rejected, committed}` counts |
+| POST | `/station-proposals/{id}/approve` | editor+. `{change_set_id, name?, lat?, lon?, members?: [{stop_id, platform_code}]}` — the reviewer may rename, move the station point, drop members or relabel platforms (never add a stop that is not a member). Appends one `station/create` change (`after.proposal_id` set) to the draft; proposal → `approved` with `change_set_id`/`change_id`. 400 with `details.problems` if the station would be invalid now |
+| POST | `/feeds/{g}/station-proposals/approve` | editor+. `{change_set_id, proposal_ids: [...]}` — approve several unchanged, one transaction; `{results: [{proposal_id, ok, change_id?, problems?}]}`; proposals with problems are skipped, not fatal |
+| POST | `/station-proposals/{id}/reject` | editor+. `{note}` (required) → `rejected` |
+| POST | `/station-proposals/{id}/reopen` | editor+. rejected → pending |
+
+Lifecycle, kept by the server: deleting the change from its draft, or discarding
+the draft, puts the proposal back to `pending` (change fields cleared); committing
+the draft marks it `committed`. Every transition writes `gtfs_audit_log`.
+
+## 7. Dashboard requirements added 2026-09-17 (user feedback on master)
+
+1. **Stations to review** page: proposal list (pending by default, search, counts
+   by status, filter "in the map area"), map of the selected proposal — station
+   point, every member kerb with its "Towards …" label, the routes through each
+   kerb — editable name, point (drag), platform labels, drop a member; actions
+   Approve into the current draft, Reject with a note, Approve all proposals in
+   the map area (bulk endpoint); a proposal already in a draft links to it.
+2. **Map**: in the focused area show every stop, each with its name label when
+   zoomed in (labels at zoom ≥ 17, markers from zoom 15; station platforms of one
+   station share one label). Clicking any stop marker switches the side panel to
+   that stop, from any view, including while a route or another stop is open.
+   Also fix: the search results dropdown must sit above the map controls; the map
+   must `invalidateSize()` whenever the side panel changes width.
+3. **Route stop list editor**: every row gets "Change stop" (search by name/id or
+   pick on the map); "Add stop" is a labelled button between rows and at the end,
+   not only a "+" icon; nothing about which stop a row is can be free text. A NEW
+   STOP's stage name is chosen from the stop's own name or the route's existing
+   stage names ("Other name…" only as an explicit choice); stage numbers can be
+   renumbered in order with one action.
+4. **Create**: a "New" menu — New stop (place by clicking the map, name, optional
+   platform label; id minted by the server unless typed), New route (id, number,
+   names, colour, then build its stop list with the stop pickers), New station
+   (existing flow).
+5. **Bulk import** page: choose Stops / Routes / Route stop lists, upload a CSV
+   (downloadable template per kind; UTF-8, header row), parse in the browser,
+   preview with `dry_run: true` — a table of rows with ok / warning / error and
+   messages, a map of the stops, counts — fix the file and re-preview, then "Add N
+   changes to draft". The draft then goes through the normal review.
