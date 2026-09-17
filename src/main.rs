@@ -47,6 +47,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Reload DB-backed feeds when an editor commit moves gtfs_feed.version
+    if app_state.gtfs_service.has_db_feeds() {
+        let gtfs_service_clone = app_state.gtfs_service.clone();
+        tokio::spawn(async move {
+            gtfs_service_clone.start_db_version_polling().await;
+        });
+    }
+
     // Start background task to update CHALO vehicle cache every 10 seconds
     let chalo_cache_clone = app_state.chalo_vehicle_cache.clone();
     tokio::spawn(async move {

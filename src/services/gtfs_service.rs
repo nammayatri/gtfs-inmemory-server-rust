@@ -8,6 +8,7 @@ use crate::models::{
     SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
+use crate::services::gtfs_db_source::{overlays_from_patterns, GtfsDbSource, TripOverlay};
 use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
@@ -72,6 +73,37 @@ struct PreprocessedManifest {
     files: HashMap<String, ManifestFile>,
 }
 
+/// Trip details for `/example-trip`, keyed gtfs_id -> route code.
+type TripDetailsCache = HashMap<String, HashMap<String, TripDetails>>;
+
+/// `/version/{gtfs_id}` for a DB feed: the routes hash combined with the
+/// `gtfs_feed.version` it was built at, so a committed edit to stops or stop
+/// order - which the routes hash alone does not see - still moves the version.
+fn db_feed_data_hash(routes_hash: &str, version: i64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(routes_hash.as_bytes());
+    hasher.update(b"|gtfs_feed.version=");
+    hasher.update(version.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Replace one feed's entry in a per-feed map: insert what the rebuild produced,
+/// or drop the stale entry if the rebuild produced none.
+fn replace_feed_entry<V>(
+    target: &mut HashMap<String, V>,
+    mut rebuilt: HashMap<String, V>,
+    gtfs_id: &str,
+) {
+    match rebuilt.remove(gtfs_id) {
+        Some(v) => {
+            target.insert(gtfs_id.to_string(), v);
+        }
+        None => {
+            target.remove(gtfs_id);
+        }
+    }
+}
+
 const SNAPSHOT_FILE: &str = "snapshot.bin";
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
@@ -117,6 +149,13 @@ pub struct GTFSService {
     cached_data_bytes: Arc<ArcSwap<Vec<u8>>>,
     /// Set once at startup so refreshes can enrich routes with DB-only fields (e.g. encoded_polyline).
     operator_service: std::sync::OnceLock<Arc<dyn OperatorService>>,
+    /// Source for the feeds in `gtfs_db_feeds`; None when none are configured.
+    db_source: Option<Arc<GtfsDbSource>>,
+    /// Per DB feed, per route: the trips a DB feed borrows from preprocessed data.
+    trip_overlays: Arc<RwLock<HashMap<String, HashMap<String, TripOverlay>>>>,
+    /// Serialises everything that replaces `data`: a full refresh and a per-feed
+    /// DB reload must not interleave, or one would overwrite the other's result.
+    reload_lock: tokio::sync::Mutex<()>,
 }
 
 impl GTFSService {
@@ -131,6 +170,8 @@ impl GTFSService {
             .build()
             .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
+        let db_source = Self::create_db_source(&config)?;
+
         let service = Self {
             config,
             data: Arc::new(ArcSwap::from_pointee(GTFSData::new())),
@@ -140,9 +181,46 @@ impl GTFSService {
             trip_details_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_data_bytes: Arc::new(ArcSwap::from_pointee(Vec::new())),
             operator_service: std::sync::OnceLock::new(),
+            db_source,
+            trip_overlays: Arc::new(RwLock::new(HashMap::new())),
+            reload_lock: tokio::sync::Mutex::new(()),
         };
 
         Ok(service)
+    }
+
+    /// A lazy pool: nothing connects until the first load, so an unreachable DB
+    /// never blocks boot. A DB feed that cannot load keeps serving its
+    /// preprocessed data and the version poller retries it.
+    fn create_db_source(config: &AppConfig) -> AppResult<Option<Arc<GtfsDbSource>>> {
+        if config.gtfs_db_feeds.is_empty() {
+            return Ok(None);
+        }
+        let Some(url) = config.internal_database_url.as_deref() else {
+            warn!(
+                "gtfs_db_feeds={:?} but internal_database_url is not set; serving them from preprocessed data",
+                config.gtfs_db_feeds
+            );
+            return Ok(None);
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_secs(config.db_acquire_timeout.max(1)))
+            .connect_lazy(url)
+            .map_err(|e| AppError::Internal(format!("Invalid internal_database_url: {}", e)))?;
+        info!(
+            "GTFS DB feeds: {:?} (version poll every {}s)",
+            config.gtfs_db_feeds, config.gtfs_version_poll_seconds
+        );
+        Ok(Some(Arc::new(GtfsDbSource::new(
+            pool,
+            config.gtfs_db_feeds.clone(),
+        ))))
+    }
+
+    pub fn has_db_feeds(&self) -> bool {
+        self.db_source.is_some()
     }
 
     pub fn set_operator_service(&self, op: Arc<dyn OperatorService>) {
@@ -156,11 +234,14 @@ impl GTFSService {
         // Preprocessed mode: load the pre-built snapshot; fall back to JSON if absent/stale.
         let temp_data = if self.config.use_preprocessed_data {
             match self.try_load_snapshot().await {
-                Ok(Some(data)) => {
+                Ok(Some(mut data)) => {
                     info!(
                         "Loaded pre-built snapshot in {:?} (skipped JSON parse + index build)",
                         start_time.elapsed()
                     );
+                    // The snapshot was baked without the DB: rebuild DB feeds on top
+                    // of it so it can never mask what the editor committed.
+                    self.overlay_db_feeds_on_snapshot(&mut data).await;
                     data
                 }
                 Ok(None) => {
@@ -297,7 +378,19 @@ impl GTFSService {
     }
 
     async fn fetch_and_process_data(&self) -> AppResult<GTFSData> {
+        let (data, trip_details) = self.build_data().await?;
+        if let Some(trip_details) = trip_details {
+            *self.trip_details_cache.write().await = trip_details;
+        }
+        Ok(data)
+    }
+
+    /// Build a complete `GTFSData`. Returns the example-trip details for
+    /// preprocessed feeds alongside instead of writing them into the live cache,
+    /// so a caller that swaps `data` can swap the cache with it.
+    async fn build_data(&self) -> AppResult<(GTFSData, Option<TripDetailsCache>)> {
         let mut temp_data = GTFSData::new();
+        let mut preprocessed_trip_details_out: Option<TripDetailsCache> = None;
         let mut all_pattern_details = Vec::new();
         let mut all_routes = Vec::new();
         let mut all_stops = Vec::new();
@@ -365,6 +458,16 @@ impl GTFSService {
             }
         }
         info!("Fetched {} patterns total", all_pattern_details.len());
+
+        // DB feeds replace their preprocessed metadata before anything is indexed.
+        let (db_feed_versions, db_polylines) = self
+            .overlay_db_feeds(
+                &mut all_routes,
+                &mut all_pattern_details,
+                &mut all_stops,
+                &preprocessed_gtfs_ids,
+            )
+            .await;
 
         // Read stop geojsons CSV file
         let stop_geojsons_by_gtfs = self.read_stop_geojsons_csv().await?;
@@ -491,7 +594,7 @@ impl GTFSService {
             }
 
             // Cache trip details for preprocessed feeds so get_example_trip returns without GraphQL
-            *self.trip_details_cache.write().await = preprocessed_trip_details;
+            preprocessed_trip_details_out = Some(preprocessed_trip_details);
 
             trip_map
         };
@@ -501,12 +604,21 @@ impl GTFSService {
 
         // Enrich with encoded_polyline from route_internal (DB-only field)
         self.enrich_routes_with_polylines(&mut routes_by_gtfs).await;
+        // A DB feed's polylines are the editor's, including a cleared one.
+        for (gtfs_id, polylines) in &db_polylines {
+            Self::apply_db_polylines(&mut routes_by_gtfs, gtfs_id, polylines);
+        }
 
         // Fetch stops and build children mapping
         let children_by_parent = self.build_children_mapping(all_stops);
 
         // Compute data hashes
-        let data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
+        let mut data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
+        for (gtfs_id, version) in &db_feed_versions {
+            if let Some(h) = data_hash.get_mut(gtfs_id) {
+                *h = db_feed_data_hash(h, *version);
+            }
+        }
 
         // Pre-compute unique stops list per GTFS feed (avoids recomputation on /stops requests)
         let pre_computed_stops_by_gtfs = Self::pre_compute_stops(
@@ -530,6 +642,7 @@ impl GTFSService {
         temp_data.route_service_tiers_by_gtfs = route_service_tiers_by_gtfs;
         temp_data.seat_layout_mapping_by_gtfs = seat_layout_mapping_by_gtfs;
         temp_data.pre_computed_stops_by_gtfs = pre_computed_stops_by_gtfs;
+        temp_data.db_feed_versions = db_feed_versions;
 
         let mem_stats = temp_data.memory_usage_bytes();
         info!(
@@ -541,7 +654,7 @@ impl GTFSService {
             mem_stats.geojson_bytes as f64 / 1024.0,
         );
 
-        Ok(temp_data)
+        Ok((temp_data, preprocessed_trip_details_out))
     }
 
     /// Load GTFS data from preprocessed JSON files produced by the Nandi
@@ -1821,6 +1934,285 @@ impl GTFSService {
         result
     }
 
+    /// Replace each DB feed's preprocessed routes, patterns and stops with the
+    /// DB's, in place. Returns the version each loaded feed was built at and its
+    /// polylines. A feed that fails to load keeps its preprocessed data (and is
+    /// absent from the returned versions, so the poller retries it).
+    async fn overlay_db_feeds(
+        &self,
+        all_routes: &mut Vec<NandiRoutesRes>,
+        all_patterns: &mut Vec<NandiPatternDetails>,
+        all_stops: &mut Vec<GTFSStop>,
+        preprocessed_gtfs_ids: &HashSet<String>,
+    ) -> (
+        HashMap<String, i64>,
+        HashMap<String, HashMap<String, Option<String>>>,
+    ) {
+        let mut versions = HashMap::new();
+        let mut polylines = HashMap::new();
+        let Some(db) = self.db_source.as_ref() else {
+            return (versions, polylines);
+        };
+        for gtfs_id in db.feeds() {
+            if !preprocessed_gtfs_ids.contains(gtfs_id) {
+                warn!(
+                    "DB feed {} has no preprocessed data to take trips from; not loading it",
+                    gtfs_id
+                );
+                continue;
+            }
+            let overlays = overlays_from_patterns(all_patterns, gtfs_id);
+            self.trip_overlays
+                .write()
+                .await
+                .insert(gtfs_id.clone(), overlays.clone());
+            match db.load_feed(gtfs_id, &overlays).await {
+                Ok(feed) => {
+                    let belongs = |id: &str| id.split(':').next() == Some(gtfs_id.as_str());
+                    all_routes.retain(|r| !belongs(&r.id));
+                    all_patterns.retain(|p| !belongs(&p.route_id));
+                    all_stops.retain(|s| !belongs(&s.id));
+                    all_routes.extend(feed.routes);
+                    all_patterns.extend(feed.patterns);
+                    all_stops.extend(feed.stops);
+                    versions.insert(gtfs_id.clone(), feed.version);
+                    polylines.insert(gtfs_id.clone(), feed.polylines);
+                }
+                Err(e) => error!(
+                    "DB feed {} failed to load ({}); serving its preprocessed data until the next poll",
+                    gtfs_id, e
+                ),
+            }
+        }
+        (versions, polylines)
+    }
+
+    fn apply_db_polylines(
+        routes_by_gtfs: &mut HashMap<String, HashMap<String, NandiRoutesRes>>,
+        gtfs_id: &str,
+        polylines: &HashMap<String, Option<String>>,
+    ) {
+        if let Some(routes) = routes_by_gtfs.get_mut(gtfs_id) {
+            for (code, route) in routes.iter_mut() {
+                if let Some(p) = polylines.get(code) {
+                    route.encoded_polyline = p.clone();
+                }
+            }
+        }
+    }
+
+    /// Snapshot boot: the snapshot carries built indexes but not the raw
+    /// patterns, so each DB feed's trip overlay is recovered from what the
+    /// snapshot did keep - the route's trip count and its example trip - and the
+    /// feed is rebuilt from the DB on top.
+    async fn overlay_db_feeds_on_snapshot(&self, data: &mut GTFSData) {
+        let Some(db) = self.db_source.clone() else {
+            return;
+        };
+        for gtfs_id in db.feeds() {
+            let overlays: HashMap<String, TripOverlay> = {
+                let cache = self.trip_details_cache.read().await;
+                let (Some(routes), Some(details)) =
+                    (data.routes_by_gtfs.get(gtfs_id), cache.get(gtfs_id))
+                else {
+                    warn!(
+                        "DB feed {} is not in the snapshot; nothing to take trips from",
+                        gtfs_id
+                    );
+                    continue;
+                };
+                routes
+                    .iter()
+                    .filter_map(|(code, route)| {
+                        let d = details.get(code)?;
+                        Some((
+                            code.clone(),
+                            TripOverlay {
+                                pattern_id: format!("{}:{}", gtfs_id, code),
+                                desc: Some(format!("Pattern for route {}", code)),
+                                trips: vec![crate::models::NandiTrip {
+                                    id: d.trip_id.clone(),
+                                    direction: None,
+                                }],
+                                trip_count: route.trip_count.unwrap_or(1),
+                                start_seconds: d
+                                    .stops
+                                    .first()
+                                    .map(|s| s.scheduled_arrival)
+                                    .unwrap_or(0),
+                            },
+                        ))
+                    })
+                    .collect()
+            };
+            self.trip_overlays
+                .write()
+                .await
+                .insert(gtfs_id.clone(), overlays);
+            match self.rebuild_db_feed(data, gtfs_id).await {
+                Ok((rebuilt, details)) => {
+                    *data = rebuilt;
+                    self.set_feed_trip_details(gtfs_id, details).await;
+                }
+                Err(e) => error!(
+                    "DB feed {} failed to load over the snapshot ({}); serving snapshot data until the next poll",
+                    gtfs_id, e
+                ),
+            }
+        }
+    }
+
+    async fn set_feed_trip_details(&self, gtfs_id: &str, mut details: TripDetailsCache) {
+        let mut cache = self.trip_details_cache.write().await;
+        match details.remove(gtfs_id) {
+            Some(d) => {
+                cache.insert(gtfs_id.to_string(), d);
+            }
+            None => {
+                cache.remove(gtfs_id);
+            }
+        }
+    }
+
+    /// `base` with one DB feed rebuilt from the tables. Every other feed, and
+    /// the CSV-derived lookups, are carried over untouched. The steps mirror
+    /// `build_data` for a single feed - keep the two in step.
+    async fn rebuild_db_feed(
+        &self,
+        base: &GTFSData,
+        gtfs_id: &str,
+    ) -> AppResult<(GTFSData, TripDetailsCache)> {
+        let db = self
+            .db_source
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("no GTFS DB source configured".to_string()))?;
+        let overlays = self
+            .trip_overlays
+            .read()
+            .await
+            .get(gtfs_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Internal(format!("no trip overlay recorded for {}", gtfs_id))
+            })?;
+        let feed = db.load_feed(gtfs_id, &overlays).await?;
+
+        let mut data = base.clone();
+        let csv_tiers = self.read_route_service_tiers_csv().await?;
+        let tiers = self
+            .build_route_service_tiers(csv_tiers, &feed.routes)
+            .await;
+        let trip_counts = self.calculate_trip_counts(&feed.patterns);
+        let stop_counts = self.calculate_stop_counts(&feed.patterns);
+        let mut routes =
+            self.build_routes_by_gtfs(feed.routes.clone(), &trip_counts, &stop_counts, &tiers);
+        let stops = self.build_stops_by_gtfs(feed.stops.clone(), &data.stop_regional_names_by_gtfs);
+        let alternates = self.build_alternate_stops_by_gtfs(feed.stops.clone());
+        let route_data = self.build_route_data(
+            &feed.patterns,
+            &routes,
+            &data.stop_geojsons_by_gtfs,
+            &data.provider_stop_code_mapping,
+            &data.stop_regional_names_by_gtfs,
+            &data.suburban_stop_info_by_gtfs,
+            &stops,
+        );
+        let ids: HashSet<String> = [gtfs_id.to_string()].into_iter().collect();
+        let (trip_map, trip_details) = Self::build_example_trip_from_patterns(&feed.patterns, &ids);
+        self.update_start_end_points(&mut routes, &route_data);
+        Self::apply_db_polylines(&mut routes, gtfs_id, &feed.polylines);
+        let children = self.build_children_mapping(feed.stops);
+        let pre_computed =
+            Self::pre_compute_stops(&route_data, &data.stop_regional_names_by_gtfs, &stops);
+
+        let routes_hash = routes.get(gtfs_id).map(|r| self.compute_data_hash(r));
+        replace_feed_entry(&mut data.routes_by_gtfs, routes, gtfs_id);
+        replace_feed_entry(&mut data.route_data_by_gtfs, route_data, gtfs_id);
+        replace_feed_entry(&mut data.stops_by_gtfs, stops, gtfs_id);
+        replace_feed_entry(&mut data.alternate_stop_by_gtfs, alternates, gtfs_id);
+        replace_feed_entry(&mut data.children_by_parent, children, gtfs_id);
+        replace_feed_entry(&mut data.route_example_trip_by_gtfs, trip_map, gtfs_id);
+        replace_feed_entry(&mut data.route_service_tiers_by_gtfs, tiers, gtfs_id);
+        replace_feed_entry(&mut data.pre_computed_stops_by_gtfs, pre_computed, gtfs_id);
+        match routes_hash {
+            Some(h) => {
+                data.data_hash
+                    .insert(gtfs_id.to_string(), db_feed_data_hash(&h, feed.version));
+            }
+            None => {
+                data.data_hash.remove(gtfs_id);
+            }
+        }
+        data.db_feed_versions
+            .insert(gtfs_id.to_string(), feed.version);
+        Ok((data, trip_details))
+    }
+
+    /// Rebuild one DB feed and swap it in. On failure the live data is untouched.
+    pub async fn reload_db_feed(&self, gtfs_id: &str) -> AppResult<()> {
+        let _reload = self.reload_lock.lock().await;
+        let started = std::time::Instant::now();
+        let current = self.data.load_full();
+        let (rebuilt, details) = self.rebuild_db_feed(&current, gtfs_id).await?;
+        let version = rebuilt.db_feed_versions.get(gtfs_id).copied();
+        let built = started.elapsed();
+        self.data.store(Arc::new(rebuilt));
+        self.set_feed_trip_details(gtfs_id, details).await;
+        self.update_cached_data_bytes().await;
+        *self.last_update.write().await = Utc::now();
+        info!(
+            gtfs_id,
+            version,
+            build_ms = built.as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "DB feed reloaded"
+        );
+        Ok(())
+    }
+
+    /// Every `gtfs_version_poll_seconds`, reload the DB feeds whose
+    /// `gtfs_feed.version` differs from the version they were built at.
+    pub async fn start_db_version_polling(&self) {
+        let Some(db) = self.db_source.clone() else {
+            return;
+        };
+        let every = Duration::from_secs(self.config.gtfs_version_poll_seconds.max(1));
+        info!(
+            "Polling gtfs_feed.version for {:?} every {:?}",
+            db.feeds(),
+            every
+        );
+        loop {
+            sleep(every).await;
+            let versions = match db.versions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("gtfs_feed version poll failed: {}", e);
+                    continue;
+                }
+            };
+            for gtfs_id in db.feeds() {
+                let Some(latest) = versions.get(gtfs_id) else {
+                    continue;
+                };
+                let loaded = self.data.load().db_feed_versions.get(gtfs_id).copied();
+                if loaded == Some(*latest) {
+                    continue;
+                }
+                info!(
+                    gtfs_id,
+                    loaded, latest, "gtfs_feed.version moved; reloading feed"
+                );
+                if let Err(e) = self.reload_db_feed(gtfs_id).await {
+                    error!(
+                        "Reloading DB feed {} failed ({}); keeping the data it had",
+                        gtfs_id, e
+                    );
+                }
+            }
+        }
+    }
+
     fn compute_all_data_hashes(
         &self,
         routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
@@ -1844,17 +2236,25 @@ impl GTFSService {
 
     async fn update_data(&self) -> AppResult<()> {
         info!("Checking for GTFS data updates...");
+        let _reload = self.reload_lock.lock().await;
         let start_time = std::time::Instant::now();
-        match self.fetch_and_process_data().await {
-            Ok(new_data) => {
+        match self.build_data().await {
+            Ok((new_data, new_trip_details)) => {
                 if self.check_for_changes(&new_data).await? {
                     info!("Changes detected, performing atomic update...");
 
                     // Atomic pointer swap - readers continue unblocked with old data
                     self.data.store(Arc::new(new_data));
 
-                    // Clear trip details cache since underlying data changed
-                    self.trip_details_cache.write().await.clear();
+                    // Swap the trip details cache with the data it describes. The
+                    // build used to write it and this used to clear it straight
+                    // after, so /example-trip 404'd for every preprocessed feed
+                    // until a restart. Only data that did not refill it (Nandi
+                    // feeds, whose details are fetched lazily) is cleared.
+                    match new_trip_details {
+                        Some(details) => *self.trip_details_cache.write().await = details,
+                        None => self.trip_details_cache.write().await.clear(),
+                    }
 
                     // Update pre-serialized cached data bytes
                     self.update_cached_data_bytes().await;
