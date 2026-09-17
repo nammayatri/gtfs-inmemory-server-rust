@@ -345,6 +345,31 @@ pub async fn feeds(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
     ok(svc::feeds(&st).await?)
 }
 
+pub async fn feed_config(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(svc::feed_config(&st, &path).await?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedConfigPatch {
+    data_source: String,
+}
+
+pub async fn feed_config_update(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<FeedConfigPatch>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    ok(svc::set_feed_data_source(&st, &ctx, &path, &body.data_source).await?)
+}
+
 #[derive(Deserialize)]
 pub struct StopsQuery {
     q: Option<String>,

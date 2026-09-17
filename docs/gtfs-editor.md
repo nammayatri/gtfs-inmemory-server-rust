@@ -19,16 +19,22 @@ ops ─VPN─▶ gtfs.sso.c2.integ.internal.svc.movingtech.net   (Pomerium, namm
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0007*.sql` (applied to master `mtc_internal_master`;
-`0006` lets a change's `op` be `merge`, `0007` holds coordinate reviews).
+Schema: `db/gtfs_editor/0001..0008*.sql` (applied to master `mtc_internal_master`;
+`0006` lets a change's `op` be `merge`, `0007` holds coordinate reviews, `0008`
+makes `gtfs_feed.data_source` live and backfills `chennai_bus` to `'db'` — see
+section 3's "Feed data source").
 
 ## 1. Data source per feed (GIMS loader)
 
-Config (dhall, all optional so existing configs still parse):
+Which feeds are DB-backed is a **live** setting, `gtfs_feed.data_source`
+(`'db'` or `'preprocessed'`), not a fixed list decided at boot — see section
+3's "Feed data source" for how it is read and changed. `gtfs_db_feeds` below
+is now only a boot-time fallback, for a feed that has no `gtfs_feed` row yet:
 
 ```dhall
-gtfs_db_feeds = ["chennai_bus"]      -- feeds whose metadata comes from the DB
-gtfs_version_poll_seconds = 5
+gtfs_db_feeds = ["chennai_bus"]      -- fallback only; a gtfs_feed row, once it
+                                      -- exists, always overrides this list
+gtfs_version_poll_seconds = 5        -- also how often the live data_source is polled
 ```
 
 A DB feed is built from the tables **overlaid on the preprocessed data**, which
@@ -178,9 +184,25 @@ platforms, diameter_m, base_version}`). Coordinate reviews (section 8) write
 `position_review_moved`, `position_review_split`, `position_review_confirmed`,
 `position_review_reopened`, `position_review_returned` and
 `position_review_committed`, and nandi's loader `position_reviews_loaded`. The
-dashboard's history has words for every one of these (`ACTION_LABEL` in
-`editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks each action in the database has a
-label).
+"Feed data source" endpoint below writes `feed_data_source_changed`, detail
+`{gtfs_id, from, to}`. The dashboard's history has words for every one of these
+(`ACTION_LABEL` in `editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks each action in
+the database has a label).
+
+### Feed data source
+
+Whether GIMS serves a feed from these tables or from its preprocessed data —
+section 1's `gtfs_feed.data_source` — read and changed here. **The POST here has
+no relationship to a draft or change-set: it takes effect immediately**, for
+everyone, without submit/approve/commit, unlike every other mutation in this
+document. Every GIMS pod picks it up on its next `gtfs_version_poll_seconds`
+poll (default 5 s) — no restart.
+
+| method | path | body → response |
+|---|---|---|
+| GET | `/feeds/{g}/config` | viewer+ → `{gtfs_id, data_source: "db"\|"preprocessed", version}` — same vocabulary as `/feeds`' `data_source` (the raw `gtfs_feed.data_source` value). 404 `feed_not_found` if `g` has no `gtfs_feed` row at all |
+| POST | `/feeds/{g}/config` | **admin only.** `{data_source: "db"\|"preprocessed"}` → the same shape as GET. 400 `invalid_data_source` for any other value. No row yet (first time this feed is switched to `db`) → inserts one, `version` starting at 1; a row already exists → updates `data_source` and bumps `version` the same way a change-set commit does. Audited as `feed_data_source_changed`, detail `{gtfs_id, from, to}` |
+
 
 ### Drafts
 

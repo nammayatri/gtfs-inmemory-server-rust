@@ -130,6 +130,79 @@ pub fn route_mode(route_type: i16) -> String {
     crate::models::cast_vehicle_type(mode)
 }
 
+/// Merges `gtfs_feed` rows (as `live_feeds` fetched them) with the static
+/// fallback list into the live decision `live_feeds` returns. Pure and
+/// synchronous so the precedence rule - a feed's own row always wins over the
+/// fallback list, even a row saying `preprocessed` - can be unit tested
+/// without a database. See `live_feeds`'s doc comment for the exact rule.
+fn merge_live_feeds(
+    rows: &[(String, String, i64)], // (gtfs_id, data_source, version)
+    fallback: &[String],
+) -> HashMap<String, Option<i64>> {
+    let known: HashMap<&str, (&str, i64)> = rows
+        .iter()
+        .map(|(id, src, v)| (id.as_str(), (src.as_str(), *v)))
+        .collect();
+    let mut out: HashMap<String, Option<i64>> = HashMap::new();
+    for (id, (src, v)) in &known {
+        if *src == "db" {
+            out.insert((*id).to_string(), Some(*v));
+        }
+    }
+    for id in fallback {
+        if !known.contains_key(id.as_str()) {
+            out.entry(id.clone()).or_insert(None);
+        }
+    }
+    out
+}
+
+/// What the poll loop should do this cycle for one feed. Returned only for a
+/// feed that needs something done; a feed that is up to date, or that has
+/// never been touched (not live and not loaded), is simply absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedAction {
+    /// Not loaded as a DB feed yet, or its live version moved: (re)load it
+    /// from the DB. Covers both "just flipped to `data_source = 'db'` for the
+    /// first time" and "a committed edit bumped its version" - `reload_db_feed`
+    /// handles both the same way.
+    LoadOrReload,
+    /// Loaded as a DB feed but no longer in `live`: someone flipped it back
+    /// to `data_source = 'preprocessed'`. Revert it to preprocessed data.
+    Revert,
+}
+
+/// Diffs a poll's `live_feeds` result against what GIMS currently has loaded
+/// as DB feeds (`GTFSData::db_feed_versions`), and says what to do with each
+/// feed that needs anything done. Pure and synchronous - the actual loading/
+/// reverting is async I/O the caller (`GTFSService::start_db_version_polling`)
+/// does after consulting this.
+///
+/// A feed absent from both `live` and `loaded_versions` - one that has never
+/// been flipped to `db`, e.g. Kolkata, Sambalpur, Bhubaneswar, Bangalore
+/// metro today - is absent from the result too: completely untouched.
+pub fn plan_feed_actions(
+    live: &HashMap<String, Option<i64>>,
+    loaded_versions: &HashMap<String, i64>,
+) -> Vec<(String, FeedAction)> {
+    let mut out = Vec::new();
+    for (gtfs_id, latest) in live {
+        let up_to_date = matches!(
+            (loaded_versions.get(gtfs_id), latest),
+            (Some(loaded), Some(v)) if loaded == v
+        );
+        if !up_to_date {
+            out.push((gtfs_id.clone(), FeedAction::LoadOrReload));
+        }
+    }
+    for gtfs_id in loaded_versions.keys() {
+        if !live.contains_key(gtfs_id) {
+            out.push((gtfs_id.clone(), FeedAction::Revert));
+        }
+    }
+    out
+}
+
 struct StopRow {
     stop_id: String,
     stop_code: Option<String>,
@@ -144,6 +217,14 @@ struct StopRow {
 
 pub struct GtfsDbSource {
     pool: PgPool,
+    /// The static `gtfs_db_feeds` config list. Since `gtfs_feed.data_source`
+    /// became the live, per-feed source of truth (docs/gtfs-editor.md "Feed
+    /// data source"), this is only a boot-time fallback: it is what
+    /// `overlay_db_feeds`/`overlay_db_feeds_on_snapshot` load as DB feeds
+    /// before the first poll runs, and what `live_feeds` treats as `db` mode
+    /// for a feed that has no `gtfs_feed` row yet. A feed with a row is
+    /// governed entirely by that row, even one saying `preprocessed` - the
+    /// row always wins over this list.
     feeds: Vec<String>,
 }
 
@@ -152,25 +233,44 @@ impl GtfsDbSource {
         Self { pool, feeds }
     }
 
+    /// The static fallback list (see the field doc). Boot-time overlay code
+    /// still uses this directly; the poll loop uses it only as `live_feeds`'s
+    /// `fallback` argument.
     pub fn feeds(&self) -> &[String] {
         &self.feeds
     }
 
-    /// Current `gtfs_feed.version` of every configured DB feed.
-    pub async fn versions(&self) -> AppResult<HashMap<String, i64>> {
-        let rows = sqlx::query("SELECT gtfs_id, version FROM gtfs_feed WHERE gtfs_id = ANY($1)")
-            .bind(&self.feeds)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("gtfs_feed versions: {}", e)))?;
-        rows.iter()
+    /// The live, per-feed `data_source` decision the poll loop reconciles
+    /// against each cycle: every feed with `data_source = 'db'` right now,
+    /// plus every `fallback` feed with no `gtfs_feed` row at all. Returns
+    /// `gtfs_id -> Some(version)` for a feed with a row, or `gtfs_id -> None`
+    /// for a fallback feed with no row yet (nothing to load until one
+    /// exists - same failure mode as before this feature existed).
+    ///
+    /// One query does both jobs: which feeds are DB-mode, and their current
+    /// version, for the union of "has a 'db' row" and "named in `fallback`"
+    /// (so a `preprocessed` row for a fallback feed is fetched too, and wins
+    /// over the fallback list rather than being invisible to it).
+    pub async fn live_feeds(&self, fallback: &[String]) -> AppResult<HashMap<String, Option<i64>>> {
+        let rows = sqlx::query(
+            "SELECT gtfs_id, data_source, version FROM gtfs_feed \
+             WHERE data_source = 'db' OR gtfs_id = ANY($1)",
+        )
+        .bind(fallback)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("gtfs_feed live_feeds: {}", e)))?;
+        let parsed = rows
+            .iter()
             .map(|r| {
                 Ok((
                     r.try_get::<String, _>("gtfs_id").map_err(db_err)?,
+                    r.try_get::<String, _>("data_source").map_err(db_err)?,
                     r.try_get::<i64, _>("version").map_err(db_err)?,
                 ))
             })
-            .collect()
+            .collect::<AppResult<Vec<(String, String, i64)>>>()?;
+        Ok(merge_live_feeds(&parsed, fallback))
     }
 
     /// Build one feed from the tables. The version is read first: an edit that
@@ -441,5 +541,123 @@ mod tests {
         assert_eq!(r.pattern_id, "long");
         assert_eq!(r.trip_count, 4);
         assert_eq!(r.start_seconds, 100);
+    }
+
+    // ---------------------------------------------------------------- live feed precedence
+
+    #[test]
+    fn merge_live_feeds_picks_up_a_db_row_even_outside_the_fallback_list() {
+        let rows = vec![("chennai_bus".to_string(), "db".to_string(), 7i64)];
+        let out = merge_live_feeds(&rows, &[]);
+        assert_eq!(out.get("chennai_bus"), Some(&Some(7)));
+    }
+
+    #[test]
+    fn merge_live_feeds_a_preprocessed_row_wins_over_the_fallback_list() {
+        // A feed named in the static fallback list, but whose row explicitly
+        // says 'preprocessed' (someone reverted it): the row wins, so it must
+        // NOT appear in the live set at all.
+        let rows = vec![("chennai_bus".to_string(), "preprocessed".to_string(), 9i64)];
+        let out = merge_live_feeds(&rows, &["chennai_bus".to_string()]);
+        assert_eq!(out.get("chennai_bus"), None);
+    }
+
+    #[test]
+    fn merge_live_feeds_fallback_feed_with_no_row_is_db_mode_with_unknown_version() {
+        let out = merge_live_feeds(&[], &["chennai_bus".to_string()]);
+        assert_eq!(out.get("chennai_bus"), Some(&None));
+    }
+
+    #[test]
+    fn merge_live_feeds_untouched_feed_is_absent() {
+        let rows = vec![("chennai_bus".to_string(), "db".to_string(), 1i64)];
+        let out = merge_live_feeds(&rows, &["chennai_bus".to_string()]);
+        assert_eq!(out.get("kolkata_bus"), None);
+        assert_eq!(out.len(), 1);
+    }
+
+    // ---------------------------------------------------------------- poll loop plan
+
+    #[test]
+    fn plan_loads_a_feed_freshly_flipped_to_db() {
+        let mut live = HashMap::new();
+        live.insert("chennai_bus".to_string(), Some(5));
+        let loaded = HashMap::new(); // GIMS has never loaded it as a DB feed
+        let plan = plan_feed_actions(&live, &loaded);
+        assert_eq!(
+            plan,
+            vec![("chennai_bus".to_string(), FeedAction::LoadOrReload)]
+        );
+    }
+
+    #[test]
+    fn plan_skips_a_feed_whose_version_has_not_moved() {
+        let mut live = HashMap::new();
+        live.insert("chennai_bus".to_string(), Some(5));
+        let mut loaded = HashMap::new();
+        loaded.insert("chennai_bus".to_string(), 5);
+        assert!(plan_feed_actions(&live, &loaded).is_empty());
+    }
+
+    #[test]
+    fn plan_reloads_a_feed_whose_version_moved() {
+        let mut live = HashMap::new();
+        live.insert("chennai_bus".to_string(), Some(6));
+        let mut loaded = HashMap::new();
+        loaded.insert("chennai_bus".to_string(), 5);
+        assert_eq!(
+            plan_feed_actions(&live, &loaded),
+            vec![("chennai_bus".to_string(), FeedAction::LoadOrReload)]
+        );
+    }
+
+    #[test]
+    fn plan_reverts_a_feed_flipped_back_to_static() {
+        // Was loaded as a DB feed; the poll's live query no longer has it
+        // (data_source flipped back to 'preprocessed').
+        let live = HashMap::new();
+        let mut loaded = HashMap::new();
+        loaded.insert("chennai_bus".to_string(), 5);
+        assert_eq!(
+            plan_feed_actions(&live, &loaded),
+            vec![("chennai_bus".to_string(), FeedAction::Revert)]
+        );
+    }
+
+    #[test]
+    fn plan_leaves_a_feed_with_no_row_and_never_loaded_untouched() {
+        let live = HashMap::new();
+        let loaded = HashMap::new();
+        assert!(plan_feed_actions(&live, &loaded).is_empty());
+    }
+
+    #[test]
+    fn plan_round_trips_static_to_db_and_back() {
+        // db -> loaded -> flipped back to static -> flipped to db again.
+        let mut loaded = HashMap::new();
+
+        // 1) first seen live: load it.
+        let mut live = HashMap::new();
+        live.insert("chennai_bus".to_string(), Some(1));
+        assert_eq!(
+            plan_feed_actions(&live, &loaded),
+            vec![("chennai_bus".to_string(), FeedAction::LoadOrReload)]
+        );
+        loaded.insert("chennai_bus".to_string(), 1); // simulate the load succeeding
+
+        // 2) flipped back to static: revert.
+        live.clear();
+        assert_eq!(
+            plan_feed_actions(&live, &loaded),
+            vec![("chennai_bus".to_string(), FeedAction::Revert)]
+        );
+        loaded.remove("chennai_bus"); // simulate the revert succeeding
+
+        // 3) flipped to db again: load it again.
+        live.insert("chennai_bus".to_string(), Some(2));
+        assert_eq!(
+            plan_feed_actions(&live, &loaded),
+            vec![("chennai_bus".to_string(), FeedAction::LoadOrReload)]
+        );
     }
 }

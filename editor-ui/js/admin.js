@@ -107,6 +107,64 @@ function userRow(u, reload) {
         : h("button.btn.quiet.small", { type: "button", on: { click: () => update({ status: "active" }, `${u.email} can sign in again.`) } }, "Turn on access"))));
 }
 
+// ------------------------------------------------------------------ feed settings
+// data_source is GIMS's own vocabulary, straight from gtfs_feed.data_source:
+// 'db' (this feed's metadata is served live from the editor tables) or
+// 'preprocessed' (the nightly build's static files - every feed's default).
+const DATA_SOURCE_LABEL = { db: "Database (live edits)", preprocessed: "Preprocessed build (static)" };
+
+export async function showFeedSettings() {
+  if (!can("admin")) {
+    return clear(page(), h("div.page-inner", h("h1", "Feed settings"), h("p.notice", "Only admins can change a feed's data source. Ask an admin if a feed needs to move to or from the database.")));
+  }
+  const tableBox = h("div", h("p.empty", "Loading…"));
+
+  const load = async () => {
+    try {
+      const feeds = (await get("feeds")).items;
+      clear(tableBox, h("div.table-wrap", h("table",
+        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Feed version"), h("th", ""))),
+        h("tbody", feeds.length
+          ? feeds.map((f) => feedRow(f, load))
+          : h("tr", h("td", { colspan: "4" }, "No feeds yet."))))));
+    } catch (e) {
+      clear(tableBox, h("p.notice.error", e.message));
+    }
+  };
+
+  clear(page(), h("div.page-inner",
+    h("div.title-block", h("h1", "Feed settings"), h("p.hint", "Which feeds GIMS serves from the live editor tables instead of the nightly preprocessed build.")),
+    h("p.notice", "Switching a feed here takes effect immediately for everyone, without a draft - it is not reviewed or approved like other edits."),
+    tableBox,
+  ));
+  load();
+}
+
+function feedRow(f, reload) {
+  const isDb = f.data_source === "db";
+  const target = isDb ? "preprocessed" : "db";
+  const switchIt = async () => {
+    const ok = await confirmDialog(
+      `Switch ${f.display_name || f.gtfs_id} to ${DATA_SOURCE_LABEL[target].toLowerCase()}?`,
+      "This takes effect immediately for everyone, without a draft. Are you sure?",
+      { confirm: "Switch", danger: true },
+    );
+    if (!ok) return;
+    try {
+      await post(`feeds/${enc(f.gtfs_id)}/config`, { data_source: target });
+      toast(`${f.display_name || f.gtfs_id} now serves from ${DATA_SOURCE_LABEL[target].toLowerCase()}.`);
+    } catch (e) {
+      toast(e.message, "error");
+    }
+    reload();
+  };
+  return h("tr",
+    h("td", h("strong", f.display_name || f.gtfs_id), f.display_name ? h("div.hint", f.gtfs_id) : null),
+    h("td", DATA_SOURCE_LABEL[f.data_source] || f.data_source),
+    h("td", f.version),
+    h("td", h("button.btn.quiet.small", { type: "button", on: { click: switchIt } }, `Switch to ${DATA_SOURCE_LABEL[target].toLowerCase()}`)));
+}
+
 // ------------------------------------------------------------------ history
 // Keys are the audit actions the API writes (src/editor, docs/gtfs-editor.md),
 // plus the ones nandi's scripts write (seed, release, station_proposals_built,
@@ -148,6 +206,7 @@ export const ACTION_LABEL = {
   position_review_reopened: "Reopened a coordinate review",
   position_review_returned: "A coordinate review went back to review",
   position_review_committed: "A fix from a coordinate review went live",
+  feed_data_source_changed: "Changed a feed's data source",
 };
 
 // An action this page has no words for yet still reads as words.
@@ -196,6 +255,8 @@ function detailText(a) {
         d.dropped && d.dropped.length ? `${n(d.dropped.length, "stop")} dropped` : null].filter(Boolean);
       return [`suggestion #${d.proposal_id}, station ${d.station_id}`, d.bulk ? "as suggested, with others in an area" : null, ...edits].filter(Boolean).join(", ");
     }
+    case "feed_data_source_changed":
+      return `${d.gtfs_id}: ${d.from ? DATA_SOURCE_LABEL[d.from] || d.from : "no row yet"} → ${DATA_SOURCE_LABEL[d.to] || d.to}`;
     default:
       break;
   }

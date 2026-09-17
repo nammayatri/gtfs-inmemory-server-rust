@@ -1187,6 +1187,31 @@ try {
   }
   await shot("20-history");
 
+  // ================================================================ feed settings (admin only)
+  check(await evaluate(`document.querySelector('[data-nav="feed-settings"]').offsetParent !== null`), "an admin sees the Feed settings nav entry");
+  await go("#/feed-settings");
+  await waitFor(`document.body.innerText.includes("Feed settings")`, "feed settings page");
+  await waitFor(`document.querySelectorAll("#page table tbody tr").length >= 1`, "feed settings table");
+  const beforeConfig = await api("feeds/chennai_bus/config");
+  check(["db", "preprocessed"].includes(beforeConfig.data_source), `chennai_bus config readable (${beforeConfig.data_source})`);
+  await click("Switch to");
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("takes effect immediately")`, "the confirm dialog warns this is immediate, with no draft");
+  await click("Switch", "dialog");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes("now serves from")`, "a toast confirms the switch");
+  const afterConfig = await api("feeds/chennai_bus/config");
+  check(afterConfig.data_source !== beforeConfig.data_source, `chennai_bus data_source flipped (${beforeConfig.data_source} -> ${afterConfig.data_source})`);
+  check(afterConfig.version === beforeConfig.version + 1, "the switch bumped the feed version");
+  await shot("21-feed-settings");
+
+  // a non-admin never sees the nav entry, or the page's controls by address
+  await signIn("editor1@nammayatri.in");
+  check(await evaluate(`document.querySelector('[data-nav="feed-settings"]').offsetParent === null`), "a non-admin never sees the Feed settings nav entry");
+  await go("#/feed-settings");
+  await waitFor(`document.body.innerText.includes("Feed settings")`, "feed settings page reachable by address for a non-admin");
+  check(!(await has("#page table")), "a non-admin sees no feed settings table or switch controls");
+  check((await text("#page")).includes("Only admins can change"), "a non-admin sees the admin-only notice instead");
+  await signIn("admin@nammayatri.in");
+
   // with every station suggestion superseded (as on master), the top bar hides the link
   const superseded = await evaluate(`fetch("/__dev/supersede-station-proposals", { method: "POST", credentials: "same-origin" }).then((r) => r.json())`);
   check(superseded.superseded > 0, `set-up: every open station suggestion superseded (${superseded.superseded})`);

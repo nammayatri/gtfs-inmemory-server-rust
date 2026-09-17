@@ -1234,6 +1234,19 @@ class Handler(BaseHTTPRequestHandler):
             if g not in s.feeds:
                 raise ApiError(404, "unknown_feed", f"There is no feed called {g}.")
             rest = parts[2:]
+            if rest == ["config"] and method == "GET":
+                return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
+                             "version": s.feeds[g]["version"]}
+            if rest == ["config"] and method == "POST":
+                self.require_role(u, "admin")
+                to = self._body().get("data_source")
+                if to not in ("db", "preprocessed"):
+                    raise ApiError(400, "invalid_data_source", "data_source is 'db' or 'preprocessed'.")
+                frm = s.feeds[g].get("data_source")
+                s.feeds[g]["data_source"] = to
+                s.feeds[g]["version"] += 1
+                s.add_audit(u, "feed_data_source_changed", g, None, {"gtfs_id": g, "from": frm, "to": to})
+                return 200, {"gtfs_id": g, "data_source": to, "version": s.feeds[g]["version"]}
             if rest == ["stops"] and method == "GET":
                 return 200, self.list_stops(g, q)
             if len(rest) == 2 and rest[0] == "stops" and method == "GET":

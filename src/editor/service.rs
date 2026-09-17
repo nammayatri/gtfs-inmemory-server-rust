@@ -117,6 +117,87 @@ pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
     Ok(json!({"items": items, "next_cursor": null}))
 }
 
+/// The two `gtfs_feed.data_source` values the API and dashboard accept -
+/// nothing else (`POST /feeds/{g}/config` 400s on anything else).
+const DATA_SOURCES: [&str; 2] = ["db", "preprocessed"];
+
+pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> {
+    let row = sqlx::query("SELECT gtfs_id, data_source, version FROM gtfs_feed WHERE gtfs_id = $1")
+        .bind(gtfs_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
+    Ok(json!({
+        "gtfs_id": row.try_get::<String, _>("gtfs_id")?,
+        "data_source": row.try_get::<String, _>("data_source")?,
+        "version": row.try_get::<i64, _>("version")?,
+    }))
+}
+
+/// `POST /feeds/{g}/config` (docs/gtfs-editor.md "Feed data source"): flips
+/// which data source GIMS serves this feed from, live - no draft, no
+/// change-set, effective as soon as the next GIMS pod polls. A feed with no
+/// row yet is created (this is how a brand-new feed is switched to `db` for
+/// the first time); an existing row is updated and its version bumped the
+/// same way a change-set commit bumps `gtfs_feed.version`.
+pub async fn set_feed_data_source(
+    state: &EditorState,
+    ctx: &Ctx,
+    gtfs_id: &str,
+    data_source: &str,
+) -> EditorResult<Value> {
+    if !DATA_SOURCES.contains(&data_source) {
+        return Err(EditorError::bad_request(
+            "invalid_data_source",
+            "data_source is 'db' or 'preprocessed'",
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    let existing = sqlx::query("SELECT data_source FROM gtfs_feed WHERE gtfs_id = $1")
+        .bind(gtfs_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let (from, version): (Option<String>, i64) = match existing {
+        Some(row) => {
+            let from: String = row.try_get("data_source")?;
+            let version: i64 = sqlx::query(
+                "UPDATE gtfs_feed SET data_source = $2, version = version + 1 \
+                 WHERE gtfs_id = $1 RETURNING version",
+            )
+            .bind(gtfs_id)
+            .bind(data_source)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("version")?;
+            (Some(from), version)
+        }
+        None => {
+            let version: i64 = sqlx::query(
+                "INSERT INTO gtfs_feed (gtfs_id, display_name, data_source, version) \
+                 VALUES ($1, $1, $2, 1) RETURNING version",
+            )
+            .bind(gtfs_id)
+            .bind(data_source)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("version")?;
+            (None, version)
+        }
+    };
+    auth::audit(
+        &mut *tx,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "feed_data_source_changed",
+        Some(gtfs_id),
+        None,
+        json!({"gtfs_id": gtfs_id, "from": from, "to": data_source}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(json!({"gtfs_id": gtfs_id, "data_source": data_source, "version": version}))
+}
+
 // ---------------------------------------------------------------- stops
 
 /// Distinct routes calling at a stop, for a query aliasing gtfs_stop as `s`.

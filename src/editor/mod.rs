@@ -187,6 +187,11 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/auth/session", web::delete().to(h::session_delete))
             // live data
             .route("/feeds", web::get().to(h::feeds))
+            .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
+            .route(
+                "/feeds/{gtfs_id}/config",
+                web::post().to(h::feed_config_update),
+            )
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))
             .route("/feeds/{gtfs_id}/stops/{stop_id}", web::get().to(h::stop))
             .route("/feeds/{gtfs_id}/routes", web::get().to(h::routes))

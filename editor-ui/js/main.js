@@ -7,7 +7,7 @@ import * as map from "./map.js";
 import { initSearch, showHome, showStop, showRoute } from "./explore.js";
 import { loadActiveDraft, renderDraftChip, chooseDraft, requireDraft, createdStops } from "./drafts.js";
 import { showDraftList, showDraft } from "./review.js";
-import { showPeople, showHistory } from "./admin.js";
+import { showPeople, showHistory, showFeedSettings } from "./admin.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
 import { newStop, newRoute } from "./create.js";
@@ -50,6 +50,7 @@ async function boot() {
   document.getElementById("user-role").textContent = `${me.email}, ${ROLE_LABEL[me.role].toLowerCase()}`;
   document.getElementById("sign-out").addEventListener("click", signOut);
   document.querySelector('[data-nav="admin"]').hidden = !can("admin");
+  document.querySelector('[data-nav="feed-settings"]').hidden = !can("admin");
   document.getElementById("draft-chip").addEventListener("click", chooseDraftAndGo);
   initNewMenu();
 
@@ -179,6 +180,8 @@ function route() {
     markNav("drafts"); showWorkspace(false); showDraftList(params.get("status") || "draft");
   } else if (parts[0] === "admin") {
     markNav("admin"); showWorkspace(false); showPeople();
+  } else if (parts[0] === "feed-settings") {
+    markNav("feed-settings"); showWorkspace(false); showFeedSettings();
   } else if (parts[0] === "audit") {
     markNav("audit"); showWorkspace(false); showHistory(params.get("change_set"));
   } else {

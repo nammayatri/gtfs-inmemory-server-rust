@@ -92,10 +92,18 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
-    /// Feeds whose metadata (stops, routes, route stop order, polylines,
-    /// stations) is read from the `gtfs_*` tables over `internal_database_url`
-    /// instead of the preprocessed files. Trips still come from the preprocessed
-    /// data. Empty (the default) keeps every feed on preprocessed data.
+    /// Static fallback list of feeds served from the `gtfs_*` tables over
+    /// `internal_database_url` instead of the preprocessed files (trips still
+    /// come from the preprocessed data either way). This is no longer the
+    /// only way to turn DB mode on: `gtfs_feed.data_source` in Postgres is now
+    /// the live, per-feed, authoritative setting (docs/gtfs-editor.md "Feed
+    /// data source"), editable without a restart from the `/internal/gtfs-editor`
+    /// dashboard. This list only matters for a feed that has no `gtfs_feed`
+    /// row yet - it is then treated as `data_source = 'db'` from boot, so an
+    /// operator relying on this old config still gets DB mode without first
+    /// creating a row by hand. Once a row exists for a feed, that row wins,
+    /// even if it says `preprocessed` and the feed is still named here. Empty
+    /// (the default) keeps every feed without a row on preprocessed data.
     #[serde(default)]
     pub gtfs_db_feeds: Vec<String>,
     /// How often each pod checks `gtfs_feed.version` for the DB feeds and
