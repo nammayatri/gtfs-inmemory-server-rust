@@ -79,7 +79,7 @@ export function routesTouched(routeId) {
 }
 
 // ------------------------------------------------------------------ actions
-const STOP_TEXT_FIELDS = ["platform_code", "cluster_id", "regional_name", "hindi_name"];
+const STOP_TEXT_FIELDS = ["platform_code", "description", "cluster_id", "regional_name", "hindi_name"];
 
 // Everything the active draft does to one entity, in change order.
 export function pendingActions(entity, key) {
@@ -183,13 +183,30 @@ export function touchedStops(stops) {
   return out;
 }
 
+// Stops whose station the draft changes (the map's station links follow it):
+// stop_id -> {parent_station, change}, `parent_station` null for a stop that
+// leaves. A station the draft creates has its point in `change.after`.
+export function draftedParents(stops) {
+  const out = new Map();
+  if (!state.draft || !state.draft.changes.length) return out;
+  const idx = build();
+  if (!idx.joins.size && !idx.leaves.size) return out;
+  for (const s of stops) {
+    if (!s || !s.stop_id) continue;
+    const join = idx.joins.get(s.stop_id);
+    if (join && !join.already) out.set(s.stop_id, { parent_station: join.change.entity_key, change: join.change });
+    else if (!join && idx.leaves.has(s.stop_id)) out.set(s.stop_id, { parent_station: null, change: idx.leaves.get(s.stop_id) });
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ words
 const KEY = {
   move: "Move", split: "Split", merge: "Merge", rename: "Rename", edit: "Edit", delete: "Delete", dissolve: "Dissolve",
   create: "New", absorb: "Merge", join: "Station", leave: "Station", relabel: "Platform", members: "Stops", stops: "Stop list",
 };
 const FIELD_WORDS = {
-  platform_code: "platform label", cluster_id: "cluster", regional_name: "Tamil name", hindi_name: "Hindi name",
+  platform_code: "platform label", description: "description", cluster_id: "cluster", regional_name: "Tamil name", hindi_name: "Hindi name",
   short_name: "route number", long_name: "route name", color: "colour", text_color: "text colour", encoded_polyline: "map line", polyline_source: null,
 };
 const stopLink = (id, words) => h("a", { href: `#/stop/${enc(id)}` }, words || id);

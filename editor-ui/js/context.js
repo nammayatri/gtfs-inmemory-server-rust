@@ -4,7 +4,7 @@
 // open drafts, recent history).
 import { get, enc, ApiError } from "./api.js";
 import { state } from "./state.js";
-import { h, clear, fmtDate, fmtMetres, plural, STATUS_LABEL } from "./util.js";
+import { h, clear, fmtDate, fmtMetres, plural, STATUS_LABEL, stopDetailWords } from "./util.js";
 import * as map from "./map.js";
 import { ACTION_LABEL } from "./admin.js";
 
@@ -135,7 +135,7 @@ export function stopContext(stop, names = new Map()) {
     const pr = c.position_reviews || {};
     const reviews = Array.isArray(pr.items) ? pr.items : [];
     const counts = ["pending", "approved", "committed", "confirmed"].filter((k) => pr[k]).map((k) => `${pr[k]} ${REVIEW_WORDS[k]}`);
-    const [sameList, stations] = foldedList(same, names, (n) => h("li.list-item",
+    const [sameList, stations] = foldedList(same, names, (n) => h("li.list-item", { title: stopDetailWords(n) || null },
       h("span.key", fmtMetres(n.distance_m)),
       h("a", { href: `#/stop/${enc(n.stop_id)}` }, n.name),
       h("span.hint", plural(n.route_count || 0, "route")),

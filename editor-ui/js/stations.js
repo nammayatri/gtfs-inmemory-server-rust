@@ -258,7 +258,7 @@ export async function showProposal(id) {
   // dragging the point fires many times a second; redraw the cards once a frame
   let frame = 0;
   const review = map.showReview({
-    lat: p.lat, lon: p.lon, members: mapMembers(), editable,
+    lat: p.lat, lon: p.lon, members: mapMembers(), editable, stationId: p.station_id || null,
     onMovePoint: (la, lo) => {
       edit.lat = la; edit.lon = lo; touch();
       if (!frame) frame = requestAnimationFrame(() => { frame = 0; showPoint(); drawMembers(); });

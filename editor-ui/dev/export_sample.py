@@ -22,7 +22,7 @@ DEFAULT_DSN = "host=127.0.0.1 port=55432 dbname=mtc_internal_master user=postgre
 QUERIES = {
     "feeds": "SELECT gtfs_id, display_name, version, data_source, agency_name, released_version FROM gtfs_feed",
     "stops": """SELECT gtfs_id, stop_id, stop_code, name, lat, lon, location_type, parent_station,
-                       platform_code, cluster_id, regional_name, hindi_name, position_source,
+                       platform_code, description, cluster_id, regional_name, hindi_name, position_source,
                        row_version, deleted
                 FROM gtfs_stop""",
     "routes": """SELECT gtfs_id, route_id, short_name, long_name, route_type, agency_id, color, encoded_polyline,

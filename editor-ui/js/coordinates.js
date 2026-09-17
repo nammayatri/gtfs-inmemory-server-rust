@@ -308,6 +308,7 @@ export async function showCoordinateReview(id) {
     .map((g) => ({ lat: g.raw_lat, lon: g.raw_lon, label: `Raw point of ${g.origin_name || g.origin_stop_id}` }));
   const view = map.showPositionReview({
     stopId: r.stop_id, current, loaded: { lat: r.lat, lon: r.lon }, raw, suggestion, origins: originPoints,
+    stationId: alive ? stop.parent_station || null : null,
     onPlace: changeable ? (la, lo, how) => place(la, lo, how) : null,
   });
   view.setDrafted(draftedPoints(draftActions));

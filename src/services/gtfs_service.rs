@@ -1539,6 +1539,7 @@ impl GTFSService {
                 cluster_id: cluster_id.clone(),
                 location_type: stop.location_type.clone(),
                 platform_code: stop.platform_code.clone(),
+                description: stop.description.clone(),
             };
             if stop.cluster.is_some() {
                 let cluster_stop_res = GTFSStop {
@@ -1555,6 +1556,7 @@ impl GTFSService {
                     cluster_id: None,
                     location_type: stop.location_type.clone(),
                     platform_code: stop.platform_code.clone(),
+                    description: stop.description.clone(),
                 };
                 stop_data
                     .stops

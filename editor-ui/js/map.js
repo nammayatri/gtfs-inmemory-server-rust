@@ -2,15 +2,16 @@
 // when zoomed in), showing a route, dragging a stop, placing a new stop, picking
 // a stop, selecting stops for a station, reviewing a suggested station, reviewing
 // a suspected coordinate, comparing two stops, and the small read-only insets.
-// Also what the person chose to see (stations, routes, stops), the chooser for
-// stops that share one point, and stops drawn where the active draft puts them.
+// Also what the person chose to see (stations, routes, stops, station links),
+// the chooser for stops that share one point, stops drawn where the active draft
+// puts them, and the thin lines that tie each station to its platforms.
 import {
   TILE_URL, TILE_ATTRIBUTION, TILE_REFERRER_POLICY, DEFAULT_VIEW, STOPS_MIN_ZOOM, LABELS_MIN_ZOOM, LABEL_GROUP_METRES,
 } from "./config.js";
 import { get, enc } from "./api.js";
 import { state, pref, setPref, subscribe } from "./state.js";
 import { debounce, decodePolyline, h, haversine, normName, fmtMetres, plural } from "./util.js";
-import { touchedStops, draftStamp, draftTitle } from "./overlay.js";
+import { touchedStops, draftedParents, draftStamp, draftTitle } from "./overlay.js";
 
 const L = window.L;
 let map;
@@ -36,11 +37,19 @@ const ACTION = "#0b6660", INK = "#14252a", MUTED = "#536569", DRAFT_FILL = "#f2b
 const DANGER = "#b42318", FOCUS = "#1f5fbf";
 const MAX_STOPS = 2000;
 // What the person chose to see (the Show control): remembered in this browser.
-const visible = { stations: true, routes: true, stops: true };
+const visible = { stations: true, routes: true, stops: true, links: true };
 let layerNote = null;
 let focusRow = null;          // the stop the panel is about: drawn even when its kind is hidden
 let drawn = [];               // the stops on the map now, as drawn (drafted positions included)
 let drawnStamp = -1;
+let linkStation = null;       // a review's station: its links stand out though no stop panel is open
+// What is known of a station beyond the loaded area, once per session and feed:
+// "<feed>|<station>" -> {row, platforms}. Stops in the area always come first.
+const linkCache = new Map();
+const linkFetching = new Set();
+const linkFailed = new Map();
+const LINK_RETRY_MS = 30000;
+const LINK_FETCHES = 4;
 
 const text = (s) => h("span", s);
 
@@ -61,7 +70,7 @@ export function initMap() {
   lines = L.canvas({ pane: "lines", padding: 0.3 });
   dots = L.canvas({ pane: "dots", padding: 0.3 });
   L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
-  for (const name of ["route", "proposal", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "labels"]) {
+  for (const name of ["links", "route", "proposal", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "labels"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
   initLayerControl();
@@ -155,13 +164,15 @@ export function setDraftStops(stops) {
   if (map) drawStops();
 }
 
-function stopTooltip(s, stack = 1) {
+function stopTooltip(s, stack = 1, station = null) {
   const bits = [s.name];
   if (s.platform_code) bits.push(s.platform_code);
+  if (s.description) bits.push(s.description.length > 90 ? `${s.description.slice(0, 88)}…` : s.description);
   if (s.location_type === 1) bits.push("station");
   else if (s.draft) bits.push("new, in your draft");
   else if (s.route_count != null) bits.push(`${s.route_count} route${s.route_count === 1 ? "" : "s"}`);
   if (s.pending) bits.push(s.pending.gone ? `goes away in draft “${draftTitle()}”, still live` : `${s.pending.moved ? "moved" : "renamed"} in draft “${draftTitle()}”, not live`);
+  if (station) bits.push(station.parent_station ? `joins station ${station.parent_station} in draft “${draftTitle()}”, not live` : `leaves its station in draft “${draftTitle()}”, still live`);
   if (stack > 1) bits.push(`and ${plural(stack - 1, "other stop")} at this point: click to choose`);
   return text(bits.join(" · "));
 }
@@ -181,7 +192,7 @@ function initLayerControl() {
     options: { position: "topleft" },
     onAdd() {
       const el = h("fieldset.layer-toggle.leaflet-bar", { "aria-label": "Show on the map" },
-        h("legend", "Show"), box("stations", "Stations"), box("routes", "Routes"), box("stops", "Stops"), layerNote);
+        h("legend", "Show"), box("stations", "Stations"), box("routes", "Routes"), box("stops", "Stops"), box("links", "Station links"), layerNote);
       L.DomEvent.disableClickPropagation(el);
       L.DomEvent.disableScrollPropagation(el);
       return el;
@@ -222,6 +233,7 @@ function updateLayerNote() {
   if (!visible.routes && layers.route.getLayers().length) notes.push("The open route is not drawn: Routes is off.");
   if ((!visible.stops || !visible.stations) && stopsNeeded()) notes.push("Every stop is drawn while you choose one on the map.");
   else if (focusRow && !kindShown(focusRow)) notes.push(`Only the open ${focusRow.location_type === 1 ? "station" : "stop"} is drawn: ${focusRow.location_type === 1 ? "Stations" : "Stops"} is off.`);
+  if (visible.links && visible.stations && !visible.stops && !stopsNeeded()) notes.push("Station links run to a station's stops: they are not drawn while Stops is off.");
   layerNote.hidden = !notes.length;
   layerNote.textContent = notes.join(" ");
 }
@@ -284,6 +296,7 @@ function drawStops() {
     const s = o ? { ...o.row, pending: o } : live;
     if (forced || kindShown(s) || (focusRow && focusRow.stop_id === s.stop_id)) drawn.push(s);
   }
+  const joining = draftedParents(drawn);
   const points = new Map();
   for (const s of drawn) {
     const key = pointKey(s);
@@ -308,7 +321,7 @@ function drawStops() {
       fillOpacity: 1,
       stopIds: stack.map((x) => x.stop_id),
     });
-    m.bindTooltip(stopTooltip(s, stack.length), { direction: "top", offset: [0, -6] });
+    m.bindTooltip(stopTooltip(s, stack.length, joining.get(s.stop_id)), { direction: "top", offset: [0, -6] });
     m.on("click", () => stopClicked(s));
     m.addTo(layers.stops);
     if (stack.length > 1) {
@@ -326,6 +339,112 @@ function drawStops() {
   }
   updateLayerNote();
   redrawLabels();
+  drawLinks();
+}
+
+// ------------------------------------------------------------------ station links
+// A thin line from every station on the map to each of its platforms, so it is
+// plain which stops belong to which station. They need Stations and "Station
+// links" on, run to the platforms that are drawn, sit under the markers and take
+// no clicks. The open station's (or the open platform's station's) stand out and
+// the rest are faint. They follow the active draft: a stop or station the draft
+// moves is tied where the draft puts it, a stop it takes into a station is tied
+// to that station, one it takes out is not - each of those in the draft's amber,
+// dashed, like everything else that is pending.
+const linkKey = (sid) => `${state.feedId}|${sid}`;
+
+function linkFocus() {
+  if (linkStation) return linkStation;
+  if (!focusRow) return null;
+  if (focusRow.location_type === 1) return focusRow.stop_id;
+  const drafted = draftedParents([focusRow]).get(focusRow.stop_id);
+  return drafted ? drafted.parent_station : focusRow.parent_station || null;
+}
+
+// What the panel already read about a station is kept: a station's detail has
+// its platforms, a platform's has its station's row.
+function rememberStation(stop) {
+  if (!stop || !stop.stop_id || !state.feedId) return;
+  if (stop.location_type === 1 && Array.isArray(stop.children)) linkCache.set(linkKey(stop.stop_id), { row: stop, platforms: stop.children });
+  else if (stop.parent && stop.parent.stop_id && !linkCache.has(linkKey(stop.parent.stop_id))) linkCache.set(linkKey(stop.parent.stop_id), { row: stop.parent, platforms: null });
+}
+
+// One read per station, ever: its row and platforms (the stop endpoint) when the
+// station itself is out of the area, else its platforms (`?station=`).
+function fetchStation(sid, haveRow) {
+  const key = linkKey(sid);
+  if (linkFetching.has(key) || linkFetching.size >= LINK_FETCHES) return;
+  if (Date.now() - (linkFailed.get(key) || 0) < LINK_RETRY_MS) return;
+  linkFetching.add(key);
+  const feed = enc(state.feedId);
+  const known = linkCache.get(key) || {};
+  const read = haveRow
+    ? get(`feeds/${feed}/stops?station=${enc(sid)}&limit=500`).then((page) => ({ row: known.row || null, platforms: page.items }))
+    : get(`feeds/${feed}/stops/${enc(sid)}`).then((d) => ({ row: d, platforms: Array.isArray(d.children) ? d.children : [] }));
+  read.then((entry) => linkCache.set(key, entry), () => linkFailed.set(key, Date.now()))
+    .finally(() => { linkFetching.delete(key); redrawLinksSoon(); });
+}
+
+const redrawLinksSoon = debounce(() => { if (map) drawLinks(); }, 60);
+
+function drawLinks() {
+  layers.links.clearLayers();
+  if (!visible.links || !visible.stations || map.getZoom() < STOPS_MIN_ZOOM) return;
+  const at = new Map(drawn.map((s) => [s.stop_id, s]));
+  const joining = draftedParents(drawn);
+  const stations = new Map();           // station id -> Map(stop id -> {stop, pending})
+  const group = (sid) => { if (!stations.has(sid)) stations.set(sid, new Map()); return stations.get(sid); };
+  for (const s of drawn) {
+    if (s.pending && s.pending.gone) continue;
+    if (s.location_type === 1) { group(s.stop_id); continue; }
+    const drafted = joining.get(s.stop_id);
+    const sid = drafted ? drafted.parent_station : s.parent_station;
+    if (sid) group(sid).set(s.stop_id, { stop: s, pending: !!drafted || !!(s.pending && s.pending.moved) });
+  }
+  const focus = linkFocus();
+  for (const [sid, platforms] of stations) {
+    const known = linkCache.get(linkKey(sid));
+    // the station's point: where it is drawn, where the draft creates it, or where it was read
+    let station = at.get(sid) || null;
+    let pendingStation = !!(station && station.pending && station.pending.moved);
+    if (!station) {
+      const made = [...platforms.values()].map((x) => joining.get(x.stop.stop_id)).find((j) => j && j.change.op === "create" && j.change.after && j.change.after.lat != null);
+      if (made) { station = { stop_id: sid, lat: made.change.after.lat, lon: made.change.after.lon }; pendingStation = true; }
+    }
+    if (!station && known && known.row) {
+      const o = touchedStops([known.row]).get(sid);
+      if (o && o.gone) continue;
+      station = o ? o.row : known.row;
+      pendingStation = !!(o && o.moved);
+    }
+    // platforms beyond the loaded area, once they have been read
+    if (known && known.platforms && (visible.stops || stopsNeeded())) {
+      const away = known.platforms.filter((c) => !at.has(c.stop_id) && !lastStops.some((x) => x.stop_id === c.stop_id));
+      const moved = touchedStops(away);
+      const leaving = draftedParents(away);
+      for (const c of away) {
+        const o = moved.get(c.stop_id);
+        if ((o && o.gone) || leaving.has(c.stop_id)) continue;
+        platforms.set(c.stop_id, { stop: o ? o.row : c, pending: !!(o && o.moved) });
+      }
+    }
+    // is anything of this station still unread? Its point, or (by the count the
+    // stop list gives a station) some of its platforms
+    const live = at.get(sid);
+    const have = lastStops.filter((x) => x.parent_station === sid).length;
+    const count = live && live.platform_count != null ? live.platform_count : null;
+    if (!station) fetchStation(sid, false);
+    else if (live && !(known && known.platforms) && (count == null || have < count)) fetchStation(sid, true);
+    if (!station || station.lat == null) continue;
+    const strong = focus === sid;
+    for (const { stop, pending } of platforms.values()) {
+      const amber = pending || pendingStation;
+      L.polyline([[station.lat, station.lon], [stop.lat, stop.lon]], {
+        renderer: lines, interactive: false, color: amber ? DRAFT_RING : INK, weight: strong ? 3 : amber ? 2 : 1.5, opacity: strong ? 0.9 : amber ? 0.75 : 0.45,
+        dashArray: amber ? "3 5" : null, stationLink: sid, platform: stop.stop_id, pendingLink: amber, strongLink: strong,
+      }).addTo(layers.links);
+    }
+  }
 }
 
 // One label per place: the platforms of a station share the station's label,
@@ -422,7 +541,8 @@ export function focusStop(stop, { zoom: z = 17 } = {}) {
   layers.focus.clearLayers();
   const had = focusRow;
   focusRow = stop && stop.lat != null && stop.stop_id ? stop : null;
-  if (!stop || stop.lat == null) return;
+  rememberStation(stop);
+  if (!stop || stop.lat == null) { drawLinks(); return; }
   L.circleMarker([stop.lat, stop.lon], { renderer: lines, radius: 14, color: ACTION, weight: 3, fill: false, interactive: false })
     .addTo(layers.focus);
   if (!map.getBounds().pad(-0.2).contains([stop.lat, stop.lon]) || map.getZoom() < STOPS_MIN_ZOOM) {
@@ -430,7 +550,7 @@ export function focusStop(stop, { zoom: z = 17 } = {}) {
   }
   // with its kind hidden, the open stop is the one marker still drawn
   if ((focusRow && !kindShown(focusRow)) || (had && !kindShown(had))) drawStops();
-  else updateLayerNote();
+  else { updateLayerNote(); drawLinks(); }
 }
 
 export function clearFocus() {
@@ -440,7 +560,7 @@ export function clearFocus() {
   const had = focusRow;
   focusRow = null;
   if (had && !kindShown(had)) drawStops();
-  else updateLayerNote();
+  else { updateLayerNote(); drawLinks(); }
 }
 
 // A stop as its draft leaves it, beside where it is live: a faint ring on the
@@ -546,6 +666,7 @@ export function endModes() {
   clickHandler = null;
   picking = null;
   selection = null;
+  linkStation = null;
   if (placeCleanup) placeCleanup();
   placeCleanup = null;
   for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal"]) layers[name].clearLayers();
@@ -704,9 +825,12 @@ export function showProposalPoints(items, { selectedId = null, onOpen } = {}) {
 // One suggested station being reviewed: the station point (draggable when
 // editable), each member kerb ringed with its platform label, and a dashed tie
 // from the point to each member. Returns {update(point, members), showRoute(route)}.
-export function showReview({ lat, lon, members, editable, onMovePoint, onMoveDone = null }) {
+export function showReview({ lat, lon, members, editable, onMovePoint, onMoveDone = null, stationId = null }) {
   layers.review.clearLayers();
   layers.reviewRoute.clearLayers();
+  // once the suggestion is a station (in the draft, or live), its links stand out
+  linkStation = stationId;
+  drawLinks();
   const ties = L.layerGroup().addTo(layers.review);
   // one label per member, updated in place: Leaflet removes a tooltip 200 ms
   // after it is taken off the map, so redrawing them on every keystroke would
@@ -812,8 +936,11 @@ const LEG_STYLE = {
 // A finished drag also reports once as onPlace(lat, lon, "dragend").
 // Returns {setLegs(specs), setPin(point), setDrafted(points), setSharing(stops), setCandidates(stops, onPick), fit(points)};
 // a leg spec is {prev, next, via: {lat, lon}, kind, routes: [route numbers]}.
-export function showPositionReview({ stopId, current, loaded = null, raw = null, suggestion = null, origins = [], onPlace = null }) {
+export function showPositionReview({ stopId, current, loaded = null, raw = null, suggestion = null, origins = [], onPlace = null, stationId = null }) {
   layers.coord.clearLayers();
+  // the reviewed stop's station, when it is a platform: its links stand out
+  linkStation = stationId;
+  drawLinks();
   const direct = L.layerGroup().addTo(layers.coord);
   const legs = L.layerGroup().addTo(layers.coord);
   const ends = L.layerGroup().addTo(layers.coord);

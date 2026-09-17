@@ -3,7 +3,7 @@
 // that so far exists only in the draft. (New station is the station editor.)
 import { get, enc, ApiError } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
-import { h, clear, toast, confirmDialog, debounce, fmtCoord, fmtMetres, haversine, ID_RE, ID_RULE } from "./util.js";
+import { h, clear, toast, confirmDialog, debounce, fmtCoord, fmtMetres, haversine, ID_RE, ID_RULE, PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField } from "./util.js";
 import * as map from "./map.js";
 import { addChange, requireDraft, createdChange, createdStops, updateChange, removeChange } from "./drafts.js";
 import { editRouteRows, problemList } from "./editors.js";
@@ -36,9 +36,11 @@ export async function newStop(change = null) {
   setLeaveGuard(() => (!dirty ? null : editing ? "Your changes to the new stop are not in the draft yet." : "The new stop is not in the draft yet."));
   const touch = () => { dirty = true; };
 
+  const description = descriptionField("new-stop-description", start.description);
   const f = {
     name: h("input", { type: "text", id: "new-stop-name", value: start.name || "", autocomplete: "off" }),
-    platform: h("input", { type: "text", id: "new-stop-platform", value: start.platform_code || "", maxlength: "120", placeholder: "For example Towards Guindy, or Bay 3" }),
+    platform: h("input", { type: "text", id: "new-stop-platform", value: start.platform_code || "", maxlength: "120", placeholder: PLATFORM_PLACEHOLDER }),
+    description: description.input,
     id: h("input", { type: "text", id: "new-stop-id", value: editing ? editing.entity_key : "", disabled: !!editing, autocomplete: "off", spellcheck: "false", placeholder: "Leave empty to have one made" }),
     lat: h("input", { type: "number", id: "new-stop-lat", step: "any", value: lat != null ? String(lat) : "" }),
     lon: h("input", { type: "number", id: "new-stop-lon", step: "any", value: lon != null ? String(lon) : "" }),
@@ -48,7 +50,7 @@ export async function newStop(change = null) {
   // placing and dragging the pin, and each field once left, can be undone until
   // the stop is in the draft
   const history = undoScope("the new stop");
-  const syncFields = history.fields([[f.name, "the name"], [f.platform, "the platform label"], [f.id, "the stop id"], [f.lat, "the latitude"], [f.lon, "the longitude"]]);
+  const syncFields = history.fields([[f.name, "the name"], [f.platform, "the platform label"], [f.description, "the description"], [f.id, "the stop id"], [f.lat, "the latitude"], [f.lon, "the longitude"]]);
   let placed = lat != null ? { lat, lon } : null;   // where the pin was last put down
 
   let nearSeq = 0;
@@ -159,10 +161,12 @@ export async function newStop(change = null) {
     const after = { name, lat: round7(lat), lon: round7(lon) };
     const platform = f.platform.value.trim();
     if (platform) after.platform_code = platform;
+    const described = f.description.value.trim();
+    if (described) after.description = described;
     try {
       let res;
       if (editing) {
-        res = await updateChange(editing, { ...editing.after, ...after, platform_code: platform || null, stop_id: editing.entity_key });
+        res = await updateChange(editing, { ...editing.after, ...after, platform_code: platform || null, description: described || null, stop_id: editing.entity_key });
       } else {
         if (id) after.stop_id = id;
         res = await addChange({ entity: "stop", op: "create", entity_key: id, after }, { merge: false });
@@ -200,7 +204,9 @@ export async function newStop(change = null) {
         h("label.field", { for: "new-stop-lon" }, h("span", "Longitude"), f.lon)),
       h("h2", "2. Name it"),
       h("label.field", { for: "new-stop-name" }, h("span", "Name passengers see"), f.name),
-      h("label.field", { for: "new-stop-platform" }, h("span", "Platform label (optional)"), f.platform),
+      h("label.field", { for: "new-stop-platform" }, h("span", "Platform label (optional)"), f.platform,
+        h("span.hint", PLATFORM_HELP)),
+      description.el,
       h("label.field", { for: "new-stop-id" }, h("span", "Stop id (optional)"), f.id,
         h("span.hint", editing ? "The id cannot change once the stop is in the draft." : `Leave empty and the editor makes one, like ed_1a2b3c4d5e. ${ID_RULE}`)),
       problems),
@@ -220,7 +226,8 @@ function added(ch, updated) {
       h("p.notice.ok", { role: "status" }, h("strong", updated ? "New stop updated in your draft" : "New stop added to your draft")),
       h("div.title-block",
         h("h1", a.name),
-        h("p.ids", `Stop id ${ch.entity_key}${!a.platform_code ? "" : `, ${a.platform_code}`}`)),
+        h("p.ids", `Stop id ${ch.entity_key}${!a.platform_code ? "" : `, ${a.platform_code}`}`),
+        a.description ? h("p.stop-description", a.description) : null),
       h("dl.facts", h("dt", "Position"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)),
       h("p.hint", "The stop is created when the draft is committed. For buses to call at it, add it to a route: open the route, choose Edit stop list, then Add stop. Stops new in your draft are offered there, and shown in amber on the map."),
       h("div.btn-row",
@@ -241,7 +248,8 @@ export function showDraftStop(ch) {
       h("a.crumb", { href: "#/" }, "Back to search"),
       h("div.title-block",
         h("h1", a.name),
-        h("p.ids", `Stop ${ch.entity_key}`)),
+        h("p.ids", `Stop ${ch.entity_key}`),
+        a.description ? h("p.stop-description", a.description) : null),
       pendingNotice(pendingActions("stop", ch.entity_key), { intro: `This stop is new in your draft "${state.draft.title}". It does not exist for passengers until the draft is committed.` }),
       h("dl.facts",
         h("dt", "Position"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`),
@@ -279,7 +287,8 @@ export function showDraftStation(ch) {
       h("a.crumb", { href: "#/" }, "Back to search"),
       h("div.title-block",
         h("h1", a.name),
-        h("p.ids", `Station ${ch.entity_key}`)),
+        h("p.ids", `Station ${ch.entity_key}`),
+        a.description ? h("p.stop-description", a.description) : null),
       pendingNotice(pendingActions("station", ch.entity_key), { intro: `This station is new in your draft "${state.draft.title}". Passengers do not see it, and its stops are not grouped, until the draft is committed.` }),
       h("dl.facts", h("dt", "Station point"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)),
       h("div.btn-row",

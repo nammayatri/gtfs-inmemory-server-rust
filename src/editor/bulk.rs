@@ -1,7 +1,8 @@
-//! Bulk import (docs/gtfs-editor.md section 5): uploaded rows of stops, routes
-//! or route stop lists become create / replace changes in a draft. A dry run
-//! previews every row; a real run appends all the changes in one transaction,
-//! and only when no row has an error.
+//! Bulk import (docs/gtfs-editor.md sections 5 and 11): uploaded rows of stops,
+//! routes or route stop lists become create / replace changes in a draft, and
+//! rows of stop details (platform label, description, name) become updates. A
+//! dry run previews every row; a real run appends all the changes in one
+//! transaction, and only when no row has an error.
 //!
 //! Validation is batched. A few queries fetch every id the upload references
 //! and the routes' rows; the draft's own changes are read once
@@ -11,7 +12,7 @@
 //! rows once the draft applies.
 
 use super::auth::{self, Ctx};
-use super::draft::DraftView;
+use super::draft::{DraftView, StopTexts};
 use super::error::{EditorError, EditorResult};
 use super::service::{self, rows_hash, ChangeInsert};
 use super::validation::{
@@ -43,6 +44,7 @@ pub enum Kind {
     Stops,
     Routes,
     RouteStops,
+    StopUpdates,
 }
 
 impl Kind {
@@ -51,6 +53,7 @@ impl Kind {
             "stops" => Some(Kind::Stops),
             "routes" => Some(Kind::Routes),
             "route_stops" => Some(Kind::RouteStops),
+            "stop_updates" => Some(Kind::StopUpdates),
             _ => None,
         }
     }
@@ -60,6 +63,7 @@ impl Kind {
             Kind::Stops => "stops",
             Kind::Routes => "routes",
             Kind::RouteStops => "route_stops",
+            Kind::StopUpdates => "stop_updates",
         }
     }
 
@@ -75,6 +79,7 @@ impl Kind {
                 "stage_no",
                 "stage_name",
             ],
+            Kind::StopUpdates => &["stop_id", "platform_code", "description", "name"],
         }
     }
 }
@@ -86,6 +91,8 @@ struct Planned {
     key: Option<String>,
     after: Value,
     before: Value,
+    /// The live row's version an update is based on; a create has none.
+    base: Option<i32>,
 }
 
 #[derive(Default)]
@@ -93,6 +100,9 @@ struct Outcome {
     findings: Vec<Finding>,
     /// Index into `Plan::changes` of the change this row is part of.
     change: Option<usize>,
+    /// `stop_updates`: the stop the row names as it is now (the draft applied),
+    /// so the preview can show what changes, and where, without a read per row.
+    stop: Option<Value>,
 }
 
 struct Plan {
@@ -308,6 +318,7 @@ async fn plan_stops(
             key: id,
             after: Value::Object(after),
             before: Value::Null,
+            base: None,
         });
         plan.rows[i].change = Some(plan.changes.len() - 1);
     }
@@ -411,6 +422,7 @@ async fn plan_routes(
             key: Some(key),
             after,
             before: Value::Null,
+            base: None,
         });
         plan.rows[i].change = Some(plan.changes.len() - 1);
     }
@@ -750,6 +762,7 @@ async fn plan_route_stops(
             key: Some(route_id.clone()),
             before: json!(read_rows.remove(&route_id).unwrap_or_default()),
             after,
+            base: None,
         });
         let change = plan.changes.len() - 1;
         for i in &uploads {
@@ -769,10 +782,287 @@ async fn plan_route_stops(
     Ok(plan)
 }
 
+// ---------------------------------------------------------------- stop details
+
+/// One readable row of a `stop_updates` upload.
+struct StopUpdate {
+    upload: usize,
+    stop_id: String,
+    /// `(column, value)` for each cell that is given, in column order.
+    given: Vec<(&'static str, String)>,
+}
+
+/// A stop as the upload needs it: what is live, before the draft.
+struct LiveStopRow {
+    lat: f64,
+    lon: f64,
+    location_type: i16,
+    deleted: bool,
+    row_version: i32,
+}
+
+/// `{stop_id, platform_code?, description?, name?}` rows: one `stop/update`
+/// (a station: `station/update`) per row, with exactly the cells given. The
+/// whole upload is checked against one read of its stops and one replay of the
+/// draft ([`DraftView::texts_after`]) - never the draft once per row.
+async fn plan_stop_updates(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    rows: &[Value],
+    draft: &DraftView,
+    with_before: bool,
+) -> EditorResult<Plan> {
+    let mut plan = Plan::new(rows.len());
+    let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut updates: Vec<StopUpdate> = Vec::new();
+    for (i, v) in rows.iter().enumerate() {
+        let m = match row_object(v, Kind::StopUpdates) {
+            Ok(m) => m,
+            Err(f) => {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let cells = ["stop_id", "platform_code", "description", "name"].map(|k| cell_text(m, k));
+        let bad: Vec<String> = cells
+            .iter()
+            .filter_map(|c| c.as_ref().err())
+            .cloned()
+            .collect();
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
+        let [id, platform, description, name] = cells.map(|c| c.unwrap_or_default());
+        let Some(stop_id) = id else {
+            plan.rows[i]
+                .findings
+                .push(invalid_row("stop_id is required"));
+            continue;
+        };
+        by_id.entry(stop_id.clone()).or_default().push(i);
+        let given: Vec<(&'static str, String)> = [
+            ("platform_code", platform),
+            ("description", description),
+            ("name", name),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?)))
+        .collect();
+        if given.is_empty() {
+            plan.rows[i].findings.push(Finding::error(
+                "nothing_to_update",
+                stop_id.as_str(),
+                format!("the row for stop {stop_id} gives no platform_code, description or name"),
+            ));
+            continue;
+        }
+        updates.push(StopUpdate {
+            upload: i,
+            stop_id,
+            given,
+        });
+    }
+    mark_duplicates(&mut plan, by_id, |id| format!("stop_id {id}"));
+
+    // every stop the upload names, and the stops a merge in the draft takes a
+    // name or a label from, in one query
+    let mut wanted: Vec<String> = updates.iter().map(|u| u.stop_id.clone()).collect();
+    wanted.extend(draft.merge_sources());
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut live: HashMap<String, LiveStopRow> = HashMap::with_capacity(wanted.len());
+    let mut live_texts: HashMap<String, StopTexts> = HashMap::with_capacity(wanted.len());
+    if !wanted.is_empty() {
+        for r in sqlx::query(
+            "SELECT stop_id, name, lat, lon, platform_code, description, parent_station, \
+                    location_type, deleted, row_version \
+             FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
+        )
+        .bind(g)
+        .bind(&wanted)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            let id: String = r.try_get("stop_id")?;
+            live_texts.insert(
+                id.clone(),
+                StopTexts {
+                    name: r.try_get("name")?,
+                    platform_code: r.try_get("platform_code")?,
+                    description: r.try_get("description")?,
+                    parent_station: r.try_get("parent_station")?,
+                },
+            );
+            live.insert(
+                id,
+                LiveStopRow {
+                    lat: r.try_get("lat")?,
+                    lon: r.try_get("lon")?,
+                    location_type: r.try_get("location_type")?,
+                    deleted: r.try_get("deleted")?,
+                    row_version: r.try_get("row_version")?,
+                },
+            );
+        }
+    }
+    let texts = draft.texts_after(&live_texts);
+
+    let mut stations: Vec<String> = Vec::new();
+    let mut created: Vec<String> = Vec::new();
+    for u in &updates {
+        let (i, id) = (u.upload, u.stop_id.as_str());
+        if let Some((into, by)) = draft.merged_into(id) {
+            plan.rows[i].findings.push(Finding::error(
+                "stop_merged_away",
+                id,
+                format!("stop {id} is merged into {into} by change {by} earlier in this draft; use {into}"),
+            ));
+            continue;
+        }
+        let in_draft = draft.created_stop(id);
+        let place = draft
+            .stop_position(id)
+            .or_else(|| live.get(id).map(|s| (s.lat, s.lon)));
+        if let (Some(t), Some((lat, lon))) = (texts.get(id), place) {
+            plan.rows[i].stop = Some(json!({
+                "name": t.name, "lat": lat, "lon": lon, "platform_code": t.platform_code,
+                "description": t.description, "parent_station": t.parent_station,
+            }));
+        }
+        let (location_type, base) = match (live.get(id), in_draft) {
+            (Some(s), _) if s.deleted => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_deleted",
+                    id,
+                    format!("stop {id} is deleted"),
+                ));
+                continue;
+            }
+            (Some(s), _) => (s.location_type, Some(s.row_version)),
+            (None, Some(c)) => (c.location_type, None),
+            (None, None) => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_not_found",
+                    id,
+                    format!("no stop {id}"),
+                ));
+                continue;
+            }
+        };
+        if draft.stop_deleted(id) {
+            plan.rows[i].findings.push(Finding::error(
+                "stop_deleted",
+                id,
+                format!("stop {id} is deleted in this draft"),
+            ));
+            continue;
+        }
+        let is_station = location_type == 1;
+        if is_station && u.given.iter().any(|(k, _)| *k == "platform_code") {
+            plan.rows[i].findings.push(Finding::error(
+                "platform_code_on_station",
+                id,
+                format!("{id} is a station; a platform label belongs to one of its stops"),
+            ));
+            continue;
+        }
+        let entity = if is_station { "station" } else { "stop" };
+        let after: Map<String, Value> = u
+            .given
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
+        let after = Value::Object(after);
+        // exactly the single change's shape check (the lengths)
+        if let Err(f) = check_payload(entity, "update", id, &after) {
+            plan.rows[i].findings.push(f);
+        }
+        if !plan.rows[i].findings.is_empty() {
+            // a duplicate or a bad length: the row is an error whatever it says
+            continue;
+        }
+        let now = texts.get(id);
+        let same = u.given.iter().all(|(k, v)| {
+            let current = now.and_then(|t| match *k {
+                "platform_code" => t.platform_code.as_deref(),
+                "description" => t.description.as_deref(),
+                _ => Some(t.name.as_str()),
+            });
+            current.map(str::trim) == Some(v.as_str())
+        });
+        if same {
+            plan.rows[i].findings.push(Finding::warning(
+                "unchanged",
+                id,
+                format!(
+                    "{entity} {id} already has {}; this row changes nothing",
+                    if u.given.len() == 1 {
+                        "this value"
+                    } else {
+                        "these values"
+                    }
+                ),
+            ));
+            continue;
+        }
+        if let Some(cid) = draft.updated_by(id) {
+            plan.rows[i].findings.push(Finding::warning(
+                "stop_already_in_draft",
+                id,
+                format!("change {cid} in this draft already updates {entity} {id}; this one applies after it"),
+            ));
+        }
+        if is_station && base.is_some() {
+            stations.push(id.to_string());
+        }
+        if base.is_none() {
+            created.push(id.to_string());
+        }
+        plan.changes.push(Planned {
+            entity,
+            op: "update",
+            key: Some(id.to_string()),
+            after,
+            before: Value::Null,
+            base,
+        });
+        plan.rows[i].change = Some(plan.changes.len() - 1);
+    }
+
+    if with_before {
+        // `before` as the single change snapshots it: the row in read shape (a
+        // station with its members), or the create's `after` for a row of the draft
+        let ids: Vec<String> = plan.changes.iter().filter_map(|c| c.key.clone()).collect();
+        let mut read = service::stop_rows(conn, g, &ids).await?;
+        let mut members = service::stations_members(conn, g, &stations).await?;
+        let mut drafted = service::stops_created_in_set(conn, change_set_id, &created).await?;
+        for c in plan.changes.iter_mut() {
+            let id = c.key.as_deref().unwrap_or_default();
+            c.before = match read.remove(id) {
+                Some(mut row) => {
+                    if c.entity == "station" {
+                        service::with_members(&mut row, &members.remove(id).unwrap_or_default());
+                    }
+                    row
+                }
+                None => drafted
+                    .remove(id)
+                    .map(|(_, after)| after)
+                    .unwrap_or(Value::Null),
+            };
+        }
+    }
+    Ok(plan)
+}
+
 // ---------------------------------------------------------------- run
 
 fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value {
-    let (mut ok, mut warnings, mut errors) = (0, 0, 0);
+    let (mut ok, mut warnings, mut errors, mut unchanged) = (0, 0, 0, 0);
     let rows: Vec<Value> = plan
         .rows
         .iter()
@@ -786,6 +1076,9 @@ fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value 
                 "ok"
             } else {
                 warnings += 1;
+                if o.findings.iter().any(|f| f.code == "unchanged") {
+                    unchanged += 1;
+                }
                 "warning"
             };
             let change = o.change.map(|k| {
@@ -796,15 +1089,19 @@ fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value 
                 }
                 v
             });
-            json!({
+            let mut row = json!({
                 "row": i + 1,
                 "status": status,
                 "messages": o.findings.iter().map(|f| json!({"level": f.level, "code": f.code, "message": f.message})).collect::<Vec<_>>(),
                 "change": change,
-            })
+            });
+            if let Some(stop) = &o.stop {
+                row["stop"] = stop.clone();
+            }
+            row
         })
         .collect();
-    json!({
+    let mut out = json!({
         "dry_run": dry_run,
         "kind": kind.name(),
         "summary": {"rows": plan.rows.len(), "ok": ok, "warnings": warnings, "errors": errors, "changes": plan.changes.len()},
@@ -812,7 +1109,12 @@ fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value 
         "changes_preview": plan.changes.iter().map(|c| json!({
             "entity": c.entity, "op": c.op, "entity_key": c.key, "after": c.after,
         })).collect::<Vec<_>>(),
-    })
+    });
+    // only an upload of updates can find a row already true
+    if kind == Kind::StopUpdates {
+        out["summary"]["unchanged"] = json!(unchanged);
+    }
+    out
 }
 
 pub async fn run(
@@ -822,7 +1124,10 @@ pub async fn run(
     req: BulkRequest,
 ) -> EditorResult<Value> {
     let kind = Kind::parse(&req.kind).ok_or_else(|| {
-        EditorError::bad_request("invalid_kind", "kind is stops, routes or route_stops")
+        EditorError::bad_request(
+            "invalid_kind",
+            "kind is stops, routes, route_stops or stop_updates",
+        )
     })?;
     if req.rows.is_empty() {
         return Err(EditorError::bad_request(
@@ -849,6 +1154,9 @@ pub async fn run(
         Kind::Stops => plan_stops(&mut tx, &g, &req.rows, &draft).await?,
         Kind::Routes => plan_routes(&mut tx, &g, &req.rows, &draft).await?,
         Kind::RouteStops => plan_route_stops(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?,
+        Kind::StopUpdates => {
+            plan_stop_updates(&mut tx, &g, change_set_id, &req.rows, &draft, !req.dry_run).await?
+        }
     };
     if req.dry_run {
         tx.rollback().await?;
@@ -865,6 +1173,14 @@ pub async fn run(
             ),
         )
         .with_details(out));
+    }
+    if plan.changes.is_empty() {
+        // every row is `unchanged`: uploading the same file again adds nothing,
+        // so nothing is written - not the draft, not the audit log
+        tx.rollback().await?;
+        let mut out = respond(false, kind, &plan, &[]);
+        out["change_set"] = service::set_detail(state, ctx, change_set_id).await?;
+        return Ok(out);
     }
     let unnamed: Vec<usize> = plan
         .changes
@@ -886,7 +1202,7 @@ pub async fn run(
             entity: c.entity.into(),
             op: c.op.into(),
             entity_key: c.key.clone().unwrap_or_default(),
-            base_row_version: None,
+            base_row_version: c.base,
             before: c.before.clone(),
             after: c.after.clone(),
         })
@@ -952,6 +1268,13 @@ mod tests {
         )
         .is_ok());
         assert!(Kind::parse("stations").is_none());
+        assert_eq!(Kind::parse("stop_updates"), Some(Kind::StopUpdates));
+        assert!(row_object(
+            &json!({"stop_id": "S", "platform_code": "Towards X", "description": "d", "name": "n"}),
+            Kind::StopUpdates
+        )
+        .is_ok());
+        assert!(row_object(&json!({"stop_id": "S", "lat": 13.0}), Kind::StopUpdates).is_err());
     }
 
     #[test]

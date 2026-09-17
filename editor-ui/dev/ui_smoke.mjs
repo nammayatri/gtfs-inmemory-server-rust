@@ -17,11 +17,13 @@
 // commit by a second person, a commit conflict, people and history; a feed's
 // data source switched through a draft, approved by the admin who submitted it
 // (the override, its confirm, badge and history row); the "Stations to review"
-// link hiding once nothing is left to review. Last come the round 4 flows
+// link hiding once nothing is left to review. Then the round 4 flows
 // (round4Flows below; `--round4` runs only those): what the map shows, stops
 // sharing a point, stations listed once, undo and redo, the trail, the cleanup
 // context, candidates and merge on a review, and pending changes shown on the
-// pages they change.
+// pages they change. Last the round 5 flows (round5Flows; `--round5`): the lines
+// that tie a station to its platforms, a description and a platform label on
+// stops and stations, and importing stop details.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -859,6 +861,369 @@ if (process.argv.includes("--round4")) {
   process.exit(failures.length ? 1 : 0);
 }
 // ====================================================================== end of round 4 (UX)
+
+// ====================================================================== round 5 (stop details, station links)
+// docs/gtfs-editor.md section 11, against the mock's seed_round5 fixtures: the
+// thin lines from a station to its platforms (the "Station links" tick, remembered;
+// the open station's standing out; a platform beyond the loaded area read once,
+// never again on a pan; a drafted move and a drafted station change redrawn as
+// pending), the platform label offered to a stop in no station, the description
+// on the stop page, the station editor, New stop and New station (counter, pending
+// in the draft, hover titles, the marker's tooltip), and the fourth import kind.
+// `node dev/ui_smoke.mjs --round5` runs only these, as the admin, on a fresh mock.
+const stationLinks = (sid = null) => mapCall(`const out = []; map.eachLayer((l) => { const o = l.options || {}; if (o.stationLink && (${JSON.stringify(sid)} === null || o.stationLink === ${JSON.stringify(sid)})) {
+  const pts = l.getLatLngs(); out.push({ station: o.stationLink, platform: o.platform, pending: !!o.pendingLink, strong: !!o.strongLink, interactive: !!o.interactive, pane: o.renderer && o.renderer.options.pane,
+    from: { lat: pts[0].lat, lon: pts[0].lng }, to: { lat: pts[1].lat, lon: pts[1].lng } }); } }); return out;`);
+// every request the page makes from now on, across reloads (the browser's own
+// resource list fills up with map tiles)
+const asked = [];
+async function watchRequests() {
+  if (asked.watching) return;
+  asked.watching = true;
+  await send("Network.enable");
+  ws.addEventListener("message", (ev) => { const msg = JSON.parse(ev.data); if (msg.method === "Network.requestWillBeSent") asked.push(msg.params.request.url); });
+}
+const requestsFor = (part) => asked.filter((u) => u.includes(part)).length;
+
+async function round5Flows() {
+  const fx = (await evaluate(`fetch("/__dev/state").then((r) => r.json())`)).round5;
+  if (!check(!!fx && !!fx.far_station, "set-up: the mock's round 5 fixtures")) return;
+  const station = await api(`feeds/chennai_bus/stops/${fx.station}`);
+  const [pa, pb] = fx.platforms.map((id) => station.children.find((c) => c.stop_id === id));
+  check(station.location_type === 1 && station.platform_count === 2 && !!pa && !!pb && metres(pa.lat, pa.lon, pb.lat, pb.lon) > 30,
+    "set-up: a station whose two platforms stand apart, and says how many it has");
+  check(!!pa.description && !!pa.platform_code, "set-up: one platform has a description and a label");
+  const solo = await api(`feeds/chennai_bus/stops/${fx.solo}`);
+  check(!solo.parent_station && !solo.platform_code && !solo.description, "set-up: a stop in no station, with no label and no description");
+
+  if (!(await text("#draft-chip")).includes("No draft open")) {
+    await clickSel("#draft-chip", "the draft chip");
+    await click("Stop using a draft", "dialog");
+  }
+  await watchRequests();
+  await go("#/");
+  await waitFor(`!!document.getElementById("show-links")`, "the Station links tick in the Show control");
+  for (const k of ["stations", "routes", "stops", "links"]) await toggleLayer(k, true);
+
+  // ================================================================ 1. station links
+  await setView(station.lat, station.lon, 17);
+  await waitStopDrawn(fx.station);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => { let n = 0; m.getMap().eachLayer((l) => { if (l.options && l.options.stationLink === ${JSON.stringify(fx.station)}) n++; }); return n === 2; })`, "a line from the station to each platform");
+  let links = await stationLinks(fx.station);
+  check(links.length === 2 && fx.platforms.every((id) => links.some((l) => l.platform === id)), "the station is tied to each of its two platforms");
+  check(links.every((l) => metres(l.from.lat, l.from.lon, station.lat, station.lon) < 0.5) && links.some((l) => metres(l.to.lat, l.to.lon, pa.lat, pa.lon) < 0.5),
+    "each line runs from the station point to the platform");
+  check(links.every((l) => !l.interactive && l.pane === "lines"), "the lines take no clicks and sit in the pane under the markers");
+  check(links.every((l) => !l.strong && !l.pending), "with nothing open every line is faint, and none is pending");
+  await shot("r5-01-station-links");
+  // clicking a platform through its line still opens the platform
+  await clickStopOnMap(pa);
+  await waitFor(`location.hash.includes(${JSON.stringify(pa.stop_id)})`, "a platform still opens by a click on its marker");
+  await waitFor(`document.querySelector("#panel h1")?.innerText.includes(${JSON.stringify(pa.name)})`, "the platform's panel");
+  await sleep(300);
+  links = await stationLinks();
+  check(links.filter((l) => l.station === fx.station).every((l) => l.strong) && links.filter((l) => l.station !== fx.station).every((l) => !l.strong),
+    "with a platform open its station's lines stand out and the others stay faint");
+  await go(`#/stop/${fx.station}`);
+  await waitFor(`document.querySelector("#panel h1")?.innerText.includes(${JSON.stringify(station.name)})`, "the station's panel");
+  await sleep(300);
+  check((await stationLinks(fx.station)).every((l) => l.strong), "with the station open its lines stand out");
+  await shot("r5-02-station-open");
+  // hover titles in a list of stops, and the marker's tooltip, carry the label and the description
+  check(await evaluate(`[...document.querySelectorAll("#panel .list-item")].some((li) => (li.title || "").includes(${JSON.stringify(pa.description)}) && li.title.includes(${JSON.stringify(pa.platform_code)}))`),
+    "a platform's row in the station's list says its label and description on hover");
+  const tip = await mapCall(`let t = null; map.eachLayer((l) => { if (l.options && l.options.stopIds && l.options.stopIds.includes(${JSON.stringify(pa.stop_id)})) t = l.getTooltip().getContent().textContent; }); return t;`);
+  check(String(tip).includes(pa.platform_code) && String(tip).includes(pa.description), `the marker's tooltip carries the label and the description (${tip})`);
+
+  // the tick: off, remembered over a reload, on again; Stations off takes the lines too
+  await go("#/");
+  await toggleLayer("links", false);
+  check((await stationLinks()).length === 0, "Station links off: no line is drawn");
+  check(await evaluate(`JSON.parse(localStorage.getItem("gtfs-editor-prefs")).mapLayers.links === false`), "the choice is kept with the other layers");
+  await reloadPage();
+  await waitFor(`!!document.getElementById("show-links")`, "the Show control after a reload");
+  await waitStopDrawn(fx.station);
+  await sleep(400);
+  check((await evaluate(`document.getElementById("show-links").checked`)) === false && (await stationLinks()).length === 0, "after a reload the lines are still off");
+  await toggleLayer("links", true);
+  check((await stationLinks(fx.station)).length === 2, "ticked again, the lines are back");
+  await toggleLayer("stations", false);
+  check((await stationLinks()).length === 0, "with Stations off there are no station lines");
+  await toggleLayer("stations", true);
+  await toggleLayer("stops", false);
+  check((await stationLinks()).length === 0 && (await text(".layer-note")).includes("Station links"), "with Stops off the lines have nowhere to run, and the control says so");
+  await toggleLayer("stops", true);
+  await setView(station.lat, station.lon, 14);
+  await sleep(500);
+  check((await stationLinks()).length === 0, "below zoom 15 no line is drawn");
+
+  // a platform beyond the loaded area: read once in a session (the page was
+  // reloaded above, so twice by now), then never again however the map moves
+  const farNear = await api(`feeds/chennai_bus/stops/${fx.far_near}`);
+  const farPlatform = await api(`feeds/chennai_bus/stops/${fx.far_platform}`);
+  await setView(farNear.lat, farNear.lon, 17);
+  await waitStopDrawn(fx.far_station);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => { let n = 0; m.getMap().eachLayer((l) => { if (l.options && l.options.stationLink === ${JSON.stringify(fx.far_station)}) n++; }); return n === 2; })`, "the line to the platform outside the map area");
+  links = await stationLinks(fx.far_station);
+  check(links.some((l) => l.platform === fx.far_platform && metres(l.to.lat, l.to.lon, farPlatform.lat, farPlatform.lon) < 0.5), "a platform outside the loaded area is tied to its station too");
+  for (const [dLat, dLon] of [[0.0006, 0], [0, 0.0006], [-0.0006, -0.0006], [0, 0]]) {
+    await setView(farNear.lat + dLat, farNear.lon + dLon, 17);
+    await sleep(300);
+  }
+  check(requestsFor(`station=${fx.far_station}`) === 2 && requestsFor(`/stops/${fx.far_station}`) === 0 && requestsFor(`station=${fx.station}`) === 0,
+    `its platforms were asked for once a session, not on every move of the map; a station with every platform in view is never asked about (${requestsFor(`station=${fx.far_station}`)}, ${requestsFor(`/stops/${fx.far_station}`)}, ${requestsFor(`station=${fx.station}`)})`);
+  // seen from the far platform, the station is what lies outside: read once as well
+  await setView(farPlatform.lat, farPlatform.lon, 17);
+  await waitStopDrawn(fx.far_platform);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => { let n = 0; m.getMap().eachLayer((l) => { if (l.options && l.options.platform === ${JSON.stringify(fx.far_platform)}) n++; }); return n === 1; })`, "the line from a platform to its station outside the map area");
+  await setView(farPlatform.lat + 0.0005, farPlatform.lon, 17);
+  await sleep(400);
+  await setView(farPlatform.lat, farPlatform.lon, 17);
+  await sleep(400);
+  check(requestsFor(`/stops/${fx.far_station}`) === 1 && requestsFor(`station=${fx.far_station}`) === 2,
+    `and the station was asked for once (${requestsFor(`/stops/${fx.far_station}`)}, ${requestsFor(`station=${fx.far_station}`)})`);
+
+  // ================================================================ 2. the lines follow the draft
+  await clickSel("#draft-chip", "the draft chip");
+  await chooseNewDraft("Smoke: round 5");
+  const r5Draft = await activeDraftId();
+  await go("#/");
+  await setView(station.lat, station.lon, 17);
+  await waitStopDrawn(fx.station);
+  const movedTo = { lat: pa.lat + 0.0003, lon: pa.lon + 0.0003 };
+  const move = await apiSend("POST", `change-sets/${r5Draft}/changes`, { entity: "stop", op: "update", entity_key: pa.stop_id, after: movedTo, base_row_version: pa.row_version });
+  check(move.status === 201, "set-up: the draft moves a platform");
+  await refreshUiDraft();
+  await sleep(500);
+  links = await stationLinks(fx.station);
+  const movedLink = links.find((l) => l.platform === pa.stop_id);
+  check(!!movedLink && movedLink.pending && metres(movedLink.to.lat, movedLink.to.lon, movedTo.lat, movedTo.lon) < 0.5, "a platform the draft moves is tied where the draft puts it, as pending");
+  check(links.some((l) => l.platform === pb.stop_id && !l.pending), "the other platform's line is as it was");
+  const join = await apiSend("POST", `change-sets/${r5Draft}/changes`, { entity: "station", op: "update", entity_key: fx.station, base_row_version: station.row_version,
+    after: { members: [{ stop_id: pa.stop_id }, { stop_id: pb.stop_id }, { stop_id: solo.stop_id, platform_code: "Towards the smoke test" }] } });
+  check(join.status === 201, "set-up: the draft takes a third stop into the station");
+  await refreshUiDraft();
+  await setView((station.lat + solo.lat) / 2, (station.lon + solo.lon) / 2, 17);
+  await waitStopDrawn(solo.stop_id);
+  await sleep(500);
+  links = await stationLinks(fx.station);
+  check(links.length === 3 && links.some((l) => l.platform === solo.stop_id && l.pending), "a stop the draft takes into the station is tied to it, as pending");
+  const joinTip = await mapCall(`let t = null; map.eachLayer((l) => { if (l.options && l.options.stopIds && l.options.stopIds.includes(${JSON.stringify(solo.stop_id)})) t = l.getTooltip().getContent().textContent; }); return t;`);
+  check(String(joinTip).includes("joins station") && String(joinTip).includes("not live"), `its marker says it joins the station in the draft (${joinTip})`);
+  await shot("r5-03-pending-links");
+  for (const c of [join, move]) await apiSend("DELETE", `change-sets/${r5Draft}/changes/${c.body.change_id}`);
+  await refreshUiDraft();
+  await sleep(500);
+  links = await stationLinks(fx.station);
+  check(links.length === 2 && links.every((l) => !l.pending), "with the changes taken out of the draft the lines are live again");
+
+  // ================================================================ 3. a label and a description on a stop in no station
+  await go(`#/stop/${solo.stop_id}`);
+  await waitFor(`document.querySelector("#panel h1")?.innerText.includes(${JSON.stringify(solo.name)})`, "the stop in no station");
+  check(!(await has("#panel .platform-line")) && !(await has("#panel .stop-description")), "a stop with neither shows neither");
+  await click("Edit stop", "#panel");
+  await waitFor(`!!document.getElementById("stop-description")`, "the stop editor with a description");
+  check((await evaluate(`document.getElementById("stop-platform").placeholder`)) === "Towards <next stop>", "the platform label is offered to a stop in no station, with its placeholder");
+  check((await text("#stop-platform-help")).includes("platform or direction"), "and says it is what passengers see as the platform or direction");
+  check(await evaluate(`document.getElementById("stop-description").tagName === "TEXTAREA" && document.getElementById("stop-description").maxLength === 500`), "the description is a textarea of at most 500 characters");
+  check((await text("#panel .char-count")).includes("0 of 500"), "with a counter");
+  await type("#stop-platform", "Towards Smoke Nagar");
+  await type("#stop-description", "Outside the smoke test, by the tea stall");
+  check((await text("#panel .char-count")).includes("40 of 500"), "the counter follows what is typed");
+  await click("Add to draft", "#panel");
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the stop page with its pending change");
+  check((await text("#panel .platform-line")).includes("Towards Smoke Nagar") && (await text("#panel .stop-description")).includes("by the tea stall"), "the header shows the drafted label and description");
+  check((await text("#panel .title-block")).includes("live:") && (await text("#panel .notice.pending")).includes("platform label, description"), "as pending in the draft, beside what is live");
+  const soloChange = (await api(`change-sets/${r5Draft}`)).changes.find((c) => c.entity_key === solo.stop_id);
+  check(!!soloChange && soloChange.after.platform_code === "Towards Smoke Nagar" && soloChange.after.description === "Outside the smoke test, by the tea stall" && Object.keys(soloChange.after).length === 2,
+    "the draft holds one stop update with exactly the label and the description");
+  await shot("r5-04-stop-details-pending");
+  // editing again starts from the draft, and clearing the description is a change too
+  await click("Edit stop", "#panel");
+  await waitFor(`document.getElementById("stop-description")?.value.includes("tea stall")`, "the editor opens with the drafted description");
+  await type("#stop-description", "");
+  await click("Update in draft", "#panel");
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the stop page again");
+  check(!(await has("#panel .stop-description")) && (await text("#panel .platform-line")).includes("Towards Smoke Nagar"), "a cleared description is gone from the page, the label stays");
+
+  // ================================================================ 4. a station's description
+  await go(`#/stop/${fx.station}`);
+  await waitFor(`document.querySelector("#panel h1")?.innerText.includes(${JSON.stringify(station.name)})`, "the station page");
+  await click("Edit station", "#panel");
+  await waitFor(`!!document.getElementById("station-description")`, "the station editor with a description");
+  check((await text("#panel .char-count")).includes("0 of 500"), "the station's description has its counter");
+  check(await evaluate(`[...document.querySelectorAll('#panel input[id^="platform-"]')].every((el) => el.placeholder === "Towards <next stop>")`), "each platform's label has the placeholder");
+  await type("#station-description", "Stops on both sides of the junction");
+  await click("Add to draft", "#panel");
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the station page with its pending change");
+  check((await text("#panel .stop-description")).includes("both sides of the junction") && (await text("#panel .notice.pending")).includes("description"), "the station page shows the drafted description as pending");
+  const stationChange = (await api(`change-sets/${r5Draft}`)).changes.find((c) => c.entity === "station" && c.entity_key === fx.station);
+  check(!!stationChange && stationChange.after.description === "Stops on both sides of the junction", "the station change carries the description");
+  await go(`#/drafts/${r5Draft}`);
+  await waitFor(`document.querySelectorAll(".change").length === 2`, "the draft's two changes");
+  check((await text("#page")).includes("Description") && (await text("#page")).includes("both sides of the junction"), "the draft's diff shows the description");
+
+  // ================================================================ 5. New stop and New station
+  await go("#/new/stop");
+  await waitFor(`!!document.getElementById("new-stop-description")`, "New stop with a description");
+  check((await evaluate(`document.getElementById("new-stop-platform").placeholder`)) === "Towards <next stop>" && (await text("#panel")).includes("platform or direction"), "New stop offers the label with its placeholder and help");
+  await setView(solo.lat + 0.004, solo.lon + 0.004, 17);
+  await clickMapAt(solo.lat + 0.004, solo.lon + 0.004);
+  await type("#new-stop-name", "Smoke round five");
+  await type("#new-stop-platform", "Towards Smoke Depot");
+  await type("#new-stop-description", "A new kerb for the smoke test");
+  check((await text("#panel .char-count")).includes("29 of 500"), "New stop counts the description");
+  await click("Add stop to draft", "#panel");
+  await waitFor(`document.getElementById("panel").innerText.includes("New stop added")`, "the new stop in the draft");
+  check((await text("#panel")).includes("A new kerb for the smoke test") && (await text("#panel")).includes("Towards Smoke Depot"), "what was added says its label and description");
+  const created = (await api(`change-sets/${r5Draft}`)).changes.find((c) => c.op === "create" && c.entity === "stop");
+  check(!!created && created.after.description === "A new kerb for the smoke test" && created.after.platform_code === "Towards Smoke Depot", "the stop create carries both");
+  await go(`#/stop/${created.entity_key}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("A new kerb for the smoke test")`, "the draft-only stop's page with its description");
+  await go("#/new/station");
+  await waitFor(`!!document.getElementById("station-description")`, "New station with a description");
+  check((await text("#panel .char-count")).includes("0 of 500"), "New station has the description and its counter");
+  await click("Cancel", "#panel");
+
+  // ================================================================ 6. importing stop details
+  await go("#/import");
+  await waitFor(`!!document.getElementById("kind-stop_updates")`, "the fourth kind of import");
+  check((await text('label[for="kind-stop_updates"]')).includes("Stop details (platform label, description)"), "it is called Stop details (platform label, description)");
+  await clickSel("#kind-stop_updates", "Stop details");
+  const template = await evaluate(`fetch(document.querySelector('a[download="stop_updates-template.csv"]').href).then((r) => r.text())`);
+  check(template.includes("stop_id,platform_code,description,name"), "its template downloads with its header row");
+  // read in the browser: a column that is not one of the kind's
+  await setFile("details.csv", "stop_id,platform_code,descripton\nx,y,z\n");
+  await waitFor(`document.getElementById("page").innerText.includes("Did you mean")`, "a misspelt column is caught in the browser");
+  // the server's errors, row by row
+  const csvCell = (v) => `"${String(v).replace(/"/g, '""')}"`;
+  await setFile("details.csv", ["stop_id,platform_code,description,name",
+    `${pb.stop_id},,Opposite the smoke test bakery,`,
+    "no_such_stop_r5,Towards nowhere,,",
+    `${fx.station},Towards X,,`,
+    `${pb.stop_id},Towards twice,,`,
+    `${fx.far_near},,,`].join("\n") + "\n");
+  await waitFor(`document.getElementById("page").innerText.includes("have errors")`, "the dry run with errors", 15000);
+  const table = await text(".result-table");
+  check(table.includes("no stop no_such_stop_r5") && table.includes("is a station") && table.includes("rows 1, 4") && table.includes("gives no platform_code"), "the table says what is wrong on each row");
+  check(await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`), "adding is off while rows have errors");
+  // the fixed file: one row already true, one for a stop the draft already updates
+  const fixed = ["stop_id,platform_code,description,name",
+    `${pa.stop_id},${csvCell(pa.platform_code)},,`,
+    `${pb.stop_id},,Opposite the smoke test bakery,`,
+    `${solo.stop_id},Towards Smoke Colony,,`,
+    `${fx.far_station},,A station described by a file,`].join("\n") + "\n";
+  await setFile("details-fixed.csv", fixed);
+  await waitFor(`document.getElementById("page").innerText.includes("can be added")`, "the dry run of the fixed file", 15000);
+  const chips = (await text(".summary-chips")).replace(/\n/g, " ");
+  check(chips.includes("4 rows") && chips.includes("0 errors") && chips.includes("1 unchanged, not added") && chips.includes("3 changes to add"), `the summary counts the unchanged row apart (${chips})`);
+  const fixedTable = await text(".result-table");
+  check(fixedTable.includes("changes nothing") && fixedTable.includes("already updates"), "the unchanged row and the stop already in the draft are warnings that say so");
+  check(fixedTable.includes(pb.name) && await has(".result-table td.stop-now"), "each row names the stop it changes");
+  check(await waitFor(`!!document.querySelector(".import-map.leaflet-container, .import-map .leaflet-container")`, "the map of the stops in the file"), "the stops of the file are on a map");
+  await shot("r5-05-import-stop-details");
+  await click("Add 3 changes to draft");
+  await click("Add 3 to draft", "dialog");
+  await waitFor(`document.getElementById("page").innerText.includes("Added 3 changes")`, "the stop details added to the draft", 15000);
+  const afterImport = await api(`change-sets/${r5Draft}`);
+  const imported = afterImport.changes.find((c) => c.entity_key === pb.stop_id);
+  check(afterImport.changes.length === 6 && !!imported && imported.op === "update" && imported.after.description === "Opposite the smoke test bakery" && Object.keys(imported.after).length === 1 && imported.base_row_version === pb.row_version,
+    "the draft gained one update per row, each with exactly the cells given and the stop's version");
+  // the same file again adds nothing
+  await clickSel("#kind-stop_updates", "Stop details");
+  await setFile("details-fixed.csv", fixed);
+  await waitFor(`document.getElementById("page").innerText.includes("Nothing to add")`, "the same file again", 15000);
+  check((await text(".summary-chips")).includes("4 unchanged") && await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`),
+    "every row is unchanged once the draft applies, and there is nothing to add");
+  // pending on the stop's page like any other change
+  await go(`#/stop/${pb.stop_id}`);
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "an imported change on the stop's page");
+  check((await text("#panel .stop-description")).includes("smoke test bakery"), "the imported description shows as pending in the draft");
+
+  // released: live on the stop, the station and the map
+  await apiSend("POST", `change-sets/${r5Draft}/submit`);
+  const approved = await apiSend("POST", `change-sets/${r5Draft}/approve`, { self_approve: true });
+  const committed = await apiSend("POST", `change-sets/${r5Draft}/commit`);
+  check(approved.status === 200 && committed.status === 200, `the draft commits (${approved.status}, ${committed.status})`);
+  const liveB = await api(`feeds/chennai_bus/stops/${pb.stop_id}`);
+  const liveSolo = await api(`feeds/chennai_bus/stops/${solo.stop_id}`);
+  const liveStation = await api(`feeds/chennai_bus/stops/${fx.station}`);
+  check(liveB.description === "Opposite the smoke test bakery" && liveSolo.platform_code === "Towards Smoke Colony" && !liveSolo.parent_station && !liveSolo.description
+    && liveStation.description === "Stops on both sides of the junction", "every detail is live: the description, the label on a stop in no station, the station's description");
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden`, "the app after the commit");
+  await go(`#/stop/${solo.stop_id}`);
+  await waitFor(`document.querySelector("#panel .platform-line")?.innerText.includes("Towards Smoke Colony")`, "the committed label on the stop's page");
+  check(!(await has("#panel .notice.pending")), "and nothing is pending any more");
+
+  // ================================================================ 7. the same lines on the review pages
+  // a suggested station's page: the live stations around it keep their lines
+  const proposal = (await api("feeds/chennai_bus/station-proposals?status=pending,superseded&limit=1")).items[0];
+  if (check(!!proposal, "set-up: a suggested station to open")) {
+    await go(`#/stations/${proposal.proposal_id}`);
+    await waitFor(`document.getElementById("panel").innerText.includes(${JSON.stringify(proposal.name)})`, "the suggested station's page");
+    await setView(station.lat, station.lon, 17);
+    await waitStopDrawn(fx.station);
+    await sleep(400);
+    links = await stationLinks(fx.station);
+    check(links.length === 2 && links.every((l) => !l.strong), "on Stations to review the live stations in view are tied to their platforms");
+  }
+  // a coordinate review of a platform: its station's lines stand out
+  const reviews = (await api("feeds/chennai_bus/position-reviews?status=pending&limit=50")).items;
+  let reviewed = null;
+  for (const rv of reviews) {
+    const st = await api(`feeds/chennai_bus/stops/${rv.stop_id}`);
+    if (st && st.location_type === 0 && !st.parent_station && !st.deleted) { reviewed = { rv, st }; break; }
+  }
+  if (check(!!reviewed, "set-up: a stop under review, in no station")) {
+    const made = await apiSend("POST", "feeds/chennai_bus/change-sets", { title: "Smoke: round 5, a platform under review" });
+    const setId = made.body.change_set_id;
+    const now = await api(`feeds/chennai_bus/stops/${fx.station}`);
+    await apiSend("POST", `change-sets/${setId}/changes`, { entity: "station", op: "update", entity_key: fx.station, base_row_version: now.row_version,
+      after: { members: [...now.children.map((c) => ({ stop_id: c.stop_id })), { stop_id: reviewed.st.stop_id }] } });
+    await apiSend("POST", `change-sets/${setId}/submit`);
+    await apiSend("POST", `change-sets/${setId}/approve`, { self_approve: true });
+    const done = await apiSend("POST", `change-sets/${setId}/commit`);
+    check(done.status === 200, `set-up: the reviewed stop is now a platform of the station (${done.status})`);
+    await reloadPage();
+    await waitFor(`!document.getElementById("app").hidden`, "the app after that commit");
+    await go(`#/coordinates/${reviewed.rv.review_id}`);
+    await waitFor(`document.getElementById("panel").innerText.includes(${JSON.stringify(reviewed.st.name)})`, "the coordinate review of the platform");
+    // a review fits its routes' legs, which can be far below the zoom stops are drawn at
+    await setView(reviewed.st.lat, reviewed.st.lon, 17);
+    await waitStopDrawn(reviewed.st.stop_id);
+    await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => { let n = 0; m.getMap().eachLayer((l) => { if (l.options && l.options.stationLink === ${JSON.stringify(fx.station)} && l.options.strongLink) n++; }); return n >= 1; })`,
+      "the reviewed platform's station lines on the Coordinates page", 15000);
+    links = await stationLinks(fx.station);
+    check(links.some((l) => l.platform === reviewed.st.stop_id) && links.every((l) => l.strong), "on Coordinates to review the reviewed platform's station is tied to its platforms, standing out");
+    await shot("r5-06-review-links");
+  }
+}
+
+// ---- only round 5
+if (process.argv.includes("--round5")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await round5Flows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of round 5
 
 // ------------------------------------------------------------------ flows
 try {
@@ -1896,6 +2261,9 @@ try {
 
   // ================================================================ round 4 (UX): see round4Flows above
   await round4Flows();
+
+  // ================================================================ round 5 (stop details, station links): see round5Flows above
+  await round5Flows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

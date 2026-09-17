@@ -177,15 +177,22 @@ async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult
 const ROUTE_COUNT: &str = "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
      WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count";
 
+/// A station's live platforms, for the same query: the map ties a station to
+/// its platforms, and this tells it whether it has them all (section 11).
+const PLATFORM_COUNT: &str = "(SELECT count(*) FROM gtfs_stop c \
+     WHERE c.gtfs_id = s.gtfs_id AND c.parent_station = s.stop_id AND NOT c.deleted) AS platform_count";
+
 fn stop_json_counted(r: &PgRow) -> Result<Value, sqlx::Error> {
     let mut v = stop_json(r)?;
     v["route_count"] = json!(r.try_get::<i64, _>("route_count")?);
+    v["platform_count"] = json!(r.try_get::<i64, _>("platform_count")?);
     Ok(v)
 }
 
 const STOP_COLS: &str = "stop_id, stop_code, name, lat, lon, location_type, parent_station, \
-     platform_code, cluster_id, regional_name, hindi_name, info_json::text AS info_json, \
-     position_source, provenance::text AS provenance, deleted, row_version, updated_at, updated_by";
+     platform_code, description, cluster_id, regional_name, hindi_name, \
+     info_json::text AS info_json, position_source, provenance::text AS provenance, deleted, \
+     row_version, updated_at, updated_by";
 
 fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -197,6 +204,7 @@ fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "location_type": r.try_get::<i16, _>("location_type")?,
         "parent_station": r.try_get::<Option<String>, _>("parent_station")?,
         "platform_code": r.try_get::<Option<String>, _>("platform_code")?,
+        "description": r.try_get::<Option<String>, _>("description")?,
         "cluster_id": r.try_get::<Option<String>, _>("cluster_id")?,
         "regional_name": r.try_get::<Option<String>, _>("regional_name")?,
         "hindi_name": r.try_get::<Option<String>, _>("hindi_name")?,
@@ -225,6 +233,66 @@ pub async fn stop_row(
     Ok(row.as_ref().map(stop_json).transpose()?)
 }
 
+/// Stop rows in read shape by id, in one query (a bulk upload's `before`s).
+pub async fn stop_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    stop_ids: &[String],
+) -> EditorResult<HashMap<String, Value>> {
+    if stop_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query(&format!(
+        "SELECT {STOP_COLS} FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)"
+    ))
+    .bind(gtfs_id)
+    .bind(stop_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        let row = stop_json(r)?;
+        out.insert(row["stop_id"].as_str().unwrap_or("").to_string(), row);
+    }
+    Ok(out)
+}
+
+/// The live platforms of each station, `(stop_id, platform_code)` in id order:
+/// what a station's `before` lists as `member_stop_ids` and `members`.
+pub async fn stations_members(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    station_ids: &[String],
+) -> EditorResult<HashMap<String, Vec<(String, Option<String>)>>> {
+    let mut out: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    if station_ids.is_empty() {
+        return Ok(out);
+    }
+    for r in sqlx::query(
+        "SELECT parent_station, stop_id, platform_code FROM gtfs_stop \
+         WHERE gtfs_id = $1 AND parent_station = ANY($2) AND NOT deleted ORDER BY stop_id",
+    )
+    .bind(gtfs_id)
+    .bind(station_ids)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        out.entry(r.try_get("parent_station")?)
+            .or_default()
+            .push((r.try_get("stop_id")?, r.try_get("platform_code")?));
+    }
+    Ok(out)
+}
+
+/// Add a station's members to its row, as a station change's `before` has them.
+pub fn with_members(row: &mut Value, members: &[(String, Option<String>)]) {
+    row["member_stop_ids"] = json!(members.iter().map(|m| &m.0).collect::<Vec<_>>());
+    row["members"] = json!(members
+        .iter()
+        .map(|(id, code)| json!({"stop_id": id, "platform_code": code}))
+        .collect::<Vec<_>>());
+}
+
 pub struct StopQuery {
     pub q: Option<String>,
     pub bbox: Option<(f64, f64, f64, f64)>,
@@ -243,7 +311,7 @@ pub async fn list_stops(
         None => (None, None, None, None),
     };
     let rows = sqlx::query(&format!(
-        "SELECT {STOP_COLS}, {ROUTE_COUNT} \
+        "SELECT {STOP_COLS}, {ROUTE_COUNT}, {PLATFORM_COUNT} \
          FROM gtfs_stop s \
          WHERE s.gtfs_id = $1 AND NOT s.deleted \
            AND ($2::text IS NULL OR s.stop_id = $2 OR s.stop_code = $2 \
@@ -304,7 +372,7 @@ pub async fn stop_detail(
     })
     .collect::<Result<Vec<_>, _>>()?;
     let children = sqlx::query(&format!(
-        "SELECT {STOP_COLS}, {ROUTE_COUNT} FROM gtfs_stop s \
+        "SELECT {STOP_COLS}, {ROUTE_COUNT}, {PLATFORM_COUNT} FROM gtfs_stop s \
          WHERE s.gtfs_id = $1 AND s.parent_station = $2 AND NOT s.deleted ORDER BY s.stop_id"
     ))
     .bind(gtfs_id)
@@ -324,7 +392,7 @@ pub async fn stop_detail(
         stop["lon"].as_f64().unwrap_or(0.0),
     );
     let nearby = sqlx::query(&format!(
-        "SELECT {STOP_COLS}, {ROUTE_COUNT} FROM gtfs_stop s \
+        "SELECT {STOP_COLS}, {ROUTE_COUNT}, {PLATFORM_COUNT} FROM gtfs_stop s \
          WHERE s.gtfs_id = $1 AND s.stop_id <> $2 AND NOT s.deleted \
            AND s.lat BETWEEN $3 - 0.0006 AND $3 + 0.0006 AND s.lon BETWEEN $4 - 0.0007 AND $4 + 0.0007"
     ))
@@ -359,6 +427,7 @@ pub async fn stop_detail(
         .collect::<HashSet<_>>()
         .len());
     stop["routes"] = json!(routes);
+    stop["platform_count"] = json!(children.len());
     stop["children"] = json!(children);
     stop["nearby"] = json!(nearby);
     stop["parent"] = parent.unwrap_or(Value::Null);
@@ -1014,6 +1083,13 @@ fn field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
     }
 }
 
+/// A text a passenger reads (platform label, description): trimmed, and blank
+/// clears it like `null` does.
+fn text_field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
+    let (has, text) = field(m, key);
+    (has, text.map(str::trim).filter(|t| !t.is_empty()))
+}
+
 fn conflict(c: &ChangeRow, reason: &str, expected: Value, actual: Value) -> Value {
     conflict_on(c, &c.entity_key, reason, expected, actual)
 }
@@ -1436,7 +1512,8 @@ async fn stop_update(
         }
     }
     let (has_name, name) = field(m, "name");
-    let (has_platform, platform) = field(m, "platform_code");
+    let (has_platform, platform) = text_field(m, "platform_code");
+    let (has_description, description) = text_field(m, "description");
     let (has_cluster, cluster) = field(m, "cluster_id");
     let (has_regional, regional) = field(m, "regional_name");
     let (has_hindi, hindi) = field(m, "hindi_name");
@@ -1452,6 +1529,7 @@ async fn stop_update(
                              ELSE jsonb_set(coalesce(info_json, '{}'::jsonb), '{clusterId}', to_jsonb($11::text)) END, \
             regional_name = CASE WHEN $12 THEN $13 ELSE regional_name END, \
             hindi_name = CASE WHEN $14 THEN $15 ELSE hindi_name END, \
+            description = CASE WHEN $17 THEN $18 ELSE description END, \
             updated_by = $16 \
          WHERE gtfs_id = $1 AND stop_id = $2",
     )
@@ -1471,6 +1549,8 @@ async fn stop_update(
     .bind(has_hindi)
     .bind(hindi)
     .bind(actor)
+    .bind(has_description)
+    .bind(description)
     .execute(&mut *conn)
     .await?;
     Ok(warnings)
@@ -1486,10 +1566,11 @@ async fn stop_create(
     let s = |k: &str| m.get(k).and_then(Value::as_str);
     let created = sqlx::query(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, platform_code, cluster_id, \
-                                info_json, regional_name, hindi_name, position_source, updated_by) \
+                                info_json, regional_name, hindi_name, position_source, updated_by, \
+                                description) \
          VALUES ($1, $2, coalesce($3, $2), $4, $5, $6, $7, $8, \
                  CASE WHEN $8::text IS NULL THEN NULL ELSE jsonb_build_object('clusterId', $8::text) END, \
-                 $9, $10, 'REVIEW', $11) \
+                 $9, $10, 'REVIEW', $11, $12) \
          ON CONFLICT DO NOTHING RETURNING stop_id",
     )
     .bind(g)
@@ -1498,11 +1579,12 @@ async fn stop_create(
     .bind(s("name").map(str::trim))
     .bind(m.get("lat").and_then(Value::as_f64))
     .bind(m.get("lon").and_then(Value::as_f64))
-    .bind(s("platform_code"))
+    .bind(text_field(m, "platform_code").1)
     .bind(s("cluster_id"))
     .bind(s("regional_name"))
     .bind(s("hindi_name"))
     .bind(actor)
+    .bind(text_field(m, "description").1)
     .fetch_optional(&mut *conn)
     .await?;
     if created.is_none() {
@@ -2302,8 +2384,9 @@ async fn station_create(
     let members: Vec<String> = specs.iter().map(|s| s.stop_id.clone()).collect();
     check_members(conn, g, id, &members).await?;
     let created = sqlx::query(
-        "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, position_source, updated_by) \
-         VALUES ($1, $2, $2, $3, $4, $5, 1, 'REVIEW', $6) ON CONFLICT DO NOTHING RETURNING stop_id",
+        "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, position_source, updated_by, \
+                                description) \
+         VALUES ($1, $2, $2, $3, $4, $5, 1, 'REVIEW', $6, $7) ON CONFLICT DO NOTHING RETURNING stop_id",
     )
     .bind(g)
     .bind(id)
@@ -2311,6 +2394,7 @@ async fn station_create(
     .bind(m.get("lat").and_then(Value::as_f64))
     .bind(m.get("lon").and_then(Value::as_f64))
     .bind(actor)
+    .bind(text_field(m, "description").1)
     .fetch_optional(&mut *conn)
     .await?;
     if created.is_none() {
@@ -2350,12 +2434,14 @@ async fn station_update(
     let live = live_station(conn, g, id).await?;
     let m = after.as_object().expect("payload checked");
     let (has_name, name) = field(m, "name");
+    let (has_description, description) = text_field(m, "description");
     let moved = m.contains_key("lat");
     sqlx::query(
         "UPDATE gtfs_stop SET name = CASE WHEN $3 THEN $4 ELSE name END, \
             lat = CASE WHEN $5 THEN $6 ELSE lat END, lon = CASE WHEN $5 THEN $7 ELSE lon END, \
+            description = CASE WHEN $9 THEN $10 ELSE description END, \
             updated_by = $8 \
-         WHERE gtfs_id = $1 AND stop_id = $2 AND ($3 OR $5)",
+         WHERE gtfs_id = $1 AND stop_id = $2 AND ($3 OR $5 OR $9)",
     )
     .bind(g)
     .bind(id)
@@ -2365,6 +2451,8 @@ async fn station_update(
     .bind(m.get("lat").and_then(Value::as_f64).unwrap_or(live.lat))
     .bind(m.get("lon").and_then(Value::as_f64).unwrap_or(live.lon))
     .bind(actor)
+    .bind(has_description)
+    .bind(description)
     .execute(&mut *conn)
     .await?;
     // members, when sent, are at least two (check_payload)
@@ -2601,6 +2689,36 @@ async fn created_in_set(
     })
 }
 
+/// The `after` of the creates in the set that make the stops or stations
+/// `keys`, as `(entity, after)` by id: [`created_in_set`] for a whole upload.
+pub async fn stops_created_in_set(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    keys: &[String],
+) -> EditorResult<HashMap<String, (String, Value)>> {
+    let mut out = HashMap::new();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    for r in sqlx::query(
+        "SELECT entity, entity_key, after::text AS after FROM gtfs_change \
+         WHERE change_set_id = $1 AND op = 'create' AND entity IN ('stop', 'station') \
+           AND entity_key = ANY($2) ORDER BY position DESC",
+    )
+    .bind(change_set_id)
+    .bind(keys)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        // position DESC: the earliest create of an id is the one that stays
+        out.insert(
+            r.try_get("entity_key")?,
+            (r.try_get("entity")?, json_col(&r, "after")?),
+        );
+    }
+    Ok(out)
+}
+
 /// A stop row in read shape, or - for a stop created earlier in the set - what
 /// its create gives it. The bool says whether it is a station.
 async fn stop_or_created(
@@ -2660,24 +2778,11 @@ async fn snapshot(
                 return Err(station_mismatch(is_station));
             }
             if is_station && version.is_some() {
-                let members = sqlx::query(
-                    "SELECT stop_id, platform_code FROM gtfs_stop WHERE gtfs_id = $1 AND parent_station = $2 \
-                     AND NOT deleted ORDER BY stop_id",
-                )
-                .bind(g)
-                .bind(key)
-                .fetch_all(&mut *conn)
-                .await?
-                .iter()
-                .map(|r| -> Result<(String, Option<String>), sqlx::Error> {
-                    Ok((r.try_get("stop_id")?, r.try_get("platform_code")?))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-                row["member_stop_ids"] = json!(members.iter().map(|m| &m.0).collect::<Vec<_>>());
-                row["members"] = json!(members
-                    .iter()
-                    .map(|(id, code)| json!({"stop_id": id, "platform_code": code}))
-                    .collect::<Vec<_>>());
+                let members = stations_members(conn, g, &[key.to_string()])
+                    .await?
+                    .remove(key)
+                    .unwrap_or_default();
+                with_members(&mut row, &members);
             }
             Ok((row, version))
         }

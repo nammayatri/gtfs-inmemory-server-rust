@@ -5,6 +5,7 @@ import { state, setLeaveGuard } from "./state.js";
 import {
   h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, STOP_TYPE_LABEL, SERVED_EXCLUDE,
   validateRows, renumberStages, decodePolyline, plural, ID_RE, ID_RULE,
+  PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField,
 } from "./util.js";
 import * as map from "./map.js";
 import { addChange, existingChange, createdChange, requireDraft, updateChange } from "./drafts.js";
@@ -59,12 +60,14 @@ function guard(what) {
 export async function editStop(stop) {
   if (!(await requireDraft())) return;
   const prior = existingChange("stop", stop.stop_id);
-  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", regional_name: stop.regional_name || "", ...(prior ? prior.after : {}) };
+  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", ...(prior ? prior.after : {}) };
+  const description = descriptionField("stop-description", start.description);
   const f = {
     name: h("input", { type: "text", id: "stop-name", value: start.name }),
     lat: h("input", { type: "number", id: "stop-lat", step: "any", value: String(start.lat) }),
     lon: h("input", { type: "number", id: "stop-lon", step: "any", value: String(start.lon) }),
-    platform_code: h("input", { type: "text", id: "stop-platform", value: start.platform_code || "", maxlength: "120" }),
+    platform_code: h("input", { type: "text", id: "stop-platform", value: start.platform_code || "", maxlength: "120", placeholder: PLATFORM_PLACEHOLDER }),
+    description: description.input,
     regional_name: h("input", { type: "text", id: "stop-regional", value: start.regional_name || "", lang: "ta" }),
   };
   const unsaved = guard(`Your changes to ${stop.name} are not in the draft yet.`);
@@ -73,7 +76,7 @@ export async function editStop(stop) {
   // a finished drag of the pin, and each field once left, is one step to undo
   const history = undoScope("this stop");
   const syncFields = history.fields([[f.name, "the name"], [f.lat, "the latitude"], [f.lon, "the longitude"],
-    [f.platform_code, "the platform label"], [f.regional_name, "the Tamil name"]]);
+    [f.platform_code, "the platform label"], [f.description, "the description"], [f.regional_name, "the Tamil name"]]);
   let placed = { lat: f.lat.value, lon: f.lon.value };     // as text, so undoing restores it exactly
   const putPin = (p) => {
     placed = p;
@@ -122,9 +125,11 @@ export async function editStop(stop) {
     if (name !== stop.name) after.name = name;
     const lat = Number(f.lat.value), lon = Number(f.lon.value);
     if (lat !== stop.lat || lon !== stop.lon) { after.lat = lat; after.lon = lon; }
-    for (const k of ["platform_code", "regional_name"]) {
+    for (const k of ["platform_code", "description", "regional_name"]) {
       const v = f[k].value.trim() || null;
-      if (v !== (stop[k] || null)) after[k] = v;
+      // put back to what is live, a value the draft already changes still has to be sent
+      const drafted = !!(prior && prior.after && k in prior.after);
+      if (v !== (stop[k] || null) || (drafted && v !== (prior.after[k] ?? null))) after[k] = v;
     }
     if (!Object.keys(after).length) { clear(problems, h("p.notice", "Nothing has changed yet.")); return; }
     try {
@@ -155,6 +160,8 @@ export async function editStop(stop) {
       h("div.field-row",
         h("label.field", { for: "stop-platform" }, h("span", "Platform label (optional)"), f.platform_code),
         h("label.field", { for: "stop-regional" }, h("span", "Tamil name (optional)"), f.regional_name)),
+      h("p.hint", { id: "stop-platform-help" }, PLATFORM_HELP),
+      description.el,
       problems),
     h("div.sticky-actions", h("div.btn-row",
       h("button.btn", { type: "submit" }, prior ? "Update in draft" : "Add to draft"),
@@ -729,6 +736,8 @@ export async function editStation(station, initialStops = []) {
   idInput.addEventListener("input", () => { idTyped = true; });
   const first = [...members.values()][0];
   const nameInput = h("input", { type: "text", id: "station-name", value: (prior && prior.after && prior.after.name) || (station ? station.name : first ? first.name : "") });
+  const startDescription = prior && prior.after && "description" in prior.after ? prior.after.description : station ? station.description : "";
+  const description = descriptionField("station-description", startDescription, "station");
   const latIn = h("input", { type: "number", step: "any", id: "station-lat", value: lat != null ? String(lat) : "" });
   const lonIn = h("input", { type: "number", step: "any", id: "station-lon", value: lon != null ? String(lon) : "" });
   const memberList = h("ul.list.member-list");
@@ -740,7 +749,7 @@ export async function editStation(station, initialStops = []) {
   // them is one step to undo, the whole of it before and after. Name and id are
   // fields, a step each once left.
   const history = undoScope("the station");
-  const syncFields = history.fields([[nameInput, "the station name"], [idInput, "the station id"], [latIn, "the latitude"], [lonIn, "the longitude"]]);
+  const syncFields = history.fields([[nameInput, "the station name"], [idInput, "the station id"], [description.input, "the description"], [latIn, "the latitude"], [lonIn, "the longitude"]]);
   const names = new Map();         // station names for the suggestions, looked up once
   const take = () => ({ members: [...members.values()].map((m) => ({ ...m })), lat: latIn.value, lon: lonIn.value, id: idInput.value, name: nameInput.value, placedByHand });
   let snap = null;
@@ -811,7 +820,7 @@ export async function editStation(station, initialStops = []) {
             h("button.btn.quiet.small", { type: "button", "aria-label": `Take ${m.name} (${m.stop_id}) out of the station`,
               on: { click: () => { members.delete(m.stop_id); selector.set([...members.keys()]); membersChanged(`took ${m.name} out of the station`); } } }, "Take out")),
           h("label.field", { for: `platform-${m.stop_id}` }, h("span", "Platform label (optional)"),
-            h("input", { type: "text", id: `platform-${m.stop_id}`, maxlength: "120", value: m.platform_code || "", placeholder: "For example Towards Guindy",
+            h("input", { type: "text", id: `platform-${m.stop_id}`, maxlength: "120", value: m.platform_code || "", placeholder: PLATFORM_PLACEHOLDER,
               on: { input: (ev) => { m.platform_code = ev.target.value; unsaved.touch(); }, change: () => remember(`changed the platform label of ${m.name}`) } }))))
       : h("p.empty", "No stops yet. Click the stops of this place on the map (for example both sides of the road)."));
   }
@@ -885,6 +894,10 @@ export async function editStation(station, initialStops = []) {
       members: [...members.values()].map((m) => ({ stop_id: m.stop_id, platform_code: (m.platform_code || "").trim() || null })),
     };
     if (creating) after.station_id = idInput.value.trim();
+    // the description goes only when it is given (a new station) or changed
+    const described = description.input.value.trim() || null;
+    const wasDescribed = !creating && ((prior && prior.after && "description" in prior.after) || described !== (station.description || null));
+    if (creating ? described : wasDescribed) after.description = described;
     try {
       const res = await addChange({
         entity: "station", op: creating ? "create" : "update",
@@ -910,6 +923,7 @@ export async function editStation(station, initialStops = []) {
       h("p.hint", "A station groups the stops of one place, such as the two sides of a road or the bays of a bus terminus, so passengers can search for the place once."),
       h("label.field", { for: "station-name" }, h("span", "Station name"), nameInput),
       h("label.field", { for: "station-id" }, h("span", "Station id"), idInput),
+      description.el,
     ),
     h("section.section",
       h("h2", "Stops in the station"),
