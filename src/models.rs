@@ -744,6 +744,10 @@ pub struct GTFSData {
     /// Pre-computed unique stops list per GTFS (avoids recomputation on every /stops request)
     #[serde(skip)]
     pub pre_computed_stops_by_gtfs: HashMap<String, Vec<Arc<RouteStopMapping>>>,
+    /// `gtfs_feed.version` each DB-backed feed was built at. A feed missing here
+    /// is serving preprocessed data (not a DB feed, or its DB load failed).
+    #[serde(default)]
+    pub db_feed_versions: HashMap<String, i64>,
 }
 
 impl GTFSData {

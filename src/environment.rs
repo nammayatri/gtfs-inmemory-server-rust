@@ -92,10 +92,24 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
+    /// Feeds whose metadata (stops, routes, route stop order, polylines,
+    /// stations) is read from the `gtfs_*` tables over `internal_database_url`
+    /// instead of the preprocessed files. Trips still come from the preprocessed
+    /// data. Empty (the default) keeps every feed on preprocessed data.
+    #[serde(default)]
+    pub gtfs_db_feeds: Vec<String>,
+    /// How often each pod checks `gtfs_feed.version` for the DB feeds and
+    /// rebuilds the ones that moved.
+    #[serde(default = "default_gtfs_version_poll_seconds")]
+    pub gtfs_version_poll_seconds: u64,
 }
 
 fn default_preprocessed_data_dir() -> String {
     "./assets".to_string()
+}
+
+fn default_gtfs_version_poll_seconds() -> u64 {
+    5
 }
 
 impl OtpConfig {

@@ -63,8 +63,18 @@ Reload: every `gtfs_version_poll_seconds`, `SELECT gtfs_id, version FROM
 gtfs_feed WHERE gtfs_id = ANY($db_feeds)`. A feed whose version differs from the
 one it was built at is rebuilt and swapped in (`ArcSwap`); others are untouched.
 The version is read **before** the feed's rows, so an edit committed mid-load is
-picked up on the next tick. A failed reload keeps the old data and retries.
-`/version/{gtfs_id}` reflects the feed version.
+picked up on the next tick. A failed reload keeps the old data and retries. A DB
+feed that cannot load at boot serves its preprocessed data until a poll succeeds.
+A snapshot boot rebuilds DB feeds on top of the snapshot, so a snapshot baked
+without the DB never masks committed edits.
+
+`/version/{gtfs_id}` for a DB feed is sha256 of the routes hash plus
+`gtfs_feed.version`, so an edit to stops or stop order - invisible to the routes
+hash - still moves it. It therefore differs from the preprocessed value for the
+same data.
+
+Acceptance: `scripts/parity_gtfs_db.py` compares two GIMS instances, one with the
+feed in `gtfs_db_feeds` and one without.
 
 ## 2. Access
 
