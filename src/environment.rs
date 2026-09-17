@@ -92,6 +92,27 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
+    /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
+    /// existing dhall configs still parse; the editor stays off unless enabled.
+    #[serde(default)]
+    pub gtfs_editor_enabled: bool,
+    /// JWKS of the Pomerium that fronts the editor: https://... or file:///...
+    #[serde(default)]
+    pub gtfs_editor_pomerium_jwks_url: Option<String>,
+    /// Expected `aud` of the Pomerium JWT: the dashboard host.
+    #[serde(default)]
+    pub gtfs_editor_audience: Option<String>,
+    /// Emails created as admins on their first authenticated request.
+    #[serde(default)]
+    pub gtfs_editor_bootstrap_admins: Vec<String>,
+    /// Base64 32-byte key that encrypts TOTP secrets (secrets dhall).
+    #[serde(default)]
+    pub gtfs_editor_totp_key: Option<String>,
+    #[serde(default)]
+    pub gtfs_editor_session_hours: Option<u64>,
+    /// Directory the dashboard's static files are served from.
+    #[serde(default)]
+    pub gtfs_editor_ui_dir: Option<String>,
 }
 
 fn default_preprocessed_data_dir() -> String {

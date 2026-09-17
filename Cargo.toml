@@ -61,6 +61,11 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 
+# GTFS editor auth: ES256 JWT verification, AES-256-GCM, HMAC-SHA1 (TOTP) and
+# secure randomness. ring is already in the tree through rustls.
+ring = "0.17"
+base64 = "0.22"
+
 # Lock-free atomic pointer swap for double-buffered cache
 arc-swap = "1"
 
