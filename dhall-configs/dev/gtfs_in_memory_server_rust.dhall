@@ -80,4 +80,5 @@ in {
   -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
   osrm_url = Some "http://localhost:5050",
   gen_int_for_id = Some True,
+  max_eta_override_seconds = Some 43200,
 }
