@@ -15,7 +15,11 @@
 // with routes from three original stops and its draft conflict, a stop merged
 // away); importing CSV files into a draft of 1,200 changes; submit, approve and
 // commit by a second person, a commit conflict, people and history; the
-// "Stations to review" link hiding once nothing is left to review.
+// "Stations to review" link hiding once nothing is left to review. Last come the
+// round 4 flows (round4Flows below; `--round4` runs only those): what the map
+// shows, stops sharing a point, stations listed once, undo and redo, the trail,
+// the cleanup context, candidates and merge on a review, and pending changes
+// shown on the pages they change.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -272,6 +276,587 @@ async function ensureGroupChecked(groupExpr, want) {
   const already = await evaluate(`${groupExpr}.querySelector(".route-group-head input")?.checked`);
   if (already !== want) await evaluate(`${groupExpr}.querySelector(".route-group-head input").click(); true`);
 }
+
+// ====================================================================== round 4 (UX), 2026-09-17
+// The flows of docs/gtfs-editor.md section 9, kept together: what the map shows
+// (and remembers), stops sharing a point, stations listed once, undo and redo of
+// what is not in a draft, the trail, the cleanup context (and an older server
+// without it), the clean-up tool's verdict, candidates and merge on a coordinate
+// review, and every kind of change shown as pending on the page it changes.
+// `node dev/ui_smoke.mjs --round4` runs only these, as the admin, on a fresh mock.
+const DRAFTSJS = `${UI}js/drafts.js`;
+const TRAILJS = `${UI}js/trail.js`;
+async function pressKey(key, { ctrl = false, shift = false, meta = false, commands = undefined } = {}) {
+  const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
+  const vk = key.toUpperCase().charCodeAt(0);
+  const base = { modifiers, key: shift ? key.toUpperCase() : key, code: `Key${key.toUpperCase()}`, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
+  await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base, ...(commands ? { commands } : {}) });
+  await send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  await sleep(350);
+}
+// the old page answers until the new one replaces it: give the reload time to start
+const reloadPage = async () => { await send("Page.reload"); await sleep(1500); };
+// Click a stop's marker; where several stops share its point the chooser opens
+// (section 9.6), and the stop meant is picked from it.
+async function clickStopOnMap(stop) {
+  await clickMapAt(stop.lat, stop.lon);
+  const pick = `.stack-picker .stack-item[data-stop="${stop.stop_id}"]`;
+  if (await has(pick)) await clickSel(pick, `${stop.stop_id} in the chooser of stops sharing its point`);
+}
+const blurAll = () => evaluate(`(document.activeElement && document.activeElement.blur(), true)`);
+const undoKey = async () => { await blurAll(); await pressKey("z", { ctrl: true }); };
+const redoKey = async () => { await blurAll(); await pressKey("z", { ctrl: true, shift: true }); };
+const lastToastText = () => text("#toasts .toast:last-child");
+// markers of the stop layer: [{ids, lat, lon}], and how many of them are stations
+const stopMarkers = () => mapCall(`const out = []; map.eachLayer((l) => { if (l.options && l.options.stopIds) { const q = l.getLatLng(); out.push({ ids: l.options.stopIds, lat: q.lat, lon: q.lng }); } }); return out;`);
+const countLayers = (option, value) => mapCall(`let n = 0; map.eachLayer((l) => { if (l.options && l.options[${JSON.stringify(option)}] !== undefined && (${JSON.stringify(value)} === null || l.options[${JSON.stringify(option)}] === ${JSON.stringify(value)})) n++; }); return n;`);
+const refreshUiDraft = () => evaluate(`import(${JSON.stringify(DRAFTSJS)}).then((m) => m.refreshDraft()).then(() => true)`);
+const trailNow = () => evaluate(`import(${JSON.stringify(TRAILJS)}).then((m) => m.trail())`);
+const reviewPin = () => mapCall(`let p = null; map.eachLayer((l) => { const html = l.options && l.options.icon && l.options.icon.options.html; if (String(html || "").includes("stop-pin") && l.getLatLng) { const q = l.getLatLng(); p = { lat: q.lat, lon: q.lng }; } }); return p;`);
+const newestAudit = async () => ((await api("feeds/chennai_bus/audit?limit=1")).items[0] || {}).audit_id || 0;
+const toggleLayer = async (key, on) => {
+  const now = await evaluate(`document.getElementById("show-${key}").checked`);
+  if (now !== on) await clickSel(`#show-${key}`, `${on ? "show" : "hide"} ${key} on the map`);
+};
+
+async function round4Flows() {
+  // ---- what is set up: the mock's fixtures (mock_server.py seed_round4)
+  const mergeList = (await api("feeds/chennai_bus/position-reviews?status=pending&auto_fix=merge&limit=5")).items;
+  check(mergeList.length === 1, `set-up: one review where the tool says merge (${mergeList.length})`);
+  const main = await api(`position-reviews/${mergeList[0].review_id}`);
+  const S = main.stop_id;
+  const candidates = main.evidence.same_name_candidates || [];
+  check(candidates.length >= 1 && !!main.evidence.auto_fix, `set-up: that review has same-named candidates (${candidates.length}) and a verdict`);
+  const platforms = (await api("feeds/chennai_bus/stops?station=stn_r4_shared&limit=10")).items;
+  const station = await api("feeds/chennai_bus/stops/stn_r4_shared");
+  check(platforms.length === 2 && station.location_type === 1, "set-up: a station whose two platforms share the reviewed stop's point");
+
+  // start from a known place: no draft open, everything shown
+  if (!(await text("#draft-chip")).includes("No draft open")) {
+    await clickSel("#draft-chip", "the draft chip");
+    await click("Stop using a draft", "dialog");
+  }
+  await go("#/");
+  await waitFor(`!!document.getElementById("show-stops")`, "the Show control on the map");
+  for (const k of ["stations", "routes", "stops"]) await toggleLayer(k, true);
+
+  // ================================================================ 1. what the map shows
+  const live = await api(`feeds/chennai_bus/stops/${S}`);
+  await setView(live.lat, live.lon, 17);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => m.loadedStops().length > 0)`, "stops in the area");
+  await sleep(400);
+  const allMarkers = await stopMarkers();
+  const isStationIds = new Set((await api(`feeds/chennai_bus/stops?station=true&bbox=${(live.lat - 0.02).toFixed(6)},${(live.lon - 0.02).toFixed(6)},${(live.lat + 0.02).toFixed(6)},${(live.lon + 0.02).toFixed(6)}&limit=500`)).items.map((x) => x.stop_id));
+  check(allMarkers.length > 0 && allMarkers.some((m) => m.ids.includes("stn_r4_shared")), `stops and the station are drawn to begin with (${allMarkers.length} markers)`);
+  check(await evaluate(`["stations", "routes", "stops"].every((k) => document.getElementById("show-" + k).checked) && document.querySelector(".layer-toggle").innerText.includes("Show")`), "the map has a Show control with Stations, Routes and Stops ticked");
+  await toggleLayer("stops", false);
+  const onlyStations = await stopMarkers();
+  check(onlyStations.length > 0 && onlyStations.every((m) => m.ids.every((id) => isStationIds.has(id))), `with Stops off only stations are drawn (${onlyStations.length})`);
+  check((await evaluate(`document.querySelectorAll(".stack-badge").length`)) === 0 || onlyStations.length > 0, "the count badges of hidden stops go with them");
+  // hidden stays hidden as the map moves and new stops load
+  await setView(live.lat + 0.004, live.lon + 0.004, 17);
+  await sleep(900);
+  await setView(live.lat, live.lon, 18);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => m.loadedStops().some((s) => s.stop_id === ${JSON.stringify(S)}))`, "the area loaded again after moving the map");
+  await sleep(400);
+  check((await stopMarkers()).every((m) => m.ids.every((id) => isStationIds.has(id))), "stops stay hidden after the map moved and loaded new stops");
+  check(await evaluate(`[...document.querySelectorAll(".leaflet-tooltip.stop-label")].filter((e) => e.style.opacity !== "0").every((e) => e.textContent.includes("(station)"))`), "hidden stops have no name labels either");
+  // it survives a reload
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden && !!document.getElementById("show-stops")`, "the app after a reload");
+  check((await evaluate(`document.getElementById("show-stops").checked`)) === false && (await evaluate(`document.getElementById("show-stations").checked`)) === true, "the Show choices survive a reload");
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => m.loadedStops().length > 0)`, "stops loaded after the reload");
+  await sleep(400);
+  check((await stopMarkers()).every((m) => m.ids.every((id) => isStationIds.has(id))), "and stops are still hidden after it");
+  // the open stop is still drawn, and the control says why it is alone
+  await go(`#/stop/${S}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Routes stopping here")`, "a stop opened while stops are hidden");
+  await sleep(500);
+  const whileOpen = (await stopMarkers()).filter((m) => !m.ids.every((id) => isStationIds.has(id)));
+  check(whileOpen.length === 1 && whileOpen[0].ids.includes(S), "with Stops off the open stop is the one stop still drawn");
+  check((await text(".layer-note")).includes("Only the open stop is drawn"), "and the control says so");
+  await toggleLayer("stations", false);
+  check((await stopMarkers()).every((m) => m.ids.includes(S)), "with Stations off too, no station is drawn");
+  // routes
+  const viaRoute = live.routes[0].route_id;
+  await go(`#/route/${viaRoute}`);
+  await waitFor(`document.querySelectorAll(".ladder .stage").length > 0`, "a route opened");
+  check((await countLayers("routeLine", "route")) > 0, "the open route is drawn");
+  await toggleLayer("routes", false);
+  check((await countLayers("routeLine", "route")) === 0, "with Routes off the route line is not drawn");
+  check((await text(".layer-note")).includes("The open route is not drawn"), "and the control says the open route is hidden");
+  await go("#/");
+  await go(`#/route/${viaRoute}`);
+  await waitFor(`document.querySelectorAll(".ladder .stage").length > 0`, "the route opened again");
+  check((await countLayers("routeLine", "route")) === 0, "a route opened later stays hidden too");
+  await toggleLayer("routes", true);
+  check((await countLayers("routeLine", "route")) > 0, "ticking Routes draws it again");
+  // storage that throws: the page still works, with everything shown
+  const blocker = await send("Page.addScriptToEvaluateOnNewDocument", { source: `for (const k of ["getItem", "setItem", "removeItem"]) Storage.prototype[k] = () => { throw new Error("storage is blocked"); };` });
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden && !!document.getElementById("show-stops")`, "the app with storage blocked");
+  check(await evaluate(`["stations", "routes", "stops"].every((k) => document.getElementById("show-" + k).checked)`), "with storage blocked the page works and shows everything");
+  await toggleLayer("stops", false);
+  check((await evaluate(`document.getElementById("show-stops").checked`)) === false, "and the Show control still works, without remembering");
+  await send("Page.removeScriptToEvaluateOnNewDocument", { identifier: blocker.identifier });
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden && !!document.getElementById("show-stops")`, "the app with storage back");
+  for (const k of ["stations", "routes", "stops"]) await toggleLayer(k, true);
+
+  // ================================================================ 6. stops sharing a point
+  await go("#/");
+  await setView(live.lat, live.lon, 18);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => m.loadedStops().some((s) => s.stop_id === ${JSON.stringify(S)}))`, "the stops around the reviewed stop");
+  await sleep(500);
+  const stack = (await stopMarkers()).find((m) => m.ids.includes(S));
+  check(!!stack && stack.ids.length >= 3, `the reviewed stop shares its point: one marker stands for ${stack ? stack.ids.length : 0} stops`);
+  check(await evaluate(`[...document.querySelectorAll(".stack-badge")].some((b) => b.textContent === ${JSON.stringify(String(stack.ids.length))})`), "the marker carries a badge with how many stops it holds");
+  check(await evaluate(`[...document.querySelectorAll(".leaflet-tooltip.stop-label")].filter((e) => e.style.opacity !== "0").length > 0`), "name labels are still drawn beside the badges at zoom 18");
+  await clickMapAt(stack.lat, stack.lon);
+  await waitFor(`document.querySelectorAll(".stack-picker .stack-item").length === ${stack.ids.length}`, "the chooser listing every stop at the point");
+  const offered = await evaluate(`[...document.querySelectorAll(".stack-picker .stack-item")].map((b) => ({ id: b.dataset.stop, text: b.innerText }))`);
+  check(offered.every((o) => o.text.includes(o.id)) && offered.some((o) => /\d+ routes?/.test(o.text)), "each is listed by name, id and route count");
+  check((await evaluate("location.hash")) === "#/", "clicking a marker of several stops opens none of them by itself");
+  const second = offered[1].id;
+  await clickSel(`.stack-picker .stack-item[data-stop="${second}"]`, "the second stop in the chooser");
+  await waitFor(`location.hash === ${JSON.stringify(`#/stop/${second}`)}`, "the second stop's panel");
+  check((await evaluate("location.hash")) === `#/stop/${second}`, "the chooser opens the second stop, which a plain click could never reach");
+  check(!(await has(".stack-picker")), "the chooser closes once a stop is chosen");
+  // a stop alone on its point still opens straight away
+  const lone = await api("feeds/chennai_bus/stops/f68ae67c0a");
+  await setView(lone.lat, lone.lon, 18);
+  await waitStopDrawn("f68ae67c0a");
+  await sleep(300);
+  const loneMarker = (await stopMarkers()).find((m) => m.ids.includes("f68ae67c0a"));
+  if (loneMarker && loneMarker.ids.length === 1) {
+    await clickMapAt(lone.lat, lone.lon);
+    await waitFor(`location.hash === "#/stop/f68ae67c0a"`, "a single stop opening directly");
+    check(!(await has(".stack-picker")), "a stop alone on its point opens directly, with no chooser");
+  }
+  // with stops hidden a station that shares the point is reached directly
+  await toggleLayer("stops", false);
+  await go("#/");
+  await setView(station.lat, station.lon, 18);
+  await waitFor(`import(${JSON.stringify(MAPJS)}).then((m) => m.loadedStops().some((s) => s.stop_id === "stn_r4_shared"))`, "the station on the map");
+  await sleep(400);
+  const stationMarker = (await stopMarkers()).find((m) => m.ids.includes("stn_r4_shared"));
+  check(!!stationMarker && stationMarker.ids.length === 1, "with Stops off the station's marker holds only the station");
+  await clickMapAt(station.lat, station.lon);
+  await waitFor(`location.hash === "#/stop/stn_r4_shared"`, "the station opened directly");
+  check(!(await has(".stack-picker")), "the chooser only counts what is shown");
+  await toggleLayer("stops", true);
+
+  // ================================================================ 2. a station once, not each platform
+  await go(`#/stop/${S}`);
+  await waitFor(`!!document.querySelector(".nearby-stops .station-entry")`, "the nearby list with the station folded");
+  const near = await text(".nearby-stops");
+  check(near.includes(`2 of these are already platforms of ${station.name}`), "the nearby list says 2 of its entries are already platforms of the station");
+  check(await has(`.nearby-stops .platforms-note a[href="#/stop/stn_r4_shared"]`), "and links the station");
+  check((await evaluate(`document.querySelectorAll(".nearby-stops .station-entry").length`)) === 1, "the station is listed once");
+  check(await evaluate(`${JSON.stringify(platforms.map((x) => x.stop_id))}.every((id) => ![...document.querySelectorAll(".nearby-stops > div > ul.list > li:not(.station-entry) > a")].some((a) => a.getAttribute("href") === "#/stop/" + id))`), "its platforms are not also listed as bare stops");
+  check(await evaluate(`document.querySelectorAll(".nearby-stops .platforms-fold li").length === 2 && !document.querySelector(".nearby-stops .platforms-fold").open`), "the platforms are one click away, folded under the station");
+  const foldedRows = live.nearby.filter((n) => n.parent_station === "stn_r4_shared" || n.stop_id === "stn_r4_shared").length;
+  check((await evaluate(`document.querySelectorAll(".nearby-stops > div > ul.list > li").length`)) === live.nearby.length - foldedRows + 1, `the ${foldedRows} rows of the station and its platforms (of ${live.nearby.length} from the API) became one entry`);
+  await shot("30-nearby-station-once");
+
+  // ================================================================ 5. cleanup context
+  await waitFor(`!!document.querySelector(".cleanup-context:not([hidden])")`, "the cleanup context of the stop");
+  const ctx = await api(`feeds/chennai_bus/stops/${S}/context`);
+  const ctxText = await text(".cleanup-context");
+  check(ctxText.includes("Detour") && ctxText.includes(distance(ctx.detour_m)) && ctxText.includes("How much further"), `the context shows the detour (${distance(ctx.detour_m)}) and says in plain words what it means`);
+  check(ctxText.includes("Coordinate reviews (1)") && (await has(`.cleanup-context a[href="#/coordinates/${main.review_id}"]`)), "it counts the coordinate reviews naming the stop and links into the Coordinates page");
+  check(ctxText.includes(`Same-named stops nearby (${ctx.same_name.length})`), `it lists the same-named stops nearby (${ctx.same_name.length})`);
+  if (ctx.same_name.length) {
+    check((await countLayers("faintStop", null)) === ctx.same_name.length, "each same-named stop is a faint marker on the map");
+    check(ctx.same_name.every((n) => ctxText.includes(distance(n.distance_m))) && /\d+ routes?/.test(ctxText), "with its distance and route count");
+    if (ctx.same_name.some((n) => n.parent_station === "stn_r4_shared")) check(ctxText.includes("already") && (await has(`.cleanup-context .station-entry`)), "and a same-named platform is shown through its station, once");
+  }
+  // an older server has no such endpoint: the section is simply not there
+  await evaluate(`fetch("/__dev/context", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ off: true }) }).then(() => true)`);
+  const errorsBefore = consoleErrors.length;
+  await go("#/");
+  await go(`#/stop/${S}`);
+  await waitFor(`document.querySelector(".cleanup-context")?.dataset.context === "unavailable"`, "the context endpoint answering 404");
+  check(await evaluate(`document.querySelector(".cleanup-context").hidden && !document.querySelector("#toasts .toast.error")`), "when the endpoint is a 404 the section is hidden, without an error");
+  check((await text("#panel")).includes("Routes stopping here") && (await has(".nearby-stops .station-entry")), "and the rest of the stop page is as usual");
+  // the browser itself logs a failed fetch; that one line is expected here
+  consoleErrors.splice(errorsBefore, consoleErrors.length - errorsBefore, ...consoleErrors.slice(errorsBefore).filter((e) => !/404/.test(String(e))));
+  await evaluate(`fetch("/__dev/context", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ off: false }) }).then(() => true)`);
+  // the route
+  await go(`#/route/${viaRoute}`);
+  await waitFor(`!!document.querySelector(".cleanup-context:not([hidden])")`, "the cleanup context of the route");
+  const rctx = await api(`feeds/chennai_bus/routes/${viaRoute}/context`);
+  const rText = await text(".cleanup-context");
+  check(rText.includes(`Stops under coordinate review (${rctx.stops_with_reviews.length})`) && (await has(`.cleanup-context a[href="#/coordinates/${main.review_id}"]`)), "the route's context lists its stops under coordinate review, linked");
+  check((await evaluate(`document.querySelectorAll(".ladder .chip.under-review").length`)) === rctx.stops_with_reviews.filter((f) => f.status === "pending").length, "rows whose stop has a pending review are marked in the stop list");
+  check(rText.includes("Longest detours") && rctx.worst_detours.every((w) => rText.includes(distance(w.detour_m))), `and it lists the worst detours (${rctx.worst_detours.length})`);
+  await shot("31-route-context");
+
+  // ================================================================ 4. the trail
+  await clickSel('[data-nav="map"]', "Map in the top bar");
+  await waitFor(`location.hash === "#/"`, "the map page");
+  check(await evaluate(`document.getElementById("trail").classList.contains("is-empty")`), "a top-level page has no trail to show");
+  await go(`#/route/${viaRoute}`);
+  await waitFor(`document.querySelectorAll(".ladder .row.clickable").length > 2`, "the route for the trail");
+  const routeName = (await api(`feeds/chennai_bus/routes/${viaRoute}`)).short_name;
+  await waitFor(`document.querySelectorAll("#trail .trail-list li").length === 2`, "a trail of two");
+  check((await text("#trail")).includes("Map") && (await text("#trail .trail-here")) === routeName, `the trail reads Map › ${routeName}`);
+  await evaluate(`document.querySelectorAll(".ladder .row.clickable")[1].click(); true`);
+  await waitFor(`location.hash.startsWith("#/stop/") && document.getElementById("panel").innerText.includes("Routes stopping here")`, "a stop opened from the route");
+  const trailStop = await evaluate("location.hash");
+  await waitFor(`document.querySelectorAll("#trail .trail-list li").length === 3`, "a trail of three");
+  const otherRoute = await evaluate(`[...document.querySelectorAll('#panel a[href^="#/route/"]')].map((a) => a.getAttribute("href")).find((x) => x !== ${JSON.stringify(`#/route/${viaRoute}`)}) || null`);
+  if (otherRoute) {
+    await go(otherRoute);
+    await waitFor(`document.querySelectorAll("#trail .trail-list li").length === 4`, "a trail of four: route, stop, another route");
+    check((await trailNow()).length === 4, "drilling down grows the trail: Map › route › stop › another route");
+    check(!(await has("#panel a.crumb")), "with a trail to go back along, the panel has no second back link");
+    // going to a place already in the trail goes BACK to it
+    await go(`#/route/${viaRoute}`);
+    await waitFor(`document.querySelectorAll("#trail .trail-list li").length === 2`, "the trail popped back to the first route");
+    check((await trailNow()).length === 2, "opening a place already in the trail pops back to it instead of growing");
+    await go(trailStop);
+    await go(otherRoute);
+    // a crumb pops to itself
+    await evaluate(`[...document.querySelectorAll("#trail .trail-list a")].find((a) => a.getAttribute("href") === ${JSON.stringify(trailStop)}).click(); true`);
+    await waitFor(`location.hash === ${JSON.stringify(trailStop)} && document.querySelectorAll("#trail .trail-list li").length === 3`, "the trail after clicking a crumb");
+    check((await trailNow()).length === 3, "clicking a crumb pops the trail to it");
+  }
+  // it lasts for the session: a reload keeps it, and it is not in localStorage
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden && document.querySelectorAll("#trail .trail-list li").length === 3`, "the trail after a reload");
+  check(await evaluate(`!!sessionStorage.getItem("gtfs-editor-trail") && !Object.keys(localStorage).some((k) => (localStorage.getItem(k) || "").includes(${JSON.stringify(trailStop)}))`), "the trail survives a reload in sessionStorage, and nothing of it is in localStorage");
+  // the one Back control
+  await clickSel("#trail .trail-back", "Back on the trail");
+  await waitFor(`location.hash === ${JSON.stringify(`#/route/${viaRoute}`)}`, "one step back");
+  check((await trailNow()).length === 2, "Back goes one step up the trail");
+  // it is capped
+  const many = (await api(`feeds/chennai_bus/routes/${viaRoute}`)).rows.filter((x) => x.stop_id).map((x) => x.stop_id);
+  const distinct = [...new Set(many)].slice(0, 10);
+  for (const id of distinct) await go(`#/stop/${id}`);
+  const capped = await trailNow();
+  check(distinct.length < 8 || (capped.length === 8 && capped[0].label === "Map"), `the trail is capped (${capped.length} of ${distinct.length + 2} places), keeping where it started`);
+  // a search result starts a new trail
+  await type("#search-input", live.stop_id);
+  await waitFor(`document.querySelectorAll(".search-item").length > 0`, "search results for the trail");
+  await evaluate(`document.querySelector(".search-item").dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); true`);
+  await waitFor(`location.hash === ${JSON.stringify(`#/stop/${S}`)}`, "the searched stop");
+  await sleep(400);
+  check((await trailNow()).length === 1 && await evaluate(`document.getElementById("trail").classList.contains("is-empty")`), "a search result starts a new trail");
+  check(await has("#panel a.crumb"), "and with no trail the panel offers its own way back");
+  await type("#search-input", "");
+
+  // ================================================================ 5b. the tool's verdict, candidates, merge
+  await go("#/coordinates");
+  await waitFor(`!!document.querySelector(".filter-chips:not([hidden])")`, "the tool's verdicts as filter chips");
+  const sums = await api("feeds/chennai_bus/position-reviews/summary");
+  const chipsText = await text(".filter-chips");
+  check(sums.auto_fix && sums.auto_fix.merge === 1 && sums.auto_fix.move === 1 && sums.auto_fix.choose === 1, `the summary counts the tool's verdicts (${JSON.stringify(sums.auto_fix)})`);
+  check([["Merge", "merge"], ["Move", "move"], ["Choose", "choose"], ["No fix", "none"]].every(([label, k]) => chipsText.replace(/\s+/g, "").includes(`${label.replace(" ", "")}${sums.auto_fix[k].toLocaleString("en-IN")}`)), `the chips show each verdict with its count (${chipsText.replace(/\s+/g, " ")})`);
+  await clickSel('.filter-chips [data-auto-fix="merge"]', "the Merge chip");
+  await waitFor(`document.querySelectorAll(".proposal-item").length === 1`, "only the reviews the tool would merge");
+  check((await text(".proposal-item")).includes(main.stop_name) && (await text(".proposal-item")).includes("tool: merge"), "the Merge chip narrows the list to the review the tool would merge");
+  await clickSel('.filter-chips [data-auto-fix="any"]', "the Anything chip");
+  await waitFor(`document.querySelectorAll(".proposal-item").length > 1`, "every review again");
+
+  await go(`#/coordinates/${main.review_id}`);
+  await waitFor(`!!document.querySelector(".auto-fix")`, "the tool's verdict on the review");
+  const banner = await text(".auto-fix");
+  const fix = main.evidence.auto_fix;
+  check(banner.includes("The tool suggests merging into") && banner.includes(fix.into_stop_id) && banner.includes(`detour ${distance(fix.detour_m)} → ${distance(fix.detour_m_after)}`), `the banner gives the verdict and the detour before and after (${distance(fix.detour_m)} → ${distance(fix.detour_m_after)})`);
+  check(banner.includes(fix.reason.slice(0, 40)), "and the tool's reason");
+  check((await evaluate(`document.querySelectorAll(".candidate").length`)) === candidates.length && (await countLayers("candidateStop", null)) === candidates.length, `the ${candidates.length} same-named candidates are a list and markers on the map`);
+  check(candidates.every((c) => true) && (await text(".candidates")).includes(candidates[0].name) && (await text(".candidates")).includes(distance(candidates[0].distance_m)), "each candidate shows its name and distance");
+  // the sharing list folds the station's platforms too
+  await waitFor(`!!document.querySelector("#panel .platforms-note")`, "the stops sharing its point, with the station folded");
+  check((await text("#panel .platforms-note")).includes(`already platforms of ${station.name}`) && (await has(`#panel .platforms-note a[href="#/stop/stn_r4_shared"]`)), "the stops that shared its point name the station once, linked, not its two platforms");
+  await shot("32-review-candidates");
+
+  // ================================================================ 3. undo and redo (nothing here is in a draft)
+  const auditBefore = await newestAudit();
+  const c0 = candidates[0];
+  await clickSel(`#use-candidate-${c0.stop_id}`, "Use this position on the first candidate");
+  await sleep(500);
+  const onCandidate = await reviewPin();
+  check(onCandidate && metres(onCandidate.lat, onCandidate.lon, c0.lat, c0.lon) < 0.5, "Use this position puts the pin on the candidate");
+  check(await has("#panel .undo-row"), "Undo and Redo buttons sit where the pin is edited");
+  await setView(live.lat, live.lon, 17);
+  const aside = await mapCall(`const s = map.getSize(); const q = map.containerPointToLatLng([s.x / 2 + 90, s.y / 2 + 70]); return { lat: q.lat, lon: q.lng };`);
+  await clickMapAt(aside.lat, aside.lon);
+  const moved = await reviewPin();
+  check(moved && metres(moved.lat, moved.lon, c0.lat, c0.lon) > 1, "a click on the map moves the pin");
+  await undoKey();
+  const undone = await reviewPin();
+  check(undone && metres(undone.lat, undone.lon, c0.lat, c0.lon) < 0.5, "Ctrl+Z puts the pin back where it was");
+  check((await lastToastText()).includes("Undid: moved the pin"), "a small hint says what was undone");
+  await undoKey();
+  check((await reviewPin()) === null && (await text("#panel")).includes("No new position yet"), "a second Ctrl+Z takes the pin off again");
+  await redoKey();
+  const redone = await reviewPin();
+  check(redone && metres(redone.lat, redone.lon, c0.lat, c0.lon) < 0.5, "Ctrl+Shift+Z redoes the placement");
+  await blurAll();
+  await pressKey("y", { ctrl: true });
+  const redone2 = await reviewPin();
+  check(redone2 && metres(redone2.lat, redone2.lon, moved.lat, moved.lon) < 0.5 && (await lastToastText()).includes("Redid: moved the pin"), "Ctrl+Y redoes too");
+  // inside a text field the browser's own undo is left alone
+  await evaluate(`(() => { window.__prevented = null; document.addEventListener("keydown", (ev) => { if (ev.key.toLowerCase() === "z") setTimeout(() => { window.__prevented = ev.defaultPrevented; }, 0); }); const el = document.getElementById("review-note"); el.focus(); return true; })()`);
+  await send("Input.insertText", { text: "typed note" });
+  await pressKey("z", { meta: true, commands: ["undo"] });
+  check((await evaluate("window.__prevented")) === false, "with the caret in a text field the shortcut is not taken from the browser");
+  check((await evaluate(`document.getElementById("review-note").value`)) === "", "and the browser's own undo of the typing works");
+  const stillThere = await reviewPin();
+  check(stillThere && metres(stillThere.lat, stillThere.lon, moved.lat, moved.lon) < 0.5, "the pin did not move for an undo meant for the text");
+  // checkboxes: a review of a stop with several routes
+  let multi = null;
+  for (const rv of (await api("feeds/chennai_bus/position-reviews?status=pending&limit=500")).items.reverse()) {
+    if (rv.review_id === main.review_id) continue;
+    const d = await api(`position-reviews/${rv.review_id}`);
+    if (d.stop && !d.stop.deleted && !d.problems.length && new Set(d.routes.map((l) => l.route_id)).size >= 2) { multi = d; break; }
+  }
+  check(!!multi, "set-up: a review of a stop with several routes");
+  // another entity: what could be undone on the last review is gone
+  await evaluate(`location.hash = ${JSON.stringify(`#/coordinates/${multi.review_id}`)}; true`);
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("Leave without saving")`, "the leave question for the unsaved pin");
+  await click("Leave without saving", "dialog");
+  await waitFor(`document.querySelectorAll(".split-route input").length >= 2`, "the review with route checkboxes");
+  await undoKey();
+  check((await lastToastText()).includes("Nothing to undo") && (await reviewPin()) === null, "opening another review starts with nothing to undo");
+  const before = await evaluate(`[...document.querySelectorAll(".split-route input:checked")].length`);
+  await evaluate(`(() => { const b = [...document.querySelectorAll(".split-route input")].find((x) => !x.checked); b.click(); return true; })()`);
+  await sleep(300);
+  check((await evaluate(`[...document.querySelectorAll(".split-route input:checked")].length`)) === before + 1, "a route is ticked");
+  await undoKey();
+  check((await evaluate(`[...document.querySelectorAll(".split-route input:checked")].length`)) === before, "Ctrl+Z unticks it");
+  await clickSel('#panel .undo-row [data-undo="redo"]', "the Redo button");
+  check((await evaluate(`[...document.querySelectorAll(".split-route input:checked")].length`)) === before + 1, "the Redo button ticks it again");
+  await clickSel('#panel .undo-row [data-undo="undo"]', "the Undo button");
+  check((await newestAudit()) === auditBefore, "none of that touched the database: no audit entry, no draft");
+
+  // the stop list editor: row operations, in a draft of its own
+  await go(`#/route/${viaRoute}`);
+  await waitFor(`document.body.innerText.includes("Edit stop list")`, "route actions for the editor");
+  await click("Edit stop list");
+  await chooseNewDraft("Smoke: round 4");
+  await waitFor(`document.querySelectorAll(".ladder.editing .row").length > 3`, "the stop list editor");
+  const r4Draft = await activeDraftId();
+  const auditInEditor = await newestAudit();
+  check(await has("#panel .undo-row"), "the stop list editor has Undo and Redo buttons");
+  const rowCount = await evaluate(`document.querySelectorAll(".ladder.editing .row").length`);
+  // a row is told apart by its stop id: the two kerbs of a road often share a name
+  const rowSig = (i) => evaluate(`(document.querySelector("#row-${i} .row-sub .meta") || document.querySelector("#row-${i} .name")).innerText`);
+  const thirdName = await text("#row-2 .name");
+  const thirdSig = await rowSig(2);
+  const selRow = await evaluate(`[...document.querySelectorAll(".ladder.editing .row")].findIndex((r, k) => k > 2 && !!r.querySelector("select"))`);
+  await clickSel('button[aria-label="Remove stop 3"]', "remove stop 3");
+  check((await evaluate(`document.querySelectorAll(".ladder.editing .row").length`)) === rowCount - 1, "a row is removed");
+  await undoKey();
+  check((await evaluate(`document.querySelectorAll(".ladder.editing .row").length`)) === rowCount && (await rowSig(2)) === thirdSig, "Ctrl+Z brings the removed row back where it was");
+  check((await lastToastText()).startsWith("Undid: removed"), "the hint names the row operation");
+  // two rows that differ (a jump stop may repeat the stop before it)
+  let mv = 0;
+  while (mv < rowCount - 2 && (await rowSig(mv)) === (await rowSig(mv + 1))) mv++;
+  const upperSig = await rowSig(mv), lowerSig = await rowSig(mv + 1);
+  await clickSel(`#row-${mv} button[title="Move down"]`, `move stop ${mv + 1} down`);
+  check((await rowSig(mv)) === lowerSig && (await rowSig(mv + 1)) === upperSig, "a row is moved");
+  const typeBefore = await evaluate(`document.querySelector("#row-${selRow} select").value`);
+  await choose(`#row-${selRow} select`, typeBefore === "JUMP STOP" ? "INTERMEDIATE STOP" : "JUMP STOP");
+  check((await evaluate(`document.querySelector("#row-${selRow} select").value`)) !== typeBefore, "a stop's type is changed in its select");
+  await undoKey();
+  check((await evaluate(`document.querySelector("#row-${selRow} select").value`)) === typeBefore, "Ctrl+Z puts a select back");
+  await undoKey();
+  check((await rowSig(mv)) === upperSig && (await rowSig(mv + 1)) === lowerSig, "and then the move before it");
+  await redoKey();
+  check((await rowSig(mv)) === lowerSig, "Ctrl+Shift+Z redoes the move");
+  await undoKey();
+  const draftNow = await api(`change-sets/${r4Draft}`);
+  check(draftNow.changes.length === 0 && (await newestAudit()) === auditInEditor, "undo and redo in the editor changed nothing in the draft or the database");
+  // saved into the draft: the steps are gone, and Ctrl+Z does not take the change out
+  await clickSel('button[aria-label="Remove stop 3"]', "remove stop 3 for real");
+  await click("Add to draft", ".sticky-actions");
+  await waitFor(`document.body.innerText.includes("Show what is live now")`, "the route with the draft applied");
+  await undoKey();
+  check((await api(`change-sets/${r4Draft}`)).changes.length === 1, "Ctrl+Z never removes a change that is already in a draft");
+
+  // a stop's pin
+  const pinStop = await api("feeds/chennai_bus/stops/b9f23c05b1");
+  await go("#/stop/b9f23c05b1");
+  await waitFor(`document.body.innerText.includes("Edit stop")`, "the stop whose pin is dragged");
+  await click("Edit stop");
+  await waitFor(`!!document.getElementById("stop-lat")`, "the stop editor for the pin");
+  await sleep(700);
+  const latBefore = await evaluate(`document.getElementById("stop-lat").value`);
+  const pinBox2 = await evaluate(`(() => { const r = document.querySelector(".stop-pin").getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
+  await mouseDrag(pinBox2.x, pinBox2.y, pinBox2.x + 50, pinBox2.y + 40);
+  const latDragged = await evaluate(`document.getElementById("stop-lat").value`);
+  check(latDragged !== latBefore, "dragging the stop's pin changes its latitude");
+  await undoKey();
+  check((await evaluate(`document.getElementById("stop-lat").value`)) === latBefore && (await text("#panel")).includes("Not moved"), "Ctrl+Z puts the dragged pin back exactly");
+  await redoKey();
+  check((await evaluate(`document.getElementById("stop-lat").value`)) === latDragged, "Ctrl+Shift+Z drags it out again");
+  // a field, once left, is one step
+  await type("#stop-name", "R4 RENAMED STOP");
+  await undoKey();
+  check((await evaluate(`document.getElementById("stop-name").value`)) === pinStop.name, "a whole field commit is undone in one step");
+  await redoKey();
+  check((await evaluate(`document.getElementById("stop-name").value`)) === "R4 RENAMED STOP", "and redone");
+
+  // ================================================================ 7. pending in the draft, on the pages it changes
+  // stop/update: moved and renamed
+  await click("Add to draft", ".sticky-actions");
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the stop shown as the draft leaves it");
+  const moveChange = (await api(`change-sets/${r4Draft}`)).changes.find((c) => c.entity === "stop" && c.entity_key === "b9f23c05b1");
+  const stopPage = await text("#panel");
+  check(stopPage.includes(`Pending in draft “Smoke: round 4”, not live`) && stopPage.includes("changes this stop"), "a stop changed in the draft is labelled pending, not live");
+  check((await text("#panel h1")).includes("R4 RENAMED STOP") && (await text("#panel h1 .live-value")).includes(pinStop.name), "it shows the drafted name with the live one beside it");
+  check(stopPage.includes(moveChange.after.lat.toFixed(6)) && (await text("#panel .facts .live-value")).includes(pinStop.lat.toFixed(6)), "and the drafted position with the live one");
+  check((await countLayers("draftedKind", "drafted")) === 1 && (await countLayers("draftedKind", "live")) === 1, "the map marks the drafted position and a ghost on the live one");
+  await waitStopDrawn("b9f23c05b1");
+  await sleep(400);
+  const areaMarker = (await stopMarkers()).find((m) => m.ids.includes("b9f23c05b1"));
+  check(areaMarker && metres(areaMarker.lat, areaMarker.lon, moveChange.after.lat, moveChange.after.lon) < 0.5 && (await countLayers("ghostOf", "b9f23c05b1")) === 1, "the map's area stops draw it at the drafted position, with its live place ghosted");
+  await shot("33-stop-pending");
+  // the context now knows the draft and the history
+  await waitFor(`document.querySelector(".cleanup-context")?.innerText.includes("Open drafts touching it (1)")`, "the open draft in the stop's context");
+  check((await text(".cleanup-context")).includes("Smoke: round 4") && (await text(".cleanup-context")).includes("Added a change"), "the context lists the open draft, and history in the words the History page uses");
+
+  // stop/create: a stop that is not live is viewable
+  const made = await apiSend("POST", `change-sets/${r4Draft}/changes`, { entity: "stop", op: "create", entity_key: "r4_new_stop", after: { stop_id: "r4_new_stop", name: "R4 New Stop", lat: pinStop.lat + 0.001, lon: pinStop.lon + 0.001 } });
+  check(made.status === 201, "set-up: a stop created in the draft");
+  await refreshUiDraft();
+  await go("#/stop/r4_new_stop");
+  await waitFor(`document.getElementById("panel").innerText.includes("R4 New Stop")`, "the stop that exists only in the draft");
+  check((await text("#panel")).includes("Pending in draft “Smoke: round 4”, not live") && (await text("#panel")).includes("Creates it"), "a stop created in the draft can be opened, labelled pending");
+  // stop/delete
+  const doomed = distinct.find((id) => id !== S && id !== "b9f23c05b1");
+  check((await apiSend("POST", `change-sets/${r4Draft}/changes`, { entity: "stop", op: "delete", entity_key: doomed, after: null })).status === 201, "set-up: a stop deleted in the draft");
+  await refreshUiDraft();
+  await go(`#/stop/${doomed}`);
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the stop the draft deletes");
+  check((await text("#panel .notice.pending")).includes("deletes this stop") && (await text("#panel .notice.pending")).includes("still live"), "a stop deleted in the draft says so, and that it is still live");
+  // station/create, seen from the station and from a member
+  const pair = (await api(`feeds/chennai_bus/stops/${doomed}`)).nearby.filter((n) => n.location_type === 0 && !n.parent_station).slice(0, 2);
+  const members = pair.length === 2 ? pair : [await api("feeds/chennai_bus/stops/CHNS03131"), await api("feeds/chennai_bus/stops/f68ae67c0a")];
+  const stationMade = await apiSend("POST", `change-sets/${r4Draft}/changes`, { entity: "station", op: "create", entity_key: "stn_r4_new",
+    after: { station_id: "stn_r4_new", name: "R4 New Station", lat: members[0].lat, lon: members[0].lon, members: members.map((m, i) => ({ stop_id: m.stop_id, platform_code: `Bay ${i + 1}` })) } });
+  if (stationMade.status === 201) {
+    await refreshUiDraft();
+    await go("#/stop/stn_r4_new");
+    await waitFor(`document.getElementById("panel").innerText.includes("R4 New Station")`, "the station that exists only in the draft");
+    check((await text("#panel")).includes("Pending in draft") && (await text("#panel")).includes("Stops it will group (2)"), "a station created in the draft can be opened, with the stops it will group");
+    await go(`#/stop/${members[0].stop_id}`);
+    await waitFor(`!!document.querySelector("#panel .notice.pending")`, "a member of the new station");
+    check((await text("#panel")).includes("Joins station") && (await text("#panel")).includes("Bay 1"), "its member says it joins the station, with its platform label");
+  } else {
+    check(false, `set-up: a station created in the draft (${JSON.stringify(stationMade.body)})`);
+  }
+  // station/update, then station/delete
+  const renamed = await apiSend("POST", `change-sets/${r4Draft}/changes`, { entity: "station", op: "update", entity_key: "stn_r4_shared", after: { name: "R4 Renamed Station" } });
+  check(renamed.status === 201, "set-up: a station renamed in the draft");
+  await refreshUiDraft();
+  await go("#/stop/stn_r4_shared");
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the renamed station");
+  check((await text("#panel h1")).includes("R4 Renamed Station") && (await text("#panel h1 .live-value")).includes(station.name), "a station renamed in the draft shows the new name and the live one");
+  await apiSend("DELETE", `change-sets/${r4Draft}/changes/${renamed.body.change_id}`);
+  check((await apiSend("POST", `change-sets/${r4Draft}/changes`, { entity: "station", op: "delete", entity_key: "stn_r4_shared", after: null })).status === 201, "set-up: the station dissolved in the draft");
+  await refreshUiDraft();
+  await go("#/");
+  await go("#/stop/stn_r4_shared");
+  await waitFor(`document.querySelector("#panel .notice.pending")?.innerText.includes("dissolves this station")`, "the dissolved station");
+  check(true, "a station dissolved in the draft says so");
+  await go(`#/stop/${platforms[0].stop_id}`);
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "a platform of the dissolved station");
+  check((await text("#panel")).includes("Leaves station") && (await text("#panel")).includes("Leaves its station in the draft"), "and its platform says it leaves the station");
+  // route/update and route_stops/replace
+  const liveRoute = await api(`feeds/chennai_bus/routes/${viaRoute}`);
+  check((await apiSend("POST", `change-sets/${r4Draft}/changes`, { entity: "route", op: "update", entity_key: viaRoute, after: { long_name: "R4 RENAMED ROUTE", color: "#1F5FBF" }, base_row_version: liveRoute.row_version })).status === 201, "set-up: the route renamed in the draft");
+  await refreshUiDraft();
+  await go("#/");
+  await go(`#/route/${viaRoute}`);
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the route as the draft leaves it");
+  const routePage = await text("#panel");
+  check(routePage.includes("Pending in draft “Smoke: round 4”, not live") && routePage.includes("R4 RENAMED ROUTE") && (await text("#panel .title-block .live-value")).includes(liveRoute.long_name || "none"), "a route renamed in the draft shows the drafted name with the live one");
+  check(routePage.includes("Taken off the route in the draft") && routePage.includes(thirdName), "the stop the draft takes off the route is named");
+  check((await evaluate(`document.querySelectorAll(".ladder .row:not(.marker)").length`)) === liveRoute.rows.filter((x) => x.stop_type !== "ROUTE CORRECTION").length - 1, "the stop list is the drafted one");
+  check((await countLayers("routeLine", "proposal")) > 0, "the live route stays on the map, dashed, under the drafted one");
+  await click("Show what is live now");
+  await waitFor(`document.getElementById("panel").innerText.includes("Show it with my draft")`, "the live route");
+  check((await evaluate(`document.querySelectorAll(".ladder .row:not(.marker)").length`)) === liveRoute.rows.filter((x) => x.stop_type !== "ROUTE CORRECTION").length && !(await text("#panel h1, #panel .title-block")).includes("R4 RENAMED ROUTE"), "Show what is live now shows the route without the draft");
+  await shot("34-route-pending");
+
+  // the merge from the review, into the same draft
+  await go(`#/coordinates/${main.review_id}`);
+  await waitFor(`!!document.getElementById("merge-candidate-${c0.stop_id}")`, "the review with its merge buttons");
+  // refusals first, straight at the API: a station is not a stop to merge into
+  const refused = await apiSend("POST", `position-reviews/${main.review_id}/merge`, { change_set_id: r4Draft, into_stop_id: "stn_r4_shared" });
+  check(refused.status === 400 && refused.body.error.code === "review_has_problems" && refused.body.error.details.problems.length > 0, "the merge endpoint refuses a station with review_has_problems and the problems");
+  await clickSel(`#merge-candidate-${c0.stop_id}`, "Merge into this stop on the first candidate");
+  await waitFor(`!!document.getElementById("merge-confirm")`, "the merge question");
+  check((await text("dialog")).includes(c0.stop_id) && (await text("dialog")).includes("switches to"), "the question says which stop stays and what happens to the routes");
+  await clickSel("#merge-confirm", "Add merge to draft");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes("Merged")`, "a toast confirms the merge");
+  await waitFor(`document.querySelector(".draft-actions")?.innerText.includes("Merges this stop into")`, "the merge among the review's actions");
+  const merged = await api(`position-reviews/${main.review_id}`);
+  check(merged.status === "approved" && merged.draft_actions.length === 1 && merged.draft_actions[0].kind === "merge" && merged.draft_actions[0].into_stop_id === c0.stop_id, "the review is approved with a merge action in the draft");
+  const mergeChange = (await api(`change-sets/${r4Draft}`)).changes.find((c) => c.entity === "stop" && c.op === "merge");
+  check(!!mergeChange && mergeChange.entity_key === S && mergeChange.after.into_stop_id === c0.stop_id && mergeChange.after.position_review_id === main.review_id, "the draft has the stop/merge change, tied to the review");
+  check(await evaluate(`document.getElementById("review-move").disabled && document.getElementById("why-move").innerText.includes("merged into")`), "Move is off: the stop is merged away in this draft");
+  check((await legKinds()).drafted > 0, "the routes are drawn to the stop that stays");
+  const again = await apiSend("POST", `position-reviews/${main.review_id}/merge`, { change_set_id: r4Draft, into_stop_id: c0.stop_id });
+  check(again.status === 409 && again.body.error.code === "draft_conflict", "a second merge of the same review is a 409 draft_conflict");
+  await shot("35-review-merged");
+  // both stops say what the draft does to them
+  await go(`#/stop/${S}`);
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the stop that is merged away");
+  check((await text("#panel .notice.pending")).includes(`merges this stop into ${c0.stop_id}`), "the stop being merged says it will be merged into the other");
+  await go(`#/stop/${c0.stop_id}`);
+  await waitFor(`!!document.querySelector("#panel .notice.pending")`, "the stop that stays");
+  check((await text("#panel .notice.pending")).includes("is merged into this stop") && (await text("#panel .notice.pending")).includes(S), "and the stop that stays says which stop is merged into it");
+  // taking the change out of the draft, the normal way, takes the overlay with it
+  await apiSend("DELETE", `change-sets/${r4Draft}/changes/${mergeChange.change_id}`);
+  check((await api(`position-reviews/${main.review_id}`)).status === "pending", "removing the merge from the draft returns the review to pending");
+  await refreshUiDraft();
+  await go("#/");
+  await go(`#/stop/${c0.stop_id}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Routes stopping here")`, "the stop that stays, after the merge was removed");
+  check(!(await has("#panel .notice.pending")), "once the change is out of the draft, the page stops showing it");
+  // another active draft: the overlay follows it
+  await clickSel("#draft-chip", "the draft chip");
+  await click("Stop using a draft", "dialog");
+  await go("#/");
+  await go("#/stop/b9f23c05b1");
+  await waitFor(`document.getElementById("panel").innerText.includes("Routes stopping here")`, "the moved stop with no draft open");
+  check(!(await has("#panel .notice.pending")) && (await text("#panel h1")).trim() === pinStop.name, "with no draft open the stop is shown as it is live");
+  await sleep(500);
+  const liveMarker = (await stopMarkers()).find((m) => m.ids.includes("b9f23c05b1"));
+  check(liveMarker && metres(liveMarker.lat, liveMarker.lon, pinStop.lat, pinStop.lon) < 0.5, "and the map draws it where it is live");
+  // leave nothing behind for a later flow
+  await apiSend("POST", `change-sets/${r4Draft}/discard`, {});
+}
+
+// ---- only round 4
+if (process.argv.includes("--round4")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await round4Flows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of round 4 (UX)
 
 // ------------------------------------------------------------------ flows
 try {
@@ -584,18 +1169,18 @@ try {
   await waitFor(`document.getElementById("panel").innerText.includes("New station")`, "new station editor");
   await setView((gateA.lat + gateB.lat) / 2, (gateA.lon + gateB.lon) / 2, 19);
   await waitStopDrawn("CHNS03131");
-  await clickMapAt(gateA.lat, gateA.lon);
+  await clickStopOnMap(gateA);
   await waitFor(`!!document.getElementById("platform-CHNS03131")`, "first member from a map click");
-  await clickMapAt(gateB.lat, gateB.lon);
+  await clickStopOnMap(gateB);
   await waitFor(`!!document.getElementById("platform-CHNS06298")`, "second member from a map click");
   check((await evaluate(`document.getElementById("station-id").value`)) === "stn_CHNS03131", "the station id is made from the first stop");
   // finding a stop by name, then giving up, leaves clicking on the map working
   await click("Find a stop to add", "#panel");
   await waitFor(`!!document.querySelector("#panel .picker input")`, "the station's stop finder");
   await click("Cancel", "#panel .picker");
-  await clickMapAt(gateB.lat, gateB.lon);
+  await clickStopOnMap(gateB);
   await waitFor(`!document.getElementById("platform-CHNS06298")`, "a map click takes a stop out again");
-  await clickMapAt(gateB.lat, gateB.lon);
+  await clickStopOnMap(gateB);
   await waitFor(`!!document.getElementById("platform-CHNS06298")`, "a map click puts it back");
   check(true, "clicking stops on the map still adds and removes them after using the stop finder");
   await type("#platform-CHNS03131", "Towards Adam Gate North");
@@ -1242,6 +1827,9 @@ try {
   await go("#/stations");
   await waitFor(`document.getElementById("panel").innerText.includes("Nothing is waiting for review")`, "the stations page by its address");
   check(await evaluate(`document.querySelector('[data-nav="stations"]').offsetParent === null`), "#/stations still opens while its link is hidden");
+
+  // ================================================================ round 4 (UX): see round4Flows above
+  await round4Flows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {
