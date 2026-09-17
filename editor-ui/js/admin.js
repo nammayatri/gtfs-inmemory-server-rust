@@ -222,6 +222,7 @@ export const ACTION_LABEL = {
   station_proposal_returned: "A suggested station went back to review",
   station_proposal_committed: "A suggested station went live",
   position_reviews_loaded: "Coordinates to review were loaded",
+  position_reviews_autofix_planned: "A tool looked for same-named stops that fit the coordinates to review",
   position_review_moved: "Moved a stop from a coordinate review into a draft",
   position_review_split: "Split routes off a stop from a coordinate review into a draft",
   position_review_merged: "Merged a stop from a coordinate review into another stop, in a draft",
@@ -265,6 +266,8 @@ function detailText(a) {
       return `suggestion #${d.proposal_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
     case "position_reviews_loaded":
       return `${n(d.queued, "stop")} to review${d.batch ? ` (${d.batch})` : ""}`;
+    case "position_reviews_autofix_planned":
+      return `${n(d.reviews, "review")}: ${d.merge} to merge, ${d.move} to move, ${d.choose} with candidates to choose from, ${d.none} not helped`;
     case "position_review_returned":
       return `coordinate review #${d.review_id}, stop ${d.stop_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
     case "position_review_moved":

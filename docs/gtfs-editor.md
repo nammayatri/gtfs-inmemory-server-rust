@@ -204,8 +204,11 @@ scripts write `seed`, `release` and `station_proposals_built` (`{batch, proposal
 platforms, diameter_m, base_version}`). Coordinate reviews (section 8) write
 `position_review_moved`, `position_review_split`, `position_review_merged`
 (section 8.2), `position_review_confirmed`, `position_review_reopened`,
-`position_review_returned` and `position_review_committed`, and nandi's loader
-`position_reviews_loaded`. Committing a `feed_config` change ("Feed data source"
+`position_review_returned` and `position_review_committed`, nandi's loader
+`position_reviews_loaded`, and nandi's `editor/autofix_same_name.py`
+`position_reviews_autofix_planned` (`{tool, reviews, fits_m, off_route_m, merge,
+move, choose, none}`) when it stores its candidates on the reviews (section 8.2).
+Committing a `feed_config` change ("Feed data source"
 below) writes `feed_data_source_changed`, detail `{gtfs_id, from, to, change_id,
 change_set_id}`. The dashboard's history has words for every one of these
 (`ACTION_LABEL` in `editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks each action in
@@ -924,6 +927,17 @@ nothing else with it, beyond the list filter and summary counts of section 8):
   "fits"|"no_fit"}]`
 - `evidence.auto_fix: {action: "merge"|"move"|"choose"|"none", into_stop_id?,
   lat?, lon?, detour_m, detour_m_after?, reason, tool, threshold_m}`
+- As nandi's `editor/autofix_same_name.py` writes them (2026-09-17): a candidate
+  also has `same_words` (the two names are the same words once case, initials and
+  abbreviations are read away - only such a candidate is ever picked; one name
+  inside the other is listed only) and `runs_opposite` (its buses head the other
+  way: the facing kerb, never a fit); on a review with `mixed_origins` each
+  candidate names the route group it fits, `fits_route_ids` and
+  `fits_origin_stop_id`, and the action is `choose` - those routes need a split,
+  not a move of the whole stop. `auto_fix` also has `off_route_m`: a review whose
+  stop is closer to its routes than that is `none`, whatever namesakes it has.
+  `move` means "same place, but the id must survive" (a station platform, or the
+  survivor of an earlier merge): `lat`/`lon` are the candidate's point.
 
 **Endpoint.** `POST /position-reviews/{id}/merge`, editor+. Body
 `{change_set_id, into_stop_id, keep_name?: "into"|"from", note?}`. It appends ONE
