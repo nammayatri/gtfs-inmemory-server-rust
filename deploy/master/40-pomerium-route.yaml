@@ -1,0 +1,8 @@
+# Append to routes: in configmap pomerium-v2/pomerium-sso-config (config.yaml).
+  - from: https://gtfs.sso.c2.integ.internal.svc.movingtech.net
+    to: http://gtfs-editor-gims.nandi.svc.cluster.local:8000
+    allowed_domains:
+      - nammayatri.in
+    pass_identity_headers: true
+    preserve_host_header: true
+    timeout: 60s

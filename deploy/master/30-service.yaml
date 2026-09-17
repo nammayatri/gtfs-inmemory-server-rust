@@ -1,0 +1,15 @@
+# Own Service and app label: the shared gtfs-inmemory-data-server Service selects
+# app=gtfs-inmemory-data-server only, so reusing that label would send live
+# in-cluster traffic to this build before it is validated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gtfs-editor-gims
+  namespace: nandi
+spec:
+  selector:
+    app: gtfs-editor-gims
+  ports:
+    - name: app
+      port: 8000
+      targetPort: 8000

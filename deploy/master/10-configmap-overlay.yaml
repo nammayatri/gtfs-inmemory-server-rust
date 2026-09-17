@@ -1,0 +1,24 @@
+# Editor GIMS config: the live master config, imported unchanged, with only the
+# DB-feed and editor settings overridden. No secret values live here - the DB
+# password and the TOTP key come from gtfs-editor-secrets.dhall (k8s secret).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gtfs-editor-gims-config
+  namespace: nandi
+data:
+  gtfs_editor_overlay.dhall: |
+    let base = ./gtfs_in_memory_server_rust.dhall
+    let editor = ./gtfs-editor-secrets.dhall
+    in  base
+      // { internal_database_url = Some "psql://${editor.master_db_user}:${editor.master_db_pass}@10.50.1.3:5432/mtc_internal_master"
+         , gtfs_db_feeds = [ "chennai_bus" ]
+         , gtfs_version_poll_seconds = 5
+         , gtfs_editor_enabled = True
+         , gtfs_editor_pomerium_jwks_url = Some "https://authenticate.c2.integ.internal.svc.movingtech.net/.well-known/pomerium/jwks.json"
+         , gtfs_editor_audience = Some "gtfs.sso.c2.integ.internal.svc.movingtech.net"
+         , gtfs_editor_bootstrap_admins = [ "vignesh.s@nammayatri.in" ]
+         , gtfs_editor_totp_key = Some editor.totp_key
+         , gtfs_editor_session_hours = Some 12
+         , gtfs_editor_ui_dir = Some "./editor-ui"
+         }

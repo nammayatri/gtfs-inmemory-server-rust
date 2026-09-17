@@ -1,0 +1,191 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "gtfs-editor-gims",
+    "namespace": "nandi",
+    "labels": {
+      "app": "gtfs-editor-gims",
+      "version": "IMAGE_VERSION"
+    }
+  },
+  "spec": {
+    "progressDeadlineSeconds": 600,
+    "replicas": 1,
+    "revisionHistoryLimit": 10,
+    "selector": {
+      "matchLabels": {
+        "app": "gtfs-editor-gims"
+      }
+    },
+    "strategy": {
+      "rollingUpdate": {
+        "maxSurge": 5,
+        "maxUnavailable": 0
+      },
+      "type": "RollingUpdate"
+    },
+    "template": {
+      "metadata": {
+        "annotations": {
+          "sidecar.istio.io/inject": "false"
+        },
+        "labels": {
+          "app": "gtfs-editor-gims",
+          "version": "IMAGE_VERSION"
+        }
+      },
+      "spec": {
+        "affinity": {
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [
+                {
+                  "matchExpressions": [
+                    {
+                      "key": "nodepool",
+                      "operator": "In",
+                      "values": [
+                        "memory-optimized"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "containers": [
+          {
+            "args": [
+              "# The shared config references secrets.master_mtc_pass, which GIMS_SECRETS_DHALL\n# lacks; add it from the secret's env var, dhall-escaped, so the base type-checks.\np=\"${master_mtc_pass:-}\"; p=\"${p//\\\\/\\\\\\\\}\"; p=\"${p//\\\"/\\\\\\\"}\"; p=\"${p//\\$/\\\\u0024}\"\nprintf '(%s) // { master_mtc_pass = \"%s\" }\\n' \"$GIMS_SECRETS_DHALL\" \"$p\" > /etc/beckn/config/gtfs-inmemory-data-server-secrets.dhall\necho \"$GTFS_EDITOR_SECRETS_DHALL\" > /etc/beckn/config/gtfs-editor-secrets.dhall\necho \"starting app server\"\n(./gtfs-routes-service | tee --output-error=warn >(/usr/sbin/log-processor --prometheus-port $LP_PROMETHEUS_PORT --kafka-brokers $LP_KAFKA_BROKERS --kafka-producer-prop $LP_KAFKA_PRODUCER_PROP --partition-key $LP_PARTITION_KEY --producer-topic $LP_PRODUCER_TOPIC $LP_EXTRA_ARGS))\n"
+            ],
+            "command": [
+              "/bin/bash",
+              "-c"
+            ],
+            "env": [
+              {
+                "name": "DHALL_CONFIG",
+                "value": "/etc/beckn/config/gtfs_editor_overlay.dhall"
+              },
+              {
+                "name": "RUST_LOG",
+                "value": "info"
+              }
+            ],
+            "envFrom": [
+              {
+                "configMapRef": {
+                  "name": "beckn-configs-logs-test"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "gtfs-inmemory-data-server-secrets"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "gtfs-editor-gims-secrets"
+                }
+              }
+            ],
+            "image": "asia-south1-docker.pkg.dev/ny-sandbox/gtfs-routes-service-rust/gtfs-routes-service-rust:IMAGE_TAG",
+            "imagePullPolicy": "Always",
+            "name": "gtfs-editor-gims",
+            "ports": [
+              {
+                "containerPort": 8000,
+                "name": "app",
+                "protocol": "TCP"
+              }
+            ],
+            "readinessProbe": {
+              "failureThreshold": 2000,
+              "httpGet": {
+                "path": "/ready",
+                "port": 8000,
+                "scheme": "HTTP"
+              },
+              "initialDelaySeconds": 5,
+              "periodSeconds": 5,
+              "successThreshold": 1,
+              "timeoutSeconds": 10
+            },
+            "resources": {
+              "requests": {
+                "cpu": "50m",
+                "memory": "3Gi"
+              }
+            },
+            "securityContext": {
+              "privileged": false
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "name": "dhall-config",
+                "mountPath": "/etc/beckn/config/gtfs_in_memory_server_rust.dhall",
+                "subPath": "gtfs_in_memory_server_rust.dhall"
+              },
+              {
+                "name": "editor-overlay",
+                "mountPath": "/etc/beckn/config/gtfs_editor_overlay.dhall",
+                "subPath": "gtfs_editor_overlay.dhall"
+              }
+            ]
+          }
+        ],
+        "dnsPolicy": "ClusterFirst",
+        "restartPolicy": "Always",
+        "schedulerName": "default-scheduler",
+        "securityContext": {},
+        "terminationGracePeriodSeconds": 90,
+        "tolerations": [
+          {
+            "effect": "NoExecute",
+            "key": "node-type",
+            "operator": "Equal",
+            "value": "memory-optimized"
+          },
+          {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/not-ready",
+            "operator": "Exists",
+            "tolerationSeconds": 300
+          },
+          {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/unreachable",
+            "operator": "Exists",
+            "tolerationSeconds": 300
+          },
+          {
+            "effect": "NoSchedule",
+            "key": "memory-optimized-od-zone-a",
+            "operator": "Equal",
+            "value": "true"
+          }
+        ],
+        "volumes": [
+          {
+            "name": "dhall-config",
+            "configMap": {
+              "name": "gtfs-inmemory-data-server-config",
+              "defaultMode": 420
+            }
+          },
+          {
+            "name": "editor-overlay",
+            "configMap": {
+              "name": "gtfs-editor-gims-config",
+              "defaultMode": 420
+            }
+          }
+        ]
+      }
+    }
+  }
+}
