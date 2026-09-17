@@ -65,7 +65,8 @@ async function freshCode(email) {
 // ------------------------------------------------------------------ CDP
 const profile = mkdtempSync(join(tmpdir(), "gtfs-editor-e2e-chrome-"));
 const chrome = spawn(CHROME, ["--headless=new", "--remote-debugging-port=9334", `--user-data-dir=${profile}`,
-  "--no-first-run", "--window-size=1440,900", "about:blank"], { stdio: "ignore" });
+  "--no-first-run", "--window-size=1440,900", "--disable-background-timer-throttling",
+  "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows", "about:blank"], { stdio: "ignore" });
 let ws, nextId = 1;
 const pending = new Map();
 const consoleErrors = [];
@@ -219,14 +220,16 @@ try {
   await waitFor(`document.querySelectorAll(".ladder.editing .row").length > 10`, "stop list editor");
   const liveWarn = await text("#panel");
   check(!/to fix before submitting/.test(liveWarn), "an unedited route shows no blocking problems");
-  const anchor = await evaluate(`document.querySelectorAll(".ladder.editing .row")[2].querySelector(".row-edit > .meta")?.textContent.trim()`);
-  await evaluate(`document.querySelectorAll(".ladder.editing .row")[2].querySelector('button[title="Insert a stop after this one"]').click()`);
+  // add a stop between stop 3 and stop 4 with the stop picker
+  const anchor = await evaluate(`document.querySelector("#row-2 .row-sub .meta")?.textContent.split(" · ")[0].trim()`);
+  await evaluate(`document.getElementById("add-3").click()`);
   await sleep(300);
-  await type("#insert-search", "PANAIYUR");
-  await waitFor(`[...document.querySelectorAll(".insert-box button")].some(b => b.textContent === "Insert")`, "insert search results");
-  const inserted = await evaluate(`document.querySelector(".insert-box .list-item .sub").textContent.trim()`);
-  const insertedName = await evaluate(`document.querySelector(".insert-box .list-item span:not(.hint):not(.sub)").textContent.trim()`);
-  await click("Insert", ".insert-box");
+  await type(".picker input", "PANAIYUR");
+  await waitFor(`[...document.querySelectorAll(".picker-item")].some((b) => b.innerText.includes("PANAIYUR"))`, "stop picker results");
+  const inserted = await evaluate(`[...document.querySelectorAll(".picker-item")].find((b) => b.innerText.includes("PANAIYUR")).dataset.stop`);
+  const insertedName = await evaluate(`[...document.querySelectorAll(".picker-item")].find((b) => b.innerText.includes("PANAIYUR")).querySelector(".picker-name").textContent.trim()`);
+  await evaluate(`[...document.querySelectorAll(".picker-item")].find((b) => b.innerText.includes("PANAIYUR")).click()`);
+  await sleep(400);
   await shot("05-route-edit");
   await click("Add to draft", ".sticky-actions");
   await waitFor(`document.body.innerText.includes("draft applied") || document.body.innerText.includes("Show what is live now")`, "route shown with draft");

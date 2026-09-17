@@ -1,10 +1,11 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
-import { get, enc } from "./api.js";
+import { get, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, debounce, fmtCoord, fmtMetres, fmtDate, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, toast } from "./util.js";
+import { h, clear, debounce, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, toast } from "./util.js";
 import * as map from "./map.js";
-import { existingChange } from "./drafts.js";
+import { existingChange, createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
+import { showDraftStop } from "./create.js";
 
 const panel = () => document.getElementById("panel");
 
@@ -79,9 +80,18 @@ export async function showHome() {
       h("h1", "Find a stop or route"),
       h("p", "Search above by stop name, stop id or route number, or zoom the map in to see stops and click one."),
       can("editor")
-        ? h("p.hint", "To change something, open it and choose Edit. Edits collect in a draft; nothing changes for passengers until another person approves and commits it.")
+        ? h("p.hint", "To change something, open it and choose Edit. To add a stop, route or station, use New at the top. Edits collect in a draft; nothing changes for passengers until another person approves and commits it.")
         : h("p.hint", "You can look at everything. Ask an admin for the editor role to make changes."),
     ));
+  const review = h("section.section", { hidden: true });
+  p.appendChild(review);
+  get(`feeds/${enc(state.feedId)}/station-proposals/summary`).then((c) => {
+    if (!c.pending) return;
+    review.hidden = false;
+    clear(review, h("h2", "Stations to review"),
+      h("p", `${plural(c.pending, "suggested station")} ${c.pending === 1 ? "is" : "are"} waiting for someone to check ${c.pending === 1 ? "it" : "them"}.`),
+      h("div.btn-row", h("a.btn.secondary", { href: "#/stations" }, "Review stations")));
+  }).catch(() => {});
   const work = h("section.section", h("h2", "Drafts in progress"), h("p.empty", "Loading…"));
   p.appendChild(work);
   try {
@@ -108,17 +118,23 @@ export async function showStop(stopId) {
   try {
     s = await get(`feeds/${enc(state.feedId)}/stops/${enc(stopId)}`);
   } catch (e) {
+    const created = e instanceof ApiError && e.status === 404 ? createdChange("stop", stopId) : null;
+    if (created) return showDraftStop(created);
     return clear(panel(), h("section.section", h("a.crumb", { href: "#/" }, "Back to search"), h("p.notice.error", e.message)));
   }
   map.focusStop(s);
   const isStation = s.location_type === 1;
   const pending = existingChange(isStation ? "station" : "stop", s.stop_id);
+  const merges = state.draft ? state.draft.changes.filter((c) => c.entity === "stop" && c.op === "merge"
+    && (c.entity_key === s.stop_id || (c.after && c.after.into_stop_id === s.stop_id))) : [];
+  const editor = can("editor") && !s.deleted;
 
-  const actions = can("editor") ? h("div.btn-row",
+  const actions = editor ? h("div.btn-row",
     isStation
       ? [h("button.btn", { type: "button", on: { click: () => editStation(s) } }, "Edit station"),
          h("button.btn.danger", { type: "button", on: { click: () => dissolveStation(s) } }, "Dissolve station")]
       : [h("button.btn", { type: "button", on: { click: () => editStop(s) } }, "Edit stop"),
+         h("a.btn.secondary", { href: `#/merge/${enc(s.stop_id)}` }, "Merge with a duplicate…"),
          s.parent_station ? null : h("button.btn.secondary", { type: "button", on: { click: () => editStation(null, [s]) } }, "Club into a station"),
          s.route_count === 0 ? h("button.btn.danger", { type: "button", on: { click: () => deleteStop(s) } }, "Delete stop") : null],
   ) : null;
@@ -130,6 +146,10 @@ export async function showStop(stopId) {
         h("h1", s.name),
         h("p.ids", `${isStation ? "Station" : "Stop"} ${s.stop_id}${s.stop_code && s.stop_code !== s.stop_id ? `, code ${s.stop_code}` : ""}`)),
       pending ? h("p.notice.draft", `Your draft "${state.draft.title}" changes this ${isStation ? "station" : "stop"}. The details below are what is live now.`) : null,
+      merges.map((c) => h("p.notice.draft", c.entity_key === s.stop_id
+        ? `Your draft "${state.draft.title}" merges this stop into ${c.after.into_stop_id}. It goes away when the draft is committed.`
+        : `Your draft "${state.draft.title}" merges stop ${c.entity_key} into this stop.`)),
+      s.deleted ? h("p.notice", "This stop has been removed from the feed.") : null,
       s.parent ? h("p.notice", "Part of station ", h("a", { href: `#/stop/${enc(s.parent.stop_id)}` }, s.parent.name), ".") : null,
       h("dl.facts",
         h("dt", "Position"), h("dd", `${fmtCoord(s.lat)}, ${fmtCoord(s.lon)}`),
@@ -156,11 +176,15 @@ export async function showStop(stopId) {
         h("span.sub", `${STOP_TYPE_LABEL[r.stop_type] || r.stop_type} in stage ${r.stage_no}, route id ${r.route_id}`)))) : h("p.empty", "No route uses this stop.")) : null,
     h("section.section",
       h("h2", "Other stops within 60 m"),
-      h("p.hint", "Two stops close together are often the two sides of the road. Club them into a station only if they are the same place."),
+      h("p.hint", "Two stops close together are often the two sides of the road: club them into a station. Merge them only if they are the same kerb entered twice."),
       s.nearby.length ? h("ul.list", s.nearby.map((n) => h("li.list-item",
         h("span.key", fmtMetres(n.distance_m)),
         h("a", { href: `#/stop/${enc(n.stop_id)}` }, n.name),
-        h("span.hint", n.location_type === 1 ? "station" : `${n.route_count} route${n.route_count === 1 ? "" : "s"}`),
+        h("span.item-end",
+          h("span.hint", n.location_type === 1 ? "station" : plural(n.route_count, "route")),
+          editor && !isStation && n.location_type === 0
+            ? h("a.btn.quiet.small", { href: `#/merge/${enc(s.stop_id)}?with=${enc(n.stop_id)}`, "aria-label": `Merge ${s.name} with ${n.name} (${n.stop_id})` }, "Merge…")
+            : null),
         h("span.sub", `${n.stop_id}${n.parent_station ? `, in station ${n.parent_station}` : ""}`)))) : h("p.empty", "None."),
     ),
   );
@@ -170,8 +194,9 @@ export async function showStop(stopId) {
 export async function showRoute(routeId, { preview = false } = {}) {
   map.endModes();
   clear(panel(), h("section.section", h("p.empty", "Loading route…")));
-  const draftChange = existingChange("route_stops", routeId) || existingChange("route", routeId);
-  const usePreview = preview && state.draft && draftChange;
+  const created = createdChange("route", routeId);
+  const draftChange = existingChange("route_stops", routeId) || existingChange("route", routeId) || created;
+  const usePreview = !!((preview || created) && state.draft && draftChange);
   let r;
   try {
     r = await get(usePreview
@@ -184,29 +209,35 @@ export async function showRoute(routeId, { preview = false } = {}) {
   map.showRoute(r);
 
   const served = r.rows.filter((x) => x.stop_type !== "ROUTE CORRECTION");
+  // GIMS serves a route only once the nightly GTFS build gives it trips
+  const notInFeed = created || !(r.provenance && r.provenance.in_shipped_feed === true);
   clear(panel(),
     h("section.section",
       h("a.crumb", { href: "#/" }, "Back to search"),
       h("div.title-block",
         h("h1", r.short_name || `Route ${r.route_id}`),
         h("p", r.long_name || ""),
-        h("p.ids", `Route id ${r.route_id}, ${r.stop_count} stops, ${groupStages(served).length} fare stages`)),
-      draftChange ? h("div.notice.draft",
+        h("p.ids", `Route id ${r.route_id}, ${plural(r.stop_count, "stop")}, ${plural(r.rows.length ? groupStages(served).length : 0, "fare stage")}`)),
+      created ? h("div.notice.draft",
+        h("p", h("strong", `New route in your draft "${state.draft.title}".`)),
+        h("p", "It is saved when the draft is approved by someone else and committed. Passengers see it only after the nightly GTFS build gives it trips from the MTC schedule.")) : null,
+      draftChange && !created ? h("div.notice.draft",
         h("p", `Your draft "${state.draft.title}" changes this route.`),
         h("div.btn-row",
           usePreview
             ? h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId) } }, "Show what is live now")
             : h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: true }) } }, "Show it with my draft"))) : null,
-      usePreview ? h("p.notice", "You are looking at this route with your draft applied. It is not live.") : null,
+      usePreview && !created ? h("p.notice", "You are looking at this route with your draft applied. It is not live.") : null,
+      !created && notInFeed ? h("p.notice", "This route is not in the published GTFS feed yet, so passengers do not see it. It appears in the live apps once the nightly GTFS build gives it trips from the MTC schedule.") : null,
       h("dl.facts",
         h("dt", "Map line"), h("dd", r.encoded_polyline ? `Saved (${r.polyline_source || "source unknown"})` : "None yet. The map joins the stops with straight dashed lines."),
         r.color ? [h("dt", "Colour"), h("dd", h("span", { style: `display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin-right:6px;background:${r.color}` }), r.color)] : null,
       ),
-      can("editor") && !usePreview ? h("div.btn-row",
-        h("button.btn", { type: "button", on: { click: () => editRouteRows(r) } }, "Edit stop list"),
-        h("button.btn.secondary", { type: "button", on: { click: () => editRouteDetails(r) } }, "Edit name, colour and map line")) : null,
+      can("editor") && (!usePreview || created) ? h("div.btn-row",
+        h("button.btn", { type: "button", on: { click: () => editRouteRows(r, { created: !!created }) } }, created && !r.rows.length ? "Build the stop list" : "Edit stop list"),
+        h("button.btn.secondary", { type: "button", on: { click: () => editRouteDetails(r, { created: !!created }) } }, "Edit name, colour and map line")) : null,
     ),
-    h("section.section", h("h2", "Stops by fare stage"), ladder(r.rows)),
+    h("section.section", h("h2", "Stops by fare stage"), r.rows.length ? ladder(r.rows) : h("p.empty", "No stops yet.")),
   );
 }
 

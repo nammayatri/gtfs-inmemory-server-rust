@@ -25,12 +25,16 @@ QUERIES = {
                        platform_code, cluster_id, regional_name, hindi_name, position_source,
                        row_version, deleted
                 FROM gtfs_stop""",
-    "routes": """SELECT gtfs_id, route_id, short_name, long_name, route_type, color, encoded_polyline,
-                        polyline_source, row_version, deleted
+    "routes": """SELECT gtfs_id, route_id, short_name, long_name, route_type, agency_id, color, encoded_polyline,
+                        polyline_source, provenance, row_version, deleted
                  FROM gtfs_route""",
     "route_stops": """SELECT gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name,
-                             marker_id, marker_lat, marker_lon, marker_name, stop_name_override
+                             marker_id, marker_lat, marker_lon, marker_name, stop_name_override, provider_id
                       FROM gtfs_route_stop ORDER BY gtfs_id, route_id, sequence""",
+    # station suggestions waiting for review (docs section 6)
+    "station_proposals": """SELECT proposal_id, gtfs_id, batch, station_id, name, lat, lon, members, spread_m,
+                                   status, review_note
+                            FROM gtfs_station_proposal ORDER BY proposal_id""",
 }
 
 

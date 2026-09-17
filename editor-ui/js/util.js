@@ -59,9 +59,9 @@ export function errorText(e) {
 
 // A modal built on <dialog>, which traps focus and closes on Escape natively.
 // `build(close)` returns the body; resolves with whatever close() was given.
-export function modal(title, build, { actions = [] } = {}) {
+export function modal(title, build, { actions = [], wide = false } = {}) {
   return new Promise((resolve) => {
-    const dlg = h("dialog", { "aria-label": title });
+    const dlg = h("dialog", { "aria-label": title, class: wide ? "wide" : null });
     const close = (value) => { dlg.close(); dlg.remove(); resolve(value); };
     dlg.addEventListener("cancel", (ev) => { ev.preventDefault(); close(undefined); });
     const body = h("div.dialog-body", h("h2", title), build(close));
@@ -97,6 +97,36 @@ export function fmtMetres(m) {
 
 export function fmtCoord(v) {
   return typeof v === "number" ? v.toFixed(6) : "";
+}
+
+export function fmtCount(n) {
+  return Number(n || 0).toLocaleString("en-IN");
+}
+
+// "1 stop", "2 stops"; `many` when the plural is not just an added s.
+export function plural(n, one, many = `${one}s`) {
+  return `${fmtCount(n)} ${n === 1 ? one : many}`;
+}
+
+// Stop and route ids: GIMS splits ids on ':', so the editor allows only these.
+export const ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+export const ID_RULE = "Use up to 64 letters, digits, _ - or . (no spaces).";
+
+// Names compared the way people read them: case, punctuation and spacing aside.
+export function normName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9\u0B80-\u0BFF]+/g, " ").trim();
+}
+
+// 2 for the same name, 1 for a similar one (one contains the other, or they
+// share most words), 0 otherwise.
+export function nameLikeness(a, b) {
+  const x = normName(a), y = normName(b);
+  if (!x || !y) return 0;
+  if (x === y) return 2;
+  if (x.includes(y) || y.includes(x)) return 1;
+  const wa = new Set(x.split(" ").filter((w) => w.length > 2)), wb = new Set(y.split(" ").filter((w) => w.length > 2));
+  const shared = [...wa].filter((w) => wb.has(w)).length;
+  return shared && shared >= Math.min(wa.size, wb.size) / 2 ? 1 : 0;
 }
 
 export function debounce(fn, ms) {
@@ -158,27 +188,36 @@ export const SERVED_EXCLUDE = new Set(["ROUTE CORRECTION", "JUMP STOP", "HIDDEN 
 export function validateRows(rows) {
   const problems = [];
   const add = (index, code, message, extra = {}) => problems.push({ index, code, message, ...extra });
-  let stageNo = null, stageName = null, lastNew = null, prevStop = null, firstChecked = false;
+  let stageNo = null, stageName = null, lastNew = null, prevStop = null, firstChecked = false, served = 0;
+  if (!rows.length) {
+    add(-1, "route_empty", "The route has no stops yet. Add at least two stops a passenger can board.");
+    return problems;
+  }
   rows.forEach((r, i) => {
     const n = i + 1;
     const name = r.stop_name || r.marker_name || r.stop_id || "?";
+    if (!String(r.stage_name ?? "").trim()) add(i, "stage_name_missing", `Stop ${n} (${name}) has no stage name.`);
     if (r.stop_type === "ROUTE CORRECTION") {
       if (r.marker_lat == null || r.marker_lon == null) add(i, "marker_without_position", `Row ${n} is a map shaping point with no position.`);
       return;
     }
     if (!r.stop_id) add(i, "unknown_stop", `Stop ${n} has no stop chosen.`);
-    if (!firstChecked) {
-      firstChecked = true;
-      if (r.stop_type !== "NEW STOP") add(i, "first_not_stage_stop", `The route must start at a stage stop. Stop 1 (${name}) is not one.`);
+    const isServed = !SERVED_EXCLUDE.has(r.stop_type);
+    if (isServed) {
+      served++;
+      if (!firstChecked) {
+        firstChecked = true;
+        if (r.stop_type !== "NEW STOP") add(i, "first_not_stage_stop", `The route must start at a stage stop. Stop ${n} (${name}) is not one.`);
+      }
     }
     const no = Number.parseInt(r.stage_no, 10);
     if (Number.isNaN(no)) {
       add(i, "missing_stage", `Stop ${n} (${name}) has no stage number.`);
       return;
     }
+    if (lastNew !== null && no < lastNew) add(i, "stage_decreases", `Stage numbers go back from ${lastNew} to ${no} at stop ${n} (${name}).`);
+    lastNew = lastNew === null ? no : Math.max(lastNew, no);
     if (r.stop_type === "NEW STOP") {
-      if (lastNew !== null && no < lastNew) add(i, "stage_decreases", `Stage numbers go back from ${lastNew} to ${no} at stop ${n} (${name}).`);
-      lastNew = no;
       stageNo = no;
       stageName = r.stage_name || "";
     } else if (r.stop_type === "INTERMEDIATE STOP" && stageNo !== null) {
@@ -190,10 +229,34 @@ export function validateRows(rows) {
           { fix: { stage_no: stageNo, stage_name: stageName } });
       }
     }
-    if (r.stop_id && prevStop === r.stop_id) add(i, "repeated_stop", `Stop ${n - 1} and stop ${n} are the same stop (${name}).`);
-    prevStop = r.stop_id || prevStop;
+    if (isServed) {
+      if (r.stop_id && prevStop === r.stop_id) add(i, "repeated_stop", `This stop is the same as the stop before it (${name}). A bus cannot stop at one stop twice in a row.`);
+      prevStop = r.stop_id || prevStop;
+    }
   });
+  if (served < 2) add(-1, "too_few_stops", "A route needs at least two stops a passenger can board.");
   return problems;
+}
+
+// The stage of every row after renumbering: stage stops count up from `start`
+// in route order, and every other row takes the number and name of the stage
+// stop before it. Returns the new rows and how many rows change.
+export function renumberStages(rows, start = 1) {
+  let no = start - 1, stage = null, changed = 0;
+  const out = rows.map((r) => {
+    const next = { ...r };
+    if (r.stop_type === "NEW STOP") {
+      no += 1;
+      next.stage_no = no;
+      stage = { stage_no: no, stage_name: r.stage_name };
+    } else if (stage) {
+      next.stage_no = stage.stage_no;
+      next.stage_name = stage.stage_name;
+    }
+    if (String(next.stage_no) !== String(r.stage_no) || (next.stage_name || "") !== (r.stage_name || "")) changed++;
+    return next;
+  });
+  return { rows: out, changed };
 }
 
 // Group ordered rows into fare stages: a stage starts at a NEW STOP; rows before

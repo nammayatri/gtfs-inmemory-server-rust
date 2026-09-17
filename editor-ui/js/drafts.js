@@ -1,8 +1,8 @@
 // The draft being edited: picking or starting one, the chip in the top bar, and
 // adding changes to it. Every edit screen goes through addChange().
-import { get, post, put, enc, ApiError } from "./api.js";
+import { get, post, put, del, enc, ApiError } from "./api.js";
 import { state, set, setPref, pref, can } from "./state.js";
-import { h, modal, toast, fmtDate, STATUS_LABEL } from "./util.js";
+import { h, modal, toast, fmtDate, plural, STATUS_LABEL } from "./util.js";
 
 // Remembered per person and feed: two people sharing a browser must not edit
 // into each other's drafts.
@@ -43,7 +43,7 @@ export function renderDraftChip() {
   if (state.draft) {
     const n = state.draft.change_count ?? state.draft.changes.length;
     chip.className = "draft-chip";
-    chip.textContent = `Draft: ${state.draft.title} (${n} change${n === 1 ? "" : "s"})`;
+    chip.textContent = `Draft: ${state.draft.title} (${plural(n, "change")})`;
     chip.title = "Your edits collect in this draft. Click to switch drafts or review it.";
   } else {
     chip.className = "draft-chip none";
@@ -86,7 +86,7 @@ export async function chooseDraft({ reason } = {}) {
         h("ul.list", open.map((cs) => h("li.list-item",
           h("span.chip.draft", STATUS_LABEL[cs.status]),
           h("button.btn.quiet", { type: "button", style: "justify-self:start", on: { click: () => close(cs) } }, cs.title),
-          h("span.hint", `${cs.change_count} change${cs.change_count === 1 ? "" : "s"}`),
+          h("span.hint", plural(cs.change_count, "change")),
           h("span.sub", `Started by ${cs.created_by_email}, updated ${fmtDate(cs.updated_at)}`),
         )))) : null,
       h("form", { style: "display:grid;gap:10px", on: { submit: start } },
@@ -118,10 +118,42 @@ export async function requireDraft(reason) {
 }
 
 // The change already in the draft for this entity, if any - editing the same
-// stop twice updates one change instead of stacking two.
+// stop twice updates one change instead of stacking two. Only edits merge this
+// way; a create, delete or merge is its own change.
 export function existingChange(entity, key) {
   if (!state.draft) return null;
-  return state.draft.changes.find((c) => c.entity === entity && c.entity_key === key && c.op !== "delete" && c.op !== "create") || null;
+  return state.draft.changes.find((c) => c.entity === entity && c.entity_key === key && (c.op === "update" || c.op === "replace")) || null;
+}
+
+// What the draft creates. Stops and routes created in a draft count as existing
+// for its later changes, so the editors offer them alongside live data.
+export function createdChange(entity, key) {
+  if (!state.draft) return null;
+  return state.draft.changes.find((c) => c.entity === entity && c.op === "create" && c.entity_key === key) || null;
+}
+
+export function createdStops() {
+  if (!state.draft) return [];
+  return state.draft.changes.filter((c) => c.entity === "stop" && c.op === "create" && c.after).map((c) => ({
+    stop_id: c.entity_key, stop_code: c.entity_key, name: c.after.name, lat: c.after.lat, lon: c.after.lon,
+    platform_code: c.after.platform_code || null, location_type: 0, parent_station: null, route_count: 0,
+    draft: true, change_id: c.change_id,
+  }));
+}
+
+// Replace the `after` of a change already in the draft.
+export async function updateChange(change, after) {
+  const draft = state.draft;
+  const cs = await put(`change-sets/${enc(draft.change_set_id)}/changes/${change.change_id}`, { after });
+  useDraft(cs);
+  const problems = (cs.validation || []).filter((v) => v.change_id === change.change_id);
+  return { draft: cs, problems, changeId: change.change_id };
+}
+
+export async function removeChange(changeId) {
+  const cs = await del(`change-sets/${enc(state.draft.change_set_id)}/changes/${changeId}`);
+  useDraft(cs && cs.change_set_id ? cs : await get(`change-sets/${enc(state.draft.change_set_id)}`));
+  return state.draft;
 }
 
 // Add (or merge into) a change. Returns {draft, problems} where problems are the
@@ -147,7 +179,7 @@ export async function addChange(change, { merge = true } = {}) {
     throw e;
   }
   useDraft(cs);
-  const mine = prior ? prior.change_id : cs.changes[cs.changes.length - 1].change_id;
+  const mine = prior ? prior.change_id : cs.change_id ?? cs.changes[cs.changes.length - 1].change_id;
   const problems = (cs.validation || []).filter((v) => v.change_id === mine);
   const errors = problems.filter((p) => p.level === "error").length;
   toast(errors ? `Added to "${cs.title}" with ${errors} problem${errors === 1 ? "" : "s"} to fix before submitting.`

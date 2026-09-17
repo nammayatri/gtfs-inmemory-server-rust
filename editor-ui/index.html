@@ -28,10 +28,20 @@
       </div>
       <nav class="nav" aria-label="Main">
         <a href="#/" data-nav="map">Map</a>
+        <a href="#/stations" data-nav="stations">Stations to review <span id="stations-count" class="nav-count" hidden></span></a>
         <a href="#/drafts" data-nav="drafts">Drafts</a>
         <a href="#/audit" data-nav="audit">History</a>
         <a href="#/admin" data-nav="admin" hidden>People</a>
       </nav>
+      <details class="new-menu" id="new-menu" hidden>
+        <summary class="btn small">New</summary>
+        <div class="new-menu-body">
+          <a href="#/new/stop"><strong>New stop</strong><span>Place it on the map</span></a>
+          <a href="#/new/route"><strong>New route</strong><span>Then build its stop list</span></a>
+          <a href="#/new/station"><strong>New station</strong><span>Group the stops of one place</span></a>
+          <a href="#/import"><strong>Import from a CSV file</strong><span>Many stops, routes or stop lists</span></a>
+        </div>
+      </details>
       <button id="draft-chip" class="draft-chip" type="button" hidden></button>
       <details class="user-menu">
         <summary id="user-summary"></summary>

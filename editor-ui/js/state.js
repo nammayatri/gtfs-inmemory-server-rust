@@ -41,5 +41,19 @@ export function setPref(name, value) {
   }
 }
 
+// Unsaved work: an editor registers a function that returns a sentence saying
+// what would be lost (or null), and the router asks before leaving.
+let leaveGuard = null;
+export function setLeaveGuard(fn) {
+  leaveGuard = fn || null;
+}
+export function leaveMessage() {
+  try {
+    return leaveGuard ? leaveGuard() : null;
+  } catch {
+    return null;
+  }
+}
+
 const RANK = { viewer: 0, editor: 1, approver: 2, admin: 3 };
 export const can = (role) => !!state.me && RANK[state.me.role] >= RANK[role];
