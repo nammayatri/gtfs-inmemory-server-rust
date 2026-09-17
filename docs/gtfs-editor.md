@@ -508,3 +508,37 @@ Settled while implementing:
    preview with `dry_run: true` — a table of rows with ok / warning / error and
    messages, a map of the stops, counts — fix the file and re-preview, then "Add N
    changes to draft". The draft then goes through the normal review.
+
+## 8. Coordinate reviews — suspected wrong positions (2026-09-17)
+
+`gtfs_position_review` (`db/gtfs_editor/0007_position_reviews.sql`) holds stops
+whose coordinate is suspected wrong: nandi's
+`scripts/chennai-bus/src/assets/review/coordinate_suspects.csv` (judged by agents
+as carrying another stop's coordinate, or found off their own routes), loaded by
+`scripts/chennai-bus/editor/load_position_reviews.py`. A reviewer checks each one
+and either **moves** the stop — a `stop/update` change `{lat, lon, position_review_id}`
+into a draft, released through the normal submit / approve (someone else) / commit
+— or **confirms** the position is right, which closes it with no change.
+
+| method | path | body / rule |
+|---|---|---|
+| GET | `/feeds/{g}/position-reviews?status=&bbox=&q=&limit=&cursor=` | `status` comma list (default `pending`); `bbox` on the loaded position; `q` trigram on name, exact on stop id. Item: `{review_id, stop_id, original_stop_id, stop_name, reason, lat, lon, raw_lat, raw_lon, suggested_lat, suggested_lon, suggested_source, evidence, status, change_set_id, change_set_title, reviewed_by_email, reviewed_at, review_note, batch}` |
+| GET | `/feeds/{g}/position-reviews/summary` | `{pending, approved, committed, confirmed}` |
+| GET | `/position-reviews/{id}` | the item plus, computed now from the tables: `stop` (current row), `routes: [{route_id, short_name, sequence, prev: {stop_id, name, lat, lon} \| null, next: {...} \| null}]` (every route that calls at the stop, previous and next SERVED stop), `detour_m` (median over routes of d(prev,stop)+d(stop,next)−d(prev,next)), and `problems: [{code, message}]` (`stop_deleted`, `stop_merged_away`, `moved_since_load` when the stop is > 25 m from the loaded position) |
+| POST | `/position-reviews/{id}/move` | editor+. `{change_set_id, lat, lon, note?}` → appends `stop/update` `{lat, lon, position_review_id}` (base_row_version = the stop's current) to the draft; review → `approved`. The response is the review detail, with `detour_m_after` for the new point |
+| POST | `/position-reviews/{id}/confirm` | editor+. `{note?}` pending → `confirmed` |
+| POST | `/position-reviews/{id}/reopen` | editor+. confirmed → pending |
+
+`stop/update` accepts an optional `position_review_id`. Lifecycle, as for station
+proposals: removing the change or discarding the draft returns the review to
+`pending`; committing marks it `committed`. Every transition is audited
+(`position_review_moved`, `position_review_confirmed`, `position_review_reopened`,
+`position_review_committed`, `position_review_returned`).
+
+Dashboard — "Coordinates to review" page: the list (pending first, counts, search,
+"in the map area"); for the selected stop a map with the current point, the raw
+MTC point, the suggestion (labelled with its source) and every route's previous →
+stop → next legs with their detour; the stops sharing its point; the reason and
+Chalo hint. Actions: drag the pin or click the map (or "Use suggestion" / "Use raw
+point") to set a new position, see the detour it would give, "Add move to draft";
+"Position is correct" (note optional); "Next".
