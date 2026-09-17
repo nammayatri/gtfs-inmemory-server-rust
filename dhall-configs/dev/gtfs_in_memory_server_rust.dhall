@@ -126,4 +126,5 @@ in {
   gtfs_gps = None GtfsGps,
   gtfs_gps_clickhouse_password = secrets.clickhouse_password,
   gen_int_for_id = Some True,
+  max_eta_override_seconds = Some 43200,
 }

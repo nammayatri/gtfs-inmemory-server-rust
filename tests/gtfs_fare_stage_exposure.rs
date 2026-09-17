@@ -238,6 +238,7 @@ fn app_config(dir: &Path) -> AppConfig {
         gtfs_pod_id: None,
         gtfs_gps: None,
         gtfs_gps_clickhouse_password: None,
+        max_eta_override_seconds: None,
     }
 }
 

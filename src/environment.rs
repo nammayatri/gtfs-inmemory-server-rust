@@ -170,6 +170,10 @@ pub struct AppConfig {
     /// The password of `gtfs_gps.user` (secrets dhall).
     #[serde(default)]
     pub gtfs_gps_clickhouse_password: Option<String>,
+    /// Longest an ops ETA override may run. Bounds the failure mode where an override set
+    /// during a disruption outlives it because nobody came back to clear it.
+    #[serde(default)]
+    pub max_eta_override_seconds: Option<u64>,
 }
 
 /// The GPS block of [`AppConfig`]. Only `url` and `user` are required.
@@ -226,7 +230,16 @@ impl AppConfig {
                 .collect(),
         }
     }
+
+    pub fn max_eta_override_seconds(&self) -> u64 {
+        self.max_eta_override_seconds
+            .unwrap_or(MAX_ETA_OVERRIDE_SECONDS_DEFAULT)
+    }
 }
+
+/// 12 hours — longer than any single disruption an ops shift would sit through, short enough
+/// that a forgotten override cannot survive into the next day.
+const MAX_ETA_OVERRIDE_SECONDS_DEFAULT: u64 = 43200;
 
 fn default_preprocessed_data_dir() -> String {
     "./assets".to_string()
