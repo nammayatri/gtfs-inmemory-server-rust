@@ -687,7 +687,7 @@ async fn enrich_stops(
 
 /// Call OSRM `/route` with all stop coords (lat, lon) → (encoded polyline, per-leg (distance_m, duration_s)).
 /// Returns None if `base` is None/empty, fewer than 2 coords, or any request/parse error.
-async fn osrm_route(
+pub(crate) async fn osrm_route(
     base: Option<&str>,
     coords: &[(f64, f64)],
 ) -> Option<(String, Vec<(f64, f64)>)> {
