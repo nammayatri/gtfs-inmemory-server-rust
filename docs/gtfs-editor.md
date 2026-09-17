@@ -1063,3 +1063,113 @@ Settled while implementing:
   4–8 ms — 8 ms at the busiest stop (234 measured calls), 4–5 ms at the names the
   most stops share (10–12 same-named within 5 km); the route context 1.6–3 ms on
   the longest routes. `tests/editor_review_merge_flow.rs` prints them.
+
+<!-- ===== section 10 begins: dashboard round 4 (UX). Self-contained; sections 2, 3 and 8 are edited elsewhere. ===== -->
+## 10. Dashboard requirements added 2026-09-17, round 4 (reviewer UX)
+
+Dashboard only (`editor-ui/`), apart from the read endpoints and the merge action
+in 10.5, which the API provides. Every item has checks in `dev/ui_smoke.mjs`
+(`round4Flows`; `node dev/ui_smoke.mjs --round4` runs only these) against
+`dev/mock_server.py` (its block "round 4 (UX)").
+
+1. **What the map shows.** A "Show" control under the zoom buttons ticks
+   Stations, Routes and Stops on or off, each on its own. The choice is a
+   per-browser preference (`localStorage`, key `mapLayers` of the editor's
+   preferences; the page works when storage throws, it then simply starts with
+   everything shown). A hidden kind stays hidden as the map moves, zooms and loads
+   new stops, its name labels and count badges included. What the panel is about
+   is never lost: the open stop (or station) is still drawn when its kind is off,
+   every stop is drawn while one has to be clicked (picking a stop, choosing a
+   station's stops), and an open route that is hidden is named as hidden; the
+   control says which of these applies.
+2. **A station once, not each of its platforms.** Where a panel lists stops near
+   or on a stop's point — "Other stops within 60 m" on the stop page, "Stops that
+   shared its point" on a coordinate review, the same-named stops of 10.5, the
+   suggestions in the station editor — a stop that is already a platform of a
+   station is not also a bare entry: the station is listed once, linked, with "N of
+   these are already platforms of <station>", and its platforms fold under it (one
+   click away, with their own Merge… buttons). Station names come from the rows'
+   `parent_station` (`parent` on a stop detail); a name not at hand is read from
+   the stop endpoint once per panel. In the station editor such stops are not
+   offered at all, since a stop has one parent.
+3. **Undo and redo of what is not in a draft.** Ctrl/Cmd+Z undoes, Ctrl/Cmd+
+   Shift+Z and Ctrl/Cmd+Y redo: a pin placed or dragged (stop editor, New stop,
+   coordinate review, station point), ticked routes on a review, a select, every
+   row operation of the stop list editor (add, change stop, move, remove, type,
+   stage, renumber, fix), a station's stops and labels, the choices of a merge,
+   a suggested or discarded map line, and a text field as a whole once it is left.
+   It never touches data: a change already in a draft is removed on the draft
+   page. While the caret is in a text field the shortcut is left to the browser,
+   so typing undoes natively. One in-memory stack per panel (`js/undo.js`;
+   `state.js` had nothing to reuse): the router drops it on every navigation, and
+   a panel clears it when its state is saved into a draft. A short hint says what
+   happened ("Undid: moved the pin"), and Undo / Redo buttons sit wherever a pin
+   or a stop list is edited.
+4. **The trail.** A drill-down (route → stop → another route → …) leaves a trail
+   under the top bar, "Map › 45B › Luz › 12C", with one "‹ Back" control
+   (`js/trail.js`, beside the hash router). It is not the browser history: each
+   place is in it once; opening a place already in it pops back to it; clicking a
+   crumb pops to it; a link in the top bar, the brand or a search result starts a
+   new trail; a top-level page (Map, Coordinates, Stations, Drafts, …) is the root
+   of one. At most 8 places (the oldest after the root go). `sessionStorage` only,
+   so it survives a reload and ends with the tab. A panel keeps its own "Back to
+   search" only when the trail has nowhere to go back to.
+5. **Cleanup context, the tool's verdict, candidates and merge.**
+   - `GET /feeds/{g}/stops/{stop_id}/context` → `{stop_id, detour_m,
+     routes_measured, position_reviews: {pending, approved, committed, confirmed,
+     items: [{review_id, status, reason}]}, same_name: [{stop_id, name, lat, lon,
+     distance_m, route_count, parent_station, similarity}], audit: [{audit_id, at,
+     actor_email, action, change_set_id, detail}], open_drafts: [{change_set_id,
+     title, status, change_id, entity, op}]}`; `GET /feeds/{g}/routes/{route_id}/
+     context` → `{route_id, stops_with_reviews: [{stop_id, sequence, review_id,
+     status}], worst_detours: [{stop_id, name, sequence, detour_m}], audit,
+     open_drafts}`. The stop and route panels show them as "Cleanup context": the
+     detour with what it means in plain words, the coordinate reviews naming the
+     stop (linked into the Coordinates page), same-named stops nearby (listed with
+     distance and route count, drawn faintly on the map, stations once as in 2),
+     open drafts touching it, and recent history in the History page's words
+     (`ACTION_LABEL`). The route's stop list marks rows whose stop has a pending
+     review, and its context lists the longest detours. **A server without these
+     endpoints answers 404: the section is then not shown, with no error.**
+   - A review's `evidence` may carry `same_name_candidates: [{stop_id, name, lat,
+     lon, distance_m, name_similarity, route_count, detour_m_after, shares_route,
+     verdict: "fits" | "no_fit"}]` and `auto_fix: {action: "merge" | "move" |
+     "choose" | "none", into_stop_id?, lat?, lon?, detour_m, detour_m_after?, reason,
+     tool, threshold_m}`. The review panel shows the verdict as a banner ("The tool
+     suggests merging into X — detour 2.4 km → 40 m", with the reason), and the
+     candidates as a numbered list and numbered map markers (teal where the routes
+     fit), each with "Use this position" (sets the pin: a move) and "Merge into
+     this stop…".
+   - `POST /position-reviews/{id}/merge` `{change_set_id, into_stop_id, keep_name?,
+     note?}` → the review detail plus `warnings`; 400 `review_has_problems`
+     (`details.problems`), 409 `draft_conflict`. `draft_actions` may then hold
+     `{kind: "merge", change_id, into_stop_id, lat, lon, detour_m_after}`, drawn
+     and listed like a move or a split; a merged review offers no move or split.
+   - The list filters by `?auto_fix=merge|move|choose|none` with chips that carry
+     the summary's `auto_fix: {merge, move, choose, none}` counts; without those
+     counts (an older server) there are no chips.
+6. **Stops sharing a point.** Stops with exactly the same coordinate (about a
+   thousand points in Chennai, up to 61 stops on one) are one marker with a count
+   badge; clicking it lists them by name, id and route count so any can be chosen,
+   in every mode that clicks a stop (opening, picking, a station's stops). A stop
+   alone opens directly, as does a click that only wants the place (a review's
+   pin). The chooser counts what is shown (10.1), and differently named stops on
+   one point share a label at zoom ≥ 17 ("NAME +2").
+7. **Pending in the draft, on the page it changes.** A change added to the active
+   draft is not live, but its pages show the entity as the draft leaves it,
+   labelled "Pending in draft “<title>”, not live", with the live value beside it
+   ("live: …", struck through): a stop's drafted name, position and labels (the
+   map marks the drafted place and ghosts the live one, and the area stops are
+   drawn where the draft puts them); a stop that will be merged into X, and X
+   saying which stop is merged into it; a stop to be deleted; a stop or a station
+   that exists only in the draft (both can be opened); a station's drafted name,
+   point and members, and a member that joins or leaves; a route's drafted number,
+   name, colour and map line, and its drafted stop list (from `GET
+   /change-sets/{id}/preview/routes/{route_id}`, rows marked added / moved /
+   changed, removed stops named, the live line dashed underneath) with "Show what
+   is live now". It is a read-side overlay in one module, `js/overlay.js`, which
+   the coordinate review panel uses too (its `draft_actions` have the same shape
+   as the overlay's actions). The cache is the active draft the dashboard already
+   holds: every mutation it makes replaces that object, as does choosing another
+   draft, and the overlay rebuilds on that.
+<!-- ===== section 10 ends ===== -->

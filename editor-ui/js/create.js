@@ -7,6 +7,9 @@ import { h, clear, toast, confirmDialog, debounce, fmtCoord, fmtMetres, haversin
 import * as map from "./map.js";
 import { addChange, requireDraft, createdChange, createdStops, updateChange, removeChange } from "./drafts.js";
 import { editRouteRows, problemList } from "./editors.js";
+import { pendingNotice, pendingActions, draftedPoints } from "./overlay.js";
+import { nameHere } from "./trail.js";
+import { undoScope } from "./undo.js";
 
 const panel = () => document.getElementById("panel");
 const round7 = (x) => Math.round(x * 1e7) / 1e7;
@@ -42,6 +45,11 @@ export async function newStop(change = null) {
   };
   const where = h("div", { "aria-live": "polite" });
   const problems = h("div");
+  // placing and dragging the pin, and each field once left, can be undone until
+  // the stop is in the draft
+  const history = undoScope("the new stop");
+  const syncFields = history.fields([[f.name, "the name"], [f.platform, "the platform label"], [f.id, "the stop id"], [f.lat, "the latitude"], [f.lon, "the longitude"]]);
+  let placed = lat != null ? { lat, lon } : null;   // where the pin was last put down
 
   let nearSeq = 0;
   const checkNearby = debounce(async () => {
@@ -83,12 +91,33 @@ export async function newStop(change = null) {
     touch();
     showWhere();
     checkNearby();
-  }, { at: lat != null ? { lat, lon } : null });
+  }, {
+    at: lat != null ? { lat, lon } : null,
+    // one step per click or finished drag
+    onDone: (la, lo) => {
+      const before = placed, after = { lat: la, lon: lo };
+      placed = after;
+      syncFields();
+      history.push({ label: before ? "moved the pin" : "placed the pin", undo: () => putPin(before), redo: () => putPin(after) });
+    },
+  });
+  function putPin(p) {
+    placed = p;
+    lat = p ? p.lat : null;
+    lon = p ? p.lon : null;
+    f.lat.value = p ? p.lat.toFixed(7) : "";
+    f.lon.value = p ? p.lon.toFixed(7) : "";
+    syncFields();
+    setPin(p ? p.lat : null, p ? p.lon : null);
+    showWhere();
+    if (p) checkNearby();
+  }
   const typed = debounce(() => {
     const la = Number(f.lat.value), lo = Number(f.lon.value);
     if (f.lat.value === "" || f.lon.value === "" || !Number.isFinite(la) || !Number.isFinite(lo)) return;
     lat = la;
     lon = lo;
+    placed = { lat: la, lon: lo };
     setPin(la, lo);
     showWhere();
     checkNearby();
@@ -140,6 +169,7 @@ export async function newStop(change = null) {
       }
       if (!res) return;
       dirty = false;
+      history.clear();
       const ch = res.draft.changes.find((c) => c.change_id === res.changeId);
       if (res.problems.some((p) => p.level === "error")) {
         // it is in the draft now; further saves update that change
@@ -164,6 +194,7 @@ export async function newStop(change = null) {
       h("p.hint", `It goes into draft "${state.draft.title}". Nothing changes for passengers until someone else approves the draft and it is committed.`),
       h("h2", "1. Place it"),
       where,
+      history.buttons(),
       h("div.field-row",
         h("label.field", { for: "new-stop-lat" }, h("span", "Latitude"), f.lat),
         h("label.field", { for: "new-stop-lon" }, h("span", "Longitude"), f.lon)),
@@ -204,13 +235,14 @@ export function showDraftStop(ch) {
   map.endModes();
   map.clearRoute();
   const a = ch.after;
+  nameHere(a.name);
   clear(panel(),
     h("section.section",
       h("a.crumb", { href: "#/" }, "Back to search"),
       h("div.title-block",
         h("h1", a.name),
         h("p.ids", `Stop ${ch.entity_key}`)),
-      h("p.notice.draft", `This stop is new in your draft "${state.draft.title}". It does not exist for passengers until the draft is committed.`),
+      pendingNotice(pendingActions("stop", ch.entity_key), { intro: `This stop is new in your draft "${state.draft.title}". It does not exist for passengers until the draft is committed.` }),
       h("dl.facts",
         h("dt", "Position"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`),
         a.platform_code ? [h("dt", "Platform"), h("dd", a.platform_code)] : null),
@@ -227,6 +259,43 @@ export function showDraftStop(ch) {
           }
         } } }, "Remove from draft"))));
   map.focusStop(a);
+  map.showDrafted(draftedPoints(pendingActions("stop", ch.entity_key)));
+}
+
+// A station that exists only in the draft: its point and the stops it groups.
+export function showDraftStation(ch) {
+  map.endModes();
+  map.clearRoute();
+  const a = ch.after;
+  const members = Array.isArray(a.members) ? a.members : (a.member_stop_ids || []).map((id) => ({ stop_id: id }));
+  const rows = h("ul.list", members.map((m) => h("li.list-item", { dataset: { stop: m.stop_id } },
+    h("span.key", m.platform_code || ""),
+    h("a", { href: `#/stop/${enc(m.stop_id)}` }, m.stop_id),
+    h("span.hint", ""),
+    h("span.sub", m.stop_id))));
+  nameHere(a.name);
+  clear(panel(),
+    h("section.section",
+      h("a.crumb", { href: "#/" }, "Back to search"),
+      h("div.title-block",
+        h("h1", a.name),
+        h("p.ids", `Station ${ch.entity_key}`)),
+      pendingNotice(pendingActions("station", ch.entity_key), { intro: `This station is new in your draft "${state.draft.title}". Passengers do not see it, and its stops are not grouped, until the draft is committed.` }),
+      h("dl.facts", h("dt", "Station point"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)),
+      h("div.btn-row",
+        h("a.btn.secondary", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft"))),
+    h("section.section",
+      h("h2", `Stops it will group (${members.length})`),
+      rows));
+  map.focusStop({ ...a, stop_id: ch.entity_key, location_type: 1 });
+  map.showDrafted(draftedPoints(pendingActions("station", ch.entity_key)));
+  // the members' names, where they are live
+  members.forEach((m) => get(`feeds/${enc(state.feedId)}/stops/${enc(m.stop_id)}`).then((d) => {
+    const li = rows.querySelector(`[data-stop="${CSS.escape(m.stop_id)}"]`);
+    if (!li) return;
+    li.querySelector("a").textContent = d.name;
+    li.querySelector(".hint").textContent = `${d.route_count} route${d.route_count === 1 ? "" : "s"}`;
+  }).catch(() => {}));
 }
 
 // ------------------------------------------------------------------ new route
