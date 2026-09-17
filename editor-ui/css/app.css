@@ -417,6 +417,41 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .route-chip[aria-pressed="true"] { background: #1f5fbf; border-color: #1f5fbf; color: #fff; }
 .compact-list { margin: 0; padding-left: 18px; font-size: var(--fs-s); display: grid; gap: 2px; }
 
+/* ------------------------------------------------------------ coordinates to review */
+.review-reason {
+  grid-column: 1 / -1; font-size: var(--fs-xs); color: var(--muted);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
+}
+.review-status { display: grid; gap: 10px; }
+.review-status > .chip { justify-self: start; }
+.review-why { display: grid; gap: 4px; }
+.review-why h2 { font-size: var(--fs-s); color: var(--muted); }
+.route-numbers { overflow-wrap: anywhere; }
+.detour-now { font-weight: 700; color: var(--danger); }
+.detour-new { font-weight: 700; color: var(--action); }
+.detour-split { font-weight: 700; color: var(--focus); }
+.route-group { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--rule); border-left: 4px solid var(--rule-strong); border-radius: var(--radius); background: var(--surface); }
+.route-group.suspect { border-left-color: var(--danger); }
+.route-group.own { border-left-color: var(--action); }
+.route-group-head { display: flex; gap: 8px; align-items: baseline; }
+.route-group-head input, .split-route input { width: 18px; height: 18px; margin: 2px 0 0; flex: none; accent-color: var(--focus); }
+.route-group-title { display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; min-width: 0; overflow-wrap: anywhere; }
+label.route-group-title, label.split-route-body { cursor: pointer; }
+.route-group-raw { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.split-routes { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.split-route { display: flex; gap: 8px; align-items: flex-start; padding: 6px; border-radius: var(--radius); }
+.split-route.checked { background: #e8effa; }
+.split-route.locked { background: #f7faf9; }
+.split-route-body { display: grid; gap: 1px; min-width: 0; font-size: var(--fs-s); }
+.split-route-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.split-route-name { overflow-wrap: anywhere; }
+.chip.split-off { background: var(--draft-tint); color: var(--draft); }
+.chip.split-off a { color: inherit; }
+.leg-line { color: var(--ink); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.split-summary { display: grid; gap: 8px; padding-top: 4px; font-size: var(--fs-s); }
+.why-lines { display: grid; gap: 2px; }
+.draft-actions { margin-top: 4px; }
+
 /* ------------------------------------------------------------ merge */
 .compare th[scope="row"] { width: 120px; }
 .compare tr.differs td { background: var(--draft-tint); }
@@ -542,6 +577,14 @@ dialog::backdrop { background: rgba(20, 37, 42, .38); }
 .proposal-pin.approved { background: var(--action); box-shadow: 0 0 0 1px var(--action); }
 .proposal-pin.rejected { background: #fff; box-shadow: 0 0 0 1px var(--muted); }
 .proposal-pin.selected { box-shadow: 0 0 0 3px #1f5fbf; }
+.coord-pin { width: 14px; height: 14px; border-radius: 50%; background: var(--danger); border: 2px solid #fff; box-shadow: 0 0 0 1px var(--danger); }
+.coord-pin.approved { background: var(--action); box-shadow: 0 0 0 1px var(--action); }
+.coord-pin.committed { background: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
+.coord-pin.confirmed, .coord-pin.superseded { background: #fff; box-shadow: 0 0 0 1px var(--muted); }
+.coord-pin.selected { box-shadow: 0 0 0 3px #1f5fbf; }
+.raw-pin { width: 12px; height: 12px; margin: 1px; transform: rotate(45deg); background: #fff; border: 3px solid var(--ink); }
+.raw-pin.origin { border-color: var(--danger); }
+.suggest-pin { width: 14px; height: 14px; border-radius: 50%; background: #1f5fbf; border: 3px solid #fff; box-shadow: 0 0 0 2px #1f5fbf; }
 .map.placing, .map.placing .leaflet-interactive { cursor: crosshair; }
 .station-pin { width: 18px; height: 18px; border-radius: 4px; background: var(--ink); border: 3px solid #fff; box-shadow: 0 0 0 2px var(--ink); }
 .marker-pin { width: 10px; height: 10px; transform: rotate(45deg); background: #fff; border: 2px solid var(--muted); }
@@ -558,6 +601,17 @@ dialog::backdrop { background: rgba(20, 37, 42, .38); }
   background: #fff; color: var(--action); font-size: 12px; font-weight: 700; white-space: nowrap;
 }
 .leaflet-tooltip.member-label.dropped { border-color: var(--rule-strong); color: var(--muted); text-decoration: line-through; }
+/* a coordinate review's points: now (red), raw points (ink), suggestion (blue), the pin (teal), in a draft (amber) */
+.leaflet-tooltip.coord-label {
+  padding: 1px 6px; border: 1px solid var(--ink); border-radius: 3px; box-shadow: 0 1px 4px rgba(20, 37, 42, .2);
+  background: #fff; color: var(--ink); font-size: 12px; font-weight: 700; white-space: nowrap;
+}
+.leaflet-tooltip.coord-label::before { display: none; }
+.leaflet-tooltip.coord-label.now { border-color: var(--danger); color: var(--danger); }
+.leaflet-tooltip.coord-label.suggest { border-color: #1f5fbf; color: #1f5fbf; }
+.leaflet-tooltip.coord-label.new { border-color: var(--action); color: var(--action); }
+.leaflet-tooltip.coord-label.drafted { border-color: #c98a00; color: var(--draft); background: var(--draft-tint); }
+.leaflet-tooltip.coord-label.muted { border-color: var(--rule-strong); color: var(--muted); font-weight: 400; }
 .leaflet-tooltip.candidate-label {
   padding: 0; border: 0; box-shadow: none; background: transparent; color: var(--action); font-size: 12px; font-weight: 700;
 }

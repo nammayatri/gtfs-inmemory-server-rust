@@ -1,7 +1,7 @@
 // The one Leaflet map, and the modes screens put it in: browsing stops (named
 // when zoomed in), showing a route, dragging a stop, placing a new stop, picking
-// a stop, selecting stops for a station, reviewing a suggested station, comparing
-// two stops, and the small read-only insets.
+// a stop, selecting stops for a station, reviewing a suggested station, reviewing
+// a suspected coordinate, comparing two stops, and the small read-only insets.
 import {
   TILE_URL, TILE_ATTRIBUTION, TILE_REFERRER_POLICY, DEFAULT_VIEW, STOPS_MIN_ZOOM, LABELS_MIN_ZOOM, LABEL_GROUP_METRES,
 } from "./config.js";
@@ -30,6 +30,7 @@ const moveListeners = new Set();
 let quietIds = new Set();
 let reserved = [];            // [{lat, lon, text, side}]
 const ACTION = "#0b6660", INK = "#14252a", MUTED = "#536569", DRAFT_FILL = "#f2b42c", DRAFT_RING = "#7a5000";
+const DANGER = "#b42318", FOCUS = "#1f5fbf";
 const MAX_STOPS = 2000;
 
 const text = (s) => h("span", s);
@@ -51,7 +52,7 @@ export function initMap() {
   lines = L.canvas({ pane: "lines", padding: 0.3 });
   dots = L.canvas({ pane: "dots", padding: 0.3 });
   L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
-  for (const name of ["route", "proposal", "review", "reviewRoute", "pair", "focus", "stops", "proposals", "candidates", "edit", "select", "place", "labels"]) {
+  for (const name of ["route", "proposal", "review", "reviewRoute", "coord", "pair", "focus", "stops", "proposals", "coordPoints", "candidates", "edit", "select", "place", "labels"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
   map.on("moveend", () => {
@@ -346,7 +347,7 @@ export function endModes() {
   selection = null;
   if (placeCleanup) placeCleanup();
   placeCleanup = null;
-  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals"]) layers[name].clearLayers();
+  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints"]) layers[name].clearLayers();
   quietIds = new Set();
   reserved = [];
   banner(null);
@@ -558,6 +559,204 @@ export function showReview({ lat, lon, members, editable, onMovePoint }) {
   };
 }
 
+// ------------------------------------------------------------------ coordinate reviews
+const REVIEW_STATUSES = new Set(["pending", "approved", "committed", "confirmed", "superseded"]);
+
+// The reviews in a list, as small round pins; the open one is ringed.
+export function showReviewPoints(items, { selectedId = null, onOpen } = {}) {
+  layers.coordPoints.clearLayers();
+  for (const r of items) {
+    const status = REVIEW_STATUSES.has(r.status) ? r.status : "";
+    const selected = r.review_id === selectedId;
+    L.marker([r.lat, r.lon], {
+      icon: L.divIcon({ className: "", html: `<div class="coord-pin ${status}${selected ? " selected" : ""}"></div>`, iconSize: [14, 14] }),
+      title: `Coordinate to review: ${r.stop_name}`,
+      keyboard: false,
+      zIndexOffset: selected ? 500 : 0,
+    }).on("click", () => onOpen(r)).addTo(layers.coordPoints);
+  }
+}
+
+// How a route's legs are drawn: through the stop as it is now (red), faded where
+// the new point takes the route away, and to the new point for a move (teal), a
+// split (blue) or a move already in a draft (amber). `legKind` lets tests count them.
+const LEG_STYLE = {
+  now: { color: DANGER, weight: 3, opacity: 0.8 },
+  was: { color: MUTED, weight: 2, opacity: 0.6, dashArray: "4 6" },
+  move: { color: ACTION, weight: 4, opacity: 0.9 },
+  split: { color: FOCUS, weight: 4, opacity: 0.9 },
+  drafted: { color: DRAFT_RING, weight: 4, opacity: 0.85 },
+};
+
+// One suspected coordinate: the stop's point now, where it was when the review
+// was loaded, the raw MTC point, the suggestion, the raw points of the stops its
+// routes came from, the stops sharing its point, and each route's previous ->
+// stop -> next legs beside the straight line the bus would take without the
+// stop, so a detour is plain to see. With `onPlace(lat, lon, how)`, a click on
+// the map or on a stop, or dragging the pin, sets a new point.
+// Returns {setLegs(specs), setPin(point), setDrafted(points), setSharing(stops), fit(points)};
+// a leg spec is {prev, next, via: {lat, lon}, kind, routes: [route numbers]}.
+export function showPositionReview({ stopId, current, loaded = null, raw = null, suggestion = null, origins = [], onPlace = null }) {
+  layers.coord.clearLayers();
+  const direct = L.layerGroup().addTo(layers.coord);
+  const legs = L.layerGroup().addTo(layers.coord);
+  const ends = L.layerGroup().addTo(layers.coord);
+  const marks = L.layerGroup().addTo(layers.coord);
+  const sharingGroup = L.layerGroup().addTo(layers.coord);
+  const draftedGroup = L.layerGroup().addTo(layers.coord);
+  let fixedLabels = [], sharingLabels = [], draftedLabels = [], pinLabel = null;
+  let sharingIds = [];
+  const box = map.getContainer();
+
+  const labelAt = (group, lat, lon, words, cls, side = "right") => {
+    L.tooltip({ permanent: true, direction: side, offset: [side === "right" ? 14 : -14, 0], className: `coord-label ${cls}`, interactive: false, opacity: 1 })
+      .setLatLng([lat, lon]).setContent(text(words)).addTo(group);
+    return { lat, lon, text: words, side };
+  };
+  const pinIcon = (cls) => L.divIcon({ className: "", html: `<div class="${cls}"></div>`, iconSize: [14, 14] });
+  // ordinary stop labels stay clear of this review's labels, and do not repeat its stops
+  const reserve = () => {
+    quietIds = new Set([stopId, ...sharingIds]);
+    reserved = [...fixedLabels, ...sharingLabels, ...draftedLabels, pinLabel].filter(Boolean);
+    redrawLabels();
+  };
+
+  L.circleMarker([current.lat, current.lon], { renderer: lines, radius: 13, color: DANGER, weight: 3, fill: false, interactive: false }).addTo(marks);
+  fixedLabels.push(labelAt(marks, current.lat, current.lon, "Now", "now", "left"));
+  if (loaded && haversine(loaded.lat, loaded.lon, current.lat, current.lon) > 5) {
+    L.circleMarker([loaded.lat, loaded.lon], { renderer: lines, radius: 9, color: MUTED, weight: 2, dashArray: "3 4", fill: false, interactive: false }).addTo(marks);
+    fixedLabels.push(labelAt(marks, loaded.lat, loaded.lon, "When loaded", "muted", "left"));
+  }
+  if (raw) {
+    L.marker([raw.lat, raw.lon], { icon: pinIcon("raw-pin"), keyboard: false, interactive: false }).addTo(marks);
+    const nearSuggestion = suggestion && haversine(raw.lat, raw.lon, suggestion.lat, suggestion.lon) < 30;
+    fixedLabels.push(labelAt(marks, raw.lat, raw.lon, "MTC raw point", "raw", nearSuggestion ? "left" : "right"));
+  }
+  if (suggestion) {
+    L.marker([suggestion.lat, suggestion.lon], { icon: pinIcon("suggest-pin"), keyboard: false, interactive: false }).addTo(marks);
+    const source = suggestion.source || "";
+    fixedLabels.push(labelAt(marks, suggestion.lat, suggestion.lon, `Suggestion${source ? `: ${source.length > 60 ? `${source.slice(0, 58)}…` : source}` : ""}`, "suggest"));
+  }
+  for (const o of origins) {
+    L.marker([o.lat, o.lon], { icon: pinIcon("raw-pin origin"), keyboard: false, interactive: false }).addTo(marks);
+    fixedLabels.push(labelAt(marks, o.lat, o.lon, o.label, "raw"));
+  }
+
+  let pin = null, pinLine = null;
+  if (onPlace) {
+    const onClick = (ev) => onPlace(ev.latlng.lat, ev.latlng.lng, "click");
+    map.on("click", onClick);
+    box.classList.add("placing");
+    clickHandler = (s) => onPlace(s.lat, s.lon, "stop");
+    placeCleanup = () => { map.off("click", onClick); box.classList.remove("placing"); };
+  }
+  reserve();
+
+  return {
+    setLegs(specs) {
+      direct.clearLayers();
+      legs.clearLayers();
+      ends.clearLayers();
+      const drawn = new Set(), straight = new Set(), stops = new Map();
+      for (const s of specs) {
+        const key = `${s.kind}|${s.prev?.stop_id}|${s.next?.stop_id}|${s.via.lat.toFixed(6)},${s.via.lon.toFixed(6)}`;
+        for (const end of [s.prev, s.next]) {
+          if (!end) continue;
+          if (!stops.has(end.stop_id)) stops.set(end.stop_id, { end, routes: new Set() });
+          (s.routes || []).forEach((x) => stops.get(end.stop_id).routes.add(x));
+        }
+        if (drawn.has(key)) continue;
+        drawn.add(key);
+        const pts = [s.prev && [s.prev.lat, s.prev.lon], [s.via.lat, s.via.lon], s.next && [s.next.lat, s.next.lon]].filter(Boolean);
+        if (pts.length > 1) L.polyline(pts, { renderer: lines, interactive: false, legKind: s.kind, ...LEG_STYLE[s.kind] }).addTo(legs);
+        const pair = s.prev && s.next ? `${s.prev.stop_id}|${s.next.stop_id}` : null;
+        if (pair && !straight.has(pair)) {
+          straight.add(pair);
+          L.polyline([[s.prev.lat, s.prev.lon], [s.next.lat, s.next.lon]], { renderer: lines, color: INK, weight: 1.5, opacity: 0.5, dashArray: "2 5", interactive: false, legKind: "direct" }).addTo(direct);
+        }
+      }
+      for (const { end, routes } of stops.values()) {
+        const m = L.circleMarker([end.lat, end.lon], { renderer: dots, bubblingMouseEvents: false, radius: 5, color: INK, weight: 2, fillColor: "#ffffff", fillOpacity: 1 })
+          .bindTooltip(text(`${end.name} (${end.stop_id})${routes.size ? `, next to this stop on ${[...routes].slice(0, 8).join(", ")}${routes.size > 8 ? "…" : ""}` : ""}`), { direction: "top" });
+        if (onPlace) m.on("click", () => onPlace(end.lat, end.lon, "stop"));
+        m.addTo(ends);
+      }
+    },
+    setPin(p) {
+      if (!p) {
+        if (pin) { layers.coord.removeLayer(pin); layers.coord.removeLayer(pinLine); }
+        pin = null;
+        pinLine = null;
+        pinLabel = null;
+        reserve();
+        return;
+      }
+      // the pin's label goes on the side away from a label already there (the
+      // suggestion's, when the pin is put on the suggestion)
+      const at = map.latLngToContainerPoint([p.lat, p.lon]);
+      const side = [...fixedLabels, ...sharingLabels].some((l) => l.side === "right" && map.latLngToContainerPoint([l.lat, l.lon]).distanceTo(at) < 24) ? "left" : "right";
+      const bindLabel = () => pin.unbindTooltip().bindTooltip(text("New position"), {
+        permanent: true, direction: side, offset: [side === "right" ? 12 : -12, 0], className: "coord-label new", interactive: false,
+      });
+      if (!pin) {
+        pin = L.marker([p.lat, p.lon], {
+          draggable: !!onPlace, autoPan: true, keyboard: false, zIndexOffset: 1000, title: "The new position. Drag it to the kerb.",
+          icon: L.divIcon({ className: "", html: '<div class="stop-pin"></div>', iconSize: [16, 16] }),
+        });
+        pinLine = L.polyline([[current.lat, current.lon], [p.lat, p.lon]], { renderer: lines, color: ACTION, weight: 2, dashArray: "4 6", interactive: false }).addTo(layers.coord);
+        bindLabel();
+        pin.addTo(layers.coord);
+        pin.on("drag", () => {
+          const q = pin.getLatLng();
+          pinLine.setLatLngs([[current.lat, current.lon], [q.lat, q.lng]]);
+          onPlace(q.lat, q.lng, "drag");
+        });
+        pin.on("dragend", () => {
+          const q = pin.getLatLng();
+          pinLabel = { lat: q.lat, lon: q.lng, text: "New position", side: pinLabel ? pinLabel.side : "right" };
+          reserve();
+        });
+      } else {
+        pin.setLatLng([p.lat, p.lon]);
+        pinLine.setLatLngs([[current.lat, current.lon], [p.lat, p.lon]]);
+        if (!pinLabel || pinLabel.side !== side) bindLabel();
+      }
+      pinLabel = { lat: p.lat, lon: p.lon, text: "New position", side };
+      reserve();
+    },
+    // one marker per action already in the review's draft (a move, or a split's
+    // new stop); `points` is an array of {lat, lon, label}, or empty/null to clear
+    setDrafted(points) {
+      draftedGroup.clearLayers();
+      draftedLabels = [];
+      for (const p of points || []) {
+        L.circleMarker([p.lat, p.lon], { renderer: lines, radius: 8, color: DRAFT_RING, weight: 3, fillColor: DRAFT_FILL, fillOpacity: 1, interactive: false }).addTo(draftedGroup);
+        draftedLabels.push(labelAt(draftedGroup, p.lat, p.lon, p.label || "In the draft", "drafted"));
+      }
+      reserve();
+    },
+    // stops that share (or shared) the point: one label for those still on it
+    setSharing(stops) {
+      sharingGroup.clearLayers();
+      sharingLabels = [];
+      const same = stops.filter((s) => s.lat != null && haversine(s.lat, s.lon, current.lat, current.lon) <= 3);
+      sharingIds = same.map((s) => s.stop_id);
+      if (same.length) {
+        const names = same.slice(0, 2).map((s) => s.name).join(", ");
+        sharingLabels.push(labelAt(sharingGroup, current.lat, current.lon, `Same point: ${names}${same.length > 2 ? ` +${same.length - 2}` : ""}`, "muted"));
+      }
+      stops.filter((s) => s.lat != null && !same.includes(s)).forEach((s) => {
+        L.circleMarker([s.lat, s.lon], { renderer: lines, radius: 6, color: INK, weight: 2, fillColor: "#ffffff", fillOpacity: 1, interactive: false }).addTo(sharingGroup);
+        sharingLabels.push(labelAt(sharingGroup, s.lat, s.lon, s.name, "muted"));
+      });
+      reserve();
+    },
+    fit(points, { maxZoom = 18 } = {}) {
+      fitPoints(points, { maxZoom, pad: 0.25 });
+    },
+  };
+}
+
 // Two stops side by side for a merge: the one that stays and the one that goes.
 export function showPair(keep, drop) {
   layers.pair.clearLayers();
@@ -601,7 +800,10 @@ export function inset(el, { points = [], lines: paths = [], maxZoom = 18 }) {
     all.push([p.lat, p.lon]);
   }
   if (all.length) m.fitBounds(L.latLngBounds(all).pad(0.4), { maxZoom });
-  setTimeout(() => m.invalidateSize(), 50);
+  // by the time this fires the change list may have re-rendered and dropped this
+  // inset (map.remove()'d, its container gone): invalidateSize on a removed map
+  // throws deep in Leaflet, so skip it once the container is no longer attached
+  setTimeout(() => { if (document.body.contains(el)) m.invalidateSize(); }, 50);
   return m;
 }
 

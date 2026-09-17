@@ -10,8 +10,12 @@
 // (add stop, change stop, stage names, renumbering); a stop move, a station, a
 // map line; New stop, New route with its stop list, New station; stations to
 // review (edit, approve, reject, reopen, approve an area); merging duplicate
-// stops; importing CSV files into a draft of 1,200 changes; submit, approve and
-// commit by a second person, a commit conflict, people and history.
+// stops; coordinates to review (the list, a move by suggestion, raw point, map
+// click and drag, position is correct and reopen, splitting routes off a stop
+// with routes from three original stops and its draft conflict, a stop merged
+// away); importing CSV files into a draft of 1,200 changes; submit, approve and
+// commit by a second person, a commit conflict, people and history; the
+// "Stations to review" link hiding once nothing is left to review.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -125,6 +129,12 @@ async function choose(selector, value) {
 const text = (sel = "body") => evaluate(`document.querySelector(${JSON.stringify(sel)})?.innerText || ""`);
 const has = (sel) => evaluate(`!!document.querySelector(${JSON.stringify(sel)})`);
 const api = (path) => evaluate(`fetch(${JSON.stringify(`${BASE}/internal/gtfs-editor/`)} + ${JSON.stringify(path)}, { credentials: "same-origin" }).then((r) => r.json())`);
+// a mutation as the signed-in person, for setting up a situation the UI then meets
+const apiSend = (method, path, body) => evaluate(`fetch(${JSON.stringify(`${BASE}/internal/gtfs-editor/`)} + ${JSON.stringify(path)}, {
+  method: ${JSON.stringify(method)}, credentials: "same-origin",
+  headers: { "Content-Type": "application/json", "X-Requested-With": "gtfs-editor" },
+  body: ${body === undefined ? "undefined" : JSON.stringify(JSON.stringify(body))},
+}).then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) }))`);
 const activeDraftId = () => evaluate(`Object.entries(JSON.parse(localStorage.getItem("gtfs-editor-prefs"))).find(([k]) => k.startsWith("draft:" + document.getElementById("user-role").textContent.split(",")[0] + ":"))?.[1]`);
 
 // the map, through the page's own module instance
@@ -202,6 +212,48 @@ function totp(secret) {
   });
 }
 
+// ------------------------------------------------------------------ coordinates
+// The detour a stop's routes take, computed here independently of the page: the
+// median over routes of d(prev, p) + d(p, next) - d(prev, next) (docs section 8).
+function metres(aLat, aLon, bLat, bLon) {
+  const R = 6371000, rad = (x) => (x * Math.PI) / 180;
+  const s = Math.sin(rad(bLat - aLat) / 2) ** 2 + Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(rad(bLon - aLon) / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+function medianDetour(legs, p) {
+  const v = legs.filter((l) => l.prev && l.next)
+    .map((l) => metres(l.prev.lat, l.prev.lon, p.lat, p.lon) + metres(p.lat, p.lon, l.next.lat, l.next.lon) - metres(l.prev.lat, l.prev.lon, l.next.lat, l.next.lon))
+    .sort((a, b) => a - b);
+  if (!v.length) return null;
+  return v.length % 2 ? v[v.length >> 1] : (v[v.length / 2 - 1] + v[v.length / 2]) / 2;
+}
+// the dashboard's way of writing a distance
+const distance = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} km` : `${Math.round(Math.max(0, m))} m`);
+const legKinds = () => mapCall(`const k = {}; map.eachLayer((l) => { const kind = l.options && l.options.legKind; if (kind) k[kind] = (k[kind] || 0) + 1; }); return k;`);
+const panelText = () => text("#panel");
+// Toggling a checkbox re-renders the whole route list (a fresh DOM each time), so
+// clicking a stale, pre-captured NodeList in one go only half-works: click one at
+// a time, re-querying the live DOM before each click.
+async function clickAllUnchecked(selector) {
+  for (let i = 0; i < 50; i++) {
+    const did = await evaluate(`(() => { const b = [...document.querySelectorAll(${JSON.stringify(selector)})].find((x) => !x.checked); if (!b) return false; b.click(); return true; })()`);
+    if (!did) break;
+  }
+}
+async function clickAllChecked(selector) {
+  for (let i = 0; i < 50; i++) {
+    const did = await evaluate(`(() => { const b = [...document.querySelectorAll(${JSON.stringify(selector)})].find((x) => x.checked); if (!b) return false; b.click(); return true; })()`);
+    if (!did) break;
+  }
+}
+// A group's checkbox (or its pre-checked suspect routes) may already be in the
+// wanted state - e.g. once one split reloads the review, the next suspect group
+// is pre-checked again - so only click it when that would actually change it.
+async function ensureGroupChecked(groupExpr, want) {
+  const already = await evaluate(`${groupExpr}.querySelector(".route-group-head input")?.checked`);
+  if (already !== want) await evaluate(`${groupExpr}.querySelector(".route-group-head input").click(); true`);
+}
+
 // ------------------------------------------------------------------ flows
 try {
   await connect();
@@ -230,6 +282,13 @@ try {
   // ================================================================ editor 1
   await signIn("editor1@nammayatri.in");
   await shot("02-home");
+  // the top bar: coordinates to review with the pending count; stations to review while any is open
+  const coordSummary = await api("feeds/chennai_bus/position-reviews/summary");
+  await waitFor(`document.getElementById("coordinates-count").textContent === ${JSON.stringify(coordSummary.pending.toLocaleString("en-IN"))}`, "the coordinates count in the top bar");
+  check(await evaluate(`(() => { const a = document.querySelector('[data-nav="coordinates"]'); return a.offsetParent !== null && a.innerText.startsWith("Coordinates to review"); })()`), `the top bar links to "Coordinates to review" with ${coordSummary.pending} pending`);
+  await waitFor(`document.querySelector('[data-nav="stations"]').offsetParent !== null`, "the stations link while suggestions are open");
+  check(true, "the top bar links to \"Stations to review\" while suggestions are waiting");
+  check((await panelText()).includes("Coordinates to review"), "the home panel points to the coordinates to review");
 
   // ---- map: the search list sits above the map's zoom control
   await type("#search-input", "45BET");
@@ -642,6 +701,364 @@ try {
   await waitFor(`document.querySelectorAll(".change").length === 1`, "merge draft page");
   check(/merged into .*routes? updated/.test(await text("#page")), "the draft shows the merge with the routes it updates");
 
+  // ---- coordinates to review
+  // Reviews are chosen from what the mock was seeded with (real rows from the local
+  // database, or made-up ones), leaving out stops and routes the drafts of this run
+  // already change, so the commits at the end do not collide.
+  const touched = new Set(), touchedRoutes = new Set();
+  for (const open of (await api("feeds/chennai_bus/change-sets?status=draft,submitted,approved&limit=100")).items) {
+    for (const c of (await api(`change-sets/${open.change_set_id}`)).changes) {
+      const a = c.after || {};
+      if (c.entity === "stop" || c.entity === "station") touched.add(c.entity_key);
+      if (a.into_stop_id) touched.add(a.into_stop_id);
+      (a.members || []).forEach((m) => touched.add(m.stop_id));
+      (a.member_stop_ids || []).forEach((id) => touched.add(id));
+      if (c.entity === "route_stops") {
+        touchedRoutes.add(c.entity_key);
+        (a.rows || []).forEach((r) => r.stop_id && touched.add(r.stop_id));
+      }
+    }
+  }
+  const pendingReviews = (await api("feeds/chennai_bus/position-reviews?status=pending&limit=500")).items;
+  const reviewDetails = new Map();
+  const reviewDetail = async (id) => {
+    if (!reviewDetails.has(id)) reviewDetails.set(id, await api(`position-reviews/${id}`));
+    return reviewDetails.get(id);
+  };
+  const mixed = pendingReviews.find((r) => r.evidence?.mixed_origins && !touched.has(r.stop_id)
+    && r.evidence.route_groups.some((g) => g.suspect && g.raw_lat != null) && r.evidence.route_groups.some((g) => !g.suspect));
+  const fx = mixed ? await reviewDetail(mixed.review_id) : null;
+  check(!!fx, "there is a stop whose routes came from several original stops (the THANDALAM fixture)");
+  (fx ? fx.routes : []).forEach((l) => touchedRoutes.add(l.route_id));
+  const usedStops = new Set(fx ? [fx.stop_id] : []);
+  const pickReview = async (want) => {
+    for (const r of pendingReviews) {
+      if (usedStops.has(r.stop_id) || touched.has(r.stop_id) || r.evidence?.mixed_origins || !want(r)) continue;
+      const d = await reviewDetail(r.review_id);
+      if (!d.stop || d.stop.deleted || d.problems.length || !d.routes.some((l) => l.prev && l.next)
+        || d.routes.some((l) => touchedRoutes.has(l.route_id))) continue;
+      usedStops.add(r.stop_id);
+      return d;
+    }
+    return null;
+  };
+  const revA = await pickReview((r) => r.suggested_lat != null);
+  const revB = await pickReview((r) => r.raw_lat != null);
+  const revC = await pickReview(() => true);
+  const revD = await pickReview(() => true);
+  const revE = await pickReview(() => true);
+  check(!!(fx && revA && revB && revC && revD && revE), "enough coordinate reviews to try every action");
+  const pendingText = coordSummary.pending.toLocaleString("en-IN");
+  const lastToast = () => text("#toasts .toast:last-child");
+
+  // the list: counts, search, only in the map area
+  await go("#/coordinates");
+  await waitFor(`document.querySelectorAll(".proposal-item").length > 1`, "coordinates to review");
+  await waitFor(`/To review\\s*${pendingText}/.test(document.querySelector(".count-tabs").innerText)`, "the pending count on the list");
+  check(await evaluate(`document.querySelectorAll(".coord-pin").length === document.querySelectorAll(".proposal-item").length`), "each review in the list is a pin on the map");
+  const listed = await evaluate(`document.querySelectorAll(".proposal-item").length`);
+  await shot("21-coordinates-list");
+  await type("#review-search", fx.stop_id);
+  await waitFor(`document.querySelectorAll(".proposal-item").length === 1 && document.querySelector(".proposal-item").innerText.includes(${JSON.stringify(fx.stop_name)})`, "search by stop id");
+  check(true, "the list searches by stop id");
+  await type("#review-search", "");
+  await waitFor(`document.querySelectorAll(".proposal-item").length === ${listed}`, "the whole list again");
+  await setView(fx.stop.lat, fx.stop.lon, 15);
+  await clickSel("#review-area", "Only in the map area");
+  await waitFor(`document.querySelectorAll(".proposal-item").length >= 1 && document.querySelectorAll(".proposal-item").length < ${listed}`, "only reviews in the map area");
+  check((await text("#panel")).includes(fx.stop_name), "only the reviews in the map area are listed");
+  await clickSel("#review-area", "untick Only in the map area");
+  await waitFor(`document.querySelectorAll(".proposal-item").length === ${listed}`, "the whole list after unticking");
+
+  // no draft open, so the first move asks which draft to use
+  await clickSel("#draft-chip", "the draft chip");
+  await click("Stop using a draft", "dialog");
+  await waitFor(`document.getElementById("draft-chip").innerText.includes("No draft open")`, "no draft open");
+
+  // a move to the suggestion, with the details a reviewer needs; the panel stays
+  // on the review afterwards, so a second action can follow (docs section 8.1)
+  await go(`#/coordinates/${revA.review_id}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Why it is flagged")`, "a review with a suggestion");
+  const aText = await text("#panel");
+  const aNow = { lat: revA.stop.lat, lon: revA.stop.lon };
+  check(aText.includes(revA.reason.slice(0, 60)), "the review says why the stop is flagged");
+  check(aText.includes(`Detour now\n${distance(revA.detour_m)}`), `the review shows the detour in metres (${distance(revA.detour_m)})`);
+  check([...new Set(revA.routes.map((l) => l.short_name || l.route_id))].every((n) => aText.includes(n)), "the review lists the numbers of its routes");
+  if ((revA.evidence.chalo_nearby || "").trim()) check(aText.includes("Chalo has nearby"), "the review shows the Chalo hint");
+  check(await evaluate(`[...document.querySelectorAll("#panel a[target=_blank]")].some((a) => a.href.startsWith("https://www.google.com/maps/search/?api=1&query="))`), "the review links to Google Maps");
+  const aLabels = await evaluate(`${shownLabels("coord-label")}.map((e) => e.textContent)`);
+  check(aLabels.includes("Now") && aLabels.some((l) => l.startsWith("Suggestion")) && (revA.raw_lat == null || aLabels.includes("MTC raw point")),
+    `the map marks the point now, the raw MTC point and the suggestion with its source (${aLabels.join(" / ")})`);
+  const aLegs = await legKinds();
+  check(aLegs.now > 0 && aLegs.direct > 0, "the map draws every route's previous, stop, next legs beside the straight line without the stop");
+  await clickSel("#use-suggestion", "Use suggestion");
+  const suggestion = { lat: revA.suggested_lat, lon: revA.suggested_lon };
+  const aAfter = medianDetour(revA.routes, suggestion);
+  await waitFor(`document.getElementById("panel").innerText.includes("Moving the stop here")`, "the detour at the suggestion");
+  check((await text("#panel")).includes(`goes from ${distance(revA.detour_m)} to ${distance(aAfter)}`), `the panel works out the detour the suggestion gives from the legs (${distance(aAfter)})`);
+  const movedLegs = await legKinds();
+  check(movedLegs.move > 0 && movedLegs.was > 0, "the legs to the new position are drawn beside the old ones");
+  await shot("22-coordinate-move");
+  await click("Add move to draft", ".sticky-actions");
+  await chooseNewDraft("Smoke: coordinates");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes(${JSON.stringify(`Moved ${revA.stop.name}`)})`, "a toast confirms the move");
+  const moveToast = await lastToast();
+  check(moveToast.includes(`Detour now ${distance(aAfter)}`), `the toast says the detour the server measured (${moveToast})`);
+  const coordDraft = await activeDraftId();
+  await waitFor(`location.hash === "#/coordinates/${revA.review_id}"`, "the panel stays on the review after the move");
+  await waitFor(`document.getElementById("panel").innerText.includes("In draft")`, "the review now shows it is in a draft");
+  check(await has(`#panel .review-status a[href="#/drafts/${coordDraft}"]`), "and links the draft the move went into");
+  check(await evaluate(`document.querySelector(".draft-actions")?.innerText.includes("Move")`), "the actions list in the draft shows the move");
+  const aInDraft = await api(`position-reviews/${revA.review_id}`);
+  check(aInDraft.status === "approved" && aInDraft.change_set_title === "Smoke: coordinates" && aInDraft.draft_actions?.length === 1, "the review is approved with one action in the draft");
+  check(await evaluate(`document.getElementById("review-move").disabled && document.getElementById("why-move").innerText.includes("already moved")`), "Move is now disabled: the stop was already moved in this draft");
+
+  // the raw point, then a click on the map, then dragging the pin
+  await go(`#/coordinates/${revB.review_id}`);
+  await waitFor(`!!document.getElementById("use-raw")`, "a review with a raw point");
+  const pinAt = () => mapCall(`let p = null; map.eachLayer((l) => { const html = l.options && l.options.icon && l.options.icon.options.html; if (String(html || "").includes("stop-pin") && l.getLatLng) { const q = l.getLatLng(); p = { lat: q.lat, lon: q.lng }; } }); return p;`);
+  await clickSel("#use-raw", "Use raw point");
+  await sleep(400);
+  const atRaw = await pinAt();
+  check(atRaw && metres(atRaw.lat, atRaw.lon, revB.raw_lat, revB.raw_lon) < 0.5, "Use raw point puts the pin on the MTC raw point");
+  await sleep(600);
+  const beside = await mapCall(`const s = map.getSize(); const at = map.latLngToContainerPoint([${atRaw ? atRaw.lat : 0}, ${atRaw ? atRaw.lon : 0}]);
+    const x = at.x + 70 < s.x - 20 ? at.x + 70 : at.x - 70, y = at.y - 50 > 20 ? at.y - 50 : at.y + 50;
+    const q = map.containerPointToLatLng([x, y]); return { lat: q.lat, lon: q.lng };`);
+  await clickMapAt(beside.lat, beside.lon);
+  const clicked = await pinAt();
+  check(clicked && metres(clicked.lat, clicked.lon, beside.lat, beside.lon) < 100 && metres(clicked.lat, clicked.lon, atRaw.lat, atRaw.lon) > 1, "a click on the map moves the pin there");
+  const pinBox = await evaluate(`(() => { const r = document.querySelector(".stop-pin").getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
+  await mouseDrag(pinBox.x, pinBox.y, pinBox.x + 40, pinBox.y + 30);
+  const dragged = await pinAt();
+  check(dragged && metres(dragged.lat, dragged.lon, clicked.lat, clicked.lon) > 1, "dragging the pin moves it");
+  await waitFor(`document.getElementById("panel").innerText.includes(${JSON.stringify(`to ${distance(medianDetour(revB.routes, dragged))}.`)})`, "the detour at the dragged position");
+  check(true, "the detour follows the pin as it is dragged");
+  await evaluate(`location.hash = "#/drafts"; true`);
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("Leave without saving")`, "the leave question for an unsaved position");
+  await click("Cancel", "dialog");
+  check((await evaluate("location.hash")) === `#/coordinates/${revB.review_id}`, "leaving with a new position not in a draft asks first");
+  await click("Add move to draft", ".sticky-actions");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes(${JSON.stringify(`Moved ${revB.stop.name}`)})`, "a toast confirms the second move");
+  await waitFor(`location.hash === "#/coordinates/${revB.review_id}" && document.getElementById("panel").innerText.includes("In draft")`, "the panel stays on this review too");
+  check((await api(`position-reviews/${revB.review_id}`)).status === "approved", "the dragged position is in the draft");
+
+  // position is correct, with a note, then reopened - this is the one action that
+  // still moves on, since a confirmed review has nothing left to do
+  await go(`#/coordinates/${revC.review_id}`);
+  await waitFor(`!!document.getElementById("review-confirm")`, "a review to confirm");
+  await clickSel("#review-confirm", "Position is correct…");
+  await waitFor(`!!document.getElementById("confirm-note")`, "the confirm dialog");
+  await click("Checked on Google Maps", "dialog");
+  await click("Confirm position", "dialog");
+  await waitFor(`location.hash !== "#/coordinates/${revC.review_id}"`, "moved on after confirming");
+  const cDone = await api(`position-reviews/${revC.review_id}`);
+  check(cDone.status === "confirmed" && /Google Maps/.test(cDone.review_note || ""), "Position is correct closes the review with its note");
+  check((await text("#panel .notice.ok")).includes("confirmed as correct"), "the next review says the last one was confirmed");
+  await go("#/coordinates");
+  await click("Confirmed", ".count-tabs");
+  await waitFor(`[...document.querySelectorAll(".proposal-item")].some((li) => li.innerText.includes(${JSON.stringify(revC.stop_name)}))`, "the confirmed review in its tab");
+  await go(`#/coordinates/${revC.review_id}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Confirmed as correct")`, "a confirmed review");
+  check(!(await has("#review-confirm")), "a confirmed review offers no second confirm");
+  await click("Reopen", "#panel");
+  await waitFor(`!!document.getElementById("review-confirm")`, "the reopened review");
+  check((await api(`position-reviews/${revC.review_id}`)).status === "pending", "Reopen puts a confirmed review back to review");
+  await go("#/coordinates");
+  await click("To review", ".count-tabs");
+  await waitFor(`document.querySelectorAll(".proposal-item").length > 0`, "the reviews to do again");
+
+  // Next leaves a review for later
+  await go(`#/coordinates/${revD.review_id}`);
+  await waitFor(`!!document.getElementById("review-confirm")`, "a review to skip");
+  const nextHref = await evaluate(`[...document.querySelectorAll(".sticky-actions a")].find((a) => a.textContent.startsWith("Next"))?.getAttribute("href")`);
+  check(!!nextHref && nextHref !== `#/coordinates/${revD.review_id}`, "Next offers the following review");
+  await click("Next ›", ".sticky-actions");
+  await waitFor(`location.hash === ${JSON.stringify(nextHref || "")}`, "the next review");
+  check((await api(`position-reviews/${revD.review_id}`)).status === "pending", "Next leaves the skipped review waiting");
+
+  // splitting routes off a stop whose routes came from three original stops: this
+  // review takes several actions in the same draft (docs section 8.1)
+  await go(`#/coordinates/${fx.review_id}`);
+  await waitFor(`document.querySelectorAll(".split-route").length > 3`, "the stop with routes from several original stops");
+  const groupsFx = fx.evidence.route_groups;
+  const liveIds = [...new Set(fx.routes.map((l) => l.route_id))];
+  const suspectIds = liveIds.filter((id) => groupsFx.some((g) => g.suspect && g.route_ids.includes(id)));
+  const checkedIds = () => evaluate(`[...document.querySelectorAll(".split-route input:checked")].map((i) => i.id.replace("split-route-", "")).sort()`);
+  check((await text("#panel")).includes(`This stop serves routes from ${groupsFx.length} original stops`), "a banner warns that moving the stop moves the routes of every original stop");
+  check(JSON.stringify(await checkedIds()) === JSON.stringify([...suspectIds].sort()), `the routes of the suspect groups start checked (${suspectIds.length})`);
+  check(await evaluate(`document.querySelector(".route-group").classList.contains("suspect") && document.querySelector(".route-group").innerText.includes(${JSON.stringify(groupsFx.find((g) => g.suspect).origin_name)})`), "suspect groups come first, headed by their original stop");
+  if (liveIds.some((id) => !groupsFx.some((g) => g.route_ids.includes(id)))) check((await text("#panel")).includes("Other routes"), "routes in no group are listed under Other routes");
+  await clickAllUnchecked(".split-route input");
+  await waitFor(`document.querySelectorAll(".split-route input:checked").length === document.querySelectorAll(".split-route input").length`, "every route checked");
+  check(await evaluate(`document.getElementById("review-split").disabled && document.getElementById("why-split").innerText.includes("all routes: use Move")`), "with every route checked Split is off: all routes: use Move");
+  await clickAllChecked(".split-route input");
+
+  // an approved review in ANOTHER draft is refused with a link to the one it is in
+  const groupA = groupsFx.find((g) => g.suspect && g.raw_lat != null);
+  const splitIdsA = liveIds.filter((id) => groupA.route_ids.includes(id)).sort();
+  const groupElA = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupA.origin_name)}))`;
+  await ensureGroupChecked(groupElA, true);
+  await waitFor(`document.querySelectorAll(".split-route input:checked").length === ${splitIdsA.length}`, "group A's routes checked");
+  await evaluate(`${groupElA}.querySelector("button").click(); true`);
+  await waitFor(`!document.getElementById("review-split").disabled`, "Split ready with a pin and checked routes");
+  const preOther = await apiSend("POST", "feeds/chennai_bus/change-sets", { title: "Smoke: elsewhere" });
+  const splitFromElsewhere = await apiSend("POST", `position-reviews/${fx.review_id}/split`, {
+    change_set_id: preOther.body.change_set_id, route_ids: splitIdsA, lat: groupA.raw_lat, lon: groupA.raw_lon,
+  });
+  check(splitFromElsewhere.status === 200, "set-up: the review already has an action in a first draft");
+  await clickSel("#draft-chip", "the draft chip");
+  await chooseNewDraft("Smoke: active elsewhere");
+  await click("Split checked routes to a new stop here", ".sticky-actions");
+  await waitFor(`(document.querySelector(".sticky-actions .notice.error")?.innerText || "").includes("In draft")`, "the review-in-another-draft notice");
+  check(await has(`.sticky-actions .notice.error a[href="#/drafts/${preOther.body.change_set_id}"]`), "and it links to the draft the review is already in");
+  // undo the API-made split so the draft the UI actually uses starts clean
+  await apiSend("DELETE", `change-sets/${preOther.body.change_set_id}/changes/${splitFromElsewhere.body.change_id}`);
+  check((await api(`position-reviews/${fx.review_id}`)).status === "pending", "removing that change returns the review to pending");
+  await clickSel("#draft-chip", "the draft chip");
+  await chooseNewDraft("Smoke: coordinates for THANDALAM");
+  const fxDraft = await activeDraftId();
+
+  // group A, with a draft conflict first: a change to one of its routes is already there
+  const blockedRoute = await api(`feeds/chennai_bus/routes/${splitIdsA[0]}`);
+  const blocker = await apiSend("POST", `change-sets/${fxDraft}/changes`, {
+    entity: "route_stops", op: "replace", entity_key: splitIdsA[0],
+    after: {
+      base_rows_hash: blockedRoute.rows_hash,
+      rows: blockedRoute.rows.map((r) => ({ stop_id: r.stop_id, stop_type: r.stop_type, stage_no: r.stage_no, stage_name: r.stage_name, marker_id: r.marker_id, marker_name: r.marker_name, marker_lat: r.marker_lat, marker_lon: r.marker_lon, stop_name_override: r.stop_name_override, provider_id: r.provider_id })),
+    },
+  });
+  check(blocker.status === 201, "set-up: the active draft already changes one of group A's routes");
+  // group A is still checked with its pin still placed from before: switching the
+  // active draft (above) does not touch either, so the same Split click now goes
+  // into the new draft and meets the blocker
+  check(!(await evaluate(`document.getElementById("review-split")?.disabled`)), "Split is still ready: checking routes and placing the pin do not depend on which draft is active");
+  const splitLegsA = fx.routes.filter((l) => splitIdsA.includes(l.route_id));
+  const fxNow = { lat: fx.stop.lat, lon: fx.stop.lon };
+  const splitAtA = { lat: groupA.raw_lat, lon: groupA.raw_lon };
+  check((await text("#panel")).includes(`their detour goes from ${distance(medianDetour(splitLegsA, fxNow))} to ${distance(medianDetour(splitLegsA, splitAtA))}`), "the panel shows the detour the split routes would get at the pin");
+  const splitKinds = await legKinds();
+  check(splitKinds.split > 0 && splitKinds.now > 0 && !splitKinds.move, "the routes being split off are drawn to the pin in their own colour, the others stay");
+  await shot("23-coordinate-split");
+  await click("Split checked routes to a new stop here", ".sticky-actions");
+  await waitFor(`(document.querySelector(".sticky-actions .notice.error")?.innerText || "").includes("#${blocker.body.change_id}")`, "the draft conflict next to the actions");
+  check((await text(".sticky-actions .notice.error")).includes("in the way"), "a 409 draft conflict is shown inline, naming the change in the way");
+  check((await api(`position-reviews/${fx.review_id}`)).status === "pending", "the refused split changed nothing");
+  await apiSend("DELETE", `change-sets/${fxDraft}/changes/${blocker.body.change_id}`);
+  await click("Split checked routes to a new stop here", ".sticky-actions");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes("Split")`, "a toast confirms the split");
+  const splitAToast = await lastToast();
+  const splitStopIdA = splitAToast.match(/new stop (ed_[0-9a-f]{10})/)?.[1];
+  check(!!splitStopIdA, `the toast names the new stop (${splitStopIdA})`);
+  await waitFor(`location.hash === "#/coordinates/${fx.review_id}" && document.getElementById("panel").innerText.includes("In draft")`, "the panel stays on the review after the split");
+  check(await has(`#panel .review-status a[href="#/drafts/${fxDraft}"]`), "the review links to the draft its actions are in");
+  check(await evaluate(`document.querySelector(".draft-actions")?.innerText.includes("Split")`), "the actions list shows the split");
+
+  // group A's routes are now locked: no checkbox, and a "split off" badge
+  const groupElA2 = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupA.origin_name)}))`;
+  check(await evaluate(`${groupElA2}.querySelectorAll(".split-route input").length === 0`), "group A's routes have no checkbox any more");
+  check(await evaluate(`${groupElA2}.innerText.includes("Split off") && ${groupElA2}.innerText.includes(${JSON.stringify(splitStopIdA)})`), `group A's routes show "Split off" naming the new stop (${splitStopIdA})`);
+  check(!(await evaluate(`[...document.querySelectorAll(".split-route input")].some((i) => ${JSON.stringify(splitIdsA)}.includes(i.id.replace("split-route-", "")))`)), "group A's routes cannot be checked again");
+
+  // group B, split into the same draft as a second action
+  const groupB = groupsFx.find((g) => g.suspect && g.raw_lat != null && g !== groupA);
+  const splitIdsB = liveIds.filter((id) => groupB.route_ids.includes(id)).sort();
+  const groupElB = `[...document.querySelectorAll(".route-group")].find((el) => el.innerText.includes(${JSON.stringify(groupB.origin_name)}))`;
+  await ensureGroupChecked(groupElB, true);
+  await waitFor(`document.querySelectorAll(".split-route input:checked").length === ${splitIdsB.length}`, "group B's routes checked");
+  await evaluate(`${groupElB}.querySelector("button").click(); true`);
+  await waitFor(`!document.getElementById("review-split").disabled`, "Split ready for group B");
+  await click("Split checked routes to a new stop here", ".sticky-actions");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes("Split")`, "a second toast confirms the second split");
+  const splitBToast = await lastToast();
+  const splitStopIdB = splitBToast.match(/new stop (ed_[0-9a-f]{10})/)?.[1];
+  check(!!splitStopIdB && splitStopIdB !== splitStopIdA, `the second split makes a different new stop (${splitStopIdB})`);
+  await waitFor(`document.getElementById("panel").innerText.includes("In draft")`, "the review again, with two actions now");
+  const afterTwoSplits = await api(`position-reviews/${fx.review_id}`);
+  check(afterTwoSplits.draft_actions?.length === 2 && afterTwoSplits.draft_actions.every((a) => a.kind === "split"), `the draft has both splits (${afterTwoSplits.draft_actions?.length})`);
+
+  // the remaining, own routes still need their own fix: a move, as the review's
+  // third action in the same draft
+  const ownIds = liveIds.filter((id) => !splitIdsA.includes(id) && !splitIdsB.includes(id));
+  check(ownIds.length > 0, "the stop still has its own routes after both splits");
+  const target = { lat: fxNow.lat + 0.0003, lon: fxNow.lon + 0.0002 };
+  // the review fits the map to every route end at this stop, not only the kerb
+  // itself, so it can be zoomed far out; zoom back in on the stop before clicking
+  // a point close to it
+  await setView(fxNow.lat, fxNow.lon, 17);
+  await clickMapAt(target.lat, target.lon);
+  await waitFor(`!!document.getElementById("review-move") && !document.getElementById("review-move").disabled`, "Move ready for the stop's own routes");
+  await click("Add move to draft", ".sticky-actions");
+  await waitFor(`document.querySelector("#toasts .toast:last-child")?.textContent.includes(${JSON.stringify(`Moved ${fx.stop.name}`)})`, "a third toast confirms the move");
+  await waitFor(`document.getElementById("panel").innerText.includes("In draft")`, "the review with all three actions");
+  const afterMove = await api(`position-reviews/${fx.review_id}`);
+  check(afterMove.draft_actions?.length === 3 && afterMove.draft_actions.filter((a) => a.kind === "move").length === 1, `the draft now has 2 splits and a move (${afterMove.draft_actions?.length})`);
+  check(await evaluate(`document.getElementById("review-move").disabled && document.getElementById("why-move").innerText.includes("already moved")`), "Move is off now: already moved in this draft");
+  check(await evaluate(`document.getElementById("why-split")?.innerText.includes("already moved") ?? true`), "Split is off too, for the same reason");
+  await shot("24-coordinate-actions");
+
+  // a stop merged away leaves nothing to move or split
+  const eRoutes = new Set(revE.routes.map((l) => l.route_id));
+  let mergeInto = null;
+  for (const s of (await api("feeds/chennai_bus/stops?limit=300")).items) {
+    if (s.location_type !== 0 || !s.route_count || s.parent_station || touched.has(s.stop_id) || usedStops.has(s.stop_id)
+      || pendingReviews.some((r) => r.stop_id === s.stop_id)) continue;
+    const d = await api(`feeds/chennai_bus/stops/${s.stop_id}`);
+    if (d.routes.some((r) => eRoutes.has(r.route_id) || touchedRoutes.has(r.route_id))) continue;
+    mergeInto = d;
+    break;
+  }
+  check(!!mergeInto, "set-up: a stop to merge a reviewed stop into");
+  await clickSel("#draft-chip", "the draft chip");
+  await chooseNewDraft("Smoke: merge a reviewed stop");
+  const eMergeDraft = await activeDraftId();
+  await go(`#/merge/${revE.stop_id}?with=${mergeInto.stop_id}`);
+  await waitFor(`!!document.querySelector("table.compare")`, "the merge of a reviewed stop");
+  await clickSel(`#keep-${mergeInto.stop_id}`, "keep the other stop's id");
+  await click("Add merge to draft", ".sticky-actions");
+  await click("Add merge to draft", "dialog");
+  await waitFor(`document.getElementById("panel").innerText.includes("Merge added to your draft")`, "the merge in its own draft");
+  // a merge is only live once its draft is committed; until then the review does
+  // not yet see stop_merged_away (checked below, once the approver commits it)
+  await go(`#/drafts/${eMergeDraft}`);
+  await waitFor(`document.body.innerText.includes("Submit for review")`, "the merge draft page");
+  await click("Submit for review");
+  await click("Submit for review", "dialog");
+  await waitFor(`document.body.innerText.includes("Waiting for review")`, "the merge draft submitted");
+
+  // the draft reads naturally
+  await go(`#/drafts/${coordDraft}`);
+  await waitFor(`document.querySelectorAll(".change").length === 2`, "the coordinates draft: the two moves");
+  const moveOf = (review) => `[...document.querySelectorAll(".change")].find((a) => a.querySelector('a[href="#/coordinates/${review.review_id}"]'))`;
+  const movedBy = distance(metres(aNow.lat, aNow.lon, suggestion.lat, suggestion.lon));
+  check(await evaluate(`(${moveOf(revA)}?.querySelector("h3").innerText || "").includes(${JSON.stringify(`${movedBy} coordinate review`)})`), `a move from a review reads "Moved ${revA.stop.name} ${movedBy}" (coordinate review)`);
+  check(await evaluate(`!!${moveOf(revA)}?.querySelector('a[href="#/coordinates/${revA.review_id}"]')`), "the move links back to its review");
+  await evaluate(`${moveOf(revA)}.scrollIntoView(); true`);
+  await waitFor(`!!${moveOf(revA)}.querySelector(".inset.leaflet-container")`, "the before and after map of the move");
+  check(true, "the move has a before and after map inset");
+  await evaluate(`[...${moveOf(revB)}.querySelectorAll("button")].find((b) => b.textContent === "Remove from draft").click(); true`);
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("coordinate review goes back")`, "the remove question for a move from a review");
+  await click("Remove change", "dialog");
+  await waitFor(`document.querySelectorAll(".change").length === 1`, "the draft without that move");
+  check((await api(`position-reviews/${revB.review_id}`)).status === "pending", "removing a move from its draft puts the review back to review");
+  await click("Submit for review");
+  await click("Submit for review", "dialog");
+  await waitFor(`document.body.innerText.includes("Waiting for review")`, "the coordinates draft submitted");
+
+  // the THANDALAM draft: two splits and a move
+  await go(`#/drafts/${fxDraft}`);
+  await waitFor(`document.querySelectorAll(".change").length === 2 + ${splitIdsA.length} + ${splitIdsB.length} + 1`, "the THANDALAM draft: 2 stop/create, their route lists, and the move");
+  const fxDraftText = await text("#page");
+  check(fxDraftText.includes(`Takes the place of ${fx.stop.name} (${fx.stop_id}) on ${splitIdsA.length} routes`) || fxDraftText.includes(`Takes the place of ${fx.stop.name} (${fx.stop_id}) on ${splitIdsB.length} routes`),
+    "the split's new stop says which routes it takes from which stop");
+  check(new RegExp(`switched to [^\\n]*\\(${splitStopIdA}\\), new in this draft`).test(fxDraftText) || new RegExp(`switched to [^\\n]*\\(${splitStopIdB}\\), new in this draft`).test(fxDraftText),
+    "each route stop list of a split reads as a stop switched to the new one");
+  await shot("26-coordinates-draft");
+  await click("Submit for review");
+  await click("Submit for review", "dialog");
+  await waitFor(`document.body.innerText.includes("Waiting for review")`, "the THANDALAM draft submitted");
+
+  // ---- bulk import, into a draft of its own
   // ---- bulk import, into a draft of its own
   await clickSel("#draft-chip", "the draft chip");
   await chooseNewDraft("Smoke: import");
@@ -710,6 +1127,35 @@ try {
   await waitFor(`document.getElementById("panel").innerText.includes("S1")`, "the committed new route");
   check((await text("#panel")).includes("nightly GTFS build"), "the committed new route says it has no trips until the nightly build");
 
+  // the coordinates and THANDALAM drafts, and the merge, go live
+  for (const cid of [coordDraft, fxDraft, eMergeDraft]) {
+    await go(`#/drafts/${cid}`);
+    await waitFor(`document.body.innerText.includes("Approve")`, `approve button on ${cid}`);
+    await click("Approve");
+    await click("Approve", "dialog");
+    await waitFor(`document.body.innerText.includes("Commit and go live")`, `commit button on ${cid}`);
+    await click("Commit and go live");
+    await click("Commit and go live", "dialog");
+    await waitFor(`document.getElementById("page").innerText.includes("is live")`, `${cid} committed`);
+  }
+  check((await api(`position-reviews/${revA.review_id}`)).status === "committed", "committing the draft marks the review of the move committed");
+  check((await api(`position-reviews/${fx.review_id}`)).status === "committed", "committing the draft marks the review of the splits and move committed");
+  const liveStopA = await api(`feeds/chennai_bus/stops/${splitStopIdA}`);
+  check([...new Set((liveStopA.routes || []).map((r) => r.route_id))].sort().join() === splitIdsA.join(), `group A's routes now call at the new stop ${splitStopIdA}`);
+  const liveStopB = await api(`feeds/chennai_bus/stops/${splitStopIdB}`);
+  check([...new Set((liveStopB.routes || []).map((r) => r.route_id))].sort().join() === splitIdsB.join(), `group B's routes now call at the new stop ${splitStopIdB}`);
+  const liveFx = await api(`feeds/chennai_bus/stops/${fx.stop_id}`);
+  // a map click's pixel rounds to a slightly different point than the exact
+  // target; a few metres of tolerance covers that, not the underlying position
+  check(metres(liveFx.lat, liveFx.lon, target.lat, target.lon) < 20, `the original stop's own routes moved to the fixed position (${metres(liveFx.lat, liveFx.lon, target.lat, target.lon).toFixed(1)} m off)`);
+
+  // now the merge is actually live, so the review of the stop it took shows why
+  await go(`#/coordinates/${revE.review_id}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("cannot be moved or split")`, "the review of a stop merged away");
+  check(await evaluate(`document.getElementById("review-move").disabled && document.getElementById("why-move").innerText.includes("gone")`), "a stop merged away cannot be moved, and the page says why");
+  check(await has(`#panel a[href="#/stop/${mergeInto.stop_id}"]`), "the review links to the stop that stayed");
+  await shot("25-coordinate-merged-away");
+
   // ================================================================ admin
   await signIn("admin@nammayatri.in");
   await go("#/admin");
@@ -722,7 +1168,23 @@ try {
   await waitFor(`document.body.innerText.includes("Committed (live)")`, "history shows the commit");
   const history = await text("#page");
   check(history.includes("Approved a suggested station into a draft") && history.includes("Imported a CSV file"), "history names the new actions");
+  for (const label of ["Moved a stop from a coordinate review into a draft", "Split routes off a stop from a coordinate review into a draft",
+    "Confirmed a stop's position", "Reopened a coordinate review", "A coordinate review went back to review", "A fix from a coordinate review went live"]) {
+    check(history.includes(label), `history says "${label}"`);
+  }
   await shot("20-history");
+
+  // with every station suggestion superseded (as on master), the top bar hides the link
+  const superseded = await evaluate(`fetch("/__dev/supersede-station-proposals", { method: "POST", credentials: "same-origin" }).then((r) => r.json())`);
+  check(superseded.superseded > 0, `set-up: every open station suggestion superseded (${superseded.superseded})`);
+  await load(UI);
+  await waitFor(`!document.getElementById("app").hidden && performance.getEntriesByType("resource").some((e) => e.name.includes("/station-proposals/summary"))`, "the top bar after reloading");
+  await sleep(500);
+  check(await evaluate(`document.querySelector('[data-nav="stations"]').offsetParent === null`), "with nothing to review or in a draft, the top bar hides Stations to review");
+  check(await evaluate(`document.querySelector('[data-nav="coordinates"]').offsetParent !== null`), "Coordinates to review stays in the top bar");
+  await go("#/stations");
+  await waitFor(`document.getElementById("panel").innerText.includes("Nothing is waiting for review")`, "the stations page by its address");
+  check(await evaluate(`document.querySelector('[data-nav="stations"]').offsetParent === null`), "#/stations still opens while its link is hidden");
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

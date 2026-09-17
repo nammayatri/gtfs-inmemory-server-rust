@@ -81,10 +81,17 @@ const kindText = (key, n) => {
 // what the page shows, kept while the same draft is open
 const pageState = { id: null, page: 1, filter: "all" };
 let openInsets = [];
+// observers for insets not yet made (still waiting to scroll into view): drop
+// these too, or one can still fire and build a map on an element the very same
+// re-render already discarded, which is what left map.js reading a
+// _leaflet_pos that was never set
+let pendingInsets = [];
 
 function dropInsets() {
   openInsets.forEach((m) => { try { m.remove(); } catch { /* already gone */ } });
   openInsets = [];
+  pendingInsets.forEach((io) => io.disconnect());
+  pendingInsets = [];
 }
 
 export async function showDraft(id, { conflicts = null } = {}) {
@@ -198,7 +205,8 @@ export async function showDraft(id, { conflicts = null } = {}) {
     actions.push(button("Discard", { style: "danger", hideIfNot: true, reason: isAuthor || me.role === "admin" ? null : "Only the person who started this draft, or an admin, can discard it.",
       onClick: async () => {
         const fromProposals = cs.changes.some((c) => c.entity === "station" && c.after && c.after.proposal_id);
-        if (await confirmDialog("Discard this draft?", `Its changes are thrown away. The draft stays in the history.${fromProposals ? " Suggested stations approved into it go back to the review list." : ""}`, { confirm: "Discard draft", danger: true })) {
+        const fromReviews = cs.changes.some((c) => (c.after && c.after.position_review_id) || splitOf(cs, c));
+        if (await confirmDialog("Discard this draft?", `Its changes are thrown away. The draft stays in the history.${fromProposals ? " Suggested stations approved into it go back to the review list." : ""}${fromReviews ? " Stops moved or split from coordinates to review go back to that list." : ""}`, { confirm: "Discard draft", danger: true })) {
           act("discard", undefined, "Draft discarded.");
         }
       } }));
@@ -281,17 +289,42 @@ function draftStopNames(cs) {
 const ENTITY_LABEL = { stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station" };
 const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged" };
 
+// A stop the draft creates and puts on route stop lists in place of another stop,
+// as splitting routes off in a coordinate review does: {from, routeIds}, or null.
+function splitOf(cs, ch) {
+  if (ch.entity !== "stop" || ch.op !== "create") return null;
+  let from = null;
+  const routeIds = new Set();
+  for (const c of cs.changes) {
+    if (c.entity !== "route_stops" || !c.after || !Array.isArray(c.after.rows) || !Array.isArray(c.before)) continue;
+    c.after.rows.forEach((row, i) => {
+      const was = c.before[i];
+      if (row.stop_id !== ch.entity_key || !was || !was.stop_id || was.stop_id === ch.entity_key) return;
+      from = from || { stop_id: was.stop_id, name: was.stop_name };
+      routeIds.add(c.entity_key);
+    });
+  }
+  return routeIds.size ? { from, routeIds: [...routeIds] } : null;
+}
+
 function changeView(cs, ch, problems, conflict, canRemove, names) {
   const a = ch.after || {}, b = ch.before || {};
+  // a move made in a coordinate review reads as the move it is
+  const reviewMove = ch.entity === "stop" && ch.op === "update" && a.position_review_id != null && a.lat != null && b.lat != null;
+  const split = splitOf(cs, ch);
   let title;
   if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
+  else if (reviewMove) title = `Moved ${b.name || ch.entity_key} ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))}`;
   else if (ch.entity === "route_stops" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
   else title = `${ENTITY_LABEL[ch.entity]} ${a.name || b.name || ch.entity_key}`;
   const link = ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
     : ch.op === "merge" ? `#/stop/${enc(a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
   const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
-    const extra = fromProposal ? " The suggested station goes back to the list of stations to review." : ch.op === "create" ? " Anything else in the draft that uses it will show a problem." : "";
+    const extra = fromProposal ? " The suggested station goes back to the list of stations to review."
+      : reviewMove ? " The coordinate review goes back to the list of coordinates to review."
+        : split ? ` It takes the place of ${split.from.stop_id} on ${plural(split.routeIds.length, "route")} in this draft. If it was split off in a coordinate review, those route changes are removed with it and the review goes back to the list; otherwise those routes will show a problem.`
+          : ch.op === "create" ? " Anything else in the draft that uses it will show a problem." : "";
     if (!(await confirmDialog("Remove this change from the draft?", `${title} goes back to what is live.${extra}`, { confirm: "Remove change", danger: true }))) return;
     try {
       await del(`change-sets/${enc(cs.change_set_id)}/changes/${ch.change_id}`);
@@ -303,7 +336,16 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   };
   let body;
   if (ch.entity === "stop" && ch.op === "merge") body = mergeDiff(ch);
-  else if (ch.entity === "stop") body = stopDiff(ch);
+  else if (reviewMove) {
+    body = h("div", { style: "display:grid;gap:10px" },
+      h("p", "From ", h("a", { href: `#/coordinates/${enc(a.position_review_id)}` }, `coordinate review #${a.position_review_id}`),
+        `: ${b.name || ch.entity_key} (${ch.entity_key}) was probably in the wrong place.`),
+      stopDiff(ch));
+  } else if (split) {
+    body = h("div", { style: "display:grid;gap:10px" },
+      h("p", `Takes the place of ${split.from.name || split.from.stop_id} (${split.from.stop_id}) on ${plural(split.routeIds.length, "route")}: ${split.routeIds.join(", ")}. The other routes stay on ${split.from.stop_id}.`),
+      stopDiff(ch));
+  } else if (ch.entity === "stop") body = stopDiff(ch);
   else if (ch.entity === "route" && ch.op === "create") body = routeCreateDiff(ch, cs);
   else if (ch.entity === "route" && ch.op === "delete") body = h("p", `Route ${b.short_name || ch.entity_key} is deleted: it no longer appears in the feed.`);
   else if (ch.entity === "route") body = routeDiff(ch);
@@ -312,7 +354,7 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   const showOpen = !(ch.op === "delete" && ch.entity === "stop") && !(ch.op === "create" && ch.entity === "station" && cs.status !== "committed");
   return h("article.change",
     h("div.change-head",
-      h("h3", title, " ", h("span.chip", OP_LABEL[ch.op] || ch.op)),
+      h("h3", title, " ", h("span.chip", reviewMove ? "coordinate review" : OP_LABEL[ch.op] || ch.op)),
       h("div.btn-row",
         showOpen ? h("a.crumb", { href: link }, "Open") : null,
         canRemove ? h("button.btn.quiet.small", { type: "button", on: { click: remove } }, "Remove from draft") : null)),
@@ -338,8 +380,13 @@ function insetEl(spec) {
   };
   if ("IntersectionObserver" in window) {
     const io = new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting)) { io.disconnect(); make(); }
+      if (entries.some((e) => e.isIntersecting)) {
+        io.disconnect();
+        pendingInsets = pendingInsets.filter((x) => x !== io);
+        make();
+      }
     }, { rootMargin: "200px" });
+    pendingInsets.push(io);
     requestAnimationFrame(() => io.observe(el));
   } else {
     requestAnimationFrame(make);
@@ -447,8 +494,24 @@ function rowsDiff(ch, cs, draftNames) {
   const names = new Map(before.map((r) => [r.stop_id, r.stop_name]));
   const live = cs.stop_names || {};
   const after = ((ch.after && ch.after.rows) || []).map((r) => ({ ...r, stop_name: r.stop_name || r.stop_name_override || names.get(r.stop_id) || live[r.stop_id] || draftNames.get(r.stop_id) }));
-  const diff = diffRows(before, after);
-  const counts = { added: 0, removed: 0, moved: 0, changed: 0 };
+  // one stop swapped for another at the same place in the list (a split in a
+  // coordinate review, or Change stop) reads as one switch, not an add and a remove
+  const diff = [];
+  const raw = diffRows(before, after);
+  for (let i = 0; i < raw.length; i++) {
+    const d = raw[i], e = raw[i + 1];
+    const add = d.kind === "added" ? d : e && e.kind === "added" ? e : null;
+    const rem = d.kind === "removed" ? d : e && e.kind === "removed" ? e : null;
+    if (e && add && rem && add !== rem && add.toIndex === rem.fromIndex && add.after.stop_type !== "ROUTE CORRECTION"
+      && add.after.stop_type === rem.before.stop_type && String(add.after.stage_no) === String(rem.before.stage_no)
+      && (add.after.stage_name || "") === (rem.before.stage_name || "")) {
+      diff.push({ kind: "switched", before: rem.before, after: add.after, fromIndex: rem.fromIndex, toIndex: add.toIndex });
+      i++;
+    } else {
+      diff.push(d);
+    }
+  }
+  const counts = { added: 0, removed: 0, moved: 0, changed: 0, switched: 0 };
   diff.forEach((d) => { if (d.kind in counts) counts[d.kind]++; });
   const items = [];
   let run = [];
@@ -469,6 +532,10 @@ function rowsDiff(ch, cs, draftNames) {
     if (d.kind === "added") items.push(h("li.added", h("span.mark", { "aria-label": "added" }, "+"), h("span", String(d.toIndex + 1)), h("span", `${rowLabel(d.after)}, ${STOP_TYPE_LABEL[d.after.stop_type]}, stage ${d.after.stage_no}`)));
     if (d.kind === "removed") items.push(h("li.removed", h("span.mark", { "aria-label": "removed" }, "−"), h("span", String(d.fromIndex + 1)), h("span", `${rowLabel(d.before)} removed`)));
     if (d.kind === "moved") items.push(h("li.moved", h("span.mark", { "aria-label": "moved" }, "↕"), h("span", String(d.toIndex + 1)), h("span", `${rowLabel(d.after)} moved from stop ${d.fromIndex + 1} to stop ${d.toIndex + 1}`)));
+    if (d.kind === "switched") {
+      items.push(h("li.changed", h("span.mark", { "aria-label": "switched" }, "⇄"), h("span", String(d.toIndex + 1)),
+        h("span", `${rowLabel(d.before)} switched to ${rowLabel(d.after)}${draftNames.has(d.after.stop_id) ? ", new in this draft" : ""}`)));
+    }
     if (d.kind === "changed") {
       const parts = [];
       if (d.before.stop_type !== d.after.stop_type) parts.push(`${STOP_TYPE_LABEL[d.before.stop_type]} to ${STOP_TYPE_LABEL[d.after.stop_type]}`);

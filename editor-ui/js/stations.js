@@ -39,14 +39,17 @@ export function leaveStations() {
   watchMap(null);
 }
 
-// The pending count in the top bar.
+// The pending count in the top bar. The link itself shows only while there are
+// suggestions to review or in a draft; #/stations works either way.
 export async function refreshStationCount() {
   const badge = document.getElementById("stations-count");
   if (!badge || !state.feedId) return;
+  const link = badge.closest("a");
   try {
     list.counts = await get(`feeds/${enc(state.feedId)}/station-proposals/summary`);
     badge.textContent = list.counts.pending ? fmtCount(list.counts.pending) : "";
     badge.hidden = !list.counts.pending;
+    if (link) link.hidden = !((list.counts.pending || 0) + (list.counts.approved || 0));
   } catch {
     badge.hidden = true;
   }

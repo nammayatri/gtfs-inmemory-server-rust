@@ -9,6 +9,7 @@ import { loadActiveDraft, renderDraftChip, chooseDraft, requireDraft, createdSto
 import { showDraftList, showDraft } from "./review.js";
 import { showPeople, showHistory } from "./admin.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
+import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
 import { showMerge } from "./merge.js";
@@ -39,6 +40,7 @@ async function boot() {
     await loadActiveDraft();
     map.refreshStops();
     refreshStationCount();
+    refreshCoordinateCount();
     setLeaveGuard(null);
     location.hash = "#/";
     route();
@@ -61,6 +63,7 @@ async function boot() {
   map.setDraftStops(createdStops());
   initSearch();
   refreshStationCount();
+  refreshCoordinateCount();
   window.addEventListener("hashchange", onHashChange);
   window.addEventListener("beforeunload", (ev) => {
     if (leaveMessage()) { ev.preventDefault(); ev.returnValue = ""; }
@@ -137,6 +140,7 @@ function editorsOnly(what, fn) {
 function route() {
   currentHash = location.hash || "#/";
   leaveStations();
+  leaveCoordinates();
   setLeaveGuard(null);
   if (!state.feedId) {
     showWorkspace(false);
@@ -157,6 +161,10 @@ function route() {
     markNav("stations"); showWorkspace(true); showProposal(parts[1]);
   } else if (parts[0] === "stations") {
     markNav("stations"); showWorkspace(true); showStationsList();
+  } else if (parts[0] === "coordinates" && parts[1]) {
+    markNav("coordinates"); showWorkspace(true); showCoordinateReview(parts[1]);
+  } else if (parts[0] === "coordinates") {
+    markNav("coordinates"); showWorkspace(true); showCoordinatesList();
   } else if (parts[0] === "new" && ["stop", "route", "station"].includes(parts[1])) {
     markNav("map"); showWorkspace(true);
     const [title, fn] = { stop: ["New stop", newStop], route: ["New route", newRoute], station: ["New station", newStation] }[parts[1]];

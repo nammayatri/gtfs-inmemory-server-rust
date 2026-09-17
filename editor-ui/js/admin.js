@@ -1,7 +1,7 @@
 // People (users, roles, two-step reset) and the history of everything done.
 import { get, post, patch, enc } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, toast, confirmDialog, fmtDate, plural, ROLE_LABEL } from "./util.js";
+import { h, clear, toast, confirmDialog, fmtDate, fmtMetres, plural, ROLE_LABEL } from "./util.js";
 
 const page = () => document.getElementById("page");
 
@@ -109,7 +109,8 @@ function userRow(u, reload) {
 
 // ------------------------------------------------------------------ history
 // Keys are the audit actions the API writes (src/editor, docs/gtfs-editor.md),
-// plus the ones nandi's scripts write (seed, release, station_proposals_built).
+// plus the ones nandi's scripts write (seed, release, station_proposals_built,
+// position_reviews_loaded).
 // Exported for dev/ui_e2e.mjs, which checks every action in the database has one.
 export const ACTION_LABEL = {
   seed: "Loaded the feed data",
@@ -140,6 +141,13 @@ export const ACTION_LABEL = {
   station_proposal_reopened: "Reopened a suggested station",
   station_proposal_returned: "A suggested station went back to review",
   station_proposal_committed: "A suggested station went live",
+  position_reviews_loaded: "Coordinates to review were loaded",
+  position_review_moved: "Moved a stop from a coordinate review into a draft",
+  position_review_split: "Split routes off a stop from a coordinate review into a draft",
+  position_review_confirmed: "Confirmed a stop's position",
+  position_review_reopened: "Reopened a coordinate review",
+  position_review_returned: "A coordinate review went back to review",
+  position_review_committed: "A fix from a coordinate review went live",
 };
 
 // An action this page has no words for yet still reads as words.
@@ -168,6 +176,20 @@ function detailText(a) {
       return `suggestion #${d.proposal_id}, station ${d.station_id}, feed version ${d.feed_version}`;
     case "station_proposal_returned":
       return `suggestion #${d.proposal_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
+    case "position_reviews_loaded":
+      return `${n(d.queued, "stop")} to review${d.batch ? ` (${d.batch})` : ""}`;
+    case "position_review_returned":
+      return `coordinate review #${d.review_id}, stop ${d.stop_id}: ${RETURNED_BECAUSE[d.reason] || d.reason}`;
+    case "position_review_moved":
+    case "position_review_split":
+    case "position_review_confirmed":
+    case "position_review_reopened":
+    case "position_review_committed":
+      return [`coordinate review #${d.review_id}`, d.stop_id ? `stop ${d.stop_id}` : null,
+        d.moved_m != null ? `moved ${fmtMetres(d.moved_m)}` : null,
+        Array.isArray(d.route_ids) ? `${n(d.route_ids.length, "route")} to new stop ${d.new_stop_id}` : null,
+        d.feed_version ? `feed version ${d.feed_version}` : null,
+        d.note ? `note: ${d.note}` : null].filter(Boolean).join(", ");
     case "station_proposal_approved": {
       const edits = [d.renamed ? "renamed" : null, d.moved ? "moved" : null,
         d.relabelled ? `${n(d.relabelled, "platform label")} changed` : null,

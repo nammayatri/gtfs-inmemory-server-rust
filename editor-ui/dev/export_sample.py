@@ -35,7 +35,15 @@ QUERIES = {
     "station_proposals": """SELECT proposal_id, gtfs_id, batch, station_id, name, lat, lon, members, spread_m,
                                    status, review_note
                             FROM gtfs_station_proposal ORDER BY proposal_id""",
+    # suspected wrong coordinates waiting for review (docs section 8); a database
+    # without the table (before 0007) exports none, and the mock makes a few up
+    "position_reviews": """SELECT review_id, gtfs_id, batch, stop_id, original_stop_id, stop_name, reason, lat, lon,
+                                  raw_lat, raw_lon, suggested_lat, suggested_lon, suggested_source, evidence,
+                                  status, review_note
+                           FROM gtfs_position_review ORDER BY review_id""",
 }
+# tables that a local database may not have yet
+OPTIONAL = {"position_reviews": "gtfs_position_review"}
 
 
 def main():
@@ -49,6 +57,12 @@ def main():
     out = {}
     with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         for key, sql in QUERIES.items():
+            if key in OPTIONAL:
+                cur.execute("SELECT to_regclass(%s) IS NOT NULL AS present", (OPTIONAL[key],))
+                if not cur.fetchone()["present"]:
+                    out[key] = []
+                    print(f"{key}: no {OPTIONAL[key]} table")
+                    continue
             cur.execute(sql)
             out[key] = [dict(r) for r in cur.fetchall()]
             print(f"{key}: {len(out[key])}")
