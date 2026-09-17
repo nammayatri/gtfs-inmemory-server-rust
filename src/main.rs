@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     // Create application state
     let port = app_config.port;
     let polling_enabled = app_config.polling_enabled;
+    let editor_state = gtfs_routes_service::editor::EditorState::init(&app_config).await;
     let app_state = environment::AppState::new(app_config).await?;
 
     // Start background polling task if enabled
@@ -44,6 +45,14 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = gtfs_service_clone.start_polling().await {
                 error!("Polling task failed: {}", e);
             }
+        });
+    }
+
+    // Reload DB-backed feeds when an editor commit moves gtfs_feed.version
+    if app_state.gtfs_service.has_db_feeds() {
+        let gtfs_service_clone = app_state.gtfs_service.clone();
+        tokio::spawn(async move {
+            gtfs_service_clone.start_db_version_polling().await;
         });
     }
 
@@ -83,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
                     .url("/api-docs/openapi.json", openapi.clone())
                     .config(Config::new(["../api-docs/openapi.json"])),
             )
+            .configure(|cfg| gtfs_routes_service::editor::configure(cfg, editor_state.clone()))
             .configure(routes::create_routes)
     })
     .bind((Ipv4Addr::UNSPECIFIED, port))?

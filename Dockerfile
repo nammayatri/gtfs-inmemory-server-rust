@@ -65,6 +65,8 @@ WORKDIR /app
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
 COPY --from=builder /app/assets /app/assets
 COPY --from=builder /app/dhall-configs /app/dhall-configs
+# GTFS editor dashboard: static files served at /internal/gtfs-editor/ui/
+COPY editor-ui /app/editor-ui
 COPY --from=builder /app/log-processor /usr/sbin/log-processor
 
 # Default to preprocessed mode; k8s overrides DHALL_CONFIG with a mounted config.

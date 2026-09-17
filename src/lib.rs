@@ -1,3 +1,4 @@
+pub mod editor;
 pub mod environment;
 pub mod graphql;
 pub mod handlers;
