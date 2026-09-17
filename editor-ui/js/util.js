@@ -45,6 +45,30 @@ export function clear(el, ...children) {
   return el;
 }
 
+// ------------------------------------------------------------------ stop details
+// What the forms say about the two texts a passenger reads at a stop.
+export const PLATFORM_PLACEHOLDER = "Towards <next stop>";
+export const PLATFORM_HELP = "What passengers see as the platform or direction at this stop, for example Towards Guindy. A stop needs no station to have one.";
+export const DESCRIPTION_MAX = 500;
+
+// The description of a stop or station: a textarea with a counter, at most
+// DESCRIPTION_MAX characters. Returns {input, el}; `el` is the labelled field.
+export function descriptionField(id, value, what = "stop") {
+  const input = h("textarea", { id, rows: "3", maxlength: String(DESCRIPTION_MAX), placeholder: what === "station" ? "For example: stops on both sides of the junction, outside the metro entrance" : "For example: outside the post office, opposite the temple tank" });
+  input.value = value || "";
+  const count = h("span.hint.char-count", { "aria-live": "polite" });
+  const show = () => { count.textContent = `${input.value.length} of ${DESCRIPTION_MAX} characters`; };
+  input.addEventListener("input", show);
+  show();
+  return { input, el: h("label.field", { for: id }, h("span", "Description (optional)"), input, count) };
+}
+
+// A stop's platform label and description in a few words, for a hover title or
+// a tooltip; "" when it has neither.
+export function stopDetailWords(s) {
+  return [s && s.platform_code, s && s.description].filter(Boolean).join(" · ");
+}
+
 // ------------------------------------------------------------------ feedback
 export function toast(message, kind = "") {
   const box = document.getElementById("toasts");

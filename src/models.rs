@@ -670,6 +670,11 @@ pub struct GTFSStop {
     pub info_json: Option<String>,
     #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
+    /// GTFS stop_desc: free text shown beside the name. Only a DB-backed feed
+    /// has one (the editor's `gtfs_stop.description`); it is left out when
+    /// absent, so a stop without one serialises exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,5 @@
-// Bulk import: new stops, new routes, or whole route stop lists from a CSV file.
+// Bulk import: new stops, new routes, whole route stop lists, or the details of
+// existing stops (platform label, description, name) from a CSV file.
 // The file is read in the browser, checked by the server against the draft
 // without changing anything (dry run), and only then added to the draft in one
 // go. The draft is reviewed and committed like any other.
@@ -76,6 +77,20 @@ const KINDS = {
     ],
     show: ["route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"],
   },
+  stop_updates: {
+    label: "Stop details (platform label, description)",
+    short: "stop details",
+    what: "Details of stops that exist. Each row changes one stop; an empty cell leaves that detail as it is.",
+    columns: [
+      { name: "stop_id", required: true, read: text, help: "An existing stop. A station's id may be used for its description or name." },
+      { name: "platform_code", required: false, read: optional, help: "The platform or direction passengers see, for example Towards Guindy. At most 120 characters. Not for a station." },
+      { name: "description", required: false, read: optional, help: "Where the stop is, in words. At most 500 characters." },
+      { name: "name", required: false, read: optional, help: "A new name. Leave empty to keep the name." },
+    ],
+    show: ["stop_id", "platform_code", "description", "name"],
+    // the server says which stop each row names, and where it is
+    now: true,
+  },
 };
 
 // A little edit distance, to suggest the column name someone meant.
@@ -117,7 +132,7 @@ export function readFile(kind, csvText) {
     seen.add(name);
     if (!known.includes(name)) {
       const guess = closeTo(name, known);
-      fileProblems.push(`The column “${name}” is not used for ${spec.label.toLowerCase()}.${guess ? ` Did you mean “${guess}”?` : ""} Use the template's column names.`);
+      fileProblems.push(`The column “${name}” is not used for ${spec.short || spec.label.toLowerCase()}.${guess ? ` Did you mean “${guess}”?` : ""} Use the template's column names.`);
     }
   });
   if (header.some((c, i) => !c && records.slice(headerAt + 1).some((r) => (r[i] || "").trim()))) {
@@ -207,7 +222,7 @@ export function showImport(kind) {
     clear(root,
       h("div.title-block",
         h("h1", "Import from a CSV file"),
-        h("p.hint", "Add many new stops or routes, or replace route stop lists, at once. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
+        h("p.hint", "Add many new stops or routes, replace route stop lists, or set the platform labels and descriptions of many stops, at once. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
       view.added ? h("div.notice.ok", { role: "status" },
         h("p", h("strong", view.added.message)),
         h("div.btn-row", h("a.btn.small", { href: `#/drafts/${enc(view.added.draftId)}` }, "Open the draft"))) : null,
@@ -215,9 +230,9 @@ export function showImport(kind) {
         h("h2", "1. What does the file hold?"),
         kinds,
         h("details.columns",
-          h("summary", `Columns for ${spec.label.toLowerCase()}`),
+          h("summary", `Columns for ${spec.short || spec.label.toLowerCase()}`),
           h("table.column-table", h("tbody", spec.columns.map((c) => h("tr", h("th", { scope: "row" }, h("code", c.name)), h("td", c.required ? "Required" : "Optional"), h("td", c.help)))))),
-        h("div.btn-row", h("a.btn.secondary.small", { href: templateHref(view.kind), download: `${view.kind}-template.csv` }, `Download the ${spec.label.toLowerCase()} template`))),
+        h("div.btn-row", h("a.btn.secondary.small", { href: templateHref(view.kind), download: `${view.kind}-template.csv` }, `Download the ${spec.short || spec.label.toLowerCase()} template`))),
       h("section.import-step",
         h("h2", "2. Choose the file"),
         fileInput, drop,
@@ -225,7 +240,7 @@ export function showImport(kind) {
       view.read ? h("section.import-step", h("h2", "3. Check"), checkSection()) : null);
 
     // the map's box is on the page and sized by now, so the map can be made at once
-    if (view.result && view.kind === "stops") {
+    if (view.result && (view.kind === "stops" || KINDS[view.kind].now)) {
       const el = root.querySelector(".import-map");
       if (el) insetMap = stopsMap(el);
     }
@@ -322,7 +337,8 @@ export function showImport(kind) {
       return h("div.btn-row", h("button.btn", { type: "button", on: { click: preview } }, "Check the file"));
     }
     const s = res.summary;
-    const rows = res.rows.map((r) => ({ i: r.row - 1, status: r.status, messages: (r.messages || []).map((m) => ({ ...m, level: m.level || (r.status === "warning" ? "warning" : "error") })), change: r.change }));
+    const spec = KINDS[view.kind];
+    const rows = res.rows.map((r) => ({ i: r.row - 1, status: r.status, messages: (r.messages || []).map((m) => ({ ...m, level: m.level || (r.status === "warning" ? "warning" : "error") })), change: r.change, stop: r.stop || null }));
     const stale = !state.draft || state.draft.change_set_id !== view.resultFor.draftId;
     return [
       h("div.summary-chips", { role: "status" },
@@ -330,11 +346,14 @@ export function showImport(kind) {
         h("span.chip.committed", `${fmtCount(s.ok)} ok`),
         h("span", { class: `chip ${s.warnings ? "submitted" : ""}` }, plural(s.warnings, "warning")),
         h("span", { class: `chip ${s.errors ? "rejected" : ""}` }, plural(s.errors, "error")),
+        s.unchanged ? h("span.chip.unchanged-count", `${fmtCount(s.unchanged)} unchanged, not added`) : null,
         h("span.chip", `${plural(s.changes, "change")} to add`)),
       s.errors
         ? h("div.notice.error", h("p", h("strong", `${plural(s.errors, "row")} ${s.errors === 1 ? "has" : "have"} errors.`), " Nothing can be added until they are fixed. Fix the file, then choose it again above."))
-        : h("div.notice.ok", h("p", h("strong", "The file can be added."), s.warnings ? ` Please look at the ${plural(s.warnings, "warning")} first.` : "")),
-      view.kind === "stops" ? h("div.import-map.inset", { role: "img", "aria-label": "Map of the stops in the file, coloured by result" }) : null,
+        : !s.changes
+          ? h("div.notice", h("p", h("strong", "Nothing to add."), " Every row already says what its stop has, counting what is in your draft."))
+          : h("div.notice.ok", h("p", h("strong", "The file can be added."), s.warnings ? ` Please look at the ${plural(s.warnings, "warning")} first.` : "")),
+      view.kind === "stops" || spec.now ? h("div.import-map.inset", { role: "img", "aria-label": "Map of the stops in the file, coloured by result" }) : null,
       resultTable(rows, view.resultFor.read),
       h("div.actionbar",
         stale ? h("p.notice.warning", "You switched drafts after the check. Check the file again against the draft you are using now.") : null,
@@ -363,6 +382,7 @@ export function showImport(kind) {
       const v = row[name];
       if (v === undefined || v === null || v === "") return h("td.empty-cell", "");
       if (name === "stop_type") return h("td", STOP_TYPE_LABEL[v] || v);
+      if (name === "description") return h("td.long-cell", String(v));
       return h("td", String(v));
     };
     const statusLabel = { ok: "OK", warning: "Warning", error: "Error" };
@@ -370,10 +390,11 @@ export function showImport(kind) {
     return h("div.result-block", { id: "import-results" },
       filters,
       filtered.length ? h("div.table-wrap", h("table.result-table",
-        h("thead", h("tr", h("th", { scope: "col" }, "Row"), h("th", { scope: "col" }, "Result"), spec.show.map((c) => h("th", { scope: "col" }, c)), h("th", { scope: "col" }, "What to fix"))),
+        h("thead", h("tr", h("th", { scope: "col" }, "Row"), h("th", { scope: "col" }, "Result"), spec.now ? h("th", { scope: "col" }, "Stop now") : null, spec.show.map((c) => h("th", { scope: "col" }, c)), h("th", { scope: "col" }, "What to fix"))),
         h("tbody", slice.map((r) => h("tr", { id: `import-row-${r.i}`, class: `result-${r.status}` },
           h("td.num", String(read.sheetRows[r.i] ?? r.i + 2)),
           h("td", h("span", { class: `chip ${statusClass[r.status]}` }, statusLabel[r.status])),
+          spec.now ? (r.stop ? h("td.stop-now", { title: r.stop.description || null }, r.stop.name, r.stop.platform_code ? h("span.sub", r.stop.platform_code) : null) : h("td.empty-cell", "")) : null,
           spec.show.map((c) => cell(read.rows[r.i] || {}, c)),
           h("td.messages", r.messages.length ? h("ul", r.messages.map((m) => h("li", { class: m.level === "warning" ? "warn" : "err" }, m.message))) : ""),
         ))))) : h("p.empty", "No rows to show here."),
@@ -385,14 +406,16 @@ export function showImport(kind) {
     const read = view.resultFor.read;
     const byRow = new Map(view.result.rows.map((r) => [r.row - 1, r.status]));
     const colors = { ok: "#0b6660", warning: "#c98a00", error: "#b42318" };
-    const points = read.rows.map((row, i) => (Number.isFinite(row.lat) && Number.isFinite(row.lon) && Math.abs(row.lat) <= 90 && Math.abs(row.lon) <= 180
+    // a new stop is where its row says; an existing one where the server found it
+    const found = new Map(view.result.rows.map((r) => [r.row - 1, r.stop || null]));
+    const points = read.rows.map((row, i) => (KINDS[view.kind].now ? { ...row, ...(found.get(i) || {}) } : row)).map((row, i) => (Number.isFinite(row.lat) && Number.isFinite(row.lon) && Math.abs(row.lat) <= 90 && Math.abs(row.lon) <= 180
       ? {
           lat: row.lat, lon: row.lon, radius: 5, weight: 1, ring: "#ffffff", color: colors[byRow.get(i)] || colors.ok,
           title: `Row ${read.sheetRows[i]}: ${row.name || ""}`,
           onClick: () => {
             view.filter = "all";
             view.page = Math.floor(i / TABLE_PAGE) + 1;
-            const rows = view.result.rows.map((r) => ({ i: r.row - 1, status: r.status, messages: (r.messages || []).map((m) => ({ ...m, level: m.level || (r.status === "warning" ? "warning" : "error") })) }));
+            const rows = view.result.rows.map((r) => ({ i: r.row - 1, status: r.status, stop: r.stop || null, messages: (r.messages || []).map((m) => ({ ...m, level: m.level || (r.status === "warning" ? "warning" : "error") })) }));
             document.getElementById("import-results")?.replaceWith(resultTable(rows, read));
             requestAnimationFrame(() => {
               const tr = document.getElementById(`import-row-${i}`);

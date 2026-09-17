@@ -166,7 +166,7 @@ pub async fn stop(conn: &mut PgConnection, g: &str, stop_id: &str) -> EditorResu
     let dlat = SAME_NAME_METRES / 111_000.0;
     let dlon = dlat / lat.to_radians().cos().abs().max(0.01);
     let mut same_name: Vec<(f64, Value)> = sqlx::query(
-        "SELECT s.stop_id, s.name, s.lat, s.lon, s.parent_station, \
+        "SELECT s.stop_id, s.name, s.lat, s.lon, s.parent_station, s.platform_code, s.description, \
                 similarity(s.name, $3)::float8 AS similarity, \
                 (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
                   WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count \
@@ -201,6 +201,8 @@ pub async fn stop(conn: &mut PgConnection, g: &str, stop_id: &str) -> EditorResu
                 "distance_m": metres(d),
                 "route_count": r.try_get::<i64, _>("route_count")?,
                 "parent_station": r.try_get::<Option<String>, _>("parent_station")?,
+                "platform_code": r.try_get::<Option<String>, _>("platform_code")?,
+                "description": r.try_get::<Option<String>, _>("description")?,
                 "similarity": (r.try_get::<f64, _>("similarity")? * 100.0).round() / 100.0,
             }),
         ))

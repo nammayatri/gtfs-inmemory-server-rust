@@ -441,12 +441,13 @@ function stopDiff(ch) {
         h("dt", "Name"), h("dd", a.name),
         h("dt", "Stop id"), h("dd", ch.entity_key || a.stop_id || "made when added"),
         h("dt", "Position"), h("dd", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`),
-        a.platform_code ? [h("dt", "Platform"), h("dd", a.platform_code)] : null),
+        a.platform_code ? [h("dt", "Platform"), h("dd", a.platform_code)] : null,
+        a.description ? [h("dt", "Description"), h("dd", a.description)] : null),
       insetEl({ points: [{ lat: a.lat, lon: a.lon, kind: "after", label: "new" }] }));
   }
   const movedPos = b && a.lat != null && (a.lat !== b.lat || a.lon !== b.lon);
   const rows = fieldRows(b, a, [
-    ["name", "Name"], ["platform_code", "Platform"], ["regional_name", "Tamil name"], ["cluster_id", "Cluster"],
+    ["name", "Name"], ["platform_code", "Platform"], ["description", "Description"], ["regional_name", "Tamil name"], ["cluster_id", "Cluster"],
   ]);
   if (movedPos) {
     rows.push(h("tr", h("th", "Position"), h("td.before", `${fmtCoord(b.lat)}, ${fmtCoord(b.lon)}`),
@@ -601,7 +602,7 @@ function stationDiff(ch) {
   const added = [...now].filter((x) => !was.has(x)), removed = [...was].filter((x) => !now.has(x));
   const label = (x) => (labels.get(x) ? `, platform “${labels.get(x)}”` : "");
   const table = h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody",
-    fieldRows(b, a, [["name", "Name"]]),
+    fieldRows(b, a, [["name", "Name"], ["description", "Description"]]),
     b && a.lat != null && (a.lat !== b.lat || a.lon !== b.lon)
       ? h("tr", h("th", "Position"), h("td.before", `${fmtCoord(b.lat)}, ${fmtCoord(b.lon)}`), h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)) : null,
     !b ? h("tr", h("th", "Position"), h("td.before", ""), h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`)) : null));

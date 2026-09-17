@@ -1,7 +1,7 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, debounce, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast } from "./util.js";
+import { h, clear, debounce, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
@@ -187,7 +187,10 @@ export async function showStop(stopId) {
       backLink(),
       h("div.title-block",
         h("h1", s.name, o.changed.has("name") ? h("span.live-value", h("span.live-tag", "live: "), h("s", live.name)) : null),
-        h("p.ids", `${isStation ? "Station" : "Stop"} ${s.stop_id}${s.stop_code && s.stop_code !== s.stop_id ? `, code ${s.stop_code}` : ""}`)),
+        h("p.ids", `${isStation ? "Station" : "Stop"} ${s.stop_id}${s.stop_code && s.stop_code !== s.stop_id ? `, code ${s.stop_code}` : ""}`),
+        // what passengers read beside the name: the platform label and the description
+        s.platform_code || o.changed.has("platform_code") ? h("p.platform-line", h("span.label-tag", "Platform label: "), shown("platform_code")) : null,
+        s.description || o.changed.has("description") ? h("p.stop-description", shown("description")) : null),
       pendingNotice(o.actions, {
         current: live,
         intro: o.gone
@@ -201,7 +204,6 @@ export async function showStop(stopId) {
           ? [withLive(`${fmtCoord(s.lat)}, ${fmtCoord(s.lon)}`, `${fmtCoord(live.lat)}, ${fmtCoord(live.lon)}`), h("span.hint", ` moved ${map.apart(live, s)}`)]
           : `${fmtCoord(s.lat)}, ${fmtCoord(s.lon)}`),
         s.position_source ? [h("dt", "Position from"), h("dd", s.position_source)] : null,
-        s.platform_code || o.changed.has("platform_code") ? [h("dt", "Platform"), h("dd", shown("platform_code"))] : null,
         s.cluster_id || o.changed.has("cluster_id") ? [h("dt", "Cluster"), h("dd", shown("cluster_id"))] : null,
         s.regional_name || o.changed.has("regional_name") ? [h("dt", "Tamil name"), h("dd", shown("regional_name"))] : null,
       ),
@@ -209,7 +211,7 @@ export async function showStop(stopId) {
     ),
     isStation ? h("section.section",
       h("h2", `Stops in this station (${members.length})`),
-      members.length ? h("ul.list", members.map((c) => h("li.list-item",
+      members.length ? h("ul.list", members.map((c) => h("li.list-item", { title: stopDetailWords(c) || null },
         h("span.key", c.platform_code || ""),
         c.leaves ? h("s", h("a", { href: `#/stop/${enc(c.stop_id)}` }, c.name)) : h("a", { href: `#/stop/${enc(c.stop_id)}` }, c.name),
         h("span.hint", c.joins ? h("span.chip.draft", "joins in the draft") : c.leaves ? h("span.chip.draft", "leaves in the draft") : `${c.route_count} route${c.route_count === 1 ? "" : "s"}`),
@@ -232,7 +234,7 @@ export async function showStop(stopId) {
   const here = location.hash;
   await stationNames(live.nearby, names, [live.parent]);
   if (location.hash !== here || !document.body.contains(nearbyBox)) return;
-  const [list, stations] = foldedList(live.nearby, names, (n) => h("li.list-item",
+  const [list, stations] = foldedList(live.nearby, names, (n) => h("li.list-item", { title: stopDetailWords(n) || null },
     h("span.key", fmtMetres(n.distance_m)),
     h("a", { href: `#/stop/${enc(n.stop_id)}` }, n.name),
     h("span.item-end",

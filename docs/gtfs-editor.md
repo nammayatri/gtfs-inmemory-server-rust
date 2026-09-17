@@ -19,14 +19,18 @@ ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0011*.sql` (`0001..0008` applied to master
+Schema: `db/gtfs_editor/0001..0012*.sql` (`0001..0008` applied to master
 `mtc_internal_master`; `0006` lets a change's `op` be `merge`, `0007` holds
 coordinate reviews, `0008` makes `gtfs_feed.data_source` live and backfills
 `chennai_bus` to `'db'` — see section 3's "Feed data source". **Not yet on
 master, applied to the local database only:** `0009` lets a change's `entity` be
 `feed_config`, `0010` adds `gtfs_change_set.self_approved` and relaxes the
 maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
-behind the cleanup context reads (section 9). All three are safe to run twice.)
+behind the cleanup context reads (section 9), `0012` adds the nullable
+`gtfs_stop.description` (section 11). All four are safe to run twice. **`0012`
+goes on a database before the build that reads it:** both the editor and the
+GIMS loader select the column, so a DB feed fails to load (and serves its
+preprocessed data) on a database without it.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -52,8 +56,9 @@ produced from a GTFS built out of these tables:
 - **stops** — `gtfs_stop` rows that a served route row references, not deleted:
   `id = "{gtfs}:{stop_id}"`, `code`, `name`, `lat`, `lon`,
   `stationId = "{gtfs}:{parent_station}"`, `infoJson` (with `clusterId`),
-  `locationType`, `platformCode`. Station rows (`location_type = 1`) are emitted
-  too.
+  `locationType`, `platformCode`, and `description` — **only on a stop that has
+  one** (section 11), so a stop without is served exactly as the preprocessed
+  load serves it. Station rows (`location_type = 1`) are emitted too.
 - **patterns** — one per route that has trips. Stops are the route's *served*
   rows (`stop_type` not in ROUTE CORRECTION / JUMP STOP / HIDDEN STOP) in
   `sequence` order, `stopSequence = i + 1`. Times follow the generator:
@@ -177,8 +182,8 @@ account · 404 · 409 conflict or wrong status · 429 locked. Every list is
 | method | path | notes |
 |---|---|---|
 | GET | `/feeds` | `{items: [{gtfs_id, display_name, version, data_source, released_version, released_at, updated_at}], next_cursor: null}` |
-| GET | `/feeds/{g}/stops?q=&bbox=minLat,minLon,maxLat,maxLon&station=&limit=&cursor=` | `q` trigram on name, exact on id/code. `station=true` lists stations only; `station=<id>` lists that station's platforms. Item: the stop row (`stop_id, stop_code, name, lat, lon, location_type, parent_station, platform_code, cluster_id, regional_name, hindi_name, info_json, position_source, provenance, deleted, row_version, updated_at, updated_by`) + `route_count` |
-| GET | `/feeds/{g}/stops/{stop_id}` | the stop row + `route_count` + `routes: [{route_id, short_name, long_name, sequence, stop_type, stage_no}]` + `children` (a station's platforms, each with `route_count`) + `nearby` (≤ 60 m, nearest first, each with `distance_m` and `route_count`) + `parent` (the station row, or null) |
+| GET | `/feeds/{g}/stops?q=&bbox=minLat,minLon,maxLat,maxLon&station=&limit=&cursor=` | `q` trigram on name, exact on id/code. `station=true` lists stations only; `station=<id>` lists that station's platforms. Item: the stop row (`stop_id, stop_code, name, lat, lon, location_type, parent_station, platform_code, description, cluster_id, regional_name, hindi_name, info_json, position_source, provenance, deleted, row_version, updated_at, updated_by`) + `route_count` + `platform_count` (a station's live platforms; 0 for a stop — section 11) |
+| GET | `/feeds/{g}/stops/{stop_id}` | the stop row + `route_count` + `platform_count` + `routes: [{route_id, short_name, long_name, sequence, stop_type, stage_no}]` + `children` (a station's platforms, each with `route_count`) + `nearby` (≤ 60 m, nearest first, each with `distance_m` and `route_count`) + `parent` (the station row, or null) |
 | GET | `/feeds/{g}/routes?q=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows) |
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change |
@@ -310,13 +315,13 @@ a snapshot in read shape: the stop or route row; for a station, the row plus
 
 | entity / op | `after` | validation |
 |---|---|---|
-| `stop` / `update` | any of `name, lat, lon, platform_code, cluster_id, regional_name, hindi_name` | lat/lon together and in range; a move > 500 m is a **warning** |
-| `stop` / `create` | `{stop_id, name, lat, lon, stop_code?, platform_code?, cluster_id?, regional_name?, hindi_name?}` | `entity_key` = `stop_id`; id unused; ids are 1–64 of `A–Z a–z 0–9 _ - .` (no `:` — GIMS splits ids on it) |
+| `stop` / `update` | any of `name, lat, lon, platform_code, description, cluster_id, regional_name, hindi_name` | lat/lon together and in range; a move > 500 m is a **warning**; `platform_code` ≤ 120 and `description` ≤ 500 characters (section 11) |
+| `stop` / `create` | `{stop_id, name, lat, lon, stop_code?, platform_code?, description?, cluster_id?, regional_name?, hindi_name?}` | `entity_key` = `stop_id`; id unused; ids are 1–64 of `A–Z a–z 0–9 _ - .` (no `:` — GIMS splits ids on it) |
 | `stop` / `delete` | `null` | error if any route row still uses it |
 | `route` / `update` | any of `short_name, long_name, color, text_color, encoded_polyline, polyline_source` | colour `#RRGGBB`; polyline decodes to ≥ 2 points |
 | `route_stops` / `replace` | `{rows: [...], base_rows_hash}` — the whole ordered list | see below |
-| `station` / `create` | `{station_id, name, lat, lon, member_stop_ids: [...]}` | `entity_key` = `station_id`; at least two members (`too_few_members`, refused when added: 400 `invalid_change`); members exist, are location_type 0, have no other parent |
-| `station` / `update` | `{name?, lat?, lon?, member_stop_ids?}` | same; members, when sent, are at least two (to ungroup a station, delete it) |
+| `station` / `create` | `{station_id, name, lat, lon, description?, member_stop_ids: [...]}` | `entity_key` = `station_id`; at least two members (`too_few_members`, refused when added: 400 `invalid_change`); members exist, are location_type 0, have no other parent |
+| `station` / `update` | `{name?, lat?, lon?, description?, member_stop_ids?}` | same; members, when sent, are at least two (to ungroup a station, delete it); a station has no `platform_code` of its own |
 | `station` / `delete` | `null` | clears members' `parent_station` |
 | `feed_config` / `update` | `{data_source: "db"\|"preprocessed"}` | **admin only**; `entity_key` = the change set's feed; see "Feed data source" above |
 
@@ -394,7 +399,7 @@ back afterwards. `--only map,stations,...` runs a subset.
 
 | entity / op | `after` | validation |
 |---|---|---|
-| `stop` / `create` | `{stop_id?, name, lat, lon, stop_code?, platform_code?, regional_name?, hindi_name?}` | as above; **`stop_id` may be omitted**: the server mints `ed_` + 10 lower-case hex (unused) and returns it in the change (`entity_key` and `after.stop_id`) |
+| `stop` / `create` | `{stop_id?, name, lat, lon, stop_code?, platform_code?, description?, regional_name?, hindi_name?}` | as above; **`stop_id` may be omitted**: the server mints `ed_` + 10 lower-case hex (unused) and returns it in the change (`entity_key` and `after.stop_id`) |
 | `route` / `create` | `{route_id, short_name, long_name?, route_type?, color?, agency_id?}` | `entity_key` = `route_id`; id unused (409-style row error `route_exists`); same id charset as stops; `route_type` defaults to 3, `agency_id` to the feed's usual one; `short_name` required |
 | `route` / `delete` | `null` | soft delete (`deleted = true`); refused while another pending change in the set edits the route |
 | `station` / `create`, `update` | may carry `members: [{stop_id, platform_code?}]` instead of `member_stop_ids` | as before; `platform_code` ≤ 120 chars; a station change that came from a proposal carries `proposal_id` |
@@ -498,6 +503,7 @@ guess.
 | `stops` | `{stop_id?, name, lat, lon, platform_code?}` | one `stop/create` per row |
 | `routes` | `{route_id, short_name, long_name?, color?}` | one `route/create` per row |
 | `route_stops` | `{route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`) |
+| `stop_updates` | `{stop_id, platform_code?, description?, name?}` | one `stop/update` per row (a station: `station/update`), with exactly the cells given — section 11 |
 
 Response (both modes): `{dry_run, summary: {rows, ok, warnings, errors, changes},
 rows: [{row, status: ok|warning|error, messages: [{code, message}], change:
@@ -1031,7 +1037,7 @@ Two reads for the dashboard's cleanup panels, viewer+, changing nothing.
 
 | method | path | response |
 |---|---|---|
-| GET | `/feeds/{g}/stops/{stop_id}/context` | `{stop_id, detour_m, routes_measured, position_reviews: {pending, approved, committed, confirmed, items: [{review_id, status, reason}]}, same_name: [{stop_id, name, lat, lon, distance_m, route_count, parent_station, similarity}], audit: [{audit_id, at, actor_email, action, change_set_id, detail}], open_drafts: [{change_set_id, title, status, change_id, entity, op}]}`. 404 `stop_not_found` |
+| GET | `/feeds/{g}/stops/{stop_id}/context` | `{stop_id, detour_m, routes_measured, position_reviews: {pending, approved, committed, confirmed, items: [{review_id, status, reason}]}, same_name: [{stop_id, name, lat, lon, distance_m, route_count, parent_station, platform_code, description, similarity}], audit: [{audit_id, at, actor_email, action, change_set_id, detail}], open_drafts: [{change_set_id, title, status, change_id, entity, op}]}`. 404 `stop_not_found` |
 | GET | `/feeds/{g}/routes/{route_id}/context` | `{route_id, stops_with_reviews: [{stop_id, sequence, review_id, status}], worst_detours: [{stop_id, name, sequence, detour_m}], audit: [...], open_drafts: [...]}` (same `audit` / `open_drafts` shapes). 404 `route_not_found` |
 
 - `detour_m` is section 8's: the median over the stop's calls that have a served
@@ -1187,3 +1193,192 @@ in 10.5, which the API provides. Every item has checks in `dev/ui_smoke.mjs`
    holds: every mutation it makes replaces that object, as does choosing another
    draft, and the overlay rebuilds on that.
 <!-- ===== section 10 ends ===== -->
+
+## 11. Stop details, bulk updates and station links (2026-09-17)
+
+Asked for on master: "Add default platform name for solo stops also - the next
+stop, like 'Towards <this>' - and a stop description for stops and stations too.
+Add a polyline to represent stations and corresponding stops." The defaults
+(about 10,000 stop updates) are computed by nandi and arrive **as a draft**, like
+every other write: through the bulk kind below, then submit, approve (someone
+else) and commit.
+
+### 11.1 `description` on stops and stations
+
+`gtfs_stop.description` (`0012_stop_description.sql`, nullable text): where the
+stop is, in words — GTFS `stop_desc`.
+
+- **Read shape**: `description` is part of the stop row, so it is in every place
+  the row is: `/stops`, `/stops/{id}` and its `children`, `nearby` and `parent`,
+  a change's `before`, a coordinate review's `stop`, a merge's `from` / `into`.
+  The cleanup context's `same_name` items carry `platform_code` and
+  `description` too.
+- **Writes**: `stop/update`, `stop/create`, `station/create` and
+  `station/update` take `description`. Left out = as it is; `null` or blank =
+  cleared; at most 500 characters once trimmed, else the validation error
+  `description_too_long` (400 `invalid_change`, `details.code`, when the change
+  is added; the same finding in a bulk row). It applies and conflicts exactly as
+  `platform_code` does: the change is based on the stop's `row_version`.
+  `stop/merge` leaves the kept stop's description as it is.
+- **Public API**: a DB-backed feed's stop JSON gains **`description`** (no
+  preprocessed field existed for `stop_desc`, so this is the name), emitted only
+  when the stop has one. Parity with the preprocessed load is therefore unchanged
+  for every stop without a description; a feed served from preprocessed data
+  never has the field.
+- **A platform label needs no station.** `platform_code` on a stop with no
+  `parent_station` applies, is in the read shape, and is served as the public
+  `platformCode` (`stationId` stays `null`). Nothing in the editor assumed
+  otherwise; `tests/editor_stop_details_flow.rs` proves it end to end.
+
+Settled while implementing:
+
+- `platform_code` and `description` are stored **trimmed**, and a blank one is
+  stored as `NULL` — on `stop/update` and `stop/create` too, where a blank
+  `platform_code` used to be stored as `""` (a station's `members[]` already
+  cleared on blank).
+- `stop/update` and `stop/create` now refuse a `platform_code` longer than 120
+  characters with `invalid_platform_code`, the rule a station's
+  `members[].platform_code` and the proposals always had; before, only those two
+  paths checked it.
+- A station never has a `platform_code` of its own: `station/*` with one is 400
+  `invalid_change`, `details.code = "invalid_payload"`, as any unknown field is.
+- The loader also treats a blank description in the table as none (a row written
+  around the editor), so the public field is never `""`.
+- Lengths count characters (not bytes) after trimming.
+
+### 11.2 Bulk kind `stop_updates`
+
+`POST /change-sets/{id}/bulk` with `kind: "stop_updates"` (section 5: same cap of
+5,000 rows, same response, same `dry_run` semantics, one transaction, one
+`bulk_imported` audit row). A row is
+
+```json
+{"stop_id": "29db2391b0", "platform_code": "Towards THIRUPORUR", "description": "…", "name": "…"}
+```
+
+`stop_id` is required; `platform_code`, `description` and `name` are each
+optional, and at least one must be given. Each row becomes one `stop/update`
+whose `after` holds **exactly the cells given**, `base_row_version` the stop's
+current `row_version`, and `before` the stop row in read shape — the change
+`POST /change-sets/{id}/changes` would have stored. A blank or `null` cell is
+"not given": **clearing a field through an upload is out of scope** (clear it
+with a single `stop/update` carrying `null`).
+
+Row findings (`messages[].code`), errors unless said:
+
+| code | when |
+|---|---|
+| `invalid_row` | not an object; a column that is not one of the four; a cell that is not text (a number is taken as its text); `stop_id` missing or blank |
+| `nothing_to_update` | none of `platform_code`, `description`, `name` is given |
+| `duplicate_in_upload` | the same `stop_id` on more than one row (on every row involved) |
+| `stop_not_found` | no such stop, live or created earlier in the draft |
+| `stop_deleted` | the stop is deleted (a stop merged away by a commit is deleted), or deleted earlier in the draft |
+| `stop_merged_away` | an earlier change in the draft merges the stop into another |
+| `platform_code_on_station` | `stop_id` is a station and the row gives `platform_code` |
+| `invalid_platform_code`, `description_too_long`, `invalid_payload` | the single change's shape check: 120 / 500 characters |
+| `unchanged` (**warning**) | every given value already equals the stop's, **taking the draft as applying**. The row becomes **no change**: `change` is `null`, and `summary.unchanged` counts it |
+| `stop_already_in_draft` (**warning**) | the draft already has an update of that stop (and the row differs from what it leaves): the row is still a change, applied after it |
+
+A station id is accepted for `description` and `name`; the row becomes a
+`station/update` (its `before` lists `member_stop_ids` / `members` as a single
+station change's does).
+
+Settled while implementing:
+
+- **Re-running an upload is idempotent.** Once its changes are in the draft,
+  the same rows are all `unchanged`; a real run with no change to add writes
+  nothing — no change, no `updated_at`, no audit row — and still answers 200 with
+  `summary.changes: 0` and the set as `change_set`.
+- `summary.unchanged` is in a `stop_updates` response only; the other kinds'
+  summaries are as they were. (Every kind's response also names its `kind`, as
+  it always has.)
+- Every row that names a known stop also carries `stop: {name, lat, lon,
+  platform_code, description, parent_station}` — the stop as it is now, the
+  draft applied — so the preview can show what changes, and where, without a
+  read per row. Rows of the other kinds have no `stop`.
+- Values are compared trimmed; a name is compared as it is spelt (case matters).
+- What "the draft as applying" covers (`DraftView::texts_after`): earlier
+  `stop/update`, `station/update`, `stop/create` and `station/create` of the
+  stop; a station change's `members[].platform_code`; a merge into the stop that
+  hands over its name (`keep_name: "from"`) or, with its station, its label.
+- A stop created earlier in the draft can be updated: no `base_row_version`, and
+  `before` is the create's `after` (section 5's rule).
+- The editor API takes a JSON body of at most 8 MiB (as for every kind): 5,000
+  rows fit unless their descriptions average well over a kilobyte; split such a
+  file.
+- Two updates of one stop in one draft do not conflict with each other: commit
+  checks every change's base against the live rows before anything applies.
+- **Cost.** The upload is validated once, not per row against the draft: one
+  query for the stops it names, one read of the draft's changes, one in-memory
+  replay of them (O(draft + upload)), and one `INSERT … SELECT FROM UNNEST`.
+  On the local chennai_bus copy (debug build, `tests/editor_stop_details_flow.rs`
+  prints them): dry run of 5,000 rows 0.28–0.30 s; the same 5,000 onto a draft
+  already holding 5,000 changes 0.27 s (2,000 new rows: 0.14 s) — no dearer than
+  onto an empty draft; the real run of 5,000 rows 2.0 s, nearly all of it the set
+  detail it returns (which applies the whole draft once, as `GET
+  /change-sets/{id}` does), and 2,000 more onto those 5,000 2.3 s; submit of the
+  7,000-change draft 3.7 s, its commit 1.6 s. nandi's 10,000 defaults are two
+  uploads into one draft.
+
+### 11.3 Station links on the map, and `platform_count`
+
+The map ties every station in view to each of its platforms with a thin line,
+so it is plain which stops belong to which station.
+
+- Drawn from zoom 15 when **Stations** and the new **Station links** tick of the
+  Show control are on (`mapLayers.links` of the editor's preferences, remembered
+  like the others), to the platforms that are drawn — so not while Stops is off,
+  and the control says so. The lines are in the pane under the markers and take
+  no clicks.
+- The open station's lines — or the open platform's station's — stand out; the
+  rest are faint. On **Coordinates to review** the reviewed stop's station stands
+  out, on **Stations to review** the suggestion's own station once it exists;
+  both pages draw the lines for every station in view, since they are part of
+  the map's stop layer.
+- They follow the active draft through `js/overlay.js`: a stop or station the
+  draft moves is tied where the draft puts it; a stop a drafted station change
+  takes in is tied to that station (also one the draft creates), one it takes out
+  is not. Each of those is drawn in the draft's amber, dashed, and the stop's
+  tooltip says it joins or leaves the station "in draft …, not live".
+- Data: the stops the map already loads for its area (`parent_station`). The stop
+  rows of a list and of a detail carry **`platform_count`**, so the map knows
+  whether it has all of a station's platforms; only when it has not does it read
+  `GET /feeds/{g}/stops?station=<id>` — or `GET /feeds/{g}/stops/{id}` when the
+  station itself is outside the area — once per station, feed and page session,
+  at most four at a time, never again on a pan. A stop or station page the person
+  opens fills the same cache from what it read. A server without
+  `platform_count` is asked once per station in view.
+
+Settled while implementing:
+
+- `platform_count` counts live (not deleted) platforms; it is on every row of
+  `/stops` and on `/stops/{id}` (where it equals `children.length`), and is not
+  part of a change's `before`.
+- A failed read is remembered for 30 s and then tried again; nothing is cached
+  for it.
+
+### 11.4 Dashboard
+
+1. **Stop page, stop editor, New stop; station page, station editor, New
+   station**: a "Description" textarea (500 at most, with a counter). The
+   platform label is offered to every stop, in a station or not, with the
+   placeholder "Towards <next stop>" and the help "What passengers see as the
+   platform or direction at this stop…". Both go through the ordinary draft
+   change and show as pending in the draft (`js/overlay.js`, "Changes the platform
+   label, description"), the live value beside them. Putting a drafted value back
+   to what is live is sent too, so the draft's change follows the form.
+2. The platform label and the description are in the stop panel's header, in the
+   hover titles of the lists of stops (a station's stops, "Other stops within 60
+   m", same-named stops nearby), in the marker's tooltip on the map, and in the
+   draft's diff.
+3. **Import**: a fourth kind, "Stop details (platform label, description)" —
+   template `stop_updates-template.csv` (`stop_id, platform_code, description,
+   name`), parsed in the browser, previewed with `dry_run: true` in the same
+   table (plus a "Stop now" column from each row's `stop`) and on a map of the
+   stops the file names, "N unchanged, not added" among the counts, then "Add N
+   changes to draft". A file whose every row is unchanged says "Nothing to add".
+
+Tests: `tests/editor_stop_details_flow.rs` (registered in
+`scripts/editor_flow_test.sh`); `dev/ui_smoke.mjs` `round5Flows` (`node
+dev/ui_smoke.mjs --round5` runs only these) against `dev/mock_server.py`
+(`seed_round5`, `bulk_stop_updates`).

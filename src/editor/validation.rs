@@ -33,8 +33,10 @@ pub const ROUTE_RULE_CODES: [&str; 8] = [
 pub const MOVE_WARNING_METRES: f64 = 500.0;
 /// A merge of stops further apart than this is a warning.
 pub const MERGE_FAR_METRES: f64 = 150.0;
-/// Longest platform label a station member may carry.
+/// Longest platform label a stop may carry.
 pub const PLATFORM_CODE_MAX_CHARS: usize = 120;
+/// Longest description a stop or station may carry.
+pub const DESCRIPTION_MAX_CHARS: usize = 500;
 /// A station groups the stops of one place; fewer than this is not a station.
 pub const STATION_MIN_MEMBERS: usize = 2;
 /// Stop ids the server mints: `ed_` + 10 lower-case hex digits.
@@ -641,6 +643,37 @@ fn req_string<'a>(map: &'a Map<String, Value>, key: &str, what: &str) -> Result<
     }
 }
 
+/// A stop's own text fields that have a length: the platform label and the
+/// description, each a string or null, counted in characters once trimmed.
+fn stop_texts(map: &Map<String, Value>, id: &str, what: &str) -> Result<(), Finding> {
+    for (key, code, max, noun) in [
+        (
+            "platform_code",
+            "invalid_platform_code",
+            PLATFORM_CODE_MAX_CHARS,
+            "platform label",
+        ),
+        (
+            "description",
+            "description_too_long",
+            DESCRIPTION_MAX_CHARS,
+            "description",
+        ),
+    ] {
+        opt_string(map, key, what)?;
+        if let Some(text) = map.get(key).and_then(Value::as_str) {
+            if text.trim().chars().count() > max {
+                return Err(Finding::error(
+                    code,
+                    id,
+                    format!("{what}: the {noun} of {id} is longer than {max} characters"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The coordinate review a change was made for (docs/gtfs-editor.md section 8):
 /// absent or null, or a positive whole number. The apply ignores it.
 fn position_review_id(map: &Map<String, Value>, what: &str) -> Result<Option<i64>, Finding> {
@@ -746,6 +779,7 @@ pub fn check_payload(
                 "lat",
                 "lon",
                 "platform_code",
+                "description",
                 "cluster_id",
                 "regional_name",
                 "hindi_name",
@@ -770,7 +804,8 @@ pub fn check_payload(
                 ));
             }
             lat_lon(m, false, what)?;
-            for k in ["platform_code", "cluster_id", "regional_name", "hindi_name"] {
+            stop_texts(m, entity_key, what)?;
+            for k in ["cluster_id", "regional_name", "hindi_name"] {
                 opt_string(m, k, what)?;
             }
             // a coordinate review's stop update is its move, never anything else
@@ -794,6 +829,7 @@ pub fn check_payload(
                     "lon",
                     "stop_code",
                     "platform_code",
+                    "description",
                     "cluster_id",
                     "regional_name",
                     "hindi_name",
@@ -813,13 +849,8 @@ pub fn check_payload(
             }
             req_string(m, "name", what)?;
             lat_lon(m, true, what)?;
-            for k in [
-                "stop_code",
-                "platform_code",
-                "cluster_id",
-                "regional_name",
-                "hindi_name",
-            ] {
+            stop_texts(m, id, what)?;
+            for k in ["stop_code", "cluster_id", "regional_name", "hindi_name"] {
                 opt_string(m, k, what)?;
             }
             Ok(())
@@ -1038,6 +1069,7 @@ pub fn check_payload(
                     "name",
                     "lat",
                     "lon",
+                    "description",
                     "member_stop_ids",
                     "members",
                     "proposal_id",
@@ -1047,12 +1079,15 @@ pub fn check_payload(
                     "name",
                     "lat",
                     "lon",
+                    "description",
                     "member_stop_ids",
                     "members",
                     "proposal_id",
                 ]
             };
             allow_only(m, allowed, what)?;
+            // a station has a description like any stop, but never a platform label
+            stop_texts(m, entity_key, what)?;
             if create {
                 let id = req_string(m, "station_id", what)?;
                 check_entity_id("station_id", id)?;
@@ -1698,6 +1733,66 @@ mod tests {
         assert!(check_payload("route", "delete", "R9", &json!({})).is_err());
         assert!(valid_route_type(0) && valid_route_type(12) && valid_route_type(1702));
         assert!(!valid_route_type(8) && !valid_route_type(99) && !valid_route_type(-1));
+    }
+
+    #[test]
+    fn descriptions_and_platform_labels_have_a_length() {
+        let update = |after: Value| check_payload("stop", "update", "S1", &after);
+        assert!(update(json!({"description": "Opposite the temple tank"})).is_ok());
+        // null and blank clear it; on its own it is a change
+        assert!(update(json!({"description": null})).is_ok());
+        assert!(update(json!({"description": "  "})).is_ok());
+        assert_eq!(
+            update(json!({"description": 5})).unwrap_err().code,
+            "invalid_payload"
+        );
+        // characters, not bytes, once trimmed
+        let fits = format!("  {}  ", "é".repeat(DESCRIPTION_MAX_CHARS));
+        assert!(update(json!({"description": fits})).is_ok());
+        let long = "x".repeat(DESCRIPTION_MAX_CHARS + 1);
+        let f = update(json!({"description": long})).unwrap_err();
+        assert_eq!(f.code, "description_too_long");
+        assert!(f.message.contains("S1") && f.message.contains("500"));
+        let label = "x".repeat(PLATFORM_CODE_MAX_CHARS + 1);
+        assert_eq!(
+            update(json!({"platform_code": label})).unwrap_err().code,
+            "invalid_platform_code"
+        );
+        let create = |extra: Value| {
+            let mut after = json!({"stop_id": "N1", "name": "New", "lat": 13.0, "lon": 80.2});
+            after
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            check_payload("stop", "create", "N1", &after)
+        };
+        assert!(create(json!({"description": "By gate 2", "platform_code": "Towards X"})).is_ok());
+        assert_eq!(
+            create(json!({"description": long})).unwrap_err().code,
+            "description_too_long"
+        );
+        // a station has a description, never a platform label of its own
+        let station = |op: &str, after: Value| check_payload("station", op, "ST", &after);
+        assert!(station("update", json!({"description": "Both sides of the road"})).is_ok());
+        assert!(station("update", json!({"description": null})).is_ok());
+        assert_eq!(
+            station("update", json!({"description": long}))
+                .unwrap_err()
+                .code,
+            "description_too_long"
+        );
+        assert_eq!(
+            station("update", json!({"platform_code": "x"}))
+                .unwrap_err()
+                .code,
+            "invalid_payload"
+        );
+        assert!(station(
+            "create",
+            json!({"station_id": "ST", "name": "Hub", "lat": 13.0, "lon": 80.2, "description": "The hub",
+            "member_stop_ids": ["A", "B"]})
+        )
+        .is_ok());
     }
 
     #[test]

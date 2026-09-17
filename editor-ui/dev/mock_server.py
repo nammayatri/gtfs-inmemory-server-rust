@@ -58,8 +58,9 @@ DEV_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 PLATFORM_MAX = 120
+DESCRIPTION_MAX = 500
 BULK_MAX_ROWS = 5000
-BULK_KINDS = ("stops", "routes", "route_stops")
+BULK_KINDS = ("stops", "routes", "route_stops", "stop_updates")
 PROPOSAL_STATUSES = ("pending", "approved", "rejected", "committed", "superseded")
 PROPOSAL_MOVE_M = 100
 REVIEW_STATUSES = ("pending", "approved", "committed", "confirmed", "superseded")
@@ -235,6 +236,7 @@ class Store:
         self.audit = []
         self.next_change_id = 1
         self.reviews = {}
+        self.stops_stamp = 0          # moves whenever live stops change (a commit, a fixture)
         self._seed_reviews(sample.get("position_reviews") or [], t)
 
     # ---- coordinate reviews (docs section 8)
@@ -370,6 +372,17 @@ class Store:
     def email_of(self, user_id):
         return (self.users.get(user_id) or {}).get("email") if user_id else None
 
+    def platform_counts(self, g):
+        """Live platforms per station; counted once per answer, not per stop."""
+        key = (g, self.stops_stamp)
+        if getattr(self, "_platform_counts_for", None) != key:
+            counts = {}
+            for (gg, _), st in self.stops.items():
+                if gg == g and st.get("parent_station") and not st.get("deleted"):
+                    counts[st["parent_station"]] = counts.get(st["parent_station"], 0) + 1
+            self._platform_counts_for, self._platform_counts = key, counts
+        return self._platform_counts
+
     def default_agency(self, g):
         return next((r.get("agency_id") for (gg, _), r in self.routes.items() if gg == g and r.get("agency_id")), None)
 
@@ -416,7 +429,13 @@ def member_spec(after):
 
 
 # ------------------------------------------------------------------ projection & validation
-STOP_FIELDS = {"name", "lat", "lon", "platform_code", "cluster_id", "regional_name", "hindi_name"}
+STOP_FIELDS = {"name", "lat", "lon", "platform_code", "description", "cluster_id", "regional_name", "hindi_name"}
+# texts a passenger reads: stored trimmed, and blank clears them like null
+STOP_TEXTS = ("platform_code", "description")
+
+
+def stored_text(v):
+    return (v.strip() or None) if isinstance(v, str) else None
 ROUTE_FIELDS = {"short_name", "long_name", "color", "text_color", "encoded_polyline", "polyline_source"}
 
 
@@ -426,6 +445,7 @@ class Projection:
     def __init__(self, store, gtfs_id, changes, upto=None):
         self.s, self.g = store, gtfs_id
         self.stops, self.routes, self.rows = {}, {}, {}
+        self.changes = changes
         for ch in changes:
             if upto is not None and ch["change_id"] == upto:
                 break
@@ -480,12 +500,14 @@ class Projection:
                 self.stops[key] = {"gtfs_id": self.g, "stop_id": key, "stop_code": after.get("stop_code") or key,
                                    "name": after.get("name"), "lat": after.get("lat"), "lon": after.get("lon"),
                                    "location_type": 0, "parent_station": None,
-                                   "platform_code": after.get("platform_code"), "cluster_id": after.get("cluster_id"),
+                                   "platform_code": stored_text(after.get("platform_code")),
+                                   "description": stored_text(after.get("description")),
+                                   "cluster_id": after.get("cluster_id"),
                                    "regional_name": after.get("regional_name"), "hindi_name": after.get("hindi_name"),
                                    "position_source": "editor", "row_version": 1, "deleted": False}
             elif op == "update" and self.stop(key):
                 st = dict(self.stop(key))
-                st.update({k: v for k, v in after.items() if k in STOP_FIELDS})
+                st.update({k: stored_text(v) if k in STOP_TEXTS else v for k, v in after.items() if k in STOP_FIELDS})
                 self.stops[key] = st
             elif op == "delete" and self.stop(key):
                 st = dict(self.stop(key))
@@ -534,6 +556,8 @@ class Projection:
                 for k in ("name", "lat", "lon"):
                     if k in after:
                         st[k] = after[k]
+                if "description" in after:
+                    st["description"] = stored_text(after["description"])
                 self.stops[key] = st
                 want, codes = member_spec(after)
                 if want is not None:
@@ -546,7 +570,7 @@ class Projection:
                             m = dict(self.stop(sid))
                             m["parent_station"] = key
                             if sid in codes:
-                                m["platform_code"] = codes[sid]
+                                m["platform_code"] = stored_text(codes[sid])
                             self.stops[sid] = m
             elif op == "delete" and self.stop(key):
                 for sid in self.children(key):
@@ -685,6 +709,13 @@ def validate_change(store, g, ch, before, final, live, route_editors):
             err("bad_position", "The position must be a latitude between -90 and 90 and a longitude between "
                                 "-180 and 180.")
 
+    def described(what):
+        d = after.get("description")
+        if d is not None and not isinstance(d, str):
+            err("invalid_payload", "description must be text or null.")
+        elif isinstance(d, str) and len(d.strip()) > DESCRIPTION_MAX:
+            err("description_too_long", f"The description of {what} is longer than {DESCRIPTION_MAX} characters.")
+
     if e == "stop" and op == "merge":
         into_id = str(after.get("into_stop_id") or "")
         frm, into = before.stop(key), before.stop(into_id)
@@ -752,8 +783,9 @@ def validate_change(store, g, ch, before, final, live, route_editors):
                 if using:
                     err("stop_in_use", f"Stop {key} is still used by {len(using)} route(s).", routes=using[:20])
         pc = after.get("platform_code")
-        if isinstance(pc, str) and len(pc) > PLATFORM_MAX:
-            err("platform_code_too_long", f"A platform label can be at most {PLATFORM_MAX} characters.")
+        if isinstance(pc, str) and len(pc.strip()) > PLATFORM_MAX:
+            err("invalid_platform_code", f"A platform label can be at most {PLATFORM_MAX} characters.")
+        described(f"stop {key}")
     elif e == "route":
         rt = before.route(key)
         if op == "create":
@@ -801,6 +833,9 @@ def validate_change(store, g, ch, before, final, live, route_editors):
             if op == "update":
                 position(False)
         if op in ("create", "update"):
+            described(f"station {key}")
+            if "platform_code" in after:
+                err("invalid_payload", "A station has no platform label of its own.")
             want, codes = member_spec(after)
             if op == "create" and want is None:
                 err("missing_field", "A new station needs its member stops.")
@@ -890,9 +925,10 @@ def conflicts_for(store, cs):
 # ------------------------------------------------------------------ serialisers
 def stop_out(store, g, st):
     return {k: st.get(k) for k in ("stop_id", "stop_code", "name", "lat", "lon", "location_type",
-                                   "parent_station", "platform_code", "cluster_id", "regional_name",
+                                   "parent_station", "platform_code", "description", "cluster_id", "regional_name",
                                    "hindi_name", "position_source", "row_version", "deleted")} | {
-        "route_count": len({rid for rid, _ in store.stop_routes.get((g, st["stop_id"]), [])})}
+        "route_count": len({rid for rid, _ in store.stop_routes.get((g, st["stop_id"]), [])}),
+        "platform_count": store.platform_counts(g).get(st["stop_id"], 0)}
 
 
 def route_detail(proj, rid):
@@ -1108,7 +1144,8 @@ class Handler(BaseHTTPRequestHandler):
             u = s.user_by_email(email)
             secret = (u or {}).get("totp_secret") or (u or {}).get("pending_secret")
             return self._send(200, {"email": email, "users": [user_out(x) for x in s.users.values()],
-                                    "current_code": totp(secret) if secret else None})
+                                    "current_code": totp(secret) if secret else None,
+                                    "round5": getattr(s, "round5", None)})
         if path == "/__dev/as" and method == "POST":
             email = self._body().get("email") or ""
             return self._send(200, {"ok": True}, [
@@ -1548,7 +1585,7 @@ class Handler(BaseHTTPRequestHandler):
             st = proj.stop(key)
             if st is None:
                 return None, None
-            snap = {k: st.get(k) for k in ("stop_id", "name", "lat", "lon", "platform_code", "cluster_id",
+            snap = {k: st.get(k) for k in ("stop_id", "name", "lat", "lon", "platform_code", "description", "cluster_id",
                                            "regional_name", "hindi_name", "location_type", "parent_station")}
             if entity == "station":
                 snap["member_stop_ids"] = sorted(proj.children(key))
@@ -1790,6 +1827,7 @@ class Handler(BaseHTTPRequestHandler):
     def apply_commit(self, cs):
         s, g = self.store, cs["gtfs_id"]
         proj = Projection(s, g, cs["changes"])
+        s.stops_stamp += 1
         for sid, st in proj.stops.items():
             old = s.stops.get((g, sid))
             new = dict(st)
@@ -1811,7 +1849,7 @@ class Handler(BaseHTTPRequestHandler):
         self.require_draft(u, cs)
         kind, rows, dry = b.get("kind"), b.get("rows"), b.get("dry_run", True)
         if kind not in BULK_KINDS:
-            raise ApiError(400, "bad_kind", "kind must be stops, routes or route_stops.")
+            raise ApiError(400, "bad_kind", "kind must be stops, routes, route_stops or stop_updates.")
         if not isinstance(rows, list) or not rows:
             raise ApiError(400, "no_rows", "The file has no rows to import.")
         if len(rows) > BULK_MAX_ROWS:
@@ -1830,22 +1868,28 @@ class Handler(BaseHTTPRequestHandler):
         for i, r in enumerate(rows):
             if not isinstance(r, dict):
                 msg(i, "bad_row", "This row is not a set of named columns.")
-        changes = {"stops": self.bulk_stops, "routes": self.bulk_routes,
-                   "route_stops": self.bulk_route_stops}[kind](g, proj, rows, msg, results)
+        changes = {"stops": self.bulk_stops, "routes": self.bulk_routes, "route_stops": self.bulk_route_stops,
+                   "stop_updates": self.bulk_stop_updates}[kind](g, proj, rows, msg, results)
         for r in results:
             levels = {m["level"] for m in r["messages"]}
             r["status"] = "error" if "error" in levels else "warning" if "warning" in levels else "ok"
         summary = {"rows": len(rows), "ok": sum(r["status"] == "ok" for r in results),
                    "warnings": sum(r["status"] == "warning" for r in results),
                    "errors": sum(r["status"] == "error" for r in results), "changes": len(changes)}
+        if kind == "stop_updates":
+            summary["unchanged"] = sum(any(m["code"] == "unchanged" for m in r["messages"]) for r in results)
         preview = [{"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"], "after": c["after"]}
                    for c in changes]
         if dry:
-            return {"dry_run": True, "summary": summary, "rows": results, "changes_preview": preview}
+            return {"dry_run": True, "kind": kind, "summary": summary, "rows": results, "changes_preview": preview}
         if summary["errors"]:
             raise ApiError(400, "bulk_has_errors",
                            f"{summary['errors']} row(s) have errors. Nothing was added; fix the file and preview again.",
                            {"summary": summary})
+        if not changes:
+            # every row is unchanged: the same file again adds nothing and writes nothing
+            return {"dry_run": False, "kind": kind, "summary": summary, "rows": results, "changes_preview": [],
+                    "change_set": self.set_full(cs)}
         running = Projection(s, g, cs["changes"])
         for c, rows_of in zip(changes, [c.pop("_rows") for c in changes]):
             before = None
@@ -1854,15 +1898,26 @@ class Handler(BaseHTTPRequestHandler):
                 c["after"] = dict(c["after"], stop_id=c["entity_key"])
             if c["entity"] == "route_stops":
                 before = route_detail(running, c["entity_key"])["rows"]
-            ch = self.append_change(u, cs, c["entity"], c["op"], c["entity_key"], c["after"], before, audit=False)
+            base = None
+            if c["op"] == "update":
+                # a stop's details: the row as it is now, and the live version it is based on
+                now_row = running.stop(c["entity_key"]) or {}
+                before = {k: now_row.get(k) for k in ("stop_id", "name", "lat", "lon", "platform_code", "description",
+                                                       "cluster_id", "regional_name", "hindi_name", "location_type",
+                                                       "parent_station")}
+                if c["entity"] == "station":
+                    before["member_stop_ids"] = sorted(running.children(c["entity_key"]))
+                base = (s.stops.get((g, c["entity_key"])) or {}).get("row_version")
+            ch = self.append_change(u, cs, c["entity"], c["op"], c["entity_key"], c["after"], before, base, audit=False)
             running.apply(ch)
             for i in rows_of:
-                results[i]["change"] = {"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"]}
+                results[i]["change"] = {"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"],
+                                        "change_id": ch["change_id"]}
         s.add_audit(u, "bulk_imported", g, cs["change_set_id"],
                     {"kind": kind, "rows": len(rows), "changes": len(changes)})
         preview = [{"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"], "after": c["after"]}
                    for c in changes]
-        return {"dry_run": False, "summary": summary, "rows": results, "changes_preview": preview,
+        return {"dry_run": False, "kind": kind, "summary": summary, "rows": results, "changes_preview": preview,
                 "change_set": self.set_full(cs)}
 
     @staticmethod
@@ -1918,6 +1973,73 @@ class Handler(BaseHTTPRequestHandler):
             change = {"entity": "stop", "op": "create", "entity_key": sid, "after": after, "_rows": [i]}
             changes.append(change)
             results[i]["change"] = {"entity": "stop", "op": "create", "entity_key": sid}
+        return changes
+
+    def bulk_stop_updates(self, g, proj, rows, msg, results):
+        """{stop_id, platform_code?, description?, name?}: one stop/update (a station:
+        station/update) per row, with exactly the cells given (docs section 11)."""
+        fields = ("platform_code", "description", "name")
+        at, changes = {}, []
+        for i, r in enumerate(rows):
+            if isinstance(r, dict) and isinstance(r.get("stop_id"), (str, int)) and str(r["stop_id"]).strip():
+                at.setdefault(str(r["stop_id"]).strip(), []).append(i + 1)
+        updated = {c["entity_key"]: c["change_id"] for c in proj.changes
+                   if c["entity"] in ("stop", "station") and c["op"] == "update"}
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                continue
+            bad = [k for k in r if k not in ("stop_id",) + fields]
+            if bad:
+                msg(i, "invalid_row", f"{bad[0]!r} is not a column of a stop_updates row (columns: stop_id, "
+                                      "platform_code, description, name)")
+                continue
+            if any(r.get(k) is not None and not isinstance(r.get(k), (str, int, float)) for k in ("stop_id",) + fields):
+                msg(i, "invalid_row", "every cell is text")
+                continue
+            sid = str(r.get("stop_id") or "").strip()
+            if not sid:
+                msg(i, "invalid_row", "stop_id is required")
+                continue
+            given = {k: str(r[k]).strip() for k in fields if r.get(k) is not None and str(r[k]).strip()}
+            if not given:
+                msg(i, "nothing_to_update", f"the row for stop {sid} gives no platform_code, description or name")
+                continue
+            if len(at[sid]) > 1:
+                msg(i, "duplicate_in_upload", f"stop_id {sid} is on rows {', '.join(map(str, at[sid]))} of this upload")
+            st = proj.stop(sid)
+            if st and not st.get("merged_into"):
+                results[i]["stop"] = {k: st.get(k) for k in ("name", "lat", "lon", "platform_code", "description",
+                                                              "parent_station")}
+            if not st:
+                msg(i, "stop_not_found", f"no stop {sid}")
+                continue
+            if st.get("merged_into"):
+                msg(i, "stop_merged_away", f"stop {sid} is merged into {st['merged_into']} earlier in this draft; "
+                                           f"use {st['merged_into']}")
+                continue
+            if st.get("deleted"):
+                msg(i, "stop_deleted", f"stop {sid} is deleted")
+                continue
+            station = st.get("location_type") == 1
+            if station and "platform_code" in given:
+                msg(i, "platform_code_on_station", f"{sid} is a station; a platform label belongs to one of its stops")
+                continue
+            if len(given.get("platform_code", "")) > PLATFORM_MAX:
+                msg(i, "invalid_platform_code", f"the platform label of {sid} is longer than {PLATFORM_MAX} characters")
+            if len(given.get("description", "")) > DESCRIPTION_MAX:
+                msg(i, "description_too_long", f"the description of {sid} is longer than {DESCRIPTION_MAX} characters")
+            if results[i]["messages"]:
+                continue
+            entity = "station" if station else "stop"
+            if all((st.get(k) or "").strip() == v for k, v in given.items()):
+                msg(i, "unchanged", f"{entity} {sid} already has {'this value' if len(given) == 1 else 'these values'}; "
+                                    "this row changes nothing", "warning")
+                continue
+            if sid in updated:
+                msg(i, "stop_already_in_draft", f"change {updated[sid]} in this draft already updates {entity} {sid}; "
+                                                "this one applies after it", "warning")
+            changes.append({"entity": entity, "op": "update", "entity_key": sid, "after": given, "_rows": [i]})
+            results[i]["change"] = {"entity": entity, "op": "update", "entity_key": sid}
         return changes
 
     def bulk_routes(self, g, proj, rows, msg, results):
@@ -2840,6 +2962,7 @@ def entity_context(self, g, kind, key):
                 same.append({"stop_id": oid, "name": o["name"], "lat": o["lat"], "lon": o["lon"], "distance_m": round(d, 1),
                              "route_count": len({rid for rid, _ in s.stop_routes.get((g, oid), [])}),
                              "parent_station": o.get("parent_station"), "location_type": o.get("location_type"),
+                             "platform_code": o.get("platform_code"), "description": o.get("description"),
                              "similarity": alike})
         same.sort(key=lambda x: (-x["similarity"], x["distance_m"]))
 
@@ -3032,6 +3155,78 @@ def seed_round4(store):
 # ====================================================================== end of round 4 (UX)
 
 
+# ====================================================================== round 5 (stop details, station links)
+R5_STATION = "stn_r5_links"
+R5_FAR_STATION = "stn_r5_far"
+
+
+def seed_round5(store):
+    """Fixtures for the round 5 flows (docs section 11), from stops no other flow
+    opens - none under review, in a suggested station, or sharing its point:
+
+      - station stn_r5_links: two stops 40-250 m apart become its platforms, the
+        station point between them, so its links have a length to be seen; the
+        first platform gets a description;
+      - station stn_r5_far: a platform near those, and one more than 3 km away, so
+        one of its platforms is always outside the loaded area;
+      - `round5` on the dev state names them for the smoke test.
+    """
+    g = next(iter(store.feeds), None)
+    busy = {rv["stop_id"] for rv in store.reviews.values()}
+    for p in store.proposals.values():
+        busy |= {m["stop_id"] for m in p.get("members") or []}
+    for rv in store.reviews.values():
+        busy |= {x.get("stop_id") for x in (rv.get("evidence") or {}).get("shares_point_with") or []}
+        busy |= {c.get("stop_id") for c in (rv.get("evidence") or {}).get("same_name_candidates") or []}
+    points = {}
+    for (gg, sid), st in store.stops.items():
+        if gg == g:
+            points.setdefault((round(st["lat"], 6), round(st["lon"], 6)), []).append(sid)
+    free = sorted((st for (gg, sid), st in store.stops.items()
+                   if gg == g and sid not in busy and not st.get("deleted") and st.get("location_type") == 0
+                   and not st.get("parent_station") and len(points[(round(st["lat"], 6), round(st["lon"], 6))]) == 1
+                   and store.stop_routes.get((g, sid))), key=lambda st: st["stop_id"])
+    grid = {}
+    for st in free:
+        grid.setdefault((int(st["lat"] * 400), int(st["lon"] * 400)), []).append(st)
+    pair = None
+    for st in free:
+        cx, cy = int(st["lat"] * 400), int(st["lon"] * 400)
+        near = [o for dx in (-1, 0, 1) for dy in (-1, 0, 1) for o in grid.get((cx + dx, cy + dy), [])
+                if o is not st and 40 <= haversine(st["lat"], st["lon"], o["lat"], o["lon"]) <= 250]
+        if len(near) >= 3:
+            pair = (st, *sorted(near, key=lambda o: o["stop_id"])[:3])
+            break
+    if not pair:
+        return
+    a, b, solo, c = pair
+    far = next((o for o in reversed(free) if o not in pair
+                and haversine(a["lat"], a["lon"], o["lat"], o["lon"]) > 3000), None)
+
+    def station(sid, name, members):
+        store.stops[(g, sid)] = {
+            "gtfs_id": g, "stop_id": sid, "stop_code": sid, "name": name,
+            "lat": round(sum(m["lat"] for m in members[:2]) / len(members[:2]) + 0.0002, 7),
+            "lon": round(sum(m["lon"] for m in members[:2]) / len(members[:2]), 7),
+            "location_type": 1, "parent_station": None, "platform_code": None, "description": None, "cluster_id": None,
+            "regional_name": None, "hindi_name": None, "position_source": "mock-fixture", "row_version": 1,
+            "deleted": False}
+        for m in members:
+            m["parent_station"] = sid
+
+    station(R5_STATION, f"{a['name']} (links)", [a, b])
+    a["platform_code"], b["platform_code"] = f"Towards {b['name']}", f"Towards {a['name']}"
+    a["description"] = "Outside the post office, opposite the temple tank"
+    if far:
+        station(R5_FAR_STATION, f"{c['name']} (far platform)", [c])
+        far["parent_station"] = R5_FAR_STATION
+    store.stops_stamp += 1
+    store.round5 = {"station": R5_STATION, "platforms": [a["stop_id"], b["stop_id"]], "solo": solo["stop_id"],
+                    "far_station": R5_FAR_STATION if far else None, "far_near": c["stop_id"],
+                    "far_platform": far["stop_id"] if far else None}
+# ====================================================================== end of round 5
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -3042,6 +3237,7 @@ def main():
     with gzip.open(args.sample, "rt", encoding="utf-8") as fh:
         Handler.store = Store(json.load(fh))
     seed_round4(Handler.store)
+    seed_round5(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
     ThreadingHTTPServer(("127.0.0.1", args.port), PolicyHandler).serve_forever()
 

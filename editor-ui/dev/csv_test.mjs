@@ -86,3 +86,11 @@ test("toCsv and parseCsv round-trip", () => {
   assert.ok(text.endsWith("\r\n"));
   assert.deepEqual(records(text), rows);
 });
+
+test("a stop details file keeps a description's commas, quotes and line breaks, and its empty cells", () => {
+  const rows = [["stop_id", "platform_code", "description", "name"],
+    ["S1", "Towards Guindy", 'Outside the "Post Office", opposite the tank', ""],
+    ["S2", "", "First line\nsecond line", ""]];
+  assert.deepEqual(records(toCsv(rows)), rows);
+  assert.deepEqual(records('stop_id,platform_code,description,name\nS3,"Towards Adyar, via OMR",,\n')[1], ["S3", "Towards Adyar, via OMR", "", ""]);
+});

@@ -2,11 +2,11 @@
 # End-to-end test of the GTFS editor API against a LOCAL Postgres that holds the
 # editor schema (db/gtfs_editor/*.sql). Runs tests/editor_flow.rs,
 # tests/editor_create_flow.rs, tests/editor_position_review_flow.rs,
-# tests/editor_review_merge_flow.rs and tests/editor_feed_config_flow.rs, which use
-# their own feeds and accounts, then proves the chennai_bus rows were not touched -
-# reseeding them from nandi if they were - and that its station proposals, its
-# position reviews and its feed row (data source and version) were not touched
-# either.
+# tests/editor_review_merge_flow.rs, tests/editor_feed_config_flow.rs and
+# tests/editor_stop_details_flow.rs, which use their own feeds and accounts, then
+# proves the chennai_bus rows were not touched - reseeding them from nandi if they
+# were - and that its station proposals, its position reviews and its feed row
+# (data source and version) were not touched either.
 #
 #   scripts/editor_flow_test.sh
 #   EDITOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55432/mtc_internal_master scripts/editor_flow_test.sh
@@ -60,6 +60,7 @@ reviews_before="$(reviews)"
 status=0
 EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow --test editor_create_flow \
   --test editor_position_review_flow --test editor_review_merge_flow --test editor_feed_config_flow \
+  --test editor_stop_details_flow \
   -- --nocapture || status=$?
 
 proposals_after="$(proposals)"

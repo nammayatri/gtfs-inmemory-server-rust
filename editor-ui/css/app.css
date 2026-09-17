@@ -253,6 +253,10 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .crumb { font-size: var(--fs-s); }
 .title-block { display: grid; gap: 4px; }
 .ids { color: var(--muted); font-size: var(--fs-s); }
+.platform-line { font-size: var(--fs-s); font-weight: 700; }
+.platform-line .label-tag { font-weight: 400; color: var(--muted); }
+.stop-description { font-size: var(--fs-s); white-space: pre-line; overflow-wrap: anywhere; }
+.char-count { justify-self: end; font-size: var(--fs-xs); }
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; font-size: var(--fs-s); }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; overflow-wrap: anywhere; }
@@ -493,6 +497,8 @@ input[type="file"]:focus-visible + .dropzone { outline: 3px solid var(--focus); 
 .result-table td { white-space: nowrap; }
 .result-table td.messages { white-space: normal; min-width: 260px; }
 .result-table td.messages ul { margin: 0; padding-left: 16px; }
+.result-table td.long-cell { white-space: normal; min-width: 220px; max-width: 360px; overflow-wrap: anywhere; }
+.result-table td.stop-now .sub { display: block; color: var(--muted); font-size: var(--fs-xs); }
 .result-table li.err { color: var(--danger); }
 .result-table li.warn { color: #8a5d00; }
 .result-table tr.result-error td:first-child { box-shadow: inset 4px 0 0 var(--danger); }

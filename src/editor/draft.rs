@@ -11,7 +11,7 @@
 //! says why).
 
 use super::error::EditorResult;
-use super::validation::{station_members, RouteRow};
+use super::validation::{station_members, MemberSpec, RouteRow};
 use serde_json::Value;
 use sqlx::{PgConnection, Row};
 use std::collections::{HashMap, HashSet};
@@ -30,19 +30,74 @@ pub struct CreatedStop {
 #[derive(Debug, Clone)]
 enum StationOp {
     /// station/create or station/update: `members` join the station; an update
-    /// with a member list also releases the station's other stops.
+    /// with a member list also releases the station's other stops. `labels`
+    /// holds the platform label of each member that sends one.
     Members {
         station: String,
         members: HashSet<String>,
         releases_others: bool,
+        labels: HashMap<String, Option<String>>,
     },
     /// station/delete releases every member.
     Delete { station: String },
     /// stop/delete clears the stop's parent.
     StopDelete { stop: String },
     /// stop/merge: the kept stop takes the parent the merged stop had when it
-    /// has none; the merged stop leaves its station.
-    Merge { from: String, into: String },
+    /// has none (and then its platform label); the merged stop leaves its
+    /// station. `keep_name_from`: the kept stop takes the merged stop's name.
+    Merge {
+        from: String,
+        into: String,
+        keep_name_from: bool,
+    },
+    /// A create or update of a stop or station: the texts it sets. A station
+    /// never sets a platform label.
+    Texts {
+        stop: String,
+        creates: bool,
+        name: Option<String>,
+        platform_code: Option<Option<String>>,
+        description: Option<Option<String>>,
+    },
+}
+
+/// The texts of a stop a passenger reads, and its station: what
+/// [`DraftView::texts_after`] follows through a draft.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StopTexts {
+    pub name: String,
+    pub platform_code: Option<String>,
+    pub description: Option<String>,
+    pub parent_station: Option<String>,
+}
+
+/// A label or description as the apply stores it: trimmed, blank is none.
+fn stored_text(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn texts_op(stop: &str, creates: bool, a: &Value) -> StationOp {
+    let given = |k: &str| a.get(k).map(stored_text);
+    StationOp::Texts {
+        stop: stop.to_string(),
+        creates,
+        name: a
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|n| n.trim().to_string()),
+        platform_code: given("platform_code"),
+        description: given("description"),
+    }
+}
+
+fn member_labels(members: &[MemberSpec]) -> HashMap<String, Option<String>> {
+    members
+        .iter()
+        .filter_map(|m| Some((m.stop_id.clone(), m.platform_code.clone()?)))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +106,8 @@ pub struct DraftView {
     deleted_stops: HashSet<String>,
     moved_stops: HashMap<String, (f64, f64)>,
     merged_away: HashMap<String, (String, i64)>,
+    /// stop or station -> the draft's last update of it
+    updated_stops: HashMap<String, i64>,
     created_routes: HashMap<String, i64>,
     deleted_routes: HashSet<String>,
     /// route -> (index of the change, change id, rows as the apply stores them)
@@ -148,10 +205,12 @@ impl DraftView {
                             lat: num("lat").unwrap_or(0.0),
                             lon: num("lon").unwrap_or(0.0),
                         });
+                    v.station_ops.push(texts_op(key, true, a));
                     if is_station {
                         if let Some(members) = a.as_object().and_then(station_members) {
                             v.station_ops.push(StationOp::Members {
                                 station: key.to_string(),
+                                labels: member_labels(&members),
                                 members: members.into_iter().map(|m| m.stop_id).collect(),
                                 releases_others: false,
                             });
@@ -162,11 +221,16 @@ impl DraftView {
                     if let (Some(lat), Some(lon)) = (num("lat"), num("lon")) {
                         v.moved_stops.insert(key.to_string(), (lat, lon));
                     }
+                    v.updated_stops.insert(key.to_string(), c.change_id);
+                    v.station_ops.push(texts_op(key, false, a));
                 }
                 ("station", "update") => {
+                    v.updated_stops.insert(key.to_string(), c.change_id);
+                    v.station_ops.push(texts_op(key, false, a));
                     if let Some(members) = a.as_object().and_then(station_members) {
                         v.station_ops.push(StationOp::Members {
                             station: key.to_string(),
+                            labels: member_labels(&members),
                             members: members.into_iter().map(|m| m.stop_id).collect(),
                             releases_others: true,
                         });
@@ -196,6 +260,7 @@ impl DraftView {
                     v.station_ops.push(StationOp::Merge {
                         from: key.to_string(),
                         into,
+                        keep_name_from: a.get("keep_name").and_then(Value::as_str) == Some("from"),
                     });
                 }
                 ("route", "create") => {
@@ -244,6 +309,11 @@ impl DraftView {
             .get(id)
             .copied()
             .or_else(|| self.created_stops.get(id).map(|c| (c.lat, c.lon)))
+    }
+
+    /// The change id of the draft's last update of a stop or station.
+    pub fn updated_by(&self, id: &str) -> Option<i64> {
+        self.updated_stops.get(id).copied()
     }
 
     pub fn created_route(&self, id: &str) -> Option<i64> {
@@ -301,6 +371,7 @@ impl DraftView {
                     station,
                     members,
                     releases_others,
+                    ..
                 } => {
                     for (id, parent) in p.iter_mut() {
                         if members.contains(id) {
@@ -322,7 +393,7 @@ impl DraftView {
                         *parent = None;
                     }
                 }
-                StationOp::Merge { from, into } => {
+                StationOp::Merge { from, into, .. } => {
                     let taken = p.get(from).cloned().flatten();
                     if let Some(parent) = p.get_mut(into) {
                         if parent.is_none() {
@@ -333,9 +404,103 @@ impl DraftView {
                         *parent = None;
                     }
                 }
+                StationOp::Texts { .. } => {}
             }
         }
         p
+    }
+
+    /// Each stop's name, platform label, description and station once the
+    /// draft applies, starting from `live`. Only stops in `live` are followed,
+    /// and the stops and stations the draft creates; a merge needs the merged
+    /// stop ([`DraftView::merge_sources`]) in `live` to hand anything over.
+    pub fn texts_after(&self, live: &HashMap<String, StopTexts>) -> HashMap<String, StopTexts> {
+        let mut t = live.clone();
+        for op in &self.station_ops {
+            match op {
+                StationOp::Texts {
+                    stop,
+                    creates,
+                    name,
+                    platform_code,
+                    description,
+                } => {
+                    if *creates && !t.contains_key(stop) {
+                        t.insert(stop.clone(), StopTexts::default());
+                    }
+                    let Some(s) = t.get_mut(stop) else { continue };
+                    if let Some(name) = name {
+                        s.name = name.clone();
+                    }
+                    if let Some(code) = platform_code {
+                        s.platform_code = code.clone();
+                    }
+                    if let Some(d) = description {
+                        s.description = d.clone();
+                    }
+                }
+                StationOp::Members {
+                    station,
+                    members,
+                    releases_others,
+                    labels,
+                } => {
+                    // a join costs its members, a release is one pass: a draft
+                    // of many stations stays linear in what it touches
+                    for id in members {
+                        if let Some(s) = t.get_mut(id) {
+                            s.parent_station = Some(station.clone());
+                            if let Some(code) = labels.get(id) {
+                                s.platform_code = code.clone();
+                            }
+                        }
+                    }
+                    if *releases_others {
+                        for (id, s) in t.iter_mut() {
+                            if !members.contains(id)
+                                && s.parent_station.as_deref() == Some(station.as_str())
+                            {
+                                s.parent_station = None;
+                            }
+                        }
+                    }
+                }
+                StationOp::Delete { station } => {
+                    for s in t.values_mut() {
+                        if s.parent_station.as_deref() == Some(station.as_str()) {
+                            s.parent_station = None;
+                        }
+                    }
+                }
+                StationOp::StopDelete { stop } => {
+                    if let Some(s) = t.get_mut(stop) {
+                        s.parent_station = None;
+                    }
+                }
+                StationOp::Merge {
+                    from,
+                    into,
+                    keep_name_from,
+                } => {
+                    let gone = t.get(from).cloned();
+                    if let (Some(gone), Some(kept)) = (gone, t.get_mut(into)) {
+                        if *keep_name_from {
+                            kept.name = gone.name;
+                        }
+                        if kept.parent_station.is_none() && gone.parent_station.is_some() {
+                            kept.parent_station = gone.parent_station;
+                            if gone.platform_code.is_some() {
+                                kept.platform_code = gone.platform_code;
+                            }
+                        }
+                    }
+                    if let Some(s) = t.get_mut(from) {
+                        s.parent_station = None;
+                    }
+                }
+            }
+        }
+        t
     }
 }
 
@@ -508,5 +673,66 @@ mod tests {
             DraftView::from_changes(&[ch(1, "stop", "merge", "E", json!({"into_stop_id": "F"}))]);
         let p = v.parents_after(&live);
         assert_eq!((p["E"].clone(), p["F"].as_deref()), (None, Some("ST9")));
+    }
+
+    #[test]
+    fn texts_follow_updates_labels_and_merges_in_order() {
+        let v = DraftView::from_changes(&[
+            ch(
+                1,
+                "stop",
+                "update",
+                "A",
+                json!({"platform_code": " Towards X ", "description": "by the gate"}),
+            ),
+            ch(2, "stop", "update", "A", json!({"description": " "})),
+            ch(
+                3,
+                "station",
+                "create",
+                "ST",
+                json!({"station_id": "ST", "name": " Hub ", "lat": 1.0, "lon": 1.0, "description": "the hub",
+                "members": [{"stop_id": "A"}, {"stop_id": "B", "platform_code": "Towards Y"}, {"stop_id": "C", "platform_code": null}]}),
+            ),
+            ch(
+                4,
+                "stop",
+                "merge",
+                "B",
+                json!({"into_stop_id": "K", "keep_name": "from"}),
+            ),
+            ch(5, "station", "update", "ST", json!({"name": "Hub 2"})),
+        ]);
+        let stop = |name: &str, code: Option<&str>| StopTexts {
+            name: name.into(),
+            platform_code: code.map(str::to_string),
+            description: None,
+            parent_station: None,
+        };
+        let live: HashMap<String, StopTexts> = [
+            ("A", stop("a", None)),
+            ("B", stop("b", Some("old"))),
+            ("C", stop("c", Some("old"))),
+            ("K", stop("k", Some("own"))),
+        ]
+        .into_iter()
+        .map(|(k, s)| (k.to_string(), s))
+        .collect();
+        let t = v.texts_after(&live);
+        // the later update cleared the description the earlier one set
+        assert_eq!(t["A"].platform_code.as_deref(), Some("Towards X"));
+        assert_eq!(t["A"].description, None);
+        assert_eq!(t["A"].parent_station.as_deref(), Some("ST"));
+        assert_eq!(t["C"].platform_code, None);
+        // the kept stop takes the station, and with it the merged stop's label
+        assert_eq!(t["K"].name, "b");
+        assert_eq!(t["K"].platform_code.as_deref(), Some("Towards Y"));
+        assert_eq!(t["K"].parent_station.as_deref(), Some("ST"));
+        assert_eq!(t["B"].parent_station, None);
+        // a station the draft creates is followed too
+        assert_eq!(t["ST"].name, "Hub 2");
+        assert_eq!(t["ST"].description.as_deref(), Some("the hub"));
+        assert_eq!(v.updated_by("A"), Some(2));
+        assert_eq!(v.updated_by("K"), None);
     }
 }

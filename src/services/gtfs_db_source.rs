@@ -213,6 +213,7 @@ struct StopRow {
     parent_station: Option<String>,
     platform_code: Option<String>,
     cluster_id: Option<String>,
+    description: Option<String>,
 }
 
 pub struct GtfsDbSource {
@@ -315,7 +316,7 @@ impl GtfsDbSource {
 
         let stop_rows = sqlx::query(
             "SELECT stop_id, stop_code, name, lat, lon, location_type, parent_station,
-                    platform_code, cluster_id
+                    platform_code, cluster_id, description
              FROM gtfs_stop WHERE gtfs_id = $1 AND NOT deleted",
         )
         .bind(gtfs_id)
@@ -335,6 +336,7 @@ impl GtfsDbSource {
                 parent_station: r.try_get("parent_station").map_err(db_err)?,
                 platform_code: r.try_get("platform_code").map_err(db_err)?,
                 cluster_id: r.try_get("cluster_id").map_err(db_err)?,
+                description: r.try_get("description").map_err(db_err)?,
             };
             stops.insert(s.stop_id.clone(), s);
         }
@@ -394,6 +396,7 @@ impl GtfsDbSource {
                 cluster_id: None,
                 location_type: s.location_type.to_string(),
                 platform_code: s.platform_code.clone(),
+                description: s.description.clone().filter(|d| !d.trim().is_empty()),
             });
         }
 
