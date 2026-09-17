@@ -10,6 +10,7 @@ traffic is untouched until a switch is decided. The shared
 | `20-deployment.json` | replace `IMAGE_TAG` (`<nandi6>-<gims6>`) and `IMAGE_VERSION`; 1 replica |
 | `30-service.yaml` | `gtfs-editor-gims:8000` |
 | `40-pomerium-route.yaml` | route for `gtfs.sso.c2.integ.internal.svc.movingtech.net` in `pomerium-v2/pomerium-sso-config` |
+| `50-managed-cert.yaml` | Google-managed cert for the SSO host; also append `gtfs-sso-cert` to the `networking.gke.io/managed-certificates` annotation on `pomerium-v2/pomerium-internal-ingress` (keep every existing entry) |
 | `create_secret.py` | `gtfs-editor-gims-secrets` from the repo `.env` + a generated TOTP key; never overwrites (rotating the key forces every user to re-enrol) |
 
 The deployment command adds `master_mtc_pass` (from the shared secret's env var,

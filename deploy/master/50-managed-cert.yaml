@@ -1,0 +1,8 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: gtfs-sso-cert
+  namespace: pomerium-v2
+spec:
+  domains:
+    - gtfs.sso.c2.integ.internal.svc.movingtech.net
