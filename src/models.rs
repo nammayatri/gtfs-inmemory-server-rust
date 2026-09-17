@@ -258,6 +258,13 @@ pub struct VehicleData {
     pub is_active_trip: Option<bool>,
     #[sqlx(default)]
     pub is_completed: Option<bool>,
+    /// Segment-time variant for this trip: an active override if one is in force, otherwise
+    /// the schedule's default. `None` resolves to the feed's default variant.
+    #[sqlx(default)]
+    pub effective_variant_id: Option<String>,
+    /// Set only while an override is in force; bounds how long a caller may cache this row.
+    #[sqlx(default)]
+    pub override_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -1055,9 +1062,61 @@ pub struct BusScheduleDetail {
     pub waybill_no: Option<String>,
     #[serde(rename = "is_completed", skip_serializing_if = "Option::is_none")]
     pub is_completed: Option<bool>,
+    #[serde(rename = "eta_variant_id", skip_serializing_if = "Option::is_none")]
+    pub eta_variant_id: Option<String>,
+    /// Epoch seconds. Present only while an override is in force, so a caller can cap its
+    /// cache at the moment this answer stops being true instead of guessing a TTL.
+    #[serde(
+        rename = "override_expires_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub override_expires_at: Option<i64>,
 }
 
 pub type BusScheduleDetails = Vec<BusScheduleDetail>;
+
+/// Segment times for one feed, split by variant: `variant_id → (from_stop, to_stop) → seconds`.
+pub type StationEtaMap = HashMap<String, HashMap<(String, String), i32>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct EtaVariant {
+    pub variant_id: String,
+    pub gtfs_id: String,
+    pub code: String,
+    pub display_name: String,
+    pub is_default: bool,
+    pub band_start_time: Option<String>,
+    pub band_end_time: Option<String>,
+}
+
+/// An override currently in force, keyed the way the backend addresses a trip
+/// (`waybill_no` + `trip_number`) rather than by the storage key, and carrying `route_id`
+/// so a route-scoped cache can be bypassed too.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct ActiveTripEtaOverride {
+    pub waybill_no: String,
+    pub trip_number: i32,
+    pub route_id: Option<String>,
+    pub variant_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StationEtaEntry {
+    pub source_station_code: String,
+    pub destination_station_code: String,
+    pub eta_in_seconds: i32,
+}
+
+/// A stored segment time as ops sees it: the entry plus the variant it belongs to, so one
+/// response can carry several variants without the caller having to ask per variant.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct StationEtaRow {
+    pub variant_id: String,
+    pub source_station_code: String,
+    pub destination_station_code: String,
+    pub eta_in_seconds: i32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RouteLastScheduleTime {
