@@ -1121,6 +1121,10 @@ class Handler(BaseHTTPRequestHandler):
                 for p in open_:
                     p.update(status="superseded", change_set_id=None, change_id=None, updated_at=iso(now()))
             return self._send(200, {"superseded": len(open_)})
+        if path == "/__dev/context" and method == "POST":
+            # round 4 (UX): {"off": true} answers 404 for the context endpoints, as an older server does
+            s.context_off = bool(self._body().get("off"))
+            return self._send(200, {"off": s.context_off})
         raise ApiError(404, "not_found", "No such dev endpoint.")
 
     # ---- auth
@@ -1254,16 +1258,6 @@ class Handler(BaseHTTPRequestHandler):
             if rest == ["config"] and method == "GET":
                 return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
                              "version": s.feeds[g]["version"]}
-            if rest == ["config"] and method == "POST":
-                self.require_role(u, "admin")
-                to = self._body().get("data_source")
-                if to not in ("db", "preprocessed"):
-                    raise ApiError(400, "invalid_data_source", "data_source is 'db' or 'preprocessed'.")
-                frm = s.feeds[g].get("data_source")
-                s.feeds[g]["data_source"] = to
-                s.feeds[g]["version"] += 1
-                s.add_audit(u, "feed_data_source_changed", g, None, {"gtfs_id": g, "from": frm, "to": to})
-                return 200, {"gtfs_id": g, "data_source": to, "version": s.feeds[g]["version"]}
             if rest == ["stops"] and method == "GET":
                 return 200, self.list_stops(g, q)
             if len(rest) == 2 and rest[0] == "stops" and method == "GET":
@@ -1323,6 +1317,9 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.list_reviews(g, q)
             if rest == ["position-reviews", "summary"] and method == "GET":
                 return 200, self.review_summary(g)
+            # round 4 (UX): cleanup context of a stop or a route
+            if len(rest) == 3 and rest[0] in ("stops", "routes") and rest[2] == "context" and method == "GET":
+                return 200, self.entity_context(g, rest[0], rest[1])
             raise ApiError(404, "not_found", "No such feed endpoint.")
 
         if parts[0] == "change-sets" and len(parts) >= 2:
@@ -1382,6 +1379,8 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.move_review(u, rv, self._body())
             if rest == ["split"] and method == "POST":
                 return 200, self.split_review(u, rv, self._body())
+            if rest == ["merge"] and method == "POST":   # round 4 (UX)
+                return 200, self.merge_review(u, rv, self._body())
             if rest == ["confirm"] and method == "POST":
                 return 200, self.confirm_review(u, rv, self._body())
             if rest == ["reopen"] and method == "POST":
@@ -2334,6 +2333,8 @@ class Handler(BaseHTTPRequestHandler):
                     after = detour_of(calls, sid, a["lat"], a["lon"], only=ids)
                 out.append({"kind": "split", "change_id": c["change_id"], "lat": a["lat"], "lon": a["lon"],
                             "new_stop_id": new_id, "route_ids": ids, "detour_m_after": after})
+            elif c["entity"] == "stop" and c["op"] == "merge":   # round 4 (UX)
+                out.append(self.merge_action(rv, c, calls))
         return out
 
     def review_detail(self, rv, q=None):
@@ -2375,6 +2376,7 @@ class Handler(BaseHTTPRequestHandler):
         for rv in self.store.reviews.values():
             if rv["gtfs_id"] == g and rv["status"] in counts:
                 counts[rv["status"]] += 1
+        counts["auto_fix"] = self.auto_fix_counts(g)   # round 4 (UX)
         return counts
 
     def list_reviews(self, g, q):
@@ -2383,6 +2385,7 @@ class Handler(BaseHTTPRequestHandler):
         if bad:
             raise ApiError(400, "invalid_status", f"Unknown status {bad[0]}.")
         items = [rv for rv in self.store.reviews.values() if rv["gtfs_id"] == g and rv["status"] in statuses]
+        items = self.filter_auto_fix(items, q)   # round 4 (UX)
         if q.get("bbox"):
             try:
                 a, b, c, d = (float(x) for x in q["bbox"][0].split(","))
@@ -2605,6 +2608,430 @@ class Handler(BaseHTTPRequestHandler):
             self.store.add_audit(u, "position_review_returned", rv["gtfs_id"], cs["change_set_id"],
                                  {"review_id": rv["review_id"], "stop_id": rv["stop_id"], "reason": reason})
 
+# ================================================================== policy (docs sections 2 and 3)
+# Two rules added on top of the handler above, kept together in this one block
+# so they read as the contract does:
+#
+#   - No direct feed writes. `POST /feeds/{g}/config` is gone; a feed's data
+#     source is switched by a `feed_config/update` change in a draft (admin
+#     only), applied - and audited as `feed_data_source_changed` - at commit.
+#     `GET /feeds/{g}/config` lists the open drafts carrying one as `pending`.
+#   - Admin self-approval. `approve` with `{self_approve: true}` lets an admin
+#     approve a draft they submitted (403 `own_change_set` without it, with
+#     `details.can_self_approve`), audited as `change_set_self_approved`; the
+#     same admin may then commit it. Reopening or resubmitting clears the mark.
+DATA_SOURCES = ("db", "preprocessed")
+
+
+def feed_config_changes(cs):
+    return [c for c in cs["changes"] if c["entity"] == "feed_config"]
+
+
+def feed_config_pending(store, g):
+    items = [cs for cs in store.change_sets.values()
+             if cs["gtfs_id"] == g and cs["status"] in ("draft", "submitted", "approved")]
+    items.sort(key=lambda cs: cs["updated_at"], reverse=True)
+    return [{"change_set_id": cs["change_set_id"], "change_set_title": cs["title"], "status": cs["status"],
+             "change_id": c["change_id"], "data_source": (c.get("after") or {}).get("data_source")}
+            for cs in items for c in feed_config_changes(cs)]
+
+
+_validate_set = validate_set
+_conflicts_for = conflicts_for
+
+
+def validate_set(store, cs):
+    """As above, plus: a switch to the data source the feed already has - earlier
+    changes of the draft taken as applied - is a warning."""
+    out = _validate_set(store, cs)
+    current = store.feeds[cs["gtfs_id"]].get("data_source", "preprocessed")
+    for c in feed_config_changes(cs):
+        to = (c.get("after") or {}).get("data_source")
+        if to == current:
+            out.append({"change_id": c["change_id"], "level": "warning", "code": "data_source_unchanged",
+                        "message": f"feed {cs['gtfs_id']} is already served from '{to}'; this change switches nothing",
+                        "details": {}})
+        current = to
+    return out
+
+
+def conflicts_for(store, cs):
+    """As above, plus: the base of a data source switch is the data source it was
+    made against (`before.data_source`)."""
+    out = _conflicts_for(store, cs)
+    live = store.feeds[cs["gtfs_id"]].get("data_source", "preprocessed")
+    for c in feed_config_changes(cs):
+        expected = (c.get("before") or {}).get("data_source")
+        if expected != live:
+            out.append({"change_id": c["change_id"], "entity": "feed_config", "entity_key": c["entity_key"],
+                        "reason": "changed", "expected": expected, "actual": live,
+                        "message": f"The data source of feed {c['entity_key']} was changed by another commit "
+                                   f"after this edit was made."})
+    return out
+
+
+def _check_data_source(after):
+    if not isinstance(after, dict) or set(after) != {"data_source"} or after["data_source"] not in DATA_SOURCES:
+        raise ApiError(400, "invalid_change", "feed_config/update: data_source is 'db' or 'preprocessed'",
+                       {"code": "invalid_data_source"})
+
+
+class PolicyHandler(Handler):
+    def _api(self, method, path, q):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        if len(parts) == 3 and parts[0] == "feeds" and parts[2] == "config":
+            self.session_user()
+            self.require_mutation(method)
+            g, s = parts[1], self.store
+            if method != "GET":
+                raise ApiError(404, "endpoint_not_found", "no such editor endpoint")
+            if g not in s.feeds:
+                raise ApiError(404, "feed_not_found", f"no feed {g}")
+            return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
+                         "version": s.feeds[g]["version"], "pending": feed_config_pending(s, g)}
+        return super()._api(method, path, q)
+
+    def set_summary(self, cs):
+        return super().set_summary(cs) | {"self_approved": bool(cs.get("self_approved"))}
+
+    def add_change(self, u, cs, b):
+        if b.get("entity") != "feed_config":
+            return super().add_change(u, cs, b)
+        self.require_role(u, "admin")
+        self.require_draft(u, cs)
+        if b.get("op") != "update":
+            raise ApiError(400, "invalid_change", f"unsupported change feed_config/{b.get('op')}",
+                           {"code": "invalid_change"})
+        _check_data_source(b.get("after"))
+        g = cs["gtfs_id"]
+        if str(b.get("entity_key") or "").strip() != g:
+            raise ApiError(400, "invalid_change",
+                           f"feed_config/update: entity_key must be the change set's feed, {g}",
+                           {"code": "feed_mismatch"})
+        feed = self.store.feeds[g]
+        before = {"gtfs_id": g, "data_source": feed.get("data_source", "preprocessed"), "version": feed["version"]}
+        ch = self.append_change(u, cs, "feed_config", "update", g, dict(b["after"]), before, None)
+        return self.set_full(cs) | {"change_id": ch["change_id"]}
+
+    def edit_change(self, u, cs, change_id, method):
+        ch = next((c for c in cs["changes"] if c["change_id"] == change_id), None)
+        if ch and ch["entity"] == "feed_config" and method == "PUT":
+            self.require_role(u, "admin")
+            self.require_draft(u, cs)
+            _check_data_source(self._body().get("after"))
+        return super().edit_change(u, cs, change_id, method)
+
+    def transition(self, u, cs, action, b):
+        s = self.store
+        own = u["user_id"] == cs["submitted_by"]
+        admin = u["role"] == "admin"
+        if action == "approve" and own and admin and b.get("self_approve") is True and cs["status"] == "submitted":
+            comment = (b.get("comment") or "").strip() or None
+            t = iso(now())
+            cs.update(status="approved", reviewed_by=u["user_id"], reviewed_at=t, review_comment=comment,
+                      self_approved=True, updated_at=t)
+            s.add_audit(u, "change_set_self_approved", cs["gtfs_id"], cs["change_set_id"],
+                        {"submitted_by": cs["submitted_by"], "submitted_by_email": u["email"], "comment": comment})
+            return self.set_full(cs)
+        # the override covers the commit of a set so approved
+        overridden = action == "commit" and own and admin and cs.get("self_approved")
+        submitter = cs["submitted_by"]
+        if overridden:
+            cs["submitted_by"] = None
+        try:
+            out = super().transition(u, cs, action, b)
+        except ApiError as e:
+            if e.code == "own_change_set":
+                e.details = {"can_self_approve": action == "approve" and admin}
+            raise
+        finally:
+            if overridden:
+                cs["submitted_by"] = submitter
+        if action in ("submit", "reopen"):
+            cs["self_approved"] = False
+        if action == "commit":
+            # the commit's audit row is the last one written
+            s.audit[-1]["detail"]["self_approved"] = bool(cs.get("self_approved"))
+            feed = s.feeds[cs["gtfs_id"]]
+            for c in feed_config_changes(cs):
+                frm, to = feed.get("data_source", "preprocessed"), c["after"]["data_source"]
+                if frm != to:
+                    feed["data_source"] = to
+                    s.add_audit(u, "feed_data_source_changed", cs["gtfs_id"], cs["change_set_id"],
+                                {"gtfs_id": cs["gtfs_id"], "from": frm, "to": to, "change_id": c["change_id"],
+                                 "change_set_id": cs["change_set_id"]})
+        return self.set_full(cs) if (overridden or action in ("submit", "reopen", "commit")) else out
+
+
+# ====================================================================== round 4 (UX), 2026-09-17
+# Everything the dashboard's round 4 needs from the API, kept together: the
+# cleanup context of a stop and of a route, merging a reviewed stop into a
+# same-named one, the clean-up tool's verdict (`evidence.auto_fix`) with its list
+# filter and counts, and the fixtures the smoke test opens. The hooks into the
+# code above are one line each and marked "round 4 (UX)".
+AUTO_FIX_ACTIONS = ("merge", "move", "choose", "none")
+AUTO_FIX_THRESHOLD_M = 150
+R4_STATION = "stn_r4_shared"
+
+
+def _auto_fix_of(rv):
+    fix = (rv.get("evidence") or {}).get("auto_fix") or {}
+    return fix.get("action") if fix.get("action") in AUTO_FIX_ACTIONS else "none"
+
+
+def auto_fix_counts(self, g):
+    """How many reviews still to do carry each verdict of the clean-up tool."""
+    counts = {k: 0 for k in AUTO_FIX_ACTIONS}
+    for rv in self.store.reviews.values():
+        if rv["gtfs_id"] == g and rv["status"] == "pending":
+            counts[_auto_fix_of(rv)] += 1
+    return counts
+
+
+def filter_auto_fix(self, items, q):
+    want = (q.get("auto_fix", [""])[0] or "").strip()
+    if not want:
+        return items
+    if want not in AUTO_FIX_ACTIONS:
+        raise ApiError(400, "invalid_auto_fix", f"auto_fix is one of {', '.join(AUTO_FIX_ACTIONS)}.")
+    return [rv for rv in items if _auto_fix_of(rv) == want]
+
+
+def _mentions(detail, key, value):
+    """Does an audit detail name the entity, however it spells the field?"""
+    if not isinstance(detail, dict):
+        return False
+    return any(detail.get(k) == value for k in (key, "entity_key", "from", "into", "new_stop_id")) or \
+        value in (detail.get("route_ids") or [])
+
+
+def entity_context(self, g, kind, key):
+    s = self.store
+    if getattr(s, "context_off", False):
+        raise ApiError(404, "not_found", "No such feed endpoint.")
+    open_sets = [cs for cs in s.change_sets.values() if cs["gtfs_id"] == g and cs["status"] in ("draft", "submitted", "approved")]
+
+    def drafts(touches):
+        return [{"change_set_id": cs["change_set_id"], "title": cs["title"], "status": cs["status"],
+                 "change_id": ch["change_id"], "entity": ch["entity"], "op": ch["op"]}
+                for cs in open_sets for ch in cs["changes"] if touches(ch)]
+
+    def history(field):
+        found = [a for a in reversed(s.audit) if a["gtfs_id"] in (g, None) and _mentions(a["detail"], field, key)]
+        return [{k: a[k] for k in ("audit_id", "at", "actor_email", "action", "change_set_id", "detail")} for a in found[:10]]
+
+    if kind == "stops":
+        st = s.stops.get((g, key))
+        if not st:
+            raise ApiError(404, "unknown_stop", f"Stop {key} does not exist.")
+        calls = route_legs(s, g, key)
+        reviews = sorted((rv for rv in s.reviews.values() if rv["gtfs_id"] == g and rv["stop_id"] == key),
+                         key=lambda rv: rv["review_id"])
+        counts = {k: sum(1 for rv in reviews if rv["status"] == k) for k in ("pending", "approved", "committed", "confirmed")}
+        want = norm_name(st["name"])
+        same = []
+        for (gg, oid), o in s.stops.items():
+            if gg != g or oid == key or o.get("deleted") or abs(o["lat"] - st["lat"]) > 0.006:
+                continue
+            other = norm_name(o["name"])
+            alike = 1.0 if other == want else 0.8 if want and other and (want in other or other in want) else 0
+            d = haversine(st["lat"], st["lon"], o["lat"], o["lon"])
+            if alike and d <= 500:
+                same.append({"stop_id": oid, "name": o["name"], "lat": o["lat"], "lon": o["lon"], "distance_m": round(d, 1),
+                             "route_count": len({rid for rid, _ in s.stop_routes.get((g, oid), [])}),
+                             "parent_station": o.get("parent_station"), "location_type": o.get("location_type"),
+                             "similarity": alike})
+        same.sort(key=lambda x: (-x["similarity"], x["distance_m"]))
+
+        def touches(ch):
+            a = ch.get("after") or {}
+            members, _ = member_spec(a) if ch["entity"] == "station" else (None, {})
+            return (ch["entity"] in ("stop", "station") and ch["entity_key"] == key) or a.get("into_stop_id") == key \
+                or key in (members or [])
+        return {"stop_id": key, "detour_m": detour_of(calls, key, st["lat"], st["lon"]),
+                "routes_measured": sum(1 for c in calls if c["prev"] and c["next"]),
+                "position_reviews": dict(counts, items=[{"review_id": rv["review_id"], "status": rv["status"],
+                                                         "reason": rv.get("reason")} for rv in reviews]),
+                "same_name": same[:12], "audit": history("stop_id"), "open_drafts": drafts(touches)}
+
+    rt = s.routes.get((g, key))
+    if not rt:
+        raise ApiError(404, "unknown_route", f"Route {key} does not exist.")
+    rows = s.rows.get((g, key), [])
+    by_stop = {}
+    for rv in sorted(s.reviews.values(), key=lambda rv: rv["review_id"]):
+        if rv["gtfs_id"] == g and rv["status"] != "superseded":
+            by_stop[rv["stop_id"]] = rv
+    flagged = [{"stop_id": r["stop_id"], "sequence": r["sequence"], "review_id": by_stop[r["stop_id"]]["review_id"],
+                "status": by_stop[r["stop_id"]]["status"]} for r in rows if r.get("stop_id") in by_stop]
+    served = [r for r in rows if r["stop_type"] not in SERVED_EXCLUDE and r.get("stop_id") and (g, r["stop_id"]) in s.stops]
+    worst = []
+    for before, at, after in zip(served, served[1:], served[2:]):
+        a, b, c = (s.stops[(g, r["stop_id"])] for r in (before, at, after))
+        d = max(0.0, haversine(a["lat"], a["lon"], b["lat"], b["lon"]) + haversine(b["lat"], b["lon"], c["lat"], c["lon"])
+                - haversine(a["lat"], a["lon"], c["lat"], c["lon"]))
+        if d >= 50:
+            worst.append({"stop_id": at["stop_id"], "name": at.get("stop_name_override") or b["name"],
+                          "sequence": at["sequence"], "detour_m": tenth(d)})
+    worst.sort(key=lambda x: -x["detour_m"])
+    return {"route_id": key, "stops_with_reviews": flagged, "worst_detours": worst[:5], "audit": history("route_id"),
+            "open_drafts": drafts(lambda ch: ch["entity"] in ("route", "route_stops") and ch["entity_key"] == key)}
+
+
+def merge_action(self, rv, c, calls):
+    """A review's merge as the detail lists it: where the stop that stays is, and
+    the detour the reviewed stop's routes would have there."""
+    into = self.store.stops.get((rv["gtfs_id"], c["after"]["into_stop_id"])) or {}
+    lat, lon = into.get("lat"), into.get("lon")
+    return {"kind": "merge", "change_id": c["change_id"], "into_stop_id": c["after"]["into_stop_id"], "lat": lat, "lon": lon,
+            "detour_m_after": detour_of(calls, rv["stop_id"], lat, lon) if lat is not None else None}
+
+
+def merge_review(self, u, rv, b):
+    """POST /position-reviews/{id}/merge: the reviewed stop is a duplicate of a
+    same-named stop; a stop/merge into it goes into the draft."""
+    s, g, sid = self.store, rv["gtfs_id"], rv["stop_id"]
+    unknown = set(b) - {"change_set_id", "into_stop_id", "keep_name", "note"}
+    if unknown:
+        raise ApiError(400, "invalid_json", f"unknown field {sorted(unknown)[0]}")
+    into_id = str(b.get("into_stop_id") or "").strip()
+    keep_name = b.get("keep_name", "into")
+    if keep_name not in ("into", "from"):
+        raise ApiError(400, "invalid_json", "keep_name is into or from.")
+    note = self.review_note(b)
+    cs = self.action_draft(u, rv, b)
+    clashing = [c["change_id"] for c in cs["changes"]
+                if (c["entity"] == "stop" and c["entity_key"] in (sid, into_id))
+                or (c["entity"] == "stop" and c["op"] == "merge" and (c.get("after") or {}).get("into_stop_id") == sid)
+                or (c.get("after") or {}).get("position_review_id") == rv["review_id"]]
+    if clashing:
+        raise ApiError(409, "draft_conflict",
+                       f"change(s) {', '.join(map(str, clashing))} in this draft already change stop {sid} or {into_id}",
+                       {"change_ids": clashing})
+    found = [p for p in self.review_problems(rv, Projection(s, g, cs["changes"])) if p["level"] == "error"]
+    into = s.stops.get((g, into_id))
+    if not into_id or into_id == sid:
+        found.append({"level": "error", "code": "merge_same_stop", "message": "name another stop to merge into"})
+    elif not into or into.get("deleted"):
+        found.append({"level": "error", "code": "stop_missing", "message": f"stop {into_id} does not exist"})
+    elif into.get("location_type") == 1:
+        found.append({"level": "error", "code": "stop_is_station", "message": f"{into_id} is a station, not a stop"})
+    if found:
+        raise ApiError(400, "review_has_problems", "the stop cannot be merged now; see the problems", {"problems": found})
+    after = {"into_stop_id": into_id, "into_row_version": into.get("row_version"), "keep_name": keep_name,
+             "keep_position": "into", "position_review_id": rv["review_id"]}
+    before, live_version = self.snapshot(cs, "stop", sid, "merge", after)
+    ch = self.append_change(u, cs, "stop", "merge", sid, after, before, live_version)
+    self.approve_with(u, rv, cs, ch["change_id"], note)
+    calls = route_legs(s, g, sid)
+    st = s.stops[(g, sid)]
+    detour_after = detour_of(calls, sid, into["lat"], into["lon"])
+    s.add_audit(u, "position_review_merged", g, cs["change_set_id"], {
+        "review_id": rv["review_id"], "stop_id": sid, "change_id": ch["change_id"], "into": into_id,
+        "keep_name": keep_name, "detour_m": detour_of(calls, sid, st["lat"], st["lon"]),
+        "detour_m_after": detour_after, "note": note})
+    warnings = [{"level": v["level"], "code": v["code"], "message": v["message"]}
+                for v in validate_set(s, cs) if v["change_id"] == ch["change_id"]]
+    return self.review_detail(rv) | {"warnings": warnings, "detour_m_after": detour_after}
+
+
+for _fn in (auto_fix_counts, filter_auto_fix, entity_context, merge_action, merge_review):
+    setattr(Handler, _fn.__name__, _fn)
+
+
+def seed_round4(store):
+    """Fixtures for the round 4 flows, taken from the END of the review list so the
+    reviews the earlier flows pick (from the start) are left as they were:
+
+      - the last review whose stop shares its point with two stops: those two become
+        the platforms of station stn_r4_shared (a station listed once, not twice),
+        it gets same-named candidates, and the tool's verdict is "merge";
+      - the two reviews before it get the verdicts "move" and "choose".
+    """
+    g = next(iter(store.feeds), None)
+    pending = sorted((rv for rv in store.reviews.values() if rv["gtfs_id"] == g and rv["status"] == "pending"
+                      and rv["stop_id"] != Store.FIXTURE_STOP), key=lambda rv: -rv["review_id"])
+
+    def usable(rv):
+        st = store.stops.get((g, rv["stop_id"]))
+        return st and not st.get("deleted") and st.get("location_type") == 0 and not st.get("parent_station") \
+            and any(c["prev"] and c["next"] for c in route_legs(store, g, rv["stop_id"]))
+
+    def shares_of(rv):
+        out = []
+        for x in (rv.get("evidence") or {}).get("shares_point_with") or []:
+            o = store.stops.get((g, x.get("stop_id")))
+            if o and not o.get("deleted") and o.get("location_type") == 0 and not o.get("parent_station") \
+                    and x["stop_id"] != rv["stop_id"]:
+                out.append(o)
+        return out
+
+    pending = [rv for rv in pending if usable(rv)]
+    main = next((rv for rv in pending if len(shares_of(rv)) >= 2), None)
+    if not main:
+        return
+    st = store.stops[(g, main["stop_id"])]
+    platforms = shares_of(main)[:2]
+    store.stops[(g, R4_STATION)] = {
+        "gtfs_id": g, "stop_id": R4_STATION, "stop_code": R4_STATION, "name": f"{platforms[0]['name']} (station)",
+        "lat": platforms[0]["lat"], "lon": platforms[0]["lon"], "location_type": 1, "parent_station": None,
+        "platform_code": None, "cluster_id": None, "regional_name": None, "hindi_name": None,
+        "position_source": "mock-fixture", "row_version": 1, "deleted": False}
+    for n, o in enumerate(platforms, start=1):
+        o["parent_station"], o["platform_code"] = R4_STATION, f"Platform {n}"
+
+    calls = route_legs(store, g, st["stop_id"])
+    leg = next(c for c in calls if c["prev"] and c["next"])
+    now = detour_of(calls, st["stop_id"], st["lat"], st["lon"])
+    want = norm_name(st["name"])
+    taken = {st["stop_id"], *(o["stop_id"] for o in shares_of(main)), *(o["stop_id"] for o in platforms)}
+    named = sorted(((haversine(st["lat"], st["lon"], o["lat"], o["lon"]), o) for (gg, oid), o in store.stops.items()
+                    if gg == g and oid not in taken and not o.get("deleted") and o.get("location_type") == 0
+                    and norm_name(o["name"]) == want), key=lambda x: (x[0], x[1]["stop_id"]))
+    pool = [o for _, o in named[:2]]
+    # no same-named stop elsewhere: the stops either side on one of its routes stand in
+    for n in (leg["prev"], leg["next"]):
+        o = store.stops.get((g, n["stop_id"]))
+        if len(pool) < 3 and o and o["stop_id"] not in taken and o not in pool and not o.get("deleted"):
+            pool.append(o)
+    on_routes = {c["route_id"] for c in calls}
+    candidates = []
+    for o in pool:
+        after = detour_of(calls, st["stop_id"], o["lat"], o["lon"])
+        candidates.append({
+            "stop_id": o["stop_id"], "name": o["name"], "lat": o["lat"], "lon": o["lon"],
+            "distance_m": round(haversine(st["lat"], st["lon"], o["lat"], o["lon"]), 1),
+            "name_similarity": 1.0 if norm_name(o["name"]) == want else 0.6,
+            "route_count": len({rid for rid, _ in store.stop_routes.get((g, o["stop_id"]), [])}),
+            "detour_m_after": after,
+            "shares_route": bool(on_routes & {rid for rid, _ in store.stop_routes.get((g, o["stop_id"]), [])}),
+            "verdict": "fits" if after is not None and after <= AUTO_FIX_THRESHOLD_M else "no_fit"})
+    candidates.sort(key=lambda c: (c["verdict"] != "fits", c["detour_m_after"] if c["detour_m_after"] is not None else 1e12))
+    best = candidates[0] if candidates else None
+    main["evidence"] = dict(main.get("evidence") or {}, same_name_candidates=candidates, auto_fix={
+        "action": "merge" if best else "none", "into_stop_id": best["stop_id"] if best else None,
+        "detour_m": now, "detour_m_after": best["detour_m_after"] if best else None,
+        "reason": (f"{best['name']} ({best['stop_id']}) is where its routes pass: merging there takes the detour away."
+                   if best else "No same-named stop fits its routes."),
+        "tool": "mock coordinate_autofix", "threshold_m": AUTO_FIX_THRESHOLD_M})
+
+    others = [rv for rv in pending if rv is not main][:2]
+    for rv, action in zip(others, ("move", "choose")):
+        o = store.stops[(g, rv["stop_id"])]
+        legs = route_legs(store, g, o["stop_id"])
+        lg = next(c for c in legs if c["prev"] and c["next"])
+        mid = ((lg["prev"]["lat"] + lg["next"]["lat"]) / 2, (lg["prev"]["lon"] + lg["next"]["lon"]) / 2)
+        fix = {"action": action, "detour_m": detour_of(legs, o["stop_id"], o["lat"], o["lon"]),
+               "tool": "mock coordinate_autofix", "threshold_m": AUTO_FIX_THRESHOLD_M}
+        if action == "move":
+            fix.update(lat=round(mid[0], 7), lon=round(mid[1], 7), detour_m_after=detour_of(legs, o["stop_id"], *mid),
+                       reason=f"Halfway between {lg['prev']['name']} and {lg['next']['name']} its routes barely detour.")
+        else:
+            fix.update(reason="Two places would fit its routes equally well; a person has to choose.")
+        rv["evidence"] = dict(rv.get("evidence") or {}, auto_fix=fix)
+# ====================================================================== end of round 4 (UX)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -2614,8 +3041,9 @@ def main():
         raise SystemExit(f"{args.sample} is missing. Run dev/export_sample.py against the local Postgres first.")
     with gzip.open(args.sample, "rt", encoding="utf-8") as fh:
         Handler.store = Store(json.load(fh))
+    seed_round4(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), PolicyHandler).serve_forever()
 
 
 if __name__ == "__main__":

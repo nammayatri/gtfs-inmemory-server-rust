@@ -527,7 +527,8 @@ async fn review_move_split_confirm_and_release() {
     );
     assert_eq!(
         summary,
-        json!({"pending": 5, "approved": 0, "committed": 0, "confirmed": 0})
+        json!({"pending": 5, "approved": 0, "committed": 0, "confirmed": 0,
+               "auto_fix": {"merge": 0, "move": 0, "choose": 0, "none": 0}})
     );
     let find = |q: &str| editor_c.req("GET", &format!("/feeds/{FEED}/position-reviews?{q}"));
     let (_, found, _) = call!(&app, find("status=superseded"));
@@ -1563,7 +1564,8 @@ async fn review_move_split_confirm_and_release() {
     );
     assert_eq!(
         summary,
-        json!({"pending": 1, "approved": 0, "committed": 3, "confirmed": 1})
+        json!({"pending": 1, "approved": 0, "committed": 3, "confirmed": 1,
+               "auto_fix": {"merge": 0, "move": 0, "choose": 0, "none": 0}})
     );
     let actions: Vec<String> = sqlx::query(&format!(
         "SELECT DISTINCT action FROM gtfs_audit_log WHERE gtfs_id = '{FEED}' AND action LIKE 'position_review_%'"

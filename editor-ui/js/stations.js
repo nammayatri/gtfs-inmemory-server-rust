@@ -8,6 +8,8 @@ import { state, can, setLeaveGuard } from "./state.js";
 import { h, clear, toast, modal, fmtCoord, fmtDate, fmtMetres, fmtCount, haversine, plural } from "./util.js";
 import * as map from "./map.js";
 import { requireDraft, refreshDraft } from "./drafts.js";
+import { undoScope } from "./undo.js";
+import { nameHere } from "./trail.js";
 
 const panel = () => document.getElementById("panel");
 const STATUSES = [["pending", "To review"], ["approved", "In a draft"], ["rejected", "Rejected"], ["committed", "Live"]];
@@ -230,6 +232,27 @@ export async function showProposal(id) {
   let dirty = false;
   setLeaveGuard(() => (dirty ? `Your changes to the suggested station ${p.name} are not saved.` : null));
   const touch = () => { dirty = true; };
+  nameHere(p.name);
+  // What the reviewer changed before approving (the name, the point, a label, a
+  // dropped stop) is only on the screen: each change is one step to undo.
+  const history = undoScope("this suggestion");
+  const take = () => ({ name: edit.name, lat: edit.lat, lon: edit.lon, members: edit.members.map((m) => ({ label: m.label, dropped: m.dropped })) });
+  let snap = take();
+  const remember = (label) => {
+    const before = snap, after = take();
+    snap = after;
+    history.push({ label, undo: () => putBack(before), redo: () => putBack(after) });
+  };
+  function putBack(st) {
+    Object.assign(edit, { name: st.name, lat: st.lat, lon: st.lon });
+    edit.members.forEach((m, i) => Object.assign(m, st.members[i]));
+    snap = st;
+    if (nameInput) nameInput.value = st.name;
+    title.textContent = st.name.trim() || p.name;
+    touch();
+    showPoint();
+    drawMembers();
+  }
 
   const mapMembers = () => edit.members.map((m) => ({ stop_id: m.stop_id, lat: m.lat, lon: m.lon, label: m.label.trim(), dropped: m.dropped }));
   // dragging the point fires many times a second; redraw the cards once a frame
@@ -240,6 +263,7 @@ export async function showProposal(id) {
       edit.lat = la; edit.lon = lo; touch();
       if (!frame) frame = requestAnimationFrame(() => { frame = 0; showPoint(); drawMembers(); });
     },
+    onMoveDone: () => remember("moved the station point"),
   });
 
   const title = h("h1", p.name);
@@ -250,6 +274,7 @@ export async function showProposal(id) {
 
   if (nameInput) {
     nameInput.addEventListener("input", () => { edit.name = nameInput.value; title.textContent = nameInput.value.trim() || p.name; touch(); });
+    nameInput.addEventListener("change", () => remember("changed the station name"));
   }
 
   const showPoint = () => {
@@ -284,7 +309,7 @@ export async function showProposal(id) {
         editable
           ? h("label.field", { for: `platform-${i}` }, h("span", "Platform label"),
               h("input", { type: "text", id: `platform-${i}`, value: m.label, maxlength: String(PLATFORM_MAX), disabled: m.dropped, placeholder: "For example Towards Guindy",
-                on: { input: (ev) => { m.label = ev.target.value; touch(); review.update(null, mapMembers()); } } }))
+                on: { input: (ev) => { m.label = ev.target.value; touch(); review.update(null, mapMembers()); }, change: () => remember(`changed the platform label of ${m.name}`) } }))
           : h("p", h("span.hint", "Platform label: "), m.platform_code || "none"),
         h("div.member-routes",
           h("span.hint", routes === null ? "Loading routes…" : unique.length ? "Routes here:" : "No route uses this stop."),
@@ -300,7 +325,7 @@ export async function showProposal(id) {
           h("button.btn.quiet.small", { type: "button", on: { click: () => map.fitPoints([m], { maxZoom: 19 }) } }, "Show on map"),
           h("a.btn.quiet.small", { href: `#/stop/${enc(m.stop_id)}` }, "Open stop"),
           editable ? h("button.btn.quiet.small", { type: "button", id: `drop-${i}`, "aria-pressed": String(m.dropped),
-            on: { click: () => { m.dropped = !m.dropped; touch(); drawMembers(); document.getElementById(`drop-${i}`)?.focus(); } } }, m.dropped ? "Put back in the station" : "Drop from the station") : null));
+            on: { click: () => { m.dropped = !m.dropped; touch(); remember(m.dropped ? `dropped ${m.name}` : `put ${m.name} back`); drawMembers(); document.getElementById(`drop-${i}`)?.focus(); } } }, m.dropped ? "Put back in the station" : "Drop from the station") : null));
     }));
   }
 
@@ -327,6 +352,7 @@ export async function showProposal(id) {
     edit.lat = kept.reduce((a, m) => a + m.lat, 0) / kept.length;
     edit.lon = kept.reduce((a, m) => a + m.lon, 0) / kept.length;
     touch();
+    remember("placed the station point in the middle");
     showPoint();
     drawMembers();
   };
@@ -362,6 +388,7 @@ export async function showProposal(id) {
     try {
       await post(`station-proposals/${enc(p.proposal_id)}/approve`, body);
       dirty = false;
+      history.clear();
       setLeaveGuard(null);
       await refreshDraft();
       toast(`${edit.name.trim()} added to draft “${draft.title}”.`);
@@ -451,7 +478,8 @@ export async function showProposal(id) {
       pointBox,
       editable ? [
         h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: centre } }, "Place in the middle of its stops")),
-        h("p.hint", "Or drag the dark square on the map.")] : null),
+        h("p.hint", "Or drag the dark square on the map."),
+        history.buttons()] : null),
     editable ? h("div.sticky-actions",
       actionProblems,
       h("p.hint", state.draft ? `Approving adds this station to draft “${state.draft.title}”.` : "Approving asks which draft to add it to."),

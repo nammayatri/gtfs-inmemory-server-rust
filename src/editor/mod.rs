@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod bulk;
+pub mod context;
 pub mod crypto;
 pub mod draft;
 pub mod error;
@@ -188,16 +189,20 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             // live data
             .route("/feeds", web::get().to(h::feeds))
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
-            .route(
-                "/feeds/{gtfs_id}/config",
-                web::post().to(h::feed_config_update),
-            )
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))
             .route("/feeds/{gtfs_id}/stops/{stop_id}", web::get().to(h::stop))
+            .route(
+                "/feeds/{gtfs_id}/stops/{stop_id}/context",
+                web::get().to(h::stop_context),
+            )
             .route("/feeds/{gtfs_id}/routes", web::get().to(h::routes))
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}",
                 web::get().to(h::route),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/context",
+                web::get().to(h::route_context),
             )
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:osrm",
@@ -280,6 +285,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/position-reviews/{id}/split",
                 web::post().to(h::position_review_split),
+            )
+            .route(
+                "/position-reviews/{id}/merge",
+                web::post().to(h::position_review_merge),
             )
             .route(
                 "/position-reviews/{id}/confirm",

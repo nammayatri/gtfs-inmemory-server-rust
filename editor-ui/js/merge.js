@@ -8,6 +8,8 @@ import { h, clear, toast, confirmDialog, fmtCoord, fmtMetres, haversine, nameLik
 import * as map from "./map.js";
 import { addChange, requireDraft, removeChange } from "./drafts.js";
 import { stopPicker } from "./picker.js";
+import { undoScope } from "./undo.js";
+import { nameHere } from "./trail.js";
 
 const panel = () => document.getElementById("panel");
 const detail = (id) => get(`feeds/${enc(state.feedId)}/stops/${enc(id)}`);
@@ -107,6 +109,21 @@ function compare(a, b) {
   const suggested = routeCount(b) > routeCount(a) ? b.stop_id : a.stop_id;
   const choice = { keep: suggested, name: "into", position: "into" };
   const byId = { [a.stop_id]: a, [b.stop_id]: b };
+  nameHere(`Merge ${a.name}`);
+  // which id, name and position stay are choices on the screen until the merge
+  // is added to a draft: each is one step to undo
+  const history = undoScope("this merge");
+  const choose = (patch, label) => {
+    const before = { ...choice }, after = { ...choice, ...patch };
+    const put = (c) => {
+      Object.assign(choice, c);
+      const radio = document.getElementById(`keep-${choice.keep}`);
+      if (radio) radio.checked = true;
+      update({ regroup: true });
+    };
+    history.push({ label, undo: () => put(before), redo: () => put(after) });
+    Object.assign(choice, patch);
+  };
   const other = (id) => (id === a.stop_id ? b : a);
   const dist = haversine(a.lat, a.lon, b.lat, b.lon);
   const namesDiffer = a.name !== b.name;
@@ -118,7 +135,7 @@ function compare(a, b) {
 
   const card = (s) => h("label.radio-card", { for: `keep-${s.stop_id}` },
     h("input", { type: "radio", name: "keep-id", id: `keep-${s.stop_id}`, value: s.stop_id, checked: s.stop_id === choice.keep,
-      on: { change: () => { choice.keep = s.stop_id; choice.name = "into"; choice.position = "into"; update({ regroup: true }); } } }),
+      on: { change: () => { choose({ keep: s.stop_id, name: "into", position: "into" }, `chose to keep ${s.stop_id}`); update({ regroup: true }); } } }),
     h("span.radio-card-body",
       h("span.radio-card-title", `Keep stop id ${s.stop_id}`),
       h("span", s.name),
@@ -126,7 +143,7 @@ function compare(a, b) {
       s.stop_id === suggested ? h("span.chip", "Suggested: used by more routes") : null));
 
   const radios = (box, key, legend, options) => clear(box, h("legend", legend), options.map(([value, label]) => h("label.check", { for: `${key}-${value}` },
-    h("input", { type: "radio", name: key, id: `${key}-${value}`, value, checked: choice[key] === value, on: { change: () => { choice[key] = value; update(); } } }),
+    h("input", { type: "radio", name: key, id: `${key}-${value}`, value, checked: choice[key] === value, on: { change: () => { choose({ [key]: value }, `chose which ${key} to keep`); update(); } } }),
     ` ${label}`)));
 
   // the name and position choices are rebuilt only when the stop that stays
@@ -158,7 +175,7 @@ function compare(a, b) {
         entity: "stop", op: "merge", entity_key: from.stop_id, base_row_version: from.row_version,
         after: { into_stop_id: into.stop_id, into_row_version: into.row_version, keep_name: choice.name, keep_position: choice.position },
       }, { merge: false });
-      if (res) done(res, into, from);
+      if (res) { history.clear(); done(res, into, from); }
     } catch (e) {
       toast(e.message, "error");
     }
@@ -191,7 +208,8 @@ function compare(a, b) {
         h("legend", h("span.legend-title", "Which stop id should stay?")),
         h("div.radio-cards", card(a), card(b))),
       nameBox,
-      positionBox),
+      positionBox,
+      history.buttons()),
     h("section.section",
       h("h2", "What changes"),
       impact),

@@ -14,6 +14,8 @@ import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
 import { showMerge } from "./merge.js";
 import { showImport } from "./importer.js";
+import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
+import { resetUndo } from "./undo.js";
 
 let reauthing = false;
 let currentHash = location.hash || "#/";
@@ -42,9 +44,14 @@ async function boot() {
     refreshStationCount();
     refreshCoordinateCount();
     setLeaveGuard(null);
+    resetTrail();
     location.hash = "#/";
     route();
   });
+  // a link in the top bar (the brand, the pages, the New menu) starts a new trail;
+  // so does a search result (explore.js)
+  document.querySelector(".topbar").addEventListener("click", (ev) => { if (ev.target.closest("a")) startFresh(); });
+  initTrail();
 
   document.getElementById("user-summary").textContent = me.display_name || me.email;
   document.getElementById("user-role").textContent = `${me.email}, ${ROLE_LABEL[me.role].toLowerCase()}`;
@@ -143,6 +150,9 @@ function route() {
   leaveStations();
   leaveCoordinates();
   setLeaveGuard(null);
+  // what could be undone belonged to the screen being left
+  resetUndo();
+  arrive(currentHash);
   if (!state.feedId) {
     showWorkspace(false);
     document.getElementById("page").replaceChildren(h("div.page-inner", h("h1", "No feeds"), h("p.notice", "The editor has no feeds to show. Ask an engineer to load one.")));
@@ -157,7 +167,9 @@ function route() {
   if (parts[0] === "stop" && parts[1]) {
     markNav("map"); showWorkspace(true); showStop(parts[1]);
   } else if (parts[0] === "route" && parts[1]) {
-    markNav("map"); showWorkspace(true); showRoute(parts[1], { preview: params.get("draft") === "1" });
+    markNav("map"); showWorkspace(true); // ?draft=1 asks for the draft applied; without it the route page decides (it
+    // applies the draft whenever the draft touches the route)
+    showRoute(parts[1], { preview: params.get("draft") === "1" ? true : undefined });
   } else if (parts[0] === "stations" && parts[1]) {
     markNav("stations"); showWorkspace(true); showProposal(parts[1]);
   } else if (parts[0] === "stations") {
