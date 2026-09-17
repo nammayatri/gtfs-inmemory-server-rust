@@ -3,9 +3,11 @@
 
 Serves the dashboard at /internal/gtfs-editor/ui/ and implements the contract in
 docs/gtfs-editor.md in memory: sections 2-3 (access, reads, drafts), 5 (creating
-stops and routes, bulk import with a dry run) and 6 (station proposals and their
-lifecycle). It is seeded from dev/sample.json.gz (written by dev/export_sample.py
-from a LOCAL Postgres). Nothing it does leaves this process.
+stops and routes, bulk import with a dry run), 6 (station proposals and their
+lifecycle) and 8 (coordinate reviews and their lifecycle). It is seeded from
+dev/sample.json.gz (written by dev/export_sample.py from a LOCAL Postgres); when
+the sample has no coordinate reviews, a few are made up from the stops whose
+routes detour most to reach them. Nothing it does leaves this process.
 
 What is faked, and only here:
 
@@ -60,6 +62,8 @@ BULK_MAX_ROWS = 5000
 BULK_KINDS = ("stops", "routes", "route_stops")
 PROPOSAL_STATUSES = ("pending", "approved", "rejected", "committed", "superseded")
 PROPOSAL_MOVE_M = 100
+REVIEW_STATUSES = ("pending", "approved", "committed", "confirmed", "superseded")
+REVIEW_MOVED_M = 25
 ID_RULE = "may use up to 64 letters, digits, _ - and . (no spaces or colons)"
 
 
@@ -78,6 +82,38 @@ def haversine(a_lat, a_lon, b_lat, b_lon):
     dp, dl = p2 - p1, math.radians(b_lon - a_lon)
     h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(h))
+
+
+def median(values):
+    vals = sorted(values)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+
+def tenth(v):
+    """Metres as the API gives them: to a tenth."""
+    return None if v is None else round(v * 10) / 10
+
+
+def leg_detour(call, stop_id, lat, lon):
+    """How much further a route travels to call at the point: d(prev, point) +
+    d(point, next) - d(prev, next), never below 0; None at either end of the route.
+    A neighbour that is the reviewed stop itself moves with it."""
+    if not call.get("prev") or not call.get("next"):
+        return None
+    place = lambda n: (lat, lon) if n["stop_id"] == stop_id else (n["lat"], n["lon"])  # noqa: E731
+    (pa, po), (na, no) = place(call["prev"]), place(call["next"])
+    return max(0.0, haversine(pa, po, lat, lon) + haversine(lat, lon, na, no) - haversine(pa, po, na, no))
+
+
+def detour_of(calls, stop_id, lat, lon, only=None):
+    """The median detour over the calls with a stop on both sides (of the routes in
+    `only`, when given), to a tenth of a metre; None when no call has one (docs 8)."""
+    vals = [d for c in calls if only is None or c["route_id"] in only
+            for d in [leg_detour(c, stop_id, lat, lon)] if d is not None]
+    return tenth(median(vals)) if vals else None
 
 
 def is_num(v):
@@ -188,6 +224,125 @@ class Store:
         self.change_sets = {}
         self.audit = []
         self.next_change_id = 1
+        self.reviews = {}
+        self._seed_reviews(sample.get("position_reviews") or [], t)
+
+    # ---- coordinate reviews (docs section 8)
+    def _seed_reviews(self, rows, t):
+        """The reviews loaded into the local database, or, when it has none, a few
+        made up from the stops whose routes detour most to reach them."""
+        base = {"change_set_id": None, "change_id": None, "reviewed_by": None, "reviewed_at": None,
+                "created_at": iso(t), "updated_at": iso(t)}
+        for r in rows:
+            d = dict(r, **base)
+            d["review_id"] = int(r["review_id"])
+            d["evidence"] = r.get("evidence") or {}
+            # a move drafted in the database has no draft here: it is waiting again
+            if d["status"] == "approved":
+                d["status"] = "pending"
+            self.reviews[d["review_id"]] = d
+        if not self.reviews:
+            self._made_up_reviews(base)
+        self._mixed_origins_fixture(base)
+
+    # A stop whose routes came from three original stops, shaped like THIRUPORUR
+    # THANDALAM (29db2391b0) in the local database: its own routes, plus 515/515A
+    # from a Thandalam near Thiruporur and 592/593CT from one near Athupakkam, all
+    # put on this kerb by the cleanup (docs section 8.1). Numbers in no group stay
+    # "other routes".
+    FIXTURE_STOP = "29db2391b0"
+    FIXTURE_GROUPS = (
+        {"origin_stop_id": "29db2391b0", "origin_name": "THIRUPORUR THANDALAM", "suspect": False,
+         "numbers": ("525", "549", "553K", "553W", "554B", "565")},
+        {"origin_stop_id": "42b7fdc465", "origin_name": "THANDALAM VILLAGE (THIRUPORUR)", "suspect": True,
+         "numbers": ("515", "515A"), "raw": (12.7083, 80.1842),
+         "reason": "515 and 515A called at the Thandalam village near Thiruporur, 38 km south; the cleanup moved them "
+                   "onto this kerb because the names match."},
+        {"origin_stop_id": "7ab6177150", "origin_name": "THANDALAM (ATHUPAKKAM)", "suspect": True,
+         "numbers": ("592", "593CT"), "raw": (13.31074, 80.00475),
+         "reason": "592 and 593CT run Redhills to Uthukkottai through the Thandalam near Athupakkam, 33 km north."},
+    )
+
+    def _mixed_origins_fixture(self, base):
+        g = next(iter(self.feeds), None)
+        sid = self.FIXTURE_STOP
+        st = self.stops.get((g, sid))
+        existing = next((r for r in self.reviews.values() if r["gtfs_id"] == g and r["stop_id"] == sid
+                         and r["status"] in ("pending", "approved")), None)
+        if existing and (existing.get("evidence") or {}).get("route_groups"):
+            return
+        legs = route_legs(self, g, sid) if st and not st.get("deleted") else []
+        if len({x["route_id"] for x in legs}) < 4:
+            return
+        groups = []
+        for spec in self.FIXTURE_GROUPS:
+            ids = sorted({x["route_id"] for x in legs if (x["short_name"] or x["route_id"]) in spec["numbers"]})
+            if not ids:
+                continue
+            grp = {"origin_stop_id": spec["origin_stop_id"], "origin_name": spec["origin_name"],
+                   "suspect": spec["suspect"], "route_ids": ids,
+                   "route_numbers": sorted({x["short_name"] or x["route_id"] for x in legs if x["route_id"] in ids})}
+            if spec.get("reason"):
+                grp["reason"] = spec["reason"]
+            if spec.get("raw"):
+                grp["raw_lat"], grp["raw_lon"] = spec["raw"]
+            groups.append(grp)
+        evidence = {"route_rows": len(self.stop_routes.get((g, sid), [])),
+                    "route_numbers": sorted({x["short_name"] or x["route_id"] for x in legs})[:8],
+                    "shares_point_with": [], "chalo_nearby": "Thandalam 0m | Thandalam 22m",
+                    "map_url": f"https://www.google.com/maps/search/?api=1&query={st['lat']},{st['lon']}",
+                    "route_groups": groups, "mixed_origins": len(groups) > 1}
+        if existing:
+            existing["evidence"] = dict(existing.get("evidence") or {}, **evidence)
+            return
+        rid = max(self.reviews, default=0) + 1
+        self.reviews[rid] = dict(base, review_id=rid, gtfs_id=g, batch="mock-fixture", stop_id=sid, original_stop_id=sid,
+                                 stop_name=st["name"], lat=st["lat"], lon=st["lon"], raw_lat=None, raw_lon=None,
+                                 suggested_lat=None, suggested_lon=None, suggested_source=None,
+                                 reason=("Serves routes from three original stops: its own, 515/515A from a Thandalam near "
+                                         "Thiruporur and 592/593CT from a Thandalam near Athupakkam, merged onto this "
+                                         "point by the cleanup."),
+                                 evidence=evidence, status="pending", review_note=None)
+
+    def _made_up_reviews(self, base):
+        g = next(iter(self.feeds), None)
+        near, far = [], []
+        for (gg, sid), st in self.stops.items():
+            if gg != g or st.get("deleted") or st.get("location_type") != 0 or sid == self.FIXTURE_STOP:
+                continue
+            legs = route_legs(self, g, sid)
+            detour = detour_of(legs, sid, st["lat"], st["lon"])
+            if detour is not None and detour >= 300 and sum(1 for x in legs if x["prev"] and x["next"]) >= 2:
+                (near if detour <= 3000 else far).append((-detour, sid, legs))
+        near.sort()
+        far.sort()
+        # the wrong kerb a few hundred metres off, and the placeholder far away, in turn
+        picked = [x for pair in zip(near[:4], far[:4]) for x in pair] or (near + far)[:8]
+        for n, (neg, sid, legs) in enumerate(picked, start=1):
+            st = self.stops[(g, sid)]
+            leg = next(x for x in legs if x["prev"] and x["next"])
+            mid = ((leg["prev"]["lat"] + leg["next"]["lat"]) / 2, (leg["prev"]["lon"] + leg["next"]["lon"]) / 2)
+            suggestion = mid if n % 3 else None
+            raw = (mid[0] + 0.0003, mid[1]) if n % 2 else None
+            shares = sorted(({"stop_id": o["stop_id"], "name": o["name"]} for (og, oid), o in self.stops.items()
+                             if og == g and oid != sid and not o.get("deleted") and abs(o["lat"] - st["lat"]) < 0.0001
+                             and haversine(st["lat"], st["lon"], o["lat"], o["lon"]) <= 2), key=lambda x: x["stop_id"])
+            numbers = sorted({x["short_name"] or x["route_id"] for x in legs})
+            evidence = {"route_rows": len(self.stop_routes.get((g, sid), [])), "route_numbers": numbers[:8],
+                        "shares_point_with": shares, "detour_m": round(-neg),
+                        "chalo_nearby": f"{leg['prev']['name'].title()} {round(haversine(st['lat'], st['lon'], leg['prev']['lat'], leg['prev']['lon']))}m" if n % 2 == 0 else "",
+                        "map_url": f"https://www.google.com/maps/search/?api=1&query={st['lat']},{st['lon']}"}
+            self.reviews[n] = dict(base, review_id=n, gtfs_id=g, batch="mock-made-up", stop_id=sid, original_stop_id=sid,
+                                   stop_name=st["name"], lat=st["lat"], lon=st["lon"],
+                                   reason=(f"Made up by the mock: its routes go {round(-neg):,} m out of their way to reach it "
+                                           f"(between {leg['prev']['name']} and {leg['next']['name']} on route "
+                                           f"{leg['short_name'] or leg['route_id']}), so its coordinate may be another place's."),
+                                   raw_lat=raw[0] if raw else None, raw_lon=raw[1] if raw else None,
+                                   suggested_lat=suggestion[0] if suggestion else None,
+                                   suggested_lon=suggestion[1] if suggestion else None,
+                                   suggested_source=(f"mock: halfway between {leg['prev']['name']} and {leg['next']['name']}"
+                                                     if suggestion else None),
+                                   evidence=evidence, status="pending", review_note=None)
 
     # ---- indexes
     def _index_route(self, key, old_rows):
@@ -570,6 +725,12 @@ def validate_change(store, g, ch, before, final, live, route_editors):
                 err(*gone(st, key))
             if op == "update":
                 position(False)
+                prid = after.get("position_review_id")
+                if prid is not None:
+                    rv = store.reviews.get(prid) if is_int(prid) else None
+                    if not rv or rv["gtfs_id"] != g or rv["stop_id"] != key:
+                        err("position_review_mismatch",
+                            f"Coordinate review #{prid} is not about stop {key}.", review_id=prid)
                 old = st
                 if old and valid_position(after.get("lat"), after.get("lon")):
                     d = haversine(old["lat"], old["lon"], float(after["lat"]), float(after["lon"]))
@@ -747,6 +908,37 @@ def route_detail(proj, rid):
         "stop_count": sum(1 for r in rows if r["stop_type"] not in SERVED_EXCLUDE)}
 
 
+def route_legs(store, g, sid):
+    """Every call a live route makes at the stop, with the served stop before and
+    after it on that route (null at either end), from the tables as they are now.
+    As the API reads them: a route calling twice is listed twice, a neighbour's name
+    is the stop's own, shaping markers and jump and hidden stops are skipped."""
+    out = []
+    for rid, seq in sorted(store.stop_routes.get((g, sid), []), key=lambda x: (x[0], x[1])):
+        rt = store.routes.get((g, rid))
+        if not rt or rt.get("deleted"):
+            continue
+        rows = store.rows.get((g, rid), [])
+        at = seq - 1 if 0 < seq <= len(rows) and rows[seq - 1]["sequence"] == seq else \
+            next((i for i, r in enumerate(rows) if r["sequence"] == seq), None)
+        if at is None:
+            continue
+
+        def served(indices):
+            for i in indices:
+                r = rows[i]
+                if r["stop_type"] in SERVED_EXCLUDE or not r.get("stop_id"):
+                    continue
+                st = store.stops.get((g, r["stop_id"]))
+                return {"stop_id": st["stop_id"], "name": st["name"], "lat": st["lat"], "lon": st["lon"]} if st else None
+            return None
+
+        out.append({"route_id": rid, "short_name": rt.get("short_name"), "sequence": seq,
+                    "stop_type": rows[at]["stop_type"],
+                    "prev": served(range(at - 1, -1, -1)), "next": served(range(at + 1, len(rows)))})
+    return out
+
+
 def user_out(u):
     return {k: u[k] for k in ("user_id", "email", "display_name", "role", "status", "totp_enabled",
                               "created_at", "last_login_at")}
@@ -905,6 +1097,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True}, [
                 ("Set-Cookie", f"dev_email={quote(email)}; Path=/; SameSite=Strict"),
                 ("Set-Cookie", "gtfs_editor_session=; Path=/; Max-Age=0; SameSite=Strict")])
+        if path == "/__dev/supersede-station-proposals" and method == "POST":
+            # as on master once stations were made directly: nothing left to review
+            with LOCK:
+                open_ = [p for p in s.proposals.values() if p["status"] in ("pending", "approved")]
+                for p in open_:
+                    p.update(status="superseded", change_set_id=None, change_id=None, updated_at=iso(now()))
+            return self._send(200, {"superseded": len(open_)})
         raise ApiError(404, "not_found", "No such dev endpoint.")
 
     # ---- auth
@@ -1090,6 +1289,10 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.proposal_summary(g)
             if rest == ["station-proposals", "approve"] and method == "POST":
                 return 200, self.approve_many(u, g, self._body())
+            if rest == ["position-reviews"] and method == "GET":
+                return 200, self.list_reviews(g, q)
+            if rest == ["position-reviews", "summary"] and method == "GET":
+                return 200, self.review_summary(g)
             raise ApiError(404, "not_found", "No such feed endpoint.")
 
         if parts[0] == "change-sets" and len(parts) >= 2:
@@ -1134,6 +1337,25 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.reject_proposal(u, p, self._body())
             if rest == ["reopen"] and method == "POST":
                 return 200, self.reopen_proposal(u, p)
+
+        if parts[0] == "position-reviews" and len(parts) >= 2:
+            try:
+                rv = s.reviews.get(int(parts[1]))
+            except ValueError:
+                rv = None
+            if not rv:
+                raise ApiError(404, "review_not_found", "That coordinate review does not exist.")
+            rest = parts[2:]
+            if not rest and method == "GET":
+                return 200, self.review_detail(rv, q)
+            if rest == ["move"] and method == "POST":
+                return 200, self.move_review(u, rv, self._body())
+            if rest == ["split"] and method == "POST":
+                return 200, self.split_review(u, rv, self._body())
+            if rest == ["confirm"] and method == "POST":
+                return 200, self.confirm_review(u, rv, self._body())
+            if rest == ["reopen"] and method == "POST":
+                return 200, self.reopen_review(u, rv)
 
         if parts[0] == "users":
             self.require_role(u, "admin")
@@ -1366,6 +1588,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "invalid_change",
                                f"station/{op}: a station groups at least two stops, and {key} would have "
                                f"{'only one' if want else 'none'}", {"code": "too_few_members"})
+        if entity == "stop" and op == "update" and after.get("position_review_id") is not None:
+            prid = after["position_review_id"]
+            if not is_int(prid) or prid <= 0:
+                raise ApiError(400, "invalid_change", "stop/update: position_review_id must be a positive whole number",
+                               {"code": "invalid_payload"})
+            if "lat" not in after or "lon" not in after:
+                raise ApiError(400, "invalid_change",
+                               "stop/update: a change for a position review moves the stop (lat and lon)",
+                               {"code": "invalid_payload"})
         if entity == "stop" and op == "merge":
             into_id = str(after.get("into_stop_id") or "").strip()
             if not into_id:
@@ -1406,6 +1637,7 @@ class Handler(BaseHTTPRequestHandler):
             cs["changes"].remove(ch)
             action = "change_removed"
             self.return_proposals(u, cs, "change_removed", change_id=change_id)
+            self.review_change_removed(u, cs, ch)
         else:
             b = self._body()
             if ch["op"] != "delete" and not isinstance(b.get("after"), dict):
@@ -1416,6 +1648,13 @@ class Handler(BaseHTTPRequestHandler):
                 after = dict(after, **{id_field: ch["entity_key"]})
                 if ch["entity"] == "station" and (ch.get("after") or {}).get("proposal_id"):
                     after.setdefault("proposal_id", ch["after"]["proposal_id"])
+            prid = (ch.get("after") or {}).get("position_review_id")
+            if prid is not None and isinstance(after, dict):
+                if after.get("position_review_id") is None:
+                    after = dict(after, position_review_id=prid)
+                elif after["position_review_id"] != prid:
+                    raise ApiError(400, "invalid_change", f"this change was made for position review {prid}",
+                                   {"code": "position_review_mismatch"})
             ch["after"] = after
             if b.get("base_row_version"):
                 ch["base_row_version"] = b["base_row_version"]
@@ -1486,6 +1725,12 @@ class Handler(BaseHTTPRequestHandler):
                     s.add_audit(u, "station_proposal_committed", p["gtfs_id"], cs["change_set_id"],
                                 {"proposal_id": p["proposal_id"], "station_id": p["station_id"],
                                  "change_id": p["change_id"], "feed_version": cs["committed_version"]})
+            for rv in s.reviews.values():
+                if rv["change_set_id"] == cs["change_set_id"] and rv["status"] == "approved":
+                    rv.update(status="committed", updated_at=t)
+                    s.add_audit(u, "position_review_committed", rv["gtfs_id"], cs["change_set_id"],
+                                {"review_id": rv["review_id"], "stop_id": rv["stop_id"], "change_id": rv["change_id"],
+                                 "feed_version": cs["committed_version"]})
             for ch in cs["changes"]:
                 if ch["entity"] == "stop" and ch["op"] == "merge":
                     affected = (ch.get("before") or {}).get("affected") or []
@@ -1501,6 +1746,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, "not_author", "Only the person who started this draft, or an admin, can discard it.")
             cs.update(status="discarded")
             self.return_proposals(u, cs, "change_set_discarded")
+            self.return_reviews(u, cs, "change_set_discarded")
         else:
             raise ApiError(404, "not_found", "No such action.")
         cs["updated_at"] = t
@@ -1997,6 +2243,337 @@ class Handler(BaseHTTPRequestHandler):
             self.store.add_audit(u, "station_proposal_returned", p["gtfs_id"], cs["change_set_id"],
                                  {"proposal_id": p["proposal_id"], "station_id": p["station_id"], "reason": reason})
 
+    # ---- coordinate reviews (docs sections 8 and 8.1, as the API answers them)
+    def review_out(self, rv):
+        s = self.store
+        cs = s.change_sets.get(rv["change_set_id"]) if rv.get("change_set_id") else None
+        return {k: rv.get(k) for k in ("review_id", "gtfs_id", "stop_id", "original_stop_id", "stop_name", "reason",
+                                       "lat", "lon", "raw_lat", "raw_lon", "suggested_lat", "suggested_lon",
+                                       "suggested_source", "evidence", "status", "change_set_id", "change_id",
+                                       "reviewed_at", "review_note", "batch", "created_at", "updated_at")} | {
+            "change_set_title": cs["title"] if cs else None, "reviewed_by_email": s.email_of(rv.get("reviewed_by"))}
+
+    def review_problems(self, rv, proj=None):
+        """What stands in the way of changing the review's stop: the live data, or
+        with `proj` the live data with a draft applied."""
+        s, g, sid = self.store, rv["gtfs_id"], rv["stop_id"]
+        live = s.stops.get((g, sid))
+        if not live:
+            return [{"level": "error", "code": "stop_missing", "message": f"stop {sid} no longer exists"}]
+        if live.get("deleted") and live.get("merged_into"):
+            into = live["merged_into"]
+            return [{"level": "error", "code": "stop_merged_away",
+                     "message": f"stop {sid} was merged into {into}; its routes call at {into} now"}]
+        if live.get("deleted"):
+            return [{"level": "error", "code": "stop_deleted", "message": f"stop {sid} is deleted"}]
+        if live.get("location_type") == 1:
+            return [{"level": "error", "code": "stop_is_station", "message": f"{sid} is a station, not a stop"}]
+        drafted = proj.stop(sid) if proj else live
+        if drafted.get("deleted") and drafted.get("merged_into"):
+            return [{"level": "error", "code": "stop_merged_away",
+                     "message": f"stop {sid} is merged into {drafted['merged_into']} in the draft"}]
+        if drafted.get("deleted"):
+            return [{"level": "error", "code": "stop_deleted", "message": f"stop {sid} is deleted in the draft"}]
+        moved = haversine(rv["lat"], rv["lon"], drafted["lat"], drafted["lon"])
+        if rv["status"] != "committed" and moved > REVIEW_MOVED_M:
+            return [{"level": "warning", "code": "moved_since_load",
+                     "message": f"stop {sid} is {moved:.0f} m from where the review found it"}]
+        return []
+
+    def review_actions(self, rv):
+        """The review's moves and splits in the draft that carries it, in change order."""
+        s, g, sid = self.store, rv["gtfs_id"], rv["stop_id"]
+        cs = s.change_sets.get(rv.get("change_set_id")) if rv.get("change_set_id") else None
+        if not cs or rv["status"] not in ("approved", "committed"):
+            return []
+        mine = [c for c in cs["changes"] if (c.get("after") or {}).get("position_review_id") == rv["review_id"]]
+        calls = route_legs(s, g, sid)
+        out = []
+        for c in mine:
+            a = c["after"]
+            if c["entity"] == "stop" and c["op"] == "update":
+                out.append({"kind": "move", "change_id": c["change_id"], "lat": a["lat"], "lon": a["lon"],
+                            "detour_m_after": detour_of(calls, sid, a["lat"], a["lon"])})
+            elif c["entity"] == "stop" and c["op"] == "create":
+                new_id = c["entity_key"]
+                ids = [x["entity_key"] for x in mine if x["entity"] == "route_stops"
+                       and any(r.get("stop_id") == new_id for r in (x.get("after") or {}).get("rows", []))]
+                if rv["status"] == "committed":   # the split routes call at the new stop now
+                    after = detour_of(route_legs(s, g, new_id), new_id, a["lat"], a["lon"], only=ids)
+                else:
+                    after = detour_of(calls, sid, a["lat"], a["lon"], only=ids)
+                out.append({"kind": "split", "change_id": c["change_id"], "lat": a["lat"], "lon": a["lon"],
+                            "new_stop_id": new_id, "route_ids": ids, "detour_m_after": after})
+        return out
+
+    def review_detail(self, rv, q=None):
+        s, g, sid = self.store, rv["gtfs_id"], rv["stop_id"]
+        st = s.stops.get((g, sid))
+        calls = route_legs(s, g, sid)
+        here = (st["lat"], st["lon"]) if st else None
+        stop = None
+        if st:
+            stop = stop_out(s, g, st)
+            if st.get("merged_into"):
+                stop["provenance"] = {"merged_into": st["merged_into"]}
+        actions = self.review_actions(rv)
+        latest = actions[-1] if actions else None
+        detour_after = latest["detour_m_after"] if latest else None
+        if q and (q.get("lat") or q.get("lon") or q.get("route_ids")):
+            # what a point would give, before anything is drafted
+            try:
+                lat, lon = float(q["lat"][0]), float(q["lon"][0])
+            except (KeyError, ValueError):
+                raise ApiError(400, "invalid_position", "lat and lon go together, and route_ids needs a point.")
+            if not valid_position(lat, lon):
+                raise ApiError(400, "invalid_position", "lat and lon must be a valid position")
+            only = [x.strip() for x in q["route_ids"][0].split(",") if x.strip()] if q.get("route_ids") else None
+            detour_after = detour_of(calls, sid, lat, lon, only=only)
+        return self.review_out(rv) | {
+            "stop": stop,
+            "routes": [dict(c, detour_m=(tenth(leg_detour(c, sid, *here)) if here else None)) for c in calls],
+            "detour_m": detour_of(calls, sid, *here) if here else None,
+            "new_position": {"lat": latest["lat"], "lon": latest["lon"]} if latest else None,
+            "new_stop_id": latest.get("new_stop_id") if latest else None,
+            "split_route_ids": latest.get("route_ids") if latest else None,
+            "detour_m_after": detour_after,
+            "draft_actions": actions if rv["status"] == "approved" else [],
+            "problems": self.review_problems(rv)}
+
+    def review_summary(self, g):
+        counts = {k: 0 for k in ("pending", "approved", "committed", "confirmed")}
+        for rv in self.store.reviews.values():
+            if rv["gtfs_id"] == g and rv["status"] in counts:
+                counts[rv["status"]] += 1
+        return counts
+
+    def list_reviews(self, g, q):
+        statuses = [x for x in (q.get("status", [""])[0] or "pending").split(",") if x]
+        bad = [x for x in statuses if x not in REVIEW_STATUSES]
+        if bad:
+            raise ApiError(400, "invalid_status", f"Unknown status {bad[0]}.")
+        items = [rv for rv in self.store.reviews.values() if rv["gtfs_id"] == g and rv["status"] in statuses]
+        if q.get("bbox"):
+            try:
+                a, b, c, d = (float(x) for x in q["bbox"][0].split(","))
+            except ValueError:
+                raise ApiError(400, "bad_bbox", "bbox is minLat,minLon,maxLat,maxLon.")
+            items = [rv for rv in items if a <= rv["lat"] <= c and b <= rv["lon"] <= d]
+        term = (q.get("q", [""])[0] or "").strip().lower()
+        order = {k: i for i, k in enumerate(REVIEW_STATUSES)}
+        if term:
+            def rank(rv):
+                if term in (rv["stop_id"].lower(), rv["original_stop_id"].lower()):
+                    return 0
+                n = rv["stop_name"].lower()
+                return 1 if n.startswith(term) else 2 if term in n else 9
+            items = sorted((rv for rv in items if rank(rv) < 9), key=lambda rv: (rank(rv), order[rv["status"]], rv["review_id"]))
+        else:
+            items.sort(key=lambda rv: (order[rv["status"]], rv["review_id"]))
+        page = paginate(items, q)
+        page["items"] = [self.review_out(rv) for rv in page["items"]]
+        return page
+
+    @staticmethod
+    def review_note(b):
+        note = b.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ApiError(400, "invalid_json", "note must be text.")
+        return (note or "").strip() or None
+
+    def action_draft(self, u, rv, b):
+        """The draft a move or split goes into: the review is waiting, or already has
+        a change in that same draft (a review may take several)."""
+        cs = self.target_draft(u, rv["gtfs_id"], b)
+        if rv["status"] == "approved" and rv["change_set_id"] != cs["change_set_id"]:
+            other = self.store.change_sets.get(rv["change_set_id"]) or {}
+            raise ApiError(409, "review_in_other_draft",
+                           f"position review {rv['review_id']} has changes in draft “{other.get('title', '')}”; "
+                           f"add more to that draft",
+                           {"change_set_id": rv["change_set_id"], "change_set_title": other.get("title")})
+        if rv["status"] not in ("pending", "approved"):
+            raise ApiError(409, "review_not_pending", f"position review {rv['review_id']} is {rv['status']}",
+                           {"status": rv["status"], "change_set_id": rv["change_set_id"]})
+        return cs
+
+    def approve_with(self, u, rv, cs, change_id, note):
+        t = iso(now())
+        rv.update(status="approved", change_set_id=cs["change_set_id"], change_id=change_id,
+                  reviewed_by=u["user_id"], reviewed_at=t, review_note=note or rv.get("review_note"), updated_at=t)
+
+    def move_review(self, u, rv, b):
+        s, g, sid = self.store, rv["gtfs_id"], rv["stop_id"]
+        lat, lon = b.get("lat"), b.get("lon")
+        if not valid_position(lat, lon):
+            raise ApiError(400, "invalid_position", "lat and lon must be a valid position")
+        note = self.review_note(b)
+        cs = self.action_draft(u, rv, b)
+        moves = [c["change_id"] for c in cs["changes"] if c["entity"] == "stop" and c["op"] == "update"
+                 and (c.get("after") or {}).get("position_review_id") == rv["review_id"]]
+        if moves:
+            raise ApiError(409, "draft_conflict",
+                           f"change {moves[0]} in this draft already moves stop {sid}; edit that change in the draft",
+                           {"change_ids": moves})
+        found = self.review_problems(rv, Projection(s, g, cs["changes"]))
+        if any(p["level"] == "error" for p in found):
+            raise ApiError(400, "review_has_problems", "the stop cannot be changed now; see the problems",
+                           {"problems": found})
+        st = s.stops[(g, sid)]
+        moved = haversine(st["lat"], st["lon"], lat, lon)
+        if moved < 0.5:
+            raise ApiError(400, "position_unchanged",
+                           f"stop {sid} is already at that point; if its position is right, confirm the review")
+        before, live_version = self.snapshot(cs, "stop", sid)
+        ch = self.append_change(u, cs, "stop", "update", sid, {"lat": lat, "lon": lon, "position_review_id": rv["review_id"]},
+                                before, live_version)
+        self.approve_with(u, rv, cs, ch["change_id"], note)
+        calls = route_legs(s, g, sid)
+        s.add_audit(u, "position_review_moved", g, cs["change_set_id"], {
+            "review_id": rv["review_id"], "stop_id": sid, "change_id": ch["change_id"],
+            "from": {"lat": st["lat"], "lon": st["lon"]}, "to": {"lat": lat, "lon": lon}, "moved_m": tenth(moved),
+            "detour_m": detour_of(calls, sid, st["lat"], st["lon"]), "detour_m_after": detour_of(calls, sid, lat, lon),
+            "note": note})
+        return self.review_detail(rv)
+
+    def split_review(self, u, rv, b):
+        """Split some routes off the reviewed stop onto a new stop at the given point
+        (docs section 8.1): a stop/create plus one route_stops/replace per route."""
+        s, g, sid = self.store, rv["gtfs_id"], rv["stop_id"]
+        route_ids = [str(x).strip() for x in b.get("route_ids") or []] if isinstance(b.get("route_ids"), list) else []
+        lat, lon = b.get("lat"), b.get("lon")
+        found = []
+        if not route_ids:
+            found.append({"code": "route_ids_required", "message": "name the routes to split off the stop"})
+        seen = set()
+        for rid in route_ids:
+            if rid in seen and not any(p.get("route_id") == rid and p["code"] == "route_listed_twice" for p in found):
+                found.append({"code": "route_listed_twice", "route_id": rid, "message": f"route {rid} is listed more than once"})
+            seen.add(rid)
+        if not valid_position(lat, lon):
+            found.append({"code": "invalid_position", "message": f"position {lat}, {lon} is out of range"})
+        if found:
+            raise ApiError(400, "invalid_split", "the routes cannot be split off this way; see the problems",
+                           {"problems": found})
+        name, note = b.get("name"), self.review_note(b)
+        if name is not None and not isinstance(name, str):
+            raise ApiError(400, "invalid_json", "name must be text.")
+        cs = self.action_draft(u, rv, b)
+        clashing = [c["change_id"] for c in cs["changes"]
+                    if (c["entity"] == "route_stops" and c["entity_key"] in route_ids)
+                    or (c["entity"] == "stop" and c["entity_key"] == sid)
+                    or (c["entity"] == "stop" and c["op"] == "merge" and (c.get("after") or {}).get("into_stop_id") == sid)]
+        if clashing:
+            raise ApiError(409, "draft_conflict",
+                           f"change(s) {', '.join(map(str, clashing))} in this draft already change stop {sid} or "
+                           f"these routes' stop lists", {"change_ids": clashing})
+        problems = [p for p in self.review_problems(rv) if p["level"] == "error"]
+        if problems:
+            raise ApiError(400, "review_has_problems", "the stop cannot be changed now; see the problems",
+                           {"problems": problems})
+        st = s.stops[(g, sid)]
+        calls = route_legs(s, g, sid)
+        calling = {c["route_id"] for c in calls}
+        found = [{"code": "route_not_at_stop", "route_id": rid, "message": f"route {rid} does not call at stop {sid}"}
+                 for rid in route_ids if rid not in calling]
+        if calling and calling <= set(route_ids):
+            found.append({"code": "would_empty_stop",
+                          "message": f"every route calling at stop {sid} would leave it; move the stop instead"})
+        if found:
+            raise ApiError(400, "invalid_split", "the routes cannot be split off this way; see the problems",
+                           {"problems": found})
+        new_id = s.mint_stop_id(g)
+        name = (name or "").strip() or st["name"]
+        create = self.append_change(u, cs, "stop", "create", new_id,
+                                    {"stop_id": new_id, "name": name, "lat": lat, "lon": lon,
+                                     "position_review_id": rv["review_id"]})
+        proj = Projection(s, g, [])
+        route_change_ids = []
+        for rid in route_ids:
+            live_rows = s.rows.get((g, rid), [])
+            rows = [{"stop_id": new_id if r.get("stop_id") == sid else r.get("stop_id"),
+                     "stop_type": r["stop_type"], "stage_no": r["stage_no"], "stage_name": r["stage_name"],
+                     "marker_id": r.get("marker_id"), "marker_name": r.get("marker_name"),
+                     "marker_lat": r.get("marker_lat"), "marker_lon": r.get("marker_lon"),
+                     "stop_name_override": r.get("stop_name_override"), "provider_id": r.get("provider_id")}
+                    for r in live_rows]
+            ch = self.append_change(u, cs, "route_stops", "replace", rid,
+                                    {"base_rows_hash": rows_hash(live_rows), "rows": rows,
+                                     "position_review_id": rv["review_id"]},
+                                    route_detail(proj, rid)["rows"])
+            route_change_ids.append(ch["change_id"])
+        self.approve_with(u, rv, cs, create["change_id"], note)
+        after = detour_of(calls, sid, lat, lon, only=route_ids)
+        s.add_audit(u, "position_review_split", g, cs["change_set_id"], {
+            "review_id": rv["review_id"], "stop_id": sid, "new_stop_id": new_id, "route_ids": route_ids,
+            "change_set_id": cs["change_set_id"], "change_id": create["change_id"], "route_change_ids": route_change_ids,
+            "name": name, "lat": lat, "lon": lon, "detour_m_after": after, "note": note})
+        return self.review_detail(rv) | {"new_stop_id": new_id, "detour_m_after": after}
+
+    def confirm_review(self, u, rv, b):
+        self.require_role(u, "editor")
+        note = self.review_note(b)
+        if rv["status"] != "pending":
+            raise ApiError(409, "review_not_pending", f"position review {rv['review_id']} is {rv['status']}",
+                           {"status": rv["status"], "change_set_id": rv["change_set_id"]})
+        t = iso(now())
+        st = self.store.stops.get((rv["gtfs_id"], rv["stop_id"]))
+        rv.update(status="confirmed", reviewed_by=u["user_id"], reviewed_at=t, review_note=note, updated_at=t)
+        self.store.add_audit(u, "position_review_confirmed", rv["gtfs_id"], None,
+                             {"review_id": rv["review_id"], "stop_id": rv["stop_id"],
+                              "position": {"lat": st["lat"], "lon": st["lon"]} if st else None, "note": note})
+        return self.review_detail(rv)
+
+    def reopen_review(self, u, rv):
+        self.require_role(u, "editor")
+        if rv["status"] != "confirmed":
+            raise ApiError(409, "review_not_confirmed",
+                           f"position review {rv['review_id']} is {rv['status']}; only a confirmed review is reopened")
+        if any(o is not rv and o["gtfs_id"] == rv["gtfs_id"] and o["stop_id"] == rv["stop_id"]
+               and o["status"] in ("pending", "approved") for o in self.store.reviews.values()):
+            raise ApiError(409, "review_superseded", f"another open review already covers stop {rv['stop_id']}")
+        note = rv.get("review_note")
+        rv.update(status="pending", reviewed_by=None, reviewed_at=None, review_note=None, updated_at=iso(now()))
+        self.store.add_audit(u, "position_review_reopened", rv["gtfs_id"], None,
+                             {"review_id": rv["review_id"], "stop_id": rv["stop_id"], "note": note})
+        return self.review_detail(rv)
+
+    def review_change_removed(self, u, cs, ch):
+        """A change of a review left its draft: a split's new stop takes its stop
+        lists along; a review with no move or split left is waiting again."""
+        s = self.store
+        prid = (ch.get("after") or {}).get("position_review_id")
+        rv = s.reviews.get(prid) if is_int(prid) else None
+        if not rv or rv["status"] != "approved" or rv["change_set_id"] != cs["change_set_id"]:
+            return
+        removed = []
+        if ch["entity"] == "stop" and ch["op"] == "create":
+            for c in [c for c in cs["changes"] if c["entity"] == "route_stops"
+                      and (c.get("after") or {}).get("position_review_id") == prid
+                      and any(r.get("stop_id") == ch["entity_key"] for r in c["after"].get("rows", []))]:
+                cs["changes"].remove(c)
+                removed.append(c["change_id"])
+                s.add_audit(u, "change_removed", cs["gtfs_id"], cs["change_set_id"],
+                            {"change_id": c["change_id"], "review_id": prid, "reason": "position_review_returned"})
+        left = [c for c in cs["changes"] if c["entity"] == "stop" and (c.get("after") or {}).get("position_review_id") == prid]
+        if left:
+            rv["change_id"] = left[-1]["change_id"]
+            return
+        rv.update(status="pending", change_set_id=None, change_id=None, reviewed_by=None, reviewed_at=None,
+                  review_note=None, updated_at=iso(now()))
+        detail = {"review_id": prid, "stop_id": rv["stop_id"], "reason": "change_removed"}
+        if removed:
+            detail["removed_change_ids"] = removed
+        s.add_audit(u, "position_review_returned", rv["gtfs_id"], cs["change_set_id"], detail)
+
+    def return_reviews(self, u, cs, reason):
+        """Every review with changes in a discarded draft is waiting again."""
+        for rv in self.store.reviews.values():
+            if rv["change_set_id"] != cs["change_set_id"] or rv["status"] != "approved":
+                continue
+            rv.update(status="pending", change_set_id=None, change_id=None, reviewed_by=None, reviewed_at=None,
+                      review_note=None, updated_at=iso(now()))
+            self.store.add_audit(u, "position_review_returned", rv["gtfs_id"], cs["change_set_id"],
+                                 {"review_id": rv["review_id"], "stop_id": rv["stop_id"], "reason": reason})
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

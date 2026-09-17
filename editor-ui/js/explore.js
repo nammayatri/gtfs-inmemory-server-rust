@@ -83,6 +83,15 @@ export async function showHome() {
         ? h("p.hint", "To change something, open it and choose Edit. To add a stop, route or station, use New at the top. Edits collect in a draft; nothing changes for passengers until another person approves and commits it.")
         : h("p.hint", "You can look at everything. Ask an admin for the editor role to make changes."),
     ));
+  const coordinates = h("section.section", { hidden: true });
+  p.appendChild(coordinates);
+  get(`feeds/${enc(state.feedId)}/position-reviews/summary`).then((c) => {
+    if (!c.pending) return;
+    coordinates.hidden = false;
+    clear(coordinates, h("h2", "Coordinates to review"),
+      h("p", `${plural(c.pending, "stop")} may be in the wrong place and ${c.pending === 1 ? "is" : "are"} waiting for someone to check ${c.pending === 1 ? "it" : "them"}.`),
+      h("div.btn-row", h("a.btn.secondary", { href: "#/coordinates" }, "Review coordinates")));
+  }).catch(() => {});
   const review = h("section.section", { hidden: true });
   p.appendChild(review);
   get(`feeds/${enc(state.feedId)}/station-proposals/summary`).then((c) => {
