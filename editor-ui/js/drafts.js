@@ -139,7 +139,7 @@ export async function addChange(change, { merge = true } = {}) {
       cs = await post(`change-sets/${enc(draft.change_set_id)}/changes`, change);
     }
   } catch (e) {
-    if (e instanceof ApiError && e.code === "not_a_draft") {
+    if (e instanceof ApiError && e.code === "change_set_not_draft") {
       useDraft(null);
       toast("That draft was submitted or closed. Choose another draft and try again.", "error");
       return null;

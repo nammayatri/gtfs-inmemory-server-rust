@@ -268,6 +268,8 @@ input[aria-invalid="true"] { border-color: var(--danger); background: var(--dang
 .row.clickable:hover .name { text-decoration: underline; }
 .row.has-error { background: var(--danger-tint); box-shadow: -4px 0 0 var(--danger); }
 .row-error { grid-column: 2 / -1; color: var(--danger); font-size: var(--fs-xs); font-weight: 700; }
+.row.has-warning { background: var(--draft-tint); box-shadow: -4px 0 0 #c98a00; }
+.row-warning { grid-column: 2 / -1; color: #8a5d00; font-size: var(--fs-xs); font-weight: 700; }
 
 /* ladder in edit mode: one flat list, a stage stop opens a tinted band */
 .ladder.editing { margin: 0; }

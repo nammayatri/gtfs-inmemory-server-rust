@@ -113,10 +113,20 @@ pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({"items": items}))
+    Ok(json!({"items": items, "next_cursor": null}))
 }
 
 // ---------------------------------------------------------------- stops
+
+/// Distinct routes calling at a stop, for a query aliasing gtfs_stop as `s`.
+const ROUTE_COUNT: &str = "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+     WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count";
+
+fn stop_json_counted(r: &PgRow) -> Result<Value, sqlx::Error> {
+    let mut v = stop_json(r)?;
+    v["route_count"] = json!(r.try_get::<i64, _>("route_count")?);
+    Ok(v)
+}
 
 const STOP_COLS: &str = "stop_id, stop_code, name, lat, lon, location_type, parent_station, \
      platform_code, cluster_id, regional_name, hindi_name, info_json::text AS info_json, \
@@ -178,9 +188,7 @@ pub async fn list_stops(
         None => (None, None, None, None),
     };
     let rows = sqlx::query(&format!(
-        "SELECT {STOP_COLS}, \
-            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
-              WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count \
+        "SELECT {STOP_COLS}, {ROUTE_COUNT} \
          FROM gtfs_stop s \
          WHERE s.gtfs_id = $1 AND NOT s.deleted \
            AND ($2::text IS NULL OR s.stop_id = $2 OR s.stop_code = $2 \
@@ -205,11 +213,7 @@ pub async fn list_stops(
     .await?;
     let items = rows
         .iter()
-        .map(|r| -> Result<Value, sqlx::Error> {
-            let mut v = stop_json(r)?;
-            v["route_count"] = json!(r.try_get::<i64, _>("route_count")?);
-            Ok(v)
-        })
+        .map(stop_json_counted)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(page.wrap(items))
 }
@@ -245,25 +249,29 @@ pub async fn stop_detail(
     })
     .collect::<Result<Vec<_>, _>>()?;
     let children = sqlx::query(&format!(
-        "SELECT {STOP_COLS} FROM gtfs_stop \
-         WHERE gtfs_id = $1 AND parent_station = $2 AND NOT deleted ORDER BY stop_id"
+        "SELECT {STOP_COLS}, {ROUTE_COUNT} FROM gtfs_stop s \
+         WHERE s.gtfs_id = $1 AND s.parent_station = $2 AND NOT s.deleted ORDER BY s.stop_id"
     ))
     .bind(gtfs_id)
     .bind(stop_id)
     .fetch_all(&mut *conn)
     .await?
     .iter()
-    .map(stop_json)
+    .map(stop_json_counted)
     .collect::<Result<Vec<_>, _>>()?;
+    let parent = match stop["parent_station"].as_str() {
+        Some(p) => stop_row(conn, gtfs_id, p).await?,
+        None => None,
+    };
 
     let (lat, lon) = (
         stop["lat"].as_f64().unwrap_or(0.0),
         stop["lon"].as_f64().unwrap_or(0.0),
     );
     let nearby = sqlx::query(&format!(
-        "SELECT {STOP_COLS} FROM gtfs_stop \
-         WHERE gtfs_id = $1 AND stop_id <> $2 AND NOT deleted \
-           AND lat BETWEEN $3 - 0.0006 AND $3 + 0.0006 AND lon BETWEEN $4 - 0.0007 AND $4 + 0.0007"
+        "SELECT {STOP_COLS}, {ROUTE_COUNT} FROM gtfs_stop s \
+         WHERE s.gtfs_id = $1 AND s.stop_id <> $2 AND NOT s.deleted \
+           AND s.lat BETWEEN $3 - 0.0006 AND $3 + 0.0006 AND s.lon BETWEEN $4 - 0.0007 AND $4 + 0.0007"
     ))
     .bind(gtfs_id)
     .bind(stop_id)
@@ -272,20 +280,33 @@ pub async fn stop_detail(
     .fetch_all(&mut *conn)
     .await?
     .iter()
-    .map(stop_json)
+    .map(stop_json_counted)
     .collect::<Result<Vec<_>, _>>()?
     .into_iter()
     .filter_map(|mut s| {
         let d = haversine_m(lat, lon, s["lat"].as_f64()?, s["lon"].as_f64()?);
         (d <= 60.0).then(|| {
-            s["metres"] = json!((d * 10.0).round() / 10.0);
+            s["distance_m"] = json!((d * 10.0).round() / 10.0);
             s
         })
     })
     .collect::<Vec<_>>();
+    let mut nearby = nearby;
+    nearby.sort_by(|a, b| {
+        a["distance_m"]
+            .as_f64()
+            .partial_cmp(&b["distance_m"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    stop["route_count"] = json!(routes
+        .iter()
+        .filter_map(|r| r["route_id"].as_str())
+        .collect::<HashSet<_>>()
+        .len());
     stop["routes"] = json!(routes);
     stop["children"] = json!(children);
     stop["nearby"] = json!(nearby);
+    stop["parent"] = parent.unwrap_or(Value::Null);
     Ok(stop)
 }
 
@@ -427,7 +448,8 @@ pub async fn route_detail(
         .await?
         .ok_or_else(|| EditorError::not_found("route_not_found", format!("no route {route_id}")))?;
     let rows = sqlx::query(
-        "SELECT rs.sequence, rs.stop_id, s.name AS stop_name, s.lat, s.lon, s.deleted AS stop_deleted, \
+        "SELECT rs.sequence, rs.stop_id, coalesce(rs.stop_name_override, s.name) AS stop_name, \
+                s.lat, s.lon, s.deleted AS stop_deleted, s.parent_station, \
                 rs.stop_type, rs.stage_no, rs.stage_name, rs.marker_id, rs.marker_name, rs.marker_lat, \
                 rs.marker_lon, rs.stop_name_override, rs.provider_id \
          FROM gtfs_route_stop rs \
@@ -447,6 +469,7 @@ pub async fn route_detail(
             "lat": r.try_get::<Option<f64>, _>("lat")?,
             "lon": r.try_get::<Option<f64>, _>("lon")?,
             "stop_deleted": r.try_get::<Option<bool>, _>("stop_deleted")?,
+            "parent_station": r.try_get::<Option<String>, _>("parent_station")?,
             "stop_type": r.try_get::<String, _>("stop_type")?,
             "stage_no": r.try_get::<i32, _>("stage_no")?,
             "stage_name": r.try_get::<String, _>("stage_name")?,
@@ -460,6 +483,15 @@ pub async fn route_detail(
     })
     .collect::<Result<Vec<_>, _>>()?;
     let hash = rows_hash(&load_route_rows(conn, gtfs_id, route_id).await?);
+    let served = rows
+        .iter()
+        .filter(|r| {
+            r["stop_type"]
+                .as_str()
+                .is_some_and(|t| !super::validation::UNSERVED_TYPES.contains(&t))
+        })
+        .count();
+    route["stop_count"] = json!(served);
     route["rows"] = json!(rows);
     route["rows_hash"] = json!(hash);
     Ok(route)
@@ -629,7 +661,8 @@ pub async fn list_sets(
     page: &Page,
 ) -> EditorResult<Value> {
     let rows = sqlx::query(&format!(
-        "{SET_SELECT} WHERE cs.gtfs_id = $1 AND ($2::text IS NULL OR cs.status = $2) \
+        "{SET_SELECT} WHERE cs.gtfs_id = $1 \
+           AND ($2::text IS NULL OR cs.status = ANY(string_to_array($2, ','))) \
          ORDER BY cs.updated_at DESC, cs.change_set_id LIMIT $3 OFFSET $4"
     ))
     .bind(gtfs_id)
@@ -753,9 +786,20 @@ fn field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
 }
 
 fn conflict(c: &ChangeRow, reason: &str, expected: Value, actual: Value) -> Value {
+    let what = match c.entity.as_str() {
+        "route_stops" => format!("The stop list of route {}", c.entity_key),
+        "route" => format!("Route {}", c.entity_key),
+        "station" => format!("Station {}", c.entity_key),
+        _ => format!("Stop {}", c.entity_key),
+    };
+    let message = match reason {
+        "missing" => format!("{what} no longer exists."),
+        "exists" => format!("{what} was created by another commit after this edit was made."),
+        _ => format!("{what} was changed by another commit after this edit was made."),
+    };
     json!({
         "change_id": c.change_id, "entity": c.entity, "entity_key": c.entity_key,
-        "reason": reason, "expected": expected, "actual": actual,
+        "reason": reason, "expected": expected, "actual": actual, "message": message,
     })
 }
 
@@ -1254,11 +1298,49 @@ async fn route_stops_replace(
         return Err(ApplyError::Findings(findings));
     }
 
+    // What the live rows carry that an edit does not send: the cleanup's
+    // per-row provenance (kept where the same stop or marker stays at the same
+    // position) and the provider id (a new row takes the route's usual one).
+    let live_meta: HashMap<i32, (Option<String>, Option<String>, Option<String>)> = sqlx::query(
+        "SELECT sequence, stop_id, marker_id, provenance::text AS provenance \
+         FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2",
+    )
+    .bind(g)
+    .bind(route_id)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(
+        |r| -> Result<(i32, (Option<String>, Option<String>, Option<String>)), sqlx::Error> {
+            Ok((
+                r.try_get("sequence")?,
+                (
+                    r.try_get("stop_id")?,
+                    r.try_get("marker_id")?,
+                    r.try_get("provenance")?,
+                ),
+            ))
+        },
+    )
+    .collect::<Result<_, _>>()?;
+    let usual_provider = {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for r in &live {
+            if let Some(p) = r.provider_id.as_deref() {
+                *counts.entry(p).or_default() += 1;
+            }
+        }
+        let mut v: Vec<_> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v.first().map(|(p, _)| p.to_string())
+    };
+
     let n = rows.len();
     let mut seq = Vec::with_capacity(n);
     let (mut stop, mut typ, mut stage_no, mut stage_name) = (vec![], vec![], vec![], vec![]);
     let (mut mid, mut mname, mut mlat, mut mlon, mut over, mut prov) =
         (vec![], vec![], vec![], vec![], vec![], vec![]);
+    let mut provenance: Vec<Option<String>> = Vec::with_capacity(n);
     for (i, r) in rows.iter().enumerate() {
         let s = i as i32 + 1;
         seq.push(s);
@@ -1291,7 +1373,19 @@ async fn route_stops_replace(
         } else {
             r.stop_name_override.clone()
         });
-        prov.push(r.provider_id.clone());
+        prov.push(r.provider_id.clone().or_else(|| usual_provider.clone()));
+        provenance.push(live_meta.get(&s).and_then(|(sid, mk, pv)| {
+            let same = if r.is_marker() {
+                mk.is_some() && mk == &r.marker_id
+            } else {
+                sid.is_some() && sid == &r.stop_id
+            };
+            if same {
+                pv.clone()
+            } else {
+                None
+            }
+        }));
     }
     sqlx::query("DELETE FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2")
         .bind(g)
@@ -1301,9 +1395,12 @@ async fn route_stops_replace(
     sqlx::query(
         "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, \
                                       marker_id, marker_name, marker_lat, marker_lon, stop_name_override, \
-                                      provider_id, updated_by) \
-         SELECT $1, $2, u.* , $14 FROM UNNEST($3::int4[], $4::text[], $5::text[], $6::int4[], $7::text[], \
-                $8::text[], $9::text[], $10::float8[], $11::float8[], $12::text[], $13::text[]) AS u",
+                                      provider_id, provenance, updated_by) \
+         SELECT $1, $2, u.seq, u.stop, u.typ, u.no, u.name, u.mid, u.mname, u.mlat, u.mlon, u.over, u.prov, \
+                u.provenance::jsonb, $14 \
+         FROM UNNEST($3::int4[], $4::text[], $5::text[], $6::int4[], $7::text[], $8::text[], $9::text[], \
+                     $10::float8[], $11::float8[], $12::text[], $13::text[], $15::text[]) \
+              AS u(seq, stop, typ, no, name, mid, mname, mlat, mlon, over, prov, provenance)",
     )
     .bind(g)
     .bind(route_id)
@@ -1319,6 +1416,7 @@ async fn route_stops_replace(
     .bind(&over)
     .bind(&prov)
     .bind(actor)
+    .bind(&provenance)
     .execute(&mut *conn)
     .await?;
     Ok(findings)
@@ -1564,7 +1662,35 @@ pub async fn set_detail(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResul
         evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?
     };
     tx.rollback().await?;
+    // Stop-order changes carry ids only; give the diff the names of every stop
+    // they reference (live names, so a stop added to a route reads as itself).
+    let referenced: Vec<String> = changes
+        .iter()
+        .filter(|c| c.entity == "route_stops")
+        .flat_map(|c| c.after["rows"].as_array().cloned().unwrap_or_default())
+        .filter_map(|r| r["stop_id"].as_str().map(str::to_string))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let stop_names: Map<String, Value> = if referenced.is_empty() {
+        Map::new()
+    } else {
+        sqlx::query("SELECT stop_id, name FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)")
+            .bind(&set.gtfs_id)
+            .bind(&referenced)
+            .fetch_all(&state.pool)
+            .await?
+            .iter()
+            .map(|r| -> Result<(String, Value), sqlx::Error> {
+                Ok((
+                    r.try_get("stop_id")?,
+                    json!(r.try_get::<String, _>("name")?),
+                ))
+            })
+            .collect::<Result<_, _>>()?
+    };
     let mut out = set.json;
+    out["stop_names"] = Value::Object(stop_names);
     out["changes"] = json!(changes.iter().map(ChangeRow::json).collect::<Vec<_>>());
     out["validation"] = json!(ev.validation);
     out["conflicts"] = json!(ev.conflicts);
@@ -1586,7 +1712,11 @@ pub async fn preview_route(
     let ev = evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?;
     let route = route_detail(&mut tx, &set.gtfs_id, route_id).await;
     tx.rollback().await?;
-    Ok(json!({"route": route?, "validation": ev.validation, "conflicts": ev.conflicts}))
+    // the route in read shape, with the draft applied, plus what applying found
+    let mut route = route?;
+    route["validation"] = json!(ev.validation);
+    route["conflicts"] = json!(ev.conflicts);
+    Ok(route)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1644,6 +1774,21 @@ async fn snapshot(
                 ));
             }
             let v = row["row_version"].as_i64().map(|v| v as i32);
+            let mut row = row;
+            if is_station {
+                let members: Vec<String> = sqlx::query(
+                    "SELECT stop_id FROM gtfs_stop WHERE gtfs_id = $1 AND parent_station = $2 \
+                     AND NOT deleted ORDER BY stop_id",
+                )
+                .bind(g)
+                .bind(key)
+                .fetch_all(&mut *conn)
+                .await?
+                .iter()
+                .map(|r| r.try_get("stop_id"))
+                .collect::<Result<_, _>>()?;
+                row["member_stop_ids"] = json!(members);
+            }
             Ok((row, v))
         }
         ("route", "update") => {
@@ -1660,9 +1805,9 @@ async fn snapshot(
                     format!("no route {key}"),
                 ));
             }
-            let rows = load_route_rows(conn, g, key).await?;
-            let hash = rows_hash(&rows);
-            Ok((json!({"rows": rows, "rows_hash": hash}), None))
+            // the rows in read shape (names and positions), as the diff shows them
+            let detail = route_detail(conn, g, key).await?;
+            Ok((detail["rows"].clone(), None))
         }
         _ => Ok((Value::Null, None)),
     }
@@ -2043,6 +2188,8 @@ pub async fn commit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Va
             ),
         ));
     }
+    // maker-checker covers commit too: whoever submitted cannot put it live
+    not_own(&set, ctx)?;
     let changes = load_changes(&mut tx, id).await?;
     let ev = evaluate(&mut tx, &gtfs_id, &changes, &ctx.user.email).await?;
     if !ev.conflicts.is_empty() {
@@ -2157,7 +2304,7 @@ pub async fn users(state: &EditorState) -> EditorResult<Value> {
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({"items": items}))
+    Ok(json!({"items": items, "next_cursor": null}))
 }
 
 pub async fn create_user(

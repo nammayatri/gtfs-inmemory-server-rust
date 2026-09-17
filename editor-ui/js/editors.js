@@ -7,6 +7,23 @@ import {
 } from "./util.js";
 import * as map from "./map.js";
 import { addChange, existingChange, requireDraft } from "./drafts.js";
+
+// A problem's identity independent of row position, so the same problem before
+// and after an edit can be matched (counted, like the server's grading).
+function problemKey(p, rows) {
+  const r = rows[p.index] || {};
+  return `${p.code}|${r.stop_id || r.marker_id || ""}|${r.stage_no ?? ""}|${r.stage_name ?? ""}`;
+}
+
+function gradeProblems(problems, rows, liveKeys) {
+  const remaining = [...liveKeys];
+  return problems.map((p) => {
+    const i = remaining.indexOf(problemKey(p, rows));
+    if (i < 0) return p;
+    remaining.splice(i, 1);
+    return { ...p, existing: true };
+  });
+}
 import { showStop, showRoute } from "./explore.js";
 
 const panel = () => document.getElementById("panel");
@@ -118,10 +135,13 @@ export async function deleteStop(stop) {
 }
 
 // ------------------------------------------------------------------ route stop list
+// stop_name and lat/lon are for display; stop_name_override (a route's own
+// spelling of the stop) and provider_id are data and go back to the server.
 const toRow = (r) => ({
-  stop_id: r.stop_id, stop_name: r.stop_name, lat: r.lat, lon: r.lon, stop_type: r.stop_type,
-  stage_no: r.stage_no, stage_name: r.stage_name, marker_id: r.marker_id, marker_name: r.marker_name,
-  marker_lat: r.marker_lat, marker_lon: r.marker_lon,
+  stop_id: r.stop_id, stop_name: r.stop_name, lat: r.lat, lon: r.lon, parent_station: r.parent_station,
+  stop_type: r.stop_type, stage_no: r.stage_no, stage_name: r.stage_name,
+  marker_id: r.marker_id, marker_name: r.marker_name, marker_lat: r.marker_lat, marker_lon: r.marker_lon,
+  stop_name_override: r.stop_name_override ?? null, provider_id: r.provider_id ?? null,
 });
 
 export async function editRouteRows(route) {
@@ -129,6 +149,10 @@ export async function editRouteRows(route) {
   const prior = existingChange("route_stops", route.route_id);
   let baseHash = route.rows_hash;
   let rows = route.rows.map(toRow);
+  // Problems the live route already has are shown as warnings: an edit is only
+  // blocked by what it introduces (the server grades the same way).
+  const liveRows = route.rows.map(toRow);
+  const liveProblems = validateRows(liveRows).map((p) => problemKey(p, liveRows));
   if (prior) {
     try {
       const preview = await get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}`);
@@ -145,17 +169,26 @@ export async function editRouteRows(route) {
   const fixAllBtn = h("button.btn.secondary.small", { type: "button", hidden: true }, "Set every intermediate stop to its stage");
 
   const redraw = ({ refit = false } = {}) => {
-    const problems = validateRows(rows);
+    const all = gradeProblems(validateRows(rows), rows, liveProblems);
+    const problems = all.filter((p) => !p.existing);
+    const existing = all.filter((p) => p.existing);
     const byRow = new Map();
-    problems.forEach((p) => { if (!byRow.has(p.index)) byRow.set(p.index, []); byRow.get(p.index).push(p); });
-    const fixable = problems.filter((p) => p.fix);
+    all.forEach((p) => { if (!byRow.has(p.index)) byRow.set(p.index, []); byRow.get(p.index).push(p); });
+    const fixable = all.filter((p) => p.fix);
     fixAllBtn.hidden = fixable.length < 2;
+    const jump = (p) => h("a", { href: `#row-${p.index}`, on: { click: (ev) => { ev.preventDefault(); document.getElementById(`row-${p.index}`)?.focus(); } } }, p.message);
     clear(summary,
       problems.length
-        ? h("div.notice.error", h("p", h("strong", `${problems.length} problem${problems.length === 1 ? "" : "s"} in this stop list`)),
-            h("ul", problems.slice(0, 6).map((p) => h("li", h("a", { href: `#row-${p.index}`, on: { click: (ev) => { ev.preventDefault(); document.getElementById(`row-${p.index}`)?.focus(); } } }, p.message)))),
+        ? h("div.notice.error", h("p", h("strong", `${problems.length} problem${problems.length === 1 ? "" : "s"} to fix before submitting`)),
+            h("ul", problems.slice(0, 6).map((p) => h("li", jump(p)))),
             problems.length > 6 ? h("p", `and ${problems.length - 6} more, marked in red below.`) : null)
-        : h("p.notice.ok", "The fare stages are consistent."),
+        : existing.length ? null : h("p.notice.ok", "The fare stages are consistent."),
+      existing.length
+        ? h("div.notice.warning", h("p", h("strong", `${existing.length} problem${existing.length === 1 ? "" : "s"} already in the live route`)),
+            h("p", "These do not stop you submitting, but please fix them if you can."),
+            h("ul", existing.slice(0, 6).map((p) => h("li", jump(p)))),
+            existing.length > 6 ? h("p", `and ${existing.length - 6} more, marked in amber below.`) : null)
+        : null,
       problemList(serverProblems));
     clear(list, rows.map((r, i) => rowEditor(r, i, byRow.get(i) || [])));
     map.showRoute({ ...route, rows, encoded_polyline: route.encoded_polyline }, { fit: refit });
@@ -196,10 +229,11 @@ export async function editRouteRows(route) {
       }
       detail = h("div.row-edit-line", line);
     }
-    const errs = problems.map((p) => h("span.row-error", p.message, p.fix
+    const errs = problems.map((p) => h(p.existing ? "span.row-warning" : "span.row-error", p.message, p.fix
       ? [" ", h("button.btn.quiet.small", { type: "button", on: { click: () => change({ stage_no: p.fix.stage_no, stage_name: p.fix.stage_name }) } }, `Use stage ${p.fix.stage_no}`)]
       : null));
-    const li = h("li.row", { class: `${kind} ${problems.length ? "has-error" : ""}`, id: `row-${i}`, tabindex: "-1" },
+    const rowState = problems.some((p) => !p.existing) ? "has-error" : problems.length ? "has-warning" : "";
+    const li = h("li.row", { class: `${kind} ${rowState}`, id: `row-${i}`, tabindex: "-1" },
       h("span.node", { "aria-hidden": "true" }),
       h("div.row-edit",
         h("div.row-head",
@@ -232,8 +266,9 @@ export async function editRouteRows(route) {
   function insertAfter(i, stop) {
     const st = stageBefore(i);
     rows.splice(i + 1, 0, {
-      stop_id: stop.stop_id, stop_name: stop.name, lat: stop.lat, lon: stop.lon, stop_type: "INTERMEDIATE STOP",
-      stage_no: st ? st.stage_no : 1, stage_name: st ? st.stage_name : "",
+      stop_id: stop.stop_id, stop_name: stop.name, lat: stop.lat, lon: stop.lon, parent_station: stop.parent_station,
+      stop_type: "INTERMEDIATE STOP", stage_no: st ? st.stage_no : 1, stage_name: st ? st.stage_name : "",
+      stop_name_override: null, provider_id: null,
     });
     inserting = null;
     serverProblems = null;
@@ -274,10 +309,14 @@ export async function editRouteRows(route) {
 
   const cancel = () => { map.endModes(); showRoute(route.route_id); };
   const save = async () => {
+    const marker = (r) => r.stop_type === "ROUTE CORRECTION";
     const payload = rows.map((r) => ({
-      stop_id: r.stop_type === "ROUTE CORRECTION" ? null : r.stop_id, stop_name: r.stop_name || null, stop_type: r.stop_type,
+      stop_id: marker(r) ? null : r.stop_id, stop_type: r.stop_type,
       stage_no: r.stage_no, stage_name: r.stage_name,
-      marker_id: r.marker_id || null, marker_name: r.marker_name || null, marker_lat: r.marker_lat ?? null, marker_lon: r.marker_lon ?? null,
+      marker_id: marker(r) ? r.marker_id || null : null, marker_name: marker(r) ? r.marker_name || null : null,
+      marker_lat: marker(r) ? r.marker_lat ?? null : null, marker_lon: marker(r) ? r.marker_lon ?? null : null,
+      stop_name_override: marker(r) ? null : r.stop_name_override ?? null,
+      provider_id: r.provider_id ?? null,
     }));
     try {
       const res = await addChange({ entity: "route_stops", op: "replace", entity_key: route.route_id, after: { rows: payload, base_rows_hash: baseHash } });
@@ -467,7 +506,7 @@ export async function editStation(station, initialStops = []) {
     const name = nameInput.value.trim();
     const la = Number(latIn.value), lo = Number(lonIn.value);
     const errs = [];
-    if (creating && !/^[A-Za-z0-9_.:-]+$/.test(idInput.value.trim())) errs.push("The station id may use letters, digits, _ . : and - only.");
+    if (creating && !/^[A-Za-z0-9_.-]{1,64}$/.test(idInput.value.trim())) errs.push("The station id may use up to 64 letters, digits, _ . and - only.");
     if (!name) errs.push("Give the station a name.");
     if (members.size < 2) errs.push("A station groups at least two stops.");
     if (!Number.isFinite(la) || !Number.isFinite(lo)) errs.push("Enter the station position.");

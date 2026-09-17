@@ -30,6 +30,10 @@ pub const JWT_HEADER: &str = "x-pomerium-jwt-assertion";
 pub const CSRF_HEADER: &str = "x-requested-with";
 pub const CSRF_VALUE: &str = "gtfs-editor";
 
+pub const NO_SSO_IDENTITY: &str = "no_sso_identity";
+pub const NOT_REGISTERED: &str = "not_registered";
+pub const ACCOUNT_DISABLED: &str = "account_disabled";
+
 /// Failed codes allowed in the window before sign-in locks.
 pub const MAX_FAILED_CODES: i64 = 5;
 pub const LOCK_MINUTES: i64 = 10;
@@ -151,18 +155,27 @@ async fn check_request(req: &ServiceRequest) -> EditorResult<Identity> {
             ));
         }
     }
+    // Every SSO failure is one code the dashboard can act on; the precise reason
+    // (missing, expired, wrong audience, forged) goes in details for logs/tests.
     let token = req
         .headers()
         .get(JWT_HEADER)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            EditorError::unauthorized("unauthenticated", "sign in through the editor's SSO URL")
+            EditorError::unauthorized(NO_SSO_IDENTITY, "open the editor through its SSO address")
+                .with_details(json!({"reason": "jwt_missing"}))
         })?;
     let claims = state
         .jwks
         .verify(token, &state.audience)
         .await
-        .map_err(|e| EditorError::unauthorized(e.code(), "the SSO assertion is not valid"))?;
+        .map_err(|e| {
+            EditorError::unauthorized(
+                NO_SSO_IDENTITY,
+                "the SSO sign-in is not valid; reload the page",
+            )
+            .with_details(json!({"reason": e.code()}))
+        })?;
     Ok(Identity {
         email: claims.email,
     })
@@ -172,7 +185,7 @@ pub fn identity(req: &HttpRequest) -> EditorResult<Identity> {
     req.extensions()
         .get::<Identity>()
         .cloned()
-        .ok_or_else(|| EditorError::unauthorized("unauthenticated", "no verified identity"))
+        .ok_or_else(|| EditorError::unauthorized(NO_SSO_IDENTITY, "no verified identity"))
 }
 
 fn user_from_row(r: &sqlx::postgres::PgRow) -> Result<User, sqlx::Error> {
@@ -242,22 +255,27 @@ pub async fn user_for_email(state: &EditorState, email: &str) -> EditorResult<Op
     Ok(fetch().await?.as_ref().map(user_from_row).transpose()?)
 }
 
+pub fn not_registered(email: &str) -> EditorError {
+    EditorError::forbidden(
+        NOT_REGISTERED,
+        format!("{email} has no editor account; ask an admin to add you"),
+    )
+}
+
+pub fn account_disabled() -> EditorError {
+    EditorError::forbidden(
+        ACCOUNT_DISABLED,
+        "this editor account is turned off; ask an admin",
+    )
+}
+
 pub async fn active_user(req: &HttpRequest, state: &EditorState) -> EditorResult<User> {
     let id = identity(req)?;
-    let user = user_for_email(state, &id.email).await?.ok_or_else(|| {
-        EditorError::forbidden(
-            "user_not_found",
-            format!(
-                "{} has no editor account; ask an admin to add you",
-                id.email
-            ),
-        )
-    })?;
+    let user = user_for_email(state, &id.email)
+        .await?
+        .ok_or_else(|| not_registered(&id.email))?;
     if user.status != "active" {
-        return Err(EditorError::forbidden(
-            "user_disabled",
-            "this account is disabled",
-        ));
+        return Err(account_disabled());
     }
     Ok(user)
 }
@@ -304,6 +322,24 @@ pub async fn require(req: &HttpRequest, state: &EditorState, min: Role) -> Edito
     let ctx = Ctx { user };
     ctx.require_role(min)?;
     Ok(ctx)
+}
+
+/// Wrong codes counted toward the lockout right now (same window as
+/// [`lockout_seconds`]), so a failed attempt can say how many tries are left.
+pub async fn failed_codes(state: &EditorState, user_id: Uuid) -> EditorResult<i64> {
+    let row = sqlx::query(
+        "WITH last_ok AS ( \
+            SELECT coalesce(max(a.at), '-infinity'::timestamptz) AS ok_at FROM gtfs_audit_log a \
+            WHERE a.actor = $1 AND a.action IN ('session_created', 'totp_confirmed')) \
+         SELECT count(*) AS n FROM gtfs_audit_log f, last_ok \
+         WHERE f.actor = $1 AND f.action = 'totp_failed' \
+           AND f.at > greatest(now() - make_interval(mins => $2), last_ok.ok_at)",
+    )
+    .bind(user_id)
+    .bind(LOCK_MINUTES as i32)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(row.try_get("n")?)
 }
 
 /// Failed-code lockout, counted in the audit log so it holds across pods:

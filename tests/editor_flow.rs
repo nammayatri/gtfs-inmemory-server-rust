@@ -45,6 +45,14 @@ async fn setup_db(pool: &PgPool) {
              ('{FEED}', 'R1', 4, 'S4', 'INTERMEDIATE STOP', 2, 'STOP 3'), \
              ('{FEED}', 'R1', 5, 'S5', 'NEW STOP', 3, 'STOP 5')"
         ),
+        // what a replace must keep: a row's provenance (same stop, same place),
+        // the route's provider id, and a route's own spelling of a stop
+        format!(
+            "UPDATE gtfs_route_stop SET provider_id = '7', \
+               provenance = CASE WHEN sequence = 1 THEN '{{\"human_decision\": \"kept\"}}'::jsonb END, \
+               stop_name_override = CASE WHEN sequence = 4 THEN 'STOP 4 ON R1' END \
+             WHERE gtfs_id = '{FEED}' AND route_id = 'R1'"
+        ),
         // accounts from an earlier run start over: no authenticator, active
         format!(
             "UPDATE gtfs_editor_user SET totp_enabled = false, totp_secret_enc = NULL, totp_last_step = NULL, \
@@ -178,7 +186,8 @@ async fn editor_end_to_end() {
         &app,
         test::TestRequest::get().uri(&format!("{BASE}/auth/me"))
     );
-    assert_eq!((s, code_of(&b)), (401, "unauthenticated"));
+    assert_eq!((s, code_of(&b)), (401, "no_sso_identity"));
+    assert_eq!(b["error"]["details"]["reason"], "jwt_missing");
     let wrong_aud = test::TestRequest::get()
         .uri(&format!("{BASE}/auth/me"))
         .insert_header((
@@ -186,7 +195,8 @@ async fn editor_end_to_end() {
             signer.token_for(ADMIN, "gims.other.local", 300),
         ));
     let (s, b, _) = call!(&app, wrong_aud);
-    assert_eq!((s, code_of(&b)), (401, "jwt_wrong_audience"));
+    assert_eq!((s, code_of(&b)), (401, "no_sso_identity"));
+    assert_eq!(b["error"]["details"]["reason"], "jwt_wrong_audience");
     let stranger = TestSigner::generate("test-key");
     let forged = test::TestRequest::get()
         .uri(&format!("{BASE}/auth/me"))
@@ -195,7 +205,17 @@ async fn editor_end_to_end() {
             stranger.token_for(ADMIN, AUD, 300),
         ));
     let (s, b, _) = call!(&app, forged);
-    assert_eq!((s, code_of(&b)), (401, "jwt_bad_signature"));
+    assert_eq!((s, code_of(&b)), (401, "no_sso_identity"));
+    assert_eq!(b["error"]["details"]["reason"], "jwt_bad_signature");
+    // a real SSO identity with no editor account
+    let unknown = test::TestRequest::get()
+        .uri(&format!("{BASE}/auth/me"))
+        .insert_header((
+            "x-pomerium-jwt-assertion",
+            signer.token_for("nobody@editor-test.invalid", AUD, 300),
+        ));
+    let (s, b, _) = call!(&app, unknown);
+    assert_eq!((s, code_of(&b)), (403, "not_registered"));
 
     // the UI is served (placeholder) without a JWT
     let ui = test::call_service(
@@ -405,7 +425,8 @@ async fn editor_end_to_end() {
             {"stop_id": "S2", "stop_type": "INTERMEDIATE STOP", "stage_no": 1, "stage_name": "STOP 1"},
             extra,
             {"stop_id": "S3", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "STOP 3"},
-            {"stop_id": "S4", "stop_type": "INTERMEDIATE STOP", "stage_no": 2, "stage_name": "STOP 3"},
+            {"stop_id": "S4", "stop_type": "INTERMEDIATE STOP", "stage_no": 2, "stage_name": "STOP 3",
+             "stop_name_override": "STOP 4 ON R1"},
             {"stop_id": "S5", "stop_type": "NEW STOP", "stage_no": 3, "stage_name": "STOP 5"},
         ])
     };
@@ -439,8 +460,13 @@ async fn editor_end_to_end() {
         editor_c.req("GET", &format!("/change-sets/{set_a}/preview/routes/R1"))
     );
     assert_eq!(s, 200, "{preview}");
-    assert_eq!(preview["route"]["rows"].as_array().unwrap().len(), 6);
-    assert_eq!(preview["route"]["rows"][1]["stop_name"], "STOP 2 RENAMED");
+    assert_eq!(preview["rows"].as_array().unwrap().len(), 6);
+    assert_eq!(preview["rows"][1]["stop_name"], "STOP 2 RENAMED");
+    assert!(preview["validation"].is_array(), "{preview}");
+    // a route's own spelling of a stop is carried through the replace
+    assert_eq!(preview["rows"][4]["stop_name"], "STOP 4 ON R1");
+    assert_eq!(preview["rows"][4]["stop_name_override"], "STOP 4 ON R1");
+    assert_eq!(preview["stop_count"], 6);
     // the preview left the live data alone
     assert_eq!(route_len(&pool).await, 5);
     let (s, b, _) = call!(
@@ -506,6 +532,39 @@ async fn editor_end_to_end() {
         approver.req("POST", &format!("/change-sets/{set_c}/commit"))
     );
     assert_eq!((s, code_of(&b)), (409, "change_set_not_approved"));
+    // ...and once someone else approves it, its submitter still cannot commit it
+    let (s, _, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{set_c}/approve"))
+    );
+    assert_eq!(s, 200);
+    let (s, b, _) = call!(
+        &app,
+        approver.req("POST", &format!("/change-sets/{set_c}/commit"))
+    );
+    assert_eq!((s, code_of(&b)), (403, "own_change_set"));
+    let (s, b, _) = call!(
+        &app,
+        approver.req("POST", &format!("/change-sets/{set_c}/discard"))
+    );
+    assert_eq!((s, b["status"].clone()), (200, json!("discarded")), "{b}");
+    let (_, listed, _) = call!(
+        &app,
+        editor_c.req(
+            "GET",
+            &format!("/feeds/{FEED}/change-sets?status=submitted,discarded")
+        )
+    );
+    let statuses: Vec<&str> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["status"].as_str())
+        .collect();
+    assert!(
+        statuses.contains(&"submitted") && statuses.contains(&"discarded"),
+        "{listed}"
+    );
 
     // ---- approve and commit A
     let (s, b, _) = call!(
@@ -539,6 +598,47 @@ async fn editor_end_to_end() {
     .unwrap()
     .get("parent_station");
     assert_eq!(parent.as_deref(), Some("ST1"));
+    let kept = sqlx::query(&format!(
+        "SELECT (SELECT provenance->>'human_decision' FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'R1' AND sequence = 1) AS prov, \
+                (SELECT count(*) FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'R1' AND provider_id = '7') AS with_provider, \
+                (SELECT stop_name_override FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'R1' AND stop_id = 'S4') AS over"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept.get::<Option<String>, _>("prov").as_deref(),
+        Some("kept")
+    );
+    assert_eq!(
+        kept.get::<i64, _>("with_provider"),
+        6,
+        "the inserted S6 row takes the route's provider"
+    );
+    assert_eq!(
+        kept.get::<Option<String>, _>("over").as_deref(),
+        Some("STOP 4 ON R1")
+    );
+    let (_, s5, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/feeds/{FEED}/stops/S5"))
+    );
+    assert_eq!(s5["parent"]["stop_id"], "ST1", "{s5}");
+    assert_eq!(s5["route_count"], 1);
+    assert!(
+        s5["nearby"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["distance_m"].is_number() && n["route_count"].is_number()),
+        "{s5}"
+    );
+    let (_, st1, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/feeds/{FEED}/stops/ST1"))
+    );
+    assert_eq!(st1["children"][0]["stop_id"], "S5");
+    assert_eq!(st1["children"][0]["route_count"], 1);
 
     // ---- B is now stale: approve, then commit is a 409 and nothing changes
     let (s, _, _) = call!(
@@ -658,7 +758,7 @@ async fn editor_end_to_end() {
     };
     let (s, _, _) = call!(&app, locker.req("POST", "/auth/totp/enroll"));
     assert_eq!(s, 200);
-    for _ in 0..5 {
+    for left in (0..5).rev() {
         let (s, b, _) = call!(
             &app,
             locker
@@ -666,6 +766,7 @@ async fn editor_end_to_end() {
                 .set_json(json!({"code": "12345"}))
         );
         assert_eq!((s, code_of(&b)), (401, "invalid_code"));
+        assert_eq!(b["error"]["details"]["attempts_left"], left, "{b}");
     }
     let (s, b, _) = call!(
         &app,
@@ -673,7 +774,7 @@ async fn editor_end_to_end() {
             .req("POST", "/auth/totp/confirm")
             .set_json(json!({"code": "123456"}))
     );
-    assert_eq!((s, code_of(&b)), (429, "sign_in_locked"), "{b}");
+    assert_eq!((s, code_of(&b)), (429, "locked"), "{b}");
     assert!(
         b["error"]["details"]["retry_after_seconds"]
             .as_i64()

@@ -87,15 +87,17 @@ export async function showDraft(id, { conflicts = null } = {}) {
       if (action === "commit" || action === "discard" || action === "submit") {
         if (state.draft && state.draft.change_set_id === cs.change_set_id) useDraft(null);
       }
-      if (action === "reopen" && isAuthor) {
+      if (action === "reopen" && (isAuthor || isSubmitter)) {
         const full = await get(`change-sets/${enc(cs.change_set_id)}`);
         useDraft(full);
       }
       if (action === "commit") map.refreshStops();
       showDraft(cs.change_set_id);
     } catch (e) {
-      if (e instanceof ApiError && e.code === "conflict") {
-        toast("Nothing was committed: some changes were overtaken by another commit.", "error");
+      if (e instanceof ApiError && e.code === "change_set_conflicts") {
+        toast(action === "commit"
+          ? "Nothing was committed: some changes were overtaken by another commit."
+          : "Some changes were overtaken by another commit.", "error");
         showDraft(cs.change_set_id, { conflicts: e.details.conflicts || [] });
       } else if (e instanceof ApiError && e.code === "validation_failed") {
         toast(e.message, "error");
@@ -160,7 +162,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
     }));
   }
   if (["submitted", "rejected", "approved"].includes(cs.status)) {
-    actions.push(button("Reopen for editing", { style: "secondary", hideIfNot: true, reason: isAuthor || me.role === "admin" ? null : "Only the person who started this draft, or an admin, can reopen it.",
+    actions.push(button("Reopen for editing", { style: "secondary", hideIfNot: true, reason: isAuthor || isSubmitter || me.role === "admin" ? null : "Only the person who started or submitted this draft, or an admin, can reopen it.",
       onClick: () => act("reopen", undefined, "Reopened as a draft.") }));
   }
   if (!["committed", "discarded"].includes(cs.status)) {
@@ -224,7 +226,7 @@ function changeView(cs, ch, problems, conflict, canRemove) {
   let body;
   if (ch.entity === "stop") body = stopDiff(ch);
   else if (ch.entity === "route") body = routeDiff(ch);
-  else if (ch.entity === "route_stops") body = rowsDiff(ch);
+  else if (ch.entity === "route_stops") body = rowsDiff(ch, cs);
   else body = stationDiff(ch);
   return h("article.change",
     h("div.change-head",
@@ -292,10 +294,11 @@ function rowLabel(r) {
   return `${r.stop_name || r.stop_id} (${r.stop_id})`;
 }
 
-function rowsDiff(ch) {
+function rowsDiff(ch, cs) {
   const before = ch.before || [];
   const names = new Map(before.map((r) => [r.stop_id, r.stop_name]));
-  const after = ((ch.after && ch.after.rows) || []).map((r) => ({ ...r, stop_name: r.stop_name || names.get(r.stop_id) }));
+  const live = cs.stop_names || {};
+  const after = ((ch.after && ch.after.rows) || []).map((r) => ({ ...r, stop_name: r.stop_name || r.stop_name_override || names.get(r.stop_id) || live[r.stop_id] }));
   const diff = diffRows(before, after);
   const counts = { added: 0, removed: 0, moved: 0, changed: 0 };
   diff.forEach((d) => { if (d.kind in counts) counts[d.kind]++; });

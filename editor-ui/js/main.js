@@ -18,7 +18,7 @@ async function boot() {
 
   let feeds = [];
   try {
-    feeds = await get("feeds");
+    feeds = (await get("feeds")).items;
   } catch (e) {
     toast(e.message, "error");
   }

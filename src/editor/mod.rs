@@ -142,7 +142,17 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
     let Some(state) = state else {
         return;
     };
+    let audience = state.audience.clone();
     let data = web::Data::from(state);
+
+    // `/` on the SSO host only; every other host keeps GIMS's own `/` handling.
+    cfg.service(
+        web::resource("/")
+            .guard(actix_web::guard::fn_guard(move |ctx| {
+                static_ui::is_editor_host(ctx.head(), &audience)
+            }))
+            .route(web::get().to(static_ui::root_redirect)),
+    );
 
     // The UI scope must be registered first: the API scope's prefix also
     // matches /internal/gtfs-editor/ui.

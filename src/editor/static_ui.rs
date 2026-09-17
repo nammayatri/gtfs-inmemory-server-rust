@@ -24,6 +24,43 @@ pub async fn redirect_to_slash() -> HttpResponse {
         .finish()
 }
 
+/// Is this request addressed to the editor's own SSO host? Pomerium sets
+/// X-Forwarded-Host; with `preserve_host_header` the Host itself carries it.
+pub fn is_editor_host(req: &actix_web::dev::RequestHead, audience: &str) -> bool {
+    let host_of = |name: header::HeaderName| {
+        req.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.split(',').next().unwrap_or("").trim())
+            .map(|h| {
+                h.rsplit_once(':').map_or(h, |(name, port)| {
+                    if port.chars().all(|c| c.is_ascii_digit()) {
+                        name
+                    } else {
+                        h
+                    }
+                })
+            })
+            .map(str::to_ascii_lowercase)
+    };
+    let want = audience.trim().to_ascii_lowercase();
+    [
+        header::HeaderName::from_static("x-forwarded-host"),
+        header::HOST,
+    ]
+    .into_iter()
+    .filter_map(host_of)
+    .any(|h| h == want)
+}
+
+/// `/` on the SSO host opens the dashboard. Registered with a host guard, so
+/// `/` on any other host (the cluster service, the public gateway) is untouched.
+pub async fn root_redirect() -> HttpResponse {
+    HttpResponse::Found()
+        .insert_header((header::LOCATION, "/internal/gtfs-editor/ui/"))
+        .finish()
+}
+
 pub fn resolve(root: &Path, tail: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for comp in Path::new(tail).components() {
@@ -96,6 +133,38 @@ pub async fn serve(req: HttpRequest, state: web::Data<EditorState>) -> HttpRespo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_editor_host_is_redirected() {
+        let head = |pairs: &[(&'static str, &str)]| {
+            let mut req = actix_web::test::TestRequest::get();
+            for (k, v) in pairs {
+                req = req.insert_header((*k, *v));
+            }
+            req.to_srv_request().head().clone()
+        };
+        let aud = "gtfs.sso.example";
+        assert!(is_editor_host(&head(&[("host", "gtfs.sso.example")]), aud));
+        assert!(is_editor_host(
+            &head(&[("host", "GTFS.sso.example:443")]),
+            aud
+        ));
+        assert!(is_editor_host(
+            &head(&[
+                ("host", "gtfs-inmemory-data-server:8000"),
+                ("x-forwarded-host", "gtfs.sso.example")
+            ]),
+            aud
+        ));
+        assert!(!is_editor_host(
+            &head(&[("host", "gtfs-inmemory-data-server:8000")]),
+            aud
+        ));
+        assert!(!is_editor_host(
+            &head(&[("host", "api.sandbox.moving.tech")]),
+            aud
+        ));
+    }
 
     #[test]
     fn paths_stay_inside_the_ui_directory() {

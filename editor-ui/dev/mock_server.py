@@ -685,14 +685,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.check_code(u, u["pending_secret"], self._body().get("code"))
                 u.update(totp_secret=u["pending_secret"], pending_secret=None, totp_enabled=True)
                 exp = self.start_session(u)
-                s.add_audit(u, "totp_enrolled")
+                s.add_audit(u, "totp_confirmed")
                 return 200, {"totp_enabled": True, "expires_at": iso(exp)}
             if parts == ["auth", "session"] and method == "POST":
                 if not u["totp_enabled"]:
                     raise ApiError(400, "enroll_first", "Set up two-step sign-in first.")
                 self.check_code(u, u["totp_secret"], self._body().get("code"))
                 exp = self.start_session(u)
-                s.add_audit(u, "sign_in")
+                s.add_audit(u, "session_created")
                 return 200, {"expires_at": iso(exp)}
             if parts == ["auth", "session"] and method == "DELETE":
                 tok = self._cookies().get("gtfs_editor_session")
@@ -706,8 +706,9 @@ class Handler(BaseHTTPRequestHandler):
         self.require_mutation(method)
 
         if parts == ["feeds"] and method == "GET":
-            return 200, [{k: f.get(k) for k in ("gtfs_id", "display_name", "version", "data_source",
-                                                "released_version")} for f in s.feeds.values()]
+            return 200, {"items": [{k: f.get(k) for k in ("gtfs_id", "display_name", "version", "data_source",
+                                                          "released_version")} for f in s.feeds.values()],
+                         "next_cursor": None}
 
         if parts[0] == "feeds" and len(parts) >= 2:
             g = parts[1]
@@ -775,13 +776,15 @@ class Handler(BaseHTTPRequestHandler):
                 proj = Projection(s, cs["gtfs_id"], cs["changes"])
                 if not proj.route(rest[2]):
                     raise ApiError(404, "unknown_route", f"Route {rest[2]} does not exist.")
-                return 200, route_detail(proj, rest[2])
+                return 200, route_detail(proj, rest[2]) | {"validation": validate_set(s, cs),
+                                                           "conflicts": conflicts_for(s, cs)}
             if len(rest) == 1 and method == "POST":
                 return 200, self.transition(u, cs, rest[0], self._body())
         if parts[0] == "users":
             self.require_role(u, "admin")
             if parts == ["users"] and method == "GET":
-                return 200, [user_out(x) for x in sorted(s.users.values(), key=lambda x: x["email"])]
+                return 200, {"items": [user_out(x) for x in sorted(s.users.values(), key=lambda x: x["email"])],
+                             "next_cursor": None}
             if parts == ["users"] and method == "POST":
                 b = self._body()
                 email = (b.get("email") or "").strip().lower()
@@ -796,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "role": b.get("role", "viewer"), "status": "active", "totp_enabled": False,
                                 "totp_secret": None, "pending_secret": None, "totp_last_step": None,
                                 "created_at": iso(now()), "last_login_at": None}
-                s.add_audit(u, "user_added", detail={"email": email, "role": s.users[uid]["role"]})
+                s.add_audit(u, "user_created", detail={"email": email, "role": s.users[uid]["role"]})
                 return 201, user_out(s.users[uid])
             if len(parts) == 2 and method == "PATCH":
                 t = s.users.get(parts[1]) or self._404("user")
@@ -818,7 +821,7 @@ class Handler(BaseHTTPRequestHandler):
                 t.update(totp_enabled=False, totp_secret=None, pending_secret=None, totp_last_step=None)
                 for k in [k for k, v in s.sessions.items() if v["user_id"] == t["user_id"]]:
                     s.sessions.pop(k)
-                s.add_audit(u, "totp_reset", detail={"email": t["email"]})
+                s.add_audit(u, "user_totp_reset", detail={"email": t["email"]})
                 return 200, user_out(t)
         raise ApiError(404, "not_found", "No such endpoint.")
 
@@ -907,7 +910,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def set_full(self, cs):
         s = self.store
-        return self.set_summary(cs) | {"changes": cs["changes"], "validation": validate_set(s, cs),
+        ids = {r.get("stop_id") for ch in cs["changes"] if ch["entity"] == "route_stops"
+               for r in (ch.get("after") or {}).get("rows", []) if r.get("stop_id")}
+        names = {i: s.stops[(cs["gtfs_id"], i)]["name"] for i in ids if (cs["gtfs_id"], i) in s.stops}
+        return self.set_summary(cs) | {"stop_names": names, "changes": cs["changes"], "validation": validate_set(s, cs),
                                        "conflicts": conflicts_for(s, cs),
                                        "feed_version": s.feeds[cs["gtfs_id"]]["version"]}
 
@@ -936,7 +942,7 @@ class Handler(BaseHTTPRequestHandler):
     def add_change(self, u, cs, b):
         self.require_role(u, "editor")
         if cs["status"] != "draft":
-            raise ApiError(409, "not_a_draft", "Only a draft can be edited. Reopen it first.")
+            raise ApiError(409, "change_set_not_draft", "Only a draft can be edited. Reopen it first.")
         entity, op, key = b.get("entity"), b.get("op"), str(b.get("entity_key") or "").strip()
         valid = {"stop": {"create", "update", "delete"}, "route": {"update"},
                  "route_stops": {"replace"}, "station": {"create", "update", "delete"}}
@@ -966,7 +972,7 @@ class Handler(BaseHTTPRequestHandler):
     def edit_change(self, u, cs, change_id, method):
         self.require_role(u, "editor")
         if cs["status"] != "draft":
-            raise ApiError(409, "not_a_draft", "Only a draft can be edited. Reopen it first.")
+            raise ApiError(409, "change_set_not_draft", "Only a draft can be edited. Reopen it first.")
         ch = next((c for c in cs["changes"] if c["change_id"] == change_id), None)
         if not ch:
             raise ApiError(404, "unknown_change", "That change is not in this draft.")
@@ -1024,7 +1030,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, "own_submission", "You submitted this change, so someone else must commit it.")
             conflicts = conflicts_for(s, cs)
             if conflicts:
-                raise ApiError(409, "conflict", "Some of this draft's changes were overtaken by another commit.",
+                raise ApiError(409, "change_set_conflicts", "Some of this draft's changes were overtaken by another commit.",
                                {"conflicts": conflicts})
             errors = [v for v in validate_set(s, cs) if v["level"] == "error"]
             if errors:
@@ -1043,7 +1049,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             raise ApiError(404, "not_found", "No such action.")
         cs["updated_at"] = t
-        s.add_audit(u, f"change_set_{action}", cs["gtfs_id"], cs["change_set_id"],
+        past = {"submit": "submitted", "reopen": "reopened", "approve": "approved", "reject": "rejected",
+                "commit": "committed", "discard": "discarded"}[action]
+        s.add_audit(u, f"change_set_{past}", cs["gtfs_id"], cs["change_set_id"],
                     {"title": cs["title"], "comment": b.get("comment"), "version": cs.get("committed_version")})
         return self.set_full(cs)
 

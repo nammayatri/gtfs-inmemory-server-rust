@@ -86,19 +86,8 @@ async fn start_session(
 }
 
 pub async fn me(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
-    let id = auth::identity(&req)?;
-    let user = auth::user_for_email(&st, &id.email).await?.ok_or_else(|| {
-        EditorError::forbidden(
-            "user_not_found",
-            format!(
-                "{} has no editor account; ask an admin to add you",
-                id.email
-            ),
-        )
-    })?;
-    let session = user.status == "active"
-        && user.totp_enabled
-        && auth::session_user(&req, &st, &user).await?;
+    let user = auth::active_user(&req, &st).await?;
+    let session = user.totp_enabled && auth::session_user(&req, &st, &user).await?;
     let locked = auth::lockout_seconds(&st, user.user_id).await?;
     ok(json!({
         "user_id": user.user_id,
@@ -121,7 +110,7 @@ pub struct CodeBody {
 fn locked_error(seconds: i64) -> EditorError {
     EditorError::new(
         StatusCode::TOO_MANY_REQUESTS,
-        "sign_in_locked",
+        "locked",
         format!(
             "too many wrong codes; try again in {} minute(s)",
             (seconds + 59) / 60
@@ -190,7 +179,9 @@ fn open_secret(st: &EditorState, user: &auth::User) -> EditorResult<Vec<u8>> {
         })
 }
 
-async fn record_failure(st: &EditorState, user: &auth::User, reason: &str) -> EditorResult<()> {
+/// Record a wrong or replayed code; returns how many tries are left before
+/// sign-in locks.
+async fn record_failure(st: &EditorState, user: &auth::User, reason: &str) -> EditorResult<i64> {
     auth::audit(
         &st.pool,
         Some(user.user_id),
@@ -201,7 +192,24 @@ async fn record_failure(st: &EditorState, user: &auth::User, reason: &str) -> Ed
         json!({"reason": reason}),
     )
     .await?;
-    Ok(())
+    let failed = auth::failed_codes(st, user.user_id).await?;
+    Ok((auth::MAX_FAILED_CODES - failed).max(0))
+}
+
+fn invalid_code(attempts_left: i64) -> EditorError {
+    EditorError::unauthorized(
+        "invalid_code",
+        "that code is not right; check the time on your phone",
+    )
+    .with_details(json!({"attempts_left": attempts_left}))
+}
+
+fn code_reused(attempts_left: i64) -> EditorError {
+    EditorError::unauthorized(
+        "code_reused",
+        "that code was already used; wait for the next one",
+    )
+    .with_details(json!({"attempts_left": attempts_left}))
 }
 
 pub async fn totp_confirm(
@@ -222,11 +230,8 @@ pub async fn totp_confirm(
     let secret = open_secret(&st, &user)?;
     let now = chrono::Utc::now().timestamp() as u64;
     let TotpCheck::Valid(step) = crypto::totp_check(&secret, &body.code, now, None) else {
-        record_failure(&st, &user, "invalid").await?;
-        return Err(EditorError::unauthorized(
-            "invalid_code",
-            "that code is not right; check the time on your phone",
-        ));
+        let left = record_failure(&st, &user, "invalid").await?;
+        return Err(invalid_code(left));
     };
     let updated = sqlx::query(
         "UPDATE gtfs_editor_user SET totp_enabled = true, totp_last_step = $2, last_login_at = now() \
@@ -287,11 +292,8 @@ pub async fn session_create(
             .fetch_optional(&st.pool)
             .await?;
             if won.is_none() {
-                record_failure(&st, &user, "reused").await?;
-                return Err(EditorError::unauthorized(
-                    "code_reused",
-                    "that code was already used; wait for the next one",
-                ));
+                let left = record_failure(&st, &user, "reused").await?;
+                return Err(code_reused(left));
             }
             let (token, expires_at) = start_session(&req, &st, &user).await?;
             auth::audit(
@@ -309,18 +311,12 @@ pub async fn session_create(
                 .json(json!({"expires_at": expires_at})))
         }
         TotpCheck::Reused => {
-            record_failure(&st, &user, "reused").await?;
-            Err(EditorError::unauthorized(
-                "code_reused",
-                "that code was already used; wait for the next one",
-            ))
+            let left = record_failure(&st, &user, "reused").await?;
+            Err(code_reused(left))
         }
         TotpCheck::Invalid => {
-            record_failure(&st, &user, "invalid").await?;
-            Err(EditorError::unauthorized(
-                "invalid_code",
-                "that code is not right; check the time on your phone",
-            ))
+            let left = record_failure(&st, &user, "invalid").await?;
+            Err(invalid_code(left))
         }
     }
 }
@@ -441,10 +437,7 @@ pub async fn polyline_osrm(
     let ctx = auth::require(&req, &st, Role::Editor).await?;
     let (g, route_id) = path.into_inner();
     let detail = match q.change_set {
-        Some(id) => {
-            let preview = svc::preview_route(&st, &ctx, id, &route_id).await?;
-            preview["route"].clone()
-        }
+        Some(id) => svc::preview_route(&st, &ctx, id, &route_id).await?,
         None => {
             let mut conn = st.pool.acquire().await?;
             svc::route_detail(&mut conn, &g, &route_id).await?
@@ -471,6 +464,7 @@ pub async fn polyline_osrm(
     ok(json!({
         "route_id": route_id,
         "encoded_polyline": polyline,
+        "polyline_source": "osrm",
         "waypoints": points.len(),
         "distance_m": distance.round(),
         "saved": false,

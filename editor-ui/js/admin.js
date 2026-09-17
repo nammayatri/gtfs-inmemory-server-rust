@@ -24,7 +24,7 @@ export async function showPeople() {
 
   const load = async () => {
     try {
-      const users = await get("users");
+      const users = (await get("users")).items;
       clear(tableBox, h("div.table-wrap", h("table",
         h("thead", h("tr", h("th", "Person"), h("th", "Role"), h("th", "Access"), h("th", "Two-step sign-in"), h("th", "Last signed in"), h("th", ""))),
         h("tbody", users.map((u) => userRow(u, load))))));
@@ -108,23 +108,28 @@ function userRow(u, reload) {
 }
 
 // ------------------------------------------------------------------ history
+// Keys are the audit actions the API writes (src/editor, docs/gtfs-editor.md).
 const ACTION_LABEL = {
   seed: "Loaded the feed data",
-  sign_in: "Signed in",
-  totp_enrolled: "Set up two-step sign-in",
-  totp_reset: "Reset someone's two-step sign-in",
-  user_added: "Added a person",
+  release: "Released the feed",
+  user_bootstrapped: "First admin sign-in",
+  totp_enroll_started: "Started two-step sign-in set-up",
+  totp_confirmed: "Set up two-step sign-in",
+  totp_failed: "Entered a wrong code",
+  session_created: "Signed in",
+  user_totp_reset: "Reset someone's two-step sign-in",
+  user_created: "Added a person",
   user_updated: "Changed a person's access",
   change_set_created: "Started a draft",
   change_added: "Added a change",
   change_updated: "Updated a change",
   change_removed: "Removed a change",
-  change_set_submit: "Submitted for review",
-  change_set_approve: "Approved",
-  change_set_reject: "Rejected",
-  change_set_commit: "Committed (live)",
-  change_set_reopen: "Reopened",
-  change_set_discard: "Discarded",
+  change_set_submitted: "Submitted for review",
+  change_set_approved: "Approved",
+  change_set_rejected: "Rejected",
+  change_set_committed: "Committed (live)",
+  change_set_reopened: "Reopened",
+  change_set_discarded: "Discarded",
 };
 
 function detailText(a) {
@@ -137,6 +142,8 @@ function detailText(a) {
   if (d.status) parts.push(d.status);
   if (d.comment) parts.push(`comment: ${d.comment}`);
   if (d.version) parts.push(`feed version ${d.version}`);
+  if (d.feed_version) parts.push(`feed version ${d.feed_version}, ${d.changes} change${d.changes === 1 ? "" : "s"}`);
+  if (d.from) parts.push(`was ${d.from}`);
   return parts.join(", ");
 }
 
