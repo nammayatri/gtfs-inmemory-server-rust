@@ -16,6 +16,12 @@ pub const STOP_TYPES: [&str; 5] = [
 pub const UNSERVED_TYPES: [&str; 3] = ["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"];
 
 pub const MOVE_WARNING_METRES: f64 = 500.0;
+/// A merge of stops further apart than this is a warning.
+pub const MERGE_FAR_METRES: f64 = 150.0;
+/// Longest platform label a station member may carry.
+pub const PLATFORM_CODE_MAX_CHARS: usize = 120;
+/// Stop ids the server mints: `ed_` + 10 lower-case hex digits.
+pub const MINTED_STOP_PREFIX: &str = "ed_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,6 +39,9 @@ pub struct Finding {
     /// that already existed before an edit can be told apart from a new one.
     #[serde(skip)]
     pub key: String,
+    /// The row a route-order finding is about (index into the rows checked).
+    #[serde(skip)]
+    pub row: Option<usize>,
 }
 
 impl Finding {
@@ -42,6 +51,7 @@ impl Finding {
             code: code.to_string(),
             message: message.into(),
             key: key.into(),
+            row: None,
         }
     }
 
@@ -51,7 +61,13 @@ impl Finding {
             code: code.to_string(),
             message: message.into(),
             key: key.into(),
+            row: None,
         }
+    }
+
+    pub fn at(mut self, row: usize) -> Self {
+        self.row = Some(row);
+        self
     }
 }
 
@@ -95,6 +111,16 @@ impl RouteRow {
 /// of the NEW STOP before it. A stop on the wrong side of a stage boundary
 /// changes what a passenger is charged.
 pub fn check_route_rows(rows: &[RouteRow]) -> Vec<Finding> {
+    check_route_rows_labelled(rows, &|i| format!("row {}", i + 1))
+}
+
+/// [`check_route_rows`], naming row `i` with `label(i)` in messages (a bulk
+/// import names rows by their uploaded sequence). Every finding about one row
+/// carries its index in [`Finding::row`]; keys never depend on the label.
+pub fn check_route_rows_labelled(
+    rows: &[RouteRow],
+    label: &dyn Fn(usize) -> String,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     if rows.is_empty() {
         out.push(Finding::error(
@@ -111,51 +137,67 @@ pub fn check_route_rows(rows: &[RouteRow]) -> Vec<Finding> {
     let mut served = 0;
 
     for (i, r) in rows.iter().enumerate() {
-        let pos = i + 1;
+        let n = i + 1;
+        let pos = label(i);
         if !STOP_TYPES.contains(&r.stop_type.as_str()) {
-            out.push(Finding::error(
-                "unknown_stop_type",
-                format!("{}|{}", r.stop_type, pos),
-                format!("row {pos}: unknown stop type {:?}", r.stop_type),
-            ));
+            out.push(
+                Finding::error(
+                    "unknown_stop_type",
+                    format!("{}|{}", r.stop_type, n),
+                    format!("{pos}: unknown stop type {:?}", r.stop_type),
+                )
+                .at(i),
+            );
             continue;
         }
         if r.stage_name.trim().is_empty() {
-            out.push(Finding::error(
-                "stage_name_missing",
-                format!("{:?}|{}", r.stop_id, r.stage_no),
-                format!("row {pos}: stage name is empty"),
-            ));
+            out.push(
+                Finding::error(
+                    "stage_name_missing",
+                    format!("{:?}|{}", r.stop_id, r.stage_no),
+                    format!("{pos}: stage name is empty"),
+                )
+                .at(i),
+            );
         }
         if r.is_marker() {
             if r.stop_id.is_some() {
                 out.push(Finding::error(
                     "marker_has_stop",
                     format!("{:?}", r.marker_id),
-                    format!("row {pos}: a ROUTE CORRECTION row is a shaping point and cannot carry a stop id"),
-                ));
+                    format!("{pos}: a ROUTE CORRECTION row is a shaping point and cannot carry a stop id"),
+                ).at(i));
             }
             match (r.marker_lat, r.marker_lon) {
                 (Some(lat), Some(lon)) if valid_lat_lon(lat, lon) => {}
-                _ => out.push(Finding::error(
-                    "marker_position",
-                    format!("{:?}", r.marker_id),
-                    format!("row {pos}: a ROUTE CORRECTION row needs a valid marker position"),
-                )),
+                _ => out.push(
+                    Finding::error(
+                        "marker_position",
+                        format!("{:?}", r.marker_id),
+                        format!("{pos}: a ROUTE CORRECTION row needs a valid marker position"),
+                    )
+                    .at(i),
+                ),
             }
             if r.stop_name_override.is_some() {
-                out.push(Finding::error(
-                    "marker_name_override",
-                    format!("{:?}", r.marker_id),
-                    format!("row {pos}: use marker_name on a ROUTE CORRECTION row"),
-                ));
+                out.push(
+                    Finding::error(
+                        "marker_name_override",
+                        format!("{:?}", r.marker_id),
+                        format!("{pos}: use marker_name on a ROUTE CORRECTION row"),
+                    )
+                    .at(i),
+                );
             }
         } else if r.stop_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            out.push(Finding::error(
-                "stop_missing",
-                format!("{pos}"),
-                format!("row {pos}: {} needs a stop id", r.stop_type),
-            ));
+            out.push(
+                Finding::error(
+                    "stop_missing",
+                    format!("{n}"),
+                    format!("{pos}: {} needs a stop id", r.stop_type),
+                )
+                .at(i),
+            );
             continue;
         }
 
@@ -163,14 +205,17 @@ pub fn check_route_rows(rows: &[RouteRow]) -> Vec<Finding> {
         if !r.is_marker() {
             if let Some(max) = max_stage {
                 if r.stage_no < max {
-                    out.push(Finding::error(
-                        "stage_decreases",
-                        format!("{sid}|{max}->{}", r.stage_no),
-                        format!(
-                            "row {pos} ({sid}): stage {} comes after stage {max}",
-                            r.stage_no
-                        ),
-                    ));
+                    out.push(
+                        Finding::error(
+                            "stage_decreases",
+                            format!("{sid}|{max}->{}", r.stage_no),
+                            format!(
+                                "{pos} ({sid}): stage {} comes after stage {max}",
+                                r.stage_no
+                            ),
+                        )
+                        .at(i),
+                    );
                 }
             }
             max_stage = Some(max_stage.map_or(r.stage_no, |m| m.max(r.stage_no)));
@@ -181,21 +226,25 @@ pub fn check_route_rows(rows: &[RouteRow]) -> Vec<Finding> {
                 last_stage = Some((r.stage_no, r.stage_name.as_str()));
             }
             "INTERMEDIATE STOP" => match last_stage {
-                None => out.push(Finding::error(
-                    "intermediate_before_stage",
-                    format!("{sid}|{}|{}", r.stage_no, r.stage_name),
-                    format!("row {pos} ({sid}): an INTERMEDIATE STOP must follow a NEW STOP"),
-                )),
-                Some((no, name)) if no != r.stage_no || name != r.stage_name => {
-                    out.push(Finding::error(
+                None => out.push(
+                    Finding::error(
+                        "intermediate_before_stage",
+                        format!("{sid}|{}|{}", r.stage_no, r.stage_name),
+                        format!("{pos} ({sid}): an INTERMEDIATE STOP must follow a NEW STOP"),
+                    )
+                    .at(i),
+                ),
+                Some((no, name)) if no != r.stage_no || name != r.stage_name => out.push(
+                    Finding::error(
                         "fare_stage_mismatch",
                         format!("{sid}|{}|{}", r.stage_no, r.stage_name),
                         format!(
-                            "row {pos} ({sid}): an INTERMEDIATE STOP must carry the preceding NEW STOP's stage {no} {name:?}, not {} {:?}",
+                            "{pos} ({sid}): an INTERMEDIATE STOP must carry the preceding NEW STOP's stage {no} {name:?}, not {} {:?}",
                             r.stage_no, r.stage_name
                         ),
-                    ))
-                }
+                    )
+                    .at(i),
+                ),
                 _ => {}
             },
             _ => {}
@@ -206,19 +255,25 @@ pub fn check_route_rows(rows: &[RouteRow]) -> Vec<Finding> {
             if !first_served_seen {
                 first_served_seen = true;
                 if r.stop_type != "NEW STOP" {
-                    out.push(Finding::error(
-                        "first_stop_not_stage",
-                        sid.to_string(),
-                        format!("row {pos} ({sid}): the first stop a passenger can board must be a NEW STOP"),
-                    ));
+                    out.push(
+                        Finding::error(
+                            "first_stop_not_stage",
+                            sid.to_string(),
+                            format!("{pos} ({sid}): the first stop a passenger can board must be a NEW STOP"),
+                        )
+                        .at(i),
+                    );
                 }
             }
             if prev_served == Some(sid) {
-                out.push(Finding::error(
-                    "stop_repeated",
-                    sid.to_string(),
-                    format!("row {pos} ({sid}): the same stop appears twice in a row"),
-                ));
+                out.push(
+                    Finding::error(
+                        "stop_repeated",
+                        sid.to_string(),
+                        format!("{pos} ({sid}): the same stop appears twice in a row"),
+                    )
+                    .at(i),
+                );
             }
             prev_served = Some(sid);
         }
@@ -291,6 +346,109 @@ pub fn check_entity_id(field: &str, id: &str) -> Result<(), Finding> {
             format!("{field} must be 1-64 characters of letters, digits, '_', '-' or '.'"),
         ))
     }
+}
+
+/// A fresh stop id: `ed_` + 10 lower-case hex digits (40 random bits). The
+/// caller checks it is unused.
+pub fn mint_stop_id() -> String {
+    format!(
+        "{MINTED_STOP_PREFIX}{}",
+        hex::encode(super::crypto::random_bytes(5))
+    )
+}
+
+/// GTFS route_type: the basic types and Google's extended range.
+pub fn valid_route_type(t: i64) -> bool {
+    matches!(t, 0..=7 | 11 | 12 | 100..=1702)
+}
+
+/// One member of a station change. `platform_code` is `None` when the change
+/// leaves the stop's label alone, `Some(None)` when it clears it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberSpec {
+    pub stop_id: String,
+    pub platform_code: Option<Option<String>>,
+}
+
+/// A station change's members, from `members: [{stop_id, platform_code?}]` or
+/// the older `member_stop_ids: [...]`. `None` when it sends neither.
+pub fn station_members(m: &Map<String, Value>) -> Option<Vec<MemberSpec>> {
+    if let Some(list) = m.get("members").and_then(Value::as_array) {
+        return Some(
+            list.iter()
+                .filter_map(|v| {
+                    let o = v.as_object()?;
+                    Some(MemberSpec {
+                        stop_id: o.get("stop_id")?.as_str()?.trim().to_string(),
+                        platform_code: o.get("platform_code").map(|p| {
+                            p.as_str()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                        }),
+                    })
+                })
+                .collect(),
+        );
+    }
+    m.get("member_stop_ids")?.as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| MemberSpec {
+                stop_id: s.to_string(),
+                platform_code: None,
+            })
+            .collect()
+    })
+}
+
+/// What merging stop `from` into `into` does to one route, given its rows in
+/// sequence order as `(sequence, stop_id, stop_type)`.
+#[derive(Debug, Default, PartialEq)]
+pub struct MergeEffect {
+    /// Consecutive served rows that would both call `into` because of the
+    /// merge (one was `from`, the other `into`), as sequence pairs.
+    pub repeats: Vec<(i32, i32)>,
+    /// Sequences of the rows calling `from` and `into` (markers excluded).
+    pub from_seqs: Vec<i32>,
+    pub into_seqs: Vec<i32>,
+}
+
+/// A route row as `(sequence, stop_id, stop_type)`.
+pub type SequencedStop = (i32, Option<String>, String);
+
+pub fn merge_effect(rows: &[SequencedStop], from: &str, into: &str) -> MergeEffect {
+    let served: Vec<(i32, &str)> = rows
+        .iter()
+        .filter(|(_, s, t)| s.is_some() && !UNSERVED_TYPES.contains(&t.as_str()))
+        .map(|(q, s, _)| (*q, s.as_deref().unwrap_or("")))
+        .collect();
+    let after = |s: &str| {
+        if s == from {
+            into.to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let mut out = MergeEffect::default();
+    for w in served.windows(2) {
+        let ((qa, a), (qb, b)) = (w[0], w[1]);
+        // a pair that was already the same stop is not the merge's doing
+        if a != b && after(a) == after(b) {
+            out.repeats.push((qa, qb));
+        }
+    }
+    for (q, s, t) in rows {
+        if t == "ROUTE CORRECTION" {
+            continue;
+        }
+        match s.as_deref() {
+            Some(x) if x == from => out.from_seqs.push(*q),
+            Some(x) if x == into => out.into_seqs.push(*q),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn is_hex_color(v: &str) -> bool {
@@ -415,6 +573,48 @@ fn lat_lon(map: &Map<String, Value>, required: bool, what: &str) -> Result<(), F
     Ok(())
 }
 
+/// The field of `after` that names the row a create makes.
+pub fn create_id_field(entity: &str, op: &str) -> Option<&'static str> {
+    match (entity, op) {
+        ("stop", "create") => Some("stop_id"),
+        ("route", "create") => Some("route_id"),
+        ("station", "create") => Some("station_id"),
+        _ => None,
+    }
+}
+
+/// A create names its row twice, as `entity_key` and in `after`; either may be
+/// left out and is filled from the other. Both empty (a stop whose id the server
+/// mints) leaves both empty. A mismatch is left for [`check_payload`] to refuse.
+pub fn settle_create_key(entity: &str, op: &str, key: &mut String, after: &mut Value) {
+    let Some(field) = create_id_field(entity, op) else {
+        return;
+    };
+    let Some(m) = after.as_object_mut() else {
+        return;
+    };
+    let given = m
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    match given {
+        Some(id) => {
+            if key.is_empty() {
+                *key = id.clone();
+            }
+            m.insert(field.to_string(), Value::String(id));
+        }
+        None if !key.is_empty() => {
+            m.insert(field.to_string(), Value::String(key.clone()));
+        }
+        None => {
+            m.remove(field);
+        }
+    }
+}
+
 /// Shape checks run when a change is added. Anything that needs live data
 /// (does the stop exist, is it in use) is checked by the service.
 pub fn check_payload(
@@ -500,7 +700,7 @@ pub fn check_payload(
             }
             Ok(())
         }
-        ("stop", "delete") | ("station", "delete") => {
+        ("stop", "delete") | ("station", "delete") | ("route", "delete") => {
             if after.is_null() {
                 Ok(())
             } else {
@@ -510,6 +710,110 @@ pub fn check_payload(
                     format!("{what}: `after` must be null"),
                 ))
             }
+        }
+        ("stop", "merge") => {
+            let m = obj(after, what)?;
+            allow_only(
+                m,
+                &[
+                    "into_stop_id",
+                    "into_row_version",
+                    "keep_name",
+                    "keep_position",
+                ],
+                what,
+            )?;
+            let into = req_string(m, "into_stop_id", what)?;
+            if into == entity_key.trim() {
+                return Err(Finding::error(
+                    "merge_same_stop",
+                    into,
+                    format!("{what}: a stop cannot be merged into itself"),
+                ));
+            }
+            if entity_key.starts_with("prm_") || into.starts_with("prm_") {
+                return Err(Finding::error(
+                    "merge_prm_stop",
+                    format!("{entity_key}->{into}"),
+                    format!("{what}: prm_ stops are never merged"),
+                ));
+            }
+            match m.get("into_row_version") {
+                None | Some(Value::Null) => {}
+                Some(v)
+                    if v.as_i64()
+                        .is_some_and(|n| (1..=i32::MAX as i64).contains(&n)) => {}
+                _ => {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "into_row_version",
+                        format!("{what}: into_row_version must be a positive whole number"),
+                    ))
+                }
+            }
+            for k in ["keep_name", "keep_position"] {
+                match m.get(k) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(v)) if v == "into" || v == "from" => {}
+                    _ => {
+                        return Err(Finding::error(
+                            "invalid_payload",
+                            k,
+                            format!("{what}: {k} is \"into\" or \"from\""),
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        }
+        ("route", "create") => {
+            let m = obj(after, what)?;
+            allow_only(
+                m,
+                &[
+                    "route_id",
+                    "short_name",
+                    "long_name",
+                    "route_type",
+                    "color",
+                    "agency_id",
+                ],
+                what,
+            )?;
+            let id = req_string(m, "route_id", what)?;
+            check_entity_id("route_id", id)?;
+            if id != entity_key {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    id,
+                    format!("{what}: entity_key must equal route_id"),
+                ));
+            }
+            req_string(m, "short_name", what)?;
+            for k in ["long_name", "color", "agency_id"] {
+                opt_string(m, k, what)?;
+            }
+            if let Some(c) = m.get("color").and_then(Value::as_str) {
+                if !is_hex_color(c) {
+                    return Err(Finding::error(
+                        "invalid_color",
+                        c,
+                        format!("{what}: color must be #RRGGBB"),
+                    ));
+                }
+            }
+            match m.get("route_type") {
+                None | Some(Value::Null) => {}
+                Some(v) if v.as_i64().is_some_and(valid_route_type) => {}
+                Some(v) => {
+                    return Err(Finding::error(
+                        "invalid_route_type",
+                        v.to_string(),
+                        format!("{what}: route_type {v} is not a GTFS route type"),
+                    ))
+                }
+            }
+            Ok(())
         }
         ("route", "update") => {
             let m = obj(after, what)?;
@@ -602,9 +906,24 @@ pub fn check_payload(
             let m = obj(after, what)?;
             let create = op == "create";
             let allowed: &[&str] = if create {
-                &["station_id", "name", "lat", "lon", "member_stop_ids"]
+                &[
+                    "station_id",
+                    "name",
+                    "lat",
+                    "lon",
+                    "member_stop_ids",
+                    "members",
+                    "proposal_id",
+                ]
             } else {
-                &["name", "lat", "lon", "member_stop_ids"]
+                &[
+                    "name",
+                    "lat",
+                    "lon",
+                    "member_stop_ids",
+                    "members",
+                    "proposal_id",
+                ]
             };
             allow_only(m, allowed, what)?;
             if create {
@@ -620,7 +939,7 @@ pub fn check_payload(
                 req_string(m, "name", what)?;
                 lat_lon(m, true, what)?;
             } else {
-                if m.is_empty() {
+                if m.keys().all(|k| k == "proposal_id") {
                     return Err(Finding::error(
                         "invalid_payload",
                         "",
@@ -639,6 +958,42 @@ pub fn check_payload(
                 }
                 lat_lon(m, false, what)?;
             }
+            match m.get("proposal_id") {
+                None | Some(Value::Null) => {}
+                Some(v) if v.as_i64().is_some_and(|n| n > 0) => {}
+                _ => {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "proposal_id",
+                        format!("{what}: proposal_id must be a positive whole number"),
+                    ))
+                }
+            }
+            if m.contains_key("member_stop_ids") && m.contains_key("members") {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "members",
+                    format!("{what}: send members or member_stop_ids, not both"),
+                ));
+            }
+            let mut seen = HashSet::new();
+            let mut member = |s: &str| -> Result<(), Finding> {
+                if s == entity_key {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        s,
+                        format!("{what}: a station cannot contain itself"),
+                    ));
+                }
+                if !seen.insert(s.to_string()) {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        s,
+                        format!("{what}: {s} is listed twice"),
+                    ));
+                }
+                Ok(())
+            };
             if let Some(members) = m.get("member_stop_ids") {
                 let list = members.as_array().ok_or_else(|| {
                     Finding::error(
@@ -647,7 +1002,6 @@ pub fn check_payload(
                         format!("{what}: member_stop_ids must be a list"),
                     )
                 })?;
-                let mut seen = HashSet::new();
                 for v in list {
                     let s = v.as_str().ok_or_else(|| {
                         Finding::error(
@@ -656,26 +1010,45 @@ pub fn check_payload(
                             format!("{what}: member ids are strings"),
                         )
                     })?;
-                    if s == entity_key {
-                        return Err(Finding::error(
+                    member(s)?;
+                }
+            } else if let Some(members) = m.get("members") {
+                let list = members.as_array().ok_or_else(|| {
+                    Finding::error(
+                        "invalid_payload",
+                        "members",
+                        format!("{what}: members must be a list of {{stop_id, platform_code?}}"),
+                    )
+                })?;
+                for v in list {
+                    let o = v.as_object().ok_or_else(|| {
+                        Finding::error(
                             "invalid_payload",
-                            s,
-                            format!("{what}: a station cannot contain itself"),
-                        ));
-                    }
-                    if !seen.insert(s) {
-                        return Err(Finding::error(
-                            "invalid_payload",
-                            s,
-                            format!("{what}: {s} is listed twice"),
-                        ));
+                            "members",
+                            format!("{what}: each member is {{stop_id, platform_code?}}"),
+                        )
+                    })?;
+                    allow_only(o, &["stop_id", "platform_code"], what)?;
+                    let s = req_string(o, "stop_id", what)?;
+                    member(s)?;
+                    opt_string(o, "platform_code", what)?;
+                    if let Some(p) = o.get("platform_code").and_then(Value::as_str) {
+                        if p.trim().chars().count() > PLATFORM_CODE_MAX_CHARS {
+                            return Err(Finding::error(
+                                "invalid_platform_code",
+                                s,
+                                format!(
+                                    "{what}: the platform label of {s} is longer than {PLATFORM_CODE_MAX_CHARS} characters"
+                                ),
+                            ));
+                        }
                     }
                 }
             } else if create {
                 return Err(Finding::error(
                     "invalid_payload",
-                    "member_stop_ids",
-                    format!("{what}: member_stop_ids is required"),
+                    "members",
+                    format!("{what}: members (or member_stop_ids) is required"),
                 ));
             }
             Ok(())
@@ -881,6 +1254,273 @@ mod tests {
             check_payload("station", "update", "S", &json!({"member_stop_ids": ["A"]})).is_ok()
         );
         assert!(check_payload("trip", "update", "T", &json!({})).is_err());
+    }
+
+    #[test]
+    fn findings_carry_their_row_and_a_label() {
+        let mut rows = good();
+        rows[5].stage_no = 1;
+        rows[5].stage_name = "ADYAR".into();
+        let f = check_route_rows_labelled(&rows, &|i| format!("sequence {}", (i + 1) * 10));
+        let mismatch = f.iter().find(|x| x.code == "fare_stage_mismatch").unwrap();
+        assert_eq!(mismatch.row, Some(5));
+        assert!(
+            mismatch.message.starts_with("sequence 60 (D)"),
+            "{}",
+            mismatch.message
+        );
+        // the default label is the row number, as before
+        let f = check_route_rows(&rows);
+        assert!(f[0].message.starts_with("row 6 (D)"), "{}", f[0].message);
+        // keys do not depend on the label, so grading matches either way
+        let graded = grade_against_live(
+            check_route_rows_labelled(&rows, &|i| format!("sequence {i}")),
+            &check_route_rows(&rows),
+        );
+        assert!(codes(&graded).is_empty());
+        let few = check_route_rows(&[row("A", "NEW STOP", 1, "X")]);
+        assert_eq!(
+            few.iter().find(|x| x.code == "too_few_stops").unwrap().row,
+            None
+        );
+    }
+
+    #[test]
+    fn minted_stop_ids() {
+        let ids: HashSet<String> = (0..2000).map(|_| mint_stop_id()).collect();
+        assert_eq!(ids.len(), 2000);
+        for id in &ids {
+            assert_eq!(id.len(), 13, "{id}");
+            assert!(id.starts_with("ed_"));
+            assert!(id[3..]
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+            assert!(check_entity_id("stop_id", id).is_ok());
+            assert!(check_payload(
+                "stop",
+                "create",
+                id,
+                &json!({"stop_id": id, "name": "New", "lat": 13.0, "lon": 80.0})
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn create_keys_settle_from_either_side() {
+        let settle = |entity: &str, key: &str, after: Value| {
+            let (mut k, mut a) = (key.to_string(), after);
+            settle_create_key(entity, "create", &mut k, &mut a);
+            (k, a)
+        };
+        assert_eq!(
+            settle("stop", "", json!({"stop_id": " N1 ", "name": "x"})),
+            ("N1".into(), json!({"stop_id": "N1", "name": "x"}))
+        );
+        assert_eq!(
+            settle("route", "R9", json!({"short_name": "9"})),
+            ("R9".into(), json!({"route_id": "R9", "short_name": "9"}))
+        );
+        // neither side: a stop the server mints an id for
+        assert_eq!(
+            settle("stop", "", json!({"stop_id": null, "name": "x"})),
+            ("".into(), json!({"name": "x"}))
+        );
+        // a mismatch is left for check_payload to refuse
+        let (k, a) = settle("station", "S1", json!({"station_id": "S2"}));
+        assert_eq!((k.as_str(), &a["station_id"]), ("S1", &json!("S2")));
+        // not a create: untouched
+        let (mut k, mut a) = (String::new(), json!({"name": "x"}));
+        settle_create_key("stop", "update", &mut k, &mut a);
+        assert_eq!((k.as_str(), a), ("", json!({"name": "x"})));
+    }
+
+    #[test]
+    fn route_create_and_delete_shapes() {
+        let ok = |after: Value| check_payload("route", "create", "R9", &after);
+        assert!(ok(json!({"route_id": "R9", "short_name": "9"})).is_ok());
+        assert!(ok(
+            json!({"route_id": "R9", "short_name": "9", "long_name": "A To B",
+            "route_type": 3, "color": "#00aa11", "agency_id": "CUMTA"})
+        )
+        .is_ok());
+        assert!(ok(json!({"route_id": "R9", "short_name": "9", "route_type": 715})).is_ok());
+        let code = |after: Value| ok(after).unwrap_err().code;
+        assert_eq!(code(json!({"route_id": "R9"})), "invalid_payload");
+        assert_eq!(
+            code(json!({"route_id": "R9", "short_name": " "})),
+            "invalid_payload"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R:9", "short_name": "9"})),
+            "invalid_id"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R8", "short_name": "9"})),
+            "invalid_payload"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R9", "short_name": "9", "color": "red"})),
+            "invalid_color"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R9", "short_name": "9", "route_type": 9})),
+            "invalid_route_type"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R9", "short_name": "9", "route_type": "3"})),
+            "invalid_route_type"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R9", "short_name": "9", "text_color": "#000000"})),
+            "invalid_payload"
+        );
+        assert!(check_payload("route", "delete", "R9", &Value::Null).is_ok());
+        assert!(check_payload("route", "delete", "R9", &json!({})).is_err());
+        assert!(valid_route_type(0) && valid_route_type(12) && valid_route_type(1702));
+        assert!(!valid_route_type(8) && !valid_route_type(99) && !valid_route_type(-1));
+    }
+
+    #[test]
+    fn station_members_with_platform_codes() {
+        let station = |op: &str, after: Value| check_payload("station", op, "S", &after);
+        let base = |members: Value| json!({"station_id": "S", "name": "Adyar", "lat": 13.0, "lon": 80.2, "members": members, "proposal_id": 7});
+        assert!(station("create", base(json!([{"stop_id": "A", "platform_code": "Towards X"}, {"stop_id": "B"}, {"stop_id": "C", "platform_code": null}]))).is_ok());
+        assert!(station("update", json!({"members": [{"stop_id": "A"}]})).is_ok());
+        let long = "x".repeat(PLATFORM_CODE_MAX_CHARS + 1);
+        assert_eq!(
+            station(
+                "create",
+                base(json!([{"stop_id": "A", "platform_code": long}]))
+            )
+            .unwrap_err()
+            .code,
+            "invalid_platform_code"
+        );
+        let fits = "é".repeat(PLATFORM_CODE_MAX_CHARS);
+        assert!(station(
+            "create",
+            base(json!([{"stop_id": "A", "platform_code": fits}]))
+        )
+        .is_ok());
+        for bad in [
+            json!([{"stop_id": "A"}, {"stop_id": "A"}]),
+            json!([{"stop_id": "S"}]),
+            json!([{"stop_id": "A", "extra": 1}]),
+            json!([{"platform_code": "x"}]),
+            json!(["A"]),
+            json!([{"stop_id": "A", "platform_code": 5}]),
+        ] {
+            assert!(station("create", base(bad.clone())).is_err(), "{bad}");
+        }
+        let mut both = base(json!([{"stop_id": "A"}]));
+        both["member_stop_ids"] = json!(["A"]);
+        assert!(station("create", both).is_err());
+        let mut no_members = base(json!([]));
+        no_members.as_object_mut().unwrap().remove("members");
+        assert!(station("create", no_members).is_err());
+        let mut bad_proposal = base(json!([{"stop_id": "A"}]));
+        bad_proposal["proposal_id"] = json!("7");
+        assert!(station("create", bad_proposal).is_err());
+        assert!(station("update", json!({"proposal_id": 7})).is_err());
+
+        let m = json!({"members": [{"stop_id": " A ", "platform_code": " Towards X "}, {"stop_id": "B"}, {"stop_id": "C", "platform_code": null}]});
+        assert_eq!(
+            station_members(m.as_object().unwrap()).unwrap(),
+            vec![
+                MemberSpec {
+                    stop_id: "A".into(),
+                    platform_code: Some(Some("Towards X".into()))
+                },
+                MemberSpec {
+                    stop_id: "B".into(),
+                    platform_code: None
+                },
+                MemberSpec {
+                    stop_id: "C".into(),
+                    platform_code: Some(None)
+                },
+            ]
+        );
+        let m = json!({"member_stop_ids": ["A"]});
+        assert_eq!(
+            station_members(m.as_object().unwrap()).unwrap(),
+            vec![MemberSpec {
+                stop_id: "A".into(),
+                platform_code: None
+            }]
+        );
+        assert!(station_members(json!({"name": "x"}).as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn merge_shapes() {
+        let merge = |from: &str, after: Value| check_payload("stop", "merge", from, &after);
+        assert!(merge("A", json!({"into_stop_id": "B"})).is_ok());
+        assert!(merge("A", json!({"into_stop_id": "B", "into_row_version": 3, "keep_name": "from", "keep_position": "into"})).is_ok());
+        assert_eq!(
+            merge("A", json!({"into_stop_id": "A"})).unwrap_err().code,
+            "merge_same_stop"
+        );
+        assert_eq!(
+            merge("prm_A", json!({"into_stop_id": "B"}))
+                .unwrap_err()
+                .code,
+            "merge_prm_stop"
+        );
+        assert_eq!(
+            merge("A", json!({"into_stop_id": "prm_B"}))
+                .unwrap_err()
+                .code,
+            "merge_prm_stop"
+        );
+        for bad in [
+            json!({}),
+            json!({"into_stop_id": "B", "keep_name": "both"}),
+            json!({"into_stop_id": "B", "into_row_version": 0}),
+            json!({"into_stop_id": "B", "into_row_version": "3"}),
+            json!({"into_stop_id": "B", "name": "x"}),
+            Value::Null,
+        ] {
+            assert!(merge("A", bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn merge_effect_on_a_route() {
+        let r = |q: i32, s: Option<&str>, t: &str| (q, s.map(str::to_string), t.to_string());
+        // MANALI RD.JN on 56D: one id at stage 1, the other at stage 2, back to back
+        let rows = vec![
+            r(1, Some("FROM"), "NEW STOP"),
+            r(2, Some("INTO"), "NEW STOP"),
+            r(3, Some("X"), "NEW STOP"),
+        ];
+        let e = merge_effect(&rows, "FROM", "INTO");
+        assert_eq!(e.repeats, vec![(1, 2)]);
+        assert_eq!((e.from_seqs, e.into_seqs), (vec![1], vec![2]));
+        // markers and unserved rows do not separate two calls
+        let rows = vec![
+            r(1, Some("INTO"), "NEW STOP"),
+            r(2, None, "ROUTE CORRECTION"),
+            r(3, Some("J"), "JUMP STOP"),
+            r(4, Some("FROM"), "INTERMEDIATE STOP"),
+        ];
+        assert_eq!(merge_effect(&rows, "FROM", "INTO").repeats, vec![(1, 4)]);
+        // apart: no repeat, both called
+        let rows = vec![
+            r(1, Some("FROM"), "NEW STOP"),
+            r(2, Some("X"), "INTERMEDIATE STOP"),
+            r(3, Some("INTO"), "NEW STOP"),
+        ];
+        let e = merge_effect(&rows, "FROM", "INTO");
+        assert!(e.repeats.is_empty());
+        assert_eq!((e.from_seqs, e.into_seqs), (vec![1], vec![3]));
+        // an old repeat of the same id is not the merge's doing
+        let rows = vec![
+            r(1, Some("FROM"), "NEW STOP"),
+            r(2, Some("FROM"), "INTERMEDIATE STOP"),
+        ];
+        assert!(merge_effect(&rows, "FROM", "INTO").repeats.is_empty());
     }
 
     #[test]

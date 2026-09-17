@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test of the GTFS editor API against a LOCAL Postgres that holds the
-# editor schema (db/gtfs_editor/*.sql). Runs tests/editor_flow.rs, which uses its
-# own feed and accounts, then proves the chennai_bus rows were not touched -
-# reseeding them from nandi if they were.
+# editor schema (db/gtfs_editor/*.sql). Runs tests/editor_flow.rs and
+# tests/editor_create_flow.rs, which use their own feeds and accounts, then
+# proves the chennai_bus rows were not touched - reseeding them from nandi if they
+# were - and that its station proposals were not touched either.
 #
 #   scripts/editor_flow_test.sh
 #   EDITOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55432/mtc_internal_master scripts/editor_flow_test.sh
@@ -28,16 +29,30 @@ fingerprint() {
         FROM gtfs_route_stop WHERE gtfs_id = 'chennai_bus') t"
 }
 
+proposals() {
+  "$PSQL" "$DB_URL" -Atc "
+    SELECT md5(coalesce(string_agg(proposal_id || status || coalesce(change_set_id::text, '')
+                                   || coalesce(change_id::text, ''), '|' ORDER BY proposal_id), ''))
+      FROM gtfs_station_proposal WHERE gtfs_id = 'chennai_bus'"
+}
+
 "$PSQL" "$DB_URL" -Atc "SELECT 1 FROM gtfs_feed LIMIT 1" >/dev/null
 before="$(fingerprint)"
+proposals_before="$(proposals)"
 
-EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --test editor_flow -- --nocapture
+EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow --test editor_create_flow -- --nocapture
 status=$?
 
+proposals_after="$(proposals)"
+if [ "$proposals_before" != "$proposals_after" ]; then
+  echo "chennai_bus station proposals changed during the test" >&2
+  status=1
+fi
 after="$(fingerprint)"
 if [ "$before" != "$after" ]; then
   echo "chennai_bus rows changed during the test; reseeding from $SEEDER" >&2
   "$PYTHON" "$SEEDER" --replace | "$PSQL" "$DB_URL" -q
 fi
 echo "chennai_bus untouched: $([ "$before" = "$after" ] && echo yes || echo 'no (reseeded)')"
+echo "chennai_bus station proposals untouched: $([ "$proposals_before" = "$proposals_after" ] && echo yes || echo no)"
 exit $status

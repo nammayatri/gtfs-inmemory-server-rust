@@ -19,7 +19,8 @@ ops ─VPN─▶ gtfs.sso.c2.integ.internal.svc.movingtech.net   (Pomerium, namm
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0003*.sql` (applied to master `mtc_internal_master`).
+Schema: `db/gtfs_editor/0001..0006*.sql` (applied to master `mtc_internal_master`;
+`0006` lets a change's `op` be `merge`).
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -164,7 +165,13 @@ Audit actions: `seed`, `release`, `user_bootstrapped`, `user_created`,
 `totp_failed`, `session_created`, `change_set_created`, `change_added`,
 `change_updated`, `change_removed`, `change_set_submitted`, `change_set_approved`,
 `change_set_rejected`, `change_set_reopened`, `change_set_discarded`,
-`change_set_committed` (detail `{feed_version, changes, applied}`).
+`change_set_committed` (detail `{feed_version, changes, applied}`), and from
+sections 5 and 6: `bulk_imported` (`{kind, rows, changes, first_change_id,
+last_change_id}`), `stop_merged` (one per merge at commit: `{change_id, from, into,
+routes, rows, keep_name, keep_position}`), `station_proposal_approved`,
+`station_proposal_rejected`, `station_proposal_reopened`,
+`station_proposal_returned` (`detail.reason` is `change_removed` or
+`change_set_discarded`) and `station_proposal_committed`.
 
 ### Drafts
 
@@ -252,16 +259,88 @@ GIMS, the dev Pomerium proxy, a local Postgres).
 | `route` / `create` | `{route_id, short_name, long_name?, route_type?, color?, agency_id?}` | `entity_key` = `route_id`; id unused (409-style row error `route_exists`); same id charset as stops; `route_type` defaults to 3, `agency_id` to the feed's usual one; `short_name` required |
 | `route` / `delete` | `null` | soft delete (`deleted = true`); refused while another pending change in the set edits the route |
 | `station` / `create`, `update` | may carry `members: [{stop_id, platform_code?}]` instead of `member_stop_ids` | as before; `platform_code` ≤ 120 chars; a station change that came from a proposal carries `proposal_id` |
+| `stop` / `merge` | `{into_stop_id, into_row_version, keep_name?: "into"\|"from", keep_position?: "into"\|"from"}` | see *Merging duplicate stops* below |
+
+Settled while implementing:
+
+- A create may leave out `entity_key`; it is taken from `after`'s id field (and
+  the other way round). A stop create with neither (or a blank / null
+  `after.stop_id`) gets a minted id. An id is "unused" when no row of the feed has
+  it (deleted rows included) and no open draft of the feed creates it.
+- `route` / `create`: the defaults are written into the stored change when it is
+  added, so a reviewer sees `route_type` and `agency_id`. The feed's usual agency
+  is the `agency_id` most of its routes carry. A colour is stored upper-case.
+- `route` / `delete`: adding it while the set has a `route` or `route_stops`
+  change for that route (a `route` / `create` included) is 409
+  `route_has_pending_changes` with `details.change_ids`; an edit added after the
+  delete makes the delete a validation error with the same code. A deleted
+  route's rows stay; they no longer count as using a stop, so `stop` / `delete`
+  of a stop only deleted routes call at is allowed.
+- `members[].platform_code`: absent leaves the stop's label as it is; `null` (or
+  blank) clears it. `member_stop_ids` and `members` are not sent together. The
+  `before` of a station update or delete lists `members: [{stop_id,
+  platform_code}]` beside `member_stop_ids`.
 
 A new route's stop list is a `route_stops` / `replace` change on that route **in
 the same draft**, positioned after the `route` / `create` (its `base_rows_hash` is
 the hash of an empty list). Stops and routes created earlier in the same draft
 count as existing for every later change's validation, preview and commit.
 
+The hash of an empty list is
+`4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945` (sha256 of
+`[]`); it is also the `rows_hash` the draft preview of a new route returns. A
+change to a stop or route created earlier in the same draft has no live row: its
+`before` is the create's `after` (`[]` for a new route's stop list), it has no
+`base_row_version`, and commit checks no version for it.
+
 GIMS serves a route in its public APIs only once it has trips, and trips come
 from the nightly GTFS build (MTC schedule). A route created here is in the
 database at commit and in `/routes` after the next build gives it a schedule;
 the dashboard says so on the create form and on the committed route.
+
+### Merging duplicate stops
+
+`stop` / `merge` merges a duplicate stop into another and moves every route row
+to the kept id. The dashboard asks the user which id stays; the server does not
+guess.
+
+- `entity_key` = the stop that goes away (the "from" stop);
+  `base_row_version` = its `row_version`; `after.into_stop_id` = the stop that
+  stays, `after.into_row_version` = its `row_version` (filled from the live row
+  when left out). `keep_name` and `keep_position` default to `"into"`.
+- `before` (read shape) = `{from: <stop row>, into: <stop row>, affected:
+  [{route_id, short_name, sequences: [...]}]}` (the live routes calling the from
+  stop).
+- **Errors**: both stops exist, are not deleted, have `location_type` 0 (never a
+  station: `stop_is_station`), neither id starts with `prm_`
+  (`merge_prm_stop`), and they are different ids (`merge_same_stop`);
+  `merge_would_repeat_stop` when after the switch some live route would call the
+  same stop on two consecutive served rows (row order by `sequence`; ROUTE
+  CORRECTION, JUMP STOP and HIDDEN STOP rows are not served and do not separate
+  two calls). The message names the route and both sequences - the MANALI RD.JN
+  case, where route 56D has fare stage 1 on one id and stage 2 on the other, back
+  to back. `stop_merged_away` on any later change in the same draft that uses the
+  from stop (a stop update, delete or merge, a station's members, a
+  `route_stops` row).
+- **Warnings**: `merge_same_route_twice` (a route calls both stops, not back to
+  back), `merge_far_apart` (more than 150 m apart; the message says the
+  distance), `merge_names_differ`.
+- **Apply** (preview replay and commit, the same code path):
+  1. `UPDATE gtfs_route_stop SET stop_id = into WHERE gtfs_id = g AND stop_id =
+     from`. Each row keeps its `stop_name_override`; a moved row without one gets
+     the from stop's name when `keep_name` is `"into"` and the names differ, so the
+     route keeps its own spelling. Provenance is kept, plus `{"merged_from": from}`.
+  2. `keep_name` / `keep_position` `"from"` copy the from stop's name / lat+lon
+     onto the kept stop.
+  3. Station: when the from stop has a `parent_station` and the kept stop has
+     none, the kept stop takes it and the from stop's `platform_code` (keeping its
+     own label when the from stop has none).
+  4. The from stop: `deleted = true`, `parent_station = NULL`, provenance
+     `{"merged_into": into}`.
+- **Commit** checks both `row_version`s; a mismatch is 409
+  `change_set_conflicts` in the usual conflict shape (the kept stop's conflict has
+  its id as `entity_key`). Commit audits `stop_merged` with the affected route
+  and row counts. Route previews in the draft show the switched ids.
 
 ### Bulk import — preview, then add to a draft
 
@@ -287,6 +366,34 @@ earlier import into the same draft or by rows of this draft.
 ONE transaction and the response carries the updated set. The draft is then
 reviewed, submitted, approved and committed like any other.
 
+Settled while implementing:
+
+- Cells may be JSON numbers or text (a CSV cell is text): `lat`, `lon`,
+  `sequence`, `stage_no` accept `"13.05"`; a blank or `null` optional cell counts
+  as not given (a blank `stop_id` gets a minted id). A column that is not one of
+  the kind's is `invalid_row`, as is a cell of the wrong type or a missing
+  required one. 400 `invalid_kind`, `rows_required` (no rows) and `too_many_rows`
+  (`details.max_rows`) refuse the whole request.
+- `messages[]` also carry `level` (`error` / `warning`). `summary.changes` counts
+  the changes the upload becomes (a row that cannot be read becomes none;
+  `change` is `null` for it). In a dry run a stop without an id has `entity_key:
+  null`; the real run mints the ids and adds `change_id` to each row's `change`,
+  and the response carries the set as `change_set`. The 400 `bulk_has_errors`
+  carries the same response in `details`.
+- Duplicates (`duplicate_in_upload`, on every row involved): the same `stop_id`;
+  the same stop name (any case) at the same position (6 decimals); the same
+  `route_id` in `routes`; the same `(route_id, sequence)` in `route_stops`.
+- `route_stops`: fare findings name rows by their `sequence`; a finding about
+  the whole route (`route_not_found`, `route_deleted`, `too_few_stops`) is on
+  every row of that route. A row calling at a stop the route already calls at
+  keeps the route's own spelling (`stop_name_override`). Warnings:
+  `markers_dropped` (the route has ROUTE CORRECTION rows, which a list of stops
+  replaces) and `route_already_in_draft` (the draft already replaces that stop
+  list). `base_rows_hash` is the live route's.
+- Validation reads the draft's changes as applying cleanly (a draft whose
+  changes do not apply shows it in its own validation and cannot be submitted).
+  The real run audits one `bulk_imported`.
+
 ## 6. Station proposals — reviewed, then drafted, then released
 
 `gtfs_station_proposal` (`db/gtfs_editor/0005_station_proposals.sql`) holds
@@ -308,6 +415,41 @@ committed through the normal maker-checker flow.
 Lifecycle, kept by the server: deleting the change from its draft, or discarding
 the draft, puts the proposal back to `pending` (change fields cleared); committing
 the draft marks it `committed`. Every transition writes `gtfs_audit_log`.
+
+Settled while implementing:
+
+- Items also carry `change_id`, `gtfs_id`, `created_at`, `updated_at`. `status`
+  values are checked (400 `invalid_status`); `superseded` may be listed too. The
+  summary counts only the four statuses above.
+- Detail: each member gets `current` - `{name, lat, lon, parent_station,
+  platform_code, location_type, deleted, row_version, route_count, moved_m}`, or
+  `null` when the stop no longer exists. `problems[]` are `{level, code, stop_id?,
+  message}`. Errors (the station would be invalid): `member_missing`,
+  `member_deleted`, `member_is_station`, `member_has_parent` (another station; its
+  own committed station is fine), `station_exists` (the id is taken; not reported
+  once committed), `no_members`, `stop_merged_away`. Warning: `member_moved` (> 100
+  m from where the build saw it).
+- Approve checks against the live data plus the draft's changes (taken as
+  applying), so a member another station in the same draft takes is a problem.
+  Only errors refuse it (400 `proposal_has_problems`, `details.problems`); a
+  moved member does not. `members[].platform_code` absent keeps the proposal's
+  label, `null` clears the stop's label. Other refusals: 404
+  `proposal_not_found` / `change_set_not_found`, 400 `feed_mismatch`, 409
+  `change_set_not_draft`, 409 `proposal_not_pending`, 400
+  `member_not_in_proposal` (`details.stop_id`), `invalid_members`,
+  `invalid_platform_code`, `name_required`, `invalid_position`. The response is
+  the proposal detail, now `approved` with `change_set_id` and `change_id`.
+- Bulk approve skips a proposal with any problem, warnings included, and one
+  that is not pending or not in the feed (`problems: [{code: proposal_not_pending
+  | proposal_not_found}]`); two proposals of the request that share a stop or a
+  station id cannot both be approved. At most 5,000 ids; the response adds
+  `approved`, `skipped` and `change_set_id`.
+- Reject is from `pending` only (409 `proposal_not_pending`; an approved one is
+  taken out of its draft first); an empty note is 400 `note_required`. Reopen is
+  from `rejected` only (409 `proposal_not_rejected`), clears the review fields,
+  and is 409 `proposal_superseded` when another open proposal already suggests
+  that station id. Both return the proposal detail.
+- List, detail and summary are viewer+.
 
 ## 7. Dashboard requirements added 2026-09-17 (user feedback on master)
 

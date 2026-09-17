@@ -399,3 +399,34 @@ where
     .await?;
     Ok(())
 }
+
+/// [`audit`] for many rows of one action in one statement: one row per detail.
+pub async fn audit_many<'e, E>(
+    executor: E,
+    actor: Option<Uuid>,
+    actor_email: Option<&str>,
+    action: &str,
+    gtfs_id: Option<&str>,
+    change_set_id: Option<Uuid>,
+    details: &[Value],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if details.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO gtfs_audit_log (actor, actor_email, action, gtfs_id, change_set_id, detail) \
+         SELECT $1, $2, $3, $4, $5, d::jsonb FROM UNNEST($6::text[]) WITH ORDINALITY AS u(d, n) ORDER BY n",
+    )
+    .bind(actor)
+    .bind(actor_email)
+    .bind(action)
+    .bind(gtfs_id)
+    .bind(change_set_id)
+    .bind(details.iter().map(Value::to_string).collect::<Vec<_>>())
+    .execute(executor)
+    .await?;
+    Ok(())
+}

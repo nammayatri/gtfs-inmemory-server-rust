@@ -1,8 +1,10 @@
 //! HTTP handlers: parse, authorize, call the service, shape the response.
 
 use super::auth::{self, Role};
+use super::bulk;
 use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
+use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
 use super::EditorState;
 use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
@@ -656,6 +658,114 @@ pub async fn discard(
     let ctx = auth::require(&req, &st, Role::Editor).await?;
     svc::discard(&st, &ctx, *path).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
+}
+
+pub async fn bulk_import(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<Uuid>,
+    body: web::Json<bulk::BulkRequest>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(bulk::run(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+// ---------------------------------------------------------------- station proposals
+
+#[derive(Deserialize)]
+pub struct ProposalsQuery {
+    status: Option<String>,
+    bbox: Option<String>,
+    q: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn station_proposals(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<ProposalsQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    let query = proposals::ListQuery {
+        status: q.status.clone(),
+        bbox: q
+            .bbox
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(parse_bbox)
+            .transpose()?,
+        q: q.q.clone(),
+    };
+    ok(proposals::list(&st, &path, &query, &page).await?)
+}
+
+pub async fn station_proposal_summary(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(proposals::summary(&st, &path).await?)
+}
+
+pub async fn station_proposal(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(proposals::detail(&mut conn, *path).await?)
+}
+
+pub async fn station_proposal_approve(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<proposals::ApproveBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(proposals::approve(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+pub async fn station_proposals_approve(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<proposals::BulkApproveBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(proposals::approve_many(&st, &ctx, &path, body.into_inner()).await?)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NoteBody {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+pub async fn station_proposal_reject(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: Option<web::Json<NoteBody>>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    ok(proposals::reject(&st, &ctx, *path, body.note.as_deref()).await?)
+}
+
+pub async fn station_proposal_reopen(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(proposals::reopen(&st, &ctx, *path).await?)
 }
 
 // ---------------------------------------------------------------- admin
