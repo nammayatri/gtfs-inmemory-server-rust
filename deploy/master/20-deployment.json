@@ -58,7 +58,7 @@
         "containers": [
           {
             "args": [
-              "# The shared config references secrets.master_mtc_pass, which GIMS_SECRETS_DHALL\n# lacks; add it from the secret's env var, dhall-escaped, so the base type-checks.\np=\"${master_mtc_pass:-}\"; p=\"${p//\\\\/\\\\\\\\}\"; p=\"${p//\\\"/\\\\\\\"}\"; p=\"${p//\\$/\\\\u0024}\"\nprintf '(%s) // { master_mtc_pass = \"%s\" }\\n' \"$GIMS_SECRETS_DHALL\" \"$p\" > /etc/beckn/config/gtfs-inmemory-data-server-secrets.dhall\necho \"$GTFS_EDITOR_SECRETS_DHALL\" > /etc/beckn/config/gtfs-editor-secrets.dhall\necho \"starting app server\"\n(./gtfs-routes-service | tee --output-error=warn >(/usr/sbin/log-processor --prometheus-port $LP_PROMETHEUS_PORT --kafka-brokers $LP_KAFKA_BROKERS --kafka-producer-prop $LP_KAFKA_PRODUCER_PROP --partition-key $LP_PARTITION_KEY --producer-topic $LP_PRODUCER_TOPIC $LP_EXTRA_ARGS))\n"
+              "echo $GIMS_SECRETS_DHALL > /etc/beckn/config/gtfs-inmemory-data-server-secrets.dhall\necho \"$GTFS_EDITOR_SECRETS_DHALL\" > /etc/beckn/config/gtfs-editor-secrets.dhall\necho \"starting app server\"\n(./gtfs-routes-service | tee --output-error=warn >(/usr/sbin/log-processor --prometheus-port $LP_PROMETHEUS_PORT --kafka-brokers $LP_KAFKA_BROKERS --kafka-producer-prop $LP_KAFKA_PRODUCER_PROP --partition-key $LP_PARTITION_KEY --producer-topic $LP_PRODUCER_TOPIC $LP_EXTRA_ARGS))\n"
             ],
             "command": [
               "/bin/bash",

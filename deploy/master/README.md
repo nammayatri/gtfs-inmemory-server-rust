@@ -13,9 +13,9 @@ traffic is untouched until a switch is decided. The shared
 | `50-managed-cert.yaml` | Google-managed cert for the SSO host; also append `gtfs-sso-cert` to the `networking.gke.io/managed-certificates` annotation on `pomerium-v2/pomerium-internal-ingress` (keep every existing entry) |
 | `create_secret.py` | `gtfs-editor-gims-secrets` from the repo `.env` + a generated TOTP key; never overwrites (rotating the key forces every user to re-enrol) |
 
-The deployment command adds `master_mtc_pass` (from the shared secret's env var,
-dhall-escaped) to the generated secrets file: the shared config references
-`secrets.master_mtc_pass`, which `GIMS_SECRETS_DHALL` does not contain.
+The shared config references `secrets.master_mtc_pass`; it must be inside the
+`GIMS_SECRETS_DHALL` record of `gtfs-inmemory-data-server-secrets` (added
+2026-09-17), not only a separate key, or the dhall fails to type-check at boot.
 
 Image: nandi Jenkins `ny-internal/nandi/<branch>` with `gimsOnly=true`,
 `syncGIMS=true`, `gimsBranch=<this branch>`, deploy flags off. First deploy
