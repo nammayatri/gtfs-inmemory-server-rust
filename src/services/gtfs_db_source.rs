@@ -60,6 +60,104 @@ pub struct DbFeed {
     pub stops: Vec<GTFSStop>,
     /// route code -> polyline (None clears whatever another source set).
     pub polylines: HashMap<String, Option<String>>,
+    /// Merged-away stop code -> the code of the stop that survived the merge,
+    /// from [`resolve_merge_chains`]. Empty for a feed that has had no merges.
+    pub aliases: HashMap<String, String>,
+}
+
+/// A `gtfs_stop` row the editor merged away: deleted, with its provenance
+/// naming the stop it was merged into (the merge's step 4, see
+/// `docs/gtfs-editor.md` "Merging duplicate stops").
+#[derive(Debug, Clone)]
+pub struct MergedAwayStop {
+    pub stop_id: String,
+    /// The feed's public code for it, when the row carries one.
+    pub stop_code: Option<String>,
+    pub merged_into: String,
+}
+
+/// The live stops a merge chain can end at: each live `stop_id` with the public
+/// code the feed serves it under, plus every one of those codes, so an alias is
+/// never built for a key a live stop already answers to.
+#[derive(Debug, Default)]
+pub struct LiveStopCodes {
+    code_by_id: HashMap<String, String>,
+    codes: HashSet<String>,
+}
+
+impl LiveStopCodes {
+    /// From `(stop_id, public code)` pairs - the loader's non-deleted rows.
+    pub fn from_pairs<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Self {
+        let code_by_id: HashMap<String, String> = pairs.into_iter().collect();
+        let codes = code_by_id.values().cloned().collect();
+        Self { code_by_id, codes }
+    }
+
+    /// True when a caller holding `key` is holding a live stop, by either
+    /// spelling - such a key must never be aliased away.
+    fn is_live(&self, key: &str) -> bool {
+        self.code_by_id.contains_key(key) || self.codes.contains(key)
+    }
+}
+
+/// Resolve every merged-away stop to the public code of the live stop at the end
+/// of its merge chain: A merged into B and B later into C gives `A -> C`, so a
+/// caller holding any id the editor has ever retired lands on what survives
+/// today, however many merges ago that was.
+///
+/// Both spellings of a retired stop are keys - its `stop_id` and its
+/// `stop_code` - because a caller holds whichever the feed served it.
+///
+/// Three chains produce no alias at all, so the ids in them 404 exactly as they
+/// do today:
+///
+/// - a **cycle** (A into B, B back into A - which the editor's own validation
+///   refuses, but a hand-written row could not be trusted to),
+/// - a **dangling** end: the chain's last target is deleted without a
+///   `merged_into` of its own, so nothing survives to answer for it,
+/// - a key that is **still live** under either spelling: a live stop always wins
+///   over an alias, so a reused id can never be shadowed by a retired one.
+pub fn resolve_merge_chains(
+    merged: &[MergedAwayStop],
+    live: &LiveStopCodes,
+) -> HashMap<String, String> {
+    let next: HashMap<&str, &str> = merged
+        .iter()
+        .map(|m| (m.stop_id.as_str(), m.merged_into.as_str()))
+        .collect();
+
+    let mut aliases = HashMap::new();
+    for m in merged {
+        // Walk to the first live stop. `seen` makes a cycle terminate, and a
+        // target that is neither live nor itself merged away ends the walk
+        // with nothing.
+        let mut seen: HashSet<&str> = HashSet::from([m.stop_id.as_str()]);
+        let mut target = m.merged_into.as_str();
+        let survivor = loop {
+            if let Some(code) = live.code_by_id.get(target) {
+                break Some(code.clone());
+            }
+            if !seen.insert(target) {
+                break None; // cycle
+            }
+            match next.get(target) {
+                Some(t) => target = t,
+                None => break None, // deleted with no merged_into, or no such row
+            }
+        };
+        let Some(survivor) = survivor else { continue };
+
+        for key in [Some(&m.stop_id), m.stop_code.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if live.is_live(key) || *key == survivor {
+                continue;
+            }
+            aliases.insert(key.clone(), survivor.clone());
+        }
+    }
+    aliases
 }
 
 /// Trip overlays for `gtfs_id`, from preprocessed patterns (JSON boot).
@@ -324,6 +422,22 @@ impl GtfsDbSource {
         .await
         .map_err(db_err)?;
 
+        // Merged-away stops, for the alias map. A second, cheap query rather
+        // than widening the one above: the stop query above must keep returning
+        // live rows only (everything downstream of it builds the served feed),
+        // and these rows are read for their provenance alone.
+        let alias_started = std::time::Instant::now();
+        let merged_rows = sqlx::query(
+            "SELECT stop_id, stop_code, provenance->>'merged_into' AS merged_into
+             FROM gtfs_stop
+             WHERE gtfs_id = $1 AND deleted AND provenance->>'merged_into' IS NOT NULL",
+        )
+        .bind(gtfs_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let alias_query_ms = alias_started.elapsed().as_millis() as u64;
+
         let mut stops: HashMap<String, StopRow> = HashMap::with_capacity(stop_rows.len());
         for r in &stop_rows {
             let s = StopRow {
@@ -355,11 +469,36 @@ impl GtfsDbSource {
             ));
         }
 
+        // The alias map: every stop the editor has merged away, pointed at what
+        // survives its chain today. Built from the live rows just read, so it
+        // can never name a stop this feed does not serve.
+        let mut merged = Vec::with_capacity(merged_rows.len());
+        for r in &merged_rows {
+            let merged_into: String = r.try_get("merged_into").map_err(db_err)?;
+            if merged_into.trim().is_empty() {
+                continue;
+            }
+            merged.push(MergedAwayStop {
+                stop_id: r.try_get("stop_id").map_err(db_err)?,
+                stop_code: r.try_get("stop_code").map_err(db_err)?,
+                merged_into,
+            });
+        }
+        let live = LiveStopCodes::from_pairs(stops.values().map(|s| {
+            (
+                s.stop_id.clone(),
+                s.stop_code.clone().unwrap_or_else(|| s.stop_id.clone()),
+            )
+        }));
+        let aliases = resolve_merge_chains(&merged, &live);
+        let merged_away = merged.len();
+
         let prefixed = |id: &str| format!("{}:{}", gtfs_id, id);
 
         let mut out = DbFeed {
             gtfs_id: gtfs_id.to_string(),
             version,
+            aliases,
             ..Default::default()
         };
 
@@ -482,6 +621,9 @@ impl GtfsDbSource {
             routes = out.routes.len(),
             stops = out.stops.len(),
             routes_without_trips = dropped_no_trips,
+            merged_away_stops = merged_away,
+            stop_aliases = out.aliases.len(),
+            alias_query_ms,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Loaded DB feed"
         );
@@ -544,6 +686,124 @@ mod tests {
         assert_eq!(r.pattern_id, "long");
         assert_eq!(r.trip_count, 4);
         assert_eq!(r.start_seconds, 100);
+    }
+
+    // ---------------------------------------------------------------- merged stop aliases
+
+    fn merged(stop_id: &str, into: &str) -> MergedAwayStop {
+        MergedAwayStop {
+            stop_id: stop_id.into(),
+            stop_code: None,
+            merged_into: into.into(),
+        }
+    }
+
+    /// Live stops whose code is their id, the usual case.
+    fn live(ids: &[&str]) -> LiveStopCodes {
+        LiveStopCodes::from_pairs(ids.iter().map(|i| (i.to_string(), i.to_string())))
+    }
+
+    #[test]
+    fn alias_points_a_merged_stop_at_the_survivor() {
+        let a = resolve_merge_chains(&[merged("A", "B")], &live(&["B"]));
+        assert_eq!(a.get("A"), Some(&"B".to_string()));
+        assert_eq!(a.len(), 1);
+    }
+
+    #[test]
+    fn alias_follows_a_chain_of_merges_to_the_end() {
+        // A -> B -> C -> D, only D live: everything answers as D.
+        let a = resolve_merge_chains(
+            &[merged("A", "B"), merged("B", "C"), merged("C", "D")],
+            &live(&["D"]),
+        );
+        assert_eq!(a.get("A"), Some(&"D".to_string()));
+        assert_eq!(a.get("B"), Some(&"D".to_string()));
+        assert_eq!(a.get("C"), Some(&"D".to_string()));
+    }
+
+    #[test]
+    fn alias_chain_order_in_the_rows_does_not_matter() {
+        // The same chain, rows in the reverse order: a later merge must not
+        // depend on having seen the earlier one first.
+        let a = resolve_merge_chains(
+            &[merged("C", "D"), merged("B", "C"), merged("A", "B")],
+            &live(&["D"]),
+        );
+        assert_eq!(a.get("A"), Some(&"D".to_string()));
+    }
+
+    #[test]
+    fn alias_guards_against_a_cycle() {
+        // A -> B -> A with neither live: no alias, and no hang.
+        let a = resolve_merge_chains(&[merged("A", "B"), merged("B", "A")], &live(&["C"]));
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn alias_guards_against_a_stop_merged_into_itself() {
+        let a = resolve_merge_chains(&[merged("A", "A")], &live(&["B"]));
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn alias_guards_against_a_cycle_that_a_live_chain_hangs_off() {
+        // X -> A -> B -> A: X is as unanswerable as the cycle it runs into.
+        let a = resolve_merge_chains(
+            &[merged("X", "A"), merged("A", "B"), merged("B", "A")],
+            &live(&["L"]),
+        );
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn alias_is_dropped_when_the_target_is_deleted_with_no_merged_into() {
+        // B is deleted (absent from the live set) and was not merged into
+        // anything: nothing survives to answer for A.
+        let a = resolve_merge_chains(&[merged("A", "B")], &live(&["C"]));
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn alias_never_shadows_a_live_stop() {
+        // A stop id that is live again (recreated under the same id) keeps
+        // answering for itself, whatever an old deleted row says.
+        let a = resolve_merge_chains(&[merged("A", "B")], &live(&["A", "B"]));
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn alias_covers_both_spellings_of_a_retired_stop() {
+        let m = MergedAwayStop {
+            stop_id: "old_id".into(),
+            stop_code: Some("OLD".into()),
+            merged_into: "new_id".into(),
+        };
+        let live = LiveStopCodes::from_pairs([("new_id".to_string(), "NEW".to_string())]);
+        let a = resolve_merge_chains(&[m], &live);
+        // Both the id and the code answer, and both give the survivor's code -
+        // never its id, which is not what the feed serves.
+        assert_eq!(a.get("old_id"), Some(&"NEW".to_string()));
+        assert_eq!(a.get("OLD"), Some(&"NEW".to_string()));
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn alias_does_not_shadow_a_live_code_belonging_to_another_stop() {
+        // A retired stop whose stop_code is now served by a different live
+        // stop: that code must still reach the live stop.
+        let m = MergedAwayStop {
+            stop_id: "X".into(),
+            stop_code: Some("SHARED".into()),
+            merged_into: "S".into(),
+        };
+        let live = LiveStopCodes::from_pairs([
+            ("S".to_string(), "S".to_string()),
+            ("other".to_string(), "SHARED".to_string()),
+        ]);
+        let a = resolve_merge_chains(&[m], &live);
+        assert_eq!(a.get("X"), Some(&"S".to_string()));
+        assert_eq!(a.get("SHARED"), None);
     }
 
     // ---------------------------------------------------------------- live feed precedence

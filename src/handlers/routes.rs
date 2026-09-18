@@ -751,7 +751,9 @@ pub async fn get_route_stop_mapping_by_stop(
             .get_route_stop_mapping_by_stop_with_direction(&gtfs_id, &stop_code, direction)
             .await?
     };
-    Ok(HttpResponse::Ok().json(mappings))
+    Ok(stop_alias_response(
+        &app_state, &gtfs_id, &stop_code, &mappings,
+    ))
 }
 
 #[utoipa::path(
@@ -1171,7 +1173,12 @@ pub async fn get_cluster_destinations(
     let destinations = app_state
         .gtfs_service
         .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
-    Ok(HttpResponse::Ok().json(destinations))
+    Ok(stop_alias_response(
+        &app_state,
+        &gtfs_id,
+        &stop_code,
+        &destinations,
+    ))
 }
 
 #[utoipa::path(
@@ -1316,6 +1323,25 @@ fn stops_response<T: serde::Serialize>(
     Ok(HttpResponse::Ok().json(value))
 }
 
+/// A 200 for a stop-keyed read, carrying `X-Stop-Alias: <old>=<new>` when the
+/// code asked for was one the editor merged away (docs/gtfs-editor.md section 1,
+/// "Merged-away stop ids keep answering"). The body is the surviving stop's, so
+/// the header is what makes the redirect visible: a caller can see that the id
+/// it holds is retired and write down the one it was given, without the body
+/// gaining a field. No alias, no header - an ordinary read is byte-identical.
+fn stop_alias_response<T: serde::Serialize>(
+    app_state: &AppState,
+    gtfs_id: &str,
+    stop_code: &str,
+    body: &T,
+) -> HttpResponse {
+    let mut resp = HttpResponse::Ok();
+    if let Some((old, new)) = app_state.gtfs_service.stop_alias(gtfs_id, stop_code) {
+        resp.insert_header(("X-Stop-Alias", format!("{}={}", old, new)));
+    }
+    resp.json(body)
+}
+
 pub fn merge_stop_and_mapping(
     stop: GTFSStop,
     mapping: Option<Arc<RouteStopMapping>>,
@@ -1382,7 +1408,12 @@ pub async fn get_stop(
         .get_stop(&gtfs_id, &stop_code)
         .await?;
     let merged_stop = merge_stop_and_mapping(stop, maybe_mapping);
-    Ok(HttpResponse::Ok().json(merged_stop))
+    Ok(stop_alias_response(
+        &app_state,
+        &gtfs_id,
+        &stop_code,
+        &merged_stop,
+    ))
 }
 
 #[utoipa::path(
@@ -1465,7 +1496,9 @@ pub async fn get_station_children(
         .gtfs_service
         .get_station_children(&gtfs_id, &stop_code)
         .await?;
-    Ok(HttpResponse::Ok().json(children))
+    Ok(stop_alias_response(
+        &app_state, &gtfs_id, &stop_code, &children,
+    ))
 }
 
 #[utoipa::path(
@@ -3543,7 +3576,12 @@ pub async fn get_alternate_stops(
         .map(|stop| merge_stop_and_mapping((*stop).clone(), None))
         .collect();
 
-    Ok(HttpResponse::Ok().json(merged_stops))
+    Ok(stop_alias_response(
+        &app_state,
+        &gtfs_id,
+        &stop_id,
+        &merged_stops,
+    ))
 }
 
 #[utoipa::path(

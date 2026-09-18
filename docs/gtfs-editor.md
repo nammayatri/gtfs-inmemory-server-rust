@@ -84,6 +84,69 @@ feed that cannot load at boot serves its preprocessed data until a poll succeeds
 A snapshot boot rebuilds DB feeds on top of the snapshot, so a snapshot baked
 without the DB never masks committed edits.
 
+### Merged-away stop ids keep answering
+
+A DB feed emits live stops only, so committing a `stop/merge` used to make the
+merged-away id 404 everywhere at once - while OTP was still running a GTFS in
+which that id is live and handing it to the rider app. That is exactly what
+happened on 2026-09-18: `stop/merge 2a25e7a0ed -> bd9b3af7c9` (Adyar Depot) made
+`GET /stop/chennai_bus/2a25e7a0ed` and its route-stop mapping answer 404 `Stop
+not found`, and `routeServiceability` in the rider app failed with 500
+`UNABLE_TO_CALL_NANDI_GET_ROUTE_STOP_MAPPING_BY_STOP_CODE_API`. Anything holding
+an id from before a merge - an OTP leg, a saved stop, a deep link, a GTFS-RT
+join - hit the same wall.
+
+So the loader also reads the rows a merge leaves behind. Alongside the live
+stops it selects the **deleted** `gtfs_stop` rows whose
+`provenance->>'merged_into'` is set, and builds an alias map, old code -> the
+code of the stop that survived:
+
+- **Chains are followed to the end.** A merged into B, B later into C, gives
+  `A -> C` and `B -> C`. However many merges ago an id was retired, it lands on
+  what survives today, never on an intermediate stop that is itself gone.
+- **Both spellings are keys**: a retired stop's `stop_id` and its `stop_code`,
+  because a caller holds whichever the feed served it. The value is always the
+  survivor's public code - what the feed serves it under.
+- **No alias is built** for a cycle (A into B, B back into A), for a chain whose
+  end is deleted with no `merged_into` of its own (nothing survives to answer),
+  or for a key that is live under either spelling (a live stop always wins, so a
+  reused id is never shadowed). Those ids 404 exactly as they did before.
+
+**The rule**: every public read that turns a stop code into a stop resolves it
+through the alias map first - `get_stop`, the route-stop mappings by stop (plain,
+`direction`, `allowClusters`), the `getAllStopsByIds` /
+`getAllRouteStopMappingsByStopCodes` bulk reads, `station-children`,
+`alternateStops`, and both cluster reads (`destinations`, `routes/{from}/{to}`).
+`/stop-code/{g}/{provider}` resolves its *answer*, so a static provider mapping
+naming a since-merged stop still hands back a live code. The response is the
+**survivor's**, `stopCode` included: that is how a caller learns the new id.
+Nothing is added to the body.
+
+A single-stop read that was redirected also carries the header
+`X-Stop-Alias: <old>=<new>`, so the redirect is observable without diffing the
+body, and the redirect is logged at info at most once an hour per `(old, new)`
+pair - enough to see which retired ids are still in callers' hands.
+
+**Caveat**: the alias exists only while the deleted row keeps its `merged_into`
+provenance. Hard-delete that row, or strip its provenance, and the old id goes
+back to 404 - the alias map is derived from those rows on every load, nothing
+else remembers the merge.
+
+The map is rebuilt with the feed on **every** reload, so a merge committed in the
+editor starts answering within one `gtfs_version_poll_seconds` tick, on the same
+poll that brings the merge itself in. A preprocessed feed has no alias map at all
+(it has no merges to know about), so reverting a feed out of DB mode returns it
+to answering for live codes only, and parity is unaffected:
+`scripts/parity_gtfs_db.py` samples codes out of `/stops/{g}`, which are all
+live, and a live code is never an alias key.
+
+Cost, measured on the local `chennai_bus` (7,855 served stops): the extra
+deleted-row query is **0.6-3.2 ms** against a feed load of ~480-540 ms, and it
+finds **0 merged-away stops** in the current seed, so the alias map is empty.
+Forced to a worst case - a copy of those stops with 800 rows merged away in one
+800-long chain - the query is 1.3-1.7 ms, all 800 aliases resolve to the one
+survivor, and the load time does not move.
+
 `/version/{gtfs_id}` for a DB feed is sha256 of the routes hash plus
 `gtfs_feed.version`, so an edit to stops or stop order - invisible to the routes
 hash - still moves it. It therefore differs from the preprocessed value for the
@@ -546,6 +609,10 @@ guess.
   `change_set_conflicts` in the usual conflict shape (the kept stop's conflict has
   its id as `entity_key`). Commit audits `stop_merged` with the affected route
   and row counts. Route previews in the draft show the switched ids.
+- The merged-away id does **not** stop answering: step 4's `merged_into`
+  provenance is what the GIMS loader turns into a stop alias, so every public
+  read for the old id answers with the stop that survived - section 1,
+  "Merged-away stop ids keep answering".
 
 ### Bulk import — preview, then add to a draft
 
