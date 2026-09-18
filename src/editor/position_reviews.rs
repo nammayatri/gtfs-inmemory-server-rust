@@ -26,6 +26,7 @@
 use super::auth::{self, Ctx};
 use super::draft::DraftView;
 use super::error::{EditorError, EditorResult};
+use super::feed_lock::{lock_feed, lock_feed_of_set, retry_transient};
 use super::proposals::{parse_status_list, ListQuery, Problem};
 use super::service::{self, ChangeInsert, Page};
 use super::validation::{check_payload, haversine_m, valid_lat_lon, Finding, Level, RouteRow};
@@ -855,7 +856,9 @@ pub async fn detail(
             change_set,
         }) => {
             // asked of the real validator, in a transaction that is rolled back
+            // - a replay, so on the feed's lock like every other
             let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            lock_feed(&mut tx, &r.gtfs_id).await?;
             let (draft, drafted) = match change_set {
                 Some(set) => {
                     let set = service::load_set(&mut tx, *set, false).await?;
@@ -941,13 +944,16 @@ fn invalid_change(f: Finding) -> EditorError {
 
 /// The draft a reviewer's action goes into, and the review, both locked: the
 /// same feed, the draft still a draft, the review pending or approved in that
-/// same draft. Also the changes the draft already holds for the review.
+/// same draft. Also the changes the draft already holds for the review. The
+/// feed's advisory lock comes first, as in every transaction that writes a
+/// draft (feed_lock.rs), so the action never collides with a commit.
 async fn open_for_change(
     conn: &mut PgConnection,
     change_set_id: Uuid,
     id: i64,
     t: Transition,
 ) -> EditorResult<(service::ChangeSet, Review, Vec<ReviewChange>)> {
+    lock_feed_of_set(conn, change_set_id).await?;
     let set = service::load_set(conn, change_set_id, true).await?;
     let r = load(conn, id, true).await?;
     if r.gtfs_id != set.gtfs_id {
@@ -1055,6 +1061,19 @@ pub async fn move_stop(
         ));
     }
     let note = note_text(body.note.as_deref());
+    retry_transient(|| move_stop_once(state, ctx, id, &body, note.as_deref())).await?;
+    let mut conn = state.pool.acquire().await?;
+    detail(&mut conn, id, None, &ctx.user.email).await
+}
+
+/// The move's one transaction, retried whole after a serialization failure.
+async fn move_stop_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: i64,
+    body: &MoveBody,
+    note: Option<&str>,
+) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
     let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Move).await?;
@@ -1121,15 +1140,7 @@ pub async fn move_stop(
         }],
     )
     .await?[0];
-    mark_approved(
-        &mut tx,
-        ctx,
-        id,
-        set.change_set_id,
-        change_id,
-        note.as_deref(),
-    )
-    .await?;
+    mark_approved(&mut tx, ctx, id, set.change_set_id, change_id, note).await?;
     let detour = |p: (f64, f64)| median_detour(&route_calls, None, &r.stop_id, p).map(metres);
     auth::audit(
         &mut *tx,
@@ -1147,8 +1158,7 @@ pub async fn move_stop(
     )
     .await?;
     tx.commit().await?;
-    let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, id, None, &ctx.user.email).await
+    Ok(())
 }
 
 /// The position is right: close the review without changing anything.
@@ -1416,11 +1426,37 @@ pub async fn split(
     }
     let name = note_text(body.name.as_deref());
     let note = note_text(body.note.as_deref());
+    retry_transient(|| {
+        split_once(
+            state,
+            ctx,
+            id,
+            &body,
+            &route_ids,
+            name.as_deref(),
+            note.as_deref(),
+        )
+    })
+    .await?;
+    let mut conn = state.pool.acquire().await?;
+    detail(&mut conn, id, None, &ctx.user.email).await
+}
+
+/// The split's one transaction, retried whole after a serialization failure.
+async fn split_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: i64,
+    body: &SplitBody,
+    route_ids: &[String],
+    name: Option<&str>,
+    note: Option<&str>,
+) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
     let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Split).await?;
     merged_in_draft(&r, &changes)?;
-    let conflicts = split_conflicts(&mut tx, set.change_set_id, id, &r.stop_id, &route_ids).await?;
+    let conflicts = split_conflicts(&mut tx, set.change_set_id, id, &r.stop_id, route_ids).await?;
     if !conflicts.is_empty() {
         return Err(draft_conflict(
             conflicts,
@@ -1436,7 +1472,7 @@ pub async fn split(
     };
     let route_calls = calls(&mut tx, &r.gtfs_id, &r.stop_id).await?;
     let calling: BTreeSet<&str> = route_calls.iter().map(|c| c.route_id.as_str()).collect();
-    let found = split_route_problems(&r.stop_id, &route_ids, &calling, &split_off(&changes));
+    let found = split_route_problems(&r.stop_id, route_ids, &calling, &split_off(&changes));
     if !found.is_empty() {
         return Err(invalid_split(found));
     }
@@ -1444,7 +1480,9 @@ pub async fn split(
     let new_stop_id = service::mint_stop_ids(&mut tx, &r.gtfs_id, 1)
         .await?
         .remove(0);
-    let name = name.unwrap_or_else(|| stop["name"].as_str().unwrap_or(&r.stop_name).to_string());
+    let name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| stop["name"].as_str().unwrap_or(&r.stop_name).to_string());
     let create = json!({
         "stop_id": new_stop_id, "name": name, "lat": body.lat, "lon": body.lon,
         "position_review_id": id,
@@ -1458,9 +1496,9 @@ pub async fn split(
         before: Value::Null,
         after: create,
     }];
-    let live_rows = service::load_routes_rows(&mut tx, &r.gtfs_id, &route_ids).await?;
-    let mut read_rows = service::load_routes_read_rows(&mut tx, &r.gtfs_id, &route_ids).await?;
-    for route_id in &route_ids {
+    let live_rows = service::load_routes_rows(&mut tx, &r.gtfs_id, route_ids).await?;
+    let mut read_rows = service::load_routes_read_rows(&mut tx, &r.gtfs_id, route_ids).await?;
+    for route_id in route_ids {
         let live = live_rows.get(route_id).map(Vec::as_slice).unwrap_or(&[]);
         let after = json!({
             "base_rows_hash": service::rows_hash(live),
@@ -1479,18 +1517,10 @@ pub async fn split(
     }
     let change_ids =
         service::insert_changes(&mut tx, set.change_set_id, ctx.user.user_id, &changes).await?;
-    mark_approved(
-        &mut tx,
-        ctx,
-        id,
-        set.change_set_id,
-        change_ids[0],
-        note.as_deref(),
-    )
-    .await?;
+    mark_approved(&mut tx, ctx, id, set.change_set_id, change_ids[0], note).await?;
     let detour_after = median_detour(
         &route_calls,
-        Some(route_ids.as_slice()),
+        Some(route_ids),
         &r.stop_id,
         (body.lat, body.lon),
     );
@@ -1511,8 +1541,7 @@ pub async fn split(
     )
     .await?;
     tx.commit().await?;
-    let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, id, None, &ctx.user.email).await
+    Ok(())
 }
 
 // ---------------------------------------------------------------- merge
@@ -1583,11 +1612,30 @@ pub async fn merge(
         ));
     }
     let note = note_text(body.note.as_deref());
+    let findings =
+        retry_transient(|| merge_once(state, ctx, id, &body, &into, keep_name, note.as_deref()))
+            .await?;
+    let mut conn = state.pool.acquire().await?;
+    let mut out = detail(&mut conn, id, None, &ctx.user.email).await?;
+    out["warnings"] = json!(findings);
+    Ok(out)
+}
+
+/// The merge's one transaction - the validator's answer, then the change -
+/// retried whole after a serialization failure. Returns the merge's warnings.
+async fn merge_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: i64,
+    body: &MergeBody,
+    into: &str,
+    keep_name: &str,
+    note: Option<&str>,
+) -> EditorResult<Vec<Value>> {
     let mut tx = state.pool.begin().await?;
     let (set, r, changes) =
         open_for_change(&mut tx, body.change_set_id, id, Transition::Merge).await?;
-    let conflicts =
-        merge_conflicts(&mut tx, set.change_set_id, &changes, &r.stop_id, &into).await?;
+    let conflicts = merge_conflicts(&mut tx, set.change_set_id, &changes, &r.stop_id, into).await?;
     if !conflicts.is_empty() {
         return Err(draft_conflict(
             conflicts,
@@ -1610,7 +1658,7 @@ pub async fn merge(
     };
     // what the merge's own validation says, before anything is stored
     let drafted = service::load_changes(&mut tx, set.change_set_id).await?;
-    let mut after = merge_after(&into, None, keep_name, id);
+    let mut after = merge_after(into, None, keep_name, id);
     let findings = service::findings_for(
         &mut tx,
         &r.gtfs_id,
@@ -1627,7 +1675,7 @@ pub async fn merge(
         )
         .with_details(json!({"problems": findings})));
     }
-    let into_at = stop_point(&mut tx, &r.gtfs_id, &into, Some(&draft)).await?;
+    let into_at = stop_point(&mut tx, &r.gtfs_id, into, Some(&draft)).await?;
     let route_calls = calls(&mut tx, &r.gtfs_id, &r.stop_id).await?;
     // the live version is filled in by the add, as for any merge
     if let Some(m) = after.as_object_mut() {
@@ -1646,15 +1694,7 @@ pub async fn merge(
         },
     )
     .await?;
-    mark_approved(
-        &mut tx,
-        ctx,
-        id,
-        set.change_set_id,
-        change_id,
-        note.as_deref(),
-    )
-    .await?;
+    mark_approved(&mut tx, ctx, id, set.change_set_id, change_id, note).await?;
     let detour = |p: (f64, f64)| median_detour(&route_calls, None, &r.stop_id, p).map(metres);
     auth::audit(
         &mut *tx,
@@ -1674,10 +1714,7 @@ pub async fn merge(
     )
     .await?;
     tx.commit().await?;
-    let mut conn = state.pool.acquire().await?;
-    let mut out = detail(&mut conn, id, None, &ctx.user.email).await?;
-    out["warnings"] = json!(findings);
-    Ok(out)
+    Ok(findings)
 }
 
 // ---------------------------------------------------------------- lifecycle

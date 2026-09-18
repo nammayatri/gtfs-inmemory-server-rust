@@ -8,9 +8,15 @@
 //! it in a transaction that is then rolled back, so validation always uses the
 //! same code path - and the same constraints - as the real commit, which runs it
 //! and commits.
+//!
+//! Every transaction that runs `evaluate`, or writes a draft, first takes the
+//! feed's advisory lock (`feed_lock.rs`) so two of them never deadlock on the
+//! live rows, and is retried by [`retry_transient`] should one still hit a
+//! serialization failure - which is never reported as a change's own finding.
 
 use super::auth::{self, Ctx};
 use super::error::{EditorError, EditorResult};
+use super::feed_lock::{is_transient, lock_feed, lock_feed_of_set, retry_transient};
 use super::validation::{
     check_payload, check_route_rows, create_id_field, grade_against_live, grade_repointed,
     haversine_m, merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level,
@@ -1057,6 +1063,18 @@ fn finding_json(change_id: Option<i64>, f: &Finding) -> Value {
     json!({"change_id": change_id, "level": f.level, "code": f.code, "message": f.message})
 }
 
+/// What a database error inside a change's savepoint means: a finding against
+/// the change when the database refused it (a constraint, a bad value); or, for
+/// a deadlock or serialization failure, which says nothing about the change,
+/// the error itself, 503 `try_again`, so the whole transaction is retried and
+/// the change is never blamed.
+fn db_failure(e: sqlx::Error) -> Result<Finding, EditorError> {
+    if is_transient(&e) {
+        return Err(e.into());
+    }
+    Ok(db_finding(&e))
+}
+
 fn db_finding(e: &sqlx::Error) -> Finding {
     match e.as_database_error() {
         Some(d) => {
@@ -1280,7 +1298,7 @@ pub async fn evaluate(
                     .await?;
                 let findings = match err {
                     ApplyError::Findings(f) => f,
-                    ApplyError::Db(e) => vec![db_finding(&e)],
+                    ApplyError::Db(e) => vec![db_failure(e)?],
                 };
                 ev.validation
                     .extend(findings.iter().map(|f| finding_json(Some(c.change_id), f)));
@@ -1309,7 +1327,7 @@ pub async fn evaluate(
             sqlx::query("ROLLBACK TO SAVEPOINT editor_constraints")
                 .execute(&mut *conn)
                 .await?;
-            ev.validation.push(finding_json(None, &db_finding(&e)));
+            ev.validation.push(finding_json(None, &db_failure(e)?));
         }
     }
     Ok(ev)
@@ -2550,12 +2568,17 @@ async fn feed_config_update(
 /// The set, its changes, and - unless it is finished - what applying it now
 /// would find. Runs the changes in a transaction that is rolled back.
 pub async fn set_detail(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
+    retry_transient(|| set_detail_once(state, ctx, id)).await
+}
+
+async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, false).await?;
     let changes = load_changes(&mut tx, id).await?;
     let ev = if matches!(set.status.as_str(), "committed" | "discarded") {
         Evaluation::default()
     } else {
+        lock_feed(&mut tx, &set.gtfs_id).await?;
         evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?
     };
     tx.rollback().await?;
@@ -2616,9 +2639,19 @@ pub async fn preview_route(
     id: Uuid,
     route_id: &str,
 ) -> EditorResult<Value> {
+    retry_transient(|| preview_route_once(state, ctx, id, route_id)).await
+}
+
+async fn preview_route_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    route_id: &str,
+) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, false).await?;
     let changes = load_changes(&mut tx, id).await?;
+    lock_feed(&mut tx, &set.gtfs_id).await?;
     let ev = evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?;
     let route = route_detail(&mut tx, &set.gtfs_id, route_id).await;
     tx.rollback().await?;
@@ -2629,7 +2662,7 @@ pub async fn preview_route(
     Ok(route)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewChange {
     pub entity: String,
@@ -2879,7 +2912,17 @@ pub async fn add_change(
     id: Uuid,
     change: NewChange,
 ) -> EditorResult<i64> {
+    retry_transient(|| add_change_once(state, ctx, id, change.clone())).await
+}
+
+async fn add_change_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    change: NewChange,
+) -> EditorResult<i64> {
     let mut tx = state.pool.begin().await?;
+    lock_feed_of_set(&mut tx, id).await?;
     let set = load_set(&mut tx, id, true).await?;
     let change_id = add_change_to(&mut tx, ctx, &set, change).await?;
     tx.commit().await?;
@@ -3010,7 +3053,7 @@ pub async fn add_change_to(
     Ok(change_id)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeUpdate {
     #[serde(default)]
@@ -3026,7 +3069,18 @@ pub async fn update_change(
     change_id: i64,
     update: ChangeUpdate,
 ) -> EditorResult<()> {
+    retry_transient(|| update_change_once(state, ctx, id, change_id, update.clone())).await
+}
+
+async fn update_change_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    change_id: i64,
+    update: ChangeUpdate,
+) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
+    lock_feed_of_set(&mut tx, id).await?;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
     let row = sqlx::query(
@@ -3111,7 +3165,17 @@ pub async fn delete_change(
     id: Uuid,
     change_id: i64,
 ) -> EditorResult<()> {
+    retry_transient(|| delete_change_once(state, ctx, id, change_id)).await
+}
+
+async fn delete_change_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    change_id: i64,
+) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
+    lock_feed_of_set(&mut tx, id).await?;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
     let removed = sqlx::query(
@@ -3159,7 +3223,12 @@ pub async fn delete_change(
 // ---------------------------------------------------------------- transitions
 
 pub async fn submit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()> {
+    retry_transient(|| submit_once(state, ctx, id)).await
+}
+
+async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
+    lock_feed_of_set(&mut tx, id).await?;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
     let changes = load_changes(&mut tx, id).await?;
@@ -3377,17 +3446,17 @@ pub async fn discard(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
 
 /// Apply an approved set. One transaction: lock the feed, check every change
 /// against the live rows, apply, bump the feed version, record it. Any conflict
-/// or error rolls everything back.
+/// or error rolls everything back - so a retry after a serialization failure
+/// starts from nothing.
 pub async fn commit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
+    retry_transient(|| commit_once(state, ctx, id)).await
+}
+
+async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
-    let gtfs_id: String =
-        sqlx::query("SELECT gtfs_id FROM gtfs_change_set WHERE change_set_id = $1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| EditorError::not_found("change_set_not_found", "no such change set"))?
-            .try_get("gtfs_id")?;
-    // feed first, then the set: every commit on a feed takes locks in this order
+    // the feed's advisory lock first (every replay of the feed queues on it),
+    // then its row, then the set: every commit on a feed takes locks in this order
+    let gtfs_id = lock_feed_of_set(&mut tx, id).await?;
     sqlx::query("SELECT version FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
         .bind(&gtfs_id)
         .fetch_one(&mut *tx)
@@ -3732,6 +3801,24 @@ mod tests {
     #[test]
     fn like_patterns_escape_wildcards() {
         assert_eq!(like_pattern("50%_off"), "%50\\%\\_off%");
+    }
+
+    /// A deadlock inside a change's savepoint is the transaction's to retry,
+    /// never the change's `database_rejected` finding; a constraint still is.
+    #[test]
+    fn a_deadlock_in_a_savepoint_is_a_retry_not_a_finding() {
+        use super::super::feed_lock::{tests::db_error, TRY_AGAIN};
+        let e = db_failure(db_error("40P01", "deadlock detected")).unwrap_err();
+        assert_eq!((e.status.as_u16(), e.code), (503, TRY_AGAIN));
+        let e = db_failure(db_error("40001", "could not serialize access")).unwrap_err();
+        assert_eq!((e.status.as_u16(), e.code), (503, TRY_AGAIN));
+        let f = db_failure(db_error("23503", "violates foreign key")).unwrap();
+        assert_eq!(
+            (f.code.as_str(), f.message.as_str()),
+            ("foreign_key_violation", "violates foreign key")
+        );
+        let f = db_failure(db_error("22P02", "invalid input syntax")).unwrap();
+        assert_eq!(f.code, "database_rejected");
     }
 
     #[test]
