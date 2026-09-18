@@ -160,7 +160,15 @@ pub struct GTFSService {
     /// Serialises everything that replaces `data`: a full refresh and a per-feed
     /// DB reload must not interleave, or one would overwrite the other's result.
     reload_lock: tokio::sync::Mutex<()>,
+    /// When each `(old, new)` stop alias was last logged, so a caller still
+    /// holding a merged-away id is reported without filling the log with one
+    /// line per request. A plain `std::sync::Mutex` because the stop lookups
+    /// that touch it are not all async; it is never held across an await.
+    alias_log_seen: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
 }
+
+/// How often one `(old, new)` stop alias is logged at info.
+const ALIAS_LOG_EVERY: Duration = Duration::from_secs(3600);
 
 impl GTFSService {
     pub async fn new(config: AppConfig) -> AppResult<Self> {
@@ -188,6 +196,7 @@ impl GTFSService {
             db_source,
             trip_overlays: Arc::new(RwLock::new(HashMap::new())),
             reload_lock: tokio::sync::Mutex::new(()),
+            alias_log_seen: std::sync::Mutex::new(HashMap::new()),
         };
 
         Ok(service)
@@ -476,7 +485,7 @@ impl GTFSService {
         info!("Fetched {} patterns total", all_pattern_details.len());
 
         // DB feeds replace their preprocessed metadata before anything is indexed.
-        let (db_feed_versions, db_polylines) = self
+        let (db_feed_versions, db_polylines, db_stop_aliases) = self
             .overlay_db_feeds(
                 &mut all_routes,
                 &mut all_pattern_details,
@@ -659,6 +668,7 @@ impl GTFSService {
         temp_data.seat_layout_mapping_by_gtfs = seat_layout_mapping_by_gtfs;
         temp_data.pre_computed_stops_by_gtfs = pre_computed_stops_by_gtfs;
         temp_data.db_feed_versions = db_feed_versions;
+        temp_data.stop_aliases_by_gtfs = db_stop_aliases;
 
         let mem_stats = temp_data.memory_usage_bytes();
         info!(
@@ -1953,9 +1963,10 @@ impl GTFSService {
     }
 
     /// Replace each DB feed's preprocessed routes, patterns and stops with the
-    /// DB's, in place. Returns the version each loaded feed was built at and its
-    /// polylines. A feed that fails to load keeps its preprocessed data (and is
-    /// absent from the returned versions, so the poller retries it).
+    /// DB's, in place. Returns the version each loaded feed was built at, its
+    /// polylines and its merged-away stop aliases. A feed that fails to load
+    /// keeps its preprocessed data (and is absent from the returned versions, so
+    /// the poller retries it).
     async fn overlay_db_feeds(
         &self,
         all_routes: &mut Vec<NandiRoutesRes>,
@@ -1965,11 +1976,13 @@ impl GTFSService {
     ) -> (
         HashMap<String, i64>,
         HashMap<String, HashMap<String, Option<String>>>,
+        HashMap<String, HashMap<String, String>>,
     ) {
         let mut versions = HashMap::new();
         let mut polylines = HashMap::new();
+        let mut aliases = HashMap::new();
         let Some(db) = self.db_source.as_ref() else {
-            return (versions, polylines);
+            return (versions, polylines, aliases);
         };
         for gtfs_id in db.feeds() {
             if !preprocessed_gtfs_ids.contains(gtfs_id) {
@@ -1995,6 +2008,7 @@ impl GTFSService {
                     all_stops.extend(feed.stops);
                     versions.insert(gtfs_id.clone(), feed.version);
                     polylines.insert(gtfs_id.clone(), feed.polylines);
+                    aliases.insert(gtfs_id.clone(), feed.aliases);
                 }
                 Err(e) => error!(
                     "DB feed {} failed to load ({}); serving its preprocessed data until the next poll",
@@ -2002,7 +2016,7 @@ impl GTFSService {
                 ),
             }
         }
-        (versions, polylines)
+        (versions, polylines, aliases)
     }
 
     fn apply_db_polylines(
@@ -2196,6 +2210,13 @@ impl GTFSService {
         }
         data.db_feed_versions
             .insert(gtfs_id.to_string(), feed.version);
+        // Rebuilt with the feed, so a merge committed in the editor starts
+        // answering on the same poll that brings the merged rows in.
+        replace_feed_entry(
+            &mut data.stop_aliases_by_gtfs,
+            [(gtfs_id.to_string(), feed.aliases)].into_iter().collect(),
+            gtfs_id,
+        );
         Ok((data, trip_details))
     }
 
@@ -2305,6 +2326,9 @@ impl GTFSService {
             }
         }
         data.db_feed_versions.remove(gtfs_id);
+        // Preprocessed data has no merges, so the feed goes back to answering
+        // for live stop codes only - the behaviour it had before DB mode.
+        data.stop_aliases_by_gtfs.remove(gtfs_id);
         Ok((data, trip_details))
     }
 
@@ -2735,7 +2759,8 @@ impl GTFSService {
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
+        // A merged-away code answers as the stop that survived it.
+        let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
 
         if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
             // A parent station fans out to its platforms; a platform resolves to
@@ -2828,7 +2853,9 @@ impl GTFSService {
         direction: Option<&str>,
     ) -> AppResult<Vec<Arc<RouteStopMapping>>> {
         let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
+        // A merged-away code answers as the stop that survived it, and it is
+        // that stop's cluster the lookup widens to.
+        let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
 
         let (cluster_id, siblings) = {
             let data = self.data.load_full();
@@ -2921,7 +2948,8 @@ impl GTFSService {
     ) -> AppResult<Vec<Arc<GTFSStop>>> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
-        let stop_id = clean_identifier(stop_id);
+        // A merged-away code answers with the survivor's alternates.
+        let stop_id = self.resolve_stop_code(&gtfs_id, stop_id);
 
         let stop_ids = data
             .alternate_stop_by_gtfs
@@ -2954,7 +2982,8 @@ impl GTFSService {
     ) -> AppResult<Vec<String>> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
+        // A merged-away code walks from the stop that survived it.
+        let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
 
         // Unknown gtfs_id is a configuration error → 404. Unknown stop_code
         // inside a known feed is semantically "no destinations" → 200 [].
@@ -3104,8 +3133,10 @@ impl GTFSService {
     ) -> AppResult<Vec<ClusterRouteConnection>> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
-        let from_stop_code = clean_identifier(from_stop_code);
-        let to_stop_code = clean_identifier(to_stop_code);
+        // Either end may be a merged-away code; each answers as its survivor,
+        // so an old pair still describes the journey between the two places.
+        let from_stop_code = self.resolve_stop_code(&gtfs_id, from_stop_code);
+        let to_stop_code = self.resolve_stop_code(&gtfs_id, to_stop_code);
 
         // Unknown gtfs_id is a configuration error → 404. Unknown stop_codes
         // inside a known feed are semantically "no connecting routes" → 200 [].
@@ -3265,7 +3296,10 @@ impl GTFSService {
     ) -> AppResult<(GTFSStop, Option<Arc<RouteStopMapping>>)> {
         let data = self.data.load_full();
         let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
+        // A merged-away code answers as the stop that survived it, so the
+        // response carries the survivor's stopCode - which is how a caller
+        // holding the old id learns the new one.
+        let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
 
         let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
             AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
@@ -3308,9 +3342,11 @@ impl GTFSService {
         let data = self.data.load_full();
         let mut found_stops = Vec::new();
 
-        if let Some(stops_data) = data.stops_by_gtfs.get(clean_identifier(gtfs_id).as_str()) {
+        let clean_gtfs_id = clean_identifier(gtfs_id);
+        if let Some(stops_data) = data.stops_by_gtfs.get(clean_gtfs_id.as_str()) {
             for stop_code in stop_codes {
-                let clean_stop_code = clean_identifier(&stop_code);
+                // Same redirect as the singular endpoint, per code.
+                let clean_stop_code = self.resolve_stop_code(&clean_gtfs_id, &stop_code);
                 if let Some(stop) = stops_data.stops.get(clean_stop_code.as_str()) {
                     found_stops.push(stop.clone());
                 }
@@ -3362,7 +3398,10 @@ impl GTFSService {
             let clean_gtfs_id = clean_identifier(gtfs_id);
             let mut seen: HashSet<usize> = HashSet::new();
             for stop_code in stop_codes {
-                let clean_stop_code = clean_identifier(&stop_code);
+                // Same redirect as the singular endpoint, per code. Two codes
+                // that merged into one stop therefore de-duplicate to that
+                // stop's mappings, like asking for it twice.
+                let clean_stop_code = self.resolve_stop_code(&clean_gtfs_id, &stop_code);
                 // Same fan-out as the singular endpoint. De-duplicate by index:
                 // asking for a station and one of its platforms in the same
                 // request must not return that platform's mappings twice.
@@ -3381,6 +3420,77 @@ impl GTFSService {
         }
 
         Ok(found_mappings)
+    }
+
+    /// `(old, new)` when `stop_code` names a stop the editor merged away, else
+    /// `None`. `old` is the cleaned code as the lookups see it, so a caller can
+    /// report the redirect verbatim (`X-Stop-Alias: old=new`).
+    ///
+    /// The alias map only ever names live stops (see `resolve_merge_chains`), so
+    /// the answer is a code that exists; and a live stop is never a key, so this
+    /// is `None` for every code that was not merged away - including an unknown
+    /// one, which then 404s exactly as it did before aliases existed.
+    pub fn stop_alias(&self, gtfs_id: &str, stop_code: &str) -> Option<(String, String)> {
+        let data = self.data.load();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = clean_identifier(stop_code);
+        let survivor = data
+            .stop_aliases_by_gtfs
+            .get(&gtfs_id)?
+            .get(&stop_code)?
+            .clone();
+        self.log_alias(&gtfs_id, &stop_code, &survivor);
+        Some((stop_code, survivor))
+    }
+
+    /// The code every stop-keyed read should look up for `stop_code`: the
+    /// survivor of its merge chain when it was merged away, and the code itself
+    /// (cleaned) otherwise.
+    ///
+    /// This is the one place a retired id becomes a live one. Every public read
+    /// that turns a stop code into a stop calls it at its entry, so an OTP leg,
+    /// a saved stop, a deep link or a GTFS-RT join made before a merge keeps
+    /// answering afterwards, and answers about the stop that survived.
+    ///
+    /// It loads the live data itself rather than taking a caller's copy, so a
+    /// reload landing between the two reads can resolve against the newer alias
+    /// map and look up in the slightly older feed. Both maps only ever name
+    /// stops that were live when they were built, so the worst case is one
+    /// request answering as it would have a moment earlier - and keeping this in
+    /// one place is worth more than closing a window a few microseconds wide.
+    pub fn resolve_stop_code(&self, gtfs_id: &str, stop_code: &str) -> String {
+        match self.stop_alias(gtfs_id, stop_code) {
+            Some((_, survivor)) => survivor,
+            None => clean_identifier(stop_code),
+        }
+    }
+
+    /// Log a redirect at info, at most once an hour per `(old, new)`: enough to
+    /// see which retired ids are still in callers' hands, not enough to matter
+    /// on a hot path. A poisoned lock is ignored - logging must never fail a
+    /// read.
+    fn log_alias(&self, gtfs_id: &str, old: &str, new: &str) {
+        let Ok(mut seen) = self.alias_log_seen.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let key = (old.to_string(), new.to_string());
+        let due = match seen.get(&key) {
+            Some(last) => now.duration_since(*last) >= ALIAS_LOG_EVERY,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        seen.insert(key, now);
+        // Bounded by the number of aliases actually asked for; a feed's whole
+        // alias map is small (chennai_bus: see docs/gtfs-editor.md section 1).
+        info!(
+            gtfs_id = %gtfs_id,
+            stop_code = %old,
+            resolved_stop_code = %new,
+            "stop code was merged away; answering with the surviving stop",
+        );
     }
 
     /// Resolve a stop code to the codes that trips actually call at.
@@ -3417,10 +3527,13 @@ impl GTFSService {
         stop_code: &str,
     ) -> AppResult<Vec<String>> {
         let data = self.data.load_full();
+        let gtfs_id = clean_identifier(gtfs_id);
+        // A station merged into another station lists the survivor's platforms.
+        let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
         Ok(data
             .children_by_parent
-            .get(clean_identifier(gtfs_id).as_str())
-            .and_then(|p| p.get(clean_identifier(stop_code).as_str()))
+            .get(gtfs_id.as_str())
+            .and_then(|p| p.get(stop_code.as_str()))
             .cloned()
             .unwrap_or_default()
             .into_iter()
@@ -3444,10 +3557,13 @@ impl GTFSService {
         let gtfs_id = clean_identifier(gtfs_id);
         let provider_stop_code = clean_identifier(provider_stop_code);
 
+        // The mapping is a static CSV, so it can still name a stop the editor
+        // has merged away since; the answer is resolved so the caller is handed
+        // a code that is live, not one that will 404 on the next call.
         data.provider_stop_code_mapping
             .get(&gtfs_id)
             .and_then(|mapping| mapping.get(&provider_stop_code))
-            .cloned()
+            .map(|code| self.resolve_stop_code(&gtfs_id, code))
             .ok_or_else(|| AppError::NotFound("Provider stop code not found".to_string()))
     }
 

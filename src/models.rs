@@ -753,6 +753,13 @@ pub struct GTFSData {
     /// is serving preprocessed data (not a DB feed, or its DB load failed).
     #[serde(default)]
     pub db_feed_versions: HashMap<String, i64>,
+    /// Per DB feed, the stop codes the editor has merged away, each pointing at
+    /// the code of the stop that survived its merge chain (docs/gtfs-editor.md
+    /// section 1, "Merged-away stop ids keep answering"). Rebuilt with the feed
+    /// on every reload, so it always describes the merges committed so far.
+    /// A preprocessed feed has no entry: it has no merges to know about.
+    #[serde(default)]
+    pub stop_aliases_by_gtfs: HashMap<String, HashMap<String, String>>,
 }
 
 impl GTFSData {
