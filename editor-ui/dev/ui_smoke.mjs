@@ -1200,6 +1200,92 @@ async function round5Flows() {
   }
 }
 
+// ====================================================================== delivery
+// The Delivery page (docs/gtfs-editor.md section 12): what each pod is serving,
+// and the webhooks GIMS calls when an edit goes live everywhere.
+// `node dev/ui_smoke.mjs --delivery` runs only these, as the admin.
+async function deliveryFlows() {
+  await go("#/delivery");
+  await waitFor(`document.querySelector("#page h1")?.innerText === "Delivery"`, "the Delivery page opens");
+  check((await text("#page")).includes("Pods"), "it shows the pods section");
+  check(/All 2 pods are serving version/.test(await text("#page")), "it says every pod is serving the committed version");
+  check((await text("#page")).includes("gtfs-inmemory-data-server-7a93ed-abc12"), "each pod is named with what it serves");
+  check((await text("#page")).includes("No webhook yet."), "with nothing configured it says so");
+  await shot("wh-01-empty");
+
+  // a URL the deployment does not allow is refused, in the form
+  await clickSel("#page button", "Add a webhook");
+  await waitFor(`!!document.querySelector("dialog")`, "the webhook form opens");
+  await type("dialog input[type=text]:nth-of-type(1)", "frontline rebuild");
+  const urlBox = `document.querySelectorAll("dialog input[type=text]")[1]`;
+  await evaluate(`(() => { const el = ${urlBox}; el.value = "https://evil.example.com/build"; el.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  await click("Add", "dialog");
+  await waitFor(`document.querySelector("dialog .notice.error")?.hidden === false`, "a host outside the allow-list is refused in the form");
+  check((await text("dialog .notice.error")).includes("allow-list"), "the message says why");
+  await shot("wh-02-host-refused");
+
+  // the real one
+  await evaluate(`(() => { const el = ${urlBox}; el.value = "https://jenkins.mock.invalid/job/rebuild/buildWithParameters?token=\${JENKINS_TOKEN}"; el.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  await click("Add", "dialog");
+  await waitFor(`!document.querySelector("dialog")`, "the webhook is added and the form closes");
+  await waitFor(`document.querySelector("#page").innerText.includes("frontline rebuild")`, "it appears in the table");
+  check((await text("#page")).includes("Every pod is serving the edit"), "the event is named in words");
+  check((await text("#page")).includes("${JENKINS_TOKEN}"), "the stored URL keeps the placeholder, not a secret");
+  await shot("wh-03-added");
+
+  // a test call is recorded in the history
+  await click("Test", "#page");
+  await waitFor(`document.querySelector("#page").innerText.includes("Delivered")`, "a test call shows in Recent calls", 12000);
+  check((await text("#page")).includes("test"), "the history marks it as a test");
+  await shot("wh-04-delivered");
+
+  // turning it off, and removing it
+  await click("Edit", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the edit form opens");
+  await clickSel("dialog input[type=checkbox]", "the On switch");
+  await click("Save", "dialog");
+  await waitFor(`!document.querySelector("dialog")`, "the change saves");
+  await waitFor(`document.querySelector("#page").innerText.includes("Off")`, "the webhook reads as off");
+  await click("Delete", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the delete confirm opens");
+  await click("Delete", "dialog");
+  await waitFor(`document.querySelector("#page").innerText.includes("No webhook yet.")`, "it is gone");
+  await shot("wh-05-deleted");
+
+  // the history names the actions in words, not codes
+  await go("#/audit");
+  await waitFor(`document.querySelector("#page h1")?.innerText === "History"`, "the History page opens");
+  const history = await text("#page");
+  check(history.includes("Added a webhook"), "the history says a webhook was added");
+  check(history.includes("Sent a test webhook call"), "the history says a test was sent");
+  check(history.includes("Deleted a webhook"), "the history says a webhook was deleted");
+}
+
+// ---- only delivery
+if (process.argv.includes("--delivery")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await deliveryFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of delivery
+
 // ---- only round 5
 if (process.argv.includes("--round5")) {
   try {
@@ -2264,6 +2350,9 @@ try {
 
   // ================================================================ round 5 (stop details, station links): see round5Flows above
   await round5Flows();
+
+  // ================================================================ delivery (pods, webhooks): see deliveryFlows above
+  await deliveryFlows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

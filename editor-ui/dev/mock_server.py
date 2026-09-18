@@ -3227,6 +3227,159 @@ def seed_round5(store):
 # ====================================================================== end of round 5
 
 
+# ====================================================================== webhooks
+#   docs/gtfs-editor.md section 12. Enough of the delivery machinery for the
+#   dashboard: pods reporting their loaded version, the webhook rows an admin
+#   edits, and a history. Nothing is actually sent - a "test" is recorded as
+#   delivered so the page can be exercised without a receiver.
+
+WEBHOOK_EVENTS = ["feed_in_sync", "feed_committed", "feed_reload_failed"]
+WEBHOOK_HOSTS = ["jenkins.mock.invalid", "127.0.0.1"]
+
+
+def seed_webhooks(store):
+    store.webhooks = {}
+    store.deliveries = []
+    # two pods, one a poll behind, so the page has something to show
+    g = next(iter(store.feeds))
+    v = store.feeds[g]["version"]
+    store.pods = {
+        g: [
+            {"pod_id": "gtfs-inmemory-data-server-7a93ed-abc12", "loaded_version": v,
+             "loaded_at": iso(now()), "last_seen_at": iso(now()), "data_source": "db",
+             "failing_version": None, "last_error": None, "image_tag": "adeee4-7a93ed",
+             "started_at": iso(now()), "up_to_date": True},
+            {"pod_id": "gtfs-inmemory-data-server-7a93ed-def34", "loaded_version": v,
+             "loaded_at": iso(now()), "last_seen_at": iso(now()), "data_source": "db",
+             "failing_version": None, "last_error": None, "image_tag": "adeee4-7a93ed",
+             "started_at": iso(now()), "up_to_date": True},
+        ]
+    }
+
+
+def _webhook_out(w):
+    return {k: w[k] for k in (
+        "webhook_id", "gtfs_id", "name", "event", "url", "method", "headers", "body", "enabled",
+        "stale_after_seconds", "settle_seconds", "give_up_after_seconds",
+        "request_timeout_seconds", "max_attempts", "created_at", "created_by",
+        "updated_at", "updated_by")}
+
+
+def _check_webhook(b, store, partial):
+    if not partial or "event" in b:
+        if b.get("event", "feed_in_sync") not in WEBHOOK_EVENTS:
+            raise ApiError(400, "invalid_event", "event is one of " + ", ".join(WEBHOOK_EVENTS))
+    if not partial or "method" in b:
+        if (b.get("method") or "POST").upper() not in ("POST", "PUT", "GET"):
+            raise ApiError(400, "invalid_method", "method is one of POST, PUT, GET")
+    if "headers" in b and b["headers"] is not None:
+        if not isinstance(b["headers"], dict) or not all(isinstance(v, str) for v in b["headers"].values()):
+            raise ApiError(400, "invalid_headers", "headers is an object of strings")
+    url = (b.get("url") or "").strip()
+    if url or not partial:
+        if not url:
+            raise ApiError(400, "url_required", "url is required")
+        # ${...} only ever appears in the query here, so the host parses as-is
+        host = urlparse(url).hostname or ""
+        if host not in WEBHOOK_HOSTS:
+            raise ApiError(400, "host_not_allowed",
+                           f"host {host} is not in this deployment's webhook allow-list")
+
+
+class WebhookHandler(PolicyHandler):
+    def _api(self, method, path, q):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        s = self.store
+        if len(parts) == 3 and parts[0] == "feeds" and parts[2] in ("cache-state", "webhooks", "webhook-deliveries"):
+            u = self.session_user()
+            self.require_mutation(method)
+            g = parts[1]
+            if g not in s.feeds:
+                raise ApiError(404, "feed_not_found", f"no feed {g}")
+            if parts[2] == "cache-state":
+                pods = s.pods.get(g, [])
+                v = s.feeds[g]["version"]
+                for p in pods:
+                    p["up_to_date"] = p["data_source"] == "db" and p["loaded_version"] == v
+                waiting = [{"pod_id": p["pod_id"], "loaded_version": p["loaded_version"]}
+                           for p in pods if p["data_source"] == "db" and p["loaded_version"] != v]
+                return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
+                             "version": v, "version_at": iso(now()), "in_sync": bool(pods) and not waiting,
+                             "live_pods": len(pods), "stale_pods": 0,
+                             "fleet_version": min([p["loaded_version"] for p in pods], default=None),
+                             "settled_at": iso(now()), "stale_after_seconds": 60,
+                             "waiting_for": waiting, "pods": pods}
+            if parts[2] == "webhook-deliveries":
+                items = [d for d in s.deliveries if d["gtfs_id"] == g]
+                return 200, {"items": list(reversed(items))[:int(q.get("limit", ["50"])[0])]}
+            if method == "GET":
+                return 200, {"items": [_webhook_out(w) for w in s.webhooks.values() if w["gtfs_id"] == g],
+                             "policy": {"enabled": True, "allowed_hosts": WEBHOOK_HOSTS, "active": True},
+                             "events": WEBHOOK_EVENTS}
+            self.require_role(u, "admin")
+            b = self._body()
+            _check_webhook(b, s, partial=False)
+            if any(w["gtfs_id"] == g and w["name"] == (b.get("name") or "").strip() for w in s.webhooks.values()):
+                raise ApiError(409, "duplicate_name", "this feed already has a webhook by that name")
+            if not (b.get("name") or "").strip():
+                raise ApiError(400, "name_required", "name is required")
+            wid = str(uuid.uuid4())
+            w = {"webhook_id": wid, "gtfs_id": g, "name": b["name"].strip(),
+                 "event": b.get("event") or "feed_in_sync", "url": b["url"].strip(),
+                 "method": (b.get("method") or "POST").upper(), "headers": b.get("headers") or {},
+                 "body": b.get("body"), "enabled": b.get("enabled", True),
+                 "stale_after_seconds": b.get("stale_after_seconds", 60),
+                 "settle_seconds": b.get("settle_seconds", 30),
+                 "give_up_after_seconds": b.get("give_up_after_seconds", 1800),
+                 "request_timeout_seconds": b.get("request_timeout_seconds", 30),
+                 "max_attempts": b.get("max_attempts", 5),
+                 "created_at": iso(now()), "created_by": u["email"],
+                 "updated_at": iso(now()), "updated_by": u["email"]}
+            s.webhooks[wid] = w
+            s.add_audit(u, "webhook_created", g, None, {"name": w["name"]})
+            return 201, _webhook_out(w)
+
+        if len(parts) >= 2 and parts[0] == "webhooks":
+            u = self.session_user()
+            self.require_mutation(method)
+            w = s.webhooks.get(parts[1])
+            if not w:
+                raise ApiError(404, "webhook_not_found", "no such webhook")
+            self.require_role(u, "admin")
+            if len(parts) == 3 and parts[2] == "test" and method == "POST":
+                d = {"delivery_id": str(uuid.uuid4()), "webhook_id": w["webhook_id"],
+                     "webhook": w["name"], "gtfs_id": w["gtfs_id"], "event": w["event"],
+                     "feed_version": s.feeds[w["gtfs_id"]]["version"], "kind": "test",
+                     "status": "succeeded", "attempts": 1, "next_attempt_at": None,
+                     "pod_count": len(s.pods.get(w["gtfs_id"], [])), "pods": None,
+                     "response_status": 200, "last_error": None, "claimed_by": "mock",
+                     "requested_by": u["email"], "created_at": iso(now()), "completed_at": iso(now())}
+                s.deliveries.append(d)
+                s.add_audit(u, "webhook_tested", w["gtfs_id"], None, {"name": w["name"]})
+                return 200, {"delivery_id": d["delivery_id"], "status": "pending",
+                             "message": "queued; a pod will send it within one poll interval"}
+            if method == "PATCH":
+                b = self._body()
+                _check_webhook(b, s, partial=True)
+                for k in ("name", "event", "url", "method", "headers", "body", "enabled",
+                          "stale_after_seconds", "settle_seconds", "give_up_after_seconds",
+                          "request_timeout_seconds", "max_attempts"):
+                    if k in b and b[k] is not None:
+                        w[k] = b[k].strip() if k in ("name", "url") else b[k]
+                    elif k == "body" and "body" in b:
+                        w["body"] = None
+                w["method"] = w["method"].upper()
+                w["updated_at"], w["updated_by"] = iso(now()), u["email"]
+                s.add_audit(u, "webhook_updated", w["gtfs_id"], None, {"name": w["name"]})
+                return 200, _webhook_out(w)
+            if method == "DELETE":
+                s.webhooks.pop(w["webhook_id"])
+                s.add_audit(u, "webhook_deleted", w["gtfs_id"], None, {"name": w["name"]})
+                return 200, {"webhook_id": w["webhook_id"], "deleted": True}
+            raise ApiError(404, "endpoint_not_found", "no such editor endpoint")
+        return super()._api(method, path, q)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -3238,8 +3391,9 @@ def main():
         Handler.store = Store(json.load(fh))
     seed_round4(Handler.store)
     seed_round5(Handler.store)
+    seed_webhooks(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), PolicyHandler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), WebhookHandler).serve_forever()
 
 
 if __name__ == "__main__":

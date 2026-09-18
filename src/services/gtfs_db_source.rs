@@ -339,6 +339,13 @@ impl GtfsDbSource {
         &self.feeds
     }
 
+    /// The internal-DB pool, for the cache-state heartbeat and the webhook
+    /// dispatcher that ride along with the version poll (`services::webhook`).
+    /// They read and write their own tables and never the feed's.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// The live, per-feed `data_source` decision the poll loop reconciles
     /// against each cycle: every feed with `data_source = 'db'` right now,
     /// plus every `fallback` feed with no `gtfs_feed` row at all. Returns
