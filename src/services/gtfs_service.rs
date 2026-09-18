@@ -165,6 +165,9 @@ pub struct GTFSService {
     /// line per request. A plain `std::sync::Mutex` because the stop lookups
     /// that touch it are not all async; it is never held across an await.
     alias_log_seen: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
+    /// When each `(gtfs_id, station)` expansion was last logged, on the same
+    /// terms as `alias_log_seen`.
+    station_log_seen: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
 }
 
 /// How often one `(old, new)` stop alias is logged at info.
@@ -197,6 +200,7 @@ impl GTFSService {
             trip_overlays: Arc::new(RwLock::new(HashMap::new())),
             reload_lock: tokio::sync::Mutex::new(()),
             alias_log_seen: std::sync::Mutex::new(HashMap::new()),
+            station_log_seen: std::sync::Mutex::new(HashMap::new()),
         };
 
         Ok(service)
@@ -635,6 +639,7 @@ impl GTFSService {
         }
 
         // Fetch stops and build children mapping
+        let station_platforms_by_gtfs = Self::build_station_platforms(&all_stops);
         let children_by_parent = self.build_children_mapping(all_stops);
 
         // Compute data hashes
@@ -656,6 +661,7 @@ impl GTFSService {
         temp_data.stops_by_gtfs = stops_by_gtfs;
         temp_data.routes_by_gtfs = routes_by_gtfs;
         temp_data.children_by_parent = children_by_parent;
+        temp_data.station_platforms_by_gtfs = station_platforms_by_gtfs;
         temp_data.data_hash = data_hash;
         temp_data.stop_geojsons_by_gtfs = stop_geojsons_by_gtfs;
         temp_data.provider_stop_code_mapping = provider_stop_code_mapping;
@@ -1887,6 +1893,77 @@ impl GTFSService {
         children_by_parent
     }
 
+    /// Each feed's stations and the platform codes beneath them, sorted.
+    ///
+    /// This is the station half of `children_by_parent`, and the difference is
+    /// the whole point: a key here is only ever a **station row**
+    /// (`location_type = 1`), the codes under it are only ever stops that name
+    /// it as their parent, and the list is sorted so the same feed always
+    /// answers in the same order.
+    ///
+    /// Two exclusions matter:
+    ///
+    /// - A stop whose parent is not a station row contributes nothing. That is
+    ///   what keeps **preprocessed** feeds out of station expansion entirely:
+    ///   they carry `stationId` (metro platforms point at their station) but no
+    ///   `location_type = 1` row at all, so the map they produce is empty and
+    ///   every read on them behaves exactly as it did.
+    /// - A platform that shares its station's code is not listed under it.
+    ///   Preprocessed metro data spells a station and its platform with one code
+    ///   (`bangalore_metro:104` is the parent of `bangalore_metro:104_1`, both
+    ///   `code = "104"`), and expanding such a code to itself would double every
+    ///   row it answers with.
+    fn build_station_platforms(
+        stops: &[GTFSStop],
+    ) -> HashMap<String, HashMap<String, Vec<String>>> {
+        let mut stations: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for stop in stops {
+            if stop.location_type != "1" {
+                continue;
+            }
+            let gtfs_id = stop.id.split(':').next().unwrap_or_default();
+            if !gtfs_id.is_empty() && !stop.code.is_empty() {
+                stations
+                    .entry(gtfs_id)
+                    .or_default()
+                    .insert(stop.code.as_str());
+            }
+        }
+        if stations.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut out: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        for stop in stops {
+            let Some(station_id) = &stop.station_id else {
+                continue;
+            };
+            let gtfs_id = stop.id.split(':').next().unwrap_or_default();
+            let parent_code = station_id.split(':').next_back().unwrap_or_default();
+            if parent_code.is_empty() || stop.code.is_empty() || parent_code == stop.code {
+                continue;
+            }
+            let Some(feed_stations) = stations.get(gtfs_id) else {
+                continue;
+            };
+            if !feed_stations.contains(parent_code) {
+                continue;
+            }
+            out.entry(gtfs_id.to_string())
+                .or_default()
+                .entry(parent_code.to_string())
+                .or_default()
+                .push(stop.code.clone());
+        }
+        for platforms_by_station in out.values_mut() {
+            for platforms in platforms_by_station.values_mut() {
+                platforms.sort();
+                platforms.dedup();
+            }
+        }
+        out
+    }
+
     /// Pre-compute unique stops list per GTFS feed with regional names populated.
     /// This avoids cloning and enriching on every /stops API request.
     fn pre_compute_stops(
@@ -2186,6 +2263,7 @@ impl GTFSService {
         let (trip_map, trip_details) = Self::build_example_trip_from_patterns(&feed.patterns, &ids);
         self.update_start_end_points(&mut routes, &route_data);
         Self::apply_db_polylines(&mut routes, gtfs_id, &feed.polylines);
+        let stations = Self::build_station_platforms(&feed.stops);
         let children = self.build_children_mapping(feed.stops);
         let pre_computed =
             Self::pre_compute_stops(&route_data, &data.stop_regional_names_by_gtfs, &stops);
@@ -2196,6 +2274,10 @@ impl GTFSService {
         replace_feed_entry(&mut data.stops_by_gtfs, stops, gtfs_id);
         replace_feed_entry(&mut data.alternate_stop_by_gtfs, alternates, gtfs_id);
         replace_feed_entry(&mut data.children_by_parent, children, gtfs_id);
+        // Rebuilt with the feed, so a station committed in the editor starts
+        // expanding on the same poll that brings its rows in - and a station
+        // dissolved there stops expanding on that same poll.
+        replace_feed_entry(&mut data.station_platforms_by_gtfs, stations, gtfs_id);
         replace_feed_entry(&mut data.route_example_trip_by_gtfs, trip_map, gtfs_id);
         replace_feed_entry(&mut data.route_service_tiers_by_gtfs, tiers, gtfs_id);
         replace_feed_entry(&mut data.pre_computed_stops_by_gtfs, pre_computed, gtfs_id);
@@ -2300,6 +2382,7 @@ impl GTFSService {
         let ids: HashSet<String> = [gtfs_id.to_string()].into_iter().collect();
         let (trip_map, trip_details) = Self::build_example_trip_from_patterns(&patterns, &ids);
         self.update_start_end_points(&mut routes_by_gtfs, &route_data);
+        let stations = Self::build_station_platforms(&stops);
         let children = self.build_children_mapping(stops);
         let pre_computed =
             Self::pre_compute_stops(&route_data, &data.stop_regional_names_by_gtfs, &stop_map);
@@ -2312,6 +2395,10 @@ impl GTFSService {
         replace_feed_entry(&mut data.stops_by_gtfs, stop_map, gtfs_id);
         replace_feed_entry(&mut data.alternate_stop_by_gtfs, alternates, gtfs_id);
         replace_feed_entry(&mut data.children_by_parent, children, gtfs_id);
+        // Preprocessed data carries no station rows, so this drops the feed's
+        // entry: it goes back to answering for the codes trips call at, which is
+        // the behaviour it had before DB mode.
+        replace_feed_entry(&mut data.station_platforms_by_gtfs, stations, gtfs_id);
         replace_feed_entry(&mut data.route_example_trip_by_gtfs, trip_map, gtfs_id);
         replace_feed_entry(&mut data.route_service_tiers_by_gtfs, tiers, gtfs_id);
         replace_feed_entry(&mut data.pre_computed_stops_by_gtfs, pre_computed, gtfs_id);
@@ -2772,7 +2859,7 @@ impl GTFSService {
             // A parent station fans out to its platforms; a platform resolves to
             // itself. Collect the union of their mapping indices so the rest of
             // the function is unchanged by which kind of code arrived.
-            let codes = self.resolve_stop_codes(&data, &gtfs_id, &stop_code);
+            let codes = Self::resolve_stop_codes(&data, &gtfs_id, &stop_code);
             let indices: Vec<usize> = codes
                 .iter()
                 .filter_map(|c| route_data.by_stop.get(c.as_str()))
@@ -2865,12 +2952,39 @@ impl GTFSService {
 
         let (cluster_id, siblings) = {
             let data = self.data.load_full();
+            // A station widens from its platforms' clusters, not from its own -
+            // it has none, so without this a station code would quietly fall
+            // through to the exact-match lookup and answer without the cluster
+            // dedup the caller asked for. Anything else resolves to itself and
+            // takes the path it always did.
+            let source_codes = self.expansion_source_codes(&data, &gtfs_id, &stop_code);
             data.stops_by_gtfs
                 .get(&gtfs_id)
                 .and_then(|stops_data| {
-                    let cid = stops_data.stops.get(&stop_code)?.cluster_id.clone()?;
-                    let siblings = stops_data.by_cluster_id.get(&cid).cloned()?;
-                    Some((cid, siblings))
+                    let mut cluster_ids: Vec<String> = Vec::new();
+                    let mut siblings: Vec<String> = Vec::new();
+                    for source_code in &source_codes {
+                        let Some(cid) = stops_data
+                            .stops
+                            .get(source_code)
+                            .and_then(|s| s.cluster_id.clone())
+                        else {
+                            continue;
+                        };
+                        let Some(cluster_siblings) = stops_data.by_cluster_id.get(&cid) else {
+                            continue;
+                        };
+                        cluster_ids.push(cid);
+                        siblings.extend(cluster_siblings.clone());
+                    }
+                    if siblings.is_empty() {
+                        return None;
+                    }
+                    cluster_ids.sort();
+                    cluster_ids.dedup();
+                    siblings.sort();
+                    siblings.dedup();
+                    Some((cluster_ids.join(","), siblings))
                 })
                 .unzip()
         };
@@ -2997,43 +3111,57 @@ impl GTFSService {
             AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
         })?;
 
-        let src_stop = match stops_data.stops.get(&stop_code) {
-            Some(s) => s,
-            None => {
-                info!(
-                    gtfs_id = %gtfs_id,
-                    stop_code = %stop_code,
-                    "destinations: stop not found in feed, returning empty list",
-                );
-                return Ok(Vec::new());
-            }
-        };
+        // A station is not a place a bus calls at, so the walk starts from its
+        // platforms; anything else starts from itself. One code in, one code
+        // out, so a platform or a plain stop takes exactly the path it did.
+        let source_codes = self.expansion_source_codes(&data, &gtfs_id, &stop_code);
 
-        let sibling_codes: Vec<String> = match src_stop.cluster_id.as_ref() {
-            Some(cid) => {
-                let siblings = stops_data
-                    .by_cluster_id
-                    .get(cid)
-                    .cloned()
-                    .unwrap_or_default();
-                info!(
-                    gtfs_id = %gtfs_id,
-                    stop_code = %stop_code,
-                    cluster_id = %cid,
-                    siblings = siblings.len(),
-                    "destinations: cluster walk",
-                );
-                siblings
+        let mut sibling_codes: Vec<String> = Vec::new();
+        let mut src_clusters: HashSet<String> = HashSet::new();
+        let mut any_source_found = false;
+        for source_code in &source_codes {
+            let src_stop = match stops_data.stops.get(source_code) {
+                Some(s) => s,
+                None => continue,
+            };
+            any_source_found = true;
+            match src_stop.cluster_id.as_ref() {
+                Some(cid) => {
+                    let siblings = stops_data
+                        .by_cluster_id
+                        .get(cid)
+                        .cloned()
+                        .unwrap_or_default();
+                    info!(
+                        gtfs_id = %gtfs_id,
+                        stop_code = %source_code,
+                        cluster_id = %cid,
+                        siblings = siblings.len(),
+                        "destinations: cluster walk",
+                    );
+                    src_clusters.insert(cid.clone());
+                    sibling_codes.extend(siblings);
+                }
+                None => {
+                    debug!(
+                        gtfs_id = %gtfs_id,
+                        stop_code = %source_code,
+                        "destinations: no cluster_id, falling back to single-stop walk",
+                    );
+                    sibling_codes.push(source_code.clone());
+                }
             }
-            None => {
-                debug!(
-                    gtfs_id = %gtfs_id,
-                    stop_code = %stop_code,
-                    "destinations: no cluster_id, falling back to single-stop walk",
-                );
-                vec![stop_code.clone()]
-            }
-        };
+        }
+        if !any_source_found {
+            info!(
+                gtfs_id = %gtfs_id,
+                stop_code = %stop_code,
+                "destinations: stop not found in feed, returning empty list",
+            );
+            return Ok(Vec::new());
+        }
+        sibling_codes.sort();
+        sibling_codes.dedup();
 
         let route_data = match data.route_data_by_gtfs.get(&gtfs_id) {
             Some(r) => r,
@@ -3061,7 +3189,6 @@ impl GTFSService {
             }
         }
 
-        let src_cluster = src_stop.cluster_id.as_deref();
         let mut rep_by_key: HashMap<String, String> = HashMap::new();
         for (route_code, src_seq) in &src_seq_by_route {
             let idxs = match route_data.by_route.get(route_code.as_ref()) {
@@ -3081,10 +3208,17 @@ impl GTFSService {
                     Some(s) => s,
                     None => continue,
                 };
-                match (src_cluster, dst_stop.cluster_id.as_deref()) {
-                    (Some(s), Some(d)) if s == d => continue,
-                    (None, _) if dst_code == stop_code.as_str() => continue,
-                    _ => {}
+                // Where the walk started is not a destination. Compared on
+                // cluster identity, and on the source codes themselves when the
+                // source carries no cluster at all - the same two tests as
+                // before, over a set of sources instead of one, which is the
+                // same thing for the one-source case.
+                let from_source_cluster = dst_stop
+                    .cluster_id
+                    .as_deref()
+                    .is_some_and(|d| src_clusters.contains(d));
+                if from_source_cluster || source_codes.iter().any(|c| c == dst_code) {
+                    continue;
                 }
                 let dedup_key = dst_stop
                     .cluster_id
@@ -3151,37 +3285,52 @@ impl GTFSService {
         })?;
 
         // Widen a stop to its cluster siblings, or to just itself when it carries
-        // no cluster_id. An unknown stop_code yields nothing to match on.
-        let widen = |stop_code: &str, side: &str| -> Option<(Vec<String>, Option<String>)> {
-            let stop = match stops_data.stops.get(stop_code) {
-                Some(s) => s,
-                None => {
-                    info!(
-                        gtfs_id = %gtfs_id,
-                        stop_code = %stop_code,
-                        side = %side,
-                        "routes between stops: stop not found in feed",
-                    );
-                    return None;
-                }
-            };
-            match stop.cluster_id.as_ref() {
-                Some(cid) => stops_data
-                    .by_cluster_id
-                    .get(cid)
-                    .cloned()
-                    .map(|siblings| (siblings, Some(cid.clone())))
-                    .or_else(|| Some((vec![stop_code.to_string()], Some(cid.clone())))),
-                None => {
-                    debug!(
-                        gtfs_id = %gtfs_id,
-                        stop_code = %stop_code,
-                        side = %side,
-                        "routes between stops: no cluster_id, falling back to single-stop match",
-                    );
-                    Some((vec![stop_code.to_string()], None))
+        // no cluster_id. A station widens from each of its platforms instead of
+        // from itself - nothing calls at a station - so an end held as a station
+        // code names the same journey as an end held as one of its platforms. An
+        // unknown stop_code yields nothing to match on.
+        let widen = |stop_code: &str, side: &str| -> Option<(Vec<String>, HashSet<String>)> {
+            let source_codes = self.expansion_source_codes(&data, &gtfs_id, stop_code);
+            let mut siblings: Vec<String> = Vec::new();
+            let mut clusters: HashSet<String> = HashSet::new();
+            let mut found = false;
+            for source_code in &source_codes {
+                let stop = match stops_data.stops.get(source_code) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                found = true;
+                match stop.cluster_id.as_ref() {
+                    Some(cid) => {
+                        clusters.insert(cid.clone());
+                        match stops_data.by_cluster_id.get(cid) {
+                            Some(cluster_siblings) => siblings.extend(cluster_siblings.clone()),
+                            None => siblings.push(source_code.clone()),
+                        }
+                    }
+                    None => {
+                        debug!(
+                            gtfs_id = %gtfs_id,
+                            stop_code = %source_code,
+                            side = %side,
+                            "routes between stops: no cluster_id, falling back to single-stop match",
+                        );
+                        siblings.push(source_code.clone());
+                    }
                 }
             }
+            if !found {
+                info!(
+                    gtfs_id = %gtfs_id,
+                    stop_code = %stop_code,
+                    side = %side,
+                    "routes between stops: stop not found in feed",
+                );
+                return None;
+            }
+            siblings.sort();
+            siblings.dedup();
+            Some((siblings, clusters))
         };
 
         let (src_siblings, src_cluster) = match widen(&from_stop_code, "source") {
@@ -3195,9 +3344,12 @@ impl GTFSService {
 
         // Same cluster (or literally the same stop) is not a journey. Compared on
         // cluster identity so the two sides of one junction don't count either.
-        let same_place = match (&src_cluster, &dst_cluster) {
-            (Some(a), Some(b)) => a == b,
-            _ => from_stop_code == to_stop_code,
+        // Two stations that share a cluster, or a station and a platform of it,
+        // are the same place for exactly the same reason.
+        let same_place = if !src_cluster.is_empty() && !dst_cluster.is_empty() {
+            src_cluster.intersection(&dst_cluster).next().is_some()
+        } else {
+            from_stop_code == to_stop_code
         };
         if same_place {
             info!(
@@ -3411,7 +3563,7 @@ impl GTFSService {
                 // Same fan-out as the singular endpoint. De-duplicate by index:
                 // asking for a station and one of its platforms in the same
                 // request must not return that platform's mappings twice.
-                for code in self.resolve_stop_codes(&data, &clean_gtfs_id, &clean_stop_code) {
+                for code in Self::resolve_stop_codes(&data, &clean_gtfs_id, &clean_stop_code) {
                     if let Some(indices) = route_data.by_stop.get(code.as_str()) {
                         for &i in indices {
                             if seen.insert(i) {
@@ -3471,6 +3623,118 @@ impl GTFSService {
         }
     }
 
+    /// `resolve_stop_code` against a snapshot the caller already holds, and
+    /// without the log line. `gtfs_id` is already cleaned.
+    fn resolve_stop_code_in(data: &GTFSData, gtfs_id: &str, stop_code: &str) -> String {
+        let stop_code = clean_identifier(stop_code);
+        data.stop_aliases_by_gtfs
+            .get(gtfs_id)
+            .and_then(|aliases| aliases.get(&stop_code))
+            .cloned()
+            .unwrap_or(stop_code)
+    }
+
+    /// The platforms beneath `stop_code` when it names a **station**, else
+    /// `None` (docs/gtfs-editor.md section 1, "A station code answers everywhere
+    /// a stop code does"). The first element of the pair is the station code the
+    /// lookups see, so a caller can report the expansion verbatim
+    /// (`X-Stop-Expanded: station=n`).
+    ///
+    /// The code is put through `resolve_stop_code` first, so a station code
+    /// retired in favour of another expands to the **survivor's** platforms -
+    /// the two maps compose in that order, and only that order makes sense: an
+    /// alias names a live stop, and only a live stop can be a station.
+    ///
+    /// `None` for a platform, for a plain stop, for an unknown code, for a
+    /// station whose platforms are all gone, and for every code in a feed with
+    /// no station rows - so every one of those reads is untouched.
+    pub fn station_platforms(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> Option<(String, Vec<String>)> {
+        let data = self.data.load();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let (station, platforms) = Self::station_expansion_in(&data, &gtfs_id, stop_code)?;
+        self.log_station_expansion(&gtfs_id, &station, platforms.len());
+        Some((station, platforms))
+    }
+
+    /// `station_platforms` against a snapshot the caller already holds, and the
+    /// one place the two maps are composed: the alias map first (a retired code
+    /// becomes the live one), the station map second (a live code that is a
+    /// station becomes its platforms). Only that order can work - an alias
+    /// always names a live stop, and only a live stop is ever a station.
+    fn station_expansion_in(
+        data: &GTFSData,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> Option<(String, Vec<String>)> {
+        let station = Self::resolve_stop_code_in(data, gtfs_id, stop_code);
+        let platforms = Self::station_platforms_in(data, gtfs_id, &station)?.clone();
+        Some((station, platforms))
+    }
+
+    /// The platforms listed under `stop_code`, without the alias step - for the
+    /// callers that resolved the code once, at their entry.
+    fn station_platforms_in<'a>(
+        data: &'a GTFSData,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> Option<&'a Vec<String>> {
+        data.station_platforms_by_gtfs
+            .get(gtfs_id)
+            .and_then(|stations| stations.get(stop_code))
+            .filter(|platforms| !platforms.is_empty())
+    }
+
+    /// The codes a read keyed on "the stop a bus calls at" should start from:
+    /// a station's platforms, or the code itself for anything else.
+    ///
+    /// Nothing calls at a station - `stop_times` only ever names platforms - so
+    /// a cluster walk, a destination walk or a routes-between match started at a
+    /// station code matches nothing at all unless it is widened here first.
+    fn expansion_source_codes(
+        &self,
+        data: &GTFSData,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> Vec<String> {
+        match Self::station_platforms_in(data, gtfs_id, stop_code) {
+            Some(platforms) => {
+                self.log_station_expansion(gtfs_id, stop_code, platforms.len());
+                platforms.clone()
+            }
+            None => vec![stop_code.to_string()],
+        }
+    }
+
+    /// Log a station expansion at info, at most once an hour per station, on the
+    /// same terms as `log_alias`: enough to see which stations callers are
+    /// actually asking for, not enough to matter on a hot path.
+    fn log_station_expansion(&self, gtfs_id: &str, station_code: &str, platforms: usize) {
+        let Ok(mut seen) = self.station_log_seen.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let key = (gtfs_id.to_string(), station_code.to_string());
+        let due = match seen.get(&key) {
+            Some(last) => now.duration_since(*last) >= ALIAS_LOG_EVERY,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        seen.insert(key, now);
+        // Bounded by the number of stations actually asked for.
+        info!(
+            gtfs_id = %gtfs_id,
+            stop_code = %station_code,
+            platforms,
+            "stop code is a station; answering for its platforms",
+        );
+    }
+
     /// Log a redirect at info, at most once an hour per `(old, new)`: enough to
     /// see which retired ids are still in callers' hands, not enough to matter
     /// on a hot path. A poisoned lock is ignored - logging must never fail a
@@ -3509,7 +3773,18 @@ impl GTFSService {
     ///
     /// A platform has no children and resolves to itself, so callers never need
     /// to know which kind of code they are holding.
-    fn resolve_stop_codes(&self, data: &GTFSData, gtfs_id: &str, stop_code: &str) -> Vec<String> {
+    fn resolve_stop_codes(data: &GTFSData, gtfs_id: &str, stop_code: &str) -> Vec<String> {
+        // A station row answers from the sorted station map, so the union it
+        // produces is in the same order on every pod and after every reload.
+        // Only a feed that has station rows has an entry here, so a
+        // preprocessed feed always falls through to `children_by_parent` and
+        // its answer is exactly what it was.
+        if let Some(platforms) = Self::station_platforms_in(data, gtfs_id, stop_code) {
+            let mut codes = Vec::with_capacity(platforms.len() + 1);
+            codes.push(stop_code.to_string());
+            codes.extend(platforms.iter().cloned());
+            return codes;
+        }
         let children = data
             .children_by_parent
             .get(gtfs_id)
@@ -3536,14 +3811,21 @@ impl GTFSService {
         let gtfs_id = clean_identifier(gtfs_id);
         // A station merged into another station lists the survivor's platforms.
         let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
-        Ok(data
+        let mut children: Vec<String> = data
             .children_by_parent
             .get(gtfs_id.as_str())
             .and_then(|p| p.get(stop_code.as_str()))
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .collect())
+            .collect();
+        // Sorted, because the set behind this is a `HashSet` and Rust seeds its
+        // hasher per process: until now two pods - or the same pod after a
+        // restart - answered this endpoint with the same codes in a different
+        // order, which no caller can rely on and which makes any diff of two
+        // GIMS builds unreadable. The membership is unchanged.
+        children.sort();
+        Ok(children)
     }
 
     pub async fn get_version(&self, gtfs_id: &str) -> AppResult<String> {
@@ -4093,5 +4375,247 @@ impl GTFSService {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------- station -> platforms map
+
+    /// A stop as the loaders hand it to the map builders: `id` is
+    /// `{gtfs}:{stop_id}`, `code` is what the feed is served under, and
+    /// `station_id` is `{gtfs}:{parent}` when it has a parent.
+    fn stop(gtfs_id: &str, code: &str, location_type: &str, parent: Option<&str>) -> GTFSStop {
+        GTFSStop {
+            id: format!("{}:{}", gtfs_id, code),
+            code: code.to_string(),
+            name: code.to_string(),
+            lat: 0.0,
+            lon: 0.0,
+            station_id: parent.map(|p| format!("{}:{}", gtfs_id, p)),
+            location_type: location_type.to_string(),
+            platform_code: None,
+            cluster: None,
+            hindi_name: None,
+            regional_name: None,
+            info_json: None,
+            cluster_id: None,
+            description: None,
+        }
+    }
+
+    fn station(gtfs_id: &str, code: &str) -> GTFSStop {
+        stop(gtfs_id, code, "1", None)
+    }
+
+    fn platform(gtfs_id: &str, code: &str, parent: &str) -> GTFSStop {
+        stop(gtfs_id, code, "0", Some(parent))
+    }
+
+    fn plain(gtfs_id: &str, code: &str) -> GTFSStop {
+        stop(gtfs_id, code, "0", None)
+    }
+
+    /// A feed whose stops are `stops`, with no aliases.
+    fn data_with(stops: Vec<GTFSStop>) -> GTFSData {
+        let mut data = GTFSData::new();
+        data.station_platforms_by_gtfs = GTFSService::build_station_platforms(&stops);
+        data
+    }
+
+    #[test]
+    fn station_lists_its_platforms_sorted() {
+        let stops = vec![
+            station("g", "stn_a"),
+            platform("g", "p2", "stn_a"),
+            platform("g", "p1", "stn_a"),
+            platform("g", "p3", "stn_a"),
+        ];
+        let map = GTFSService::build_station_platforms(&stops);
+        assert_eq!(map["g"]["stn_a"], vec!["p1", "p2", "p3"]);
+        assert_eq!(map["g"].len(), 1, "only the station is a key");
+    }
+
+    #[test]
+    fn a_platform_is_not_a_key_and_a_plain_stop_is_not_either() {
+        let stops = vec![
+            station("g", "stn_a"),
+            platform("g", "p1", "stn_a"),
+            plain("g", "lonely"),
+        ];
+        let data = data_with(stops);
+        assert!(GTFSService::station_platforms_in(&data, "g", "p1").is_none());
+        assert!(GTFSService::station_platforms_in(&data, "g", "lonely").is_none());
+        assert!(GTFSService::station_platforms_in(&data, "g", "nope").is_none());
+        assert!(GTFSService::station_platforms_in(&data, "other", "stn_a").is_none());
+    }
+
+    #[test]
+    fn a_station_with_no_live_platform_does_not_expand() {
+        // Its platforms were all merged away or deleted, so the feed carries the
+        // station row alone. Expanding it to nothing would turn a 404 into an
+        // empty 200, so it must not be a key at all.
+        let stops = vec![station("g", "stn_empty"), plain("g", "elsewhere")];
+        let data = data_with(stops);
+        assert!(GTFSService::station_platforms_in(&data, "g", "stn_empty").is_none());
+        assert_eq!(
+            GTFSService::resolve_stop_codes(&data, "g", "stn_empty"),
+            vec!["stn_empty".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_parent_that_is_not_a_station_row_builds_nothing() {
+        // This is every preprocessed feed: metro platforms carry a stationId, but
+        // no row in the feed is location_type = 1, so there is no station map and
+        // station expansion cannot reach them.
+        let stops = vec![
+            plain("g", "104"),
+            platform("g", "104_1", "104"),
+            platform("g", "104_2", "104"),
+        ];
+        let map = GTFSService::build_station_platforms(&stops);
+        assert!(map.is_empty(), "{map:?}");
+    }
+
+    #[test]
+    fn a_platform_that_shares_its_stations_code_is_not_listed_under_it() {
+        // Preprocessed metro spells a station and its platform with one code.
+        // Listing it under itself would answer every row twice.
+        let stops = vec![
+            station("g", "104"),
+            stop("g", "104", "0", Some("104")),
+            platform("g", "104_2", "104"),
+        ];
+        let map = GTFSService::build_station_platforms(&stops);
+        assert_eq!(map["g"]["104"], vec!["104_2"]);
+    }
+
+    #[test]
+    fn feeds_do_not_bleed_into_each_other() {
+        let stops = vec![
+            station("a", "stn_1"),
+            platform("a", "p_a", "stn_1"),
+            station("b", "stn_1"),
+            platform("b", "p_b", "stn_1"),
+        ];
+        let map = GTFSService::build_station_platforms(&stops);
+        assert_eq!(map["a"]["stn_1"], vec!["p_a"]);
+        assert_eq!(map["b"]["stn_1"], vec!["p_b"]);
+    }
+
+    // ------------------------------------------------------- the fan-out itself
+
+    #[test]
+    fn resolve_stop_codes_puts_the_station_first_then_its_platforms() {
+        let stops = vec![
+            station("g", "stn_a"),
+            platform("g", "p2", "stn_a"),
+            platform("g", "p1", "stn_a"),
+        ];
+        let data = data_with(stops);
+        assert_eq!(
+            GTFSService::resolve_stop_codes(&data, "g", "stn_a"),
+            vec!["stn_a".to_string(), "p1".to_string(), "p2".to_string()],
+        );
+    }
+
+    #[test]
+    fn resolve_stop_codes_leaves_a_platform_and_an_unknown_code_alone() {
+        let stops = vec![station("g", "stn_a"), platform("g", "p1", "stn_a")];
+        let data = data_with(stops);
+        assert_eq!(
+            GTFSService::resolve_stop_codes(&data, "g", "p1"),
+            vec!["p1".to_string()]
+        );
+        assert_eq!(
+            GTFSService::resolve_stop_codes(&data, "g", "nope"),
+            vec!["nope".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_stop_codes_still_uses_children_by_parent_when_there_is_no_station_map() {
+        // A preprocessed feed: `children_by_parent` is all there is, and the
+        // answer is exactly what it was before the station map existed.
+        let mut data = GTFSData::new();
+        data.children_by_parent.insert(
+            "g".to_string(),
+            [(
+                "104".to_string(),
+                ["104_1".to_string()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            GTFSService::resolve_stop_codes(&data, "g", "104"),
+            vec!["104".to_string(), "104_1".to_string()],
+        );
+    }
+
+    // --------------------------------------------- composing with the alias map
+
+    fn with_alias(mut data: GTFSData, gtfs_id: &str, old: &str, new: &str) -> GTFSData {
+        data.stop_aliases_by_gtfs
+            .entry(gtfs_id.to_string())
+            .or_default()
+            .insert(old.to_string(), new.to_string());
+        data
+    }
+
+    #[test]
+    fn a_station_merged_into_another_expands_to_the_survivors_platforms() {
+        // merge-then-station: the code held is a retired *station*, and what
+        // survived it is a station of its own.
+        let stops = vec![
+            station("g", "stn_new"),
+            platform("g", "p1", "stn_new"),
+            platform("g", "p2", "stn_new"),
+        ];
+        let data = with_alias(data_with(stops), "g", "stn_old", "stn_new");
+        let (station_code, platforms) =
+            GTFSService::station_expansion_in(&data, "g", "stn_old").expect("expands");
+        assert_eq!(station_code, "stn_new");
+        assert_eq!(platforms, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    #[test]
+    fn a_platform_merged_away_under_a_station_resolves_to_its_survivor_not_the_station() {
+        // station-then-merge: the retired code is a *platform*, and its survivor
+        // sits under a station. It must answer as that platform - expanding to
+        // the whole station would widen the answer behind the caller's back.
+        let stops = vec![
+            station("g", "stn_a"),
+            platform("g", "p_new", "stn_a"),
+            platform("g", "p_other", "stn_a"),
+        ];
+        let data = with_alias(data_with(stops), "g", "p_old", "p_new");
+        assert!(GTFSService::station_expansion_in(&data, "g", "p_old").is_none());
+        assert_eq!(
+            GTFSService::resolve_stop_code_in(&data, "g", "p_old"),
+            "p_new"
+        );
+    }
+
+    #[test]
+    fn a_station_whose_platform_was_merged_away_lists_only_what_is_live() {
+        // The merged-away platform is not in the feed's stops at all, so it is
+        // not under the station; the survivor is, under its own parent.
+        let stops = vec![station("g", "stn_a"), platform("g", "p_survivor", "stn_a")];
+        let data = with_alias(data_with(stops), "g", "p_gone", "p_survivor");
+        let (_, platforms) =
+            GTFSService::station_expansion_in(&data, "g", "stn_a").expect("expands");
+        assert_eq!(platforms, vec!["p_survivor".to_string()]);
+    }
+
+    #[test]
+    fn an_unknown_code_expands_to_nothing_with_or_without_aliases() {
+        let stops = vec![station("g", "stn_a"), platform("g", "p1", "stn_a")];
+        let data = with_alias(data_with(stops), "g", "old", "p1");
+        assert!(GTFSService::station_expansion_in(&data, "g", "nope").is_none());
+        assert!(GTFSService::station_expansion_in(&data, "g", "old").is_none());
     }
 }

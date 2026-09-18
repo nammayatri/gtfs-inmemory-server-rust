@@ -752,8 +752,11 @@ pub async fn get_route_stop_mapping_by_stop(
             .get_route_stop_mapping_by_stop_with_direction(&gtfs_id, &stop_code, direction)
             .await?
     };
-    Ok(stop_alias_response(
-        &app_state, &gtfs_id, &stop_code, &mappings,
+    Ok(stop_expansion_response(
+        &app_state,
+        &gtfs_id,
+        &[&stop_code],
+        &mappings,
     ))
 }
 
@@ -1174,10 +1177,10 @@ pub async fn get_cluster_destinations(
     let destinations = app_state
         .gtfs_service
         .get_cluster_destinations_for_stop(&gtfs_id, &stop_code)?;
-    Ok(stop_alias_response(
+    Ok(stop_expansion_response(
         &app_state,
         &gtfs_id,
-        &stop_code,
+        &[&stop_code],
         &destinations,
     ))
 }
@@ -1221,7 +1224,12 @@ pub async fn get_routes_between_stops(
         &from_stop_code,
         &to_stop_code,
     )?;
-    Ok(HttpResponse::Ok().json(connections))
+    Ok(stop_expansion_response(
+        &app_state,
+        &gtfs_id,
+        &[&from_stop_code, &to_stop_code],
+        &connections,
+    ))
 }
 
 #[utoipa::path(
@@ -1339,6 +1347,48 @@ fn stop_alias_response<T: serde::Serialize>(
     let mut resp = HttpResponse::Ok();
     if let Some((old, new)) = app_state.gtfs_service.stop_alias(gtfs_id, stop_code) {
         resp.insert_header(("X-Stop-Alias", format!("{}={}", old, new)));
+    }
+    resp.json(body)
+}
+
+/// `stop_alias_response`, plus `X-Stop-Expanded: <station>=<n platforms>` when
+/// the code asked for named a station and the body is the answer for its
+/// platforms (docs/gtfs-editor.md section 1, "A station code answers everywhere
+/// a stop code does").
+///
+/// Only the endpoints that actually widen use this. The body keeps the shape it
+/// always had - every row still carries the real platform's `stopCode` - so the
+/// header is the only way to see that one code was answered as several, and a
+/// platform or plain code still produces a byte-identical response with no
+/// header at all.
+///
+/// `stop_codes` is one code for most endpoints and two for
+/// `/cluster/{g}/routes/{from}/{to}`; where both ends say something, each header
+/// carries both entries, comma separated, so one code never hides the other.
+fn stop_expansion_response<T: serde::Serialize>(
+    app_state: &AppState,
+    gtfs_id: &str,
+    stop_codes: &[&str],
+    body: &T,
+) -> HttpResponse {
+    let mut aliases = Vec::new();
+    let mut expansions = Vec::new();
+    for stop_code in stop_codes {
+        if let Some((old, new)) = app_state.gtfs_service.stop_alias(gtfs_id, stop_code) {
+            aliases.push(format!("{}={}", old, new));
+        }
+        if let Some((station, platforms)) =
+            app_state.gtfs_service.station_platforms(gtfs_id, stop_code)
+        {
+            expansions.push(format!("{}={}", station, platforms.len()));
+        }
+    }
+    let mut resp = HttpResponse::Ok();
+    if !aliases.is_empty() {
+        resp.insert_header(("X-Stop-Alias", aliases.join(",")));
+    }
+    if !expansions.is_empty() {
+        resp.insert_header(("X-Stop-Expanded", expansions.join(",")));
     }
     resp.json(body)
 }
