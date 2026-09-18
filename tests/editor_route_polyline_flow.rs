@@ -1,5 +1,5 @@
 //! Route map lines (docs/gtfs-editor.md section 14), end to end against a real
-//! Postgres holding the editor schema (db/gtfs_editor/0001..0013): which routes
+//! Postgres holding the editor schema (db/gtfs_editor/0001..0015): which routes
 //! have no line, the operator's line kept in a draft as a `route/update` - the
 //! router's proposal, an encoded line, the points of one - the refusal to cover
 //! a line the route already has, the area and length checks, and the `polylines`

@@ -1583,7 +1583,7 @@ in this document.
   so a second city's line would be refused; that constant is where to make it per
   feed.
 - `polyline_source` is `osrm`, `manual`, `upload` or `imported`. `upload` is new
-  (`0013_polyline_source_upload.sql` widens the column's CHECK); `imported` stays
+  (`0015_polyline_source_upload.sql` widens the column's CHECK); `imported` stays
   for the lines the nightly build wrote, which nothing here rewrites.
 
 Then the line is measured against the route's own stops — the straight line
