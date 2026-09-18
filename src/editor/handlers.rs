@@ -5,6 +5,7 @@ use super::bulk;
 use super::context;
 use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
+use super::feed_lock;
 use super::position_reviews;
 use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
@@ -903,8 +904,14 @@ pub async fn position_review(
             "lat and lon are sent together, with route_ids if any, and must be a valid position",
         )),
     };
-    let mut conn = st.pool.acquire().await?;
-    ok(position_reviews::detail(&mut conn, *path, what_if.as_ref(), &ctx.user.email).await?)
+    // a what-if merge replays the draft in a transaction: retried like every
+    // other replay should that transaction hit a serialization failure
+    let detail = feed_lock::retry_transient(|| async {
+        let mut conn = st.pool.acquire().await?;
+        position_reviews::detail(&mut conn, *path, what_if.as_ref(), &ctx.user.email).await
+    })
+    .await?;
+    ok(detail)
 }
 
 pub async fn position_review_move(

@@ -14,6 +14,7 @@
 use super::auth::{self, Ctx};
 use super::draft::{DraftView, StopTexts};
 use super::error::{EditorError, EditorResult};
+use super::feed_lock::{lock_feed_of_set, retry_transient};
 use super::service::{self, rows_hash, ChangeInsert};
 use super::validation::{
     check_payload, check_route_rows, check_route_rows_labelled, grade_against_live, Finding, Level,
@@ -1145,7 +1146,28 @@ pub async fn run(
         )
         .with_details(json!({"max_rows": MAX_ROWS, "rows": req.rows.len()})));
     }
+    let (mut out, with_detail) =
+        retry_transient(|| run_once(state, ctx, change_set_id, kind, &req)).await?;
+    if with_detail {
+        out["change_set"] = service::set_detail(state, ctx, change_set_id).await?;
+    }
+    Ok(out)
+}
+
+/// The upload's one transaction: plan the rows against the live tables and the
+/// draft, and - unless it is a dry run or nothing changes - store the changes.
+/// On the feed's lock like every other draft write, so it never collides with a
+/// commit; retried whole after a serialization failure. The bool says whether
+/// the response carries the set detail (a dry run's does not).
+async fn run_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    change_set_id: Uuid,
+    kind: Kind,
+    req: &BulkRequest,
+) -> EditorResult<(Value, bool)> {
     let mut tx = state.pool.begin().await?;
+    lock_feed_of_set(&mut tx, change_set_id).await?;
     let set = service::load_set(&mut tx, change_set_id, !req.dry_run).await?;
     service::editable(&set)?;
     let g = set.gtfs_id.clone();
@@ -1160,7 +1182,7 @@ pub async fn run(
     };
     if req.dry_run {
         tx.rollback().await?;
-        return Ok(respond(true, kind, &plan, &[]));
+        return Ok((respond(true, kind, &plan, &[]), false));
     }
     if plan.has_errors() {
         tx.rollback().await?;
@@ -1178,9 +1200,7 @@ pub async fn run(
         // every row is `unchanged`: uploading the same file again adds nothing,
         // so nothing is written - not the draft, not the audit log
         tx.rollback().await?;
-        let mut out = respond(false, kind, &plan, &[]);
-        out["change_set"] = service::set_detail(state, ctx, change_set_id).await?;
-        return Ok(out);
+        return Ok((respond(false, kind, &plan, &[]), true));
     }
     let unnamed: Vec<usize> = plan
         .changes
@@ -1227,9 +1247,7 @@ pub async fn run(
     )
     .await?;
     tx.commit().await?;
-    let mut out = respond(false, kind, &plan, &change_ids);
-    out["change_set"] = service::set_detail(state, ctx, change_set_id).await?;
-    Ok(out)
+    Ok((respond(false, kind, &plan, &change_ids), true))
 }
 
 #[cfg(test)]

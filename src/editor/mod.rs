@@ -13,6 +13,7 @@ pub mod context;
 pub mod crypto;
 pub mod draft;
 pub mod error;
+pub mod feed_lock;
 pub mod handlers;
 pub mod jwt;
 pub mod position_reviews;

@@ -73,6 +73,11 @@ impl ResponseError for EditorError {
 
 impl From<sqlx::Error> for EditorError {
     fn from(e: sqlx::Error) -> Self {
+        // A deadlock or serialization failure is nobody's fault: 503 try_again,
+        // and the transaction is retried (feed_lock.rs).
+        if super::feed_lock::is_transient(&e) {
+            return super::feed_lock::try_again(&e);
+        }
         // The message is logged, never returned: it can carry SQL and values.
         tracing::error!(tag = "[GTFS EDITOR DB]", error = %e);
         EditorError::internal("database error")

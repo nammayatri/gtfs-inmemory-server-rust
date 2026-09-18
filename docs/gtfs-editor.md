@@ -150,7 +150,10 @@ feed in `gtfs_db_feeds` and one without.
 
 JSON everywhere. Errors: `{"error": {"code": "...", "message": "...", "details": {...}}}`
 with HTTP 400 validation · 401 no/invalid identity or session · 403 role or
-account · 404 · 409 conflict or wrong status · 429 locked. Every list is
+account · 404 · 409 conflict or wrong status · 429 locked · 503 `try_again`
+(a transaction lost a lock-order race with another change to the feed three
+times running; nothing was applied — send the same request again; see "Commit"
+below). Every list is
 `{items, next_cursor}`; paged lists take `limit` (default 50, max 500) and
 `cursor`, and `next_cursor` is null on the last page.
 
@@ -166,6 +169,7 @@ account · 404 · 409 conflict or wrong status · 429 locked. Every list is
 | 401 | `invalid_code` | wrong code; `details.attempts_left` before the lock |
 | 401 | `code_reused` | that code's step was already used; `details.attempts_left` |
 | 429 | `locked` | too many wrong codes; `details.retry_after_seconds` |
+| 503 | `try_again` | any editor write or draft replay: the transaction hit a deadlock or serialization failure on every one of its 3 retries; nothing was applied — repeat the request (section 3, "Commit") |
 
 ### Auth
 
@@ -347,12 +351,62 @@ block submit and commit. A stop that does not exist, is deleted or is a station,
 or a row the table refuses, does not apply; the preview then shows the route
 without that change.
 
-**Commit** — one transaction: `SELECT … FROM gtfs_feed WHERE gtfs_id = $g FOR
-UPDATE`; for each change in `position` order check the target's current
-`row_version` (stop, route), `rows_hash` (route_stops) or `data_source`
-(feed_config) against the change's base — any mismatch aborts with 409 `change_set_conflicts` and `details.conflicts`;
-apply; re-run validation on the result; `version = version + 1`; set
+**Commit** — one transaction: the feed's advisory lock (below), then `SELECT …
+FROM gtfs_feed WHERE gtfs_id = $g FOR UPDATE`; for each change in `position`
+order check the target's current `row_version` (stop, route), `rows_hash`
+(route_stops) or `data_source` (feed_config) against the change's base — any
+mismatch aborts with 409 `change_set_conflicts` and `details.conflicts`; apply;
+re-run validation on the result; `version = version + 1`; set
 `committed_version`; audit. Nothing is applied if anything fails.
+
+**Every replay of a feed's drafts is serialised on one advisory transaction
+lock** — `SELECT pg_advisory_xact_lock(hashtext('gtfs_editor:' || $g))`, taken
+first thing by every transaction that replays or writes a draft of feed `g`: the
+commit, submit's validation, `GET /change-sets/{id}` and the route preview
+(both replay the draft with real UPDATEs that are rolled back), add / PUT /
+DELETE change, bulk import (dry run included), a coordinate review's move, split
+and merge and its what-if merge. A commit and a concurrent add therefore queue,
+one after the other, instead of taking the same live rows in different orders
+and deadlocking. Reads that do not replay (stops, routes, lists, audit, context)
+never take it.
+
+Settled while implementing (the feed lock, 2026-09-18):
+
+- Why: while a script was adding ~560 `route_stops/replace` changes to one
+  draft — each add's response replays the whole draft — a person committed
+  another draft of 13 stop moves and merges on the same feed. Postgres killed
+  two of the commit's statements with `deadlock detected` (SQLSTATE 40P01), and
+  the commit answered 400 `validation_failed` with the per-change finding
+  `{"code": "database_rejected", "message": "deadlock detected"}` — a transient
+  lock-order collision reported as if the changes were wrong. Retrying later
+  worked.
+- The lock is `src/editor/feed_lock.rs`'s `lock_feed` (by feed) and
+  `lock_feed_of_set` (by change set: reads the set's feed without a lock, then
+  locks the feed — so a transaction never holds a row while it waits for the
+  feed). It is taken before the first row lock of the transaction; the commit's
+  order is feed lock, feed row, set row. Held only to the end of the
+  transaction; nothing to release, nothing to leak.
+- A deadlock (40P01) or serialization failure (40001) anywhere in one of these
+  transactions is **never a finding**: `evaluate` propagates it out of the
+  change's savepoint instead of writing `database_rejected`, and every
+  `sqlx::Error` with either code becomes 503 `try_again`. The transaction is
+  retried whole up to 3 times, after 50 / 150 / 400 ms, before that 503 reaches
+  the caller. Each retried unit is exactly one transaction (a commit is one
+  transaction; an add's response is a second, retried on its own), so a retry
+  never applies anything twice. `database_rejected` stays what it was for a
+  genuine refusal (a constraint, a bad value).
+- Cost, measured locally: the lock statement itself 0.3 ms and the set's feed
+  lookup 0.4 ms (psql `\timing`); a 5,000-row `stop_updates` dry run 274–283 ms
+  before and 290–304 ms after (run to run noise on the same machine is of that
+  order); one add to a draft of 16 stop-list changes 50 ms before, 48–51 ms
+  after. Under a concurrent commit an add averaged 93 ms before (1.09 s worst,
+  the deadlock timeout) and 67 ms after (113 ms worst); the commit itself 439 ms
+  before (1.08 s worst) and 46 ms after. `tests/editor_feed_lock_flow.rs` runs
+  30 commits against 300 concurrent adds and removals and found 12 deadlock
+  findings before the lock, none after.
+- The dashboard treats 503 `try_again` like any other error: it shows the
+  message ("another change to this feed was being applied at the same time;
+  please try again").
 
 ### Admin
 
