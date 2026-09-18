@@ -156,6 +156,7 @@ fn state(pool: &PgPool, signer: &TestSigner, admin: &str) -> (EditorState, std::
             session_hours: 1,
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
+            ops_pool: None,
         },
     )
     .unwrap();

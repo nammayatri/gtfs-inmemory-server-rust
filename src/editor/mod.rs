@@ -20,6 +20,7 @@ pub mod position_reviews;
 pub mod proposals;
 pub mod service;
 pub mod static_ui;
+pub mod trips;
 pub mod validation;
 
 use crate::environment::AppConfig;
@@ -40,6 +41,12 @@ pub struct EditorState {
     pub session_hours: i64,
     pub ui_dir: PathBuf,
     pub osrm_url: Option<String>,
+    /// The OPERATIONAL database (`database_url`), where the waybills say what a
+    /// route has actually been running - a different database from the editor's
+    /// own. `None` when the deployment has not configured one; the trips
+    /// endpoint then says so instead of failing (see `trips`).
+    pub ops_pool: Option<sqlx::postgres::PgPool>,
+    pub trips_cache: Arc<trips::TripsCache>,
 }
 
 pub struct EditorSettings {
@@ -50,6 +57,7 @@ pub struct EditorSettings {
     pub session_hours: i64,
     pub ui_dir: PathBuf,
     pub osrm_url: Option<String>,
+    pub ops_pool: Option<sqlx::postgres::PgPool>,
 }
 
 impl EditorState {
@@ -77,6 +85,8 @@ impl EditorState {
             session_hours: s.session_hours.clamp(1, 24 * 7),
             ui_dir: s.ui_dir,
             osrm_url: s.osrm_url,
+            ops_pool: s.ops_pool,
+            trips_cache: trips::TripsCache::new(),
         })
     }
 
@@ -129,6 +139,27 @@ impl EditorState {
                     .unwrap_or_else(|| "./editor-ui".to_string()),
             ),
             osrm_url: config.osrm_url.clone(),
+            // A small, lazy pool of its own: the editor must not compete for
+            // the connections that serve riders, and an unreachable operational
+            // database must not stop the editor from starting.
+            ops_pool: config.database_url.as_deref().and_then(|url| {
+                match PgPoolOptions::new()
+                    .max_connections(2)
+                    .min_connections(0)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .idle_timeout(Duration::from_secs(600))
+                    .connect_lazy(url)
+                {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        error!(
+                            "GTFS editor: database_url is invalid; \
+                                what a route has been running will not be shown"
+                        );
+                        None
+                    }
+                }
+            }),
         };
         match Self::build(pool, settings) {
             Ok(state) => {
@@ -204,6 +235,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/context",
                 web::get().to(h::route_context),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/trips",
+                web::get().to(h::route_trips),
             )
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:osrm",

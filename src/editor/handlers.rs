@@ -9,6 +9,7 @@ use super::feed_lock;
 use super::position_reviews;
 use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
+use super::trips;
 use super::validation::valid_lat_lon;
 use super::EditorState;
 use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
@@ -448,6 +449,40 @@ pub async fn stop_context(
     let (g, id) = path.into_inner();
     let mut conn = st.pool.acquire().await?;
     ok(context::stop(&mut conn, &g, &id).await?)
+}
+
+#[derive(Deserialize)]
+pub struct TripsQuery {
+    #[serde(default)]
+    days: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// What a route has actually been running (docs/gtfs-editor.md section 13):
+/// its trips inside the window, or its last known trip when it has none.
+/// Readable by anyone who can sign in.
+pub async fn route_trips(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+    q: web::Query<TripsQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let (g, route_id) = path.into_inner();
+    let mut conn = st.pool.acquire().await?;
+    // 404 on a route the feed does not have, so a typo is not an empty answer
+    svc::route_row(&mut conn, &g, &route_id)
+        .await?
+        .ok_or_else(|| EditorError::not_found("route_not_found", format!("no route {route_id}")))?;
+    ok(trips::for_route(
+        st.ops_pool.as_ref(),
+        &st.trips_cache,
+        &route_id,
+        trips::clamp_days(q.days),
+        trips::clamp_limit(q.limit),
+    )
+    .await?)
 }
 
 pub async fn route_context(

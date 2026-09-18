@@ -173,6 +173,7 @@ async fn editor_end_to_end() {
             session_hours: 1,
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
+            ops_pool: None,
         },
     )
     .unwrap();

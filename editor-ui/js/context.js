@@ -122,6 +122,62 @@ async function load(path, box) {
   }
 }
 
+// ------------------------------------------------------------------ running
+
+const SOURCE_WORDS = {
+  operated: "ran recently",
+  last_known: "has not run lately",
+  never: "has never run",
+  unavailable: "not known here",
+};
+
+// What a route has actually been running (docs/gtfs-editor.md section 13).
+// Everything else on the route page is what the feed SAYS; this is the road.
+export function routeTrips(route) {
+  const box = h("section.section.route-trips", { hidden: true, "aria-label": "What this route runs" });
+  const here = location.hash;
+  load(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/trips`, box).then((t) => {
+    if (!t || location.hash !== here || !document.body.contains(box)) return;
+    const s = t.summary || {};
+    const last = t.last_trip;
+    const when = (x) => (x ? `${x.duty_date}${x.start_time ? ` at ${x.start_time}` : ""}` : "");
+    box.hidden = false;
+
+    let headline;
+    if (t.source === "operated") {
+      headline = h("p.notice.ok",
+        `${plural(s.trips || 0, "trip")} in the last ${t.days} days, on ${plural(s.days_operated || 0, "day")}`,
+        s.vehicles ? `, ${plural(s.vehicles, "vehicle")}` : "",
+        last ? `. Last ran ${when(last)}.` : ".");
+    } else if (t.source === "last_known") {
+      headline = h("p.notice.warning",
+        `No trip in the last ${t.days} days. The last one this route ran was ${when(last)}.`);
+    } else if (t.source === "never") {
+      headline = h("p.notice.warning", "No trip has ever been recorded for this route.");
+    } else {
+      headline = h("p.hint", t.message || "Not known here.");
+    }
+
+    const rows = (t.trips || []).slice(0, 12);
+    clear(box,
+      h("h2", "What it runs"),
+      h("p.hint", "Trips a crew signed a waybill for, so these are trips that ran, not the timetable. Depot moves are left out."),
+      headline,
+      rows.length ? h("div.table-wrap", h("table",
+        h("thead", h("tr", h("th", "Date"), h("th", "Start"), h("th", "End"), h("th", "Vehicle"), h("th", "Schedule"))),
+        h("tbody", rows.map((x) => h("tr",
+          h("td", x.duty_date || ""),
+          h("td", x.start_time || ""),
+          h("td", x.end_time || ""),
+          h("td", x.vehicle_no || h("span.hint", "—")),
+          h("td", x.schedule_no || h("span.hint", "—"),
+            x.is_flexi ? h("span.chip", " flexi") : null)))))) : null,
+      (t.trips || []).length > rows.length
+        ? h("p.hint", `Showing the ${rows.length} most recent of ${plural(t.trips.length, "trip")}.`) : null);
+  });
+  return box;
+}
+
 // For the stop panel. Returns the section at once and fills it when the answer
 // comes; `names` is the panel's station-name cache.
 export function stopContext(stop, names = new Map()) {

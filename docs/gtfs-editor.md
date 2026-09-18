@@ -1436,3 +1436,89 @@ Tests: `tests/editor_stop_details_flow.rs` (registered in
 `scripts/editor_flow_test.sh`); `dev/ui_smoke.mjs` `round5Flows` (`node
 dev/ui_smoke.mjs --round5` runs only these) against `dev/mock_server.py`
 (`seed_round5`, `bulk_stop_updates`).
+
+## 13. What a route actually runs (2026-09-18)
+
+Everything else the dashboard shows about a route is what the feed **says**: its
+stops, their order, its polyline. None of it says whether buses are on the road.
+An operator deciding whether a route's stop list is worth fixing, or whether the
+route should exist at all, is asking a different question.
+
+`GET /feeds/{g}/routes/{route_id}/trips?days=&limit=` — viewer+, read-only.
+
+```json
+{ "route_id": "2561", "days": 45, "window_from": "2026-08-04",
+  "source": "operated",
+  "summary": {"trips": 6, "days_operated": 3, "vehicles": 2,
+              "busiest_day": {"duty_date": "2026-09-18", "trips": 2}},
+  "last_trip": {"duty_date": "2026-09-18", "start_time": "10:40", …},
+  "trips": [ {duty_date, start_time, end_time, vehicle_no, schedule_no,
+              schedule_trip_id, trip_type, is_flexi}, … ] }
+```
+
+`source` is the whole answer in one word:
+
+| `source` | meaning | `trips` | `last_trip` |
+|---|---|---|---|
+| `operated` | it ran inside the window | the trips, newest first | the newest |
+| `last_known` | nothing in the window | empty | the last trip it ever ran |
+| `never` | no trip has ever been recorded | empty | `null` |
+| `unavailable` | this deployment has no operational database | empty | `null` |
+
+`days` defaults to 45 and is capped at 180; `limit` defaults to 50, capped at
+500. 404 `route_not_found` for a route the feed does not have, so a typo is not
+an empty answer.
+
+### 13.1 Where it comes from
+
+A waybill is a duty a crew actually signed for, so a waybill joined to its
+scheduled trip is a trip that **ran** — not the timetable. `waybills` joins
+`bus_schedule_trip_detail` for ordinary trips and `bus_schedule_trip_flexi` for
+flexible ones, unioned rather than chosen by `waybills.is_flexi`, which is not
+always set. Both carry `route_number_id`, and that is the same id as
+`gtfs_route.route_id`, so no mapping table is needed.
+
+**Dead trips are excluded** (`trip_type != 'dead-trip'`): a bus moving to or from
+the depot is not service, and counting it would say a route ran when nobody could
+board. Deleted waybills are excluded too.
+
+45 days is the window the nightly GTFS build already treats as "recent" when it
+decides whether a route's schedule is live (nandi's
+`query_tummoc_db_for_generating_schedule_info_tummoc_db_latest.sql`), so the
+dashboard and the feed mean the same thing by the word.
+
+`duty_date` is a local calendar day stored as text, so the window bound is
+computed in **IST** and compared as text, which keeps the comparison on the
+column's own index.
+
+### 13.2 This is the operational database
+
+The editor's own tables live on `internal_database_url`; every fact here lives on
+`database_url`, the operational Postgres shared with everything that serves
+riders. This is the first thing in the editor to read it, on an operator's page
+view, so:
+
+- its pool is separate, lazy and small (2 connections), and the editor starts
+  whether or not that database answers;
+- every query names **one route**, and the recent one also bounds the days and
+  the rows;
+- each route's answer is cached for 3 minutes, so reloading a route page is not
+  load on it;
+- a deployment with no `database_url` gets `source: "unavailable"` and a sentence
+  saying so, rather than an error — a GIMS without it is still a perfectly good
+  editor, it just cannot see the road.
+
+### 13.3 Dashboard
+
+A "What it runs" section on the route page, **above** the stop list, because
+whether a route is on the road at all decides whether its stop list is worth
+fixing. One sentence — "6 trips in the last 45 days, on 3 days, 2 vehicles. Last
+ran 2026-09-18 at 10:40." — then the recent trips with their vehicle and
+schedule. A dormant route reads "No trip in the last 45 days. The last one this
+route ran was …" and shows no table. The section hides itself on a 404, so an
+older server simply does not show it.
+
+Tests: the window arithmetic, the bounds, the summary and the shape of both
+queries are unit tested in `src/editor/trips.rs` (no database); `dev/ui_smoke.mjs
+--trips` covers the page against `dev/mock_server.py`, which invents a
+deterministic answer per route so all three states are exercised.

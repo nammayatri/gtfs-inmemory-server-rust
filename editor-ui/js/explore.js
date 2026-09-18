@@ -7,7 +7,7 @@ import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
 import { showDraftStop, showDraftStation } from "./create.js";
 import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, routesTouched, draftTitle } from "./overlay.js";
-import { stationNames, foldedList, platformsNote, stopContext, routeContext } from "./context.js";
+import { stationNames, foldedList, platformsNote, stopContext, routeContext, routeTrips } from "./context.js";
 import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 
 const panel = () => document.getElementById("panel");
@@ -346,6 +346,9 @@ export async function showRoute(routeId, { preview } = {}) {
         h("button.btn", { type: "button", on: { click: () => editRouteRows(created ? r : live, { created: !!created }) } }, created && !r.rows.length ? "Build the stop list" : "Edit stop list"),
         h("button.btn.secondary", { type: "button", on: { click: () => editRouteDetails(created ? r : live, { created: !!created }) } }, "Edit name, colour and map line")) : null,
     ),
+    // above the stop list: whether the route is on the road at all decides
+    // whether its stop list is worth fixing
+    live ? routeTrips(live) : null,
     h("section.section", h("h2", "Stops by fare stage"), ladderBox,
       removed.length ? h("p.pending-removed.notice.draft", `Taken off the route in the draft: ${removed.map((d) => d.before.stop_name || d.before.marker_name || d.before.stop_id).join(", ")}.`) : null),
     live ? routeContext(live, { onReviews: (m) => { reviews = m; drawLadder(); } }) : null,

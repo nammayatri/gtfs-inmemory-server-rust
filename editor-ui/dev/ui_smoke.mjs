@@ -1200,6 +1200,62 @@ async function round5Flows() {
   }
 }
 
+// ====================================================================== route trips
+// What a route has actually been running (docs/gtfs-editor.md section 13), on
+// the route page. `node dev/ui_smoke.mjs --trips` runs only these.
+async function tripsFlows() {
+  const routes = await api("feeds/chennai_bus/routes?limit=30");
+  const seen = {};
+  for (const r of routes.items) {
+    const t = await api(`feeds/chennai_bus/routes/${encodeURIComponent(r.route_id)}/trips`);
+    if (!seen[t.source]) seen[t.source] = r.route_id;
+  }
+  check(!!seen.operated, "set-up: a route the mock says ran recently");
+  check(!!seen.last_known, "set-up: a route that has not run lately");
+
+  await go(`#/route/${encodeURIComponent(seen.operated)}`);
+  await waitFor(`document.querySelector(".route-trips")?.hidden === false`, "the route page shows what it runs");
+  const ran = await text(".route-trips");
+  check(/trips in the last 45 days/.test(ran), "it counts the trips in the window");
+  check(/Last ran /.test(ran), "it says when the route last ran");
+  check(ran.includes("Vehicle"), "it lists the trips with their vehicle");
+  check(/waybill/i.test(ran), "it says the trips are waybills, not the timetable");
+  await shot("tr-01-operated");
+
+  await go(`#/route/${encodeURIComponent(seen.last_known)}`);
+  await waitFor(`document.querySelector(".route-trips")?.hidden === false`, "a dormant route shows the section too");
+  const dormant = await text(".route-trips");
+  check(/No trip in the last 45 days/.test(dormant), "a dormant route says nothing ran in the window");
+  check(/The last one this route ran was/.test(dormant), "and falls back to its last known trip");
+  check(!/Vehicle/.test(dormant), "with no trip table for a dormant route");
+  await shot("tr-02-dormant");
+}
+
+// ---- only trips
+if (process.argv.includes("--trips")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await tripsFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of route trips
+
 // ---- only round 5
 if (process.argv.includes("--round5")) {
   try {
@@ -2264,6 +2320,9 @@ try {
 
   // ================================================================ round 5 (stop details, station links): see round5Flows above
   await round5Flows();
+
+  // ================================================================ route trips: see tripsFlows above
+  await tripsFlows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {
