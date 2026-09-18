@@ -11,6 +11,7 @@ import { showPeople, showHistory, showFeedSettings } from "./admin.js";
 import { showDelivery, leaveWebhooks } from "./webhooks.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
+import { showRouteReviewsList, showRouteReview, refreshRouteReviewCount } from "./routereviews.js";
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
 import { showMerge } from "./merge.js";
@@ -44,6 +45,7 @@ async function boot() {
     map.refreshStops();
     refreshStationCount();
     refreshCoordinateCount();
+    refreshRouteReviewCount();
     setLeaveGuard(null);
     resetTrail();
     location.hash = "#/";
@@ -73,6 +75,7 @@ async function boot() {
   initSearch();
   refreshStationCount();
   refreshCoordinateCount();
+  refreshRouteReviewCount();
   window.addEventListener("hashchange", onHashChange);
   window.addEventListener("beforeunload", (ev) => {
     if (leaveMessage()) { ev.preventDefault(); ev.returnValue = ""; }
@@ -180,6 +183,10 @@ function route() {
     markNav("coordinates"); showWorkspace(true); showCoordinateReview(parts[1]);
   } else if (parts[0] === "coordinates") {
     markNav("coordinates"); showWorkspace(true); showCoordinatesList();
+  } else if (parts[0] === "routes-to-review" && parts[1]) {
+    markNav("routereviews"); showWorkspace(true); showRouteReview(parts[1]);
+  } else if (parts[0] === "routes-to-review") {
+    markNav("routereviews"); showWorkspace(true); showRouteReviewsList();
   } else if (parts[0] === "new" && ["stop", "route", "station"].includes(parts[1])) {
     markNav("map"); showWorkspace(true);
     const [title, fn] = { stop: ["New stop", newStop], route: ["New route", newRoute], station: ["New station", newStation] }[parts[1]];

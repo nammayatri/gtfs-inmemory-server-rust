@@ -8,6 +8,7 @@ use super::error::{EditorError, EditorResult};
 use super::feed_lock;
 use super::position_reviews;
 use super::proposals;
+use super::route_reviews;
 use super::service::{self as svc, Page, StopQuery};
 use super::trips;
 use super::validation::valid_lat_lon;
@@ -1030,6 +1031,108 @@ pub async fn position_review_reopen(
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Editor).await?;
     ok(position_reviews::reopen(&st, &ctx, *path).await?)
+}
+
+// ---------------------------------------------------------------- route reviews
+
+/// The route queue's filters: `status` a comma list, `q` a route id or name,
+/// `reason` one of the codes a load writes (section 14).
+#[derive(Deserialize)]
+pub struct RouteReviewsQuery {
+    status: Option<String>,
+    q: Option<String>,
+    reason: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn route_reviews(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<RouteReviewsQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    ok(route_reviews::list(
+        &st,
+        &path,
+        q.status.as_deref(),
+        q.q.as_deref(),
+        q.reason.as_deref(),
+        &page,
+    )
+    .await?)
+}
+
+pub async fn route_review_summary(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(route_reviews::summary(&st, &path).await?)
+}
+
+pub async fn route_review(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(route_reviews::detail(&mut conn, *path).await?)
+}
+
+pub async fn route_review_fix(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<route_reviews::FixBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(route_reviews::fix(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+pub async fn route_review_confirm(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: Option<web::Json<route_reviews::NoteBody>>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    ok(route_reviews::confirm(&st, &ctx, *path, body.note.as_deref()).await?)
+}
+
+pub async fn route_review_reject(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: Option<web::Json<route_reviews::NoteBody>>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    ok(route_reviews::reject(&st, &ctx, *path, body.note.as_deref()).await?)
+}
+
+pub async fn route_review_reopen(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(route_reviews::reopen(&st, &ctx, *path).await?)
+}
+
+pub async fn route_review_note(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<route_reviews::NoteBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    ok(route_reviews::note(&st, &ctx, *path, body.note.as_deref()).await?)
 }
 
 // ---------------------------------------------------------------- admin
