@@ -1256,6 +1256,132 @@ if (process.argv.includes("--trips")) {
 }
 // ====================================================================== end of route trips
 
+// ====================================================================== route reviews
+// The routes-to-review queue (docs/gtfs-editor.md section 14): ranked worst-first,
+// filtered by what the load found wrong, and a review walked through — recording a
+// fix in a draft (refused until the draft really changes the route), leaving a
+// route as it is, setting one aside and putting it back.
+// `node dev/ui_smoke.mjs --routereview` runs only these.
+async function routeReviewFlows() {
+  const sum = await api("feeds/chennai_bus/route-reviews/summary");
+  check(sum.pending > 0, `set-up: routes waiting to be reviewed (${sum.pending})`);
+  check(sum.batch && sum.batch.measure === "bookings", "set-up: the queue says what it is ranked by");
+
+  // ---- the list
+  await go("#/routes-to-review");
+  await waitFor(`document.querySelector("#panel h1")?.textContent === "Routes to review"`, "the queue page");
+  const listed = await api("feeds/chennai_bus/route-reviews?status=pending&limit=10");
+  const ranks = listed.items.map((r) => r.queue_rank);
+  check(ranks.every((v, i) => i === 0 || ranks[i - 1] < v), `the busiest route is first (${ranks.slice(0, 5).join(", ")})`);
+  const values = listed.items.map((r) => r.measure_value);
+  check(values.every((v, i) => i === 0 || values[i - 1] >= v), "rank follows the measure, worst first");
+  const panel0 = await panelText();
+  check(panel0.includes(listed.items[0].route_short_name || listed.items[0].route_id), "the first route is on the page");
+  check(/bookings/.test(panel0), "the page says what the ranking counts");
+  check(await has(`#routereviews-count`), "the nav carries a count of what is waiting");
+  await shot("rr-01-queue");
+
+  // ---- the reason filter, against the server's own counts
+  const withReason = Object.entries(sum.reasons).find(([, n]) => n > 0);
+  check(!!withReason, "set-up: the load recorded why routes are queued");
+  const filtered = await api(`feeds/chennai_bus/route-reviews?status=pending&reason=${withReason[0]}&limit=50`);
+  check(filtered.items.length > 0 && filtered.items.every((r) => (r.reasons || []).some((x) => x.code === withReason[0])),
+    `filtering by "${withReason[0]}" returns only routes queued for it`);
+  const bad = await api("feeds/chennai_bus/route-reviews?reason=not_a_code");
+  check(bad.error && bad.error.code === "invalid_reason", "a reason nobody defined is refused");
+
+  // ---- one review
+  const first = listed.items[0];
+  await go(`#/routes-to-review/${first.review_id}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("What looks wrong")`, "the review page");
+  const detail = await api(`route-reviews/${first.review_id}`);
+  const page = await panelText();
+  check(page.includes(`#${first.queue_rank} by use`), "it says why this route is worth the time");
+  check(detail.problems.length > 0, `the server judges the route now (${detail.problems.map((p) => p.code).join(", ")})`);
+  check(detail.problems.every((p) => page.includes(p.message)), "and every problem is shown");
+  check(await has("#open-route"), "there is a way through to the route editor");
+  check(/Stop list \(/.test(page), "the stop list is on the page");
+  await shot("rr-02-review");
+
+  // ---- recording a fix: refused until the draft really changes the route
+  const draft = await apiSend("POST", "feeds/chennai_bus/change-sets", { title: "route review smoke" });
+  const draftId = draft.body.change_set_id;
+  const refused = await apiSend("POST", `route-reviews/${first.review_id}/fix`, { change_set_id: draftId });
+  check(refused.status === 409 && refused.body.error.code === "no_change_for_route",
+    "a draft that does not touch the route has no fix to record");
+
+  // the fix itself is an ordinary route_stops change, made the way the editor makes it
+  const route = await api(`feeds/chennai_bus/routes/${encodeURIComponent(first.route_id)}`);
+  const rows = route.rows.map((r) => ({
+    stop_id: r.stop_id, stop_type: r.stop_type, stage_no: r.stage_no, stage_name: r.stage_name,
+    marker_id: r.marker_id, marker_name: r.marker_name, marker_lat: r.marker_lat, marker_lon: r.marker_lon,
+  }));
+  const added = await apiSend("POST", `change-sets/${draftId}/changes`, {
+    entity: "route_stops", op: "replace", entity_key: first.route_id,
+    after: { base_rows_hash: route.rows_hash, rows },
+  });
+  check(added.status === 201, `the route's stop list goes into the draft (${added.status})`);
+  const tied = await apiSend("POST", `route-reviews/${first.review_id}/fix`, { change_set_id: draftId, note: "smoke test" });
+  check(tied.status === 200 && tied.body.status === "approved", "recording the fix puts the review in the draft");
+  // the page is already on this review, and the same hash re-renders nothing:
+  // leave and come back so the panel is rebuilt from the server
+  await go("#/routes-to-review");
+  await go(`#/routes-to-review/${first.review_id}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("A fix is in draft")`, "the review showing its draft");
+  const drafted = await panelText();
+  check(/In a draft/.test(drafted) && /approved by someone else and committed/.test(drafted),
+    "the page says the fix is waiting in a draft and what happens next");
+
+  // discarding the draft puts the route back in the queue
+  await apiSend("POST", `change-sets/${draftId}/discard`, {});
+  const back = await api(`route-reviews/${first.review_id}`);
+  check(back.status === "pending", "discarding the draft puts the route back in the queue");
+
+  // ---- left as it is, set aside, and back again
+  const second = listed.items[1];
+  const left = await apiSend("POST", `route-reviews/${second.review_id}/confirm`, { note: "walked it; nothing to change" });
+  check(left.status === 200 && left.body.status === "confirmed", "a route can be left as it is");
+  const third = listed.items[2];
+  const aside = await apiSend("POST", `route-reviews/${third.review_id}/reject`, { note: "not before the timetable change" });
+  check(aside.status === 200 && aside.body.status === "rejected", "and one can be set aside");
+  await go(`#/routes-to-review/${third.review_id}`);
+  await waitFor(`!!document.getElementById("route-review-reopen")`, "the way back for a set-aside route");
+  await clickSel("#route-review-reopen", "put it back in the queue");
+  const reopened = await api(`route-reviews/${third.review_id}`);
+  check(reopened.status === "pending", "a judgement about priority can be revisited");
+  await shot("rr-03-closed");
+
+  // ---- the counts moved with the work
+  const after = await api("feeds/chennai_bus/route-reviews/summary");
+  check(after.confirmed >= 1 && after.pending === sum.pending - 1,
+    `the queue's counts follow the work (${after.pending} waiting, ${after.confirmed} left as they are)`);
+}
+
+// ---- only route reviews
+if (process.argv.includes("--routereview")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await routeReviewFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of route reviews
+
 // ---- only round 5
 if (process.argv.includes("--round5")) {
   try {
@@ -2323,6 +2449,9 @@ try {
 
   // ================================================================ route trips: see tripsFlows above
   await tripsFlows();
+
+  // ================================================================ routes to review: see routeReviewFlows above
+  await routeReviewFlows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

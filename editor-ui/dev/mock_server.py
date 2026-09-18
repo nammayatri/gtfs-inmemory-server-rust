@@ -3298,6 +3298,360 @@ class TripsHandler(PolicyHandler):
         return super()._api(method, path, q)
 
 
+# ====================================================================== route reviews
+#   docs/gtfs-editor.md section 14. The queue of the most-used routes, ordered by
+#   use rather than by defect, with what a load found wrong with each. The mock
+#   has no booking data, so it invents a deterministic "bookings" number per route
+#   and queues the routes whose live rows really do have something wrong - the
+#   same rules the server applies, so the page can be driven end to end.
+
+ROUTE_REVIEW_STATUSES = ("pending", "approved", "committed", "confirmed", "rejected", "superseded")
+ROUTE_REASON_CODES = ("no_polyline", "too_few_stops", "short_stop_list", "repeated_stop",
+                      "stops_under_position_review", "worst_detour")
+MIN_SERVED_STOPS = 2
+SHORT_STOP_LIST = 5
+WORST_DETOUR_METRES = 300.0
+
+
+def served_calls(store, g, rid):
+    """The route's served calls in order, with positions: what `problems` reads."""
+    out = []
+    for r in store.rows.get((g, rid), []):
+        if r["stop_type"] in SERVED_EXCLUDE or not r.get("stop_id"):
+            continue
+        st = store.stops.get((g, r["stop_id"]))
+        if not st or st.get("deleted"):
+            continue
+        out.append({"sequence": r["sequence"], "stop_id": st["stop_id"], "name": st["name"],
+                    "lat": st["lat"], "lon": st["lon"]})
+    return out
+
+
+def route_problems(calls, has_polyline, stops_in_review):
+    """What looks wrong with a route now, by src/editor/route_reviews.rs's rules."""
+    out = []
+    if not has_polyline:
+        out.append({"level": "warning", "code": "no_polyline",
+                    "message": "the route has no shape, so it cannot be drawn on a map"})
+    if len(calls) < MIN_SERVED_STOPS:
+        out.append({"level": "error", "code": "too_few_stops",
+                    "message": f"the route has {len(calls)} served stop(s); a bus cannot be ridden "
+                               "from anywhere to anywhere"})
+    elif len(calls) < SHORT_STOP_LIST:
+        out.append({"level": "warning", "code": "short_stop_list",
+                    "message": f"the route has only {len(calls)} served stops; check whether any are missing"})
+    repeated = [b for a, b in zip(calls, calls[1:]) if a["stop_id"] == b["stop_id"]]
+    if repeated:
+        out.append({"level": "warning", "code": "repeated_stop", "stop_id": repeated[0]["stop_id"],
+                    "message": f"{len(repeated)} stop(s) are listed twice running, the first at "
+                               f"sequence {repeated[0]['sequence']} ({repeated[0]['name']})"})
+    if stops_in_review:
+        out.append({"level": "warning", "code": "stops_under_position_review",
+                    "message": f"{stops_in_review} stop(s) on this route have a coordinate review open; "
+                               "the route's shape may be wrong because a stop is"})
+    worst = None
+    for a, b, c in zip(calls, calls[1:], calls[2:]):
+        here = (b["lat"], b["lon"])
+        p = here if a["stop_id"] == b["stop_id"] else (a["lat"], a["lon"])
+        n = here if c["stop_id"] == b["stop_id"] else (c["lat"], c["lon"])
+        d = max(0.0, haversine(*p, *here) + haversine(*here, *n) - haversine(*p, *n))
+        if d > WORST_DETOUR_METRES and (worst is None or d > worst[0]):
+            worst = (d, b)
+    if worst:
+        d, b = worst
+        out.append({"level": "warning", "code": "worst_detour", "stop_id": b["stop_id"],
+                    "message": f"the bus goes {tenth(d)} m out of its way to call at {b['name']} "
+                               f"(sequence {b['sequence']})"})
+    return out
+
+
+def seed_route_reviews(store):
+    """A queue over the sample's routes: every route whose live rows have something
+    wrong, ranked by an invented but stable number of bookings."""
+    store.route_reviews = {}
+    g = "chennai_bus"
+    if g not in store.feeds:
+        return
+    candidates = []
+    for (feed, rid), rt in store.routes.items():
+        if feed != g or rt.get("deleted"):
+            continue
+        calls = served_calls(store, g, rid)
+        in_review = len({rv["stop_id"] for rv in store.reviews.values()
+                         if rv["gtfs_id"] == g and rv["status"] in ("pending", "approved")
+                         and any(c["stop_id"] == rv["stop_id"] for c in calls)})
+        found = route_problems(calls, bool(rt.get("encoded_polyline")), in_review)
+        if not found:
+            continue
+        seed = int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16)
+        candidates.append((seed % 50000, rid, rt, found))
+    # rank 1 is the busiest; the whole queue comes from one load
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    t = iso(now())
+    for i, (bookings, rid, rt, found) in enumerate(candidates[:60], start=1):
+        store.route_reviews[i] = {
+            "review_id": i, "gtfs_id": g, "batch": "mock-route-bookings", "route_id": rid,
+            "route_short_name": rt.get("short_name"), "route_long_name": rt.get("long_name"),
+            "queue_rank": i, "measure": "bookings", "measure_value": float(bookings),
+            "measure_window": "2026-08-20..2026-09-19",
+            "reasons": [{"code": p["code"], "severity": p["level"], "message": p["message"]} for p in found],
+            "evidence": {"source": "mock", "served_stops": len(served_calls(store, g, rid))},
+            "status": "pending", "change_set_id": None, "change_id": None,
+            "reviewed_by": None, "reviewed_at": None, "review_note": None,
+            "created_at": t, "updated_at": t}
+
+
+class RouteReviewHandler(TripsHandler):
+    # ---- reads
+    def route_review_out(self, rv):
+        s = self.store
+        cs = s.change_sets.get(rv["change_set_id"]) if rv["change_set_id"] else None
+        u = s.users.get(rv["reviewed_by"]) if rv["reviewed_by"] else None
+        return {k: rv[k] for k in ("review_id", "gtfs_id", "batch", "route_id", "route_short_name",
+                                   "route_long_name", "queue_rank", "measure", "measure_value",
+                                   "measure_window", "reasons", "evidence", "status", "change_set_id",
+                                   "change_id", "review_note", "reviewed_at", "created_at", "updated_at")} | {
+            "change_set_title": cs["title"] if cs else None,
+            "reviewed_by_email": u["email"] if u else None}
+
+    def list_route_reviews(self, g, q):
+        statuses = [x for x in (q.get("status", [""])[0] or "pending").split(",") if x]
+        bad = [x for x in statuses if x not in ROUTE_REVIEW_STATUSES]
+        if bad:
+            raise ApiError(400, "invalid_status", f"Unknown status {bad[0]}.")
+        reason = (q.get("reason", [""])[0] or "").strip()
+        if reason and reason not in ROUTE_REASON_CODES:
+            raise ApiError(400, "invalid_reason", f"reason is one of {', '.join(ROUTE_REASON_CODES)}")
+        items = [rv for rv in self.store.route_reviews.values()
+                 if rv["gtfs_id"] == g and rv["status"] in statuses]
+        if reason:
+            items = [rv for rv in items if any(x.get("code") == reason for x in rv["reasons"])]
+        term = (q.get("q", [""])[0] or "").strip().lower()
+        if term:
+            items = [rv for rv in items
+                     if term == rv["route_id"].lower() or term in (rv["route_short_name"] or "").lower()
+                     or term in (rv["route_long_name"] or "").lower()]
+        order = {k: i for i, k in enumerate(ROUTE_REVIEW_STATUSES)}
+        items.sort(key=lambda rv: (order[rv["status"]], rv["queue_rank"], rv["review_id"]))
+        page = paginate(items, q)
+        page["items"] = [self.route_review_out(rv) for rv in page["items"]]
+        return page
+
+    def route_review_summary(self, g):
+        mine = [rv for rv in self.store.route_reviews.values() if rv["gtfs_id"] == g]
+        counts = {k: 0 for k in ("pending", "approved", "committed", "confirmed", "rejected")}
+        for rv in mine:
+            if rv["status"] in counts:
+                counts[rv["status"]] += 1
+        reasons = {c: 0 for c in ROUTE_REASON_CODES}
+        for rv in mine:
+            if rv["status"] != "pending":
+                continue
+            for x in rv["reasons"]:
+                if x.get("code") in reasons:
+                    reasons[x["code"]] += 1
+        newest = max(mine, key=lambda rv: rv["review_id"], default=None)
+        return counts | {"reasons": reasons,
+                         "batch": {"batch": newest["batch"], "measure": newest["measure"],
+                                   "measure_window": newest["measure_window"], "reviews": len(mine)}
+                         if newest else None}
+
+    def route_review_detail(self, rv):
+        s, g, rid = self.store, rv["gtfs_id"], rv["route_id"]
+        rt = s.routes.get((g, rid))
+        alive = bool(rt and not rt.get("deleted"))
+        calls = served_calls(s, g, rid) if alive else []
+        has_polyline = bool(rt and (rt.get("encoded_polyline") or "").strip())
+        with_reviews = [{"stop_id": r["stop_id"], "sequence": seq, "review_id": r["review_id"],
+                         "status": r["status"]}
+                        for c in calls for seq in [c["sequence"]]
+                        for r in s.reviews.values()
+                        if r["gtfs_id"] == g and r["stop_id"] == c["stop_id"]
+                        and r["status"] in ("pending", "approved", "committed", "confirmed")]
+        in_review = len({x["stop_id"] for x in with_reviews if x["status"] in ("pending", "approved")})
+        worst = []
+        for a, b, c in zip(calls, calls[1:], calls[2:]):
+            here = (b["lat"], b["lon"])
+            p = here if a["stop_id"] == b["stop_id"] else (a["lat"], a["lon"])
+            n = here if c["stop_id"] == b["stop_id"] else (c["lat"], c["lon"])
+            d = max(0.0, haversine(*p, *here) + haversine(*here, *n) - haversine(*p, *n))
+            if d > WORST_DETOUR_METRES:
+                worst.append({"stop_id": b["stop_id"], "name": b["name"], "sequence": b["sequence"],
+                              "detour_m": tenth(d)})
+        worst.sort(key=lambda x: (-x["detour_m"], x["sequence"]))
+        drafts = [{"change_set_id": cs["change_set_id"], "title": cs["title"], "status": cs["status"],
+                   "change_id": ch["change_id"], "entity": ch["entity"], "op": ch["op"]}
+                  for cs in s.change_sets.values() if cs["gtfs_id"] == g
+                  and cs["status"] in ("draft", "submitted", "approved")
+                  for ch in cs["changes"]
+                  if ch["entity"] in ("route", "route_stops") and ch["entity_key"] == rid]
+        problems = route_problems(calls, has_polyline, in_review) if alive else [
+            {"level": "error", "code": "route_missing", "message": f"route {rid} is gone from the feed"}]
+        return self.route_review_out(rv) | {
+            "route": ({k: rt.get(k) for k in ("route_id", "short_name", "long_name", "route_type",
+                                              "agency_id", "color", "text_color", "encoded_polyline",
+                                              "polyline_source", "deleted", "row_version")} if rt else None),
+            "stop_count": len(calls), "has_polyline": has_polyline, "stops": calls,
+            "problems": problems,
+            "context": {"route_id": rid, "stops_with_reviews": with_reviews,
+                        "worst_detours": worst[:5], "audit": [], "open_drafts": drafts}}
+
+    # ---- actions
+    def route_review_fix(self, u, rv, b):
+        self.require_role(u, "editor")
+        s = self.store
+        set_id = b.get("change_set_id")
+        cs = s.change_sets.get(set_id)
+        if not cs:
+            raise ApiError(404, "change_set_not_found", "That draft does not exist.")
+        if cs["gtfs_id"] != rv["gtfs_id"]:
+            raise ApiError(400, "feed_mismatch", "The draft is for another feed.")
+        if cs["status"] != "draft":
+            raise ApiError(409, "change_set_not_draft", "The draft is not open for editing.")
+        if rv["status"] not in ("pending", "approved"):
+            raise ApiError(409, "review_not_open", f"route review {rv['review_id']} is {rv['status']}",
+                           {"status": rv["status"], "change_set_id": rv["change_set_id"]})
+        if rv["status"] == "approved" and rv["change_set_id"] != set_id:
+            raise ApiError(409, "review_in_other_draft",
+                           f"route review {rv['review_id']} already follows another draft",
+                           {"change_set_id": rv["change_set_id"]})
+        ch = next((c for c in cs["changes"] if c["entity"] in ("route", "route_stops")
+                   and c["entity_key"] == rv["route_id"]), None)
+        if not ch:
+            raise ApiError(409, "no_change_for_route",
+                           f"draft {set_id} does not change route {rv['route_id']}; make the fix on "
+                           "the route page first, then record it here",
+                           {"route_id": rv["route_id"], "change_set_id": set_id})
+        note = self.review_note(b)
+        t = iso(now())
+        rv.update(status="approved", change_set_id=set_id, change_id=ch["change_id"],
+                  reviewed_by=u["user_id"], reviewed_at=t, review_note=note or rv["review_note"],
+                  updated_at=t)
+        s.add_audit(u, "route_review_fixed", rv["gtfs_id"], set_id,
+                    {"review_id": rv["review_id"], "route_id": rv["route_id"],
+                     "change_id": ch["change_id"], "note": note})
+        return self.route_review_detail(rv)
+
+    def route_review_close(self, u, rv, b, status, action):
+        self.require_role(u, "editor")
+        if rv["status"] != "pending":
+            raise ApiError(409, "review_not_open", f"route review {rv['review_id']} is {rv['status']}",
+                           {"status": rv["status"], "change_set_id": rv["change_set_id"]})
+        note = self.review_note(b)
+        t = iso(now())
+        rv.update(status=status, reviewed_by=u["user_id"], reviewed_at=t, review_note=note, updated_at=t)
+        self.store.add_audit(u, action, rv["gtfs_id"], None,
+                             {"review_id": rv["review_id"], "route_id": rv["route_id"], "note": note})
+        return self.route_review_detail(rv)
+
+    def route_review_reopen(self, u, rv):
+        self.require_role(u, "editor")
+        if rv["status"] not in ("confirmed", "rejected"):
+            raise ApiError(409, "review_not_closed",
+                           f"route review {rv['review_id']} is {rv['status']}; only a confirmed or "
+                           "rejected review is reopened")
+        was, note = rv["status"], rv["review_note"]
+        rv.update(status="pending", reviewed_by=None, reviewed_at=None, review_note=None,
+                  updated_at=iso(now()))
+        self.store.add_audit(u, "route_review_reopened", rv["gtfs_id"], None,
+                             {"review_id": rv["review_id"], "route_id": rv["route_id"],
+                              "was": was, "note": note})
+        return self.route_review_detail(rv)
+
+    def route_review_note(self, u, rv, b):
+        self.require_role(u, "editor")
+        if rv["status"] == "superseded":
+            raise ApiError(409, "review_not_open", f"route review {rv['review_id']} is {rv['status']}")
+        rv.update(review_note=self.review_note(b), updated_at=iso(now()))
+        self.store.add_audit(u, "route_review_noted", rv["gtfs_id"], rv["change_set_id"],
+                             {"review_id": rv["review_id"], "route_id": rv["route_id"],
+                              "note": rv["review_note"]})
+        return self.route_review_detail(rv)
+
+    # ---- the lifecycle a review follows once it is tied to a draft
+    def route_reviews_of(self, set_id):
+        return [rv for rv in self.store.route_reviews.values() if rv["change_set_id"] == set_id]
+
+    def route_reviews_after_edit(self, u, cs):
+        """A review whose draft no longer changes its route is waiting again."""
+        for rv in self.route_reviews_of(cs["change_set_id"]):
+            if rv["status"] != "approved":
+                continue
+            ch = next((c for c in cs["changes"] if c["entity"] in ("route", "route_stops")
+                       and c["entity_key"] == rv["route_id"]), None)
+            if ch:
+                rv["change_id"] = ch["change_id"]
+                continue
+            rv.update(status="pending", change_set_id=None, change_id=None, reviewed_by=None,
+                      reviewed_at=None, review_note=None, updated_at=iso(now()))
+            self.store.add_audit(u, "route_review_returned", rv["gtfs_id"], cs["change_set_id"],
+                                 {"review_id": rv["review_id"], "route_id": rv["route_id"],
+                                  "reason": "change_removed"})
+
+    def edit_change(self, u, cs, change_id, method):
+        out = super().edit_change(u, cs, change_id, method)
+        self.route_reviews_after_edit(u, cs)
+        return out
+
+    def transition(self, u, cs, what, b):
+        out = super().transition(u, cs, what, b)
+        if what == "commit":
+            for rv in self.route_reviews_of(cs["change_set_id"]):
+                if rv["status"] == "approved":
+                    rv.update(status="committed", updated_at=iso(now()))
+                    self.store.add_audit(u, "route_review_committed", rv["gtfs_id"], cs["change_set_id"],
+                                         {"review_id": rv["review_id"], "route_id": rv["route_id"]})
+        elif what == "discard":
+            for rv in self.route_reviews_of(cs["change_set_id"]):
+                if rv["status"] == "approved":
+                    rv.update(status="pending", change_set_id=None, change_id=None, reviewed_by=None,
+                              reviewed_at=None, review_note=None, updated_at=iso(now()))
+                    self.store.add_audit(u, "route_review_returned", rv["gtfs_id"], cs["change_set_id"],
+                                         {"review_id": rv["review_id"], "route_id": rv["route_id"],
+                                          "reason": "change_set_discarded"})
+        return out
+
+    def _api(self, method, path, q):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        if len(parts) >= 3 and parts[0] == "feeds" and parts[2] == "route-reviews":
+            u = self.session_user()
+            self.require_mutation(method)
+            self.require_role(u, "viewer")
+            g = parts[1]
+            if g not in self.store.feeds:
+                raise ApiError(404, "feed_not_found", f"no feed {g}")
+            if len(parts) == 3 and method == "GET":
+                return 200, self.list_route_reviews(g, q)
+            if parts[3:] == ["summary"] and method == "GET":
+                return 200, self.route_review_summary(g)
+        if parts[0] == "route-reviews" and len(parts) >= 2:
+            u = self.session_user()
+            self.require_mutation(method)
+            try:
+                rv = self.store.route_reviews.get(int(parts[1]))
+            except ValueError:
+                rv = None
+            if not rv:
+                raise ApiError(404, "review_not_found", "That route review does not exist.")
+            rest = parts[2:]
+            if not rest and method == "GET":
+                return 200, self.route_review_detail(rv)
+            if rest == ["fix"] and method == "POST":
+                return 200, self.route_review_fix(u, rv, self._body())
+            if rest == ["confirm"] and method == "POST":
+                return 200, self.route_review_close(u, rv, self._body(), "confirmed",
+                                                    "route_review_confirmed")
+            if rest == ["reject"] and method == "POST":
+                return 200, self.route_review_close(u, rv, self._body(), "rejected",
+                                                    "route_review_rejected")
+            if rest == ["reopen"] and method == "POST":
+                return 200, self.route_review_reopen(u, rv)
+            if rest == ["note"] and method == "POST":
+                return 200, self.route_review_note(u, rv, self._body())
+        return super()._api(method, path, q)
+# ====================================================================== end of route reviews
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -3309,8 +3663,9 @@ def main():
         Handler.store = Store(json.load(fh))
     seed_round4(Handler.store)
     seed_round5(Handler.store)
+    seed_route_reviews(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), TripsHandler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), RouteReviewHandler).serve_forever()
 
 
 if __name__ == "__main__":

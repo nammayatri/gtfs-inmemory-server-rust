@@ -18,6 +18,7 @@ pub mod handlers;
 pub mod jwt;
 pub mod position_reviews;
 pub mod proposals;
+pub mod route_reviews;
 pub mod service;
 pub mod static_ui;
 pub mod trips;
@@ -333,6 +334,36 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/position-reviews/{id}/reopen",
                 web::post().to(h::position_review_reopen),
+            )
+            // route reviews
+            .route(
+                "/feeds/{gtfs_id}/route-reviews",
+                web::get().to(h::route_reviews),
+            )
+            .route(
+                "/feeds/{gtfs_id}/route-reviews/summary",
+                web::get().to(h::route_review_summary),
+            )
+            .route("/route-reviews/{id}", web::get().to(h::route_review))
+            .route(
+                "/route-reviews/{id}/fix",
+                web::post().to(h::route_review_fix),
+            )
+            .route(
+                "/route-reviews/{id}/confirm",
+                web::post().to(h::route_review_confirm),
+            )
+            .route(
+                "/route-reviews/{id}/reject",
+                web::post().to(h::route_review_reject),
+            )
+            .route(
+                "/route-reviews/{id}/reopen",
+                web::post().to(h::route_review_reopen),
+            )
+            .route(
+                "/route-reviews/{id}/note",
+                web::post().to(h::route_review_note),
             )
             // admin
             .route("/users", web::get().to(h::users))

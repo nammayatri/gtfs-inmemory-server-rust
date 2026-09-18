@@ -3216,6 +3216,15 @@ async fn delete_change_once(
     )
     .await?;
     super::position_reviews::change_removed(&mut tx, ctx, &set.gtfs_id, id, &removed).await?;
+    super::route_reviews::change_removed(
+        &mut tx,
+        ctx,
+        &set.gtfs_id,
+        id,
+        &removed.entity,
+        &removed.entity_key,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -3440,6 +3449,7 @@ pub async fn discard(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
     )
     .await?;
     super::position_reviews::draft_discarded(&mut tx, ctx, &set.gtfs_id, id).await?;
+    super::route_reviews::draft_discarded(&mut tx, ctx, &set.gtfs_id, id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -3561,6 +3571,7 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     .await?;
     super::proposals::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
     super::position_reviews::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
+    super::route_reviews::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
     tx.commit().await?;
     Ok(json!({"change_set_id": id, "status": "committed", "feed_version": version}))
 }

@@ -1522,3 +1522,127 @@ Tests: the window arithmetic, the bounds, the summary and the shape of both
 queries are unit tested in `src/editor/trips.rs` (no database); `dev/ui_smoke.mjs
 --trips` covers the page against `dev/mock_server.py`, which invents a
 deterministic answer per route so all three states are exercised.
+
+## 14. Routes to review — the busiest routes, worst first (2026-09-19)
+
+`gtfs_route_review` (`db/gtfs_editor/0014_route_reviews.sql`) holds the routes
+most worth an operator's time, loaded by nandi's
+`scripts/chennai-bus/editor/load_route_reviews.py`.
+
+**Why it is ordered by use.** Coordinate reviews (section 8) start from a defect
+and ask whether a stop is wrong. This queue starts from the other end. A route
+nobody rides can be wrong for years and cost nothing; the same defect on the
+most-booked route is felt by thousands of passengers a day. So the order is
+`queue_rank` — 1 is the most-used route — and `reasons` says what the load found
+wrong with it, so an operator opening the queue sees both why this route matters
+and what to look at when they get there.
+
+**What was counted is never assumed.** `measure` names it (`bookings`,
+`trips_operated`, …), `measure_value` is the number and `measure_window` the
+period. A deployment with no ticket data must say `trips_operated` rather than
+quietly pass operations off as bookings: the queue is sorted by this, and a
+queue that lies about its own ordering is worse than no queue.
+
+**Nothing here writes the feed.** The fix is made with the ordinary route
+editor — a `route` or `route_stops` change in a draft, graded by the same
+validation as any other edit. `/route-reviews/{id}/fix` only records which draft
+it went into, and refuses a draft that holds no such change, so a review cannot
+claim a fix nobody made. From there it follows its draft exactly as a coordinate
+review does: the change leaves and it is pending again, the draft is committed
+and it is committed.
+
+| method | path | body / rule |
+|---|---|---|
+| GET | `/feeds/{g}/route-reviews?status=&q=&reason=&limit=&cursor=` | `status` comma list (default `pending`); `q` exact on `route_id`, contains on the names, trigram on the number; `reason` one of the codes below. Ordered by status, then `queue_rank`, then `review_id`. Item: `{review_id, gtfs_id, batch, route_id, route_short_name, route_long_name, queue_rank, measure, measure_value, measure_window, reasons, evidence, status, change_set_id, change_id, change_set_title, reviewed_by_email, reviewed_at, review_note, created_at, updated_at}` |
+| GET | `/feeds/{g}/route-reviews/summary` | `{pending, approved, committed, confirmed, rejected, reasons: {…}, batch: {batch, measure, measure_window, reviews}}` — `reasons` counts the **pending** reviews by reason code, `batch` names the latest load so a page can say what the ranking means |
+| GET | `/route-reviews/{id}` | the item plus, computed now: `route` (the live row, or `null`), `stop_count`, `has_polyline`, `stops` (its served calls), `problems` (below) and `context` — section 9's route context, so the worst detours, the stops under coordinate review, the history and the open drafts all come from one place |
+| POST | `/route-reviews/{id}/fix` | editor+. `{change_set_id, note?}` → the review follows that draft; `change_id` is the earliest `route` / `route_stops` change on the route |
+| POST | `/route-reviews/{id}/confirm` | editor+. `{note?}` pending → `confirmed`: the route is right as it stands |
+| POST | `/route-reviews/{id}/reject` | editor+. `{note?}` pending → `rejected`: not worth fixing, or not a real problem |
+| POST | `/route-reviews/{id}/reopen` | editor+. confirmed or rejected → `pending` |
+| POST | `/route-reviews/{id}/note` | editor+. `{note?}` writes down what was found without closing anything |
+
+`status` is `pending` / `approved` / `committed` / `confirmed` / `rejected` /
+`superseded`. List, summary and detail are viewer+. Every action is audited
+(`route_review_fixed`, `route_review_confirmed`, `route_review_rejected`,
+`route_review_reopened`, `route_review_noted`, `route_review_returned`,
+`route_review_committed`); the load writes `route_reviews_loaded`.
+
+### 14.1 What looks wrong, computed twice
+
+`reasons` is the load's snapshot, stored so the queue can be filtered and counted
+without reading the whole feed. The detail recomputes the same judgements from
+the live rows (`route_reviews::problems`), so an operator is never sent after
+something already fixed. Both use the same codes, because a filter and a detail
+page that disagreed about what "short stop list" means would be worse than
+either alone:
+
+| code | level | what it means |
+|---|---|---|
+| `no_polyline` | warning | the route has no shape, so it cannot be drawn |
+| `too_few_stops` | error | fewer than two served stops: it cannot be ridden from anywhere to anywhere |
+| `short_stop_list` | warning | fewer than five served stops |
+| `repeated_stop` | warning | a stop listed twice running — a duplicated row, or two ids for one place |
+| `stops_under_position_review` | warning | stops on it have an open coordinate review: settle the stop first |
+| `worst_detour` | warning | the single worst call, by section 9's detour (`WORST_DETOUR_METRES`, 300 m) |
+
+Measured on master before choosing the thresholds (2026-09-19, 5,567 live
+routes): 78 routes have exactly one served stop; the stop-count distribution is
+flat from two upwards (224 / 129 / 221 / 183 routes at 2 / 3 / 4 / 5), so a short
+list is a place to start looking and never evidence on its own — hence a warning.
+103 rows on 30 routes list a stop twice running. 3,667 routes have a call more
+than 300 m out of the way, 1,343 of them over a kilometre, and 1,791 have a stop
+under an open coordinate review.
+
+**`no_polyline` currently fires on almost everything.** 5,557 of those 5,567
+routes have no `encoded_polyline` in the editor database, so on this feed the
+code carries no signal at all and must not be what a queue is sorted by. It is
+kept because it is the right question to ask of a feed whose shapes are filled
+in, and because an operator looking at one route still wants to know.
+
+A route calling at the same stop twice is only `repeated_stop` when the two calls
+are **consecutive**: 153 (route, stop) pairs in this data are out-and-back spurs
+that pass a stop outbound and again inbound, and those are not defects. For the
+same reason a neighbour that is the reviewed stop itself moves with it when the
+detour is measured, so a spur does not read as a vast way round.
+
+### 14.2 The dashboard
+
+"Routes to review" (`editor-ui/js/routereviews.js`, `#/routes-to-review`, with a
+count in the top bar): the queue worst-first with each route's rank, its measure
+and the reasons it was queued; tabs by status and chips by reason, both with the
+server's counts. Opening one draws the route on the map, says in one line why it
+is worth the time ("#1 by use — 48,414 bookings over 2026-08-20..2026-09-19"),
+lists what looks wrong **now**, its stop list, and the cleanup context. The
+actions are "Open route … to fix it" (the ordinary route editor), "Record the fix
+in my draft", "Route is right…", "Not worth fixing…", a note and "Next".
+
+Recording a fix before the draft changes the route answers 409
+`no_change_for_route`, and the page says so in words with a link to the route.
+
+Settled while implementing:
+
+- **A review follows one draft.** A route fixed in two drafts at once has no
+  answer to "what happened to it", so `/fix` on a review already tied elsewhere
+  is 409 `review_in_other_draft` with `details.change_set_id`.
+- The draft checks run before the review's status, as they do for a coordinate
+  review: a fix recorded against a committed draft is 409 `change_set_not_draft`,
+  not `review_not_open`.
+- **Rejected is reopenable, committed is not.** "Not worth fixing" is a
+  judgement about priority and priority changes; a committed fix is live and
+  there is nothing to go back to (409 `review_not_closed`).
+- A load supersedes the previous pending queue and never queues a route that
+  already has an open review (`gtfs_route_review_open_uq`).
+- `reason` with an unknown code is 400 `invalid_reason`, as `status` is 400
+  `invalid_status`. A code the loader invents is filterable but uncounted — the
+  right way round, so a new signal is not silently dropped from the queue.
+- The detail answers for a route that is gone: its `problems` are one
+  `route_missing` error. The queue and why it was queued are the point.
+
+Tests: `route_reviews::problems`, the statuses and the draft rules are unit
+tested in `src/editor/route_reviews.rs` (no database, 14 tests);
+`tests/editor_route_review_flow.rs` runs the queue, the filters, the summary, a
+fix taken back twice and then released, confirm, reject, reopen and a note
+against a real Postgres, and is in `scripts/editor_flow_test.sh`;
+`dev/ui_smoke.mjs --routereview` covers the page against `dev/mock_server.py`,
+which builds its queue from the sample's own routes by the same rules.
