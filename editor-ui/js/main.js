@@ -8,6 +8,7 @@ import { initSearch, showHome, showStop, showRoute } from "./explore.js";
 import { loadActiveDraft, renderDraftChip, chooseDraft, requireDraft, createdStops } from "./drafts.js";
 import { showDraftList, showDraft } from "./review.js";
 import { showPeople, showHistory, showFeedSettings } from "./admin.js";
+import { showDelivery, leaveWebhooks } from "./webhooks.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
 import { newStop, newRoute } from "./create.js";
@@ -149,6 +150,7 @@ function route() {
   currentHash = location.hash || "#/";
   leaveStations();
   leaveCoordinates();
+  leaveWebhooks();
   setLeaveGuard(null);
   // what could be undone belonged to the screen being left
   resetUndo();
@@ -194,6 +196,8 @@ function route() {
     markNav("admin"); showWorkspace(false); showPeople();
   } else if (parts[0] === "feed-settings") {
     markNav("feed-settings"); showWorkspace(false); showFeedSettings();
+  } else if (parts[0] === "delivery") {
+    markNav("delivery"); showWorkspace(false); showDelivery();
   } else if (parts[0] === "audit") {
     markNav("audit"); showWorkspace(false); showHistory(params.get("change_set"));
   } else {

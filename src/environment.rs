@@ -131,6 +131,45 @@ pub struct AppConfig {
     /// Directory the dashboard's static files are served from.
     #[serde(default)]
     pub gtfs_editor_ui_dir: Option<String>,
+    /// Outbound webhooks (docs/gtfs-editor.md section 12): GIMS calls a
+    /// configured URL when something happens to a DB feed - most usefully once
+    /// every pod is serving a committed edit, which is when a downstream cache
+    /// such as the S3/CloudFront frontline layer can safely be rebuilt.
+    ///
+    /// Off by default. Turning it on also needs a non-empty
+    /// `gtfs_webhook_allowed_hosts`: see that field.
+    #[serde(default)]
+    pub gtfs_webhooks_enabled: bool,
+    /// Hosts a webhook may call. A dashboard admin chooses the URL, but only
+    /// within this list, so the deployment - not the dashboard alone - decides
+    /// where GIMS may send a request. An entry written `.example.com` matches
+    /// that domain and its subdomains.
+    ///
+    /// Empty (the default) means no webhook can fire, even with
+    /// `gtfs_webhooks_enabled = True`: the feature fails closed.
+    #[serde(default)]
+    pub gtfs_webhook_allowed_hosts: Vec<String>,
+    /// How this pod identifies itself when it reports which feed version it is
+    /// serving. Defaults to the `POD_NAME` environment variable (the downward
+    /// API), then the hostname. Two pods must never share it: a shared id makes
+    /// the fleet look smaller than it is, which would fire a webhook early.
+    #[serde(default)]
+    pub gtfs_pod_id: Option<String>,
+}
+
+impl AppConfig {
+    /// The deployment's webhook policy, as the dispatcher reads it.
+    pub fn webhook_policy(&self) -> crate::services::webhook::WebhookPolicy {
+        crate::services::webhook::WebhookPolicy {
+            enabled: self.gtfs_webhooks_enabled,
+            allowed_hosts: self
+                .gtfs_webhook_allowed_hosts
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        }
+    }
 }
 
 fn default_preprocessed_data_dir() -> String {

@@ -12,6 +12,7 @@ use crate::services::gtfs_db_source::{
     overlays_from_patterns, plan_feed_actions, FeedAction, GtfsDbSource, TripOverlay,
 };
 use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
+use crate::services::webhook;
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -25,6 +26,7 @@ use shared::call_external_api;
 use shared::tools::callapi::{call_api, Protocol};
 use shared::tools::prometheus::CALL_EXTERNAL_API;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
@@ -160,6 +162,13 @@ pub struct GTFSService {
     /// Serialises everything that replaces `data`: a full refresh and a per-feed
     /// DB reload must not interleave, or one would overwrite the other's result.
     reload_lock: tokio::sync::Mutex<()>,
+    /// Who this pod says it is when it reports the feed versions it has loaded
+    /// (`services::webhook`), so the fleet can tell when an edit is live
+    /// everywhere.
+    pod: webhook::PodIdentity,
+    /// A persistent cache-state write failure is worth one line, not one every
+    /// poll tick.
+    cache_state_warned: AtomicBool,
 }
 
 impl GTFSService {
@@ -175,6 +184,7 @@ impl GTFSService {
             .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
         let db_source = Self::create_db_source(&config)?;
+        let pod = webhook::PodIdentity::from_env(config.gtfs_pod_id.as_deref());
 
         let service = Self {
             config,
@@ -188,6 +198,8 @@ impl GTFSService {
             db_source,
             trip_overlays: Arc::new(RwLock::new(HashMap::new())),
             reload_lock: tokio::sync::Mutex::new(()),
+            pod,
+            cache_state_warned: AtomicBool::new(false),
         };
 
         Ok(service)
@@ -2353,11 +2365,25 @@ impl GTFSService {
             return;
         };
         let every = Duration::from_secs(self.config.gtfs_version_poll_seconds.max(1));
+        let policy = self.config.webhook_policy();
         info!(
             "Polling gtfs_feed.data_source/version every {:?} (static fallback feeds: {:?})",
             every,
             db.feeds()
         );
+        if policy.enabled {
+            info!(
+                pod = %self.pod.pod_id,
+                "Reporting this pod's loaded feed versions every poll; webhooks may call {:?}",
+                policy.allowed_hosts
+            );
+            if policy.allowed_hosts.is_empty() {
+                warn!(
+                    "gtfs_webhooks_enabled is true but gtfs_webhook_allowed_hosts is empty; \
+                     cache state is reported but no webhook can fire"
+                );
+            }
+        }
         loop {
             sleep(every).await;
             let live = match db.live_feeds(db.feeds()).await {
@@ -2368,6 +2394,10 @@ impl GTFSService {
                 }
             };
             let loaded_versions = self.data.load().db_feed_versions.clone();
+            // feeds this pod could not load this tick, and the version it was
+            // reaching for: reported in the heartbeat, because a pod serving
+            // older data than the rest is exactly what must not be invisible
+            let mut failures: HashMap<String, (i64, String)> = HashMap::new();
             for (gtfs_id, action) in plan_feed_actions(&live, &loaded_versions) {
                 match action {
                     FeedAction::LoadOrReload => {
@@ -2380,6 +2410,8 @@ impl GTFSService {
                                 "Loading/reloading DB feed {} failed ({}); keeping the data it had",
                                 gtfs_id, e
                             );
+                            let target = live.get(&gtfs_id).copied().flatten().unwrap_or(0);
+                            failures.insert(gtfs_id.clone(), (target, e.to_string()));
                         }
                     }
                     FeedAction::Revert => {
@@ -2396,6 +2428,62 @@ impl GTFSService {
                     }
                 }
             }
+            if policy.enabled {
+                self.report_cache_state(db.pool(), &live, &failures).await;
+                webhook::dispatch_tick(db.pool(), &self.http_client, &self.pod, &policy).await;
+            }
+        }
+    }
+
+    /// Tell the other pods, and the dashboard, which version of each DB feed
+    /// this pod is serving right now. Written every tick, not only on a change:
+    /// the row is also this pod's proof of life, and a pod that stopped writing
+    /// it would drop out of the fleet and let a webhook fire without it.
+    ///
+    /// A failure here is logged once and then swallowed. The version poll must
+    /// keep the feed data fresh whatever the state of the webhook tables - an
+    /// unapplied migration must not stop edits reaching the pods.
+    async fn report_cache_state(
+        &self,
+        pool: &sqlx::postgres::PgPool,
+        live: &HashMap<String, Option<i64>>,
+        failures: &HashMap<String, (i64, String)>,
+    ) {
+        let loaded = self.data.load().db_feed_versions.clone();
+        for (gtfs_id, version) in &loaded {
+            let failure = failures.get(gtfs_id).cloned();
+            if let Err(e) =
+                webhook::heartbeat(pool, &self.pod, gtfs_id, *version, "db", failure).await
+            {
+                self.warn_once_about_cache_state(&e.to_string());
+                return;
+            }
+        }
+        // A feed this pod has reverted to preprocessed data keeps its row, so
+        // the pod stays visibly alive, but says so: it has no feed version to
+        // be in sync with and must not hold a webhook back.
+        for gtfs_id in live.keys() {
+            if loaded.contains_key(gtfs_id) {
+                continue;
+            }
+            if let Err(e) =
+                webhook::heartbeat(pool, &self.pod, gtfs_id, 0, "preprocessed", None).await
+            {
+                self.warn_once_about_cache_state(&e.to_string());
+                return;
+            }
+        }
+    }
+
+    /// The poll runs every few seconds, so a persistent fault - most likely
+    /// `db/gtfs_editor/0013_webhooks.sql` not applied yet - would fill the log.
+    fn warn_once_about_cache_state(&self, error: &str) {
+        if !self.cache_state_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "Reporting this pod's cache state failed ({error}); webhooks cannot fire until \
+                 this is fixed. Has db/gtfs_editor/0013_webhooks.sql been applied? \
+                 Feed data is unaffected. This is logged once."
+            );
         }
     }
 

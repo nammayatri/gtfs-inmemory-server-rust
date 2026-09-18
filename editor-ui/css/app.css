@@ -708,3 +708,14 @@ h1 .live-value, .title-block .live-value { display: block; font-weight: 400; whi
 .filter-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .filter-chips .route-chip .count { font-weight: 400; color: var(--muted); margin-left: 3px; }
 .filter-chips .route-chip[aria-pressed="true"] .count { color: #fff; }
+
+/* Delivery page (docs/gtfs-editor.md section 12): pod cache state, webhooks
+   and what was delivered. The chips read as a traffic light, so they reuse the
+   same tints as the draft statuses rather than inventing colours. */
+.chip.ok { background: var(--ok-tint); color: var(--ok); }
+.chip.warn { background: var(--draft-tint); color: var(--draft); }
+.chip.error { background: var(--danger-tint); color: var(--danger); }
+/* a URL or an error from a receiver can be long and has no spaces to break at */
+.break { overflow-wrap: anywhere; word-break: break-word; }
+code.break { display: inline-block; max-width: 46ch; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 6px; }

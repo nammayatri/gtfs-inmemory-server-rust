@@ -10,6 +10,7 @@ use super::position_reviews;
 use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
 use super::validation::valid_lat_lon;
+use super::webhooks;
 use super::EditorState;
 use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use actix_web::error::{JsonPayloadError, PathError, QueryPayloadError};
@@ -1035,4 +1036,82 @@ pub async fn user_reset_totp(
     let ctx = auth::require(&req, &st, Role::Admin).await?;
     svc::reset_totp(&st, &ctx, *path).await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+// ---------------------------------------------------------------- webhooks
+
+/// Which version of the feed each pod is serving, and whether the fleet has
+/// caught up with the committed one (docs/gtfs-editor.md section 12). Readable
+/// by anyone who can sign in: it answers "is my edit live yet".
+pub async fn cache_state(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(webhooks::cache_state(&st, &path).await?)
+}
+
+pub async fn webhook_list(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(webhooks::list(&st, &path).await?)
+}
+
+pub async fn webhook_create(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<webhooks::WebhookBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let out = webhooks::create(&st, &ctx, &path, body.into_inner()).await?;
+    Ok(HttpResponse::Created().json(out))
+}
+
+pub async fn webhook_update(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<Uuid>,
+    body: web::Json<webhooks::WebhookBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    ok(webhooks::update(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+pub async fn webhook_delete(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<Uuid>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    ok(webhooks::delete(&st, &ctx, *path).await?)
+}
+
+pub async fn webhook_test(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<Uuid>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    ok(webhooks::test(&st, &ctx, *path).await?)
+}
+
+#[derive(Deserialize)]
+pub struct DeliveriesQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+pub async fn webhook_deliveries(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<DeliveriesQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(webhooks::deliveries(&st, &path, q.limit.unwrap_or(50)).await?)
 }

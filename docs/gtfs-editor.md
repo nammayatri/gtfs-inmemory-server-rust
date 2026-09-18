@@ -19,7 +19,7 @@ ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0012*.sql` (`0001..0008` applied to master
+Schema: `db/gtfs_editor/0001..0013*.sql` (`0001..0008` applied to master
 `mtc_internal_master`; `0006` lets a change's `op` be `merge`, `0007` holds
 coordinate reviews, `0008` makes `gtfs_feed.data_source` live and backfills
 `chennai_bus` to `'db'` — see section 3's "Feed data source". **Not yet on
@@ -27,7 +27,8 @@ master, applied to the local database only:** `0009` lets a change's `entity` be
 `feed_config`, `0010` adds `gtfs_change_set.self_approved` and relaxes the
 maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
 behind the cleanup context reads (section 9), `0012` adds the nullable
-`gtfs_stop.description` (section 11). All four are safe to run twice. **`0012`
+`gtfs_stop.description` (section 11), `0013` adds the webhook and pod cache
+state tables (section 12). All five are safe to run twice. **`0012`
 goes on a database before the build that reads it:** both the editor and the
 GIMS loader select the column, so a DB feed fails to load (and serves its
 preprocessed data) on a database without it.)
@@ -1436,3 +1437,167 @@ Tests: `tests/editor_stop_details_flow.rs` (registered in
 `scripts/editor_flow_test.sh`); `dev/ui_smoke.mjs` `round5Flows` (`node
 dev/ui_smoke.mjs --round5` runs only these) against `dev/mock_server.py`
 (`seed_round5`, `bulk_stop_updates`).
+
+## 12. Webhooks, and knowing when an edit is live everywhere (2026-09-18)
+
+GIMS calls a URL when something happens to a feed. It is general plumbing — a
+webhook row picks one `event`, and the dispatcher delivers it exactly once with
+retries — but it exists for one problem in particular.
+
+**The problem.** The frontline layer is static files on S3 behind CloudFront,
+rebuilt and invalidated by a Jenkins job. That job has to run *after* an edit is
+live on every pod, not when it was committed. A commit bumps `gtfs_feed.version`
+and each pod notices within its poll interval, so for a few seconds the fleet is
+mixed. Fire on commit and a pod still holding the previous version can answer the
+request that the freshly invalidated CloudFront passes through — and CloudFront
+caches that stale answer again, for as long as its TTL says.
+
+**The answer.** Each pod reports the version it has loaded, and the webhook fires
+once every live pod is at the committed version. No sidecar: a sidecar would have
+to infer a pod's cache state from outside, and the process that owns the cache
+can simply say.
+
+```
+commit ──▶ gtfs_feed.version = N
+             │
+   each pod polls (5 s), rebuilds the feed, then writes its own row:
+             ▼
+   gtfs_pod_feed_state   pod-a → N     pod-b → N-1     pod-c → N
+             │                            ▲ not there yet: nothing fires
+             │  …one poll later, pod-b reaches N and the fleet settles
+             ▼
+   every pod tries to INSERT the delivery; the unique index lets one through
+             ▼
+   that pod POSTs the webhook ──▶ Jenkins ──▶ rebuild S3 + invalidate CloudFront
+```
+
+### 12.1 Events
+
+| `event` | fires when | typical use |
+| --- | --- | --- |
+| `feed_in_sync` | every live pod is serving the committed version, and has been for `settle_seconds` | rebuild a downstream cache |
+| `feed_committed` | a draft was committed, at once, without waiting for the pods | notify a chat channel |
+| `feed_reload_failed` | a pod could not load a version and is serving older data | alert |
+
+A webhook only ever fires for a version that appeared **after** it was
+configured, so adding one to a quiet feed does not immediately trigger a
+rebuild.
+
+### 12.2 Exactly once, without a leader
+
+Every pod runs the same dispatcher and they all notice the same moment. They all
+try to insert the delivery row; the partial unique index on `(webhook_id,
+feed_version) WHERE kind = 'event'` lets exactly one through, and only that pod
+sends the request. There is no leader to elect and nothing to fail over. A
+delivery claimed by a pod that dies mid-request is reclaimed by another pod after
+`CLAIM_STALE_SECONDS`, so a kill costs a retry, not a delivery.
+
+Skipped versions are normal. If two commits land faster than the pods reload,
+the fleet settles on the newer one and only that version gets a delivery — one
+invalidation per settled state, not one per commit.
+
+### 12.3 What holds a delivery back, and what gives up
+
+- **A laggard pod** — any live pod below the committed version. The delivery
+  waits. `GET /feeds/{g}/cache-state` names it.
+- **A silent pod** — no heartbeat for `stale_after_seconds` (default 60). It is
+  treated as gone, not as a laggard: otherwise one dead pod would suppress every
+  future delivery in silence.
+- **A pod on preprocessed data** — counted as neither. It is healthy, but this
+  feed's version means nothing to it.
+- **No live pod at all** — never fires. Firing would tell the frontline to
+  rebuild from data nothing is actually serving.
+
+After `give_up_after_seconds` (default 1800) an undelivered version is recorded
+as an **abandoned** delivery, with the laggards named. It is deliberately not
+fired anyway: rebuilding a downstream cache from a fleet we know is inconsistent
+is the failure this whole mechanism exists to prevent. The abandonment is
+visible in the dashboard and the log; press **Test** once the fleet is healthy.
+
+### 12.4 Credentials
+
+`url` and every value in `headers` may contain placeholders:
+
+- `${NAME}` / `${env:NAME}` — an environment variable **of the pod**, which is
+  where the credential lives: in the Kubernetes secret the pod already mounts.
+- `${event:field}` — `gtfs_id`, `feed_version`, `event`, `delivery_id`,
+  `webhook`, `pod_count`, `fired_at`.
+
+So a Jenkins hook is stored as
+
+```
+https://<jenkins host>/job/frontline-rebuild/buildWithParameters?token=${JENKINS_TOKEN}&FEED=${event:gtfs_id}
+```
+
+The token is never written to the database, never returned by the API, and never
+reaches the audit log. An **unresolved** placeholder fails the delivery rather
+than sending the literal text, and is caught when the URL is saved, not at the
+first delivery. An error message has the URL and its query string removed before
+it is stored.
+
+The request body is the built-in JSON payload (`event`, `gtfs_id`,
+`feed_version`, `delivery_id`, `webhook`, `pod_count`, `fired_at`) unless `body`
+is set, in which case that object is sent with `${...}` resolved in every string
+leaf. `GET` sends no body.
+
+### 12.5 Where a webhook may point
+
+A URL's host must match `gtfs_webhook_allowed_hosts` in the **dhall config** —
+checked when it is saved and again when the request is about to go out, because
+the list can be tightened after a webhook was configured. An entry written
+`.example.com` matches that domain and its subdomains.
+
+```dhall
+gtfs_webhooks_enabled = True,
+gtfs_webhook_allowed_hosts = [".internal.svc.movingtech.net"],
+gtfs_pod_id = None Text,   -- defaults to $POD_NAME, then the hostname
+```
+
+Empty allow-list means no webhook can fire, even with `gtfs_webhooks_enabled =
+True`: the feature fails closed. With `gtfs_webhooks_enabled = False` (the
+default) pods do not even report their cache state, so an existing deployment is
+completely unaffected until someone turns this on.
+
+**Why this is not a draft change.** Everything about a *feed* goes through a
+draft a second person approves. A webhook is not feed data, and a draft would not
+address the actual risk, which is GIMS being pointed at a host it should not
+call. That is answered in the deployment: an admin chooses the URL within the
+allow-list and cannot widen the list. Every change is audited
+(`webhook_created`, `webhook_updated`, `webhook_deleted`, `webhook_tested`).
+
+`gtfs_pod_id` must differ per pod. Two pods sharing one id overwrite each other's
+heartbeat, the fleet looks smaller than it is, and a webhook fires early.
+
+### 12.6 API
+
+| | |
+| --- | --- |
+| `GET /feeds/{g}/cache-state` | viewer+. The feed's version, each pod's loaded version, `in_sync`, and `waiting_for` |
+| `GET /feeds/{g}/webhooks` | viewer+. The rows, plus `policy` (what the deployment allows) and `events` |
+| `POST /feeds/{g}/webhooks` | **admin**. `{name, event?, url, method?, headers?, body?, enabled?, …}` → 201 |
+| `PATCH /webhooks/{id}` | **admin**. Only the fields sent are changed |
+| `DELETE /webhooks/{id}` | **admin** |
+| `POST /webhooks/{id}/test` | **admin**. Queues a `kind = 'test'` delivery, sent like a real one, which does not consume the version's delivery |
+| `GET /feeds/{g}/webhook-deliveries?limit=` | viewer+. History with status, attempts, response code and error |
+
+Errors: `host_not_allowed`, `invalid_url` (a placeholder that cannot be
+resolved), `invalid_event`, `invalid_method`, `invalid_headers`, `out_of_range`,
+`duplicate_name`, `webhooks_inactive`, `webhook_not_found`.
+
+Retries: 30 s, 1 m, 2 m, 4 m, 8 m, then every 15 m, up to `max_attempts`
+(default 5). The receiver here is a build system, so retrying for a long while
+beats dropping the request: a missed delivery means CloudFront serves yesterday's
+data until someone notices.
+
+### 12.7 Schema and tests
+
+`db/gtfs_editor/0013_webhooks.sql` — `gtfs_pod_feed_state`, `gtfs_webhook`,
+`gtfs_webhook_delivery`. Safe to run twice. **Apply it before rolling out an
+image with `gtfs_webhooks_enabled = True`**; without it the pods log one line and
+carry on serving, and no webhook can fire.
+
+Tests: `tests/editor_webhook_flow.rs` (registered in
+`scripts/editor_flow_test.sh`) runs the whole path against a real Postgres and a
+real HTTP receiver, including two pods dispatching at the same instant to prove
+the delivery goes out exactly once; the fleet arithmetic, the allow-list, the
+placeholders and the backoff are unit tested in `src/services/webhook.rs`.

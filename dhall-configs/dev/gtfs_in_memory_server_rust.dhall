@@ -77,6 +77,15 @@ in {
   gtfs_db_feeds = [] : List Text,
   gtfs_version_poll_seconds = 5,
 
+  -- Outbound webhooks (docs/gtfs-editor.md section 12). Off here: each pod
+  -- reports the feed version it is serving only when this is True, and a
+  -- webhook can fire only if its URL's host is in the allow-list, which is
+  -- empty by default so the feature fails closed.
+  gtfs_webhooks_enabled = False,
+  gtfs_webhook_allowed_hosts = [] : List Text,
+  -- Defaults to $POD_NAME, then the hostname. Two pods must never share it.
+  gtfs_pod_id = None Text,
+
   -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
   osrm_url = Some "http://localhost:5050",
   gen_int_for_id = Some True,
