@@ -43,6 +43,23 @@ pub const STATION_MIN_MEMBERS: usize = 2;
 pub const MINTED_STOP_PREFIX: &str = "ed_";
 /// The two `gtfs_feed.data_source` values a `feed_config` change may set.
 pub const DATA_SOURCES: [&str; 2] = ["db", "preprocessed"];
+/// Where a route's map line came from. `imported` is the nightly build's own
+/// line, which the editor never writes; the other three say who chose this one -
+/// the road router, a person drawing it, or a file.
+pub const POLYLINE_SOURCES: [&str; 4] = ["osrm", "manual", "upload", "imported"];
+/// The area these buses run in, as `(min_lat, max_lat, min_lon, max_lon)`:
+/// nandi's `OPERATING_BBOX` (`scripts/chennai-bus/src/cleanup/common.py`), wide
+/// enough for the long-distance routes that leave Chennai. A map line with a
+/// point outside it is in the wrong place, not a long route - the ten lines
+/// chennai_bus carries today sit inside 12.82-13.19 N, 80.07-80.31 E. A second
+/// city would need this per feed.
+pub const OPERATING_AREA: (f64, f64, f64, f64) = (8.0, 14.0, 76.0, 81.0);
+/// A road line through a route's stops is always longer than the straight line
+/// from stop to stop, and rarely more than half as long again (1.09-1.84 over
+/// chennai_bus's ten lines). Outside this band the line is probably not this
+/// route's - a warning either way, since a genuine one-way loop can be long.
+pub const POLYLINE_SHORT_RATIO: f64 = 0.75;
+pub const POLYLINE_LONG_RATIO: f64 = 3.0;
 
 /// Why a station of `members` stops is too small to be one, if it is.
 pub fn too_few_members(station_id: &str, members: usize) -> Option<String> {
@@ -595,6 +612,147 @@ pub fn decode_polyline(encoded: &str) -> Option<Vec<(f64, f64)>> {
     Some(points)
 }
 
+/// Encode points as a Google polyline (precision 5), the inverse of
+/// [`decode_polyline`]: the shape the table stores, whatever the operator sent.
+pub fn encode_polyline(points: &[(f64, f64)]) -> String {
+    let mut out = String::with_capacity(points.len() * 12);
+    let (mut lat, mut lon) = (0i64, 0i64);
+    for (plat, plon) in points {
+        // rounded to the stored precision first, so re-encoding what was decoded
+        // gives back the same string
+        let (elat, elon) = ((plat * 1e5).round() as i64, (plon * 1e5).round() as i64);
+        for d in [elat - lat, elon - lon] {
+            let mut v = if d < 0 { !(d << 1) } else { d << 1 };
+            while v >= 0x20 {
+                out.push((((0x20 | (v & 0x1f)) + 63) as u8) as char);
+                v >>= 5;
+            }
+            out.push(((v + 63) as u8) as char);
+        }
+        lat = elat;
+        lon = elon;
+    }
+    out
+}
+
+/// Whether a point is in the area these buses run in ([`OPERATING_AREA`]).
+pub fn in_operating_area(lat: f64, lon: f64) -> bool {
+    let (min_lat, max_lat, min_lon, max_lon) = OPERATING_AREA;
+    (min_lat..=max_lat).contains(&lat) && (min_lon..=max_lon).contains(&lon)
+}
+
+/// A map line as every path that stores one must have it: it decodes, it has at
+/// least two points, and every point is somewhere these buses go. Whoever sent
+/// it - the route editor, a file, the road router's own proposal - runs this.
+pub fn check_polyline(encoded: &str, what: &str) -> Result<Vec<(f64, f64)>, Finding> {
+    let points = decode_polyline(encoded)
+        .filter(|p| p.len() >= 2)
+        .ok_or_else(|| {
+            Finding::error(
+                "invalid_polyline",
+                "",
+                format!("{what}: encoded_polyline does not decode to at least two valid points"),
+            )
+        })?;
+    match points
+        .iter()
+        .position(|(lat, lon)| !in_operating_area(*lat, *lon))
+    {
+        None => Ok(points),
+        Some(i) => {
+            let (lat, lon) = points[i];
+            Err(Finding::error(
+                "polyline_outside_area",
+                "",
+                format!(
+                    "{what}: point {} of the map line is at {lat:.5}, {lon:.5}, outside the area these buses run in",
+                    i + 1
+                ),
+            ))
+        }
+    }
+}
+
+/// Points as an operator may hand them over instead of an encoded line:
+/// `[[lat, lon], …]` or `[{"lat": …, "lon": …}, …]`. The caller encodes what
+/// comes back, so both forms end up as the one thing the table stores.
+pub fn read_points(v: &Value, what: &str) -> Result<Vec<(f64, f64)>, Finding> {
+    let bad = |detail: String| Finding::error("invalid_points", "", format!("{what}: {detail}"));
+    let list = v
+        .as_array()
+        .ok_or_else(|| bad("points is a list of [lat, lon] pairs".into()))?;
+    let mut out = Vec::with_capacity(list.len());
+    for (i, p) in list.iter().enumerate() {
+        let pair = match p {
+            Value::Array(a) if a.len() == 2 => (a[0].as_f64(), a[1].as_f64()),
+            Value::Object(m) => (
+                m.get("lat").and_then(Value::as_f64),
+                m.get("lon").and_then(Value::as_f64),
+            ),
+            _ => (None, None),
+        };
+        match pair {
+            (Some(lat), Some(lon)) if valid_lat_lon(lat, lon) => out.push((lat, lon)),
+            _ => {
+                return Err(bad(format!(
+                    "point {} is not a [lat, lon] pair in range",
+                    i + 1
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What storing `line` on a route whose map line is `current` would do. The
+/// replace is what the operator has to ask for: adding a line to a route that
+/// has none is the easy case, overwriting one is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolylineChange {
+    Unchanged,
+    Added,
+    Replaced,
+}
+
+pub fn polyline_change(current: Option<&str>, line: &str) -> PolylineChange {
+    match current.map(str::trim).filter(|c| !c.is_empty()) {
+        None => PolylineChange::Added,
+        Some(c) if c == line.trim() => PolylineChange::Unchanged,
+        Some(_) => PolylineChange::Replaced,
+    }
+}
+
+/// How long a line is on the ground, in metres.
+pub fn polyline_length_m(points: &[(f64, f64)]) -> f64 {
+    points
+        .windows(2)
+        .map(|w| haversine_m(w[0].0, w[0].1, w[1].0, w[1].1))
+        .sum()
+}
+
+/// The line measured against the straight line from stop to stop
+/// ([`POLYLINE_SHORT_RATIO`]). A **warning**, never a block: a line that looks
+/// wrong is still the operator's call, and the numbers are in the message so
+/// they can make it.
+pub fn polyline_length_finding(what: &str, line_m: f64, chain_m: f64) -> Option<Finding> {
+    // a route with one served stop, or none, has no chain to measure against
+    if chain_m < 1.0 {
+        return None;
+    }
+    let ratio = line_m / chain_m;
+    (!(POLYLINE_SHORT_RATIO..=POLYLINE_LONG_RATIO).contains(&ratio)).then(|| {
+        Finding::warning(
+            "polyline_length_unlikely",
+            "",
+            format!(
+                "{what}: the map line runs {:.1} km where the route's stops are {:.1} km apart end to end ({ratio:.1}x); check it is this route's line",
+                line_m / 1000.0,
+                chain_m / 1000.0
+            ),
+        )
+    })
+}
+
 fn obj<'a>(after: &'a Value, what: &str) -> Result<&'a Map<String, Value>, Finding> {
     after.as_object().ok_or_else(|| {
         Finding::error(
@@ -1015,25 +1173,17 @@ pub fn check_payload(
                 }
             }
             if let Some(p) = m.get("encoded_polyline").and_then(Value::as_str) {
-                match decode_polyline(p) {
-                    Some(pts) if pts.len() >= 2 => {}
-                    _ => {
-                        return Err(Finding::error(
-                            "invalid_polyline",
-                            "",
-                            format!(
-                            "{what}: encoded_polyline does not decode to at least two valid points"
-                        ),
-                        ))
-                    }
-                }
+                check_polyline(p, what)?;
             }
             if let Some(s) = m.get("polyline_source").and_then(Value::as_str) {
-                if !["osrm", "manual", "imported"].contains(&s) {
+                if !POLYLINE_SOURCES.contains(&s) {
                     return Err(Finding::error(
                         "invalid_payload",
                         s,
-                        format!("{what}: polyline_source is osrm, manual or imported"),
+                        format!(
+                            "{what}: polyline_source is one of {}",
+                            POLYLINE_SOURCES.join(", ")
+                        ),
                     ));
                 }
             }
@@ -1555,16 +1705,42 @@ mod tests {
         assert!(check_payload("stop", "delete", "A", &Value::Null).is_ok());
         assert!(check_payload("route", "update", "R", &json!({"color": "#00AA11"})).is_ok());
         assert!(check_payload("route", "update", "R", &json!({"color": "green"})).is_err());
+        let chennai = encode_polyline(&[(13.0827, 80.2707), (13.0900, 80.2800)]);
         assert!(check_payload(
             "route",
             "update",
             "R",
-            &json!({"encoded_polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@"})
+            &json!({"encoded_polyline": chennai})
         )
         .is_ok());
         assert!(
             check_payload("route", "update", "R", &json!({"encoded_polyline": "!!!"})).is_err()
         );
+        // Google's documented example decodes, but it is in California
+        assert_eq!(
+            check_payload(
+                "route",
+                "update",
+                "R",
+                &json!({"encoded_polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@"})
+            )
+            .unwrap_err()
+            .code,
+            "polyline_outside_area"
+        );
+        assert_eq!(
+            check_payload("route", "update", "R", &json!({"polyline_source": "guess"}))
+                .unwrap_err()
+                .code,
+            "invalid_payload"
+        );
+        assert!(check_payload(
+            "route",
+            "update",
+            "R",
+            &json!({"polyline_source": "upload"})
+        )
+        .is_ok());
         assert!(check_payload(
             "route_stops",
             "replace",
@@ -1955,6 +2131,121 @@ mod tests {
         assert!((pts[0].0 - 38.5).abs() < 1e-9 && (pts[0].1 + 120.2).abs() < 1e-9);
         assert!((pts[2].0 - 43.252).abs() < 1e-9 && (pts[2].1 + 126.453).abs() < 1e-9);
         assert!(decode_polyline("_p~iF~ps|U_").is_none());
+    }
+
+    #[test]
+    fn polyline_encoding_round_trips() {
+        assert_eq!(
+            encode_polyline(&[(38.5, -120.2), (40.7, -120.95), (43.252, -126.453)]),
+            "_p~iF~ps|U_ulLnnqC_mqNvxq`@"
+        );
+        assert_eq!(encode_polyline(&[]), "");
+        let pts = vec![(13.08271, 80.27071), (13.09, 80.28), (12.9, 80.1)];
+        assert_eq!(decode_polyline(&encode_polyline(&pts)).unwrap(), pts);
+        // a sixth decimal is not stored, so what comes back is the rounded point
+        assert_eq!(
+            decode_polyline(&encode_polyline(&[
+                (13.0827149, 80.2707151),
+                (13.09, 80.28)
+            ]))
+            .unwrap()[0],
+            (13.08271, 80.27072)
+        );
+    }
+
+    #[test]
+    fn polyline_check_wants_two_points_inside_the_area() {
+        let line = encode_polyline(&[(13.0827, 80.2707), (13.09, 80.28)]);
+        assert_eq!(check_polyline(&line, "w").unwrap().len(), 2);
+        assert_eq!(
+            check_polyline(&encode_polyline(&[(13.0827, 80.2707)]), "w")
+                .unwrap_err()
+                .code,
+            "invalid_polyline"
+        );
+        assert_eq!(
+            check_polyline("", "w").unwrap_err().code,
+            "invalid_polyline"
+        );
+        assert_eq!(
+            check_polyline("!!!", "w").unwrap_err().code,
+            "invalid_polyline"
+        );
+        // Kolkata, and the edges of the box
+        let out =
+            check_polyline(&encode_polyline(&[(13.08, 80.27), (22.57, 88.36)]), "w").unwrap_err();
+        assert_eq!(out.code, "polyline_outside_area");
+        assert!(out.message.contains("point 2"), "{}", out.message);
+        assert!(in_operating_area(8.0, 76.0) && in_operating_area(14.0, 81.0));
+        assert!(!in_operating_area(14.001, 80.0) && !in_operating_area(13.0, 81.001));
+    }
+
+    #[test]
+    fn points_are_read_in_either_form() {
+        let pairs = read_points(&json!([[13.08, 80.27], [13.09, 80.28]]), "w").unwrap();
+        let objects = read_points(
+            &json!([{"lat": 13.08, "lon": 80.27}, {"lat": 13.09, "lon": 80.28}]),
+            "w",
+        )
+        .unwrap();
+        assert_eq!(pairs, objects);
+        assert_eq!(pairs, vec![(13.08, 80.27), (13.09, 80.28)]);
+        assert_eq!(read_points(&json!([]), "w").unwrap(), vec![]);
+        for bad in [
+            json!("13,80"),
+            json!([[13.08]]),
+            json!([[13.08, 80.27, 5.0]]),
+            json!([{"lat": 13.08}]),
+            json!([[91.0, 80.27]]),
+            json!([["13.08", "80.27"]]),
+        ] {
+            assert_eq!(read_points(&bad, "w").unwrap_err().code, "invalid_points");
+        }
+        // only the world's range here; the area is [`check_polyline`]'s to judge,
+        // once the points are the line the table would store
+        assert!(read_points(&json!([[13.08, 80.27], [0.0, 0.0]]), "w").is_ok());
+        assert!(read_points(&json!([[13.08, 80.27], [13.09, 181.0]]), "w")
+            .unwrap_err()
+            .message
+            .contains("point 2"));
+    }
+
+    #[test]
+    fn a_line_is_added_replaced_or_already_there() {
+        assert_eq!(polyline_change(None, "abc"), PolylineChange::Added);
+        assert_eq!(polyline_change(Some(""), "abc"), PolylineChange::Added);
+        assert_eq!(polyline_change(Some("  "), "abc"), PolylineChange::Added);
+        assert_eq!(
+            polyline_change(Some("abc"), "abc"),
+            PolylineChange::Unchanged
+        );
+        assert_eq!(
+            polyline_change(Some("abc"), " abc "),
+            PolylineChange::Unchanged
+        );
+        assert_eq!(
+            polyline_change(Some("abc"), "abd"),
+            PolylineChange::Replaced
+        );
+    }
+
+    #[test]
+    fn polyline_length_warns_only_outside_the_band() {
+        let pts = vec![(13.00, 80.20), (13.05, 80.20)];
+        let straight = polyline_length_m(&pts);
+        assert!((straight - 5559.0).abs() < 5.0, "{straight}");
+        assert_eq!(polyline_length_m(&pts[..1]), 0.0);
+        // chennai_bus's real lines sit at 1.09-1.84 times their stop chain
+        assert!(polyline_length_finding("w", 1.84 * straight, straight).is_none());
+        assert!(polyline_length_finding("w", straight, straight).is_none());
+        assert!(polyline_length_finding("w", 0.75 * straight, straight).is_none());
+        let short = polyline_length_finding("w", 0.2 * straight, straight).unwrap();
+        assert_eq!(short.code, "polyline_length_unlikely");
+        assert_eq!(short.level, Level::Warning);
+        assert!(short.message.contains("0.2x"), "{}", short.message);
+        assert!(polyline_length_finding("w", 4.0 * straight, straight).is_some());
+        // a route with nothing to measure against is never warned about
+        assert!(polyline_length_finding("w", straight, 0.0).is_none());
     }
 
     #[test]

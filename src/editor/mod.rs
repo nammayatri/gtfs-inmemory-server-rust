@@ -268,6 +268,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 "/change-sets/{id}/preview/routes/{route_id}",
                 web::get().to(h::change_set_preview_route),
             )
+            .route(
+                "/change-sets/{id}/routes/{route_id}/polyline",
+                web::post().to(h::route_polyline_set),
+            )
             .route("/change-sets/{id}/submit", web::post().to(h::submit))
             .route("/change-sets/{id}/reopen", web::post().to(h::reopen))
             .route("/change-sets/{id}/approve", web::post().to(h::approve))

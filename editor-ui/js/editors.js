@@ -3,12 +3,12 @@
 import { get, post, enc } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
 import {
-  h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, STOP_TYPE_LABEL, SERVED_EXCLUDE,
-  validateRows, renumberStages, decodePolyline, plural, ID_RE, ID_RULE,
+  h, clear, toast, confirmDialog, modal, debounce, fmtCount, fmtMetres, haversine, STOP_TYPE_LABEL, SERVED_EXCLUDE,
+  validateRows, renumberStages, decodePolyline, encodePolyline, plural, ID_RE, ID_RULE,
   PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField,
 } from "./util.js";
 import * as map from "./map.js";
-import { addChange, existingChange, createdChange, requireDraft, updateChange } from "./drafts.js";
+import { addChange, existingChange, createdChange, requireDraft, updateChange, useDraft } from "./drafts.js";
 import { stopPicker } from "./picker.js";
 import { showStop, showRoute } from "./explore.js";
 import { undoScope } from "./undo.js";
@@ -596,7 +596,11 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const prior = existingChange("route", route.route_id);
   const base = createChange ? createChange.after : route;
   const start = { short_name: base.short_name || "", long_name: base.long_name || "", color: base.color || "", ...(prior && !createChange ? prior.after : {}) };
-  let proposed = prior && prior.after.encoded_polyline ? { encoded_polyline: prior.after.encoded_polyline, polyline_source: prior.after.polyline_source } : null;
+  // a line already in the draft is a saved line here, not a proposal: it goes
+  // through its own endpoint, and re-sending it would only be refused as
+  // unchanged. `proposed` is always a line this screen has just made.
+  let proposed = null;
+  let lineWarnings = [];
   const unsaved = guard(`Your changes to route ${route.short_name || route.route_id} are not in the draft yet.`);
   const f = {
     short_name: h("input", { type: "text", id: "route-short", value: start.short_name }),
@@ -619,23 +623,49 @@ export async function editRouteDetails(route, { created = false } = {}) {
     showProposal();
   };
 
-  const showProposal = () => {
-    if (!proposed) {
-      map.clearRoute("proposal");
-      clear(lineStatus, h("p.hint", route.encoded_polyline ? "This route has a saved map line." : "This route has no map line yet."));
-      return;
-    }
-    map.showRoute({ ...route, encoded_polyline: proposed.encoded_polyline }, { layer: "proposal", dashed: true, color: "#0b6660", fit: true });
-    let km = "";
+  // how long a line runs, so the person can see at a glance whether it is this
+  // route's; the server measures it against the stops again and may warn
+  const lineMetres = (encoded) => {
     try {
-      const pts = decodePolyline(proposed.encoded_polyline);
+      const pts = decodePolyline(encoded);
       let d = 0;
       for (let i = 1; i < pts.length; i++) d += haversine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]);
-      km = fmtMetres(d);
-    } catch { /* shown as-is */ }
-    clear(lineStatus, h("p.notice.ok", `New map line ready (${km}), shown dashed in teal. It is saved when you add these changes to the draft.`),
-      h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line"));
+      return { metres: d, points: pts.length };
+    } catch {
+      return null;
+    }
   };
+  // the line the route has once the draft applies: a line drafted earlier counts,
+  // so a second one in the same draft is still a replacement
+  const drafted = () => !!(prior && "encoded_polyline" in prior.after);
+  const savedLine = () => (drafted() ? prior.after.encoded_polyline : route.encoded_polyline) || null;
+  const savedSource = () => (drafted() && prior.after.polyline_source) || route.polyline_source || null;
+  // points the person pasted are drawn from a local encode; the server does the
+  // encoding that is stored
+  const proposedLine = () => (proposed ? proposed.encoded_polyline || encodePolyline(proposed.points) : null);
+  const replacing = () => !!savedLine() && !!proposed && proposedLine() !== savedLine();
+  const replaceTick = h("input", { type: "checkbox", id: "route-line-replace" });
+  replaceTick.addEventListener("change", () => { unsaved.touch(); showProposal(); });
+
+  function showProposal() {
+    const saved = savedLine();
+    if (!proposed) {
+      map.clearRoute("proposal");
+      const now = saved ? lineMetres(saved) : null;
+      clear(lineStatus, saved
+        ? h("p.hint", `This route has a ${drafted() ? "map line waiting in your draft" : "saved map line"}${now ? ` (${fmtMetres(now.metres)}, ${fmtCount(now.points)} points)` : ""}, from ${savedSource() || "an unknown source"}.`)
+        : h("p.notice.warning", h("strong", "This route has no map line yet."), " The map joins its stops with straight dashed lines until it has one."));
+      return;
+    }
+    map.showRoute({ ...route, encoded_polyline: proposedLine() }, { layer: "proposal", dashed: true, color: "#0b6660", fit: true });
+    const m = lineMetres(proposedLine());
+    clear(lineStatus,
+      h("p.notice.ok", `New map line ready${m ? ` (${fmtMetres(m.metres)}, ${fmtCount(m.points)} points)` : ""}, shown dashed in teal. It is saved when you add these changes to the draft.`),
+      replacing() ? h("div.notice.warning",
+        h("p", h("strong", "This route already has a map line."), " Adding this one throws the saved line away. The draft's diff shows both, and whoever approves it sees what was replaced."),
+        h("label.check", { for: "route-line-replace" }, replaceTick, h("span", `Replace the ${drafted() ? "drafted" : "saved"} ${savedSource() || ""} map line`))) : null,
+      h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line"));
+  }
 
   const suggest = async () => {
     clear(lineStatus, h("p.hint", "Asking the road router for a line through the stops…"));
@@ -648,6 +678,39 @@ export async function editRouteDetails(route, { created = false } = {}) {
     }
   };
 
+  // a line the operator already has: the encoded string, or the lat/lon points
+  // of one, which the server encodes
+  const paste = async () => {
+    const box = h("textarea", { id: "route-line-paste", rows: "5", placeholder: "gscnAmwzhNs@…  — or — 13.0827,80.2707" });
+    const raw = await modal("Paste a map line", () => h("div",
+      h("p", "Either the line as an encoded polyline, or its points as lat,lon — one pair per line. Every point has to be in the area these buses run in."),
+      h("label.field", { for: "route-line-paste" }, h("span", "The line"), box)), {
+      actions: [
+        (close) => h("button.btn.secondary", { type: "button", on: { click: () => close(null) } }, "Cancel"),
+        (close) => h("button.btn", { type: "button", on: { click: () => close(box.value.trim()) } }, "Use this line"),
+      ],
+    });
+    if (!raw) return;
+    // digits and separators only means points; anything else is an encoded line
+    try {
+      if (/^[\s\d.,;+-]+$/.test(raw)) {
+        const points = raw.split(/[;\n]+/).map((p) => p.trim()).filter(Boolean).map((p) => {
+          const [lat, lon] = p.split(/[,\s]+/).map(Number);
+          if (!Number.isFinite(lat) || !Number.isFinite(lon)) throw new Error(`“${p}” is not a lat,lon pair.`);
+          return [lat, lon];
+        });
+        if (points.length < 2) throw new Error("A map line needs at least two points.");
+        setLine({ points, polyline_source: "manual" }, "pasted a map line");
+      } else {
+        if (decodePolyline(raw).length < 2) throw new Error("That line has fewer than two points.");
+        setLine({ encoded_polyline: raw, polyline_source: "manual" }, "pasted a map line");
+      }
+      unsaved.touch();
+    } catch (e) {
+      clear(lineStatus, h("p.notice.error", e.message || "That is not a map line; paste it exactly as it was given to you."));
+    }
+  };
+
   const cancel = () => { unsaved.done(); map.clearRoute("proposal"); showRoute(route.route_id, { preview: created }); };
   const save = async (ev) => {
     ev.preventDefault();
@@ -655,6 +718,11 @@ export async function editRouteDetails(route, { created = false } = {}) {
     if (color && !/^#[0-9A-F]{6}$/.test(color)) {
       clear(problems, h("p.notice.error", "Colour must be # followed by six hex digits, for example #0B6660."));
       f.color.setAttribute("aria-invalid", "true");
+      return;
+    }
+    if (replacing() && !replaceTick.checked) {
+      clear(problems, h("p.notice.error", "This route already has a map line. Tick “Replace the saved map line” to put the new one over it, or discard the new line."));
+      replaceTick.focus();
       return;
     }
     try {
@@ -668,7 +736,6 @@ export async function editRouteDetails(route, { created = false } = {}) {
         if (long) after.long_name = long; else delete after.long_name;
         if (color) after.color = color; else delete after.color;
         res = await updateChange(createChange, after);
-        if (proposed) res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after: proposed });
       } else {
         const after = {};
         for (const k of ["short_name", "long_name"]) {
@@ -676,9 +743,22 @@ export async function editRouteDetails(route, { created = false } = {}) {
           if (v !== (route[k] || "")) after[k] = v;
         }
         if ((color || null) !== (route.color ? route.color.toUpperCase() : null)) after.color = color || null;
-        if (proposed) Object.assign(after, proposed);
-        if (!Object.keys(after).length) { clear(problems, h("p.notice", "Nothing has changed yet.")); return; }
-        res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after, base_row_version: route.row_version });
+        if (Object.keys(after).length) {
+          res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after, base_row_version: route.row_version });
+        } else if (!proposed) {
+          clear(problems, h("p.notice", "Nothing has changed yet."));
+          return;
+        }
+      }
+      // the map line goes through its own endpoint, which measures it against
+      // the route's stops and refuses to cover a saved line unasked
+      if (proposed) {
+        const body = { polyline_source: proposed.polyline_source, replace: replaceTick.checked };
+        if (proposed.points) body.points = proposed.points; else body.encoded_polyline = proposed.encoded_polyline;
+        const done = await post(`change-sets/${enc(state.draft.change_set_id)}/routes/${enc(route.route_id)}/polyline`, body);
+        useDraft(done);
+        lineWarnings = (done.polyline && done.polyline.warnings) || [];
+        res = { problems: (done.validation || []).filter((p) => p.entity_key === route.route_id) };
       }
       if (!res) return;
       unsaved.done();
@@ -686,6 +766,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
       if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
       map.clearRoute("proposal");
       showRoute(route.route_id, { preview: true });
+      if (lineWarnings.length) toast(lineWarnings[0].message, "warning");
     } catch (e) {
       clear(problems, h("p.notice.error", e.message));
     }
@@ -703,9 +784,11 @@ export async function editRouteDetails(route, { created = false } = {}) {
     ),
     h("section.section",
       h("h2", "Map line"),
-      h("p.hint", "The map line is the road path drawn between the stops. The road router can suggest one through this route's stops."),
+      h("p.hint", "The map line is the road path drawn between the stops. The road router can suggest one through this route's stops, or you can paste a line you already have."),
       lineStatus,
-      h("div.btn-row", h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Suggest a map line")),
+      h("div.btn-row",
+        h("button.btn.secondary", { type: "button", on: { click: suggest } }, savedLine() ? "Suggest a new map line" : "Suggest a map line"),
+        h("button.btn.secondary", { type: "button", on: { click: paste } }, "Paste a map line")),
       problems),
     h("div.sticky-actions", h("div.btn-row",
       h("button.btn", { type: "submit" }, prior || createChange ? "Update in draft" : "Add to draft"),

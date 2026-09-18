@@ -203,6 +203,26 @@ export function decodePolyline(str) {
   return pts;
 }
 
+// The inverse, for drawing a line someone gave as points before the server has
+// seen it. The server encodes them again; this is only for the map.
+export function encodePolyline(points) {
+  let out = "", lat = 0, lon = 0;
+  for (const [pLat, pLon] of points) {
+    const eLat = Math.round(pLat * 1e5), eLon = Math.round(pLon * 1e5);
+    for (const d of [eLat - lat, eLon - lon]) {
+      let v = d < 0 ? ~(d << 1) : d << 1;
+      while (v >= 0x20) {
+        out += String.fromCharCode((0x20 | (v & 0x1f)) + 63);
+        v >>>= 5;
+      }
+      out += String.fromCharCode(v + 63);
+    }
+    lat = eLat;
+    lon = eLon;
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ route rules
 export const SERVED_EXCLUDE = new Set(["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"]);
 

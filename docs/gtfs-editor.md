@@ -188,9 +188,9 @@ below). Every list is
 | GET | `/feeds` | `{items: [{gtfs_id, display_name, version, data_source, released_version, released_at, updated_at}], next_cursor: null}` |
 | GET | `/feeds/{g}/stops?q=&bbox=minLat,minLon,maxLat,maxLon&station=&limit=&cursor=` | `q` trigram on name, exact on id/code. `station=true` lists stations only; `station=<id>` lists that station's platforms. Item: the stop row (`stop_id, stop_code, name, lat, lon, location_type, parent_station, platform_code, description, cluster_id, regional_name, hindi_name, info_json, position_source, provenance, deleted, row_version, updated_at, updated_by`) + `route_count` + `platform_count` (a station's live platforms; 0 for a stop — section 11) |
 | GET | `/feeds/{g}/stops/{stop_id}` | the stop row + `route_count` + `platform_count` + `routes: [{route_id, short_name, long_name, sequence, stop_type, stage_no}]` + `children` (a station's platforms, each with `route_count`) + `nearby` (≤ 60 m, nearest first, each with `distance_m` and `route_count`) + `parent` (the station row, or null) |
-| GET | `/feeds/{g}/routes?q=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows) |
+| GET | `/feeds/{g}/routes?q=&polyline=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows). `polyline=missing` lists the routes with no map line, `polyline=present` the ones with one; anything else is 400 `invalid_polyline_filter` (section 14) |
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
-| POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change |
+| POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved. `POST /change-sets/{id}/routes/{route_id}/polyline` keeps it (section 14) |
 | GET | `/feeds/{g}/stops/{stop_id}/context`, `/feeds/{g}/routes/{route_id}/context` | what is known about a stop or a route for cleanup: detours, coordinate reviews, same-named stops, its audit rows, the open drafts touching it — section 9 |
 | GET | `/feeds/{g}/audit?change_set=&limit=&cursor=` | newest first: `{audit_id, at, actor, actor_email, action, gtfs_id, change_set_id, detail}` |
 
@@ -287,6 +287,7 @@ Settled while implementing:
 | PUT | `/change-sets/{id}/changes/{change_id}` | `{after, base_row_version?}` replaces a change's `after` → the set |
 | DELETE | `/change-sets/{id}/changes/{change_id}` | → the set |
 | GET | `/change-sets/{id}/preview/routes/{route_id}` | the route detail (same shape as above) with the draft applied, plus `validation` and `conflicts` |
+| POST | `/change-sets/{id}/routes/{route_id}/polyline` | `{encoded_polyline\|points\|from_osrm, polyline_source?, replace?}` → 201 the set + `change_id` + `polyline`: the operator's map line kept as a `route/update` (section 14) |
 | POST | `/change-sets/{id}/submit` | draft → submitted; 400 `validation_failed` with errors, 409 `change_set_conflicts` |
 | POST | `/change-sets/{id}/reopen` | submitted/rejected/approved → draft; its creator, its submitter, or an admin. Clears `self_approved` |
 | POST | `/change-sets/{id}/approve` | `{comment?, self_approve?: bool}` submitted → approved; approver+, 403 `own_change_set` for the submitter (`details.can_self_approve`) — **unless** the submitter is an admin and sends `self_approve: true` (section 2), which approves it, marks it `self_approved` and audits `change_set_self_approved` |
@@ -322,7 +323,7 @@ a snapshot in read shape: the stop or route row; for a station, the row plus
 | `stop` / `update` | any of `name, lat, lon, platform_code, description, cluster_id, regional_name, hindi_name` | lat/lon together and in range; a move > 500 m is a **warning**; `platform_code` ≤ 120 and `description` ≤ 500 characters (section 11) |
 | `stop` / `create` | `{stop_id, name, lat, lon, stop_code?, platform_code?, description?, cluster_id?, regional_name?, hindi_name?}` | `entity_key` = `stop_id`; id unused; ids are 1–64 of `A–Z a–z 0–9 _ - .` (no `:` — GIMS splits ids on it) |
 | `stop` / `delete` | `null` | error if any route row still uses it |
-| `route` / `update` | any of `short_name, long_name, color, text_color, encoded_polyline, polyline_source` | colour `#RRGGBB`; polyline decodes to ≥ 2 points |
+| `route` / `update` | any of `short_name, long_name, color, text_color, encoded_polyline, polyline_source` | colour `#RRGGBB`; the polyline decodes to ≥ 2 points, every one of them inside the area these buses run in (`polyline_outside_area`); `polyline_source` is `osrm`, `manual`, `upload` or `imported` — section 14 |
 | `route_stops` / `replace` | `{rows: [...], base_rows_hash}` — the whole ordered list | see below |
 | `station` / `create` | `{station_id, name, lat, lon, description?, member_stop_ids: [...]}` | `entity_key` = `station_id`; at least two members (`too_few_members`, refused when added: 400 `invalid_change`); members exist, are location_type 0, have no other parent |
 | `station` / `update` | `{name?, lat?, lon?, description?, member_stop_ids?}` | same; members, when sent, are at least two (to ungroup a station, delete it); a station has no `platform_code` of its own |
@@ -558,6 +559,7 @@ guess.
 | `routes` | `{route_id, short_name, long_name?, color?}` | one `route/create` per row |
 | `route_stops` | `{route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`) |
 | `stop_updates` | `{stop_id, platform_code?, description?, name?}` | one `stop/update` per row (a station: `station/update`), with exactly the cells given — section 11 |
+| `polylines` | `{route_id, encoded_polyline, polyline_source?, replace?}` | one `route/update` per row carrying the map line — section 14 |
 
 Response (both modes): `{dry_run, summary: {rows, ok, warnings, errors, changes},
 rows: [{row, status: ok|warning|error, messages: [{code, message}], change:
@@ -1522,3 +1524,163 @@ Tests: the window arithmetic, the bounds, the summary and the shape of both
 queries are unit tested in `src/editor/trips.rs` (no database); `dev/ui_smoke.mjs
 --trips` covers the page against `dev/mock_server.py`, which invents a
 deterministic answer per route so all three states are exercised.
+
+## 14. A route's map line (2026-09-19)
+
+The map line is the road path drawn between a route's stops -
+`gtfs_route.encoded_polyline`, a Google encoded polyline at precision 5, with
+`polyline_source` saying where it came from. Both columns have been there since
+`0001_create_gtfs_editor.sql`, and a `route` / `update` change has always been
+able to carry them: the change type, its apply and its `before` snapshot needed
+nothing new. What was missing was the way an operator gets a line **into** a
+draft. `POST /feeds/{g}/routes/{route_id}/polyline:osrm` proposed one through
+the stops and answered `saved: false`; there was no second step.
+
+It matters because almost no route has one: of chennai_bus's 5,567 live routes,
+**10** carry a line (all of them `polyline_source = 'imported'`, written by
+nandi's loader) and 5,557 do not. Adding a line to a route that has none is
+therefore the ordinary case, and the one the API and the dashboard make easy.
+
+### 14.1 Keeping a line in a draft
+
+`POST /change-sets/{id}/routes/{route_id}/polyline` (editor+, draft only) takes
+**exactly one** of:
+
+| field | the line is |
+|---|---|
+| `encoded_polyline` | the encoded string, as the operator has it; `polyline_source` defaults to `manual` |
+| `points` | `[[lat, lon], …]` or `[{"lat": …, "lon": …}, …]`, which the server encodes; `manual` |
+| `from_osrm: true` | routed now, through the route's stops **as this draft leaves them** — the proposal endpoint's line, kept; `osrm` |
+
+plus `polyline_source` to override the default and `replace` (below). It answers
+201 with the change set detail, `change_id`, and
+
+```json
+{"polyline": {"route_id": "…", "encoded_polyline": "…", "polyline_source": "manual",
+              "points": 644, "length_m": 21730, "stop_chain_m": 17190,
+              "replaced": false, "warnings": [{"level", "code", "message"}]}}
+```
+
+The change itself goes through `add_change_to`, so what lands in the draft is
+exactly the `route` / `update` that `POST /change-sets/{id}/changes` would have
+stored — `before` (the route row, the old line in it), `base_row_version` and the
+`change_added` audit row included. Nothing writes `gtfs_route`: the line is live
+when someone else approves the draft and it is committed, like everything else
+in this document.
+
+### 14.2 What a line has to be
+
+`check_polyline` is the one rule, and every path runs it — this endpoint, a
+`route` / `update` added by hand, and every row of an upload:
+
+- it decodes, to **at least two** points (`invalid_polyline`);
+- **every** point is inside the area these buses run in
+  (`polyline_outside_area`, and the message names the first point that is not).
+  The area is `validation::OPERATING_AREA`, 8–14 N and 76–81 E: nandi's
+  `OPERATING_BBOX` (`scripts/chennai-bus/src/cleanup/common.py`), wide enough for
+  the long-distance routes that leave Chennai. The ten lines chennai_bus carries
+  today sit inside 12.82–13.19 N, 80.07–80.31 E. **It is one box for every feed**,
+  so a second city's line would be refused; that constant is where to make it per
+  feed.
+- `polyline_source` is `osrm`, `manual`, `upload` or `imported`. `upload` is new
+  (`0013_polyline_source_upload.sql` widens the column's CHECK); `imported` stays
+  for the lines the nightly build wrote, which nothing here rewrites.
+
+Then the line is measured against the route's own stops — the straight line
+through the same points a map line should pass through (`polyline_waypoints`:
+every boarded stop and every ROUTE CORRECTION marker, the draft applied). A road
+line is always longer than that and rarely more than half as long again
+(1.09–1.84 over chennai_bus's ten). Outside 0.75× to 3.0× the row or the response
+carries **`polyline_length_unlikely`**, with both lengths and the ratio in the
+message. It is a **warning**: it never blocks the draft, the submit or the
+commit. A route with fewer than two measurable stops is not warned about at all.
+
+### 14.3 Replacing one is always asked for
+
+A line over a line is never silent.
+
+- The route's line "now" is the live one **with the draft applied**: a line an
+  earlier change in the same draft gives the route counts, so a second line in one
+  draft is a replacement too.
+- The same line again is 400 `polyline_unchanged` — nothing to do.
+- A different line over one that is there is **409 `polyline_exists`** unless the
+  request says `replace: true`. `details` says what would go:
+  `{route_id, polyline_source, points, length_m, in_draft}`, `in_draft` the change
+  id when the line being covered is one the draft added.
+- On a replacement the change's `before` carries the old `encoded_polyline` and
+  `polyline_source`, so the draft's diff — and whoever approves it — sees exactly
+  what was thrown away. The response's `polyline.replaced` is `true`.
+
+### 14.4 Bulk kind `polylines`
+
+`POST /change-sets/{id}/bulk` with `kind: "polylines"` (section 5: the same cap
+of 5,000 rows, the same response, the same `dry_run` semantics, one transaction,
+one `bulk_imported` audit row). A row is
+
+```json
+{"route_id": "5176", "encoded_polyline": "gfinA{{lhN…", "polyline_source": "upload", "replace": "yes"}
+```
+
+`route_id` and `encoded_polyline` are required. `polyline_source` defaults to
+**`upload`** — a file of lines is a file of lines, whoever drew them. `replace`
+is a yes/no cell (`yes`, `y`, `true`, `1` and their opposites; blank is no).
+There is **no points form here**: one route's points do not fit a CSV cell, so
+points are the single-route endpoint's business.
+
+Row findings (`messages[].code`), errors unless said:
+
+| code | when |
+|---|---|
+| `invalid_row` | not an object; a column that is not one of the four; a cell that is not text; a `replace` that is not yes or no; `route_id` or `encoded_polyline` missing or blank |
+| `duplicate_in_upload` | the same `route_id` on more than one row (on every row involved) |
+| `route_not_found` | no such route, live or created earlier in the draft |
+| `route_deleted` | the route is deleted, or deleted earlier in the draft |
+| `invalid_polyline`, `polyline_outside_area`, `invalid_payload` | the single change's shape check — 14.2 |
+| `polyline_exists` | the route already has a map line (the draft applied) and the row does not say `replace` |
+| `unchanged` (**warning**) | the route already has exactly this line. The row becomes **no change**: `change` is `null`, and `summary.unchanged` counts it |
+| `route_already_in_draft` (**warning**) | the draft already has a `route/update` of that route; the row is still a change, applied after it |
+| `polyline_length_unlikely` (**warning**) | the length band of 14.2 |
+
+Settled while implementing:
+
+- **Re-running an upload is idempotent**, as `stop_updates` is: once its changes
+  are in the draft the same rows are all `unchanged`, and a real run with nothing
+  to add writes nothing — no change, no `updated_at`, no audit row — and still
+  answers 200 with `summary.changes: 0` and the set as `change_set`.
+  `summary.unchanged` is in a `stop_updates` and a `polylines` response only.
+- Every row that names a known route also carries `polyline: {points, length_m,
+  stop_chain_m, had_polyline, polyline_source}` — the line measured, and whether
+  it goes over one — so the preview can show what a row does without showing the
+  thousands of characters the line actually is.
+- **Cost.** The file is validated once, not per row: one read of the routes it
+  names, one read of the draft, one `load_routes_rows` and one stop query for
+  every route's stop chain (`service::stop_chain_lengths`, O(file + draft)), and
+  one `INSERT … SELECT FROM UNNEST`.
+- A row for a route created earlier in the same draft works: no
+  `base_row_version`, and `before` is the create's `after` (section 5's rule).
+
+### 14.5 Dashboard
+
+1. **Route page**: the "Map line" fact says how long the line runs and over how
+   many points, and which source it came from, with the live one beside a drafted
+   one as every other field does. A route with none says so in amber, and says
+   how to give it one. The search list marks a route with no map line.
+2. **Route editor** ("Edit name, colour and map line"): what the route has now,
+   **Suggest a map line** (the road router, as before) and **Paste a map line** —
+   an encoded line, or lat,lon points one per line, which go to the endpoint as
+   `points`. The new line is drawn dashed in teal over the route. If the route
+   already has one, a tick — "Replace the saved map line" — has to be ticked
+   before the form will send, and the name/colour change and the line go in as two
+   changes, the line through its own endpoint so its checks and its warning apply.
+3. **Import**: a fifth kind, "Route map lines" — template `polylines-template.csv`
+   (`route_id, encoded_polyline, polyline_source, replace`), parsed in the browser
+   (a cell that is not an encoded line of two points is caught before the server
+   is asked), previewed with `dry_run: true` in the same table with a "The line"
+   column (how long, how many points, and what it replaces), "N unchanged, not
+   added" among the counts, then "Add N changes to draft".
+
+Tests: `tests/editor_route_polyline_flow.rs` (registered in
+`scripts/editor_flow_test.sh`); the pure rules in `src/editor/validation.rs` and
+`src/editor/draft.rs`'s own unit tests; `dev/ui_smoke.mjs` `polylineFlows` (`node
+dev/ui_smoke.mjs --polyline` runs only these) against `dev/mock_server.py`
+(`seed_polyline`, `bulk_polylines`, `route_polyline`).

@@ -60,7 +60,10 @@ COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 PLATFORM_MAX = 120
 DESCRIPTION_MAX = 500
 BULK_MAX_ROWS = 5000
-BULK_KINDS = ("stops", "routes", "route_stops", "stop_updates")
+BULK_KINDS = ("stops", "routes", "route_stops", "stop_updates", "polylines")
+# the box the server checks every map line against (docs section 14)
+OPERATING_AREA = (8.0, 14.0, 76.0, 81.0)
+POLYLINE_SOURCES = ("osrm", "manual", "upload", "imported")
 PROPOSAL_STATUSES = ("pending", "approved", "rejected", "committed", "superseded")
 PROPOSAL_MOVE_M = 100
 REVIEW_STATUSES = ("pending", "approved", "committed", "confirmed", "superseded")
@@ -1145,7 +1148,8 @@ class Handler(BaseHTTPRequestHandler):
             secret = (u or {}).get("totp_secret") or (u or {}).get("pending_secret")
             return self._send(200, {"email": email, "users": [user_out(x) for x in s.users.values()],
                                     "current_code": totp(secret) if secret else None,
-                                    "round5": getattr(s, "round5", None)})
+                                    "round5": getattr(s, "round5", None),
+                                    "polyline": getattr(s, "polyline", None)})
         if path == "/__dev/as" and method == "POST":
             email = self._body().get("email") or ""
             return self._send(200, {"ok": True}, [
@@ -1380,6 +1384,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(404, "unknown_route", f"Route {rest[2]} does not exist.")
                 return 200, route_detail(proj, rest[2]) | {"validation": validate_set(s, cs),
                                                            "conflicts": conflicts_for(s, cs)}
+            if len(rest) == 3 and rest[0] == "routes" and rest[2] == "polyline" and method == "POST":
+                return 201, self.route_polyline(u, cs, rest[1], self._body())
             if rest == ["bulk"] and method == "POST":
                 return 200, self.bulk(u, cs, self._body())
             if len(rest) == 1 and method == "POST":
@@ -1525,6 +1531,11 @@ class Handler(BaseHTTPRequestHandler):
     def list_routes(self, g, q):
         s = self.store
         items = [rt for (gg, _), rt in s.routes.items() if gg == g and not rt.get("deleted")]
+        want = (q.get("polyline", [""])[0] or "").strip()
+        if want in ("missing", "present"):
+            items = [rt for rt in items if bool(rt.get("encoded_polyline")) == (want == "present")]
+        elif want:
+            raise ApiError(400, "invalid_polyline_filter", "polyline is missing or present")
         term = (q.get("q", [""])[0] or "").strip().lower()
         if term:
             def rank(rt):
@@ -1843,13 +1854,106 @@ class Handler(BaseHTTPRequestHandler):
             s.rows[(g, rid)] = [dict(r) for r in rows]
             s._index_route((g, rid), old_rows)
 
+    # ---- a route's map line (docs section 14)
+    def route_polyline(self, u, cs, route_id, b):
+        """The operator's line kept as the route/update change it is: the router's
+        proposal, an encoded line, or the points of one, which the server encodes."""
+        s = self.store
+        self.require_draft(u, cs)
+        g = cs["gtfs_id"]
+        given = [k for k in ("encoded_polyline", "points") if b.get(k) is not None]
+        if b.get("from_osrm"):
+            given.append("from_osrm")
+        if len(given) != 1:
+            raise ApiError(400, "invalid_change", "send exactly one of encoded_polyline, points or from_osrm",
+                           {"code": "invalid_payload"})
+        proj = Projection(s, g, cs["changes"])
+        rt = proj.route(route_id)
+        if not rt:
+            raise ApiError(404, "route_not_found", f"no route {route_id}")
+        if rt.get("deleted"):
+            raise ApiError(400, "route_deleted", f"route {route_id} is deleted")
+        source = "manual"
+        if b.get("encoded_polyline") is not None:
+            line = str(b["encoded_polyline"]).strip()
+        elif b.get("points") is not None:
+            pts = b["points"]
+            if not isinstance(pts, list):
+                raise ApiError(400, "invalid_change", f"route/update: {route_id}: points is a list of [lat, lon] pairs",
+                               {"code": "invalid_points"})
+            read = []
+            for n, pt in enumerate(pts, 1):
+                pair = pt if isinstance(pt, list) else [pt.get("lat"), pt.get("lon")] if isinstance(pt, dict) else []
+                if len(pair) != 2 or not all(isinstance(x, (int, float)) for x in pair):
+                    raise ApiError(400, "invalid_change",
+                                   f"route/update: {route_id}: point {n} is not a [lat, lon] pair in range",
+                                   {"code": "invalid_points"})
+                read.append((pair[0], pair[1]))
+            line = polyline_encode(read)
+        else:
+            d = route_detail(proj, route_id)
+            stops = [(r["lat"], r["lon"]) for r in d["rows"]
+                     if r["stop_type"] not in SERVED_EXCLUDE and r["lat"] is not None]
+            line, source = polyline_encode(stops), "osrm"
+        source = str(b.get("polyline_source") or source)
+        if source not in POLYLINE_SOURCES:
+            raise ApiError(400, "invalid_change",
+                           f"route/update: {route_id}: polyline_source is one of {', '.join(POLYLINE_SOURCES)}",
+                           {"code": "invalid_payload"})
+        try:
+            pts = polyline_decode(line)
+        except ValueError:
+            pts = []
+        if len(pts) < 2:
+            raise ApiError(400, "invalid_change",
+                           f"route/update: {route_id}: encoded_polyline does not decode to at least two valid points",
+                           {"code": "invalid_polyline"})
+        out = next(((n, pt) for n, pt in enumerate(pts, 1)
+                    if not (OPERATING_AREA[0] <= pt[0] <= OPERATING_AREA[1]
+                            and OPERATING_AREA[2] <= pt[1] <= OPERATING_AREA[3])), None)
+        if out:
+            raise ApiError(400, "invalid_change",
+                           f"route/update: {route_id}: point {out[0]} of the map line is at "
+                           f"{out[1][0]:.5f}, {out[1][1]:.5f}, outside the area these buses run in",
+                           {"code": "polyline_outside_area"})
+        current = (rt.get("encoded_polyline") or "").strip() or None
+        if current == line:
+            raise ApiError(400, "polyline_unchanged", f"route {route_id} already has this map line")
+        if current and not b.get("replace"):
+            had = polyline_decode(current)
+            raise ApiError(409, "polyline_exists",
+                           f"route {route_id} already has a map line; send replace: true to put this one over it",
+                           {"route_id": route_id, "polyline_source": rt.get("polyline_source"), "points": len(had),
+                            "length_m": round(sum(haversine(*a, *b2) for a, b2 in zip(had, had[1:]))),
+                            "in_draft": next((c["change_id"] for c in reversed(cs["changes"])
+                                              if c["entity"] == "route" and c["op"] == "update"
+                                              and c["entity_key"] == route_id), None)})
+        live = s.routes.get((g, route_id)) or {}
+        ch = self.append_change(u, cs, "route", "update", route_id,
+                                {"encoded_polyline": line, "polyline_source": source},
+                                dict(rt), live.get("row_version"))
+        length = sum(haversine(*a, *b2) for a, b2 in zip(pts, pts[1:]))
+        chain_pts = [(r["lat"], r["lon"]) for r in route_detail(proj, route_id)["rows"]
+                     if r["stop_type"] not in SERVED_EXCLUDE and r["lat"] is not None]
+        chain = sum(haversine(*a, *b2) for a, b2 in zip(chain_pts, chain_pts[1:]))
+        warnings = []
+        if chain >= 1 and not 0.75 <= length / chain <= 3.0:
+            warnings.append({"level": "warning", "code": "polyline_length_unlikely",
+                             "message": f"route/update: {route_id}: the map line runs {length / 1000:.1f} km where "
+                                        f"the route's stops are {chain / 1000:.1f} km apart end to end "
+                                        f"({length / chain:.1f}x); check it is this route's line"})
+        return self.set_full(cs) | {"change_id": ch["change_id"], "polyline": {
+            "route_id": route_id, "encoded_polyline": line, "polyline_source": source, "points": len(pts),
+            "length_m": round(length), "stop_chain_m": round(chain), "replaced": bool(current),
+            "warnings": warnings}}
+
     # ---- bulk import (docs section 5)
     def bulk(self, u, cs, b):
         s = self.store
         self.require_draft(u, cs)
         kind, rows, dry = b.get("kind"), b.get("rows"), b.get("dry_run", True)
         if kind not in BULK_KINDS:
-            raise ApiError(400, "bad_kind", "kind must be stops, routes, route_stops or stop_updates.")
+            raise ApiError(400, "bad_kind", "kind must be stops, routes, route_stops, stop_updates or polylines.")
         if not isinstance(rows, list) or not rows:
             raise ApiError(400, "no_rows", "The file has no rows to import.")
         if len(rows) > BULK_MAX_ROWS:
@@ -1869,14 +1973,14 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(r, dict):
                 msg(i, "bad_row", "This row is not a set of named columns.")
         changes = {"stops": self.bulk_stops, "routes": self.bulk_routes, "route_stops": self.bulk_route_stops,
-                   "stop_updates": self.bulk_stop_updates}[kind](g, proj, rows, msg, results)
+                   "stop_updates": self.bulk_stop_updates, "polylines": self.bulk_polylines}[kind](g, proj, rows, msg, results)
         for r in results:
             levels = {m["level"] for m in r["messages"]}
             r["status"] = "error" if "error" in levels else "warning" if "warning" in levels else "ok"
         summary = {"rows": len(rows), "ok": sum(r["status"] == "ok" for r in results),
                    "warnings": sum(r["status"] == "warning" for r in results),
                    "errors": sum(r["status"] == "error" for r in results), "changes": len(changes)}
-        if kind == "stop_updates":
+        if kind in ("stop_updates", "polylines"):
             summary["unchanged"] = sum(any(m["code"] == "unchanged" for m in r["messages"]) for r in results)
         preview = [{"entity": c["entity"], "op": c["op"], "entity_key": c["entity_key"], "after": c["after"]}
                    for c in changes]
@@ -1899,7 +2003,10 @@ class Handler(BaseHTTPRequestHandler):
             if c["entity"] == "route_stops":
                 before = route_detail(running, c["entity_key"])["rows"]
             base = None
-            if c["op"] == "update":
+            if c["entity"] == "route" and c["op"] == "update":
+                before = dict(running.route(c["entity_key"]) or {})
+                base = (s.routes.get((g, c["entity_key"])) or {}).get("row_version")
+            elif c["op"] == "update":
                 # a stop's details: the row as it is now, and the live version it is based on
                 now_row = running.stop(c["entity_key"]) or {}
                 before = {k: now_row.get(k) for k in ("stop_id", "name", "lat", "lon", "platform_code", "description",
@@ -2040,6 +2147,90 @@ class Handler(BaseHTTPRequestHandler):
                                                 "this one applies after it", "warning")
             changes.append({"entity": entity, "op": "update", "entity_key": sid, "after": given, "_rows": [i]})
             results[i]["change"] = {"entity": entity, "op": "update", "entity_key": sid}
+        return changes
+
+    def bulk_polylines(self, g, proj, rows, msg, results):
+        """{route_id, encoded_polyline, polyline_source?, replace?}: one route/update per
+        row carrying the map line and where it came from (docs section 14)."""
+        cols = ("route_id", "encoded_polyline", "polyline_source", "replace")
+        at, changes = {}, []
+        for i, r in enumerate(rows):
+            if isinstance(r, dict) and str(r.get("route_id") or "").strip():
+                at.setdefault(str(r["route_id"]).strip(), []).append(i + 1)
+        updated = {c["entity_key"]: c["change_id"] for c in proj.changes
+                   if c["entity"] == "route" and c["op"] == "update"}
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                continue
+            bad = [k for k in r if k not in cols]
+            if bad:
+                msg(i, "invalid_row", f"{bad[0]!r} is not a column of a polylines row "
+                                      f"(columns: {', '.join(cols)})")
+                continue
+            rid = str(r.get("route_id") or "").strip()
+            if not rid:
+                msg(i, "invalid_row", "route_id is required")
+                continue
+            line = str(r.get("encoded_polyline") or "").strip()
+            if not line:
+                msg(i, "invalid_row", f"the row for route {rid} gives no encoded_polyline")
+                continue
+            replace = str(r.get("replace") or "").strip().lower() in ("yes", "y", "true", "1")
+            source = str(r.get("polyline_source") or "").strip().lower() or "upload"
+            if len(at[rid]) > 1:
+                msg(i, "duplicate_in_upload", f"route_id {rid} is on rows {', '.join(map(str, at[rid]))} of this upload")
+            rt = proj.route(rid)
+            if not rt:
+                msg(i, "route_not_found", f"no route {rid}")
+                continue
+            if rt.get("deleted"):
+                msg(i, "route_deleted", f"route {rid} is deleted")
+                continue
+            if source not in POLYLINE_SOURCES:
+                msg(i, "invalid_payload", f"route/update: polyline_source is one of {', '.join(POLYLINE_SOURCES)}")
+            try:
+                pts = polyline_decode(line)
+            except ValueError:
+                pts = []
+            if len(pts) < 2:
+                msg(i, "invalid_polyline",
+                    f"route/update: {rid}: encoded_polyline does not decode to at least two valid points")
+            else:
+                out = next(((n, p) for n, p in enumerate(pts, 1)
+                            if not (OPERATING_AREA[0] <= p[0] <= OPERATING_AREA[1]
+                                    and OPERATING_AREA[2] <= p[1] <= OPERATING_AREA[3])), None)
+                if out:
+                    msg(i, "polyline_outside_area",
+                        f"route/update: {rid}: point {out[0]} of the map line is at "
+                        f"{out[1][0]:.5f}, {out[1][1]:.5f}, outside the area these buses run in")
+            if results[i]["messages"]:
+                continue
+            current = (rt.get("encoded_polyline") or "").strip() or None
+            if current == line:
+                msg(i, "unchanged", f"route {rid} already has this map line; this row changes nothing", "warning")
+                continue
+            if current and not replace:
+                msg(i, "polyline_exists", f"route {rid} already has a map line; put yes in the replace "
+                                          "column to put this one over it")
+                continue
+            if rid in updated:
+                msg(i, "route_already_in_draft", f"change {updated[rid]} in this draft already updates route "
+                                                 f"{rid}; this one applies after it", "warning")
+            length = sum(haversine(*a, *b) for a, b in zip(pts, pts[1:]))
+            chain_pts = [(x["lat"], x["lon"]) for x in route_detail(proj, rid)["rows"]
+                         if x["stop_type"] not in SERVED_EXCLUDE and x["lat"] is not None]
+            chain = sum(haversine(*a, *b) for a, b in zip(chain_pts, chain_pts[1:]))
+            if chain >= 1 and not 0.75 <= length / chain <= 3.0:
+                msg(i, "polyline_length_unlikely",
+                    f"route {rid}: the map line runs {length / 1000:.1f} km where the route's stops are "
+                    f"{chain / 1000:.1f} km apart end to end ({length / chain:.1f}x); check it is this "
+                    "route's line", "warning")
+            results[i]["polyline"] = {"points": len(pts), "length_m": round(length),
+                                      "stop_chain_m": round(chain), "had_polyline": bool(current),
+                                      "polyline_source": rt.get("polyline_source")}
+            changes.append({"entity": "route", "op": "update", "entity_key": rid,
+                            "after": {"encoded_polyline": line, "polyline_source": source}, "_rows": [i]})
+            results[i]["change"] = {"entity": "route", "op": "update", "entity_key": rid}
         return changes
 
     def bulk_routes(self, g, proj, rows, msg, results):
@@ -3227,6 +3418,43 @@ def seed_round5(store):
 # ====================================================================== end of round 5
 
 
+# ====================================================================== route map lines
+#   docs/gtfs-editor.md section 14. The sample carries the feed as it is: ten of
+#   its 5,567 routes have a map line and the rest have none, which is the whole
+#   point of the flow. This only names one of each, with enough stops to measure
+#   a line against, so the smoke test does not have to hunt for them.
+
+def seed_polyline(store):
+    g = next(iter(store.feeds), None)
+    served = {}
+    for (gg, rid), rows in store.rows.items():
+        if gg == g:
+            served[rid] = [r for r in rows if r["stop_type"] not in SERVED_EXCLUDE and r.get("stop_id")]
+    def pick(want_line):
+        for rid in sorted(served, key=lambda r: (len(served[r]), r)):
+            rt = store.routes.get((g, rid))
+            if rt and not rt.get("deleted") and bool(rt.get("encoded_polyline")) == want_line and len(served[rid]) >= 4:
+                return rid
+        return None
+    with_line, without = pick(True), pick(False)
+    if not (with_line and without):
+        return
+    rt = store.routes[(g, with_line)]
+    store.polyline = {
+        "with_line": with_line, "without": without,
+        "line": rt["encoded_polyline"], "source": rt.get("polyline_source"),
+        # a two-point line by the route's first stop: far shorter than its stop
+        # chain, so a preview of it carries the length warning
+        "short_line": polyline_encode([(store.stops[(g, served[without][0]["stop_id"])]["lat"],
+                                        store.stops[(g, served[without][0]["stop_id"])]["lon"]),
+                                       (store.stops[(g, served[without][0]["stop_id"])]["lat"] + 0.002,
+                                        store.stops[(g, served[without][0]["stop_id"])]["lon"])]),
+        "no_line_total": sum(1 for (gg, _), r in store.routes.items()
+                             if gg == g and not r.get("deleted") and not r.get("encoded_polyline")),
+    }
+# ====================================================================== end of route map lines
+
+
 # ====================================================================== route trips
 #   docs/gtfs-editor.md section 13. The mock has no operational database, so it
 #   invents a plausible answer per route: most routes ran recently, a few are
@@ -3309,6 +3537,7 @@ def main():
         Handler.store = Store(json.load(fh))
     seed_round4(Handler.store)
     seed_round5(Handler.store)
+    seed_polyline(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
     ThreadingHTTPServer(("127.0.0.1", args.port), TripsHandler).serve_forever()
 
