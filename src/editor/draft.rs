@@ -110,6 +110,11 @@ pub struct DraftView {
     updated_stops: HashMap<String, i64>,
     created_routes: HashMap<String, i64>,
     deleted_routes: HashSet<String>,
+    /// route -> the draft's last `route/update` of it
+    updated_routes: HashMap<String, i64>,
+    /// route -> the map line the draft's last `route/update` leaves on it
+    /// (`None` where that change clears it), for the routes it sets one on
+    polylines: HashMap<String, Option<String>>,
     /// route -> (index of the change, change id, rows as the apply stores them)
     replaces: HashMap<String, (usize, i64, Vec<RouteRow>)>,
     /// (index of the change, from, into), in order
@@ -268,6 +273,16 @@ impl DraftView {
                         .entry(key.to_string())
                         .or_insert(c.change_id);
                 }
+                ("route", "update") => {
+                    v.updated_routes.insert(key.to_string(), c.change_id);
+                    // absent leaves the route's line alone; null clears it
+                    if let Some(line) = a.get("encoded_polyline") {
+                        v.polylines.insert(
+                            key.to_string(),
+                            line.as_str().map(str::trim).map(str::to_string),
+                        );
+                    }
+                }
                 ("route", "delete") => {
                     v.deleted_routes.insert(key.to_string());
                 }
@@ -322,6 +337,20 @@ impl DraftView {
 
     pub fn route_deleted(&self, id: &str) -> bool {
         self.deleted_routes.contains(id)
+    }
+
+    /// The change id of the draft's last `route/update` of a route.
+    pub fn route_updated_by(&self, id: &str) -> Option<i64> {
+        self.updated_routes.get(id).copied()
+    }
+
+    /// The route's map line once the draft applies, given its live one: `None`
+    /// where the draft leaves no line, and the live line where it sets none.
+    pub fn polyline_after<'a>(&'a self, id: &str, live: Option<&'a str>) -> Option<&'a str> {
+        match self.polylines.get(id) {
+            Some(drafted) => drafted.as_deref().filter(|l| !l.is_empty()),
+            None => live.map(str::trim).filter(|l| !l.is_empty()),
+        }
     }
 
     /// The change id of the draft's last stop-list replace of a route.
@@ -581,6 +610,47 @@ mod tests {
         assert_eq!(v.stop_position("A"), Some((13.5, 80.5)));
         assert_eq!(v.stop_position("ed_1"), Some((13.0, 80.0)));
         assert_eq!(v.merge_sources(), vec!["M".to_string()]);
+    }
+
+    #[test]
+    fn a_route_keeps_the_last_map_line_the_draft_gives_it() {
+        let v = DraftView::from_changes(&[
+            ch(1, "route", "update", "R1", json!({"short_name": "1A"})),
+            ch(
+                2,
+                "route",
+                "update",
+                "R2",
+                json!({"encoded_polyline": " abc "}),
+            ),
+            ch(
+                3,
+                "route",
+                "update",
+                "R2",
+                json!({"encoded_polyline": "def"}),
+            ),
+            ch(
+                4,
+                "route",
+                "update",
+                "R3",
+                json!({"encoded_polyline": null}),
+            ),
+        ]);
+        assert_eq!(
+            (v.route_updated_by("R1"), v.route_updated_by("R9")),
+            (Some(1), None)
+        );
+        // a change that says nothing about the line leaves the live one
+        assert_eq!(v.polyline_after("R1", Some("live")), Some("live"));
+        assert_eq!(v.polyline_after("R9", Some("live")), Some("live"));
+        assert_eq!(v.polyline_after("R9", None), None);
+        assert_eq!(v.polyline_after("R2", Some("live")), Some("def"));
+        assert_eq!(v.polyline_after("R2", None), Some("def"));
+        // null clears it, as `route/update` does when it applies
+        assert_eq!(v.polyline_after("R3", Some("live")), None);
+        assert_eq!(v.polyline_after("R1", Some("  ")), None);
     }
 
     #[test]

@@ -1,11 +1,12 @@
-// Bulk import: new stops, new routes, whole route stop lists, or the details of
-// existing stops (platform label, description, name) from a CSV file.
+// Bulk import: new stops, new routes, whole route stop lists, the details of
+// existing stops (platform label, description, name), or the map lines of
+// existing routes, from a CSV file.
 // The file is read in the browser, checked by the server against the draft
 // without changing anything (dry run), and only then added to the draft in one
 // go. The draft is reviewed and committed like any other.
 import { get, post, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, toast, confirmDialog, fmtCount, plural, STOP_TYPE_LABEL } from "./util.js";
+import { h, clear, toast, confirmDialog, fmtCount, fmtMetres, plural, decodePolyline, STOP_TYPE_LABEL } from "./util.js";
 import { parseCsv, toCsv, CsvError } from "./csv.js";
 import * as map from "./map.js";
 import { requireDraft, refreshDraft, useDraft } from "./drafts.js";
@@ -35,6 +36,34 @@ function whole(name) {
 function stopType(v) {
   const s = v.trim().toUpperCase().replace(/\s+/g, " ");
   if (!STOP_TYPES.includes(s)) throw new Error(`stop_type must be one of ${STOP_TYPES.join(", ")}.`);
+  return s;
+}
+const YES = ["yes", "y", "true", "1"], NO = ["no", "n", "false", "0"];
+function yesNo(v) {
+  const s = v.trim().toLowerCase();
+  if (s === "") return undefined;
+  if (YES.includes(s)) return true;
+  if (NO.includes(s)) return false;
+  throw new Error("replace must be yes or no.");
+}
+// An encoded line is read here only to say how long it is and to draw it; the
+// server is the one that decides whether it may be stored.
+function encodedLine(v) {
+  const s = v.trim();
+  if (s === "") throw new Error("encoded_polyline is empty.");
+  let pts;
+  try {
+    pts = decodePolyline(s);
+  } catch {
+    throw new Error("encoded_polyline is not an encoded polyline. Paste the line exactly as it was given to you.");
+  }
+  if (pts.length < 2) throw new Error(`encoded_polyline has ${pts.length === 1 ? "only one point" : "no points"}; a map line needs at least two.`);
+  return s;
+}
+function polylineSource(v) {
+  const s = v.trim().toLowerCase();
+  if (s === "") return undefined;
+  if (!["osrm", "manual", "upload"].includes(s)) throw new Error("polyline_source must be osrm, manual or upload.");
   return s;
 }
 
@@ -90,6 +119,20 @@ const KINDS = {
     show: ["stop_id", "platform_code", "description", "name"],
     // the server says which stop each row names, and where it is
     now: true,
+  },
+  polylines: {
+    label: "Route map lines",
+    short: "route map lines",
+    what: "Map lines for routes that exist. Each row gives one route the road path drawn between its stops.",
+    columns: [
+      { name: "route_id", required: true, read: text, help: "An existing route, or one new in your draft." },
+      { name: "encoded_polyline", required: true, read: encodedLine, help: "The line as an encoded polyline (Google precision 5). At least two points, all of them in the area these buses run in." },
+      { name: "polyline_source", required: false, read: polylineSource, help: "Where the line came from: osrm, manual or upload. Empty means upload." },
+      { name: "replace", required: false, read: yesNo, help: "yes to put this line over the one the route already has. Empty leaves a route that has a line alone." },
+    ],
+    show: ["route_id", "polyline_source", "replace"],
+    // the server measures each line against the route's stops
+    line: true,
   },
 };
 
@@ -222,7 +265,7 @@ export function showImport(kind) {
     clear(root,
       h("div.title-block",
         h("h1", "Import from a CSV file"),
-        h("p.hint", "Add many new stops or routes, replace route stop lists, or set the platform labels and descriptions of many stops, at once. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
+        h("p.hint", "Add many new stops or routes, replace route stop lists, set the platform labels and descriptions of many stops, or give many routes their map line, at once. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
       view.added ? h("div.notice.ok", { role: "status" },
         h("p", h("strong", view.added.message)),
         h("div.btn-row", h("a.btn.small", { href: `#/drafts/${enc(view.added.draftId)}` }, "Open the draft"))) : null,
@@ -338,7 +381,7 @@ export function showImport(kind) {
     }
     const s = res.summary;
     const spec = KINDS[view.kind];
-    const rows = res.rows.map((r) => ({ i: r.row - 1, status: r.status, messages: (r.messages || []).map((m) => ({ ...m, level: m.level || (r.status === "warning" ? "warning" : "error") })), change: r.change, stop: r.stop || null }));
+    const rows = res.rows.map((r) => ({ i: r.row - 1, status: r.status, messages: (r.messages || []).map((m) => ({ ...m, level: m.level || (r.status === "warning" ? "warning" : "error") })), change: r.change, stop: r.stop || null, polyline: r.polyline || null }));
     const stale = !state.draft || state.draft.change_set_id !== view.resultFor.draftId;
     return [
       h("div.summary-chips", { role: "status" },
@@ -351,7 +394,7 @@ export function showImport(kind) {
       s.errors
         ? h("div.notice.error", h("p", h("strong", `${plural(s.errors, "row")} ${s.errors === 1 ? "has" : "have"} errors.`), " Nothing can be added until they are fixed. Fix the file, then choose it again above."))
         : !s.changes
-          ? h("div.notice", h("p", h("strong", "Nothing to add."), " Every row already says what its stop has, counting what is in your draft."))
+          ? h("div.notice", h("p", h("strong", "Nothing to add."), ` Every row already says what its ${view.kind === "polylines" ? "route" : "stop"} has, counting what is in your draft.`))
           : h("div.notice.ok", h("p", h("strong", "The file can be added."), s.warnings ? ` Please look at the ${plural(s.warnings, "warning")} first.` : "")),
       view.kind === "stops" || spec.now ? h("div.import-map.inset", { role: "img", "aria-label": "Map of the stops in the file, coloured by result" }) : null,
       resultTable(rows, view.resultFor.read),
@@ -387,14 +430,22 @@ export function showImport(kind) {
     };
     const statusLabel = { ok: "OK", warning: "Warning", error: "Error" };
     const statusClass = { ok: "committed", warning: "submitted", error: "rejected" };
+    // the line itself is thousands of characters, so the table shows what it is
+    // instead: how long it runs, and whether it goes over one the route has
+    const lineCell = (line) => (line
+      ? h("td.route-line", fmtMetres(line.length_m),
+          h("span.sub", `${fmtCount(line.points)} points`),
+          line.had_polyline ? h("span.sub.replacing", `replaces the ${line.polyline_source || "saved"} line`) : null)
+      : h("td.empty-cell", ""));
     return h("div.result-block", { id: "import-results" },
       filters,
       filtered.length ? h("div.table-wrap", h("table.result-table",
-        h("thead", h("tr", h("th", { scope: "col" }, "Row"), h("th", { scope: "col" }, "Result"), spec.now ? h("th", { scope: "col" }, "Stop now") : null, spec.show.map((c) => h("th", { scope: "col" }, c)), h("th", { scope: "col" }, "What to fix"))),
+        h("thead", h("tr", h("th", { scope: "col" }, "Row"), h("th", { scope: "col" }, "Result"), spec.now ? h("th", { scope: "col" }, "Stop now") : null, spec.line ? h("th", { scope: "col" }, "The line") : null, spec.show.map((c) => h("th", { scope: "col" }, c)), h("th", { scope: "col" }, "What to fix"))),
         h("tbody", slice.map((r) => h("tr", { id: `import-row-${r.i}`, class: `result-${r.status}` },
           h("td.num", String(read.sheetRows[r.i] ?? r.i + 2)),
           h("td", h("span", { class: `chip ${statusClass[r.status]}` }, statusLabel[r.status])),
           spec.now ? (r.stop ? h("td.stop-now", { title: r.stop.description || null }, r.stop.name, r.stop.platform_code ? h("span.sub", r.stop.platform_code) : null) : h("td.empty-cell", "")) : null,
+          spec.line ? lineCell(r.polyline) : null,
           spec.show.map((c) => cell(read.rows[r.i] || {}, c)),
           h("td.messages", r.messages.length ? h("ul", r.messages.map((m) => h("li", { class: m.level === "warning" ? "warn" : "err" }, m.message))) : ""),
         ))))) : h("p.empty", "No rows to show here."),

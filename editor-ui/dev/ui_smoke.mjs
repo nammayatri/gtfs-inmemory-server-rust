@@ -23,7 +23,9 @@
 // context, candidates and merge on a review, and pending changes shown on the
 // pages they change. Last the round 5 flows (round5Flows; `--round5`): the lines
 // that tie a station to its platforms, a description and a platform label on
-// stops and stations, and importing stop details.
+// stops and stations, and importing stop details. Then the route map line flows
+// (polylineFlows; `--polyline`): which routes have none, pasting a line and its
+// points, the tick before a saved line is covered, and importing a file of lines.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1342,6 +1344,198 @@ if (process.argv.includes("--trips")) {
 }
 // ====================================================================== end of route trips
 
+
+// ====================================================================== route map lines
+// docs/gtfs-editor.md section 14, against the mock's seed_polyline fixtures: a
+// route saying it has no map line and one saying it has, pasting a line and
+// pasting its points, the tick that has to be ticked before a saved line is
+// covered, and the fifth import kind. `node dev/ui_smoke.mjs --polyline` runs
+// only these, as the admin, on a fresh mock.
+async function polylineFlows() {
+  const fx = (await evaluate(`fetch("/__dev/state").then((r) => r.json())`)).polyline;
+  if (!check(!!fx && !!fx.with_line && !!fx.without, "set-up: the mock's route map line fixtures")) return;
+  const missing = await api("feeds/chennai_bus/routes?polyline=missing&limit=5");
+  const present = await api("feeds/chennai_bus/routes?polyline=present&limit=50");
+  check(missing.items.every((r) => r.has_polyline === false) && present.items.every((r) => r.has_polyline === true),
+    "the routes list can be asked for the routes with no map line, and for the ones with one");
+  check(present.items.length >= 1 && !present.items.some((r) => missing.items.some((m) => m.route_id === r.route_id)),
+    `the two lists never overlap (${present.items.length} with a line)`);
+  check(missing.items.every((r) => !("encoded_polyline" in r)), "a list row never carries the line itself");
+
+  if (!(await text("#draft-chip")).includes("No draft open")) {
+    await clickSel("#draft-chip", "the draft chip");
+    await click("Stop using a draft", "dialog");
+  }
+  const made = await apiSend("POST", "feeds/chennai_bus/change-sets", { title: "Smoke: route map lines" });
+  const setId = made.body.change_set_id;
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden`, "the app with a draft to use");
+  await clickSel("#draft-chip", "the draft chip");
+  await click(`Smoke: route map lines`, "dialog");
+  await waitFor(`!document.getElementById("draft-chip").innerText.includes("No draft open")`, "the draft in use");
+
+  // ================================================================ 1. a route with no line says so
+  await go(`#/route/${encodeURIComponent(fx.without)}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "the route page of a route with no map line");
+  check(await has("#panel .facts dd.no-polyline"), "a route with no map line says so, in its own colour");
+  check((await text("#panel .facts")).includes("None yet"), "and says the map only joins the stops until it has one");
+  await shot("pl-01-no-line");
+
+  // ================================================================ 2. pasting a line
+  await click("Edit name, colour and map line");
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "the route details editor");
+  check((await text("#panel")).includes("This route has no map line yet"), "the editor says the route has none");
+  check(!(await evaluate(`!!document.getElementById("route-line-replace")`)), "and offers no replace tick, because there is nothing to replace");
+  await click("Paste a map line");
+  await waitFor(`!!document.getElementById("route-line-paste")`, "the paste box");
+  // the points form: the server encodes them
+  const stops = (await api(`feeds/chennai_bus/routes/${encodeURIComponent(fx.without)}`)).rows
+    .filter((r) => r.lat != null && r.stop_type !== "ROUTE CORRECTION").slice(0, 4);
+  await evaluate(`(() => { const t = document.getElementById("route-line-paste");
+    t.value = ${JSON.stringify(stops.map((r) => `${r.lat},${r.lon}`).join("\n"))};
+    t.dispatchEvent(new Event("input", { bubbles: true })); return true; })()`);
+  await click("Use this line", "dialog");
+  await waitFor(`document.getElementById("panel").innerText.includes("New map line ready")`, "the pasted line, ready");
+  check((await text("#panel")).includes("shown dashed in teal"), "the new line is drawn over the route");
+  await shot("pl-02-pasted");
+  await clickSel(".sticky-actions button[type=submit]", "the form's submit button");
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "back on the route page");
+  const drafted = await api(`change-sets/${setId}`);
+  const change = drafted.changes.find((c) => c.entity_key === fx.without);
+  check(!!change && change.entity === "route" && change.op === "update" && !!change.after.encoded_polyline
+    && change.after.polyline_source === "manual" && !change.before.encoded_polyline,
+    "the draft gained one route/update carrying the line, its before showing there was none");
+  check((await text("#panel .facts")).includes("New in the draft"), "and the route page shows it pending in the draft");
+  check(/over \d+ points/.test(await text("#panel .facts")), "the page says how long the line runs and over how many points");
+
+  // ================================================================ 3. never over a saved line unasked
+  await go(`#/route/${encodeURIComponent(fx.with_line)}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "a route that already has a line");
+  check(!(await has("#panel .facts dd.no-polyline")) && (await text("#panel .facts")).includes(fx.source || "imported"),
+    "it says the line is saved, and where it came from");
+  await click("Edit name, colour and map line");
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "its editor");
+  check((await text("#panel")).includes("has a saved map line"), "the editor says there is one already");
+  await click("Paste a map line");
+  await waitFor(`!!document.getElementById("route-line-paste")`, "the paste box again");
+  await evaluate(`(() => { const t = document.getElementById("route-line-paste");
+    t.value = ${JSON.stringify(fx.short_line)}; t.dispatchEvent(new Event("input", { bubbles: true })); return true; })()`);
+  await click("Use this line", "dialog");
+  await waitFor(`!!document.getElementById("route-line-replace")`, "the replace tick, once there is a line to cover");
+  check((await text("#panel")).includes("throws the saved line away"), "the editor says what replacing costs");
+  await clickSel(".sticky-actions button[type=submit]", "the form's submit button");
+  await waitFor(`document.getElementById("panel").innerText.includes("Tick \u201CReplace")`, "the refusal to replace unasked");
+  check(await has("#route-line-replace"), "the form stays open, nothing added");
+  await shot("pl-03-replace-tick");
+  await clickSel("#route-line-replace", "the replace tick");
+  await clickSel(".sticky-actions button[type=submit]", "the form's submit button again");
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "the replacement, once it is ticked");
+  const after = await api(`change-sets/${setId}`);
+  const replaced = after.changes.find((c) => c.entity_key === fx.with_line);
+  check(!!replaced && replaced.before.encoded_polyline === fx.line && replaced.after.encoded_polyline === fx.short_line,
+    "the change carries the line it replaces, so the draft's diff shows what went");
+
+  // ================================================================ 4. a file of lines
+  await go("#/import");
+  await waitFor(`!!document.getElementById("kind-polylines")`, "the fifth import kind");
+  await clickSel("#kind-polylines", "Route map lines");
+  const free = (await api("feeds/chennai_bus/routes?polyline=missing&limit=6")).items
+    .filter((r) => r.route_id !== fx.without).slice(0, 2);
+  // a route whose saved line this draft has not touched, so a row over it is refused
+  const untouched = present.items.find((r) => r.route_id !== fx.with_line);
+  // a cell that is not an encoded line is caught in the browser, before the server is asked
+  await setFile("not-lines.csv", ["route_id,encoded_polyline,polyline_source,replace",
+    `${free[0].route_id},!!!,,`].join("\n") + "\n");
+  await waitFor(`document.getElementById("page").innerText.includes("cannot be read")`, "the file the browser refuses", 15000);
+  check((await text("#page")).includes("not an encoded polyline"), "the browser says which cell is not a map line");
+  // what only the server can know
+  await setFile("lines.csv", ["route_id,encoded_polyline,polyline_source,replace",
+    `${free[0].route_id},${fx.line},,`,
+    `${untouched.route_id},${fx.short_line},,`,
+    `no_such_route_pl,${fx.line},,`,
+    `${free[0].route_id},${fx.short_line},,`].join("\n") + "\n");
+  await waitFor(`document.getElementById("page").innerText.includes("have errors")`, "the dry run with errors", 15000);
+  const table = await text(".result-table");
+  check(table.includes("no route no_such_route_pl"), "the table says a route is not there");
+  check(table.includes("already has a map line"), "and that a line would go over one, without the replace column");
+  check(table.includes("rows 1, 4"), "and which rows name the same route twice");
+  check(await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`),
+    "adding is off while rows have errors");
+  await shot("pl-04-import-errors");
+  // the fixed file: the two routes the draft already gives these lines to are
+  // unchanged, and the replace is said out loud
+  const drafting = await api(`change-sets/${setId}`);
+  const already = drafting.changes.find((c) => c.entity_key === fx.without).after.encoded_polyline;
+  const fixed = ["route_id,encoded_polyline,polyline_source,replace",
+    `${free[0].route_id},${fx.line},upload,`,
+    `${fx.with_line},${fx.short_line},,yes`,
+    `${fx.without},${already},,yes`].join("\n") + "\n";
+  await setFile("lines-fixed.csv", fixed);
+  await waitFor(`document.getElementById("page").innerText.includes("can be added")`, "the dry run of the fixed file", 15000);
+  const chips = (await text(".summary-chips")).replace(/\n/g, " ");
+  check(chips.includes("3 rows") && chips.includes("0 errors") && chips.includes("2 unchanged, not added") && chips.includes("1 change to add"),
+    `the rows the draft already says are counted apart (${chips})`);
+  const fixedTable = await text(".result-table");
+  check(fixedTable.includes("changes nothing"), "the table says which rows change nothing");
+  check(/\d+ points/.test(fixedTable), "each row says how long its line runs and over how many points, not the line itself");
+  await shot("pl-05-import-lines");
+  await click("Add 1 change to draft");
+  await click("Add 1 to draft", "dialog");
+  await waitFor(`document.getElementById("page").innerText.includes("Added 1 change")`, "the line added to the draft", 15000);
+  const imported = (await api(`change-sets/${setId}`)).changes.find((c) => c.entity_key === free[0].route_id);
+  check(!!imported && imported.after.polyline_source === "upload" && imported.after.encoded_polyline === fx.line,
+    "the imported row became a route/update, its source saying it came from a file");
+  // the same file again adds nothing
+  await clickSel("#kind-polylines", "Route map lines");
+  await setFile("lines-fixed.csv", fixed);
+  await waitFor(`document.getElementById("page").innerText.includes("Nothing to add")`, "the same file again", 15000);
+  check((await text(".summary-chips")).includes("3 unchanged"), "every row is unchanged once the draft applies");
+  check(await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`),
+    "and there is nothing to add");
+
+  // ================================================================ 5. released
+  await apiSend("POST", `change-sets/${setId}/submit`);
+  await apiSend("POST", `change-sets/${setId}/approve`, { self_approve: true });
+  const committed = await apiSend("POST", `change-sets/${setId}/commit`);
+  check(committed.status === 200, `the draft commits (${committed.status})`);
+  const live = await api(`feeds/chennai_bus/routes/${encodeURIComponent(fx.without)}`);
+  check(!!live.encoded_polyline && live.polyline_source === "manual", "the pasted line is live, and says where it came from");
+  const stillMissing = await api(`feeds/chennai_bus/routes?polyline=missing&q=${encodeURIComponent(fx.without)}`);
+  check(!stillMissing.items.some((r) => r.route_id === fx.without), "and the route is no longer among the ones with no map line");
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden`, "the app after the commit");
+  await go(`#/route/${encodeURIComponent(fx.without)}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line")`, "the committed route page");
+  check(!(await has("#panel .facts dd.no-polyline")) && !(await has("#panel .notice.pending")),
+    "the route no longer says it has none, and nothing is pending");
+  await shot("pl-06-committed");
+}
+
+// ---- only route map lines
+if (process.argv.includes("--polyline")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await polylineFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of route map lines
+
 // ---- only round 5
 if (process.argv.includes("--round5")) {
   try {
@@ -2409,6 +2603,9 @@ try {
 
   // ================================================================ delivery (pods, webhooks): see deliveryFlows above
   await deliveryFlows();
+  // ================================================================ route map lines: see polylineFlows above
+  await polylineFlows();
+
   // ================================================================ route trips: see tripsFlows above
   await tripsFlows();
 

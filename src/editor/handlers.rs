@@ -414,6 +414,8 @@ pub async fn stop(
 #[derive(Deserialize)]
 pub struct RoutesQuery {
     q: Option<String>,
+    /// `missing` or `present`: whether the route has a map line (section 14).
+    polyline: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -426,7 +428,23 @@ pub async fn routes(
 ) -> EditorResult<HttpResponse> {
     auth::require(&req, &st, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
-    ok(svc::list_routes(&st, &path, q.q.as_deref(), &page).await?)
+    let polyline = match q
+        .polyline
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some("missing") => Some(false),
+        Some("present") => Some(true),
+        Some(_) => {
+            return Err(EditorError::bad_request(
+                "invalid_polyline_filter",
+                "polyline is missing or present",
+            ))
+        }
+    };
+    ok(svc::list_routes(&st, &path, q.q.as_deref(), polyline, &page).await?)
 }
 
 pub async fn route(
@@ -543,6 +561,20 @@ pub async fn polyline_osrm(
         "distance_m": distance.round(),
         "saved": false,
     }))
+}
+
+/// Keep a map line on a route, as a `route/update` in the draft: the proposal
+/// above, a line the operator has, or the points of one (docs section 14).
+pub async fn route_polyline_set(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+    body: web::Json<svc::PolylineRequest>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let (set_id, route_id) = path.into_inner();
+    let out = svc::set_route_polyline(&st, &ctx, set_id, &route_id, body.into_inner()).await?;
+    Ok(HttpResponse::Created().json(out))
 }
 
 #[derive(Deserialize)]

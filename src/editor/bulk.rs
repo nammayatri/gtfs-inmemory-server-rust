@@ -1,8 +1,9 @@
-//! Bulk import (docs/gtfs-editor.md sections 5 and 11): uploaded rows of stops,
-//! routes or route stop lists become create / replace changes in a draft, and
-//! rows of stop details (platform label, description, name) become updates. A
-//! dry run previews every row; a real run appends all the changes in one
-//! transaction, and only when no row has an error.
+//! Bulk import (docs/gtfs-editor.md sections 5, 11 and 14): uploaded rows of
+//! stops, routes or route stop lists become create / replace changes in a
+//! draft, and rows of stop details (platform label, description, name) or of
+//! route map lines become updates. A dry run previews every row; a real run
+//! appends all the changes in one transaction, and only when no row has an
+//! error.
 //!
 //! Validation is batched. A few queries fetch every id the upload references
 //! and the routes' rows; the draft's own changes are read once
@@ -17,8 +18,9 @@ use super::error::{EditorError, EditorResult};
 use super::feed_lock::{lock_feed_of_set, retry_transient};
 use super::service::{self, rows_hash, ChangeInsert};
 use super::validation::{
-    check_payload, check_route_rows, check_route_rows_labelled, grade_against_live, Finding, Level,
-    RouteRow,
+    check_payload, check_route_rows, check_route_rows_labelled, decode_polyline,
+    grade_against_live, polyline_change, polyline_length_finding, polyline_length_m, Finding,
+    Level, PolylineChange, RouteRow,
 };
 use super::EditorState;
 use serde::Deserialize;
@@ -46,6 +48,7 @@ pub enum Kind {
     Routes,
     RouteStops,
     StopUpdates,
+    Polylines,
 }
 
 impl Kind {
@@ -55,6 +58,7 @@ impl Kind {
             "routes" => Some(Kind::Routes),
             "route_stops" => Some(Kind::RouteStops),
             "stop_updates" => Some(Kind::StopUpdates),
+            "polylines" => Some(Kind::Polylines),
             _ => None,
         }
     }
@@ -65,6 +69,7 @@ impl Kind {
             Kind::Routes => "routes",
             Kind::RouteStops => "route_stops",
             Kind::StopUpdates => "stop_updates",
+            Kind::Polylines => "polylines",
         }
     }
 
@@ -81,7 +86,14 @@ impl Kind {
                 "stage_name",
             ],
             Kind::StopUpdates => &["stop_id", "platform_code", "description", "name"],
+            Kind::Polylines => &["route_id", "encoded_polyline", "polyline_source", "replace"],
         }
+    }
+
+    /// Kinds whose rows can already say what the route or stop says, so their
+    /// summary counts the rows that become no change.
+    fn counts_unchanged(self) -> bool {
+        matches!(self, Kind::StopUpdates | Kind::Polylines)
     }
 }
 
@@ -104,6 +116,9 @@ struct Outcome {
     /// `stop_updates`: the stop the row names as it is now (the draft applied),
     /// so the preview can show what changes, and where, without a read per row.
     stop: Option<Value>,
+    /// `polylines`: the line the row carries, measured, and whether the route
+    /// already has one - what the preview shows instead of the line's characters.
+    polyline: Option<Value>,
 }
 
 struct Plan {
@@ -194,6 +209,28 @@ pub fn cell_i32(m: &Map<String, Value>, key: &str) -> Result<Option<i32>, String
             .and_then(whole)
             .map(Some)
             .ok_or_else(bad),
+        Some(_) => Err(bad()),
+    }
+}
+
+/// Yes/no cell: a JSON bool, or what a person types in a spreadsheet for one.
+/// Blank and absent are both "not said", which every caller reads as no.
+pub fn cell_bool(m: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    let bad = || format!("{key} must be yes or no");
+    match m.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(None),
+            "yes" | "y" | "true" | "1" => Ok(Some(true)),
+            "no" | "n" | "false" | "0" => Ok(Some(false)),
+            _ => Err(bad()),
+        },
+        Some(Value::Number(n)) => match n.as_f64() {
+            Some(x) if x == 1.0 => Ok(Some(true)),
+            Some(x) if x == 0.0 => Ok(Some(false)),
+            _ => Err(bad()),
+        },
         Some(_) => Err(bad()),
     }
 }
@@ -1060,6 +1097,214 @@ async fn plan_stop_updates(
     Ok(plan)
 }
 
+// ---------------------------------------------------------------- route map lines
+
+/// One readable row of a `polylines` upload.
+struct PolylineRow {
+    upload: usize,
+    route_id: String,
+    line: String,
+    source: String,
+    replace: bool,
+}
+
+/// `{route_id, encoded_polyline, polyline_source?, replace?}` rows: one
+/// `route/update` per row carrying the line and where it came from (docs
+/// section 14).
+///
+/// The rules are the single change's, run in memory against one read of the
+/// routes the file names, one read of the draft and one measurement of their
+/// stop chains - never a read per row. Two of them are this kind's own: a row
+/// that says what the route already says becomes **no change**, so re-running a
+/// file adds nothing; and a line over a line the route already has is an error
+/// unless the row asks for it, so a file never quietly throws work away.
+async fn plan_polylines(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    rows: &[Value],
+    draft: &DraftView,
+    with_before: bool,
+) -> EditorResult<Plan> {
+    let mut plan = Plan::new(rows.len());
+    let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut wanted: Vec<PolylineRow> = Vec::new();
+    for (i, v) in rows.iter().enumerate() {
+        let m = match row_object(v, Kind::Polylines) {
+            Ok(m) => m,
+            Err(f) => {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let cells = ["route_id", "encoded_polyline", "polyline_source"].map(|k| cell_text(m, k));
+        let replace = cell_bool(m, "replace");
+        let bad: Vec<String> = cells
+            .iter()
+            .filter_map(|c| c.as_ref().err())
+            .chain(replace.as_ref().err())
+            .cloned()
+            .collect();
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
+        let [route_id, line, source] = cells.map(|c| c.unwrap_or_default());
+        let Some(route_id) = route_id else {
+            plan.rows[i]
+                .findings
+                .push(invalid_row("route_id is required"));
+            continue;
+        };
+        by_id.entry(route_id.clone()).or_default().push(i);
+        let Some(line) = line else {
+            plan.rows[i].findings.push(invalid_row(format!(
+                "the row for route {route_id} gives no encoded_polyline"
+            )));
+            continue;
+        };
+        wanted.push(PolylineRow {
+            upload: i,
+            route_id,
+            line,
+            // a file of lines is a file of lines, whoever drew them
+            source: source.unwrap_or_else(|| "upload".to_string()),
+            replace: replace.unwrap_or_default().unwrap_or(false),
+        });
+    }
+    mark_duplicates(&mut plan, by_id, |id| format!("route_id {id}"));
+
+    let ids: Vec<String> = wanted
+        .iter()
+        .map(|w| w.route_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let live = service::route_rows(conn, g, &ids).await?;
+    // how far apart each route's stops are, so a line can be measured against
+    // the route it claims to be: one pair of queries for the whole file
+    let chains = service::stop_chain_lengths(conn, g, &ids, draft).await?;
+
+    let mut created: Vec<String> = Vec::new();
+    for w in &wanted {
+        let (i, id) = (w.upload, w.route_id.as_str());
+        let row = live.get(id);
+        let in_draft = draft.created_route(id);
+        if row.is_none() && in_draft.is_none() {
+            plan.rows[i].findings.push(Finding::error(
+                "route_not_found",
+                id,
+                format!("no route {id}"),
+            ));
+            continue;
+        }
+        if row.is_some_and(|r| r["deleted"] == json!(true)) {
+            plan.rows[i].findings.push(Finding::error(
+                "route_deleted",
+                id,
+                format!("route {id} is deleted"),
+            ));
+            continue;
+        }
+        if draft.route_deleted(id) {
+            plan.rows[i].findings.push(Finding::error(
+                "route_deleted",
+                id,
+                format!("route {id} is deleted in this draft"),
+            ));
+            continue;
+        }
+        let after = json!({"encoded_polyline": w.line, "polyline_source": w.source});
+        // exactly the single change's shape check: it decodes, it has two
+        // points, every point is somewhere these buses go
+        if let Err(f) = check_payload("route", "update", id, &after) {
+            plan.rows[i].findings.push(f);
+        }
+        if !plan.rows[i].findings.is_empty() {
+            // a duplicate or a line that will not do: an error whatever it says
+            continue;
+        }
+        let current = draft.polyline_after(id, row.and_then(|r| r["encoded_polyline"].as_str()));
+        match polyline_change(current, &w.line) {
+            PolylineChange::Unchanged => {
+                plan.rows[i].findings.push(Finding::warning(
+                    "unchanged",
+                    id,
+                    format!("route {id} already has this map line; this row changes nothing"),
+                ));
+                continue;
+            }
+            PolylineChange::Replaced if !w.replace => {
+                plan.rows[i].findings.push(Finding::error(
+                    "polyline_exists",
+                    id,
+                    format!(
+                        "route {id} already has a map line; put yes in the replace column to \
+                         put this one over it"
+                    ),
+                ));
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(cid) = draft.route_updated_by(id) {
+            plan.rows[i].findings.push(Finding::warning(
+                "route_already_in_draft",
+                id,
+                format!("change {cid} in this draft already updates route {id}; this one applies after it"),
+            ));
+        }
+        // decoded once more than the check strictly needs, to say how long it is
+        let points = decode_polyline(&w.line).unwrap_or_default();
+        let length = polyline_length_m(&points);
+        if let Some(f) = polyline_length_finding(
+            &format!("route {id}"),
+            length,
+            chains.get(id).copied().unwrap_or(0.0),
+        ) {
+            plan.rows[i].findings.push(f);
+        }
+        plan.rows[i].polyline = Some(json!({
+            "points": points.len(),
+            "length_m": length.round(),
+            "stop_chain_m": chains.get(id).copied().unwrap_or(0.0).round(),
+            "had_polyline": current.is_some(),
+            "polyline_source": row.map(|r| r["polyline_source"].clone()).unwrap_or(Value::Null),
+        }));
+        if in_draft.is_some() && row.is_none() {
+            created.push(id.to_string());
+        }
+        plan.changes.push(Planned {
+            entity: "route",
+            op: "update",
+            key: Some(id.to_string()),
+            after,
+            before: Value::Null,
+            base: row
+                .and_then(|r| r["row_version"].as_i64())
+                .map(|v| v as i32),
+        });
+        plan.rows[i].change = Some(plan.changes.len() - 1);
+    }
+
+    if with_before {
+        // `before` as the single change snapshots it: the route row, or the
+        // create's `after` for a route this draft makes
+        let mut drafted = service::routes_created_in_set(conn, change_set_id, &created).await?;
+        for c in plan.changes.iter_mut() {
+            let id = c.key.as_deref().unwrap_or_default();
+            c.before = live
+                .get(id)
+                .cloned()
+                .or_else(|| drafted.remove(id))
+                .unwrap_or(Value::Null);
+        }
+    }
+    Ok(plan)
+}
+
 // ---------------------------------------------------------------- run
 
 fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value {
@@ -1099,6 +1344,9 @@ fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value 
             if let Some(stop) = &o.stop {
                 row["stop"] = stop.clone();
             }
+            if let Some(line) = &o.polyline {
+                row["polyline"] = line.clone();
+            }
             row
         })
         .collect();
@@ -1112,7 +1360,7 @@ fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value 
         })).collect::<Vec<_>>(),
     });
     // only an upload of updates can find a row already true
-    if kind == Kind::StopUpdates {
+    if kind.counts_unchanged() {
         out["summary"]["unchanged"] = json!(unchanged);
     }
     out
@@ -1127,7 +1375,7 @@ pub async fn run(
     let kind = Kind::parse(&req.kind).ok_or_else(|| {
         EditorError::bad_request(
             "invalid_kind",
-            "kind is stops, routes, route_stops or stop_updates",
+            "kind is stops, routes, route_stops, stop_updates or polylines",
         )
     })?;
     if req.rows.is_empty() {
@@ -1178,6 +1426,9 @@ async fn run_once(
         Kind::RouteStops => plan_route_stops(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?,
         Kind::StopUpdates => {
             plan_stop_updates(&mut tx, &g, change_set_id, &req.rows, &draft, !req.dry_run).await?
+        }
+        Kind::Polylines => {
+            plan_polylines(&mut tx, &g, change_set_id, &req.rows, &draft, !req.dry_run).await?
         }
     };
     if req.dry_run {
@@ -1293,6 +1544,39 @@ mod tests {
         )
         .is_ok());
         assert!(row_object(&json!({"stop_id": "S", "lat": 13.0}), Kind::StopUpdates).is_err());
+        assert_eq!(Kind::parse("polylines"), Some(Kind::Polylines));
+        assert!(row_object(
+            &json!({"route_id": "R", "encoded_polyline": "abc", "polyline_source": "upload", "replace": "yes"}),
+            Kind::Polylines
+        )
+        .is_ok());
+        let f = row_object(
+            &json!({"route_id": "R", "points": "13,80"}),
+            Kind::Polylines,
+        )
+        .unwrap_err();
+        assert!(f.message.contains("points"), "{}", f.message);
+        // only these two kinds can find a row that changes nothing
+        assert!(Kind::StopUpdates.counts_unchanged() && Kind::Polylines.counts_unchanged());
+        assert!(!Kind::Stops.counts_unchanged() && !Kind::RouteStops.counts_unchanged());
+    }
+
+    #[test]
+    fn a_replace_cell_is_what_a_person_types_for_yes() {
+        let m = json!({"t": "Yes", "f": " NO ", "b": true, "one": 1, "zero": "0",
+                       "blank": "  ", "null": null, "junk": "maybe", "num": 7})
+        .as_object()
+        .cloned()
+        .unwrap();
+        assert_eq!(cell_bool(&m, "t"), Ok(Some(true)));
+        assert_eq!(cell_bool(&m, "f"), Ok(Some(false)));
+        assert_eq!(cell_bool(&m, "b"), Ok(Some(true)));
+        assert_eq!(cell_bool(&m, "one"), Ok(Some(true)));
+        assert_eq!(cell_bool(&m, "zero"), Ok(Some(false)));
+        assert_eq!(cell_bool(&m, "blank"), Ok(None));
+        assert_eq!(cell_bool(&m, "null"), Ok(None));
+        assert_eq!(cell_bool(&m, "missing"), Ok(None));
+        assert!(cell_bool(&m, "junk").is_err() && cell_bool(&m, "num").is_err());
     }
 
     #[test]

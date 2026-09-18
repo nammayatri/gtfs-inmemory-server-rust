@@ -15,12 +15,15 @@
 //! serialization failure - which is never reported as a change's own finding.
 
 use super::auth::{self, Ctx};
+use super::draft::DraftView;
 use super::error::{EditorError, EditorResult};
 use super::feed_lock::{is_transient, lock_feed, lock_feed_of_set, retry_transient};
 use super::validation::{
-    check_payload, check_route_rows, create_id_field, grade_against_live, grade_repointed,
-    haversine_m, merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level,
-    MemberSpec, RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES, ROUTE_RULE_CODES,
+    check_payload, check_polyline, check_route_rows, create_id_field, encode_polyline,
+    grade_against_live, grade_repointed, haversine_m, merge_effect, mint_stop_id, polyline_change,
+    polyline_length_finding, polyline_length_m, read_points, settle_create_key, station_members,
+    Finding, Level, MemberSpec, PolylineChange, RouteRow, SequencedStop, MERGE_FAR_METRES,
+    MOVE_WARNING_METRES, ROUTE_RULE_CODES,
 };
 use super::EditorState;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -482,10 +485,62 @@ pub async fn route_row(
     Ok(row.as_ref().map(route_json).transpose()?)
 }
 
+/// [`route_row`] for many routes in one query, by route id; routes that do not
+/// exist are absent. What an upload's `before` snapshots, one query for a file.
+pub async fn route_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    route_ids: &[String],
+) -> EditorResult<HashMap<String, Value>> {
+    let mut out = HashMap::new();
+    if route_ids.is_empty() {
+        return Ok(out);
+    }
+    for r in sqlx::query(&format!(
+        "SELECT {ROUTE_COLS} FROM gtfs_route WHERE gtfs_id = $1 AND route_id = ANY($2)"
+    ))
+    .bind(gtfs_id)
+    .bind(route_ids)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        out.insert(r.try_get("route_id")?, route_json(&r)?);
+    }
+    Ok(out)
+}
+
+/// The `after` of each route a draft creates, by route id - the `before` of a
+/// change to a route that has no live row yet (docs section 5).
+pub async fn routes_created_in_set(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    keys: &[String],
+) -> EditorResult<HashMap<String, Value>> {
+    let mut out = HashMap::new();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    for r in sqlx::query(
+        "SELECT entity_key, after::text AS after FROM gtfs_change \
+         WHERE change_set_id = $1 AND op = 'create' AND entity = 'route' \
+           AND entity_key = ANY($2) ORDER BY position DESC",
+    )
+    .bind(change_set_id)
+    .bind(keys)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        // position DESC: the earliest create of an id is the one that stays
+        out.insert(r.try_get("entity_key")?, json_col(&r, "after")?);
+    }
+    Ok(out)
+}
+
 pub async fn list_routes(
     state: &EditorState,
     gtfs_id: &str,
     q: Option<&str>,
+    polyline: Option<bool>,
     page: &Page,
 ) -> EditorResult<Value> {
     let q = q.map(str::trim).filter(|s| !s.is_empty());
@@ -497,6 +552,8 @@ pub async fn list_routes(
          FROM gtfs_route r \
          WHERE r.gtfs_id = $1 AND NOT r.deleted \
            AND ($2::text IS NULL OR r.route_id = $2 OR r.short_name ILIKE $3 OR r.long_name ILIKE $3) \
+           AND ($6::bool IS NULL \
+                OR ($6 = (r.encoded_polyline IS NOT NULL AND r.encoded_polyline <> ''))) \
          ORDER BY (r.route_id = $2 OR lower(r.short_name) = lower($2)) DESC NULLS LAST, \
                   r.short_name, r.route_id \
          LIMIT $4 OFFSET $5"
@@ -506,6 +563,7 @@ pub async fn list_routes(
     .bind(q.map(like_pattern))
     .bind(page.limit + 1)
     .bind(page.offset)
+    .bind(polyline)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -684,6 +742,289 @@ pub fn polyline_waypoints(detail: &Value) -> Vec<(f64, f64)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- route map lines
+
+/// How far a route's stops are apart end to end, following the same points a
+/// map line should pass through ([`polyline_waypoints`]), for many routes in
+/// three queries - never a read per route, so a whole uploaded file costs the
+/// same as one row. The draft is taken as applying, so a route whose stop list
+/// this draft replaces is measured along the list it will have. Routes with
+/// nothing to measure are absent.
+pub async fn stop_chain_lengths(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    route_ids: &[String],
+    draft: &DraftView,
+) -> EditorResult<HashMap<String, f64>> {
+    if route_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let live = load_routes_rows(conn, gtfs_id, route_ids).await?;
+    let drafted: HashMap<&String, Vec<RouteRow>> = route_ids
+        .iter()
+        .map(|id| {
+            let rows = draft.current_rows(id, live.get(id).map(Vec::as_slice).unwrap_or_default());
+            (id, rows)
+        })
+        .collect();
+    let wanted: Vec<String> = drafted
+        .values()
+        .flatten()
+        .filter(|r| !r.is_marker() && r.is_served())
+        .filter_map(|r| r.stop_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut at: HashMap<String, (f64, f64)> = HashMap::with_capacity(wanted.len());
+    if !wanted.is_empty() {
+        for r in sqlx::query(
+            "SELECT stop_id, lat, lon FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
+        )
+        .bind(gtfs_id)
+        .bind(&wanted)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            at.insert(
+                r.try_get("stop_id")?,
+                (r.try_get("lat")?, r.try_get("lon")?),
+            );
+        }
+    }
+    let mut out = HashMap::with_capacity(route_ids.len());
+    for (id, rows) in drafted {
+        let points: Vec<(f64, f64)> = rows
+            .iter()
+            .filter_map(|r| {
+                if r.is_marker() {
+                    return Some((r.marker_lat?, r.marker_lon?));
+                }
+                if !r.is_served() {
+                    return None;
+                }
+                let stop = r.stop_id.as_deref()?;
+                // a stop the draft moves is measured where the draft puts it
+                draft.stop_position(stop).or_else(|| at.get(stop).copied())
+            })
+            .collect();
+        if points.len() >= 2 {
+            out.insert(id.clone(), polyline_length_m(&points));
+        }
+    }
+    Ok(out)
+}
+
+/// A map line an operator wants on a route: an encoded line, the points of one,
+/// or the road router's proposal for it. Exactly one of the three.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolylineRequest {
+    #[serde(default)]
+    pub encoded_polyline: Option<String>,
+    #[serde(default)]
+    pub points: Option<Value>,
+    /// The line [`super::handlers::polyline_osrm`] last proposed, sent back to
+    /// be kept. `polyline_source` then defaults to `osrm`.
+    #[serde(default)]
+    pub from_osrm: bool,
+    #[serde(default)]
+    pub polyline_source: Option<String>,
+    /// Overwriting a line the route already has is asked for, never assumed.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Add the operator's map line to a draft as the `route/update` change it is.
+///
+/// Everything a line has to survive is here, in the order the operator meets
+/// it: the shape (one source, points encoded to the one form the table holds),
+/// [`check_polyline`], then what it would do to the route - and a line over a
+/// line the route already has is refused unless `replace` says so, so the
+/// overwrite is always somebody's decision. The change itself goes through
+/// [`add_change_to`], so what lands in the draft is exactly what `POST
+/// /change-sets/{id}/changes` would have stored, `before` and base version and
+/// audit row included; the diff then shows the line it replaces.
+pub async fn set_route_polyline(
+    state: &EditorState,
+    ctx: &Ctx,
+    change_set_id: Uuid,
+    route_id: &str,
+    req: PolylineRequest,
+) -> EditorResult<Value> {
+    retry_transient(|| set_route_polyline_once(state, ctx, change_set_id, route_id, req.clone()))
+        .await
+}
+
+async fn set_route_polyline_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    change_set_id: Uuid,
+    route_id: &str,
+    req: PolylineRequest,
+) -> EditorResult<Value> {
+    let what = format!("route/update: {route_id}");
+    let bad = |f: Finding| {
+        EditorError::bad_request("invalid_change", f.message.clone())
+            .with_details(json!({"code": f.code}))
+    };
+    let given = [
+        req.encoded_polyline.is_some(),
+        req.points.is_some(),
+        req.from_osrm,
+    ]
+    .iter()
+    .filter(|g| **g)
+    .count();
+    if given != 1 {
+        return Err(EditorError::bad_request(
+            "invalid_change",
+            "send exactly one of encoded_polyline, points or from_osrm",
+        )
+        .with_details(json!({"code": "invalid_payload"})));
+    }
+    // the road router runs before the write transaction, as the proposal
+    // endpoint does: it is a call out to another service, and nothing that slow
+    // belongs under the feed's lock
+    let (line, source) = match (&req.encoded_polyline, &req.points) {
+        (Some(encoded), _) => (encoded.trim().to_string(), "manual"),
+        (_, Some(points)) => (
+            encode_polyline(&read_points(points, &what).map_err(bad)?),
+            "manual",
+        ),
+        // routed through the stops as this draft leaves them, and routed now, so
+        // what is stored is a line for the route the draft describes
+        _ => (
+            osrm_line(state, ctx, change_set_id, route_id).await?,
+            "osrm",
+        ),
+    };
+    let source = req.polyline_source.as_deref().unwrap_or(source).to_string();
+
+    let mut tx = state.pool.begin().await?;
+    lock_feed_of_set(&mut tx, change_set_id).await?;
+    let set = load_set(&mut tx, change_set_id, true).await?;
+    editable(&set)?;
+    let g = set.gtfs_id.clone();
+    let route = route_row(&mut tx, &g, route_id)
+        .await?
+        .ok_or_else(|| EditorError::not_found("route_not_found", format!("no route {route_id}")))?;
+    if route["deleted"] == json!(true) {
+        return Err(EditorError::bad_request(
+            "route_deleted",
+            format!("route {route_id} is deleted"),
+        ));
+    }
+    let draft = DraftView::load(&mut tx, change_set_id).await?;
+    if draft.route_deleted(route_id) {
+        return Err(EditorError::bad_request(
+            "route_deleted",
+            format!("route {route_id} is deleted in this draft"),
+        ));
+    }
+    let points = check_polyline(&line, &what).map_err(bad)?;
+
+    let current = draft.polyline_after(route_id, route["encoded_polyline"].as_str());
+    let outcome = polyline_change(current, &line);
+    if outcome == PolylineChange::Unchanged {
+        return Err(EditorError::bad_request(
+            "polyline_unchanged",
+            format!("route {route_id} already has this map line"),
+        ));
+    }
+    if outcome == PolylineChange::Replaced && !req.replace {
+        let had = decode_current(current);
+        return Err(EditorError::conflict(
+            "polyline_exists",
+            format!(
+                "route {route_id} already has a map line; send replace: true to put this one over it"
+            ),
+        )
+        .with_details(json!({
+            "route_id": route_id,
+            "polyline_source": route["polyline_source"],
+            "points": had.len(),
+            "length_m": polyline_length_m(&had).round(),
+            "in_draft": draft.route_updated_by(route_id),
+        })));
+    }
+
+    let after = json!({"encoded_polyline": line, "polyline_source": source});
+    let change_id = add_change_to(
+        &mut tx,
+        ctx,
+        &set,
+        NewChange {
+            entity: "route".into(),
+            op: "update".into(),
+            entity_key: route_id.to_string(),
+            after,
+            base_row_version: route["row_version"].as_i64().map(|v| v as i32),
+        },
+    )
+    .await?;
+    let chain = stop_chain_lengths(&mut tx, &g, &[route_id.to_string()], &draft)
+        .await?
+        .remove(route_id)
+        .unwrap_or(0.0);
+    tx.commit().await?;
+
+    let length = polyline_length_m(&points);
+    let warnings: Vec<Value> = polyline_length_finding(&what, length, chain)
+        .into_iter()
+        .map(|f| json!({"level": f.level, "code": f.code, "message": f.message}))
+        .collect();
+    let mut detail = set_detail(state, ctx, change_set_id).await?;
+    detail["change_id"] = json!(change_id);
+    detail["polyline"] = json!({
+        "route_id": route_id,
+        "encoded_polyline": line,
+        "polyline_source": source,
+        "points": points.len(),
+        "length_m": length.round(),
+        "stop_chain_m": chain.round(),
+        "replaced": outcome == PolylineChange::Replaced,
+        "warnings": warnings,
+    });
+    Ok(detail)
+}
+
+/// The points of the line a route has now, for saying how long it was in the
+/// refusal to overwrite it. A line already in the table always decodes.
+fn decode_current(current: Option<&str>) -> Vec<(f64, f64)> {
+    current
+        .and_then(super::validation::decode_polyline)
+        .unwrap_or_default()
+}
+
+/// The road router's line through a route's stops, the draft applied - the same
+/// proposal `POST /feeds/{g}/routes/{id}/polyline:osrm` returns.
+pub async fn osrm_line(
+    state: &EditorState,
+    ctx: &Ctx,
+    change_set_id: Uuid,
+    route_id: &str,
+) -> EditorResult<String> {
+    if state.osrm_url.as_deref().unwrap_or("").is_empty() {
+        return Err(EditorError::new(
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+            "osrm_unavailable",
+            "no OSRM server is configured",
+        ));
+    }
+    let detail = preview_route(state, ctx, change_set_id, route_id).await?;
+    let waypoints = polyline_waypoints(&detail);
+    crate::services::operator::osrm_route(state.osrm_url.as_deref(), &waypoints)
+        .await
+        .map(|(line, _)| line)
+        .ok_or_else(|| {
+            EditorError::new(
+                actix_web::http::StatusCode::BAD_GATEWAY,
+                "osrm_failed",
+                "OSRM could not route through these stops",
+            )
+        })
 }
 
 // ---------------------------------------------------------------- change sets

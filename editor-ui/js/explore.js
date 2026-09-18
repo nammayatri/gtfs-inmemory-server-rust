@@ -1,7 +1,7 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, debounce, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
+import { h, clear, debounce, decodePolyline, fmtCoord, fmtCount, fmtMetres, fmtDate, haversine, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
@@ -38,7 +38,8 @@ export function initSearch() {
       ]);
       if (mine !== seq) return;
       items = [
-        ...routes.items.map((r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops`, href: `#/route/${enc(r.route_id)}` })),
+        // most routes have no map line yet, so the search says which
+        ...routes.items.map((r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops${r.has_polyline === false ? ", no map line" : ""}`, href: `#/route/${enc(r.route_id)}` })),
         ...stops.items.map((s) => ({ group: "Stops", key: s.location_type === 1 ? "Station" : "Stop", text: s.name, sub: `${s.stop_id}, ${s.route_count} route${s.route_count === 1 ? "" : "s"}`, href: `#/stop/${enc(s.stop_id)}` })),
       ];
       active = items.length ? 0 : -1;
@@ -247,6 +248,21 @@ export async function showStop(stopId) {
 }
 
 // ------------------------------------------------------------------ route
+// How far a map line runs and how many points it has — what tells someone
+// whether the line on the map is this route's, without reading the line itself.
+function lineSize(encoded) {
+  let pts;
+  try {
+    pts = decodePolyline(encoded);
+  } catch {
+    return "";
+  }
+  if (pts.length < 2) return "";
+  let d = 0;
+  for (let i = 1; i < pts.length; i++) d += haversine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]);
+  return `, ${fmtMetres(d)} over ${fmtCount(pts.length)} points`;
+}
+
 // `preview`: true shows the route with the draft applied, false what is live;
 // left out, the draft is applied whenever it touches the route.
 export async function showRoute(routeId, { preview } = {}) {
@@ -335,10 +351,12 @@ export async function showRoute(routeId, { preview } = {}) {
             : h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: true }) } }, "Show it with my draft"))) : null,
       !created && notInFeed ? h("p.notice", "This route is not in the published GTFS feed yet, so passengers do not see it. It appears in the live apps once the nightly GTFS build gives it trips from the MTC schedule.") : null,
       h("dl.facts",
-        h("dt", "Map line"), h("dd", r.encoded_polyline
+        h("dt", "Map line"), h("dd", { class: r.encoded_polyline ? null : "no-polyline" }, r.encoded_polyline
           ? [drafted && o.changed.has("encoded_polyline") ? h("span.drafted-value", `New in the draft (${r.polyline_source || "source unknown"})`) : `Saved (${r.polyline_source || "source unknown"})`,
-             drafted && o.changed.has("encoded_polyline") ? h("span.live-value", " ", h("span.live-tag", "live: "), live.encoded_polyline ? `saved (${live.polyline_source || "source unknown"}), dashed grey on the map` : "none") : null]
-          : "None yet. The map joins the stops with straight dashed lines."),
+             lineSize(r.encoded_polyline),
+             drafted && o.changed.has("encoded_polyline") ? h("span.live-value", " ", h("span.live-tag", "live: "), live.encoded_polyline ? `saved (${live.polyline_source || "source unknown"})${lineSize(live.encoded_polyline)}, dashed grey on the map` : "none") : null]
+          : ["None yet. The map joins the stops with straight dashed lines.",
+             can("editor") ? h("span.sub", "Add one with “Edit name, colour and map line” below, or import a file of lines.") : null]),
         r.color ? [h("dt", "Colour"), h("dd", h("span", { style: `display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin-right:6px;background:${r.color}` }), field("color"))] : null,
       ),
       // the editors start from the live route and lay the draft's change over it themselves
