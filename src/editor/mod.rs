@@ -21,6 +21,7 @@ pub mod proposals;
 pub mod service;
 pub mod static_ui;
 pub mod validation;
+pub mod webhooks;
 
 use crate::environment::AppConfig;
 use actix_web::{middleware::from_fn, web};
@@ -40,6 +41,10 @@ pub struct EditorState {
     pub session_hours: i64,
     pub ui_dir: PathBuf,
     pub osrm_url: Option<String>,
+    /// Which hosts a webhook may be pointed at, from the deployment's dhall
+    /// config rather than the database: an admin picks the URL, the deployment
+    /// decides the hosts. See `webhooks`.
+    pub webhook_policy: crate::services::webhook::WebhookPolicy,
 }
 
 pub struct EditorSettings {
@@ -50,6 +55,7 @@ pub struct EditorSettings {
     pub session_hours: i64,
     pub ui_dir: PathBuf,
     pub osrm_url: Option<String>,
+    pub webhook_policy: crate::services::webhook::WebhookPolicy,
 }
 
 impl EditorState {
@@ -77,6 +83,7 @@ impl EditorState {
             session_hours: s.session_hours.clamp(1, 24 * 7),
             ui_dir: s.ui_dir,
             osrm_url: s.osrm_url,
+            webhook_policy: s.webhook_policy,
         })
     }
 
@@ -129,6 +136,7 @@ impl EditorState {
                     .unwrap_or_else(|| "./editor-ui".to_string()),
             ),
             osrm_url: config.osrm_url.clone(),
+            webhook_policy: config.webhook_policy(),
         };
         match Self::build(pool, settings) {
             Ok(state) => {
@@ -299,6 +307,23 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 "/position-reviews/{id}/reopen",
                 web::post().to(h::position_review_reopen),
             )
+            // cache state and webhooks
+            .route(
+                "/feeds/{gtfs_id}/cache-state",
+                web::get().to(h::cache_state),
+            )
+            .route("/feeds/{gtfs_id}/webhooks", web::get().to(h::webhook_list))
+            .route(
+                "/feeds/{gtfs_id}/webhooks",
+                web::post().to(h::webhook_create),
+            )
+            .route(
+                "/feeds/{gtfs_id}/webhook-deliveries",
+                web::get().to(h::webhook_deliveries),
+            )
+            .route("/webhooks/{id}", web::patch().to(h::webhook_update))
+            .route("/webhooks/{id}", web::delete().to(h::webhook_delete))
+            .route("/webhooks/{id}/test", web::post().to(h::webhook_test))
             // admin
             .route("/users", web::get().to(h::users))
             .route("/users", web::post().to(h::user_create))
