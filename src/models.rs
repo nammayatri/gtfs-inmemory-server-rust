@@ -760,6 +760,18 @@ pub struct GTFSData {
     /// A preprocessed feed has no entry: it has no merges to know about.
     #[serde(default)]
     pub stop_aliases_by_gtfs: HashMap<String, HashMap<String, String>>,
+    /// Per feed, each **station** stop code (`location_type = 1`) pointing at the
+    /// codes of the platforms beneath it, sorted (docs/gtfs-editor.md section 1,
+    /// "A station code answers everywhere a stop code does"). Rebuilt with the
+    /// feed on every reload, so a station committed in the editor starts
+    /// expanding on the same poll that brings its rows in.
+    ///
+    /// Only a code that is itself a station row is a key, and a platform that
+    /// shares its station's code is not listed under it. A feed with no station
+    /// rows - every preprocessed feed - therefore has **no entry at all**, which
+    /// is what keeps station expansion out of its way.
+    #[serde(default)]
+    pub station_platforms_by_gtfs: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 impl GTFSData {
@@ -837,6 +849,18 @@ impl GTFSData {
                 stats.children_bytes += parent.len() + 24;
                 for child in children {
                     stats.children_bytes += child.len() + 24;
+                }
+            }
+        }
+
+        // Station -> platforms mapping, counted with the children mapping it
+        // sits beside: both are the same shape, one keyed by parent stop, the
+        // other only by a station row.
+        for stations in self.station_platforms_by_gtfs.values() {
+            for (station, platforms) in stations {
+                stats.children_bytes += station.len() + 24;
+                for platform in platforms {
+                    stats.children_bytes += platform.len() + 24;
                 }
             }
         }

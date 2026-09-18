@@ -147,6 +147,103 @@ Forced to a worst case - a copy of those stops with 800 rows merged away in one
 800-long chain - the query is 1.3-1.7 ms, all 800 aliases resolve to the one
 survivor, and the load time does not move.
 
+### A station code answers everywhere a stop code does
+
+A feed's stops are grouped into **stations**: a station row has
+`location_type = 1` and the places a bus actually calls at are its **platforms**,
+each its own stop with `parent_station` set. Callers hold either kind of code -
+an OTP leg, a saved stop, a deep link and a map pin are all just a stop code -
+and cannot be expected to know which kind they have.
+
+GIMS used to answer some endpoints for a station and quietly nothing for others.
+`/route-stop-mapping/{g}/stop/{station}` already fanned out to the platforms, so
+the rider app got the routes; `/cluster/{g}/destinations/{station}` walked from
+the station itself, which no trip calls at, and returned `[]`. The screen showed
+routes with no ETAs and no vehicles, and nothing said why - the code was not
+wrong, it was the wrong *kind* of code for that endpoint.
+
+So the loader also builds a **station map** beside the alias map: station code ->
+its platforms' codes, sorted. Only a code that is itself a `location_type = 1`
+row is a key, and a platform that shares its station's code is not listed under
+it.
+
+**The rule, per endpoint.** This is what every stop-keyed endpoint does with each
+kind of code, on a DB feed that has stations. "unchanged" means byte-identical to
+before this section existed.
+
+| endpoint | platform or plain code | station code, before | station code, now | unknown code |
+| --- | --- | --- | --- | --- |
+| `GET /stop/{g}/{c}` | the stop | the **station row** | unchanged - the station row | 404 |
+| `POST /getAllStopsByIds` | the stops | the station row | unchanged - the station row | omitted |
+| `GET /route-stop-mapping/{g}/stop/{c}` | its own rows | the platforms' rows, in `HashSet` order | the same rows, in sorted platform order, `X-Stop-Expanded` | 404 |
+| `GET …/stop/{c}?direction=` | as above | as above | as above | 404 |
+| `GET …/stop/{c}?allowClusters=true` | one row per route over the stop's cluster | **fell through to the plain fan-out**: no cluster widening, no per-route dedup | one row per route over the union of the platforms' clusters, `X-Stop-Expanded` | 404 |
+| `POST /getAllRouteStopMappingsByStopCodes` | its rows | the platforms' rows | the same, sorted; a station and its own platform in one request still de-duplicate | omitted |
+| `GET /cluster/{g}/destinations/{c}` | destinations downstream of its cluster | **`[]`** | the union over the platforms' clusters, deduplicated per destination cluster, `X-Stop-Expanded` | `[]` |
+| `GET /cluster/{g}/routes/{from}/{to}` | direct routes between the two clusters | **`[]`** | either end widens from its platforms' clusters, `X-Stop-Expanded` | `[]` |
+| `GET /station-children/{g}/{c}` | `[]` | its platforms, in `HashSet` order | its platforms, **sorted** | `[]` |
+| `GET /alternateStops/{g}/{c}` | stops with the same normalised name | same-name stops | unchanged - deliberately | `[]` |
+| `GET /stop-code/{g}/{provider}` | the mapped code | n/a | unchanged | 404 |
+
+Each row a station answers with keeps **its own platform's `stopCode`** - the
+code a bus calls at, which is what an ETA or a GTFS-RT vehicle join is keyed on.
+No response gains a field and no field is renamed. Where a station was expanded
+the response carries `X-Stop-Expanded: <station>=<n platforms>`, in the style of
+`X-Stop-Alias`, and the expansion is logged at info at most once an hour per
+station.
+
+**Left alone, on purpose:**
+
+- `/stop` and `getAllStopsByIds` **must** keep returning the station row.
+  Substituting a platform would silently change what a saved stop or a deep link
+  means, and a caller asking for a station is asking about the place.
+- `/alternateStops` groups by normalised stop *name*, not by geometry or
+  parentage. A station and its platforms share a name, so a station code already
+  lists the platforms and a platform already lists its station; nothing about
+  stations makes that answer better or worse, and widening it would change what a
+  plain code returns too.
+- A **station with no live platforms** is not expanded. Its route-stop mapping
+  still 404s rather than becoming an empty `200`: "nothing is under this station"
+  is not "this station has no service", and turning the first into the second is
+  the failure this section exists to remove.
+- `/stop-code/{g}/{provider}` maps a provider's own code to a GIMS one. Provider
+  mappings name the stops a provider knows, never a station GIMS invented.
+
+**Composing with the merge aliases.** A code is resolved through the alias map
+first and the station map second, and only that order works: an alias always
+names a *live* stop, and only a live stop can be a station. So a retired station
+code expands to the **survivor's** platforms, and a platform merged away under a
+station answers as the platform that survived it - not as the whole station,
+which would widen the answer behind the caller's back. A station whose platform
+was merged away lists only what is live, on the same poll that brings the merge
+in. (The editor refuses `stop/merge` on a station - `stop_is_station`, "only
+stops are merged" - so a retired station code can only come from a row deleted
+with `merged_into` provenance some other way; the alias map is built from those
+rows whatever wrote them.)
+
+**A preprocessed feed has no station map at all.** Its stops carry `stationId`
+(metro platforms point at their station) but no row is `location_type = 1`, so
+nothing is a key and no read on it can expand. Reverting a feed out of DB mode
+drops its entry, exactly as it drops the alias map. The one visible change on a
+preprocessed feed is that `/station-children` is now **sorted**: it was answered
+straight out of a `HashSet`, and Rust seeds its hasher per process, so two pods -
+or the same pod after a restart - already returned the same codes in a different
+order. Verified by running `origin/main` twice against the same data: the two
+processes disagreed on the order for every station asked for.
+
+Cost, measured on a local copy of `chennai_bus` with the station layer applied
+(10,113 served stops, of which 2,258 are station rows standing over 5,433
+platforms), against the same binary without the map: the per-feed rebuild the
+version poll runs is **10,716 ms median without the map and 10,784 ms with it**
+(4 reloads each, 10,407-11,338 against 10,455-11,384) - the ranges overlap and
+the difference is inside the noise of a rebuild that size. The map itself adds
+**264 KB** to the served data (`children_bytes` 355,173 -> 625,435, of ~42 MB
+accounted). Boot is likewise unmoved: the same feed's DB load measured
+1,669-2,019 ms either way over three boots each. `chennai_bus` as it stands has
+no station rows, so its map is empty and none of its numbers move at all. The map
+is built once per feed load and rebuilt on the version poll, like the alias map;
+a request costs one hash lookup.
+
 `/version/{gtfs_id}` for a DB feed is sha256 of the routes hash plus
 `gtfs_feed.version`, so an edit to stops or stop order - invisible to the routes
 hash - still moves it. It therefore differs from the preprocessed value for the
