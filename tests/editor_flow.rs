@@ -174,6 +174,7 @@ async fn editor_end_to_end() {
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
             webhook_policy: Default::default(),
+            ops_pool: None,
         },
     )
     .unwrap();

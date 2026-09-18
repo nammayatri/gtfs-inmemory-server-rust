@@ -3379,6 +3379,76 @@ class WebhookHandler(PolicyHandler):
             raise ApiError(404, "endpoint_not_found", "no such editor endpoint")
         return super()._api(method, path, q)
 
+# ====================================================================== route trips
+#   docs/gtfs-editor.md section 13. The mock has no operational database, so it
+#   invents a plausible answer per route: most routes ran recently, a few are
+#   dormant (last known trip), one has never run. Deterministic per route id so
+#   a smoke test can rely on it.
+
+def _trip_rows(rid, days, limit):
+    seed = int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16)
+    bucket = seed % 10
+    if bucket == 0:
+        return "never", []
+    today = now().date()
+    if bucket == 1:
+        # dormant: nothing in the window, one old trip
+        old = today - timedelta(days=days + 40 + (seed % 60))
+        return "last_known", [{"duty_date": old.isoformat(), "start_time": "06:10",
+                               "end_time": "07:55", "vehicle_no": f"TN01AA{seed % 9000 + 1000}",
+                               "schedule_no": f"ZE-{rid[:4]}-AS-AP",
+                               "schedule_trip_id": str(seed), "trip_type": "regular",
+                               "is_flexi": False}]
+    rows = []
+    for d in range((seed % 5) + 2):
+        day = (today - timedelta(days=d)).isoformat()
+        for k in range((seed % 3) + 1):
+            hh = 6 + k * 4
+            rows.append({"duty_date": day, "start_time": f"{hh:02d}:{(seed % 6) * 10:02d}",
+                         "end_time": f"{hh + 1:02d}:{(seed % 6) * 10:02d}",
+                         "vehicle_no": f"TN01AA{(seed + k) % 9000 + 1000}",
+                         "schedule_no": f"ZE-{rid[:4]}-AS-AP",
+                         "schedule_trip_id": str(seed + k), "trip_type": "regular",
+                         "is_flexi": bool(k % 3 == 2)})
+    rows.sort(key=lambda r: (r["duty_date"], r["start_time"]), reverse=True)
+    return "operated", rows[:limit]
+
+
+def _summarise(rows):
+    per_day, vehicles = {}, set()
+    for r in rows:
+        per_day[r["duty_date"]] = per_day.get(r["duty_date"], 0) + 1
+        if r.get("vehicle_no"):
+            vehicles.add(r["vehicle_no"])
+    busiest = max(per_day.items(), key=lambda kv: (kv[1], kv[0])) if per_day else None
+    return {"trips": len(rows), "days_operated": len(per_day), "vehicles": len(vehicles),
+            "busiest_day": {"duty_date": busiest[0], "trips": busiest[1]} if busiest else None}
+
+
+class TripsHandler(WebhookHandler):
+    def _api(self, method, path, q):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        if len(parts) == 5 and parts[0] == "feeds" and parts[2] == "routes" and parts[4] == "trips":
+            self.session_user()
+            self.require_mutation(method)
+            g, rid, s = parts[1], parts[3], self.store
+            if g not in s.feeds:
+                raise ApiError(404, "feed_not_found", f"no feed {g}")
+            if (g, rid) not in s.routes:
+                raise ApiError(404, "route_not_found", f"no route {rid}")
+            days = max(1, min(180, int(q.get("days", ["45"])[0])))
+            limit = max(1, min(500, int(q.get("limit", ["50"])[0])))
+            source, rows = _trip_rows(rid, days, limit)
+            window = (now().date() - timedelta(days=days)).isoformat()
+            if source == "operated":
+                return 200, {"route_id": rid, "days": days, "window_from": window,
+                             "source": source, "trips": rows, "summary": _summarise(rows),
+                             "last_trip": rows[0]}
+            return 200, {"route_id": rid, "days": days, "window_from": window,
+                         "source": source, "trips": [], "summary": _summarise([]),
+                         "last_trip": rows[0] if rows else None}
+        return super()._api(method, path, q)
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3393,7 +3463,7 @@ def main():
     seed_round5(Handler.store)
     seed_webhooks(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), WebhookHandler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), TripsHandler).serve_forever()
 
 
 if __name__ == "__main__":

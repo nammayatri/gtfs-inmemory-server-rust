@@ -207,6 +207,7 @@ fn state(pool: &PgPool, signer: &TestSigner) -> (EditorState, std::path::PathBuf
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
             webhook_policy: Default::default(),
+            ops_pool: None,
         },
     )
     .unwrap();

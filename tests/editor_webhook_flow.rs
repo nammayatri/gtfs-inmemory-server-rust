@@ -217,6 +217,7 @@ fn state(
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
             webhook_policy: policy,
+            ops_pool: None,
         },
     )
     .unwrap();
