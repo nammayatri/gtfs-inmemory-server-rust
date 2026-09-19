@@ -50,6 +50,14 @@ enum StationOp {
         into: String,
         keep_name_from: bool,
     },
+    /// station/merge: every platform of the station that goes moves onto the
+    /// one that stays, keeping its own label; the station that goes is deleted.
+    /// `keep_name_from`: the kept station takes the other's name.
+    StationMerge {
+        from: String,
+        into: String,
+        keep_name_from: bool,
+    },
     /// A create or update of a stop or station: the texts it sets. A station
     /// never sets a platform label.
     Texts {
@@ -263,6 +271,20 @@ impl DraftView {
                         keep_name_from: a.get("keep_name").and_then(Value::as_str) == Some("from"),
                     });
                 }
+                ("station", "merge") => {
+                    let Some(into) = a.get("into_station_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let into = into.trim().to_string();
+                    v.deleted_stops.insert(key.to_string());
+                    v.merged_away
+                        .insert(key.to_string(), (into.clone(), c.change_id));
+                    v.station_ops.push(StationOp::StationMerge {
+                        from: key.to_string(),
+                        into,
+                        keep_name_from: a.get("keep_name").and_then(Value::as_str) == Some("from"),
+                    });
+                }
                 ("route", "create") => {
                     v.created_routes
                         .entry(key.to_string())
@@ -404,6 +426,16 @@ impl DraftView {
                         *parent = None;
                     }
                 }
+                StationOp::StationMerge { from, into, .. } => {
+                    for parent in p.values_mut() {
+                        if parent.as_deref() == Some(from.as_str()) {
+                            *parent = Some(into.clone());
+                        }
+                    }
+                    if let Some(parent) = p.get_mut(from) {
+                        *parent = None;
+                    }
+                }
                 StationOp::Texts { .. } => {}
             }
         }
@@ -492,6 +524,27 @@ impl DraftView {
                             if gone.platform_code.is_some() {
                                 kept.platform_code = gone.platform_code;
                             }
+                        }
+                    }
+                    if let Some(s) = t.get_mut(from) {
+                        s.parent_station = None;
+                    }
+                }
+                StationOp::StationMerge {
+                    from,
+                    into,
+                    keep_name_from,
+                } => {
+                    if *keep_name_from {
+                        let gone = t.get(from).map(|s| s.name.clone());
+                        if let (Some(name), Some(kept)) = (gone, t.get_mut(into)) {
+                            kept.name = name;
+                        }
+                    }
+                    // the platforms keep their own labels, only the parent moves
+                    for s in t.values_mut() {
+                        if s.parent_station.as_deref() == Some(from.as_str()) {
+                            s.parent_station = Some(into.clone());
                         }
                     }
                     if let Some(s) = t.get_mut(from) {

@@ -13,16 +13,23 @@ const SEARCH_NEAR_DEGREES = 0.045; // about 5 km each way
 const box = (at, d) => [at.lat - d, at.lon - d, at.lat + d, at.lon + d].map((x) => x.toFixed(6)).join(",");
 
 // Returns {el, focus, close}. `near` = {lat, lon, label} ranks and measures
-// results from that place; `exclude` = stop ids not to offer.
-export function stopPicker({ title, near = null, exclude = [], excludeReason = "it cannot be chosen here.", includeDraft = true, suggest = true, onPick, onCancel, mapMessage }) {
+// results from that place; `exclude` = stop ids not to offer. `kind` is what may
+// be chosen: "stop" (the default; a station is refused, as a bus never calls at
+// one) or "station" (only a station, for merging two of them).
+export function stopPicker({ title, near = null, exclude = [], excludeReason = "it cannot be chosen here.", includeDraft = true, suggest = true, kind = "stop", onPick, onCancel, mapMessage }) {
   const id = `picker-${++seq}`;
   const excluded = new Set(exclude);
+  const stations = kind === "station";
+  const wanted = (s) => (stations ? s.location_type === 1 : s.location_type !== 1);
+  const wrongKind = (s) => (stations
+    ? `${s.name} is a stop, not a station. Choose a station.`
+    : `${s.name} is a station. Choose one of its stops.`);
   const input = h("input", {
     type: "search", id: `${id}-q`, autocomplete: "off", spellcheck: "false",
-    placeholder: "Stop name or stop id", "aria-describedby": `${id}-status`, "aria-controls": `${id}-results`,
+    placeholder: stations ? "Station name or station id" : "Stop name or stop id", "aria-describedby": `${id}-status`, "aria-controls": `${id}-results`,
   });
   const status = h("p.hint", { id: `${id}-status`, "aria-live": "polite" });
-  const list = h("ol.picker-results", { id: `${id}-results`, "aria-label": "Stops to choose from" });
+  const list = h("ol.picker-results", { id: `${id}-results`, "aria-label": stations ? "Stations to choose from" : "Stops to choose from" });
   let shown = [];
   let highlight = () => {};
   let closed = false;
@@ -34,8 +41,8 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
     map.cancelPick();
   };
   const pick = (s) => {
-    if (s.location_type === 1) {
-      toast(`${s.name} is a station. Choose one of its stops.`, "error");
+    if (!wanted(s)) {
+      toast(wrongKind(s), "error");
       return;
     }
     close();
@@ -46,7 +53,7 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
     const d = distance(s);
     return [
       s.stop_id,
-      s.draft ? "new in your draft" : plural(s.route_count ?? 0, "route"),
+      s.draft ? "new in your draft" : stations ? plural(s.platform_count ?? 0, "platform") : plural(s.route_count ?? 0, "route"),
       s.platform_code || null,
       s.parent_station ? `in station ${s.parent_station}` : null,
       d !== null ? `${fmtMetres(d)} from ${near.label || "here"}` : null,
@@ -81,13 +88,13 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
   const draftMatches = (q) => {
     if (!includeDraft) return [];
     const term = normName(q);
-    return createdStops().filter((s) => !excluded.has(s.stop_id)
+    return createdStops().filter((s) => wanted(s) && !excluded.has(s.stop_id)
       && (s.stop_id.toLowerCase() === q.toLowerCase() || normName(s.name).includes(term)));
   };
 
   const suggestions = async () => {
     if (!near || !suggest) {
-      render([], "Type at least two letters of the name, or the stop id.");
+      render([], `Type at least two letters of the name, or the ${stations ? "station" : "stop"} id.`);
       return;
     }
     const run = ++mine;
@@ -97,13 +104,15 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
       if (run !== mine) return;
       const drafts = includeDraft ? createdStops() : [];
       const items = [...drafts, ...page.items]
-        .filter((s) => s.location_type !== 1 && !excluded.has(s.stop_id))
+        .filter((s) => wanted(s) && !excluded.has(s.stop_id))
         .map((s) => ({ s, d: distance(s) }))
         .filter((x) => x.d !== null && x.d <= 700)
         .sort((a, b) => a.d - b.d)
         .slice(0, 8)
         .map((x) => x.s);
-      render(items, items.length ? `Closest stops to ${near.label || "here"}. Or search by name or stop id.` : "No stops close by. Search by name or stop id.");
+      render(items, items.length
+        ? `Closest ${stations ? "stations" : "stops"} to ${near.label || "here"}. Or search by name or id.`
+        : `No ${stations ? "stations" : "stops"} close by. Search by name or id.`);
     } catch (e) {
       if (run === mine) status.textContent = e.message;
     }
@@ -125,12 +134,14 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
       const seen = new Set();
       const live = [...(around ? around.items : []), ...page.items]
         .filter((s) => !seen.has(s.stop_id) && seen.add(s.stop_id))
-        .filter((s) => s.location_type !== 1 && !excluded.has(s.stop_id));
+        .filter((s) => wanted(s) && !excluded.has(s.stop_id));
       let items = [...draftMatches(q), ...live];
       // near a place, the closest match is usually the kerb meant
       if (near) items = items.map((s, i) => ({ s, i, d: distance(s) ?? Infinity })).sort((a, b) => a.d - b.d || a.i - b.i).map((x) => x.s);
       items = items.slice(0, 10);
-      render(items, items.length ? `${plural(items.length, "stop")} match “${q}”.` : `No stop matches “${q}”. Try part of the name, or the stop id.`);
+      render(items, items.length
+        ? `${plural(items.length, stations ? "station" : "stop")} match “${q}”.`
+        : `No ${stations ? "station" : "stop"} matches “${q}”. Try part of the name, or the id.`);
     } catch (e) {
       if (run === mine) status.textContent = e.message;
     }
@@ -152,9 +163,9 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
   });
 
   const onMap = () => {
-    map.pickStop(mapMessage || "Click the stop on the map.", (s) => {
-      if (s.location_type === 1 || excluded.has(s.stop_id)) {
-        toast(s.location_type === 1 ? `${s.name} is a station. Click one of its stops.` : `${s.name} (${s.stop_id}): ${excludeReason}`, "error");
+    map.pickStop(mapMessage || `Click the ${stations ? "station" : "stop"} on the map.`, (s) => {
+      if (!wanted(s) || excluded.has(s.stop_id)) {
+        toast(!wanted(s) ? wrongKind(s) : `${s.name} (${s.stop_id}): ${excludeReason}`, "error");
         onMap();
         return;
       }
@@ -164,7 +175,7 @@ export function stopPicker({ title, near = null, exclude = [], excludeReason = "
 
   const el = h("div.picker", { role: "group", "aria-labelledby": `${id}-title` },
     h("p.picker-title", { id: `${id}-title` }, title),
-    h("label.visually-hidden", { for: `${id}-q` }, "Search stops by name or stop id"),
+    h("label.visually-hidden", { for: `${id}-q` }, stations ? "Search stations by name or station id" : "Search stops by name or stop id"),
     h("div.picker-bar", input,
       h("button.btn.secondary.small", { type: "button", on: { click: onMap } }, "Pick on the map"),
       onCancel ? h("button.btn.quiet.small", { type: "button", on: { click: cancel } }, "Cancel") : null),

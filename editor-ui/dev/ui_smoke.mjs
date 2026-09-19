@@ -3,6 +3,7 @@
 //
 //   python dev/mock_server.py &            # port 8765, fresh state for every run
 //   node dev/ui_smoke.mjs [--shots /tmp/gtfs-editor-shots]
+//   node dev/ui_smoke.mjs --station-merge    # only the merge-two-stations screen
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -1286,6 +1287,87 @@ if (process.argv.includes("--delivery")) {
 }
 // ====================================================================== end of delivery
 
+
+// ====================================================================== merging two stations
+// docs section 5, "Merging duplicate stations". The fixture (mock
+// seed_station_merge) is two stations a few hundred metres apart, each over two
+// platforms, named alike but not identically.
+async function stationMergeFlows() {
+  const fx = (await evaluate(`fetch("/__dev/state").then((r) => r.json())`)).station_merge;
+  if (!check(!!fx && !!fx.keep && !!fx.gone, "the mock has a station-merge fixture")) return;
+
+  // ---- the action is on a station, and only on a station
+  await go(`#/stop/${fx.keep}`);
+  await waitFor(`document.body.innerText.includes("Merge into another station")`, "a station offers the merge action");
+  check(!(await text("#panel")).includes("Merge with a duplicate"), "a station is not offered the two-stop merge");
+  await go(`#/stop/${fx.keep_platforms[0]}`);
+  await waitFor(`document.body.innerText.includes("Merge with a duplicate")`, "a platform offers the two-stop merge");
+  check(!(await text("#panel")).includes("Merge into another station"), "a platform is not offered the station merge");
+
+  // ---- choose the other station
+  await go(`#/stop/${fx.keep}`);
+  await waitFor(`document.body.innerText.includes("Merge into another station")`, "back on the station");
+  await click("Merge into another station");
+  await waitFor(`document.getElementById("panel").innerText.includes("Stations close by")`, "the station picker");
+  check((await text("#panel")).includes("Merge two stations only when they are one place entered twice"), "says when two stations should be merged");
+  check((await text("#panel")).includes(fx.gone), "the other station is listed close by");
+  await shot("sm-01-choose");
+
+  // ---- compare
+  await go(`#/station-merge/${fx.keep}?with=${fx.gone}`);
+  await waitFor(`!!document.querySelector("table.compare")`, "the two stations side by side");
+  const compare = await text("#panel");
+  check(compare.includes("Which station id should stay?") && compare.includes("Suggested: has more platforms"), "asks which station id stays and suggests one");
+  check(/\d+ platforms? \(.*routes?\) moves? from \w+ to \w+/.test(compare), "says how many platforms move, and their routes, before adding");
+  check(compare.includes("No route changes"), "says plainly that no route changes");
+  check(compare.includes("Platforms") && compare.includes("Routes through them"), "compares platform and route counts");
+  for (const p of fx.gone_platforms) check(compare.includes(p), `the moving platform ${p} is listed`);
+  await shot("sm-02-compare");
+
+  // ---- the other id may be kept instead
+  const keepOther = await evaluate(`[...document.querySelectorAll('input[name="keep-station-id"]')].find((r) => !r.checked).id`);
+  await clickSel(`#${keepOther}`, "the other station id");
+  check((await text(".sticky-actions")).includes(keepOther.replace("keep-station-", "")), "the add button names the station id that stays");
+  // put it back: the fixture's "gone" station is the one to retire
+  await clickSel(`#keep-station-${fx.keep}`, `keeping ${fx.keep}`);
+
+  // ---- add it to a draft
+  await click("Add merge to draft", ".sticky-actions");
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("Add this station merge")`, "the station merge confirmation");
+  const confirm = await text("dialog");
+  check(confirm.includes(`Station id ${fx.keep} stays`), "the confirm says which id survives");
+  check(/\d+ platforms? moves? to it/.test(confirm), "the confirm says how many platforms move");
+  check(confirm.includes(`Station id ${fx.gone} is removed`), "the confirm says which id is removed");
+  await shot("sm-03-confirm");
+  await click("Add merge to draft", "dialog");
+  await chooseNewDraft("Smoke: station merges");
+  await waitFor(`document.getElementById("panel").innerText.includes("Station merge added to your draft")`, "the station merge in the draft");
+  const added = await text("#panel");
+  for (const p of fx.gone_platforms) check(added.includes(p), `the draft page lists the moved platform ${p}`);
+
+  // ---- it renders in the draft view
+  const smDraft = await activeDraftId();
+  await go(`#/drafts/${smDraft}`);
+  await waitFor(`document.querySelectorAll(".change").length === 1`, "the station merge draft page");
+  const draftText = await text("#page");
+  check(/merged into/.test(draftText) && /platforms? moved/.test(draftText), "the draft shows the station merge and how many platforms move");
+  check(draftText.includes("station merge"), "the draft counts it as a station merge");
+  check(draftText.includes("a route calls at a platform, never at a station"), "the draft says why no route changes");
+  await shot("sm-04-draft");
+
+  // ---- and in the pending overlay, on both stations and on a moving platform
+  await go(`#/stop/${fx.gone}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Pending in draft")`, "the retired station shows the merge as pending");
+  check((await text("#panel")).includes(`merges this station into ${fx.keep}`), "the retired station says where it goes");
+  await go(`#/stop/${fx.keep}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Pending in draft")`, "the surviving station shows the merge as pending");
+  check(/is merged into this station, which takes its \d+ platforms?/.test(await text("#panel")), "the surviving station says what it takes");
+  await go(`#/stop/${fx.gone_platforms[0]}`);
+  await waitFor(`document.getElementById("panel").innerText.includes("Pending in draft")`, "a moving platform shows the merge as pending");
+  check((await text("#panel")).includes(`Moves from station ${fx.gone} to`), "the platform says which station it moves to");
+  await shot("sm-05-pending");
+}
+
 // ---- only round 5
 if (process.argv.includes("--round5")) {
   try {
@@ -1310,6 +1392,31 @@ if (process.argv.includes("--round5")) {
   process.exit(failures.length ? 1 : 0);
 }
 // ====================================================================== end of round 5
+
+// ---- only the station merge
+if (process.argv.includes("--station-merge")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await stationMergeFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of the station merge
 
 // ------------------------------------------------------------------ flows
 try {
@@ -1768,6 +1875,8 @@ try {
       const a = c.after || {};
       if (c.entity === "stop" || c.entity === "station") touched.add(c.entity_key);
       if (a.into_stop_id) touched.add(a.into_stop_id);
+      if (a.into_station_id) touched.add(a.into_station_id);
+      ((c.before || {}).moving_platforms || []).forEach((m) => touched.add(m.stop_id));
       (a.members || []).forEach((m) => touched.add(m.stop_id));
       (a.member_stop_ids || []).forEach((id) => touched.add(id));
       if (c.entity === "route_stops") {
@@ -2353,6 +2462,8 @@ try {
 
   // ================================================================ delivery (pods, webhooks): see deliveryFlows above
   await deliveryFlows();
+  // ================================================================ merging two stations: see stationMergeFlows above
+  await stationMergeFlows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {
