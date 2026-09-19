@@ -1162,6 +1162,18 @@ class Handler(BaseHTTPRequestHandler):
             # round 4 (UX): {"off": true} answers 404 for the context endpoints, as an older server does
             s.context_off = bool(self._body().get("off"))
             return self._send(200, {"off": s.context_off})
+        if path == "/__dev/feed-source" and method == "POST":
+            # The Delivery page only has a live version to talk about when the feed is
+            # served from the DB, and the feed-config flow above deliberately leaves it
+            # on "preprocessed". A flow that needs the other state says so here rather
+            # than depending on the order the flows happen to run in.
+            b = self._body()
+            with LOCK:
+                feed = s.feeds.get(b.get("gtfs_id", ""))
+                if feed is None:
+                    raise ApiError(404, "feed_not_found", "no such feed")
+                feed["data_source"] = b.get("data_source", "db")
+            return self._send(200, {"gtfs_id": b.get("gtfs_id"), "data_source": feed["data_source"]})
         raise ApiError(404, "not_found", "No such dev endpoint.")
 
     # ---- auth
@@ -1783,6 +1795,14 @@ class Handler(BaseHTTPRequestHandler):
                                {"validation": errors})
             self.apply_commit(cs)
             s.feeds[cs["gtfs_id"]]["version"] += 1
+            # Real pods poll gtfs_feed.version and catch up within seconds. The seeded
+            # pods used to keep whatever version they were born with, so every commit
+            # any earlier flow made left the Delivery page permanently "waiting".
+            for pod in getattr(s, "pods", {}).get(cs["gtfs_id"], []):
+                if pod.get("data_source") == "db" and pod.get("failing_version") is None:
+                    pod["loaded_version"] = s.feeds[cs["gtfs_id"]]["version"]
+                    pod["loaded_at"] = iso(now())
+                    pod["up_to_date"] = True
             cs.update(status="committed", committed_by=u["user_id"], committed_at=t,
                       committed_version=s.feeds[cs["gtfs_id"]]["version"])
             for p in s.proposals.values():
@@ -3240,7 +3260,8 @@ WEBHOOK_HOSTS = ["jenkins.mock.invalid", "127.0.0.1"]
 def seed_webhooks(store):
     store.webhooks = {}
     store.deliveries = []
-    # two pods, one a poll behind, so the page has something to show
+    # two pods, both serving what is committed; a commit moves them on (see the
+    # commit path), the way a real pod's version poll does
     g = next(iter(store.feeds))
     v = store.feeds[g]["version"]
     store.pods = {
