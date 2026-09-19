@@ -14,6 +14,7 @@ import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leav
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
 import { showMerge } from "./merge.js";
+import { showStationMerge } from "./station_merge.js";
 import { showImport } from "./importer.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
@@ -186,6 +187,8 @@ function route() {
     editorsOnly(title, () => fn());
   } else if (parts[0] === "merge" && parts[1]) {
     markNav("map"); showWorkspace(true); showMerge(parts[1], params.get("with"));
+  } else if (parts[0] === "station-merge" && parts[1]) {
+    markNav("map"); showWorkspace(true); showStationMerge(parts[1], params.get("with"));
   } else if (parts[0] === "import") {
     markNav("import"); showWorkspace(false); showImport(params.get("kind"));
   } else if (parts[0] === "drafts" && parts[1]) {

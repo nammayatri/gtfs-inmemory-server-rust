@@ -33,6 +33,15 @@ pub const ROUTE_RULE_CODES: [&str; 8] = [
 pub const MOVE_WARNING_METRES: f64 = 500.0;
 /// A merge of stops further apart than this is a warning.
 pub const MERGE_FAR_METRES: f64 = 150.0;
+/// A merge of **stations** further apart than this is a warning. Looser than
+/// [`MERGE_FAR_METRES`] on purpose: that one is about two kerbs, which are the
+/// same place or they are not, while a station point is the centroid of its
+/// platforms. `build_stations` already groups same-named stops within a 500 m
+/// diameter (section 6), so two stations that are really one place have their
+/// points inside that same 500 m - anything wider is a grouping the builder
+/// deliberately did not make. See the doc's "Settled while implementing" note
+/// for the measurement behind the number.
+pub const STATION_MERGE_FAR_METRES: f64 = 500.0;
 /// Longest platform label a stop may carry.
 pub const PLATFORM_CODE_MAX_CHARS: usize = 120;
 /// Longest description a stop or station may carry.
@@ -1060,6 +1069,54 @@ pub fn check_payload(
             })?;
             Ok(())
         }
+        ("station", "merge") => {
+            let m = obj(after, what)?;
+            allow_only(
+                m,
+                &[
+                    "into_station_id",
+                    "into_row_version",
+                    "keep_name",
+                    "keep_position",
+                ],
+                what,
+            )?;
+            let into = req_string(m, "into_station_id", what)?;
+            if into == entity_key.trim() {
+                return Err(Finding::error(
+                    "merge_same_station",
+                    into,
+                    format!("{what}: a station cannot be merged into itself"),
+                ));
+            }
+            match m.get("into_row_version") {
+                None | Some(Value::Null) => {}
+                Some(v)
+                    if v.as_i64()
+                        .is_some_and(|n| (1..=i32::MAX as i64).contains(&n)) => {}
+                _ => {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "into_row_version",
+                        format!("{what}: into_row_version must be a positive whole number"),
+                    ))
+                }
+            }
+            for k in ["keep_name", "keep_position"] {
+                match m.get(k) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(v)) if v == "into" || v == "from" => {}
+                    _ => {
+                        return Err(Finding::error(
+                            "invalid_payload",
+                            k,
+                            format!("{what}: {k} is \"into\" or \"from\""),
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        }
         ("station", "create") | ("station", "update") => {
             let m = obj(after, what)?;
             let create = op == "create";
@@ -1908,6 +1965,44 @@ mod tests {
         ] {
             assert!(merge("A", bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn station_merge_shapes() {
+        let merge = |from: &str, after: Value| check_payload("station", "merge", from, &after);
+        assert!(merge("STN_A", json!({"into_station_id": "STN_B"})).is_ok());
+        assert!(merge(
+            "STN_A",
+            json!({"into_station_id": "STN_B", "into_row_version": 3,
+                   "keep_name": "from", "keep_position": "into"})
+        )
+        .is_ok());
+        assert_eq!(
+            merge("STN_A", json!({"into_station_id": "STN_A"}))
+                .unwrap_err()
+                .code,
+            "merge_same_station"
+        );
+        // a station merge is its own change type: the stop merge's field names
+        // and its prm_ rule are not borrowed
+        assert!(merge("STN_A", json!({"into_stop_id": "STN_B"})).is_err());
+        assert!(merge("prm_A", json!({"into_station_id": "STN_B"})).is_ok());
+        for bad in [
+            json!({}),
+            json!({"into_station_id": ""}),
+            json!({"into_station_id": "STN_B", "keep_name": "both"}),
+            json!({"into_station_id": "STN_B", "keep_position": true}),
+            json!({"into_station_id": "STN_B", "into_row_version": 0}),
+            json!({"into_station_id": "STN_B", "into_row_version": "3"}),
+            json!({"into_station_id": "STN_B", "name": "x"}),
+            json!({"into_station_id": "STN_B", "position_review_id": 7}),
+            json!({"into_station_id": 7}),
+            Value::Null,
+        ] {
+            assert!(merge("STN_A", bad.clone()).is_err(), "{bad}");
+        }
+        // a stop is never merged with the station change type, and the other way
+        assert!(check_payload("stop", "merge", "A", &json!({"into_station_id": "B"})).is_err());
     }
 
     #[test]

@@ -21,6 +21,7 @@ use super::validation::{
     check_payload, check_route_rows, create_id_field, grade_against_live, grade_repointed,
     haversine_m, merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level,
     MemberSpec, RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES, ROUTE_RULE_CODES,
+    STATION_MERGE_FAR_METRES,
 };
 use super::EditorState;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1027,6 +1028,9 @@ pub struct Evaluation {
     /// One entry per stop merge that applied: `{change_id, from, into, routes,
     /// rows, keep_name, keep_position}`; commit audits them.
     pub merges: Vec<Value>,
+    /// One entry per station merge that applied: `{change_id, from, into,
+    /// platforms_moved, keep_name, keep_position}`; commit audits them.
+    pub station_merges: Vec<Value>,
     /// One entry per `feed_config` change that switched the data source:
     /// `{gtfs_id, from, to, change_id}`; commit audits them.
     pub feed_configs: Vec<Value>,
@@ -1118,6 +1122,9 @@ fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: 
     let what = match c.entity.as_str() {
         "route_stops" => format!("The stop list of route {key}"),
         "route" => format!("Route {key}"),
+        "station" if key != c.entity_key => {
+            format!("Station {key} (kept by the merge of {})", c.entity_key)
+        }
         "station" => format!("Station {key}"),
         "feed_config" => format!("The data source of feed {key}"),
         _ if key != c.entity_key => format!("Stop {key} (kept by the merge of {})", c.entity_key),
@@ -1187,12 +1194,19 @@ async fn conflict_for(
             let live = live_row_version(conn, "gtfs_route", "route_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
         }
-        ("stop", "merge") => {
+        // a merge is two rows: the one that goes away and the one that stays,
+        // and either moving on under the editor's feet is a conflict
+        ("stop", "merge") | ("station", "merge") => {
+            let into_field = if c.entity == "station" {
+                "into_station_id"
+            } else {
+                "into_stop_id"
+            };
             if !in_draft(false, key) {
                 let live = live_row_version(conn, "gtfs_stop", "stop_id", g, key).await?;
                 out.extend(version_conflict(c, key, live, c.base_row_version));
             }
-            if let Some(into) = c.after["into_stop_id"].as_str().map(str::trim) {
+            if let Some(into) = c.after[into_field].as_str().map(str::trim) {
                 if !in_draft(false, into) {
                     let base = c.after["into_row_version"].as_i64().map(|v| v as i32);
                     let live = live_row_version(conn, "gtfs_stop", "stop_id", g, into).await?;
@@ -1246,9 +1260,11 @@ async fn conflict_for(
 /// What applying one change needs to know about the rest of the set.
 struct ApplyState<'a> {
     changes: &'a [ChangeRow],
-    /// stop merged away by an applied change -> (the stop kept, that change)
-    merged_away: HashMap<String, (String, i64)>,
+    /// stop or station merged away by an applied change -> (the row kept, that
+    /// change, whether it was a station)
+    merged_away: HashMap<String, (String, i64, bool)>,
     merges: Vec<Value>,
+    station_merges: Vec<Value>,
     feed_configs: Vec<Value>,
 }
 
@@ -1275,6 +1291,7 @@ pub async fn evaluate(
         changes,
         merged_away: HashMap::new(),
         merges: Vec::new(),
+        station_merges: Vec::new(),
         feed_configs: Vec::new(),
     };
     for c in changes {
@@ -1306,6 +1323,7 @@ pub async fn evaluate(
         }
     }
     ev.merges = state.merges;
+    ev.station_merges = state.station_merges;
     ev.feed_configs = state.feed_configs;
     // parent_station is DEFERRABLE: check it now rather than at COMMIT.
     sqlx::query("SAVEPOINT editor_constraints")
@@ -1381,22 +1399,31 @@ pub async fn findings_for(
 /// Every stop id a change uses (not the rows it creates).
 fn referenced_stops(c: &ChangeRow) -> Vec<String> {
     let mut ids: Vec<String> = match (c.entity.as_str(), c.op.as_str()) {
-        ("stop", "update" | "delete") => vec![c.entity_key.clone()],
-        ("stop", "merge") => {
+        ("stop", "update" | "delete") | ("station", "delete") => vec![c.entity_key.clone()],
+        ("stop", "merge") | ("station", "merge") => {
+            let into_field = if c.entity == "station" {
+                "into_station_id"
+            } else {
+                "into_stop_id"
+            };
             let mut v = vec![c.entity_key.clone()];
-            v.extend(
-                c.after["into_stop_id"]
-                    .as_str()
-                    .map(|s| s.trim().to_string()),
-            );
+            v.extend(c.after[into_field].as_str().map(|s| s.trim().to_string()));
             v
         }
-        ("station", "create" | "update") => c
-            .after
-            .as_object()
-            .and_then(station_members)
-            .map(|m| m.into_iter().map(|m| m.stop_id).collect())
-            .unwrap_or_default(),
+        ("station", "create" | "update") => {
+            let mut v: Vec<String> = c
+                .after
+                .as_object()
+                .and_then(station_members)
+                .map(|m| m.into_iter().map(|m| m.stop_id).collect())
+                .unwrap_or_default();
+            // an update also uses the station it edits, which an earlier
+            // station merge in the same draft may have retired
+            if c.op == "update" {
+                v.push(c.entity_key.clone());
+            }
+            v
+        }
         ("route_stops", "replace") => c.after["rows"]
             .as_array()
             .map(|rows| {
@@ -1424,15 +1451,17 @@ async fn apply_change(
 ) -> Result<Vec<Finding>, ApplyError> {
     check_payload(&c.entity, &c.op, &c.entity_key, &c.after)
         .map_err(|f| ApplyError::Findings(vec![f]))?;
-    // a stop an earlier change merged away is gone for every later change
+    // a stop or station an earlier change merged away is gone for every later
+    // change
     let gone: Vec<Finding> = referenced_stops(c)
         .iter()
         .filter_map(|id| {
-            let (into, by) = state.merged_away.get(id)?;
+            let (into, by, was_station) = state.merged_away.get(id)?;
+            let kind = if *was_station { "station" } else { "stop" };
             Some(Finding::error(
-                "stop_merged_away",
+                if *was_station { "station_merged_away" } else { "stop_merged_away" },
                 id.as_str(),
-                format!("stop {id} is merged into {into} by change {by} earlier in this draft; use {into}"),
+                format!("{kind} {id} is merged into {into} by change {by} earlier in this draft; use {into}"),
             ))
         })
         .collect();
@@ -1452,6 +1481,7 @@ async fn apply_change(
         ("station", "create") => station_create(conn, g, &c.after, actor).await,
         ("station", "update") => station_update(conn, g, key, &c.after, actor).await,
         ("station", "delete") => station_delete(conn, g, key, actor).await,
+        ("station", "merge") => station_merge(conn, g, c, actor, state).await,
         ("feed_config", "update") => feed_config_update(conn, g, c, state).await,
         (e, o) => Err(fail(
             "invalid_change",
@@ -2047,7 +2077,7 @@ async fn stop_merge(
     let routes = moved.iter().collect::<HashSet<_>>().len();
     state
         .merged_away
-        .insert(from.to_string(), (into.to_string(), c.change_id));
+        .insert(from.to_string(), (into.to_string(), c.change_id, false));
     state.merges.push(json!({
         "change_id": c.change_id, "from": from, "into": into, "routes": routes, "rows": moved.len(),
         "keep_name": if keep_name_from { "from" } else { "into" },
@@ -2518,6 +2548,257 @@ async fn station_delete(
     Ok(vec![])
 }
 
+/// The platforms a station merge would re-parent, in id order: the live stops
+/// whose `parent_station` is the station that goes away.
+async fn moving_platforms(
+    conn: &mut PgConnection,
+    g: &str,
+    station: &str,
+) -> Result<Vec<Value>, sqlx::Error> {
+    sqlx::query(
+        "SELECT s.stop_id, s.name, s.platform_code, \
+            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
+                                AND NOT r.deleted \
+              WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count \
+         FROM gtfs_stop s \
+         WHERE s.gtfs_id = $1 AND s.parent_station = $2 AND NOT s.deleted ORDER BY s.stop_id",
+    )
+    .bind(g)
+    .bind(station)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        Ok(json!({
+            "stop_id": r.try_get::<String, _>("stop_id")?,
+            "name": r.try_get::<String, _>("name")?,
+            "platform_code": r.try_get::<Option<String>, _>("platform_code")?,
+            "route_count": r.try_get::<i64, _>("route_count")?,
+        }))
+    })
+    .collect()
+}
+
+/// Merge one station (`entity_key`) into another: every live platform of the
+/// station going away is re-parented onto the station that stays, keeping its
+/// own platform label, the kept station optionally takes the other's name or
+/// position, and the station going away is soft-deleted with `merged_into`
+/// provenance - the key the loader's alias map reads (section 1), so the retired
+/// station code keeps answering, and keeps expanding to the survivor's
+/// platforms.
+///
+/// Route rows are never touched: `gtfs_route_stop` only ever names platforms,
+/// and a platform's id does not change here.
+async fn station_merge(
+    conn: &mut PgConnection,
+    g: &str,
+    c: &ChangeRow,
+    actor: &str,
+    state: &mut ApplyState<'_>,
+) -> Result<Vec<Finding>, ApplyError> {
+    let from = c.entity_key.as_str();
+    let m = c.after.as_object().expect("payload checked");
+    let into = m["into_station_id"]
+        .as_str()
+        .expect("payload checked")
+        .trim();
+    let keep_name_from = m.get("keep_name").and_then(Value::as_str) == Some("from");
+    let keep_position_from = m.get("keep_position").and_then(Value::as_str) == Some("from");
+
+    // both rows, locked in id order
+    let found: HashMap<String, MergeStop> = sqlx::query(
+        "SELECT stop_id, name, lat, lon, location_type, deleted, parent_station, platform_code \
+         FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2) ORDER BY stop_id FOR UPDATE",
+    )
+    .bind(g)
+    .bind(vec![from.to_string(), into.to_string()])
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<(String, MergeStop), sqlx::Error> {
+        Ok((
+            r.try_get("stop_id")?,
+            MergeStop {
+                name: r.try_get("name")?,
+                lat: r.try_get("lat")?,
+                lon: r.try_get("lon")?,
+                location_type: r.try_get("location_type")?,
+                deleted: r.try_get("deleted")?,
+                parent_station: r.try_get("parent_station")?,
+                platform_code: r.try_get("platform_code")?,
+            },
+        ))
+    })
+    .collect::<Result<_, _>>()?;
+    let mut errors = Vec::new();
+    for id in [from, into] {
+        match found.get(id) {
+            None => errors.push(Finding::error(
+                "station_not_found",
+                id,
+                format!("no station {id}"),
+            )),
+            Some(s) if s.deleted => errors.push(Finding::error(
+                "station_deleted",
+                id,
+                format!("station {id} is deleted"),
+            )),
+            Some(s) if s.location_type != 1 => errors.push(Finding::error(
+                "not_a_station",
+                id,
+                format!("{id} is a stop, not a station; only stations are merged this way"),
+            )),
+            _ => {}
+        }
+    }
+    if !errors.is_empty() {
+        return Err(ApplyError::Findings(errors));
+    }
+    let (f, i) = (&found[from], &found[into]);
+    // A station under another station is a shape nothing here understands: the
+    // platforms would land on a station that is itself somebody's platform.
+    if let Some(parent) = &i.parent_station {
+        return Err(ApplyError::Findings(vec![Finding::error(
+            "into_station_has_parent",
+            into,
+            format!(
+                "station {into} is itself inside {parent}; a station that stays cannot have a parent"
+            ),
+        )]));
+    }
+
+    let platforms = moving_platforms(&mut *conn, g, from).await?;
+    let mut warnings = Vec::new();
+    if platforms.is_empty() {
+        warnings.push(Finding::warning(
+            "station_merge_no_platforms",
+            from,
+            format!(
+                "station {from} has no live platforms; this merge only removes it, nothing moves"
+            ),
+        ));
+    }
+    let apart = haversine_m(f.lat, f.lon, i.lat, i.lon);
+    if apart > STATION_MERGE_FAR_METRES {
+        warnings.push(Finding::warning(
+            "station_merge_far_apart",
+            format!("{from}|{into}"),
+            format!(
+                "{from} and {into} are {apart:.0} m apart, more than the {STATION_MERGE_FAR_METRES:.0} m a station is grouped within; check they are one place"
+            ),
+        ));
+    }
+    if f.name != i.name {
+        let kept = if keep_name_from { &f.name } else { &i.name };
+        warnings.push(Finding::warning(
+            "station_merge_names_differ",
+            format!("{from}|{into}"),
+            format!(
+                "{from} is named {:?} and {into} {:?}; the kept station is named {kept:?}",
+                f.name, i.name
+            ),
+        ));
+    }
+    // A suggestion still waiting for review that names either station would be
+    // reviewed against a world this merge has changed.
+    let pending: Vec<i64> = sqlx::query(
+        "SELECT proposal_id FROM gtfs_station_proposal \
+         WHERE gtfs_id = $1 AND status = 'pending' \
+           AND (station_id = ANY($2) OR members @> $3::jsonb OR members @> $4::jsonb) \
+         ORDER BY proposal_id LIMIT 20",
+    )
+    .bind(g)
+    .bind(vec![from.to_string(), into.to_string()])
+    .bind(json!([{"stop_id": from}]).to_string())
+    .bind(json!([{"stop_id": into}]).to_string())
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| r.try_get("proposal_id"))
+    .collect::<Result<_, _>>()?;
+    if !pending.is_empty() {
+        warnings.push(Finding::warning(
+            "station_merge_pending_proposal",
+            format!("{from}|{into}"),
+            format!(
+                "{} still waiting for review name{} one of these stations ({}); review or reject {} first",
+                plural_count(pending.len(), "suggested station"),
+                if pending.len() == 1 { "s" } else { "" },
+                pending
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if pending.len() == 1 { "it" } else { "them" }
+            ),
+        ));
+    }
+
+    // 1. the platforms: a new parent, their own labels
+    let moved: i64 = sqlx::query(
+        "UPDATE gtfs_stop SET parent_station = $3, updated_by = $4 \
+         WHERE gtfs_id = $1 AND parent_station = $2 AND NOT deleted",
+    )
+    .bind(g)
+    .bind(from)
+    .bind(into)
+    .bind(actor)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected() as i64;
+    // 2. the kept station: name / position if asked
+    if keep_name_from || keep_position_from {
+        sqlx::query(
+            "UPDATE gtfs_stop SET \
+                name = CASE WHEN $3 THEN $4 ELSE name END, \
+                lat = CASE WHEN $5 THEN $6 ELSE lat END, \
+                lon = CASE WHEN $5 THEN $7 ELSE lon END, \
+                updated_by = $8 \
+             WHERE gtfs_id = $1 AND stop_id = $2",
+        )
+        .bind(g)
+        .bind(into)
+        .bind(keep_name_from)
+        .bind(&f.name)
+        .bind(keep_position_from)
+        .bind(f.lat)
+        .bind(f.lon)
+        .bind(actor)
+        .execute(&mut *conn)
+        .await?;
+    }
+    // 3. the station that goes: the same `merged_into` key a stop merge writes,
+    // which is what the loader turns into an alias
+    sqlx::query(
+        "UPDATE gtfs_stop SET deleted = true, parent_station = NULL, \
+            provenance = coalesce(provenance, '{}'::jsonb) || jsonb_build_object('merged_into', $3::text), \
+            updated_by = $4 \
+         WHERE gtfs_id = $1 AND stop_id = $2",
+    )
+    .bind(g)
+    .bind(from)
+    .bind(into)
+    .bind(actor)
+    .execute(&mut *conn)
+    .await?;
+
+    state
+        .merged_away
+        .insert(from.to_string(), (into.to_string(), c.change_id, true));
+    state.station_merges.push(json!({
+        "change_id": c.change_id, "from": from, "into": into, "platforms_moved": moved,
+        "keep_name": if keep_name_from { "from" } else { "into" },
+        "keep_position": if keep_position_from { "from" } else { "into" },
+    }));
+    Ok(warnings)
+}
+
+/// "1 thing" / "3 things", for a finding's message.
+fn plural_count(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Switch the data source GIMS serves the feed from. The feed's version is not
 /// touched here: the commit's own bump is what every pod's poll notices. A
 /// change to the value the feed already has - earlier changes of the set taken
@@ -2871,6 +3152,39 @@ async fn snapshot(
                 from_version,
             ))
         }
+        ("station", "merge") => {
+            let into = after["into_station_id"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let side = |row: Option<(Value, bool, Option<i32>)>, id: &str| {
+                let (row, is_station, version) = row.ok_or_else(|| {
+                    EditorError::not_found("entity_not_found", format!("no station {id}"))
+                })?;
+                if !is_station {
+                    return Err(EditorError::bad_request(
+                        "not_a_station",
+                        format!("{id} is a stop, not a station; only stations are merged this way"),
+                    ));
+                }
+                Ok::<_, EditorError>((row, version))
+            };
+            let (from_row, from_version) =
+                side(stop_or_created(conn, change_set_id, g, key).await?, key)?;
+            let (into_row, into_version) =
+                side(stop_or_created(conn, change_set_id, g, &into).await?, &into)?;
+            if after["into_row_version"].is_null() {
+                if let (Some(m), Some(v)) = (after.as_object_mut(), into_version) {
+                    m.insert("into_row_version".into(), json!(v));
+                }
+            }
+            let platforms = moving_platforms(conn, g, key).await?;
+            Ok((
+                json!({"from": from_row, "into": into_row, "moving_platforms": platforms}),
+                from_version,
+            ))
+        }
         ("route", "update" | "delete") => {
             if let Some(row) = route_row(conn, g, key).await? {
                 let v = row["row_version"].as_i64().map(|v| v as i32);
@@ -3104,10 +3418,18 @@ async fn update_change_once(
     // stop's version it was made against unless it names another stop
     let mut fixed_key = key.clone();
     settle_create_key(&entity, &op, &mut fixed_key, &mut update.after);
-    if entity == "stop" && op == "merge" && update.after["into_row_version"].is_null() {
+    let into_field = if entity == "station" {
+        "into_station_id"
+    } else {
+        "into_stop_id"
+    };
+    if (entity == "stop" || entity == "station")
+        && op == "merge"
+        && update.after["into_row_version"].is_null()
+    {
         let old: Value = json_col(&row, "after")?;
-        let into = update.after["into_stop_id"].as_str().map(str::trim);
-        let version = if old["into_stop_id"].as_str().map(str::trim) == into {
+        let into = update.after[into_field].as_str().map(str::trim);
+        let version = if old[into_field].as_str().map(str::trim) == into {
             old["into_row_version"].as_i64()
         } else {
             match into {
@@ -3540,6 +3862,16 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         &ev.merges,
     )
     .await?;
+    auth::audit_many(
+        &mut *tx,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "station_merged",
+        Some(&gtfs_id),
+        Some(id),
+        &ev.station_merges,
+    )
+    .await?;
     let switched: Vec<Value> = ev
         .feed_configs
         .iter()
@@ -3868,8 +4200,22 @@ mod tests {
             "S",
             json!({"members": [{"stop_id": "C"}]}),
         );
-        assert_eq!(referenced_stops(&c), vec!["C"]);
-        assert!(referenced_stops(&change(4, "stop", "create", "N", json!({}))).is_empty());
+        // a station update uses its members and the station it edits, either of
+        // which an earlier merge in the same draft may have retired
+        assert_eq!(referenced_stops(&c), vec!["C", "S"]);
+        let c = change(
+            4,
+            "station",
+            "merge",
+            "S1",
+            json!({"into_station_id": "S2"}),
+        );
+        assert_eq!(referenced_stops(&c), vec!["S1", "S2"]);
+        assert_eq!(
+            referenced_stops(&change(5, "station", "delete", "S", Value::Null)),
+            vec!["S"]
+        );
+        assert!(referenced_stops(&change(6, "stop", "create", "N", json!({}))).is_empty());
     }
 
     #[test]

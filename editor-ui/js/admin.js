@@ -215,6 +215,7 @@ export const ACTION_LABEL = {
   change_set_discarded: "Discarded",
   bulk_imported: "Imported a CSV file",
   stop_merged: "Merged a duplicate stop",
+  station_merged: "Merged two stations",
   station_proposals_built: "Suggested stations were built",
   station_proposal_approved: "Approved a suggested station into a draft",
   station_proposal_rejected: "Rejected a suggested station",
@@ -256,6 +257,8 @@ function detailText(a) {
   switch (a.action) {
     case "stop_merged":
       return `${d.from} merged into ${d.into}, ${n(d.routes, "route")} and ${n(d.rows, "route row")} switched`;
+    case "station_merged":
+      return `${d.from} merged into ${d.into}, ${n(d.platforms_moved, "platform")} moved`;
     case "bulk_imported":
       return `${String(d.kind || "").replace("_", " ")}: ${n(d.rows, "row")}, ${n(d.changes, "change")}`;
     case "station_proposals_built":
