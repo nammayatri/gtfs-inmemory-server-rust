@@ -387,6 +387,9 @@ fn app_config(dir: &Path, db_url: &str) -> AppConfig {
         gtfs_editor_totp_key: None,
         gtfs_editor_session_hours: None,
         gtfs_editor_ui_dir: None,
+        gtfs_webhooks_enabled: false,
+        gtfs_webhook_allowed_hosts: vec![],
+        gtfs_pod_id: None,
     }
 }
 
@@ -405,6 +408,7 @@ fn editor_state(pool: &PgPool, signer: &TestSigner, dir: &Path) -> EditorState {
             session_hours: 1,
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
+            webhook_policy: Default::default(),
         },
     )
     .unwrap()
