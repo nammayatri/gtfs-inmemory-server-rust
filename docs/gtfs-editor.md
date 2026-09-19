@@ -19,7 +19,7 @@ ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0013*.sql` (`0001..0008` applied to master
+Schema: `db/gtfs_editor/0001..0016*.sql` (`0001..0008` applied to master
 `mtc_internal_master`; `0006` lets a change's `op` be `merge`, `0007` holds
 coordinate reviews, `0008` makes `gtfs_feed.data_source` live and backfills
 `chennai_bus` to `'db'` — see section 3's "Feed data source". **Not yet on
@@ -28,7 +28,9 @@ master, applied to the local database only:** `0009` lets a change's `entity` be
 maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
 behind the cleanup context reads (section 9), `0012` adds the nullable
 `gtfs_stop.description` (section 11), `0013` adds the webhook and pod cache
-state tables (section 12). All five are safe to run twice. **`0012`
+state tables (section 12), `0016` adds `gtfs_webhook_settings`, the webhook
+policy row that supersedes the dhall config (section 12.5). All six are safe to
+run twice. **`0012`
 goes on a database before the build that reads it:** both the editor and the
 GIMS loader select the column, so a DB feed fails to load (and serves its
 preprocessed data) on a database without it.)
@@ -382,7 +384,10 @@ platforms, diameter_m, base_version}`). Coordinate reviews (section 8) write
 move, choose, none}`) when it stores its candidates on the reviews (section 8.2).
 Committing a `feed_config` change ("Feed data source"
 below) writes `feed_data_source_changed`, detail `{gtfs_id, from, to, change_id,
-change_set_id}`. The dashboard's history has words for every one of these
+change_set_id}`. Saving the webhook policy (section 12.5) writes
+`webhook_settings_updated`, detail `{from: {enabled, allowed_hosts, source}, to:
+{enabled, allowed_hosts}}`, with no `gtfs_id`: the policy is the deployment's,
+not a feed's. The dashboard's history has words for every one of these
 (`ACTION_LABEL` in `editor-ui/js/admin.js`; `dev/ui_e2e.mjs` checks each action in
 the database has a label).
 
@@ -590,8 +595,11 @@ relative (`../`), so it works wherever the UI directory is mounted. For the ops
 team: search a stop or route, see it on a map, edit, collect edits into a draft,
 submit, and — as a different person — review the diff and commit.
 
-Feed settings (admin): each feed's data source, the drafts already carrying a
-switch of it (from `GET /feeds/{g}/config`'s `pending`, linked), and "Add to
+Delivery: "Where GIMS may send" — the webhook policy of section 12.5, with the
+on/off switch, the allow-list and a line saying whether it is coming from the
+database or from this deployment's configuration. An admin changes it there;
+everyone else sees the same block, read-only. Feed settings (admin): each feed's
+data source, the drafts already carrying a switch of it (from `GET /feeds/{g}/config`'s `pending`, linked), and "Add to
 draft: switch to …", which adds a `feed_config` change to the current draft —
 for the feed chosen in the top bar, since a draft belongs to one feed — after a
 confirm that says it takes effect only once the draft is submitted, approved by
@@ -1809,28 +1817,62 @@ leaf. `GET` sends no body.
 
 ### 12.5 Where a webhook may point
 
-A URL's host must match `gtfs_webhook_allowed_hosts` in the **dhall config** —
-checked when it is saved and again when the request is about to go out, because
-the list can be tightened after a webhook was configured. An entry written
-`.example.com` matches that domain and its subdomains.
+A URL's host must match the **allow-list** — checked when it is saved and again
+when the request is about to go out, because the list can be tightened after a
+webhook was configured. An entry written `.example.com` matches that domain and
+its subdomains.
+
+The allow-list, and the on/off switch beside it, are the *webhook policy*, and
+they live in **two places with one rule between them**: the
+`gtfs_webhook_settings` row wins, and the dhall config is only the seed used
+while no row has been saved. That is exactly how `gtfs_feed.data_source`
+supersedes the static `gtfs_db_feeds` list (section 1), deliberately — this
+system answers "which of these two wins" once, not twice.
 
 ```dhall
-gtfs_webhooks_enabled = True,
+gtfs_webhooks_enabled = True,                                -- the seed
 gtfs_webhook_allowed_hosts = [".internal.svc.movingtech.net"],
 gtfs_pod_id = None Text,   -- defaults to $POD_NAME, then the hostname
 ```
 
-Empty allow-list means no webhook can fire, even with `gtfs_webhooks_enabled =
-True`: the feature fails closed. With `gtfs_webhooks_enabled = False` (the
-default) pods do not even report their cache state, so an existing deployment is
-completely unaffected until someone turns this on.
+An admin edits the policy on the Delivery page (`#/delivery`), which writes the
+row; it is read by every pod **on each version poll**, so turning webhooks on, or
+adding the host that a delivery has been failing on, takes effect within a poll
+interval with no restart and no configmap edit. `check_host` reads the same live
+list at the moment of the request, so a host removed from it stops being called
+by webhooks that were configured while it was there.
+
+Empty allow-list means no webhook can fire, whether the switch is on or off: the
+feature fails closed, and turning it on before deciding where it may point is a
+legal half-step that sends nothing. With the switch off pods do not even report
+their cache state, so a deployment that has neither the row nor
+`gtfs_webhooks_enabled = True` is completely unaffected by all of this.
+
+A host is a plain host name (`jenkins.example.com`), or one with a leading dot
+for a domain and its subdomains (`.example.com`). No scheme, port, path, space or
+wildcard — none of those could ever match, so they are refused as the typos they
+are (400 `invalid_host`) rather than quietly stripped. Entries are lowercased,
+trimmed and de-duplicated, and the list holds at most 64.
 
 **Why this is not a draft change.** Everything about a *feed* goes through a
 draft a second person approves. A webhook is not feed data, and a draft would not
 address the actual risk, which is GIMS being pointed at a host it should not
-call. That is answered in the deployment: an admin chooses the URL within the
-allow-list and cannot widen the list. Every change is audited
-(`webhook_created`, `webhook_updated`, `webhook_deleted`, `webhook_tested`).
+call. That is answered by the allow-list, by the policy being an **admin's** to
+change, and by every change being audited (`webhook_created`, `webhook_updated`,
+`webhook_deleted`, `webhook_tested`, `webhook_settings_updated`, the last
+carrying the whole policy before and after).
+
+**What this gives up.** Before the row existed, the deployment was a hard ceiling:
+an admin chose the URL, and could not widen the list it had to sit inside. That
+ceiling is gone. A compromised or careless admin account can now add a host and
+point GIMS at it without anyone editing the configmap, and the audit row is what
+you have afterwards rather than a second pair of eyes beforehand. It was traded
+knowingly: the list is one ops discover they need an entry in *while a delivery is
+failing*, and an engineer editing a shared configmap and restarting every pod was
+both slower and, in practice, less reviewed than it looked. The credential is not
+part of the trade — a URL's secret stays a `${PLACEHOLDER}` resolved from the
+pod's environment (12.4), so a host added here cannot be handed a token the pods
+do not already hold for it.
 
 `gtfs_pod_id` must differ per pod. Two pods sharing one id overwrite each other's
 heartbeat, the fleet looks smaller than it is, and a webhook fires early.
@@ -1840,15 +1882,24 @@ heartbeat, the fleet looks smaller than it is, and a webhook fires early.
 | | |
 | --- | --- |
 | `GET /feeds/{g}/cache-state` | viewer+. The feed's version, each pod's loaded version, `in_sync`, and `waiting_for` |
-| `GET /feeds/{g}/webhooks` | viewer+. The rows, plus `policy` (what the deployment allows) and `events` |
+| `GET /webhook-settings` | viewer+ → `{policy, config: {enabled, allowed_hosts}, max_allowed_hosts}`. `config` is the deployment's seed, shown so the page can say what saving takes over from |
+| `PUT /webhook-settings` | **admin**. `{enabled?, allowed_hosts?}` → the same shape. Only the fields sent are changed; the rest keep what is in force. Audited `webhook_settings_updated` |
+| `GET /feeds/{g}/webhooks` | viewer+. The rows, plus `policy` and `events` |
 | `POST /feeds/{g}/webhooks` | **admin**. `{name, event?, url, method?, headers?, body?, enabled?, …}` → 201 |
 | `PATCH /webhooks/{id}` | **admin**. Only the fields sent are changed |
 | `DELETE /webhooks/{id}` | **admin** |
 | `POST /webhooks/{id}/test` | **admin**. Queues a `kind = 'test'` delivery, sent like a real one, which does not consume the version's delivery |
 | `GET /feeds/{g}/webhook-deliveries?limit=` | viewer+. History with status, attempts, response code and error |
 
+`policy` everywhere is the one in force: `{enabled, allowed_hosts, active,
+source: "database"|"config", updated_at, updated_by}`. `source` says which of
+the two it came from — the row, or the deployment seed that is still standing in
+for one — and `active` is `enabled && allowed_hosts` non-empty, which is the
+condition anything fires under.
+
 Errors: `host_not_allowed`, `invalid_url` (a placeholder that cannot be
-resolved), `invalid_event`, `invalid_method`, `invalid_headers`, `out_of_range`,
+resolved), `invalid_host` (an allow-list entry that is not a host name),
+`invalid_event`, `invalid_method`, `invalid_headers`, `out_of_range`,
 `duplicate_name`, `webhooks_inactive`, `webhook_not_found`.
 
 Retries: 30 s, 1 m, 2 m, 4 m, 8 m, then every 15 m, up to `max_attempts`
@@ -1863,8 +1914,17 @@ data until someone notices.
 image with `gtfs_webhooks_enabled = True`**; without it the pods log one line and
 carry on serving, and no webhook can fire.
 
-Tests: `tests/editor_webhook_flow.rs` (registered in
-`scripts/editor_flow_test.sh`) runs the whole path against a real Postgres and a
-real HTTP receiver, including two pods dispatching at the same instant to prove
-the delivery goes out exactly once; the fleet arithmetic, the allow-list, the
-placeholders and the backoff are unit tested in `src/services/webhook.rs`.
+`db/gtfs_editor/0016_webhook_settings.sql` — `gtfs_webhook_settings`, the policy
+row of 12.5. One row, ever: `singleton boolean PRIMARY KEY CHECK (singleton)`,
+because the policy is the deployment's and a second row would raise the question
+of which one is in force. Safe to run twice. Without it every pod falls back to
+the dhall values — the state before this existed — and logs that once.
+
+Tests: `tests/editor_webhook_flow.rs` and
+`tests/editor_webhook_settings_flow.rs` (both registered in
+`scripts/editor_flow_test.sh`) run the whole path against a real Postgres and a
+real HTTP receiver — two pods dispatching at the same instant to prove the
+delivery goes out exactly once, and a saved policy turning the feature on, taking
+the deployment's own host away and stopping a call at send time. The fleet
+arithmetic, the precedence rule, the host validation, the placeholders and the
+backoff are unit tested in `src/services/webhook.rs`.

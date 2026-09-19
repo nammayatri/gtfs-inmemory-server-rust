@@ -5,7 +5,7 @@
 // but it is only *live* once every pod has reloaded, and anything downstream
 // that caches GIMS's answers - the S3/CloudFront frontline layer - must be
 // rebuilt after that, not before. See docs/gtfs-editor.md section 12.
-import { get, post, patch, del, enc } from "./api.js";
+import { get, post, put, patch, del, enc } from "./api.js";
 import { state, can } from "./state.js";
 import { h, clear, toast, confirmDialog, fmtDate, plural, modal, errorText } from "./util.js";
 
@@ -41,17 +41,20 @@ export function leaveWebhooks() {
 export async function showDelivery() {
   const feed = state.feedId;
   const fleetBox = h("div", h("p.empty", "Loading…"));
+  const settingsBox = h("div");
   const hooksBox = h("div");
   const historyBox = h("div");
 
   const load = async () => {
     if (state.feedId !== feed) return leaveWebhooks();
-    const [fleet, hooks, history] = await Promise.all([
+    const [fleet, settings, hooks, history] = await Promise.all([
       get(`feeds/${enc(feed)}/cache-state`).catch((e) => ({ error: e })),
+      get("webhook-settings").catch((e) => ({ error: e })),
       get(`feeds/${enc(feed)}/webhooks`).catch((e) => ({ error: e })),
       get(`feeds/${enc(feed)}/webhook-deliveries?limit=25`).catch((e) => ({ error: e })),
     ]);
     renderFleet(fleetBox, fleet);
+    renderSettings(settingsBox, settings, load);
     renderHooks(hooksBox, hooks, load);
     renderHistory(historyBox, history);
   };
@@ -61,6 +64,7 @@ export async function showDelivery() {
       h("h1", "Delivery"),
       h("p.hint", "Where each pod has got to, and who is told when an edit goes live.")),
     fleetBox,
+    settingsBox,
     hooksBox,
     historyBox,
   ));
@@ -105,6 +109,92 @@ function renderFleet(box, fleet) {
       : null));
 }
 
+// ------------------------------------------------------------------ settings
+
+// Whether GIMS may call anything at all, and the hosts it may call. Saved here,
+// these replace what the deployment's configuration says - so adding a host is
+// an admin's job on this page, not an engineer's in a shared configmap followed
+// by a restart of every pod.
+
+const SOURCE_NOTE = {
+  database: "These settings were saved here, and are what GIMS goes by.",
+  config: "Nothing has been saved here, so GIMS is going by this deployment's own configuration. Saving takes over from it.",
+};
+
+function renderSettings(box, data, reload) {
+  if (data.error) return clear(box, h("p.notice.error", errorText(data.error)));
+  const policy = data.policy || {};
+  const hosts = policy.allowed_hosts || [];
+  const admin = can("admin");
+
+  const summary = !policy.enabled
+    ? h("p.notice", "Webhooks are off. Nothing is sent, and the pods do not report which version they are serving.")
+    : hosts.length
+      ? h("p.notice.ok", `Webhooks are on, and may be sent to: ${hosts.join(", ")}.`)
+      : h("p.notice.warning", "Webhooks are on but no host is allowed, so nothing can be sent. Add the host you want called.");
+
+  clear(box, h("section.section",
+    h("div.title-block",
+      h("h2", "Where GIMS may send"),
+      h("p.hint", "A webhook's URL must point at one of these hosts. It is checked when the URL is saved, and again every time a call goes out.")),
+    summary,
+    h("p.hint",
+      SOURCE_NOTE[policy.source] || "",
+      policy.source === "database" && policy.updated_by
+        ? ` Last changed by ${policy.updated_by}${policy.updated_at ? `, ${fmtDate(policy.updated_at)}` : ""}.`
+        : ""),
+    admin
+      ? h("div.row-actions",
+          h("button.btn.small", { type: "button", on: { click: () => settingsForm(data, reload) } }, "Change these settings"))
+      : h("p.hint", "Only an admin can change this."),
+  ));
+}
+
+// A form, not switches on the page itself: the page reloads every five seconds,
+// which would wipe a half-typed host list.
+function settingsForm(data, reload) {
+  const policy = data.policy || {};
+  const config = data.config || {};
+  const enabled = h("input", { type: "checkbox", checked: !!policy.enabled });
+  const hosts = h("textarea", { rows: "5", placeholder: "jenkins.example.com\n.internal.example.net" },
+    (policy.allowed_hosts || []).join("\n"));
+  const error = h("p.notice.error", { role: "alert", hidden: true });
+
+  modal("Where GIMS may send", () => h("div.section",
+    h("label.field", h("span", "Send webhooks"), enabled),
+    h("label.field", h("span", "Allowed hosts (one per line)"), hosts),
+    h("p.hint",
+      "A host name on its own, such as ", h("code", "jenkins.example.com"), ", or ",
+      h("code", ".example.com"), " to allow that domain and everything under it. No ",
+      h("code", "https://"), ", no port, no path. An empty list is allowed, and means nothing can be sent."),
+    h("p.hint",
+      "Saved here, this replaces what the deployment's configuration allows",
+      config.allowed_hosts?.length ? ` (${config.allowed_hosts.join(", ")})` : "",
+      ": from then on these are the hosts GIMS may call."),
+    error,
+  ), {
+    actions: [
+      (close) => h("button.btn.secondary", { type: "button", on: { click: () => close() } }, "Cancel"),
+      (close) => h("button.btn", { type: "button", on: { click: async () => {
+        error.hidden = true;
+        const payload = {
+          enabled: enabled.checked,
+          allowed_hosts: hosts.value.split("\n").map((s) => s.trim()).filter(Boolean),
+        };
+        try {
+          await put("webhook-settings", payload);
+          toast(payload.enabled ? "Saved. Webhooks are on." : "Saved. Webhooks are off.");
+          close();
+          reload();
+        } catch (e) {
+          error.textContent = errorText(e);
+          error.hidden = false;
+        }
+      } } }, "Save"),
+    ],
+  });
+}
+
 // ------------------------------------------------------------------ webhooks
 
 function renderHooks(box, data, reload) {
@@ -118,10 +208,10 @@ function renderHooks(box, data, reload) {
     h("p.hint", "A URL GIMS calls when something happens to this feed."));
 
   const policyNote = !policy.enabled
-    ? h("p.notice", "This build has webhooks turned off, so nothing is sent. An engineer turns them on in the deployment config.")
+    ? h("p.notice", "Webhooks are turned off, so nothing is sent. Turn them on under “Where GIMS may send” above.")
     : !policy.allowed_hosts?.length
-      ? h("p.notice.warning", "This build allows no webhook hosts, so nothing can be sent. An engineer sets the allowed hosts in the deployment config.")
-      : h("p.hint", `A URL must point at: ${policy.allowed_hosts.join(", ")}. An engineer changes that list in the deployment config.`);
+      ? h("p.notice.warning", "No host is allowed, so nothing can be sent. Add one under “Where GIMS may send” above.")
+      : h("p.hint", `A URL must point at: ${policy.allowed_hosts.join(", ")}. That list is “Where GIMS may send” above.`);
 
   clear(box, h("section.section",
     head,

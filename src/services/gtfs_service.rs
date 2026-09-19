@@ -174,6 +174,10 @@ pub struct GTFSService {
     /// (`services::webhook`), so the fleet can tell when an edit is live
     /// everywhere.
     pod: webhook::PodIdentity,
+    /// Whether webhooks may fire and where they may point. The dhall values
+    /// only seed it: the poll loop asks this for the policy in force on every
+    /// tick, so a dashboard change lands without a restart.
+    webhook_policy: webhook::LivePolicy,
     /// A persistent cache-state write failure is worth one line, not one every
     /// poll tick.
     cache_state_warned: AtomicBool,
@@ -196,6 +200,7 @@ impl GTFSService {
 
         let db_source = Self::create_db_source(&config)?;
         let pod = webhook::PodIdentity::from_env(config.gtfs_pod_id.as_deref());
+        let webhook_policy = webhook::LivePolicy::new(config.webhook_policy());
 
         let service = Self {
             config,
@@ -212,6 +217,7 @@ impl GTFSService {
             alias_log_seen: std::sync::Mutex::new(HashMap::new()),
             station_log_seen: std::sync::Mutex::new(HashMap::new()),
             pod,
+            webhook_policy,
             cache_state_warned: AtomicBool::new(false),
         };
 
@@ -2476,25 +2482,18 @@ impl GTFSService {
             return;
         };
         let every = Duration::from_secs(self.config.gtfs_version_poll_seconds.max(1));
-        let policy = self.config.webhook_policy();
+        let seed = self.webhook_policy.seed();
         info!(
             "Polling gtfs_feed.data_source/version every {:?} (static fallback feeds: {:?})",
             every,
             db.feeds()
         );
-        if policy.enabled {
-            info!(
-                pod = %self.pod.pod_id,
-                "Reporting this pod's loaded feed versions every poll; webhooks may call {:?}",
-                policy.allowed_hosts
-            );
-            if policy.allowed_hosts.is_empty() {
-                warn!(
-                    "gtfs_webhooks_enabled is true but gtfs_webhook_allowed_hosts is empty; \
-                     cache state is reported but no webhook can fire"
-                );
-            }
-        }
+        info!(
+            pod = %self.pod.pod_id,
+            "Webhook policy seeded from this deployment as enabled={} hosts={:?}; \
+             a saved gtfs_webhook_settings row supersedes it and is re-read every poll",
+            seed.enabled, seed.allowed_hosts
+        );
         loop {
             sleep(every).await;
             let live = match db.live_feeds(db.feeds()).await {
@@ -2539,9 +2538,15 @@ impl GTFSService {
                     }
                 }
             }
-            if policy.enabled {
+            // read every tick, never once before the loop: the policy now lives
+            // in the database, so an admin turning webhooks on from the
+            // dashboard - or taking a host out of the allow-list - has to reach
+            // this pod within a poll interval, without a restart
+            let effective = self.webhook_policy.get(db.pool()).await;
+            if effective.policy.enabled {
                 self.report_cache_state(db.pool(), &live, &failures).await;
-                webhook::dispatch_tick(db.pool(), &self.http_client, &self.pod, &policy).await;
+                webhook::dispatch_tick(db.pool(), &self.http_client, &self.pod, &effective.policy)
+                    .await;
             }
         }
     }

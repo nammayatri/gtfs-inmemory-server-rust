@@ -81,6 +81,11 @@ in {
   -- reports the feed version it is serving only when this is True, and a
   -- webhook can fire only if its URL's host is in the allow-list, which is
   -- empty by default so the feature fails closed.
+  --
+  -- These two are only the SEED. Once an admin saves the policy from the
+  -- dashboard, the gtfs_webhook_settings row supersedes both of them and
+  -- editing here changes nothing (section 12.5) - the same way gtfs_feed.
+  -- data_source supersedes gtfs_db_feeds above.
   gtfs_webhooks_enabled = False,
   gtfs_webhook_allowed_hosts = [] : List Text,
   -- Defaults to $POD_NAME, then the hostname. Two pods must never share it.

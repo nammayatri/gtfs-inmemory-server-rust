@@ -5,7 +5,8 @@
 # tests/editor_review_merge_flow.rs, tests/editor_feed_config_flow.rs,
 # tests/editor_stop_details_flow.rs, tests/editor_feed_lock_flow.rs,
 # tests/editor_station_merge_flow.rs, tests/gtfs_stop_alias_flow.rs,
-# tests/gtfs_station_code_flow.rs and tests/editor_webhook_flow.rs, which use
+# tests/gtfs_station_code_flow.rs, tests/editor_webhook_flow.rs and
+# tests/editor_webhook_settings_flow.rs, which use
 # their own feeds and accounts, then proves the chennai_bus rows were not touched
 # - reseeding them from nandi if they were - and that its station proposals, its
 # position reviews and its feed row (data source and version) were not touched
@@ -66,7 +67,7 @@ EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow --test
   --test editor_stop_details_flow --test editor_feed_lock_flow \
   --test editor_station_merge_flow \
   --test gtfs_stop_alias_flow --test gtfs_station_code_flow \
-  --test editor_webhook_flow \
+  --test editor_webhook_flow --test editor_webhook_settings_flow \
   -- --nocapture || status=$?
 
 proposals_after="$(proposals)"

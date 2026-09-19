@@ -41,10 +41,10 @@ pub struct EditorState {
     pub session_hours: i64,
     pub ui_dir: PathBuf,
     pub osrm_url: Option<String>,
-    /// Which hosts a webhook may be pointed at, from the deployment's dhall
-    /// config rather than the database: an admin picks the URL, the deployment
-    /// decides the hosts. See `webhooks`.
-    pub webhook_policy: crate::services::webhook::WebhookPolicy,
+    /// Whether webhooks may fire, and which hosts they may be pointed at. Holds
+    /// the deployment's dhall values as a seed and reads the saved policy per
+    /// request, because this same API edits it. See `webhooks`.
+    pub webhook_policy: crate::services::webhook::LivePolicy,
 }
 
 pub struct EditorSettings {
@@ -55,7 +55,7 @@ pub struct EditorSettings {
     pub session_hours: i64,
     pub ui_dir: PathBuf,
     pub osrm_url: Option<String>,
-    pub webhook_policy: crate::services::webhook::WebhookPolicy,
+    pub webhook_policy: crate::services::webhook::LivePolicy,
 }
 
 impl EditorState {
@@ -136,7 +136,7 @@ impl EditorState {
                     .unwrap_or_else(|| "./editor-ui".to_string()),
             ),
             osrm_url: config.osrm_url.clone(),
-            webhook_policy: config.webhook_policy(),
+            webhook_policy: crate::services::webhook::LivePolicy::new(config.webhook_policy()),
         };
         match Self::build(pool, settings) {
             Ok(state) => {
@@ -311,6 +311,11 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/feeds/{gtfs_id}/cache-state",
                 web::get().to(h::cache_state),
+            )
+            .route("/webhook-settings", web::get().to(h::webhook_settings))
+            .route(
+                "/webhook-settings",
+                web::put().to(h::webhook_settings_update),
             )
             .route("/feeds/{gtfs_id}/webhooks", web::get().to(h::webhook_list))
             .route(

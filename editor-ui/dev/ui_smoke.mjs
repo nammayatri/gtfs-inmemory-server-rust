@@ -1216,10 +1216,29 @@ async function deliveryFlows() {
   check(/All 2 pods are serving version/.test(await text("#page")), "it says every pod is serving the committed version");
   check((await text("#page")).includes("gtfs-inmemory-data-server-7a93ed-abc12"), "each pod is named with what it serves");
   check((await text("#page")).includes("No webhook yet."), "with nothing configured it says so");
+  check((await text("#page")).includes("Where GIMS may send"), "the policy block is on the page");
+  check((await text("#page")).includes("going by this deployment's own configuration"),
+    "with nothing saved it says the deployment's configuration is what GIMS goes by");
   await shot("wh-01-empty");
 
+  // the policy is editable here: a host that is not a host name is refused,
+  // and a host the deployment never allowed can be added (docs section 12.5)
+  await click("Change these settings", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the policy form opens");
+  await type("dialog textarea", "https://jenkins.example.com/job/rebuild");
+  await click("Save", "dialog");
+  await waitFor(`document.querySelector("dialog .notice.error")?.hidden === false`, "a URL in the host list is refused");
+  check((await text("dialog .notice.error")).includes("scheme"), "the message says what is wrong with it");
+  await type("dialog textarea", "jenkins.mock.invalid\njenkins.c2.sso.internal.svc.movingtech.net\n  JENKINS.MOCK.INVALID  ");
+  await click("Save", "dialog");
+  await waitFor(`!document.querySelector("dialog")`, "the policy saves and the form closes");
+  await waitFor(`document.querySelector("#page").innerText.includes("saved here")`, "the block says the settings now come from here");
+  check((await text("#page")).includes("jenkins.mock.invalid, jenkins.c2.sso.internal.svc.movingtech.net"),
+    "a host the deployment never allowed is now allowed, and the repeat was dropped");
+  await shot("wh-02-policy");
+
   // a URL the deployment does not allow is refused, in the form
-  await clickSel("#page button", "Add a webhook");
+  await click("Add a webhook", "#page");
   await waitFor(`!!document.querySelector("dialog")`, "the webhook form opens");
   await type("dialog input[type=text]:nth-of-type(1)", "frontline rebuild");
   const urlBox = `document.querySelectorAll("dialog input[type=text]")[1]`;
@@ -1227,7 +1246,7 @@ async function deliveryFlows() {
   await click("Add", "dialog");
   await waitFor(`document.querySelector("dialog .notice.error")?.hidden === false`, "a host outside the allow-list is refused in the form");
   check((await text("dialog .notice.error")).includes("allow-list"), "the message says why");
-  await shot("wh-02-host-refused");
+  await shot("wh-03-host-refused");
 
   // the real one
   await evaluate(`(() => { const el = ${urlBox}; el.value = "https://jenkins.mock.invalid/job/rebuild/buildWithParameters?token=\${JENKINS_TOKEN}"; el.dispatchEvent(new Event("input", { bubbles: true })); })()`);
@@ -1236,13 +1255,13 @@ async function deliveryFlows() {
   await waitFor(`document.querySelector("#page").innerText.includes("frontline rebuild")`, "it appears in the table");
   check((await text("#page")).includes("Every pod is serving the edit"), "the event is named in words");
   check((await text("#page")).includes("${JENKINS_TOKEN}"), "the stored URL keeps the placeholder, not a secret");
-  await shot("wh-03-added");
+  await shot("wh-04-added");
 
   // a test call is recorded in the history
   await click("Test", "#page");
   await waitFor(`document.querySelector("#page").innerText.includes("Delivered")`, "a test call shows in Recent calls", 12000);
   check((await text("#page")).includes("test"), "the history marks it as a test");
-  await shot("wh-04-delivered");
+  await shot("wh-05-delivered");
 
   // turning it off, and removing it
   await click("Edit", "#page");
@@ -1255,7 +1274,21 @@ async function deliveryFlows() {
   await waitFor(`!!document.querySelector("dialog")`, "the delete confirm opens");
   await click("Delete", "dialog");
   await waitFor(`document.querySelector("#page").innerText.includes("No webhook yet.")`, "it is gone");
-  await shot("wh-05-deleted");
+  await shot("wh-06-deleted");
+
+  // the switch itself: off means nothing is sent and the pods stop reporting
+  await click("Change these settings", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the policy form opens again");
+  await clickSel("dialog input[type=checkbox]", "the Send webhooks switch");
+  await click("Save", "dialog");
+  await waitFor(`document.querySelector("#page").innerText.includes("Webhooks are off")`, "turning them off is shown on the page");
+  check((await text("#page")).includes("Turn them on under"), "and the webhooks section says where to turn them back on");
+  await shot("wh-07-off");
+  await click("Change these settings", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the policy form opens once more");
+  await clickSel("dialog input[type=checkbox]", "the Send webhooks switch");
+  await click("Save", "dialog");
+  await waitFor(`document.querySelector("#page").innerText.includes("Webhooks are on")`, "and back on again");
 
   // the history names the actions in words, not codes
   await go("#/audit");
@@ -1264,6 +1297,7 @@ async function deliveryFlows() {
   check(history.includes("Added a webhook"), "the history says a webhook was added");
   check(history.includes("Sent a test webhook call"), "the history says a test was sent");
   check(history.includes("Deleted a webhook"), "the history says a webhook was deleted");
+  check(history.includes("Changed where GIMS may send webhooks"), "the history says the policy was changed");
 }
 
 // ---- only delivery

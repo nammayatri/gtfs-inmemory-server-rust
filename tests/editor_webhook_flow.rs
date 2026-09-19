@@ -22,7 +22,7 @@ use actix_web::{test, web, App, HttpResponse, HttpServer};
 use gtfs_routes_service::editor::{
     self, crypto, jwt::testing::TestSigner, EditorSettings, EditorState,
 };
-use gtfs_routes_service::services::webhook::{self, PodIdentity, WebhookPolicy};
+use gtfs_routes_service::services::webhook::{self, LivePolicy, PodIdentity, WebhookPolicy};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -216,7 +216,9 @@ fn state(
             session_hours: 1,
             ui_dir: dir.join("no-ui"),
             osrm_url: None,
-            webhook_policy: policy,
+            // no gtfs_webhook_settings row is written here, so this is also the
+            // fallback rule under test: the deployment's values stay in force
+            webhook_policy: LivePolicy::new(policy),
         },
     )
     .unwrap();

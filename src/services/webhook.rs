@@ -1,5 +1,6 @@
 //! Outbound webhooks, and the per-pod cache state one of their events is built
-//! on. See `docs/gtfs-editor.md` section 12 and `db/gtfs_editor/0013_webhooks.sql`.
+//! on. See `docs/gtfs-editor.md` section 12, `db/gtfs_editor/0013_webhooks.sql`
+//! and `db/gtfs_editor/0016_webhook_settings.sql`.
 //!
 //! # What this is for
 //!
@@ -89,21 +90,243 @@ impl PodIdentity {
     }
 }
 
-/// The deployment's say over webhooks, from the dhall config rather than the
-/// database: a dashboard admin configures *which* URL is called, but only
-/// within the hosts the deployment allows.
-#[derive(Debug, Clone, Default)]
+/// Whether webhooks may fire at all, and which hosts they may be pointed at.
+/// A dashboard admin configures *which* URL is called, but only within these
+/// hosts.
+///
+/// Where the values came from is [`PolicySource`]: the `gtfs_webhook_settings`
+/// row if there is one, else the dhall config that seeded it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WebhookPolicy {
     pub enabled: bool,
     /// Hosts a webhook URL may point at. Empty means no webhook can fire:
-    /// failing closed, so turning the feature on is a deliberate act in the
-    /// deployment config and not something the dashboard alone can do.
+    /// failing closed, so turning the feature on is a deliberate act and not
+    /// something a half-filled form does by accident.
     pub allowed_hosts: Vec<String>,
 }
 
 impl WebhookPolicy {
     pub fn is_active(&self) -> bool {
         self.enabled && !self.allowed_hosts.is_empty()
+    }
+}
+
+/// Which of the two places the policy in force was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySource {
+    /// The `gtfs_webhook_settings` row, saved from the dashboard.
+    Database,
+    /// There is no row, so the deployment's dhall values are still in force.
+    Config,
+}
+
+impl PolicySource {
+    /// The word the API and the dashboard use for it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicySource::Database => "database",
+            PolicySource::Config => "config",
+        }
+    }
+}
+
+/// The policy in force, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectivePolicy {
+    pub policy: WebhookPolicy,
+    pub source: PolicySource,
+    /// When the row was last saved, and by whom; both `None` for `Config`.
+    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_by: Option<String>,
+}
+
+/// The `gtfs_webhook_settings` row, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPolicy {
+    pub enabled: bool,
+    pub allowed_hosts: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: Option<String>,
+}
+
+/// The precedence rule: **a stored row wins outright, and the dhall value is
+/// only the seed used while there is no row.**
+///
+/// Deliberately the same rule `gtfs_feed.data_source` has over the static
+/// `gtfs_db_feeds` list (`gtfs_db_source::merge_live_feeds`), so this system
+/// has one answer to "which of these two wins" rather than two. A row saying
+/// `enabled = false`, or one with an empty host list, therefore overrides a
+/// permissive deployment config instead of being merged with it: a union would
+/// make turning something *off* from the dashboard impossible.
+///
+/// Pure, so the rule is tested without a database.
+pub fn resolve_policy(row: Option<StoredPolicy>, seed: &WebhookPolicy) -> EffectivePolicy {
+    match row {
+        Some(r) => EffectivePolicy {
+            policy: WebhookPolicy {
+                enabled: r.enabled,
+                allowed_hosts: r.allowed_hosts,
+            },
+            source: PolicySource::Database,
+            updated_at: Some(r.updated_at),
+            updated_by: r.updated_by,
+        },
+        None => EffectivePolicy {
+            policy: seed.clone(),
+            source: PolicySource::Config,
+            updated_at: None,
+            updated_by: None,
+        },
+    }
+}
+
+/// The longest allow-list that is still a list someone reads, and a bound on
+/// what one careless paste can put in the row.
+pub const MAX_ALLOWED_HOSTS: usize = 64;
+
+/// The longest a host name may be, plus the leading `.` of a subdomain entry.
+const MAX_HOST_LEN: usize = 254;
+
+/// Normalise and check one allow-list entry. An entry is a bare host name, or
+/// one written `.example.com` to match that domain and its subdomains, because
+/// that is all [`check_host`] ever compares against: a scheme, port or path in
+/// here would match nothing at all, so it is a typo to report rather than
+/// something to quietly strip.
+pub fn normalise_host(raw: &str) -> Result<String, String> {
+    let host = raw.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("a host cannot be empty".to_string());
+    }
+    if host.len() > MAX_HOST_LEN {
+        return Err(format!("{host} is too long to be a host name"));
+    }
+    for (what, found) in [
+        ("a scheme", host.contains("://")),
+        ("a port", host.contains(':')),
+        ("a path", host.contains('/')),
+        ("a query", host.contains('?') || host.contains('#')),
+        ("a user", host.contains('@')),
+        ("a space", host.chars().any(char::is_whitespace)),
+        ("a wildcard", host.contains('*')),
+    ] {
+        if found {
+            return Err(format!(
+                "{host} has {what}; an entry is a host name such as jenkins.example.com, \
+                 or .example.com for a domain and its subdomains"
+            ));
+        }
+    }
+    // the leading dot is the subdomain marker, not a label of its own
+    let labels = host.strip_prefix('.').unwrap_or(&host);
+    if labels.is_empty() {
+        return Err("a host cannot be just a dot".to_string());
+    }
+    for label in labels.split('.') {
+        if label.is_empty() {
+            return Err(format!("{host} has an empty part between two dots"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!("{host} has a part that starts or ends with a dash"));
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!("{host} has a part that is not a host name"));
+        }
+    }
+    Ok(host)
+}
+
+/// [`normalise_host`] over a whole list, de-duplicated, order kept.
+///
+/// An empty list is valid and means nothing can fire: turning webhooks on
+/// before deciding where they may point is a legitimate half-step, and it fails
+/// closed, so it needs no refusing.
+pub fn normalise_hosts(raw: &[String]) -> Result<Vec<String>, String> {
+    if raw.len() > MAX_ALLOWED_HOSTS {
+        return Err(format!(
+            "an allow-list holds at most {MAX_ALLOWED_HOSTS} hosts"
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let host = normalise_host(entry)?;
+        if !out.contains(&host) {
+            out.push(host);
+        }
+    }
+    Ok(out)
+}
+
+// ------------------------------------------------------------ live settings
+
+/// Read the one `gtfs_webhook_settings` row, if it has ever been saved.
+pub async fn load_policy_row(pool: &PgPool) -> AppResult<Option<StoredPolicy>> {
+    let row = sqlx::query(
+        "SELECT enabled, allowed_hosts, updated_at, updated_by FROM gtfs_webhook_settings",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    row.map(|r| {
+        Ok(StoredPolicy {
+            enabled: r.try_get("enabled").map_err(db)?,
+            allowed_hosts: r.try_get("allowed_hosts").map_err(db)?,
+            updated_at: r.try_get("updated_at").map_err(db)?,
+            updated_by: r.try_get("updated_by").map_err(db)?,
+        })
+    })
+    .transpose()
+}
+
+/// The dhall seed, plus the one read that turns it into the policy in force.
+///
+/// Everything that acts on the policy holds one of these rather than a
+/// [`WebhookPolicy`], because the value has to be read *now*: an admin turning
+/// webhooks on from the dashboard must take effect within a poll interval, and
+/// a host removed from the list must stop being callable at the next request,
+/// neither of them at the next restart.
+#[derive(Debug, Default)]
+pub struct LivePolicy {
+    seed: WebhookPolicy,
+    /// A persistent read failure - almost always
+    /// `db/gtfs_editor/0016_webhook_settings.sql` not applied yet - is worth
+    /// one line, not one per poll tick.
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl LivePolicy {
+    pub fn new(seed: WebhookPolicy) -> Self {
+        Self {
+            seed,
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// What the deployment's config says, which is the policy in force only
+    /// while nothing has been saved from the dashboard.
+    pub fn seed(&self) -> &WebhookPolicy {
+        &self.seed
+    }
+
+    /// The policy in force right now. Never fails: a database that cannot
+    /// answer falls back to the deployment's own values, which is what was in
+    /// force before this table existed, rather than to a policy nobody chose.
+    pub async fn get(&self, pool: &PgPool) -> EffectivePolicy {
+        match load_policy_row(pool).await {
+            Ok(row) => resolve_policy(row, &self.seed),
+            Err(e) => {
+                if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "Reading the webhook settings failed ({e}); using this deployment's \
+                         gtfs_webhooks_enabled and gtfs_webhook_allowed_hosts instead. Has \
+                         db/gtfs_editor/0016_webhook_settings.sql been applied? This is logged once."
+                    );
+                }
+                resolve_policy(None, &self.seed)
+            }
+        }
     }
 }
 
@@ -482,6 +705,12 @@ pub struct Webhook {
 
 /// The whole per-tick job: hand back stranded claims, decide what is now due,
 /// and send what is owed. Every pod runs it; the database decides who acts.
+///
+/// `policy` must be the one [`LivePolicy::get`] returned **this tick**, not a
+/// value the caller kept from boot: an admin turning webhooks on, or taking a
+/// host out of the allow-list, has to reach the dispatcher within a poll
+/// interval. The same value is carried down to [`send_once`], so the host a
+/// request is actually sent to is checked against the list as it is now.
 ///
 /// Never returns an error to the caller - a webhook problem must not disturb
 /// the poll loop that keeps the feed data fresh. Everything is logged instead.
@@ -1045,6 +1274,118 @@ mod tests {
             allowed_hosts: vec![],
         }
         .is_active());
+    }
+
+    // ------------------------------------------------------------ precedence
+
+    fn seed() -> WebhookPolicy {
+        WebhookPolicy {
+            enabled: true,
+            allowed_hosts: vec![".internal.svc.movingtech.net".to_string()],
+        }
+    }
+
+    fn stored(enabled: bool, hosts: &[&str]) -> StoredPolicy {
+        StoredPolicy {
+            enabled,
+            allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            updated_at: at(0),
+            updated_by: Some("admin@example.invalid".to_string()),
+        }
+    }
+
+    #[test]
+    fn with_no_row_the_deployments_own_values_are_in_force() {
+        let e = resolve_policy(None, &seed());
+        assert_eq!(e.policy, seed());
+        assert_eq!(e.source, PolicySource::Config);
+        assert_eq!(e.updated_at, None);
+    }
+
+    #[test]
+    fn a_saved_row_wins_over_the_deployment_config() {
+        let e = resolve_policy(Some(stored(true, &["jenkins.c2.example"])), &seed());
+        assert_eq!(e.policy.allowed_hosts, vec!["jenkins.c2.example"]);
+        assert_eq!(e.source, PolicySource::Database);
+        assert_eq!(e.updated_by.as_deref(), Some("admin@example.invalid"));
+    }
+
+    #[test]
+    fn a_row_can_take_away_what_the_config_allowed() {
+        // the two halves the union would have got wrong: turning the feature
+        // off, and emptying a list the deployment had filled
+        assert!(
+            !resolve_policy(Some(stored(false, &["jenkins.c2.example"])), &seed())
+                .policy
+                .enabled
+        );
+        let emptied = resolve_policy(Some(stored(true, &[])), &seed());
+        assert!(emptied.policy.allowed_hosts.is_empty());
+        assert!(
+            !emptied.policy.is_active(),
+            "on with an empty list stays legal and still fires nothing"
+        );
+        assert_eq!(emptied.source, PolicySource::Database);
+    }
+
+    // ------------------------------------------------------------ host input
+
+    #[test]
+    fn a_host_is_a_host_name_and_nothing_else() {
+        assert_eq!(
+            normalise_host("  Jenkins.Example.COM ").unwrap(),
+            "jenkins.example.com"
+        );
+        assert_eq!(normalise_host(".example.com").unwrap(), ".example.com");
+        assert_eq!(normalise_host("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(
+            normalise_host("jenkins.c2.sso.internal.svc.movingtech.net").unwrap(),
+            "jenkins.c2.sso.internal.svc.movingtech.net"
+        );
+        for bad in [
+            "https://jenkins.example.com",
+            "jenkins.example.com/job/x",
+            "jenkins.example.com:8080",
+            "user@jenkins.example.com",
+            "jenkins example.com",
+            "*.example.com",
+            "jenkins..example.com",
+            "-jenkins.example.com",
+            "",
+            "   ",
+            ".",
+        ] {
+            assert!(normalise_host(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_host_list_is_de_duplicated_and_bounded() {
+        assert_eq!(
+            normalise_hosts(&[
+                "Jenkins.Example.com".into(),
+                "jenkins.example.com".into(),
+                ".example.com".into(),
+            ])
+            .unwrap(),
+            vec!["jenkins.example.com", ".example.com"]
+        );
+        // an empty list is a legal policy, not a mistake
+        assert_eq!(normalise_hosts(&[]).unwrap(), Vec::<String>::new());
+        assert!(normalise_hosts(&["ok.example.com".into(), " ".into()]).is_err());
+        let too_many: Vec<String> = (0..=MAX_ALLOWED_HOSTS)
+            .map(|i| format!("h{i}.example"))
+            .collect();
+        assert!(normalise_hosts(&too_many).is_err());
+    }
+
+    #[test]
+    fn a_normalised_entry_is_one_check_host_can_match() {
+        let hosts =
+            normalise_hosts(&["  .Example.COM ".into(), "JENKINS.internal".into()]).unwrap();
+        assert!(check_host("https://a.b.example.com/x", &hosts).is_ok());
+        assert!(check_host("https://jenkins.internal/x", &hosts).is_ok());
+        assert!(check_host("https://elsewhere.invalid/x", &hosts).is_err());
     }
 
     // ------------------------------------------------------------ placeholders
