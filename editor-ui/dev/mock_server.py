@@ -580,6 +580,22 @@ class Projection:
                 st = dict(self.stop(key))
                 st["deleted"] = True
                 self.stops[key] = st
+            elif op == "merge" and self.stop(key) and self.stop(after.get("into_station_id")):
+                # every platform of the station that goes moves to the one that
+                # stays, keeping its own label; no route row names a station
+                into_id = after["into_station_id"]
+                frm, into = dict(self.stop(key)), dict(self.stop(into_id))
+                if after.get("keep_name") == "from":
+                    into["name"] = frm["name"]
+                if after.get("keep_position") == "from":
+                    into["lat"], into["lon"] = frm["lat"], frm["lon"]
+                self.stops[into_id] = into
+                for sid in self.children(key):
+                    m = dict(self.stop(sid))
+                    m["parent_station"] = into_id
+                    self.stops[sid] = m
+                frm.update(deleted=True, parent_station=None, merged_into=into_id)
+                self.stops[key] = frm
 
 
 def gone(st, sid):
@@ -716,6 +732,28 @@ def validate_change(store, g, ch, before, final, live, route_editors):
         elif isinstance(d, str) and len(d.strip()) > DESCRIPTION_MAX:
             err("description_too_long", f"The description of {what} is longer than {DESCRIPTION_MAX} characters.")
 
+    if e == "station" and op == "merge":
+        into_id = str(after.get("into_station_id") or "")
+        frm, into = before.stop(key), before.stop(into_id)
+        problems = [x for x in (gone(frm, key), gone(into, into_id)) if x]
+        for code, message in problems:
+            err(code, message)
+        if problems:
+            return out
+        kept_name = frm["name"] if after.get("keep_name") == "from" else into["name"]
+        if not before.children(key):
+            err("station_merge_no_platforms",
+                f"{frm['name']} ({key}) has no platforms, so this merge only removes it.", level="warning")
+        d = haversine(frm["lat"], frm["lon"], into["lat"], into["lon"])
+        if d > 500:
+            err("station_merge_far_apart",
+                f"The two station points are {d:,.0f} m apart, more than the 500 m a station is grouped "
+                f"within. Check they are one place.", level="warning", metres=round(d))
+        if norm_name(frm["name"]) != norm_name(into["name"]):
+            err("station_merge_names_differ",
+                f"The names differ: {frm['name']} and {into['name']}. The station that stays is called "
+                f"{kept_name}.", level="warning")
+        return out
     if e == "stop" and op == "merge":
         into_id = str(after.get("into_stop_id") or "")
         frm, into = before.stop(key), before.stop(into_id)
@@ -891,6 +929,16 @@ def conflicts_for(store, cs):
                             "actual": live["row_version"],
                             "message": f"Stop {live['name']} ({key}) was changed by a commit after this edit "
                                        f"was made (version {ch['base_row_version']} → {live['row_version']})."})
+        elif ch["entity"] == "station" and ch["op"] == "merge":
+            after = ch.get("after") or {}
+            for sid, base in ((key, ch.get("base_row_version")),
+                              (after.get("into_station_id"), after.get("into_row_version"))):
+                live_row = store.stops.get((g, sid))
+                if base and live_row and live_row["row_version"] != base:
+                    out.append({"change_id": ch["change_id"], "entity": "station", "entity_key": sid,
+                                "reason": "row_version", "expected": base, "actual": live_row["row_version"],
+                                "message": f"Station {live_row['name']} ({sid}) was changed by a commit after "
+                                           f"this merge was made (version {base} -> {live_row['row_version']})."})
         elif ch["entity"] == "stop" and ch["op"] == "merge":
             after = ch.get("after") or {}
             for sid, base in ((key, ch.get("base_row_version")),
@@ -1145,7 +1193,8 @@ class Handler(BaseHTTPRequestHandler):
             secret = (u or {}).get("totp_secret") or (u or {}).get("pending_secret")
             return self._send(200, {"email": email, "users": [user_out(x) for x in s.users.values()],
                                     "current_code": totp(secret) if secret else None,
-                                    "round5": getattr(s, "round5", None)})
+                                    "round5": getattr(s, "round5", None),
+                                    "station_merge": getattr(s, "station_merge", None)})
         if path == "/__dev/as" and method == "POST":
             email = self._body().get("email") or ""
             return self._send(200, {"ok": True}, [
@@ -1581,6 +1630,15 @@ class Handler(BaseHTTPRequestHandler):
             live = self.store.stops.get((g, key))
             return {"from": stop_out(self.store, g, frm), "into": stop_out(self.store, g, into),
                     "affected": affected}, (live or {}).get("row_version")
+        if entity == "station" and op == "merge":
+            frm, into = proj.stop(key), proj.stop(after["into_station_id"])
+            moving = [{"stop_id": sid, "name": (proj.stop(sid) or {}).get("name"),
+                       "platform_code": (proj.stop(sid) or {}).get("platform_code"),
+                       "route_count": len(proj.routes_using(sid))}
+                      for sid in sorted(proj.children(key))]
+            live = self.store.stops.get((g, key))
+            return {"from": stop_out(self.store, g, frm), "into": stop_out(self.store, g, into),
+                    "moving_platforms": moving}, (live or {}).get("row_version")
         if entity in ("stop", "station"):
             st = proj.stop(key)
             if st is None:
@@ -1625,7 +1683,7 @@ class Handler(BaseHTTPRequestHandler):
         s = self.store
         entity, op, key = b.get("entity"), b.get("op"), str(b.get("entity_key") or "").strip()
         valid = {"stop": {"create", "update", "delete", "merge"}, "route": {"create", "update", "delete"},
-                 "route_stops": {"replace"}, "station": {"create", "update", "delete"}}
+                 "route_stops": {"replace"}, "station": {"create", "update", "delete", "merge"}}
         if entity not in valid or op not in valid[entity]:
             raise ApiError(400, "bad_change", f"'{op}' on '{entity}' is not a change the editor supports.")
         after = b.get("after")
@@ -1680,6 +1738,33 @@ class Handler(BaseHTTPRequestHandler):
                 if st.get("location_type") == 1:
                     raise ApiError(400, "merge_station", f"{st['name']} ({sid}) is a station. Merge its stops instead.")
             after = dict(after, into_stop_id=into_id, keep_name=after.get("keep_name", "into"),
+                         keep_position=after.get("keep_position", "into"))
+        if entity == "station" and op == "merge":
+            into_id = str(after.get("into_station_id") or "").strip()
+            if not into_id:
+                raise ApiError(400, "bad_change", "after.into_station_id is required: the station that stays.")
+            if into_id == key:
+                raise ApiError(400, "invalid_change", "station/merge: a station cannot be merged into itself",
+                               {"code": "merge_same_station"})
+            for k in ("keep_name", "keep_position"):
+                if after.get(k, "into") not in ("into", "from"):
+                    raise ApiError(400, "bad_change", f"{k} must be into or from.")
+            proj = Projection(s, cs["gtfs_id"], cs["changes"])
+            for sid in (key, into_id):
+                st = proj.stop(sid)
+                if not st or st.get("deleted"):
+                    raise ApiError(404, "entity_not_found", f"There is no station {sid}.")
+                if st.get("location_type") != 1:
+                    raise ApiError(400, "not_a_station",
+                                   f"{st['name']} ({sid}) is a stop, not a station; only stations are merged this way.")
+            if proj.stop(into_id).get("parent_station"):
+                raise ApiError(400, "into_station_has_parent",
+                               f"Station {into_id} is itself inside {proj.stop(into_id)['parent_station']}; "
+                               f"a station that stays cannot have a parent.")
+            after = dict(after, into_station_id=into_id,
+                         into_row_version=after.get("into_row_version")
+                         or (s.stops.get((cs["gtfs_id"], into_id)) or {}).get("row_version"),
+                         keep_name=after.get("keep_name", "into"),
                          keep_position=after.get("keep_position", "into"))
         if entity == "route" and op == "delete":
             others = [c for c in cs["changes"] if c["entity_key"] == key and
@@ -1798,6 +1883,13 @@ class Handler(BaseHTTPRequestHandler):
                                 {"review_id": rv["review_id"], "stop_id": rv["stop_id"], "change_id": rv["change_id"],
                                  "feed_version": cs["committed_version"]})
             for ch in cs["changes"]:
+                if ch["entity"] == "station" and ch["op"] == "merge":
+                    moving = (ch.get("before") or {}).get("moving_platforms") or []
+                    s.add_audit(u, "station_merged", cs["gtfs_id"], cs["change_set_id"], {
+                        "change_id": ch["change_id"], "from": ch["entity_key"],
+                        "into": ch["after"]["into_station_id"], "platforms_moved": len(moving),
+                        "keep_name": ch["after"].get("keep_name", "into"),
+                        "keep_position": ch["after"].get("keep_position", "into")})
                 if ch["entity"] == "stop" and ch["op"] == "merge":
                     affected = (ch.get("before") or {}).get("affected") or []
                     s.add_audit(u, "stop_merged", cs["gtfs_id"], cs["change_set_id"], {
@@ -2969,7 +3061,8 @@ def entity_context(self, g, kind, key):
         def touches(ch):
             a = ch.get("after") or {}
             members, _ = member_spec(a) if ch["entity"] == "station" else (None, {})
-            return (ch["entity"] in ("stop", "station") and ch["entity_key"] == key) or a.get("into_stop_id") == key \
+            return (ch["entity"] in ("stop", "station") and ch["entity_key"] == key) \
+                or a.get("into_stop_id") == key or a.get("into_station_id") == key \
                 or key in (members or [])
         return {"stop_id": key, "detour_m": detour_of(calls, key, st["lat"], st["lon"]),
                 "routes_measured": sum(1 for c in calls if c["prev"] and c["next"]),
@@ -3227,6 +3320,79 @@ def seed_round5(store):
 # ====================================================================== end of round 5
 
 
+# ====================================================================== station merge
+SM_KEEP, SM_GONE, SM_FAR = "stn_sm_keep", "stn_sm_gone", "stn_sm_far"
+
+
+def seed_station_merge(store):
+    """Fixtures for merging two stations (docs section 5), from stops no other
+    flow opens:
+
+      - stn_sm_keep and stn_sm_gone: two stations whose points are a few hundred
+        metres apart, each over two platforms, named alike but not identically,
+        so the merge screen has a name choice to offer and the server a
+        `station_merge_names_differ` warning to give;
+      - stn_sm_far: a third station kilometres away, so the far-apart warning can
+        be seen too;
+      - `station_merge` on the dev state names them for the smoke test.
+    """
+    g = next(iter(store.feeds), None)
+    busy = {rv["stop_id"] for rv in store.reviews.values()}
+    for p in store.proposals.values():
+        busy |= {m["stop_id"] for m in p.get("members") or []}
+    for rv in store.reviews.values():
+        busy |= {x.get("stop_id") for x in (rv.get("evidence") or {}).get("shares_point_with") or []}
+        busy |= {c.get("stop_id") for c in (rv.get("evidence") or {}).get("same_name_candidates") or []}
+    free = sorted((st for (gg, sid), st in store.stops.items()
+                   if gg == g and sid not in busy and not st.get("deleted") and st.get("location_type") == 0
+                   and not st.get("parent_station") and store.stop_routes.get((g, sid))),
+                  key=lambda st: st["stop_id"])
+    if len(free) < 6:
+        return
+    grid = {}
+    for st in free:
+        grid.setdefault((int(st["lat"] * 200), int(st["lon"] * 200)), []).append(st)
+    found = None
+    for st in free:
+        cx, cy = int(st["lat"] * 200), int(st["lon"] * 200)
+        near = sorted((o for dx in (-1, 0, 1) for dy in (-1, 0, 1) for o in grid.get((cx + dx, cy + dy), [])
+                       if o is not st and haversine(st["lat"], st["lon"], o["lat"], o["lon"]) <= 400),
+                      key=lambda o: o["stop_id"])
+        if len(near) >= 3:
+            found = (st, *near[:3])
+            break
+    if not found:
+        return
+    a, b, c, d = found
+    far = next((o for o in reversed(free) if o not in found
+                and haversine(a["lat"], a["lon"], o["lat"], o["lon"]) > 4000), None)
+
+    def station(sid, name, members):
+        store.stops[(g, sid)] = {
+            "gtfs_id": g, "stop_id": sid, "stop_code": sid, "name": name,
+            "lat": round(sum(m["lat"] for m in members) / len(members), 7),
+            "lon": round(sum(m["lon"] for m in members) / len(members), 7),
+            "location_type": 1, "parent_station": None, "platform_code": None, "description": None, "cluster_id": None,
+            "regional_name": None, "hindi_name": None, "position_source": "mock-fixture", "row_version": 1,
+            "deleted": False}
+        for n, m in enumerate(members, start=1):
+            m["parent_station"] = sid
+            m["platform_code"] = m.get("platform_code") or f"Platform {n}"
+
+    station(SM_KEEP, f"{a['name']} (north)", [a, b])
+    station(SM_GONE, f"{a['name']} (south)", [c, d])
+    if far:
+        store.stops[(g, SM_FAR)] = dict(store.stops[(g, SM_KEEP)], stop_id=SM_FAR, stop_code=SM_FAR,
+                                        name=f"{far['name']} (far)", lat=far["lat"], lon=far["lon"])
+        far["parent_station"] = SM_FAR
+        far["platform_code"] = far.get("platform_code") or "Platform 1"
+    store.stops_stamp += 1
+    store.station_merge = {"keep": SM_KEEP, "gone": SM_GONE, "far": SM_FAR if far else None,
+                           "keep_platforms": [a["stop_id"], b["stop_id"]],
+                           "gone_platforms": [c["stop_id"], d["stop_id"]]}
+# ====================================================================== end of station merge
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -3238,6 +3404,7 @@ def main():
         Handler.store = Store(json.load(fh))
     seed_round4(Handler.store)
     seed_round5(Handler.store)
+    seed_station_merge(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
     ThreadingHTTPServer(("127.0.0.1", args.port), PolicyHandler).serve_forever()
 

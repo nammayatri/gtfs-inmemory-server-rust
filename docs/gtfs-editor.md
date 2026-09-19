@@ -217,9 +217,9 @@ station answers as the platform that survived it - not as the whole station,
 which would widen the answer behind the caller's back. A station whose platform
 was merged away lists only what is live, on the same poll that brings the merge
 in. (The editor refuses `stop/merge` on a station - `stop_is_station`, "only
-stops are merged" - so a retired station code can only come from a row deleted
-with `merged_into` provenance some other way; the alias map is built from those
-rows whatever wrote them.)
+stops are merged". A retired *station* code comes from `station/merge`, section
+5's "Merging duplicate stations", which writes the same `merged_into` provenance;
+the alias map is built from those rows whatever wrote them.)
 
 **A preprocessed feed has no station map at all.** Its stops carry `stationId`
 (metro platforms point at their station) but no row is `location_type = 1`, so
@@ -364,7 +364,9 @@ Audit actions: `seed`, `release`, `user_bootstrapped`, `user_created`,
 `{feed_version, changes, applied, self_approved}`), and from
 sections 5 and 6: `bulk_imported` (`{kind, rows, changes, first_change_id,
 last_change_id}`), `stop_merged` (one per merge at commit: `{change_id, from, into,
-routes, rows, keep_name, keep_position}`), `station_proposal_approved`,
+routes, rows, keep_name, keep_position}`), `station_merged` (one per station merge
+at commit: `{change_id, from, into, platforms_moved, keep_name, keep_position}`),
+`station_proposal_approved`,
 `station_proposal_rejected`, `station_proposal_reopened`,
 `station_proposal_returned` (`detail.reason` is `change_removed` or
 `change_set_discarded`) and `station_proposal_committed`. Approving an area
@@ -475,7 +477,9 @@ Settled while implementing (self-approval):
 
 A change is `{entity, op, entity_key, after, base_row_version?}`. Its `before` is
 a snapshot in read shape: the stop or route row; for a station, the row plus
-`member_stop_ids`; for `route_stops`, the route detail's `rows` list.
+`member_stop_ids`; for `route_stops`, the route detail's `rows` list. A merge's
+`before` is both sides and what moves - `{from, into, affected}` for a stop,
+`{from, into, moving_platforms}` for a station (section 5).
 
 | entity / op | `after` | validation |
 |---|---|---|
@@ -618,6 +622,7 @@ back afterwards. `--only map,stations,...` runs a subset.
 | `route` / `delete` | `null` | soft delete (`deleted = true`); refused while another pending change in the set edits the route |
 | `station` / `create`, `update` | may carry `members: [{stop_id, platform_code?}]` instead of `member_stop_ids` | as before; `platform_code` ≤ 120 chars; a station change that came from a proposal carries `proposal_id` |
 | `stop` / `merge` | `{into_stop_id, into_row_version, keep_name?: "into"\|"from", keep_position?: "into"\|"from", position_review_id?}` | see *Merging duplicate stops* below; `position_review_id` is stored and ignored, as on `stop/update` (section 8.2) |
+| `station` / `merge` | `{into_station_id, into_row_version, keep_name?: "into"\|"from", keep_position?: "into"\|"from"}` | see *Merging duplicate stations* below; `entity_key` = the station that goes away. Both ids are live stations (`not_a_station`, `station_not_found`, `station_deleted`), different (`merge_same_station`), and the one that stays has no parent (`into_station_has_parent`). No route row moves |
 
 Settled while implementing:
 
@@ -710,6 +715,104 @@ guess.
   provenance is what the GIMS loader turns into a stop alias, so every public
   read for the old id answers with the stop that survived - section 1,
   "Merged-away stop ids keep answering".
+
+### Merging duplicate stations (2026-09-19)
+
+`station` / `merge` merges one station into another: every platform of the
+station that goes away becomes a platform of the one that stays, keeping its own
+`platform_code`, and the station that goes is soft-deleted. It is a **separate
+change type**, not a loosening of `stop` / `merge`, which still refuses a station
+on either side (`stop_is_station`, "only stops are merged") exactly as it always
+has. Nothing about merging two stops changes.
+
+**Route rows are never touched.** `gtfs_route_stop` only ever names platforms
+(section 1), a platform's id does not change here, and so no route, no fare stage
+and no stop list moves. That is why this op has no `merge_would_repeat_stop`, no
+`merge_same_route_twice` and no `affected` routes: there is nothing to repeat.
+
+- `entity_key` = the station that goes away (the "from" station);
+  `base_row_version` = its `row_version`; `after` is
+  `{into_station_id, into_row_version, keep_name?: "into"|"from",
+  keep_position?: "into"|"from"}`. `into_row_version` is filled from the live row
+  when left out, as on `stop` / `merge`; `keep_name` and `keep_position` default
+  to `"into"`. No other key is accepted (a station merge carries no
+  `position_review_id`: a coordinate review is about one stop's point).
+- `before` (read shape) = `{from: <station row>, into: <station row>,
+  moving_platforms: [{stop_id, name, platform_code, route_count}]}` - the live
+  platforms that would change parent, in id order, each with the number of live
+  routes through it. A platform an earlier merge already retired is not live and
+  is not listed.
+- **Errors**: both ids exist (`station_not_found`), are not deleted
+  (`station_deleted`) and are `location_type = 1` (`not_a_station`, whose message
+  and key name **which** id is the stop); they are different ids
+  (`merge_same_station`, a shape check when the change is added); and the station
+  that stays has no `parent_station` of its own (`into_station_has_parent`) -
+  otherwise the platforms would land on a station that is itself a platform.
+  `station_merged_away` on any later change in the same draft that uses the from
+  station (a station update, delete or merge).
+- **Warnings**: `station_merge_far_apart` (the two station points more than
+  **500 m** apart; the message says the distance), `station_merge_names_differ`,
+  `station_merge_no_platforms` (the from station has no live platforms, so the
+  merge is really just a delete) and `station_merge_pending_proposal` (a
+  `gtfs_station_proposal` still `pending` names either station as its
+  `station_id` or lists it among its members; the message names the proposals).
+  As everywhere, a warning never blocks submit or commit.
+- **Apply** (preview replay and commit, the same code path):
+  1. `UPDATE gtfs_stop SET parent_station = into WHERE parent_station = from AND
+     NOT deleted`. Each platform keeps its own `platform_code`: the label says
+     which way the buses there go, which the merge does not change.
+  2. `keep_name` / `keep_position` `"from"` copy the from station's name /
+     lat+lon onto the kept station.
+  3. The from station: `deleted = true`, `parent_station = NULL`, provenance
+     `{"merged_into": into}`.
+- **Commit** checks both `row_version`s; a mismatch is 409 `change_set_conflicts`
+  in the usual conflict shape, `entity` `station` (the kept station's conflict has
+  its own id as `entity_key` and says "kept by the merge of &lt;from&gt;"). Commit
+  audits `station_merged` with `{from, into, platforms_moved, keep_name,
+  keep_position}`.
+- **It composes with section 1, in one order: alias first, expansion second.**
+  Step 3 writes the *same* `merged_into` provenance key a stop merge writes, so
+  the loader's alias map picks the retired station code up unchanged, and what it
+  resolves to is a live station, which the station map then expands. So
+  `GET /stop/{g}/<old station>` answers with the surviving **station row**, and
+  `GET /route-stop-mapping/{g}/stop/<old station>` answers with the **survivor's**
+  platforms (`X-Stop-Alias` and `X-Stop-Expanded` both set). A platform merged
+  away *before* its station was merged still resolves to the platform that
+  survived it, not to the whole station. `tests/editor_station_merge_flow.rs`
+  asserts all three against a real feed load.
+
+Settled while implementing:
+
+- **Why 500 m for `station_merge_far_apart`, and not the 150 m a stop merge
+  uses.** The stop threshold is about two kerbs, which are the same piece of
+  pavement or they are not. A station point is the centroid of its platforms, and
+  `build_stations` (section 6) already groups same-named stops within a 500 m
+  diameter, so two stations that are really one place have their points inside
+  that same 500 m; a wider gap is a grouping the builder deliberately did not
+  make. Measured on the local `chennai_bus` seed's 2,258 station proposals
+  (`spread_m` median 32 m, p90 254 m, p99 475 m): of the 95 pairs of proposals
+  that share a name, **0 are within 250 m** of each other point to point, **10
+  are within 500 m**, and the median gap is 1,018 m (max 52 km - the same name in
+  two parts of the city). So 500 m stays quiet for exactly the ten plausible
+  merges and warns on the other 85. 150 m or 250 m would have warned on all 95,
+  which is a warning nobody reads.
+- The change type is `station` / `merge` with its own `after` field
+  (`into_station_id`, not `into_stop_id`) so that nothing which dispatches on
+  `into_stop_id` - the draft view, the pending overlay, the coordinate reviews -
+  silently treats a station merge as a stop merge.
+- A station a draft merges away is gone for that draft's later changes, exactly
+  as a merged stop is: the finding is `station_merged_away`, the station version
+  of `stop_merged_away`, and it names the station that survived.
+- A **deleted** platform whose `parent_station` was the from station keeps
+  pointing at it: the from station's row stays (soft delete), so the reference is
+  still valid, and only live platforms move. A station's `before` and
+  `station-children` both list live platforms only, so nothing downstream sees it.
+- The dashboard's station page offers "Merge into another station…" beside "Edit
+  station" and "Dissolve station"; a plain stop is offered "Merge with a
+  duplicate…" as before, and neither is offered the other. The nearby list on a
+  station offers "Merge…" against a nearby **station**, as the one on a stop does
+  against a nearby stop. `editor-ui/js/station_merge.js` is the screen; the stop
+  picker takes `kind: "station"` to search and click stations only.
 
 ### Bulk import — preview, then add to a draft
 
