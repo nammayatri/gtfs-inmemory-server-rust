@@ -158,6 +158,7 @@ export async function showStop(stopId) {
   const actions = editor ? h("div.btn-row",
     isStation
       ? [h("button.btn", { type: "button", on: { click: () => editStation(live) } }, "Edit station"),
+         h("a.btn.secondary", { href: `#/station-merge/${enc(live.stop_id)}` }, "Merge into another station…"),
          h("button.btn.danger", { type: "button", on: { click: () => dissolveStation(live) } }, "Dissolve station")]
       : [h("button.btn", { type: "button", on: { click: () => editStop(live) } }, "Edit stop"),
          h("a.btn.secondary", { href: `#/merge/${enc(live.stop_id)}` }, "Merge with a duplicate…"),
@@ -194,7 +195,7 @@ export async function showStop(stopId) {
       pendingNotice(o.actions, {
         current: live,
         intro: o.gone
-          ? `Your draft “${draftTitle()}” ${o.gone.kind === "merge" ? `merges this stop into ${o.gone.into_stop_id}` : o.gone.kind === "dissolve" ? "dissolves this station" : `deletes this ${what}`}. It is still live until the draft is committed.`
+          ? `Your draft “${draftTitle()}” ${o.gone.kind === "merge" ? `merges this stop into ${o.gone.into_stop_id}` : o.gone.kind === "station_merge" ? `merges this station into ${o.gone.into_stop_id}` : o.gone.kind === "dissolve" ? "dissolves this station" : `deletes this ${what}`}. It is still live until the draft is committed.`
           : `Your draft changes this ${what}. It is shown as it will be once the draft is committed, with what is live now marked “live”.`,
       }),
       live.deleted ? h("p.notice", "This stop has been removed from the feed.") : null,
@@ -241,7 +242,9 @@ export async function showStop(stopId) {
       h("span.hint", n.location_type === 1 ? "station" : plural(n.route_count, "route")),
       editor && !isStation && n.location_type === 0
         ? h("a.btn.quiet.small", { href: `#/merge/${enc(live.stop_id)}?with=${enc(n.stop_id)}`, "aria-label": `Merge ${live.name} with ${n.name} (${n.stop_id})` }, "Merge…")
-        : null),
+        : editor && isStation && n.location_type === 1
+          ? h("a.btn.quiet.small", { href: `#/station-merge/${enc(live.stop_id)}?with=${enc(n.stop_id)}`, "aria-label": `Merge ${live.name} into ${n.name} (${n.stop_id})` }, "Merge…")
+          : null),
     h("span.sub", `${n.stop_id}${n.platform_code ? `, ${n.platform_code}` : ""}`)));
   clear(nearbyBox, live.nearby.length ? [platformsNote(stations, live.nearby.length), list] : h("p.empty", "None."));
 }

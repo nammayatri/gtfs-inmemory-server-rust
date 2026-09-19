@@ -33,7 +33,7 @@ function build() {
   if (index && state.draft === indexedFor) return index;
   indexedFor = state.draft;
   stamp += 1;
-  index = { byKey: new Map(), absorbs: new Map(), joins: new Map(), leaves: new Map(), routes: new Set() };
+  index = { byKey: new Map(), absorbs: new Map(), stationAbsorbs: new Map(), movesTo: new Map(), joins: new Map(), leaves: new Map(), routes: new Set() };
   for (const c of (state.draft && state.draft.changes) || []) {
     push(index.byKey, `${c.entity}|${c.entity_key}`, c);
     const after = c.after || {};
@@ -43,7 +43,12 @@ function build() {
       // the routes a merge switches to the stop that stays
       ((c.before && c.before.affected) || []).forEach((r) => index.routes.add(r.route_id));
     }
-    if (c.entity === "station") {
+    if (c.entity === "station" && c.op === "merge" && after.into_station_id) {
+      push(index.stationAbsorbs, after.into_station_id, c);
+      // the platforms the merge re-parents: each one shows it on its own page
+      ((c.before && c.before.moving_platforms) || []).forEach((p) => index.movesTo.set(p.stop_id, c));
+    }
+    if (c.entity === "station" && c.op !== "merge") {
       const was = (c.before && (c.before.member_stop_ids || (c.before.members || []).map((m) => m.stop_id))) || [];
       const now = c.op === "delete" ? [] : memberSpec(after);
       if (now) {
@@ -91,6 +96,11 @@ export function pendingActions(entity, key) {
     if (entity === "stop" || entity === "station") {
       if (c.op === "create") out.push({ ...base, kind: "create", lat: a.lat, lon: a.lon, name: a.name, members: memberSpec(a) });
       else if (c.op === "delete") out.push({ ...base, kind: entity === "station" ? "dissolve" : "delete" });
+      else if (c.op === "merge" && entity === "station") out.push({ ...base, kind: "station_merge", into_stop_id: a.into_station_id,
+        keep_name: a.keep_name || "into", keep_position: a.keep_position || "into",
+        platforms: ((c.before && c.before.moving_platforms) || []).length,
+        lat: c.before && c.before.into ? c.before.into.lat : null, lon: c.before && c.before.into ? c.before.into.lon : null,
+        into_name: c.before && c.before.into ? c.before.into.name : null });
       else if (c.op === "merge") out.push({ ...base, kind: "merge", into_stop_id: a.into_stop_id, keep_name: a.keep_name || "into", keep_position: a.keep_position || "into",
         lat: c.before && c.before.into ? c.before.into.lat : null, lon: c.before && c.before.into ? c.before.into.lon : null,
         into_name: c.before && c.before.into ? c.before.into.name : null });
@@ -109,7 +119,22 @@ export function pendingActions(entity, key) {
       out.push({ ...base, kind: "stops", rows: (a.rows || []).length });
     }
   }
+  if (entity === "station") {
+    for (const c of idx.stationAbsorbs.get(key) || []) {
+      const a = c.after || {};
+      const from = (c.before && c.before.from) || {};
+      out.push({ kind: "station_absorb", change_id: c.change_id, from_stop_id: c.entity_key, from_name: from.name || null,
+        keep_name: a.keep_name || "into", keep_position: a.keep_position || "into",
+        platforms: ((c.before && c.before.moving_platforms) || []).length,
+        lat: from.lat ?? null, lon: from.lon ?? null });
+    }
+  }
   if (entity === "stop") {
+    const movedBy = idx.movesTo.get(key);
+    if (movedBy) {
+      out.push({ kind: "moved_station", change_id: movedBy.change_id, station_id: (movedBy.after || {}).into_station_id,
+        from_station_id: movedBy.entity_key });
+    }
     for (const c of idx.absorbs.get(key) || []) {
       const a = c.after || {};
       const from = (c.before && c.before.from) || {};
@@ -138,8 +163,9 @@ export function applyToStop(stop) {
     if (a.kind === "move") { put("lat", a.lat); put("lon", a.lon); }
     else if (a.kind === "rename") put("name", a.name);
     else if (a.kind === "edit") a.fields.forEach((k) => put(k, a.values[k]));
-    else if (a.kind === "delete" || a.kind === "dissolve" || a.kind === "merge") gone = a;
-    else if (a.kind === "absorb") {
+    else if (a.kind === "delete" || a.kind === "dissolve" || a.kind === "merge" || a.kind === "station_merge") gone = a;
+    else if (a.kind === "moved_station") put("parent_station", a.station_id);
+    else if (a.kind === "absorb" || a.kind === "station_absorb") {
       if (a.keep_name === "from" && a.from_name) put("name", a.from_name);
       if (a.keep_position === "from" && a.lat != null) { put("lat", a.lat); put("lon", a.lon); }
     } else if (a.kind === "join") {
@@ -176,7 +202,8 @@ export function touchedStops(stops) {
   const idx = build();
   for (const s of stops) {
     if (!s || !s.stop_id || s.draft) continue;
-    if (!idx.byKey.has(`stop|${s.stop_id}`) && !idx.byKey.has(`station|${s.stop_id}`) && !idx.absorbs.has(s.stop_id)) continue;
+    if (!idx.byKey.has(`stop|${s.stop_id}`) && !idx.byKey.has(`station|${s.stop_id}`)
+      && !idx.absorbs.has(s.stop_id) && !idx.stationAbsorbs.has(s.stop_id) && !idx.movesTo.has(s.stop_id)) continue;
     const o = applyToStop(s);
     if (o.moved || o.gone || o.changed.has("name")) out.set(s.stop_id, o);
   }
@@ -194,7 +221,9 @@ export function draftedParents(stops) {
   for (const s of stops) {
     if (!s || !s.stop_id) continue;
     const join = idx.joins.get(s.stop_id);
+    const movedBy = idx.movesTo.get(s.stop_id);
     if (join && !join.already) out.set(s.stop_id, { parent_station: join.change.entity_key, change: join.change });
+    else if (movedBy) out.set(s.stop_id, { parent_station: (movedBy.after || {}).into_station_id, change: movedBy });
     else if (!join && idx.leaves.has(s.stop_id)) out.set(s.stop_id, { parent_station: null, change: idx.leaves.get(s.stop_id) });
   }
   return out;
@@ -204,6 +233,7 @@ export function draftedParents(stops) {
 const KEY = {
   move: "Move", split: "Split", merge: "Merge", rename: "Rename", edit: "Edit", delete: "Delete", dissolve: "Dissolve",
   create: "New", absorb: "Merge", join: "Station", leave: "Station", relabel: "Platform", members: "Stops", stops: "Stop list",
+  station_merge: "Merge", station_absorb: "Merge", moved_station: "Station",
 };
 const FIELD_WORDS = {
   platform_code: "platform label", description: "description", cluster_id: "cluster", regional_name: "Tamil name", hindi_name: "Hindi name",
@@ -223,6 +253,13 @@ export function actionLine(a, ctx = {}) {
       ". Its routes switch to that stop and this one goes away.");
     case "absorb": return h("span", "Stop ", stopLink(a.from_stop_id, a.from_name ? `${a.from_name} (${a.from_stop_id})` : a.from_stop_id), " is merged into this stop",
       a.keep_name === "from" || a.keep_position === "from" ? `, which takes its ${[a.keep_name === "from" ? "name" : null, a.keep_position === "from" ? "position" : null].filter(Boolean).join(" and ")}` : "", ".");
+    case "station_merge": return h("span", "Merges this station into ", stopLink(a.into_stop_id, a.into_name ? `${a.into_name} (${a.into_stop_id})` : a.into_stop_id),
+      `. Its ${plural(a.platforms ?? 0, "platform")} move${a.platforms === 1 ? "s" : ""} to that station and this one goes away. No route changes.`);
+    case "station_absorb": return h("span", "Station ", stopLink(a.from_stop_id, a.from_name ? `${a.from_name} (${a.from_stop_id})` : a.from_stop_id),
+      ` is merged into this station, which takes its ${plural(a.platforms ?? 0, "platform")}`,
+      a.keep_name === "from" || a.keep_position === "from" ? ` and its ${[a.keep_name === "from" ? "name" : null, a.keep_position === "from" ? "point" : null].filter(Boolean).join(" and ")}` : "", ".");
+    case "moved_station": return h("span", "Moves from station ", stopLink(a.from_station_id), " to ", stopLink(a.station_id),
+      ", which absorbs it. Its platform label and its routes do not change.");
     case "rename": return h("span", `Renames it to “${a.name}”.`);
     case "edit": return h("span", `Changes the ${a.fields.map((k) => (k in FIELD_WORDS ? FIELD_WORDS[k] : k)).filter(Boolean).join(", ")}.`);
     case "delete": return h("span", "Deletes it.");
@@ -249,10 +286,10 @@ export function actionsList(actions, ctx = {}) {
 
 // A marker for each action that has a place: [{lat, lon, label}].
 export function draftedPoints(actions) {
-  return actions.filter((a) => a.lat != null && a.lon != null && ["move", "split", "merge", "create"].includes(a.kind)).map((a) => ({
+  return actions.filter((a) => a.lat != null && a.lon != null && ["move", "split", "merge", "station_merge", "create"].includes(a.kind)).map((a) => ({
     lat: a.lat, lon: a.lon,
     label: a.kind === "move" ? "Moved here in the draft" : a.kind === "split" ? `New stop ${a.new_stop_id}, in the draft`
-      : a.kind === "merge" ? `Merges into ${a.into_stop_id}, in the draft` : "New, in the draft",
+      : a.kind === "merge" || a.kind === "station_merge" ? `Merges into ${a.into_stop_id}, in the draft` : "New, in the draft",
   }));
 }
 

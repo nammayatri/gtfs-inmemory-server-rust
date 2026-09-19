@@ -76,6 +76,7 @@ const KIND_LABEL = {
   "stop:merge": ["stop merge", "stop merges"], "route:create": ["new route", "new routes"], "route:update": ["route edit", "route edits"],
   "route:delete": ["route deleted", "routes deleted"], "route_stops:replace": ["stop list change", "stop list changes"],
   "station:create": ["new station", "new stations"], "station:update": ["station edit", "station edits"], "station:delete": ["station dissolved", "stations dissolved"],
+  "station:merge": ["station merge", "station merges"],
   "feed_config:update": ["feed data source switch", "feed data source switches"],
 };
 const kindOf = (ch) => `${ch.entity}:${ch.op}`;
@@ -334,11 +335,12 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   let title;
   if (feedConfig) title = `Data source of feed ${ch.entity_key}`;
   else if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
+  else if (ch.entity === "station" && ch.op === "merge") title = `Station ${(b.from && b.from.name) || ch.entity_key} merged`;
   else if (reviewMove) title = `Moved ${b.name || ch.entity_key} ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))}`;
   else if (ch.entity === "route_stops" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
   else title = `${ENTITY_LABEL[ch.entity]} ${a.name || b.name || ch.entity_key}`;
   const link = feedConfig ? "#/feed-settings" : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
-    : ch.op === "merge" ? `#/stop/${enc(a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
+    : ch.op === "merge" ? `#/stop/${enc(a.into_station_id || a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
   const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
     const extra = fromProposal ? " The suggested station goes back to the list of stations to review."
@@ -362,6 +364,7 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
         `: ${(b.from && b.from.name) || ch.entity_key} (${ch.entity_key}) was probably in the wrong place, and a stop of the same name is where its routes pass.`),
       mergeDiff(ch));
   } else if (ch.entity === "stop" && ch.op === "merge") body = mergeDiff(ch);
+  else if (ch.entity === "station" && ch.op === "merge") body = stationMergeDiff(ch);
   else if (reviewMove) {
     body = h("div", { style: "display:grid;gap:10px" },
       h("p", "From ", h("a", { href: `#/coordinates/${enc(a.position_review_id)}` }, `coordinate review #${a.position_review_id}`),
@@ -486,6 +489,40 @@ function mergeDiff(ch) {
             h("span.hint", stopsWord(r.sequences || [])))))
         : h("p.empty", "No route used the removed stop."),
       affected.length > 40 ? h("p.hint", `and ${fmtCount(affected.length - 40)} more routes.`) : null),
+    both ? insetEl({
+      points: [{ lat: from.lat, lon: from.lon, color: "#b42318", label: `goes: ${from.stop_id}` }, { lat: into.lat, lon: into.lon, label: `stays: ${into.stop_id}` }],
+      lines: [{ pts: [[from.lat, from.lon], [into.lat, into.lon]], color: "#14252a", dashed: true, weight: 2 }],
+      maxZoom: 19,
+    }) : null);
+}
+
+// A station merge: which id stays, which platforms move and where they go. No
+// route row moves - a route's stop list names platforms, never a station.
+function stationMergeDiff(ch) {
+  const b = ch.before || {}, a = ch.after || {};
+  const from = b.from || { stop_id: ch.entity_key }, into = b.into || { stop_id: a.into_station_id };
+  const moving = b.moving_platforms || [];
+  const keptName = a.keep_name === "from" ? from.name : into.name;
+  const keptAt = a.keep_position === "from" ? from : into;
+  const both = from.lat != null && into.lat != null;
+  return h("div.change-grid",
+    h("div", { style: "display:grid;gap:10px" },
+      h("p", h("strong", `${from.name || from.stop_id} (${from.stop_id}) merged into ${into.name || into.stop_id} (${into.stop_id})`),
+        `, ${plural(moving.length, "platform")} moved.`),
+      h("dl.facts",
+        h("dt", "Stays"), h("dd", `${into.stop_id}, named ${keptName || into.stop_id}`),
+        keptAt.lat != null ? [h("dt", "At"), h("dd", `${fmtCoord(keptAt.lat)}, ${fmtCoord(keptAt.lon)}, the point of ${keptAt.stop_id}`)] : null,
+        both ? [h("dt", "Apart"), h("dd", fmtMetres(haversine(from.lat, from.lon, into.lat, into.lon)))] : null,
+        h("dt", "Removed"), h("dd", from.stop_id),
+        h("dt", "Routes"), h("dd", "unchanged: a route calls at a platform, never at a station")),
+      moving.length
+        ? h("ul.list.platform-move", moving.slice(0, 40).map((p) => h("li.list-item",
+            h("span.key", p.platform_code || "no label"),
+            h("a", { href: `#/stop/${enc(p.stop_id)}` }, p.name || p.stop_id),
+            h("span.hint", plural(p.route_count || 0, "route")),
+            h("span.sub", p.stop_id))))
+        : h("p.empty", "The station that goes had no platforms; the merge only removes it."),
+      moving.length > 40 ? h("p.hint", `and ${fmtCount(moving.length - 40)} more platforms.`) : null),
     both ? insetEl({
       points: [{ lat: from.lat, lon: from.lon, color: "#b42318", label: `goes: ${from.stop_id}` }, { lat: into.lat, lon: into.lon, label: `stays: ${into.stop_id}` }],
       lines: [{ pts: [[from.lat, from.lon], [into.lat, into.lon]], color: "#14252a", dashed: true, weight: 2 }],
