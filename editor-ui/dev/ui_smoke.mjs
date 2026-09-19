@@ -1206,6 +1206,10 @@ async function round5Flows() {
 // and the webhooks GIMS calls when an edit goes live everywhere.
 // `node dev/ui_smoke.mjs --delivery` runs only these, as the admin.
 async function deliveryFlows() {
+  // The page only has a live version for the pods to follow when the feed is served
+  // from the DB, and the feed-config flow above leaves chennai_bus on "preprocessed".
+  // State this flow's precondition instead of depending on the order flows run in.
+  await evaluate(`fetch("/__dev/feed-source", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ gtfs_id: "chennai_bus", data_source: "db" }) }).then(() => true)`);
   await go("#/delivery");
   await waitFor(`document.querySelector("#page h1")?.innerText === "Delivery"`, "the Delivery page opens");
   check((await text("#page")).includes("Pods"), "it shows the pods section");
