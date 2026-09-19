@@ -133,6 +133,21 @@ pub struct AppConfig {
     /// Directory the dashboard's static files are served from.
     #[serde(default)]
     pub gtfs_editor_ui_dir: Option<String>,
+    /// Longest an ops ETA override may run. Bounds the failure mode where an override set
+    /// during a disruption outlives it because nobody came back to clear it.
+    #[serde(default)]
+    pub max_eta_override_seconds: Option<u64>,
+}
+
+/// 12 hours — longer than any single disruption an ops shift would sit through, short enough
+/// that a forgotten override cannot survive into the next day.
+const MAX_ETA_OVERRIDE_SECONDS_DEFAULT: u64 = 43200;
+
+impl AppConfig {
+    pub fn max_eta_override_seconds(&self) -> u64 {
+        self.max_eta_override_seconds
+            .unwrap_or(MAX_ETA_OVERRIDE_SECONDS_DEFAULT)
+    }
 }
 
 fn default_preprocessed_data_dir() -> String {
