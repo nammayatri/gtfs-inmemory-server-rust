@@ -236,6 +236,7 @@ export const ACTION_LABEL = {
   webhook_updated: "Changed a webhook",
   webhook_deleted: "Deleted a webhook",
   webhook_tested: "Sent a test webhook call",
+  webhook_settings_updated: "Changed where GIMS may send webhooks",
 };
 
 // Maker-checker set aside: these rows stand out in the history.

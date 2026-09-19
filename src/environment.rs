@@ -140,15 +140,20 @@ pub struct AppConfig {
     ///
     /// Off by default. Turning it on also needs a non-empty
     /// `gtfs_webhook_allowed_hosts`: see that field.
+    ///
+    /// Only the **seed**: a saved `gtfs_webhook_settings` row supersedes it,
+    /// and from then on this value does nothing (docs section 12.5).
     #[serde(default)]
     pub gtfs_webhooks_enabled: bool,
-    /// Hosts a webhook may call. A dashboard admin chooses the URL, but only
-    /// within this list, so the deployment - not the dashboard alone - decides
-    /// where GIMS may send a request. An entry written `.example.com` matches
-    /// that domain and its subdomains.
+    /// Hosts a webhook may call. An entry written `.example.com` matches that
+    /// domain and its subdomains.
     ///
     /// Empty (the default) means no webhook can fire, even with
     /// `gtfs_webhooks_enabled = True`: the feature fails closed.
+    ///
+    /// Only the **seed**, on the same terms as `gtfs_webhooks_enabled`: this
+    /// is the list in force until an admin saves one from the dashboard, and
+    /// is ignored afterwards.
     #[serde(default)]
     pub gtfs_webhook_allowed_hosts: Vec<String>,
     /// How this pod identifies itself when it reports which feed version it is
@@ -160,7 +165,9 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// The deployment's webhook policy, as the dispatcher reads it.
+    /// The deployment's webhook policy, which seeds
+    /// `services::webhook::LivePolicy` and is what is in force only while no
+    /// `gtfs_webhook_settings` row has been saved.
     pub fn webhook_policy(&self) -> crate::services::webhook::WebhookPolicy {
         crate::services::webhook::WebhookPolicy {
             enabled: self.gtfs_webhooks_enabled,

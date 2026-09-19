@@ -11,15 +11,15 @@
 //! would not make it safer, because the risk here is not a bad edit reaching
 //! passengers but GIMS being pointed at a host it should not call.
 //!
-//! That risk is answered where it belongs, in the deployment: a URL must match
-//! `gtfs_webhook_allowed_hosts` from the dhall config, checked when it is saved
-//! and again when the request is about to go out. A dashboard admin chooses the
-//! URL within that list, and cannot widen the list. Every change is audited.
+//! That risk is answered by the allow-list: a URL must match one of its hosts,
+//! checked when it is saved and again when the request is about to go out. The
+//! list itself is [`settings_update`] - admin only, and audited like every
+//! other change here.
 
 use super::auth::{self, Ctx, Role};
 use super::error::{EditorError, EditorResult};
 use super::EditorState;
-use crate::services::webhook::{self, check_host, fleet_from, PodState};
+use crate::services::webhook::{self, check_host, fleet_from, EffectivePolicy, PodState};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -122,11 +122,17 @@ fn check_headers(headers: &Value) -> EditorResult<()> {
     Ok(())
 }
 
-/// A URL is usable if this deployment allows its host *and* every placeholder
-/// in it can be resolved right now. Catching a missing environment variable
-/// here, rather than at the first delivery, is the difference between a typo
-/// the admin sees immediately and a cache that silently never refreshes.
-fn check_url(state: &EditorState, url: &str) -> EditorResult<()> {
+/// The policy in force. Read per call rather than held anywhere, because this
+/// same API edits it: a list read a moment ago may already be the wrong one.
+async fn live_policy(state: &EditorState) -> EffectivePolicy {
+    state.webhook_policy.get(&state.pool).await
+}
+
+/// A URL is usable if the allow-list in force covers its host *and* every
+/// placeholder in it can be resolved right now. Catching a missing environment
+/// variable here, rather than at the first delivery, is the difference between
+/// a typo the admin sees immediately and a cache that silently never refreshes.
+async fn check_url(state: &EditorState, url: &str) -> EditorResult<()> {
     let mut probe = Map::new();
     for (k, v) in [
         ("gtfs_id", json!("probe")),
@@ -141,8 +147,8 @@ fn check_url(state: &EditorState, url: &str) -> EditorResult<()> {
     }
     let resolved = webhook::resolve(url, &probe)
         .map_err(|e| bad("invalid_url", format!("the URL cannot be resolved: {e}")))?;
-    check_host(&resolved, &state.webhook_policy.allowed_hosts)
-        .map_err(|e| bad("host_not_allowed", e))?;
+    let allowed = live_policy(state).await.policy.allowed_hosts;
+    check_host(&resolved, &allowed).map_err(|e| bad("host_not_allowed", e))?;
     Ok(())
 }
 
@@ -174,6 +180,21 @@ const COLS: &str = "webhook_id, gtfs_id, name, event, url, method, headers, body
      stale_after_seconds, settle_seconds, give_up_after_seconds, request_timeout_seconds, \
      max_attempts, created_at, created_by, updated_at, updated_by";
 
+/// The policy in force, as the API reports it everywhere. `source` is the
+/// whole point of the shape: an operator looking at an allow-list needs to know
+/// whether changing it here will do anything, or whether they are reading the
+/// deployment's values because nobody has saved any yet.
+fn policy_json(effective: &EffectivePolicy) -> Value {
+    json!({
+        "enabled": effective.policy.enabled,
+        "allowed_hosts": effective.policy.allowed_hosts,
+        "active": effective.policy.is_active(),
+        "source": effective.source.as_str(),
+        "updated_at": effective.updated_at,
+        "updated_by": effective.updated_by,
+    })
+}
+
 pub async fn list(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> {
     let rows = sqlx::query(&format!(
         "SELECT {COLS} FROM gtfs_webhook WHERE gtfs_id = $1 ORDER BY name"
@@ -182,17 +203,95 @@ pub async fn list(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> {
     .fetch_all(&state.pool)
     .await?;
     let items = rows.iter().map(row_json).collect::<Result<Vec<_>, _>>()?;
+    let effective = live_policy(state).await;
     Ok(json!({
         "items": items,
-        // what the deployment permits, so the dashboard can say why a URL was
+        // what is permitted right now, so the dashboard can say why a URL was
         // refused instead of showing a bare error
-        "policy": {
-            "enabled": state.webhook_policy.enabled,
-            "allowed_hosts": state.webhook_policy.allowed_hosts,
-            "active": state.webhook_policy.is_active(),
-        },
+        "policy": policy_json(&effective),
         "events": EVENTS,
     }))
+}
+
+/// The policy in force, plus what the deployment's own config says, so the
+/// dashboard can show what saving would replace - and what it would fall back
+/// to if this row had never been written.
+pub async fn settings_get(state: &EditorState) -> EditorResult<Value> {
+    let effective = live_policy(state).await;
+    let seed = state.webhook_policy.seed();
+    Ok(json!({
+        "policy": policy_json(&effective),
+        "config": {
+            "enabled": seed.enabled,
+            "allowed_hosts": seed.allowed_hosts,
+        },
+        "max_allowed_hosts": webhook::MAX_ALLOWED_HOSTS,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettingsBody {
+    pub enabled: Option<bool>,
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
+/// Save the policy. Both fields are written together, absent ones keeping what
+/// is in force, because a half-saved policy is the dangerous kind: turning
+/// webhooks on without saying where they may point, or replacing a host list
+/// while the switch is stale, are exactly the states worth not creating.
+///
+/// **Admin only**, and the deployment no longer caps the result: after this
+/// runs, the hosts GIMS may call are the ones in this row and not the ones in
+/// the configmap. That is the trade the feature makes (docs section 12.5,
+/// "What this gives up"), and it is why the endpoint is an admin's and why the
+/// audit row carries the whole policy, before and after.
+pub async fn settings_update(
+    state: &EditorState,
+    ctx: &Ctx,
+    b: SettingsBody,
+) -> EditorResult<Value> {
+    ctx.require_role(Role::Admin)?;
+    let before = live_policy(state).await;
+    let enabled = b.enabled.unwrap_or(before.policy.enabled);
+    let hosts = match &b.allowed_hosts {
+        Some(h) => webhook::normalise_hosts(h).map_err(|e| bad("invalid_host", e))?,
+        None => before.policy.allowed_hosts.clone(),
+    };
+
+    sqlx::query(
+        "INSERT INTO gtfs_webhook_settings (singleton, enabled, allowed_hosts, updated_by) \
+         VALUES (true, $1, $2, $3) \
+         ON CONFLICT (singleton) DO UPDATE SET \
+           enabled = EXCLUDED.enabled, \
+           allowed_hosts = EXCLUDED.allowed_hosts, \
+           updated_by = EXCLUDED.updated_by",
+    )
+    .bind(enabled)
+    .bind(&hosts)
+    .bind(&ctx.user.email)
+    .execute(&state.pool)
+    .await?;
+
+    // `from` carries its source, because "it was on" reads very differently
+    // when the deployment said so and when a person did
+    auth::audit(
+        &state.pool,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "webhook_settings_updated",
+        None,
+        None,
+        json!({
+            "from": {
+                "enabled": before.policy.enabled,
+                "allowed_hosts": before.policy.allowed_hosts,
+                "source": before.source.as_str(),
+            },
+            "to": {"enabled": enabled, "allowed_hosts": hosts},
+        }),
+    )
+    .await?;
+    settings_get(state).await
 }
 
 pub async fn create(
@@ -227,7 +326,7 @@ pub async fn create(
     check_event(&event)?;
     check_method(&method)?;
     check_headers(&headers)?;
-    check_url(state, &url)?;
+    check_url(state, &url).await?;
     for (field, v) in [
         ("stale_after_seconds", b.stale_after_seconds),
         ("settle_seconds", b.settle_seconds),
@@ -310,7 +409,7 @@ pub async fn update(
         check_headers(h)?;
     }
     if let Some(u) = b.url.as_deref() {
-        check_url(state, u.trim())?;
+        check_url(state, u.trim()).await?;
     }
     for (field, v) in [
         ("stale_after_seconds", b.stale_after_seconds),
@@ -409,10 +508,10 @@ pub async fn delete(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorR
 /// placeholders, the pod's egress and the receiver's own authentication.
 pub async fn test(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorResult<Value> {
     ctx.require_role(Role::Admin)?;
-    if !state.webhook_policy.is_active() {
+    if !live_policy(state).await.policy.is_active() {
         return Err(bad(
             "webhooks_inactive",
-            "this deployment has no webhook allow-list, so nothing would be sent",
+            "webhooks are off or the allow-list is empty, so nothing would be sent",
         ));
     }
     let delivery_id = webhook::enqueue_test(&state.pool, webhook_id, &ctx.user.email)

@@ -1052,6 +1052,23 @@ pub async fn cache_state(
     ok(webhooks::cache_state(&st, &path).await?)
 }
 
+/// The webhook policy in force. Readable by anyone who can sign in: the
+/// allow-list is the reason a URL is refused, and a viewer already sees that
+/// refusal.
+pub async fn webhook_settings(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
+    auth::require(&req, &st, Role::Viewer).await?;
+    ok(webhooks::settings_get(&st).await?)
+}
+
+pub async fn webhook_settings_update(
+    req: HttpRequest,
+    st: Data,
+    body: web::Json<webhooks::SettingsBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    ok(webhooks::settings_update(&st, &ctx, body.into_inner()).await?)
+}
+
 pub async fn webhook_list(
     req: HttpRequest,
     st: Data,

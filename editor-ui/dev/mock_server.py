@@ -3347,12 +3347,61 @@ def seed_round5(store):
 #   delivered so the page can be exercised without a receiver.
 
 WEBHOOK_EVENTS = ["feed_in_sync", "feed_committed", "feed_reload_failed"]
-WEBHOOK_HOSTS = ["jenkins.mock.invalid", "127.0.0.1"]
+# what this "deployment" ships with, which is only the seed: once the settings
+# row below exists it decides instead (docs/gtfs-editor.md section 12.5)
+WEBHOOK_CONFIG = {"enabled": True, "allowed_hosts": ["jenkins.mock.invalid", "127.0.0.1"]}
+MAX_ALLOWED_HOSTS = 64
+
+
+def webhook_policy(store):
+    """The policy in force: the saved row if there is one, else the config."""
+    row = store.webhook_settings
+    if row is None:
+        p = dict(WEBHOOK_CONFIG, source="config", updated_at=None, updated_by=None)
+    else:
+        p = dict(enabled=row["enabled"], allowed_hosts=list(row["allowed_hosts"]),
+                 source="database", updated_at=row["updated_at"], updated_by=row["updated_by"])
+    p["active"] = bool(p["enabled"] and p["allowed_hosts"])
+    return p
+
+
+def _check_host(raw):
+    host = raw.strip().lower()
+    if not host:
+        raise ApiError(400, "invalid_host", "a host cannot be empty")
+    for what, found in (("a scheme", "://" in host), ("a port", ":" in host),
+                        ("a path", "/" in host), ("a query", "?" in host or "#" in host),
+                        ("a user", "@" in host), ("a space", any(c.isspace() for c in host)),
+                        ("a wildcard", "*" in host)):
+        if found:
+            raise ApiError(400, "invalid_host", f"{host} has {what}; an entry is a host name "
+                                                "such as jenkins.example.com, or .example.com "
+                                                "for a domain and its subdomains")
+    labels = host[1:] if host.startswith(".") else host
+    if not labels or any(not part or part.startswith("-") or part.endswith("-")
+                         or not re.fullmatch(r"[a-z0-9_-]+", part)
+                         for part in labels.split(".")):
+        raise ApiError(400, "invalid_host", f"{host} is not a host name")
+    return host
+
+
+def _check_hosts(raw):
+    if len(raw) > MAX_ALLOWED_HOSTS:
+        raise ApiError(400, "invalid_host", f"an allow-list holds at most {MAX_ALLOWED_HOSTS} hosts")
+    out = []
+    for entry in raw:
+        host = _check_host(entry)
+        if host not in out:
+            out.append(host)
+    return out
 
 
 def seed_webhooks(store):
     store.webhooks = {}
     store.deliveries = []
+    # nothing saved yet, so the dashboard opens showing the deployment's own
+    # values and says so
+    store.webhook_settings = None
     # two pods, both serving what is committed; a commit moves them on (see the
     # commit path), the way a real pod's version poll does
     g = next(iter(store.feeds))
@@ -3395,7 +3444,9 @@ def _check_webhook(b, store, partial):
             raise ApiError(400, "url_required", "url is required")
         # ${...} only ever appears in the query here, so the host parses as-is
         host = urlparse(url).hostname or ""
-        if host not in WEBHOOK_HOSTS:
+        allowed = webhook_policy(store)["allowed_hosts"]
+        if not any(host == a or (a.startswith(".") and (host == a[1:] or host.endswith(a)))
+                   for a in allowed):
             raise ApiError(400, "host_not_allowed",
                            f"host {host} is not in this deployment's webhook allow-list")
 
@@ -3428,8 +3479,7 @@ class WebhookHandler(PolicyHandler):
                 return 200, {"items": list(reversed(items))[:int(q.get("limit", ["50"])[0])]}
             if method == "GET":
                 return 200, {"items": [_webhook_out(w) for w in s.webhooks.values() if w["gtfs_id"] == g],
-                             "policy": {"enabled": True, "allowed_hosts": WEBHOOK_HOSTS, "active": True},
-                             "events": WEBHOOK_EVENTS}
+                             "policy": webhook_policy(s), "events": WEBHOOK_EVENTS}
             self.require_role(u, "admin")
             b = self._body()
             _check_webhook(b, s, partial=False)
@@ -3453,6 +3503,30 @@ class WebhookHandler(PolicyHandler):
             s.add_audit(u, "webhook_created", g, None, {"name": w["name"]})
             return 201, _webhook_out(w)
 
+        if parts == ["webhook-settings"]:
+            u = self.session_user()
+            self.require_mutation(method)
+            if method == "GET":
+                return 200, {"policy": webhook_policy(s), "config": dict(WEBHOOK_CONFIG),
+                             "max_allowed_hosts": MAX_ALLOWED_HOSTS}
+            if method == "PUT":
+                self.require_role(u, "admin")
+                b = self._body()
+                live = webhook_policy(s)
+                enabled = live["enabled"] if b.get("enabled") is None else bool(b["enabled"])
+                hosts = (live["allowed_hosts"] if b.get("allowed_hosts") is None
+                         else _check_hosts(b["allowed_hosts"]))
+                s.webhook_settings = {"enabled": enabled, "allowed_hosts": hosts,
+                                      "updated_at": iso(now()), "updated_by": u["email"]}
+                s.add_audit(u, "webhook_settings_updated", None, None,
+                            {"from": {"enabled": live["enabled"],
+                                      "allowed_hosts": live["allowed_hosts"],
+                                      "source": live["source"]},
+                             "to": {"enabled": enabled, "allowed_hosts": hosts}})
+                return 200, {"policy": webhook_policy(s), "config": dict(WEBHOOK_CONFIG),
+                             "max_allowed_hosts": MAX_ALLOWED_HOSTS}
+            raise ApiError(404, "endpoint_not_found", "no such editor endpoint")
+
         if len(parts) >= 2 and parts[0] == "webhooks":
             u = self.session_user()
             self.require_mutation(method)
@@ -3461,6 +3535,10 @@ class WebhookHandler(PolicyHandler):
                 raise ApiError(404, "webhook_not_found", "no such webhook")
             self.require_role(u, "admin")
             if len(parts) == 3 and parts[2] == "test" and method == "POST":
+                if not webhook_policy(s)["active"]:
+                    raise ApiError(400, "webhooks_inactive",
+                                   "webhooks are off or the allow-list is empty, "
+                                   "so nothing would be sent")
                 d = {"delivery_id": str(uuid.uuid4()), "webhook_id": w["webhook_id"],
                      "webhook": w["name"], "gtfs_id": w["gtfs_id"], "event": w["event"],
                      "feed_version": s.feeds[w["gtfs_id"]]["version"], "kind": "test",
