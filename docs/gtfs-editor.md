@@ -19,7 +19,7 @@ ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0016*.sql` (`0001..0008` applied to master
+Schema: `db/gtfs_editor/0001..0017*.sql` (`0001..0008` applied to master
 `mtc_internal_master`; `0006` lets a change's `op` be `merge`, `0007` holds
 coordinate reviews, `0008` makes `gtfs_feed.data_source` live and backfills
 `chennai_bus` to `'db'` — see section 3's "Feed data source". **Not yet on
@@ -29,12 +29,14 @@ maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
 behind the cleanup context reads (section 9), `0012` adds the nullable
 `gtfs_stop.description` (section 11), `0013` adds the webhook and pod cache
 state tables (section 12), `0016` adds `gtfs_webhook_settings`, the webhook
-policy row that supersedes the dhall config (section 12.5), `0022` adds the
-`release_requested` event and the `release` delivery kind (section 12.6). All
-seven are safe to run twice. **`0012`
-goes on a database before the build that reads it:** both the editor and the
-GIMS loader select the column, so a DB feed fails to load (and serves its
-preprocessed data) on a database without it.)
+policy row that supersedes the dhall config (section 12.5), `0017` adds
+`gtfs_route_stop.stop_headsign` and `gtfs_feed.headsign_source`, and gives
+`stage_no` / `stage_name` defaults so a feed with no fare stages can have a route
+at all ("The headsign" below), `0022` adds the `release_requested` event and the
+`release` delivery kind (section 12.6). All eight are safe to run twice. **`0012`
+and `0017` go on a database before the build that reads them:** both the editor
+and the GIMS loader select those columns, so a DB feed fails to load (and serves
+its preprocessed data) on a database without them.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -65,19 +67,135 @@ produced from a GTFS built out of these tables:
   load serves it. Station rows (`location_type = 1`) are emitted too.
 - **patterns** — one per route that has trips. Stops are the route's *served*
   rows (`stop_type` not in ROUTE CORRECTION / JUMP STOP / HIDDEN STOP) in
-  `sequence` order, `stopSequence = i + 1`. Times follow the generator:
-  `arrival = start + 135·i`, `departure = arrival + 15` (last stop:
-  `departure = arrival`), where `start` is the preprocessed example trip's first
-  arrival. `headsign` = stage number, or
-  `{'fareStageNumber': 'N', 'isStageStop': true}` on NEW STOP rows. `trips` =
-  the preprocessed pattern's trips.
+  `sequence` order, `stopSequence = i + 1`. Times are the preprocessed example
+  trip's own, where the DB calls at the same stops in the same order; where it
+  does not, they follow the generator: `arrival = start + 135·i`,
+  `departure = arrival + 15` (last stop: `departure = arrival`), `start` being
+  the example trip's first arrival ("The timetable" below). `headsign` = the
+  row's `stop_headsign`, or what the feed's `headsign_source` falls back to
+  ("The headsign" below). `trips` = the preprocessed pattern's trips.
 - **routes** — routes with a pattern: `shortName`, `longName`, `mode` (from
   `route_type`), `agencyName` (`gtfs_feed.agency_name`), `color`,
   `encodedPolyline`, `tripCount`, `stopCount`, `startPoint`/`endPoint` from the
   pattern.
 
 **Parity is the acceptance test**: loaded from the seeded tables, every public
-static API for `chennai_bus` must return what the preprocessed load returns.
+static API for a feed must return what the preprocessed load returns.
+`scripts/parity_gtfs_db.py` takes `--gtfs-id` once per feed and compares them all
+in one run.
+
+### The headsign
+
+A stop headsign has two sources, in this order:
+
+| | |
+|---|---|
+| `gtfs_route_stop.stop_headsign` | the row's own, GTFS `stop_headsign`. Wins whenever it is set; blank counts as unset. |
+| `gtfs_feed.headsign_source` | what a row with none falls back to: `'fare_stage'` synthesises MTC's — the stage number, or `{'fareStageNumber': 'N', 'isStageStop': true}` on a NEW STOP — and `'none'` serves no headsign at all. |
+
+Until `0017` the fare-stage synthesis was the only source, which is MTC bus
+semantics: `chennai_bus` is the one feed that has fare stages, and every other
+feed serves `headsign: null` today. Seeding one of them into these tables as they
+stood would have turned that null into a stage number derived from columns the
+feed has no meaning for — a "fare stage 1" on a metro platform, in the rider app,
+with nothing upstream that could have produced it.
+
+So `'none'` is the **default** for a feed row, and the `0017` backfill sets
+`'fare_stage'` on every feed that existed when it ran. A feed seeded afterwards
+therefore keeps serving exactly what it serves today, and `chennai_bus` — whose
+rows all have a null `stop_headsign` — still gets the synthesis on every row.
+`tests/gtfs_headsign_flow.rs` asserts that against its real rows: every headsign
+the loader builds equals the one the pre-`0017` code built from the same row.
+
+`stage_no` and `stage_name` stay NOT NULL and keep their meaning for a fare-stage
+feed (an INTERMEDIATE STOP carries the preceding NEW STOP's stage — section 6's
+fare invariant). For a feed with `headsign_source = 'none'` they are internal and
+default to `0` / `''`: nothing public reads either column, and a seeder does not
+have to invent fare stages to insert a route.
+
+### The timetable
+
+The editor does not own trip times, so a DB feed carries them over from the
+preprocessed example trip — **per route, all of them or none**:
+
+- the DB calls at the same stops in the same order as the example trip: every
+  stop keeps its real arrival and departure, so a metro that runs to a timetable
+  goes on serving it;
+- it does not (the editor has since inserted, moved or dropped a stop): the whole
+  route falls back to the generator's spacing. There are no times for a shape
+  that never ran, and keeping the ones that still match would put an inserted
+  stop *ahead* of the stop before it — a mixed schedule is worse than a synthetic
+  one.
+
+This is a no-op for `chennai_bus` by construction: its GTFS is built by
+`generate_trips_from_db.py`, whose times are `start + 135·i` with 15 s of dwell,
+so the preprocessed data agrees with the formula on all 71,269 of its pattern
+stops and both branches produce the same bytes. For any other feed the formula
+was never right — it would replace a real timetable with a stop every 135
+seconds, which is what `tests/gtfs_headsign_flow.rs` and the `schedule` unit
+tests pin down.
+
+One thing a DB feed still cannot carry over shows up in `/example-trip` for a
+route with **several** preprocessed patterns: `gtfs_route_stop` holds one stop
+order per route, so the feed keeps the longest pattern (the one the route-stop
+mapping was already built from) and the example trip becomes that pattern's, not
+the first one's. A feed whose routes are 1:1 with patterns is unaffected.
+
+### Seeding a feed that is not chennai_bus
+
+`chennai_bus` was seeded from nandi's own sources. Every other feed arrives
+preprocessed in the data image, so the only description of it that exists is what
+GIMS is serving: `scripts/chennai-bus/editor/seed_gtfs_feeds.py` in nandi reads
+`/cached-data`, `/routes/{gtfs_id}` and each route's `/example-trip` and writes
+the SQL. Read it from the **same** GIMS the rows are going into — master and prod
+do not serve the same feed list.
+
+What a feed's rows have to be, all of it forced by how GIMS keys its reads:
+
+- **one stop row per stop *code***, carrying the `stop_id` GIMS serves for that
+  code today. Codes are what every public read is keyed by; ids are external
+  (`SWA|0101`, a hex digest) and minting new ones breaks every caller holding
+  one.
+- **name and position from the route-stop mapping**, not from the stops map.
+  Preprocessed metro data spells a station, its platforms and its entrance gates
+  with one code and the stops map keeps whichever was read last, so a code can
+  sit there under a gate's name while every route that calls at it says the
+  station's. `/stops`, every route-stop read and a route's start and end points
+  are built from the mapping, so that is the spelling that has to be stored.
+- **a parent row for every `stationId`**, as a station when a served stop already
+  answers to that code (the metro case, where GIMS goes on serving the platform)
+  and otherwise as a plain unreferenced stop, which anchors `parent_station`
+  without adding a station to `/stops` that the feed never served.
+- **`stop_headsign` per row** where the feed serves one, and `stop_type`
+  NEW STOP everywhere: the other types are MTC fare and shaping rows.
+
+Measured against a local GIMS pair, every route and every stop compared
+(`scripts/parity_gtfs_db.py --all-routes --every 1`), this reproduces `kochi_metro`,
+`mumbai_metro`, `mumbai_suburban` and `delhi_bus_nammayatri_application_mock`
+byte for byte. Three differences survive it, and they are properties of the
+tables, not of the seeder:
+
+- **stops no route calls at disappear.** The loader emits stations and stops a
+  served row references, so a stop in the preprocessed data that no pattern
+  visits is not in a DB feed at all: it stops answering `/stop/{g}/{code}`, and
+  it stops being an alternate of the stop it shares a name with
+  (`/alternateStops`: 32 of 2,620 stops for `bhubaneshwar_bus`, 24 of 330 for
+  `sambalpur_bus`, 222 of 446 for `kolkata_bus`, where half the stops are
+  unserved).
+- **one agency per feed.** `gtfs_feed.agency_name` covers the whole feed, so a
+  feed whose routes name two agencies (`kolkata_bus`: "KolkataBus" and "Moving
+  Tech") cannot serve both.
+- **platform-level reads on a feed with stations.** `/station-children` answers
+  with the platform *ids* under a station, and `/example-trip` names the platform
+  its trip called at; one row per code keeps one of those ids, so both change on
+  `bangalore_metro`, `chennai_metro`, `delhi_metro`, `chennai_suburban` and
+  `kolkata_metro`. `kolkata_metro` cannot be seeded at all as it stands: its
+  stops are their own `stationId`, which the schema forbids
+  (`parent_station IS DISTINCT FROM stop_id`).
+
+Parity first, flip second: seeding a feed changes nothing until an admin's
+`feed_config` change moves its `data_source` to `'db'` (section 3), and a feed
+flipped with missing rows serves a broken feed to riders.
 
 Reload: every `gtfs_version_poll_seconds`, `SELECT gtfs_id, version FROM
 gtfs_feed WHERE gtfs_id = ANY($db_feeds)`. A feed whose version differs from the
