@@ -14,10 +14,11 @@
 //! - **stops**: stops a served route row references, plus stations
 //!   (`location_type = 1`), with `clusterId` carried in `infoJson`.
 //! - **patterns**: one per route that has trips. Stops are the route's served
-//!   rows (NEW STOP / INTERMEDIATE STOP) in sequence order. Times follow the
-//!   generator: `arrival = start + 135·i`, `departure = arrival + 15`, the last
-//!   stop departing when it arrives. The headsign is the fare stage number, or
-//!   `{'fareStageNumber': 'N', 'isStageStop': true}` on a NEW STOP.
+//!   rows (NEW STOP / INTERMEDIATE STOP) in sequence order. Times are the
+//!   example trip's own where the DB still spells the route the same way, and
+//!   the generator's `start + 135·i` spacing where it does not (see
+//!   [`schedule`]). The headsign is the row's own `stop_headsign`, or what the
+//!   feed's `headsign_source` falls back to (see [`headsign`]).
 //! - **routes**: routes with a pattern.
 
 use crate::models::{GTFSStop, LatLong, NandiPatternDetails, NandiRoutesRes, NandiStop, NandiTrip};
@@ -47,6 +48,10 @@ pub struct TripOverlay {
     pub trip_count: i32,
     /// Arrival at the first stop of the example trip, seconds since midnight.
     pub start_seconds: i32,
+    /// The example trip's schedule, `(stop code, arrival, departure)` in stop
+    /// order - the feed's real timetable, for [`schedule`] to give back when the
+    /// DB still spells the route the same way.
+    pub schedule: Vec<(String, i32, i32)>,
 }
 
 /// One DB feed, ready for the normal build.
@@ -184,6 +189,14 @@ pub fn overlays_from_patterns(
             trips: p.trips.clone(),
             trip_count: 0,
             start_seconds: start,
+            schedule: p
+                .stops
+                .iter()
+                .map(|s| {
+                    let arrival = s.arrival_time.unwrap_or(0);
+                    (s.code.clone(), arrival, s.departure_time.unwrap_or(arrival))
+                })
+                .collect(),
         };
         match by_route.get(route) {
             Some((len, _)) if *len >= p.stops.len() => {}
@@ -201,12 +214,105 @@ pub fn overlays_from_patterns(
         .collect()
 }
 
-/// The generator's `stop_headsign`.
-pub fn headsign(stage_no: i32, stop_type: &str) -> String {
+/// The arrival and departure of each stop on a route, given the codes the DB
+/// says the route calls at and the example trip the preprocessed data holds.
+///
+/// A feed with a real timetable - a metro every twelve minutes, a suburban line
+/// on the hour - must keep serving it. The generator's synthetic spacing
+/// (`start + 135·i`, 15 s of dwell) is only correct for a feed whose GTFS was
+/// *built* that way, which is chennai_bus and nothing else: its preprocessed
+/// times are that formula to the second, on all 71,269 of its pattern stops.
+///
+/// So the times come from the example trip whenever the DB still calls at the
+/// same stops in the same order, and from the formula whenever it does not - a
+/// route the editor has since changed has no trustworthy times for its new
+/// shape, and half a real timetable is worse than none, because a stop inserted
+/// mid-route would arrive before the stop ahead of it. The decision is per
+/// route, never per stop.
+///
+/// For chennai_bus both answers are the same bytes, so nothing about it moves.
+pub fn schedule(codes: &[&str], overlay: &TripOverlay) -> Vec<(i32, i32)> {
+    let unchanged = overlay.schedule.len() == codes.len()
+        && overlay
+            .schedule
+            .iter()
+            .zip(codes)
+            .all(|((code, _, _), db)| code == db);
+    if unchanged {
+        return overlay.schedule.iter().map(|(_, a, d)| (*a, *d)).collect();
+    }
+    let last = codes.len().saturating_sub(1);
+    (0..codes.len())
+        .map(|i| {
+            let arrival = overlay.start_seconds + STOP_INTERVAL_SECONDS * i as i32;
+            (
+                arrival,
+                if i == last {
+                    arrival
+                } else {
+                    arrival + DWELL_SECONDS
+                },
+            )
+        })
+        .collect()
+}
+
+/// What a feed's headsign falls back to on a row that carries none of its own
+/// (`gtfs_feed.headsign_source`, migration 0017).
+///
+/// The default is [`HeadsignSource::None`] because that is what every feed but
+/// chennai_bus serves today: a metro pattern's stops have `headsign: null`, and
+/// synthesising a fare stage number for a feed that has no fare stages would
+/// change what its riders are shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HeadsignSource {
+    /// No headsign at all.
+    #[default]
+    None,
+    /// MTC's fare stages, from `stage_no` and `stop_type` ([`fare_stage_headsign`]).
+    FareStage,
+}
+
+impl HeadsignSource {
+    /// From the column. An unknown value reads as [`HeadsignSource::None`]: a
+    /// feed whose fallback cannot be understood serves no headsign rather than
+    /// one invented from stage columns that may mean nothing to it.
+    pub fn from_column(value: &str) -> Self {
+        match value {
+            "fare_stage" => Self::FareStage,
+            _ => Self::None,
+        }
+    }
+}
+
+/// The generator's `stop_headsign` for a fare-stage feed.
+pub fn fare_stage_headsign(stage_no: i32, stop_type: &str) -> String {
     if stop_type == "NEW STOP" {
         format!("{{'fareStageNumber': '{}', 'isStageStop': true}}", stage_no)
     } else {
         stage_no.to_string()
+    }
+}
+
+/// The `stop_headsign` a pattern stop serves: the route-stop row's own when it
+/// has one, else whatever the feed's [`HeadsignSource`] falls back to.
+///
+/// The row always wins, whatever the feed's fallback is, so a feed can give one
+/// stop a headsign of its own without declaring fare stages. A blank row value
+/// is treated as no value - a headsign of `""` says nothing a null does not, and
+/// an ops edit that clears the field should serve what an untouched row serves.
+pub fn headsign(
+    row_headsign: Option<&str>,
+    source: HeadsignSource,
+    stage_no: i32,
+    stop_type: &str,
+) -> Option<String> {
+    match row_headsign.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => Some(h.to_string()),
+        None => match source {
+            HeadsignSource::FareStage => Some(fare_stage_headsign(stage_no, stop_type)),
+            HeadsignSource::None => None,
+        },
     }
 }
 
@@ -301,6 +407,17 @@ pub fn plan_feed_actions(
     out
 }
 
+/// One `gtfs_route_stop` row a pattern is built from, already filtered to the
+/// served types and ordered by `sequence`.
+struct ServedRow {
+    stop_id: String,
+    stop_type: String,
+    /// MTC's fare stage. Read only by a feed whose headsign falls back to it;
+    /// 0 on a feed that has no fare stages (migration 0017).
+    stage_no: i32,
+    headsign: Option<String>,
+}
+
 struct StopRow {
     stop_id: String,
     stop_code: Option<String>,
@@ -388,14 +505,21 @@ impl GtfsDbSource {
         overlays: &HashMap<String, TripOverlay>,
     ) -> AppResult<DbFeed> {
         let started = std::time::Instant::now();
-        let feed = sqlx::query("SELECT version, agency_name FROM gtfs_feed WHERE gtfs_id = $1")
-            .bind(gtfs_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| AppError::Internal(format!("gtfs_feed has no row for {}", gtfs_id)))?;
+        let feed = sqlx::query(
+            "SELECT version, agency_name, headsign_source FROM gtfs_feed WHERE gtfs_id = $1",
+        )
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| AppError::Internal(format!("gtfs_feed has no row for {}", gtfs_id)))?;
         let version: i64 = feed.try_get("version").map_err(db_err)?;
         let agency_name: Option<String> = feed.try_get("agency_name").map_err(db_err)?;
+        let headsign_source = HeadsignSource::from_column(
+            &feed
+                .try_get::<String, _>("headsign_source")
+                .map_err(db_err)?,
+        );
 
         let route_rows = sqlx::query(
             "SELECT route_id, short_name, long_name, route_type, color, encoded_polyline
@@ -407,7 +531,7 @@ impl GtfsDbSource {
         .map_err(db_err)?;
 
         let served = sqlx::query(
-            "SELECT rs.route_id, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no
+            "SELECT rs.route_id, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no, rs.stop_headsign
              FROM gtfs_route_stop rs
              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
              WHERE rs.gtfs_id = $1 AND rs.stop_type = ANY($2)
@@ -462,18 +586,19 @@ impl GtfsDbSource {
             stops.insert(s.stop_id.clone(), s);
         }
 
-        // route_id -> ordered (stop_id, stop_type, stage_no); BTreeMap keeps the
+        // route_id -> its served rows in sequence order; BTreeMap keeps the
         // output order independent of hashing.
-        let mut rows_by_route: BTreeMap<String, Vec<(String, String, i32)>> = BTreeMap::new();
+        let mut rows_by_route: BTreeMap<String, Vec<ServedRow>> = BTreeMap::new();
         for r in &served {
             let route_id: String = r.try_get("route_id").map_err(db_err)?;
             let stop_id: Option<String> = r.try_get("stop_id").map_err(db_err)?;
             let Some(stop_id) = stop_id else { continue };
-            rows_by_route.entry(route_id).or_default().push((
+            rows_by_route.entry(route_id).or_default().push(ServedRow {
                 stop_id,
-                r.try_get("stop_type").map_err(db_err)?,
-                r.try_get("stage_no").map_err(db_err)?,
-            ));
+                stop_type: r.try_get("stop_type").map_err(db_err)?,
+                stage_no: r.try_get("stage_no").map_err(db_err)?,
+                headsign: r.try_get("stop_headsign").map_err(db_err)?,
+            });
         }
 
         // The alias map: every stop the editor has merged away, pointed at what
@@ -513,8 +638,8 @@ impl GtfsDbSource {
         // runs trips - the generator writes those too), plus stations.
         let mut referenced: HashSet<&str> = HashSet::new();
         for rows in rows_by_route.values() {
-            for (stop_id, _, _) in rows {
-                referenced.insert(stop_id.as_str());
+            for row in rows {
+                referenced.insert(row.stop_id.as_str());
             }
         }
         let mut stop_ids: Vec<&String> = stops
@@ -559,23 +684,27 @@ impl GtfsDbSource {
             let Some(rows) = rows_by_route.get(&route_id) else {
                 continue;
             };
-            let last = rows.len().saturating_sub(1);
-            let mut pattern_stops = Vec::with_capacity(rows.len());
-            let mut codes: HashSet<&str> = HashSet::new();
-            for (i, (stop_id, stop_type, stage_no)) in rows.iter().enumerate() {
-                let Some(s) = stops.get(stop_id) else {
+            let mut row_stops = Vec::with_capacity(rows.len());
+            for row in rows {
+                let Some(s) = stops.get(&row.stop_id) else {
                     return Err(AppError::Internal(format!(
                         "{} route {} uses stop {} that is missing or deleted",
-                        gtfs_id, route_id, stop_id
+                        gtfs_id, route_id, row.stop_id
                     )));
                 };
-                let arrival = overlay.start_seconds + STOP_INTERVAL_SECONDS * i as i32;
-                let departure = if i == last {
-                    arrival
-                } else {
-                    arrival + DWELL_SECONDS
-                };
-                codes.insert(s.stop_code.as_deref().unwrap_or(&s.stop_id));
+                row_stops.push((row, s));
+            }
+            let row_codes: Vec<&str> = row_stops
+                .iter()
+                .map(|(_, s)| s.stop_code.as_deref().unwrap_or(&s.stop_id))
+                .collect();
+            let times = schedule(&row_codes, overlay);
+
+            let mut pattern_stops = Vec::with_capacity(rows.len());
+            let mut codes: HashSet<&str> = HashSet::new();
+            for (i, (row, s)) in row_stops.iter().enumerate() {
+                let (arrival, departure) = times[i];
+                codes.insert(row_codes[i]);
                 pattern_stops.push(NandiStop {
                     id: prefixed(&s.stop_id),
                     code: s.stop_code.clone().unwrap_or_else(|| s.stop_id.clone()),
@@ -586,7 +715,12 @@ impl GtfsDbSource {
                     departure_time: Some(departure),
                     stop_sequence: Some(i as i32 + 1),
                     platform_code: None,
-                    headsign: Some(headsign(*stage_no, stop_type)),
+                    headsign: headsign(
+                        row.headsign.as_deref(),
+                        headsign_source,
+                        row.stage_no,
+                        &row.stop_type,
+                    ),
                 });
             }
             let (Some(first), Some(end)) = (pattern_stops.first(), pattern_stops.last()) else {
@@ -646,13 +780,150 @@ fn db_err(e: sqlx::Error) -> AppError {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------- the schedule
+
+    fn overlay_with(schedule: &[(&str, i32, i32)]) -> TripOverlay {
+        TripOverlay {
+            pattern_id: "p".into(),
+            desc: None,
+            trips: vec![],
+            trip_count: 1,
+            start_seconds: 21600,
+            schedule: schedule
+                .iter()
+                .map(|(c, a, d)| ((*c).to_string(), *a, *d))
+                .collect(),
+        }
+    }
+
     #[test]
-    fn headsign_matches_the_generator() {
+    fn a_route_the_db_still_spells_the_same_keeps_its_real_timetable() {
+        // A metro every few minutes: the times are the feed's own, not a stop
+        // every 135 seconds.
+        let o = overlay_with(&[
+            ("A", 30000, 30030),
+            ("B", 30240, 30270),
+            ("C", 30500, 30500),
+        ]);
         assert_eq!(
-            headsign(3, "NEW STOP"),
+            schedule(&["A", "B", "C"], &o),
+            vec![(30000, 30030), (30240, 30270), (30500, 30500)]
+        );
+    }
+
+    #[test]
+    fn a_route_the_editor_has_changed_falls_back_to_the_generators_spacing() {
+        // A stop inserted in the middle: the preprocessed times describe a route
+        // that no longer exists, and half of them would put the new stop ahead
+        // of the stop before it. All or nothing, per route.
+        let o = overlay_with(&[("A", 30000, 30030), ("C", 30500, 30500)]);
+        assert_eq!(
+            schedule(&["A", "B", "C"], &o),
+            vec![(21600, 21615), (21735, 21750), (21870, 21870)]
+        );
+        // Same length, different stop: still not the route the times describe.
+        assert_eq!(
+            schedule(
+                &["A", "X"],
+                &overlay_with(&[("A", 30000, 30030), ("C", 30500, 30500)])
+            ),
+            vec![(21600, 21615), (21735, 21735)]
+        );
+    }
+
+    #[test]
+    fn with_no_timetable_at_all_the_spacing_is_what_it_always_was() {
+        // A snapshot boot before this field existed, and every route of a feed
+        // whose GTFS was built by the generator: start + 135·i, 15 s of dwell,
+        // the last stop departing when it arrives.
+        let times = schedule(&["A", "B", "C"], &overlay_with(&[]));
+        assert_eq!(times, vec![(21600, 21615), (21735, 21750), (21870, 21870)]);
+    }
+
+    #[test]
+    fn a_generator_built_timetable_gives_back_the_generators_spacing() {
+        // chennai_bus: its preprocessed times *are* the formula, so keeping them
+        // and computing them are the same bytes. This is the no-change claim.
+        let kept = overlay_with(&[
+            ("A", 21600, 21615),
+            ("B", 21735, 21750),
+            ("C", 21870, 21870),
+        ]);
+        assert_eq!(
+            schedule(&["A", "B", "C"], &kept),
+            schedule(&["A", "B", "C"], &overlay_with(&[]))
+        );
+    }
+
+    #[test]
+    fn fare_stage_headsign_matches_the_generator() {
+        assert_eq!(
+            fare_stage_headsign(3, "NEW STOP"),
             "{'fareStageNumber': '3', 'isStageStop': true}"
         );
-        assert_eq!(headsign(3, "INTERMEDIATE STOP"), "3");
+        assert_eq!(fare_stage_headsign(3, "INTERMEDIATE STOP"), "3");
+    }
+
+    #[test]
+    fn a_fare_stage_feed_serves_what_it_always_has() {
+        // chennai_bus: every row's stop_headsign is null, so every headsign is
+        // still synthesised from the stage. This is the whole no-change claim.
+        assert_eq!(
+            headsign(None, HeadsignSource::FareStage, 3, "NEW STOP").as_deref(),
+            Some("{'fareStageNumber': '3', 'isStageStop': true}")
+        );
+        assert_eq!(
+            headsign(None, HeadsignSource::FareStage, 3, "INTERMEDIATE STOP").as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn a_feed_with_no_fare_stages_serves_no_headsign() {
+        // What metro serves today, and what it must keep serving once its rows
+        // live in these tables: null, not the stage 0 the columns default to.
+        assert_eq!(headsign(None, HeadsignSource::None, 0, "NEW STOP"), None);
+        assert_eq!(
+            headsign(None, HeadsignSource::None, 7, "INTERMEDIATE STOP"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rows_own_headsign_wins_over_either_fallback() {
+        for source in [HeadsignSource::None, HeadsignSource::FareStage] {
+            assert_eq!(
+                headsign(Some("Towards Airport"), source, 3, "NEW STOP").as_deref(),
+                Some("Towards Airport")
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_row_headsign_falls_back_like_an_empty_one() {
+        assert_eq!(
+            headsign(Some("   "), HeadsignSource::None, 3, "NEW STOP"),
+            None
+        );
+        assert_eq!(
+            headsign(Some(""), HeadsignSource::FareStage, 3, "INTERMEDIATE STOP").as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn headsign_source_defaults_to_none_for_anything_unknown() {
+        assert_eq!(
+            HeadsignSource::from_column("fare_stage"),
+            HeadsignSource::FareStage
+        );
+        assert_eq!(HeadsignSource::from_column("none"), HeadsignSource::None);
+        assert_eq!(HeadsignSource::from_column(""), HeadsignSource::None);
+        assert_eq!(
+            HeadsignSource::from_column("something_later"),
+            HeadsignSource::None
+        );
+        assert_eq!(HeadsignSource::default(), HeadsignSource::None);
     }
 
     #[test]

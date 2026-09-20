@@ -2197,6 +2197,21 @@ impl GTFSService {
                                 .first()
                                 .map(|s| s.scheduled_arrival)
                                 .unwrap_or(0),
+                            // The same timetable a JSON boot takes from the
+                            // pattern, so a snapshot boot keeps a feed's real
+                            // times instead of falling back to the generator's
+                            // spacing for every route.
+                            schedule: d
+                                .stops
+                                .iter()
+                                .map(|s| {
+                                    (
+                                        s.stop_code.clone(),
+                                        s.scheduled_arrival,
+                                        s.scheduled_departure,
+                                    )
+                                })
+                                .collect(),
                         },
                     ))
                 })
