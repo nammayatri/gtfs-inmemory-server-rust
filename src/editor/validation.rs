@@ -5,15 +5,39 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
+/// The `gtfs_route_stop.stop_type` vocabulary, as its CHECK constraint spells
+/// it (`db/gtfs_editor/0001_create_gtfs_editor.sql`). The operator's
+/// `route_point_internal` uses a different vocabulary for the same idea -
+/// STAGE STOP where this one says NEW STOP - and that one lives in
+/// `services::operator::StopType`. Never mix the two.
+pub const NEW_STOP: &str = "NEW STOP";
+pub const INTERMEDIATE_STOP: &str = "INTERMEDIATE STOP";
+pub const JUMP_STOP: &str = "JUMP STOP";
+pub const ROUTE_CORRECTION: &str = "ROUTE CORRECTION";
+pub const HIDDEN_STOP: &str = "HIDDEN STOP";
+
 pub const STOP_TYPES: [&str; 5] = [
-    "NEW STOP",
-    "INTERMEDIATE STOP",
-    "JUMP STOP",
-    "ROUTE CORRECTION",
-    "HIDDEN STOP",
+    NEW_STOP,
+    INTERMEDIATE_STOP,
+    JUMP_STOP,
+    ROUTE_CORRECTION,
+    HIDDEN_STOP,
 ];
 /// Rows a passenger never boards at: shaping markers and fare-only jump stops.
-pub const UNSERVED_TYPES: [&str; 3] = ["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"];
+pub const UNSERVED_TYPES: [&str; 3] = [ROUTE_CORRECTION, JUMP_STOP, HIDDEN_STOP];
+/// Rows a GTFS build turns into stop_times - everything else is fare or
+/// shaping data, never a place a bus stops.
+pub const SERVED_STOP_TYPES: [&str; 2] = [NEW_STOP, INTERMEDIATE_STOP];
+
+/// Whether a row is where its fare stage begins. This is what `isStageStop`
+/// meant in the generator's `stop_headsign`; the column is where it lives.
+pub fn is_stage_boundary(stop_type: &str) -> bool {
+    stop_type == NEW_STOP
+}
+
+pub fn is_served_stop_type(stop_type: &str) -> bool {
+    !UNSERVED_TYPES.contains(&stop_type)
+}
 /// Findings of [`check_route_rows`] about fares and stop order. Rows that break
 /// only these can still be stored (no table constraint refuses them), so a draft
 /// shows its stop list as drafted while the errors block submit and commit. The
@@ -137,11 +161,11 @@ pub struct RouteRow {
 
 impl RouteRow {
     pub fn is_marker(&self) -> bool {
-        self.stop_type == "ROUTE CORRECTION"
+        self.stop_type == ROUTE_CORRECTION
     }
 
     pub fn is_served(&self) -> bool {
-        !UNSERVED_TYPES.contains(&self.stop_type.as_str())
+        is_served_stop_type(&self.stop_type)
     }
 }
 

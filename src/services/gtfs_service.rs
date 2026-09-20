@@ -9,7 +9,8 @@ use crate::models::{
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
 use crate::services::gtfs_db_source::{
-    overlays_from_patterns, plan_feed_actions, FeedAction, GtfsDbSource, TripOverlay,
+    is_fare_stage_dict, overlays_from_patterns, parse_headsign_stage, plan_feed_actions,
+    FeedAction, GtfsDbSource, TripOverlay,
 };
 use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
 use crate::services::webhook;
@@ -1716,6 +1717,20 @@ impl GTFSService {
             })
             .collect();
 
+        // Feeds whose stop_headsign really is a fare stage: at least one stop
+        // carries the generator's dict shape. On any other feed a bare numeric
+        // headsign is a destination or route label, not a stage.
+        let fare_stage_feeds: HashSet<&str> = pattern_details
+            .iter()
+            .filter(|p| {
+                p.stops
+                    .iter()
+                    .any(|s| s.headsign.as_deref().is_some_and(is_fare_stage_dict))
+            })
+            .filter_map(|p| p.route_id.split(':').next())
+            .collect();
+        let mut stop_type_arcs: HashMap<String, Arc<str>> = HashMap::new();
+
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
         // Group patterns by route to find the longest pattern for each route
@@ -1757,6 +1772,7 @@ impl GTFSService {
                 .map(|route| Arc::from(route.mode.as_str()))
                 .unwrap_or_else(|| Arc::from("UNKNOWN"));
             let route_code_arc: Arc<str> = Arc::from(route_code);
+            let fare_stage_feed = fare_stage_feeds.contains(gtfs_id);
 
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
             let mut visited_mapping: HashSet<String> = HashSet::new();
@@ -1797,8 +1813,28 @@ impl GTFSService {
                             .map(Arc::from)
                     });
 
+                let (stage_number, stop_type) =
+                    if stop.stage_number.is_some() || stop.stop_type.is_some() {
+                        (stop.stage_number, stop.stop_type.as_deref())
+                    } else {
+                        stop.headsign
+                            .as_deref()
+                            .map(|h| parse_headsign_stage(h, fare_stage_feed))
+                            .unwrap_or((None, None))
+                    };
+                let stop_type = stop_type.map(|t| match stop_type_arcs.get(t) {
+                    Some(a) => a.clone(),
+                    None => {
+                        let a: Arc<str> = Arc::from(t);
+                        stop_type_arcs.insert(t.to_string(), a.clone());
+                        a
+                    }
+                });
+
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
+                    stage_number,
+                    stop_type,
                     provider_code,
                     route_code: route_code_arc.clone(),
                     sequence_num: (seq + 1) as i32,
@@ -2026,6 +2062,8 @@ impl GTFSService {
                     let regional = regional_names.and_then(|names| names.get(stop.code.as_str()));
                     stops.push(Arc::new(RouteStopMapping {
                         estimated_travel_time_from_previous_stop: None,
+                        stage_number: None,
+                        stop_type: None,
                         provider_code: Arc::from("GTFS"),
                         route_code: Arc::from("UNKNOWN"),
                         sequence_num: 0,

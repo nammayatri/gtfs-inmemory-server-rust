@@ -690,7 +690,7 @@ pub fn polyline_waypoint_rows(detail: &Value) -> Vec<Waypoint> {
         .map(|rows| {
             rows.iter()
                 .filter_map(|r| match r["stop_type"].as_str()? {
-                    "ROUTE CORRECTION" => Some(Waypoint {
+                    super::validation::ROUTE_CORRECTION => Some(Waypoint {
                         lat: r["marker_lat"].as_f64()?,
                         lon: r["marker_lon"].as_f64()?,
                         sequence: r["sequence"].as_i64(),
@@ -698,7 +698,7 @@ pub fn polyline_waypoint_rows(detail: &Value) -> Vec<Waypoint> {
                         name: text(&r["marker_name"]),
                         marker: true,
                     }),
-                    "JUMP STOP" | "HIDDEN STOP" => None,
+                    super::validation::JUMP_STOP | super::validation::HIDDEN_STOP => None,
                     _ => Some(Waypoint {
                         lat: r["lat"].as_f64()?,
                         lon: r["lon"].as_f64()?,
@@ -1462,7 +1462,7 @@ fn referenced_stops(c: &ChangeRow) -> Vec<String> {
             .as_array()
             .map(|rows| {
                 rows.iter()
-                    .filter(|r| r["stop_type"] != "ROUTE CORRECTION")
+                    .filter(|r| r["stop_type"] != super::validation::ROUTE_CORRECTION)
                     .filter_map(|r| r["stop_id"].as_str())
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
