@@ -294,5 +294,7 @@ pub fn osrtc_station_to_route_stop_mapping(station: &OsrtcStation) -> RouteStopM
         platform: None,
         parent_stop_code: None,
         cluster_id: None,
+        stage_number: None,
+        stop_type: None,
     }
 }

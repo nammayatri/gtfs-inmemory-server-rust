@@ -20,6 +20,9 @@
 //!   `{'fareStageNumber': 'N', 'isStageStop': true}` on a NEW STOP.
 //! - **routes**: routes with a pattern.
 
+use crate::editor::validation::{
+    is_stage_boundary, INTERMEDIATE_STOP, NEW_STOP, SERVED_STOP_TYPES,
+};
 use crate::models::{GTFSStop, LatLong, NandiPatternDetails, NandiRoutesRes, NandiStop, NandiTrip};
 use crate::tools::error::{AppError, AppResult};
 use sqlx::postgres::PgPool;
@@ -31,10 +34,6 @@ use tracing::info;
 pub const STOP_INTERVAL_SECONDS: i32 = 135;
 /// Dwell at each stop but the last.
 pub const DWELL_SECONDS: i32 = 15;
-
-/// Row types a GTFS build turns into stop_times. JUMP STOP, ROUTE CORRECTION
-/// and HIDDEN STOP rows are fare / shaping data, never a place a bus stops.
-const SERVED_STOP_TYPES: [&str; 2] = ["NEW STOP", "INTERMEDIATE STOP"];
 
 /// What a DB feed borrows from the preprocessed data for one route.
 #[derive(Debug, Clone)]
@@ -203,11 +202,87 @@ pub fn overlays_from_patterns(
 
 /// The generator's `stop_headsign`.
 pub fn headsign(stage_no: i32, stop_type: &str) -> String {
-    if stop_type == "NEW STOP" {
+    if is_stage_boundary(stop_type) {
         format!("{{'fareStageNumber': '{}', 'isStageStop': true}}", stage_no)
     } else {
         stage_no.to_string()
     }
+}
+
+pub fn parse_headsign_stage(
+    headsign: &str,
+    feed_uses_fare_stages: bool,
+) -> (Option<i32>, Option<&'static str>) {
+    let raw = headsign.trim();
+    if raw.is_empty() {
+        return (None, None);
+    }
+    if !raw.starts_with('{') {
+        if !feed_uses_fare_stages {
+            return (None, None);
+        }
+        return match parse_stage_no(raw) {
+            Some(stage_no) => (Some(stage_no), Some(INTERMEDIATE_STOP)),
+            None => (None, None),
+        };
+    }
+    let stage_raw = dict_value(raw, "fareStageNumber");
+    let flag_raw = dict_value(raw, "isStageStop");
+    if stage_raw.is_none() && flag_raw.is_none() {
+        return (None, None);
+    }
+    let stage_no = stage_raw.and_then(parse_stage_no);
+    if stage_raw.is_some() && stage_no.is_none() {
+        return (None, None);
+    }
+    let stop_type = match flag_raw {
+        Some(v) if v.eq_ignore_ascii_case("true") => Some(NEW_STOP),
+        Some(v) if v.eq_ignore_ascii_case("false") => Some(INTERMEDIATE_STOP),
+        _ => None,
+    };
+    (stage_no, stop_type)
+}
+
+pub fn is_fare_stage_dict(headsign: &str) -> bool {
+    let raw = headsign.trim();
+    raw.starts_with('{')
+        && (dict_value(raw, "fareStageNumber").is_some()
+            || dict_value(raw, "isStageStop").is_some())
+}
+
+fn parse_stage_no(raw: &str) -> Option<i32> {
+    let v = raw.trim();
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<i32>().ok()
+}
+
+fn dict_value<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+    for quote in ['\'', '"'] {
+        let needle = format!("{quote}{key}{quote}");
+        let mut from = 0;
+        while let Some(rel) = raw[from..].find(&needle) {
+            let after = from + rel + needle.len();
+            if let Some(value) = value_after_colon(&raw[after..]) {
+                return Some(value);
+            }
+            from += rel + 1;
+        }
+    }
+    None
+}
+
+fn value_after_colon(rest: &str) -> Option<&str> {
+    let value = rest.trim_start().strip_prefix(':')?.trim_start();
+    let quoted = value.starts_with('\'') || value.starts_with('"');
+    let value = value.trim_start_matches(['\'', '"']);
+    let end = value.find([',', '}', '\'', '"']).unwrap_or(value.len());
+    let out = value[..end].trim();
+    if out.is_empty() || (!quoted && (out == "None" || out == "null" || out == "nil")) {
+        return None;
+    }
+    Some(out)
 }
 
 /// GTFS route_type -> the mode string GIMS stores (preprocessor's ROUTE_TYPE_MAP
@@ -587,6 +662,8 @@ impl GtfsDbSource {
                     stop_sequence: Some(i as i32 + 1),
                     platform_code: None,
                     headsign: Some(headsign(*stage_no, stop_type)),
+                    stage_number: Some(*stage_no),
+                    stop_type: Some(stop_type.clone()),
                 });
             }
             let (Some(first), Some(end)) = (pattern_stops.first(), pattern_stops.last()) else {
@@ -656,6 +733,167 @@ mod tests {
     }
 
     #[test]
+    fn parse_headsign_stage_inverts_the_generator() {
+        for stage_no in [1, 3, 12, 47] {
+            assert_eq!(
+                parse_headsign_stage(&headsign(stage_no, "NEW STOP"), true),
+                (Some(stage_no), Some(NEW_STOP))
+            );
+            assert_eq!(
+                parse_headsign_stage(&headsign(stage_no, "INTERMEDIATE STOP"), true),
+                (Some(stage_no), Some(INTERMEDIATE_STOP))
+            );
+        }
+    }
+
+    #[test]
+    fn parse_headsign_stage_tolerates_the_dialect() {
+        assert_eq!(
+            parse_headsign_stage("{'isStageStop': True, 'fareStageNumber': '7'}", true),
+            (Some(7), Some(NEW_STOP))
+        );
+        assert_eq!(
+            parse_headsign_stage("{\"fareStageNumber\":\"7\",\"isStageStop\":false}", true),
+            (Some(7), Some(INTERMEDIATE_STOP))
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_flag_is_unknown_not_a_boundary() {
+        assert_eq!(
+            parse_headsign_stage("{'fareStageNumber': 7}", true),
+            (Some(7), None)
+        );
+        assert_eq!(
+            parse_headsign_stage("{'fareStageNumber': '7', 'isStageStop': maybe}", true),
+            (Some(7), None)
+        );
+        assert_eq!(
+            parse_headsign_stage("{'isStageStop': true}", true),
+            (None, Some(NEW_STOP))
+        );
+    }
+
+    #[test]
+    fn a_value_that_says_nothing_is_not_read_as_a_value() {
+        for raw in [
+            "{'fareStageNumber': None, 'isStageStop': None}",
+            "{\"fareStageNumber\": null, \"isStageStop\": null}",
+        ] {
+            assert_eq!(parse_headsign_stage(raw, true), (None, None), "{raw}");
+        }
+        assert_eq!(
+            parse_headsign_stage("{'fareStageNumber': 'None', 'isStageStop': true}", true),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_stage_number_that_does_not_fit_is_not_published_as_a_stage() {
+        for raw in [
+            "{'fareStageNumber': '99999999999', 'isStageStop': true}",
+            "{'fareStageNumber': '-4', 'isStageStop': true}",
+            "{'fareStageNumber': '+7', 'isStageStop': true}",
+            "{'fareStageNumber': '3.5', 'isStageStop': true}",
+        ] {
+            assert_eq!(parse_headsign_stage(raw, true), (None, None), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_key_named_inside_an_earlier_value_does_not_shadow_the_real_one() {
+        assert_eq!(
+            parse_headsign_stage(
+                "{'note': 'see fareStageNumber below', 'fareStageNumber': '5'}",
+                true
+            ),
+            (Some(5), None)
+        );
+        assert_eq!(
+            parse_headsign_stage(
+                "{'stopName': 'fareStageNumber Rd', 'fareStageNumber': '5'}",
+                true
+            ),
+            (Some(5), None)
+        );
+        assert_eq!(
+            parse_headsign_stage(
+                "{'stopName': 'fareStageNumber', 'fareStageNumber': '5', 'isStageStop': true}",
+                true
+            ),
+            (Some(5), Some(NEW_STOP))
+        );
+        assert_eq!(
+            parse_headsign_stage(
+                "{\"stopName\": \"isStageStop\", \"fareStageNumber\": \"5\", \"isStageStop\": false}",
+                true
+            ),
+            (Some(5), Some(INTERMEDIATE_STOP))
+        );
+    }
+
+    #[test]
+    fn a_bare_number_is_a_stage_only_on_a_feed_that_uses_fare_stages() {
+        assert_eq!(
+            parse_headsign_stage("3", true),
+            (Some(3), Some(INTERMEDIATE_STOP))
+        );
+        for raw in ["3", "500", "-4", "+7"] {
+            assert_eq!(parse_headsign_stage(raw, false), (None, None), "{raw}");
+        }
+        assert_eq!(parse_headsign_stage("-4", true), (None, None));
+        assert_eq!(parse_headsign_stage("+7", true), (None, None));
+    }
+
+    #[test]
+    fn is_fare_stage_dict_recognises_only_the_generators_shape() {
+        assert!(is_fare_stage_dict(
+            "{'fareStageNumber': '1', 'isStageStop': true}"
+        ));
+        assert!(is_fare_stage_dict("{'isStageStop': false}"));
+        assert!(!is_fare_stage_dict("3"));
+        assert!(!is_fare_stage_dict("Towards Broadway"));
+        assert!(!is_fare_stage_dict("{'headsign': 'Broadway'}"));
+    }
+
+    #[test]
+    fn parse_headsign_stage_reports_nothing_for_a_headsign_that_is_not_a_stage() {
+        assert_eq!(
+            parse_headsign_stage("Towards Parrys Corner", true),
+            (None, None)
+        );
+        assert_eq!(parse_headsign_stage("", true), (None, None));
+        assert_eq!(parse_headsign_stage("  ", true), (None, None));
+        assert_eq!(
+            parse_headsign_stage("{'headsign': 'Broadway'}", true),
+            (None, None)
+        );
+    }
+
+    /// Parity: a feed reverted from `data_source = db` to preprocessed data
+    /// (`FeedAction::Revert`, or a deploy with `gtfs_db_feeds` empty) must
+    /// report the same stage. The DB path reads the columns; the preprocessed
+    /// path parses the headsign built from those same columns.
+    #[test]
+    fn the_db_and_preprocessed_paths_report_the_same_stage() {
+        for stage_no in [1, 2, 7, 23, 104] {
+            for stop_type in SERVED_STOP_TYPES {
+                let from_columns = (Some(stage_no), Some(stop_type));
+                let from_headsign = parse_headsign_stage(&headsign(stage_no, stop_type), true);
+                assert_eq!(
+                    from_columns, from_headsign,
+                    "stage {stage_no} on {stop_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn served_stop_types_are_the_ones_the_headsign_can_carry() {
+        assert_eq!(SERVED_STOP_TYPES, [NEW_STOP, INTERMEDIATE_STOP]);
+    }
+
+    #[test]
     fn route_type_maps_like_the_preprocessor() {
         assert_eq!(route_mode(3), "BUS");
         assert_eq!(route_mode(2), "METRO");
@@ -675,6 +913,8 @@ mod tests {
             stop_sequence: Some(i),
             platform_code: None,
             headsign: None,
+            stage_number: None,
+            stop_type: None,
         };
         let pat = |id: &str, n: i32, trips: usize| NandiPatternDetails {
             id: id.into(),
