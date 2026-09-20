@@ -6,6 +6,10 @@ Run two GIMS instances over the same preprocessed data, one with the feed in
 
     python scripts/parity_gtfs_db.py --a http://127.0.0.1:18001 --b http://127.0.0.1:18002
 
+`--gtfs-id` may be given once per feed (default: chennai_bus), and each feed is
+reported on its own - a feed is either identical or it is not, and one feed's
+failure says nothing about the next one's.
+
 Every public static API for the feed is requested from both and compared as
 normalised JSON (object keys sorted, lists compared as multisets - HashMap
 iteration order differs between processes, so list order is not data; every
@@ -83,15 +87,34 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--a", required=True, help="GIMS serving the feed from preprocessed data")
     ap.add_argument("--b", required=True, help="GIMS serving the feed from the DB")
-    ap.add_argument("--gtfs-id", default="chennai_bus")
+    ap.add_argument("--gtfs-id", action="append", default=None,
+                    help="feed to compare; repeat for several (default: chennai_bus)")
     ap.add_argument("--every", type=int, default=50, help="sample every Nth route and stop")
     ap.add_argument("--focus-stop", action="append", default=None,
-                    help="stop codes always sampled (default: the Alwarpet Anjaneyar ids)")
+                    help="stop codes always sampled on every feed that has them "
+                         "(default: the Alwarpet Anjaneyar ids, which only chennai_bus has)")
     ap.add_argument("--all-routes", action="store_true", help="compare every route, not a sample")
     ap.add_argument("--cached-data", action="store_true", help="also compare /cached-data for the feed")
     args = ap.parse_args()
-    g = args.gtfs_id
+    feeds = args.gtfs_id or ["chennai_bus"]
+
+    for base in (args.a, args.b):
+        status, _ = fetch(base, "/ready")
+        if status != 200:
+            sys.exit(f"{base} is not ready (HTTP {status})")
+
+    failed = [g for g in feeds if compare_feed(args, g) != 0]
+    if len(feeds) > 1:
+        print("\n==== all feeds ====")
+        for g in feeds:
+            print(f"{g:<45} {'FAILED' if g in failed else 'OK'}")
+    return 1 if failed else 0
+
+
+def compare_feed(args, g):
+    """Every compared response for one feed. 0 when they are all identical."""
     focus = args.focus_stop or ALWARPET
+    print(f"\n==== {g} ====")
 
     results = collections.defaultdict(lambda: [0, 0])   # group -> [identical, differing]
     examples = collections.defaultdict(list)
@@ -107,11 +130,6 @@ def main():
             examples[group].append(f"{path} -> {why}")
         return ja
 
-    for base in (args.a, args.b):
-        status, _ = fetch(base, "/ready")
-        if status != 200:
-            sys.exit(f"{base} is not ready (HTTP {status})")
-
     routes = compare("/routes/{g}", f"/routes/{g}")
     stops = compare("/stops/{g}", f"/stops/{g}")
     compare("/stops/{g}?includeClusterId=true", f"/stops/{g}?includeClusterId=true")
@@ -119,7 +137,8 @@ def main():
     route_ids = sorted(r["id"] for r in (routes or []))
     sample_routes = route_ids if args.all_routes else route_ids[:: args.every]
     stop_codes = sorted({s["stopCode"] for s in (stops or [])})
-    sample_stops = sorted(set(stop_codes[:: args.every]) | set(focus))
+    # A focus code the feed does not have would only compare two 404s.
+    sample_stops = sorted(set(stop_codes[:: args.every]) | (set(focus) & set(stop_codes)))
 
     q = urllib.parse.quote
     pairs = []
@@ -170,7 +189,8 @@ def main():
             print(f"{'':<{width}}    {e}")
     print(f"\nsampled {len(sample_routes)} routes, {len(sample_stops)} stops, {len(pairs[:100])} cluster pairs")
     print(f"/version/{g}: a={va[1]} b={vb[1]} (expected to differ: the DB feed folds in gtfs_feed.version)")
-    print("PARITY OK" if total_diff == 0 else f"PARITY FAILED: {total_diff} differing responses")
+    print(f"{g}: PARITY OK" if total_diff == 0
+          else f"{g}: PARITY FAILED: {total_diff} differing responses")
     return 0 if total_diff == 0 else 1
 
 
