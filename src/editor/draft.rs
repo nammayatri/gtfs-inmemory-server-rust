@@ -587,6 +587,7 @@ mod tests {
             pickup_type: None,
             drop_off_type: None,
             timepoint: None,
+            stop_headsign: None,
         }
     }
 
