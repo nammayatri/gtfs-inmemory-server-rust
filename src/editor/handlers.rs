@@ -10,6 +10,7 @@ use super::gps_line::{self, GpsFailure};
 use super::position_reviews;
 use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
+use super::trips;
 use super::validation::valid_lat_lon;
 use super::webhooks;
 use super::EditorState;
@@ -731,13 +732,26 @@ pub async fn change_set_create(
     Ok(HttpResponse::Created().json(set))
 }
 
+/// A change set's changes come a page at a time (section 16.5, "Big drafts").
+#[derive(Deserialize)]
+pub struct ChangesQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
 pub async fn change_set(
     req: HttpRequest,
     st: Data,
     path: web::Path<Uuid>,
+    q: web::Query<ChangesQuery>,
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Viewer).await?;
-    ok(svc::set_detail(&st, &ctx, *path).await?)
+    let first = q.cursor.as_deref().is_none_or(str::is_empty);
+    let page = Page::parse(
+        Some(q.limit.unwrap_or(svc::CHANGES_PAGE)),
+        q.cursor.as_deref(),
+    )?;
+    ok(svc::set_detail_page(&st, &ctx, *path, &page, first).await?)
 }
 
 pub async fn change_add(
@@ -874,6 +888,69 @@ pub async fn bulk_import(
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     ok(bulk::run(&st, &ctx, *path, body.into_inner()).await?)
+}
+
+// ---------------------------------------------------------------- timetable (section 16)
+
+/// A route's other stop orders read like its stop list: the route detail with
+/// pattern `k`'s rows.
+pub async fn route_pattern(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String, i16)>,
+) -> EditorResult<HttpResponse> {
+    let (g, id, pattern) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(svc::route_pattern_detail(&mut conn, &g, &id, pattern).await?)
+}
+
+pub async fn route_trips(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(trips::route_trips_detail(&mut conn, &g, &id).await?)
+}
+
+pub async fn services(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(trips::list_services(&mut conn, &path).await?)
+}
+
+pub async fn change_set_preview_pattern(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String, i16)>,
+) -> EditorResult<HttpResponse> {
+    let (id, route_id, pattern) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(svc::preview_route_as(
+        &st,
+        &ctx,
+        id,
+        &route_id,
+        svc::RoutePreview::Pattern(pattern),
+    )
+    .await?)
+}
+
+pub async fn change_set_preview_trips(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+) -> EditorResult<HttpResponse> {
+    let (id, route_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(svc::preview_route_as(&st, &ctx, id, &route_id, svc::RoutePreview::Trips).await?)
 }
 
 // ---------------------------------------------------------------- station proposals
