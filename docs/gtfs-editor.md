@@ -34,8 +34,8 @@ policy row that supersedes the dhall config (section 12.5), `0017` adds
 `stage_no` / `stage_name` defaults so a feed with no fare stages can have a route
 at all ("The headsign" below), `0018` adds per-feed access grants and system
 accounts (section 15), `0019` adds patterns, timing profiles, trips, frequencies
-and service calendars (section 16). All nine are safe to
-run twice. **`0012` and `0017`
+and service calendars (section 16), `0020` the MTC sync's system account (section
+16.8). All ten are safe to run twice. **`0012` and `0017`
 go on a database before the build that reads them:** both the editor and the
 GIMS loader select those columns, so a DB feed fails to load (and serves its
 preprocessed data) on a database without them.)
@@ -2338,9 +2338,8 @@ CREATE TABLE gtfs_sync_run (
 ```
 
 The migration also widens `gtfs_change.entity` to add `pattern`,
-`timing_profile`, `route_trips` and `service`, and creates the system account
-`mtc-sync` (`kind = 'system'`, section 15) with an `editor` grant on
-`chennai_bus`. Safe to run twice.
+`timing_profile`, `route_trips` and `service`. Safe to run twice. (The sync's
+system account comes with the sync, in `0020_mtc_sync.sql` — section 16.8.)
 
 **Every query that means "a route's stop list" gains `pattern_key`.** Code that
 takes no pattern means pattern 1, so everything written before this section keeps
@@ -2515,6 +2514,8 @@ credential and nobody's session.
   the last one arrives N minutes after the first, 15 s dwell — shared by every
   trip on that pattern with the same N. Otherwise the default timing. Off by
   default, so turning it on is its own reviewed change.
+- **The account**: `0020_mtc_sync.sql` creates `mtc-sync` (`kind = 'system'`,
+  section 15; it needs `0018`) with an `editor` grant on `chennai_bus`.
 - **The draft**: one per run, titled "MTC schedule sync YYYY-MM-DD", created and
   submitted by `mtc-sync`: one `route_trips/replace` per route whose trips
   differ, plus the profiles they need. No difference, no draft (`no_change`). A
