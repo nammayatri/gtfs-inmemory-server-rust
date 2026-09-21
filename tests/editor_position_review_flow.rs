@@ -1652,7 +1652,8 @@ async fn position_review_timings() {
             "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
                                           marker_lat, marker_lon, stop_name_override, provider_id) \
              SELECT '{PERF_FEED}', route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
-                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop WHERE gtfs_id = 'chennai_bus'"
+                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop \
+             WHERE gtfs_id = 'chennai_bus' AND pattern_key = 1"
         ),
         // the three stops the most routes call at
         format!(

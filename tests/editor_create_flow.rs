@@ -646,7 +646,8 @@ async fn create_merge_bulk_and_proposals() {
         Some("#0A7E3C")
     );
     let order: Vec<String> = sqlx::query(&format!(
-        "SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'NR1' ORDER BY sequence"
+        "SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'NR1' AND pattern_key = 1 \
+         ORDER BY sequence"
     ))
     .fetch_all(&pool)
     .await
@@ -1251,7 +1252,7 @@ async fn create_merge_bulk_and_proposals() {
         );
         assert_eq!(s, 200, "{action}: {b}");
     }
-    let br1: Vec<String> = sqlx::query(&format!("SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'BR1' ORDER BY sequence"))
+    let br1: Vec<String> = sqlx::query(&format!("SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'BR1' AND pattern_key = 1 ORDER BY sequence"))
         .fetch_all(&pool).await.unwrap().iter().map(|r| r.get("stop_id")).collect();
     assert_eq!(
         br1,
@@ -1914,7 +1915,8 @@ async fn bulk_dry_run_timings() {
             "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
                                           marker_lat, marker_lon, stop_name_override, provider_id) \
              SELECT '{PERF_FEED}', route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
-                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop WHERE gtfs_id = 'chennai_bus'"
+                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop \
+             WHERE gtfs_id = 'chennai_bus' AND pattern_key = 1"
         ),
     ]);
     setup.extend(reset_accounts(&[PERF_ADMIN]));
@@ -1962,7 +1964,8 @@ async fn bulk_dry_run_timings() {
     // 5,000 rows: whole stop lists of real routes, re-uploaded
     let rows = sqlx::query(&format!(
         "SELECT route_id, sequence, stop_id, stop_type, stage_no, stage_name FROM gtfs_route_stop \
-         WHERE gtfs_id = '{PERF_FEED}' AND stop_type <> 'ROUTE CORRECTION' ORDER BY route_id, sequence"
+         WHERE gtfs_id = '{PERF_FEED}' AND pattern_key = 1 AND stop_type <> 'ROUTE CORRECTION' \
+         ORDER BY route_id, sequence"
     ))
     .fetch_all(&pool)
     .await
