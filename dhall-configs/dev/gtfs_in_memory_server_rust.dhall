@@ -7,6 +7,19 @@ let logger_cfg = {
 
 let secrets = ../secrets/gtfs_in_memory_server_rust.example.dhall
 
+-- Where the GTFS editor reads bus pings for "suggest a map line from GPS"
+-- (docs/gtfs-editor.md section 17). Only url and user are required.
+let GtfsGps =
+      { url : Text
+      , user : Text
+      , table : Optional Text
+      , days : Optional Natural
+      , feeds : Optional (List Text)
+      , max_bus_days : Optional Natural
+      , page_rows : Optional Natural
+      , timeout_seconds : Optional Natural
+      }
+
 in {
   -- Logger configuration
   logger_cfg = logger_cfg,
@@ -93,5 +106,22 @@ in {
 
   -- OSRM server for route polyline reprocessing (absent/empty ⇒ polyline skipped)
   osrm_url = Some "http://localhost:5050",
+
+  -- GPS pings for the editor's "suggest a map line from GPS". Off here: the
+  -- endpoint answers 503 gps_unavailable. To turn it on, for example:
+  --   gtfs_gps = Some
+  --     { url = "https://clickhouse.internal:8443"
+  --     , user = "gims_reader"
+  --     , table = Some "atlas_kafka.amnex_direct_data"
+  --     , days = Some 14
+  --     , feeds = Some [ "chennai_bus" ]
+  --     , max_bus_days = None Natural
+  --     , page_rows = None Natural
+  --     , timeout_seconds = None Natural
+  --     },
+  -- The cluster is production and shared: GIMS reads it read-only (readonly=2
+  -- on every query), one query at a time, and only bounded SELECTs.
+  gtfs_gps = None GtfsGps,
+  gtfs_gps_clickhouse_password = secrets.clickhouse_password,
   gen_int_for_id = Some True,
 }

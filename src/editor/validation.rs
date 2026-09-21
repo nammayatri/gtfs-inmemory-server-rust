@@ -1038,11 +1038,11 @@ pub fn check_payload(
                 }
             }
             if let Some(s) = m.get("polyline_source").and_then(Value::as_str) {
-                if !["osrm", "manual", "imported"].contains(&s) {
+                if !["osrm", "gps", "manual", "imported"].contains(&s) {
                     return Err(Finding::error(
                         "invalid_payload",
                         s,
-                        format!("{what}: polyline_source is osrm, manual or imported"),
+                        format!("{what}: polyline_source is osrm, gps, manual or imported"),
                     ));
                 }
             }

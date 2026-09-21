@@ -668,23 +668,57 @@ pub async fn route_detail(
     Ok(route)
 }
 
-/// Coordinates a polyline should pass through: every boarded stop and every
-/// shaping marker, in order. Jump and hidden stops are not on the bus's path.
-pub fn polyline_waypoints(detail: &Value) -> Vec<(f64, f64)> {
+/// One point a polyline should pass through, and which row it came from, so
+/// that a router's complaint about "coordinate 7" can name the stop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Waypoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub sequence: Option<i64>,
+    /// The stop id, or the marker id of a shaping marker.
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub marker: bool,
+}
+
+/// Every boarded stop and every shaping marker, in order. Jump and hidden
+/// stops are not on the bus's path.
+pub fn polyline_waypoint_rows(detail: &Value) -> Vec<Waypoint> {
+    let text = |v: &Value| v.as_str().map(str::to_string);
     detail["rows"]
         .as_array()
         .map(|rows| {
             rows.iter()
                 .filter_map(|r| match r["stop_type"].as_str()? {
-                    "ROUTE CORRECTION" => {
-                        Some((r["marker_lat"].as_f64()?, r["marker_lon"].as_f64()?))
-                    }
+                    "ROUTE CORRECTION" => Some(Waypoint {
+                        lat: r["marker_lat"].as_f64()?,
+                        lon: r["marker_lon"].as_f64()?,
+                        sequence: r["sequence"].as_i64(),
+                        id: text(&r["marker_id"]),
+                        name: text(&r["marker_name"]),
+                        marker: true,
+                    }),
                     "JUMP STOP" | "HIDDEN STOP" => None,
-                    _ => Some((r["lat"].as_f64()?, r["lon"].as_f64()?)),
+                    _ => Some(Waypoint {
+                        lat: r["lat"].as_f64()?,
+                        lon: r["lon"].as_f64()?,
+                        sequence: r["sequence"].as_i64(),
+                        id: text(&r["stop_id"]),
+                        name: text(&r["stop_name"]),
+                        marker: false,
+                    }),
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Coordinates a polyline should pass through: [`polyline_waypoint_rows`].
+pub fn polyline_waypoints(detail: &Value) -> Vec<(f64, f64)> {
+    polyline_waypoint_rows(detail)
+        .into_iter()
+        .map(|w| (w.lat, w.lon))
+        .collect()
 }
 
 // ---------------------------------------------------------------- change sets

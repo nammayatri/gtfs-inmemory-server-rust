@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod draft;
 pub mod error;
 pub mod feed_lock;
+pub mod gps_line;
 pub mod handlers;
 pub mod jwt;
 pub mod position_reviews;
@@ -45,6 +46,10 @@ pub struct EditorState {
     /// the deployment's dhall values as a seed and reads the saved policy per
     /// request, because this same API edits it. See `webhooks`.
     pub webhook_policy: crate::services::webhook::LivePolicy,
+    /// Map lines from GPS (docs section 17); None when not configured.
+    pub gps_line: Option<Arc<gps_line::GpsLine>>,
+    /// For the OSRM calls.
+    pub http: reqwest::Client,
 }
 
 pub struct EditorSettings {
@@ -84,7 +89,18 @@ impl EditorState {
             ui_dir: s.ui_dir,
             osrm_url: s.osrm_url,
             webhook_policy: s.webhook_policy,
+            gps_line: None,
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|_| "cannot build the HTTP client".to_string())?,
         })
+    }
+
+    /// Turn on map lines from GPS.
+    pub fn with_gps_line(mut self, gps: gps_line::GpsLine) -> Self {
+        self.gps_line = Some(Arc::new(gps));
+        self
     }
 
     /// Build from the GIMS config. `None` when the editor is disabled or its
@@ -139,8 +155,24 @@ impl EditorState {
             webhook_policy: crate::services::webhook::LivePolicy::new(config.webhook_policy()),
         };
         match Self::build(pool, settings) {
-            Ok(state) => {
+            Ok(mut state) => {
                 info!("GTFS editor enabled at /internal/gtfs-editor");
+                if let Some(gps) = &config.gtfs_gps {
+                    let settings = gps_line::settings_from_config(
+                        gps,
+                        config.gtfs_gps_clickhouse_password.clone(),
+                    );
+                    let feeds = settings.feeds.clone();
+                    match gps_line::GpsLine::new(settings) {
+                        Ok(g) => {
+                            info!("GTFS editor: map lines from GPS for {feeds:?}");
+                            state = state.with_gps_line(g);
+                        }
+                        Err(e) => error!(
+                            "GTFS editor GPS config is invalid: {e}; map lines from GPS disabled"
+                        ),
+                    }
+                }
                 Some(Arc::new(state))
             }
             Err(e) => {
@@ -216,6 +248,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:osrm",
                 web::post().to(h::polyline_osrm),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/polyline:gps",
+                web::post().to(h::polyline_gps),
             )
             .route("/feeds/{gtfs_id}/audit", web::get().to(h::audit))
             // drafts
@@ -384,6 +420,39 @@ mod tests {
             cfg.gtfs_editor_audience.as_deref(),
             Some("gtfs.sso.example")
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_gps_block_is_off_in_dev_and_parses_when_set() {
+        let cfg =
+            read_dhall_config("./dhall-configs/dev/gtfs_in_memory_server_rust.dhall").unwrap();
+        assert!(cfg.gtfs_gps.is_none());
+        let dev =
+            std::fs::canonicalize("./dhall-configs/dev/gtfs_in_memory_server_rust.dhall").unwrap();
+        let dir = std::env::temp_dir().join(format!("gps-dhall-{}", super::crypto::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gps.dhall");
+        std::fs::write(
+            &path,
+            format!(
+                "{} // {{ gtfs_gps = Some {{ url = \"https://ch.example:8443\", user = \"reader\" }}, \
+                   gtfs_gps_clickhouse_password = Some \"pw\" }}",
+                dev.display()
+            ),
+        )
+        .unwrap();
+        let cfg = read_dhall_config(path.to_str().unwrap()).unwrap();
+        let gps = cfg.gtfs_gps.clone().unwrap();
+        assert_eq!(gps.url, "https://ch.example:8443");
+        assert!(gps.table.is_none() && gps.days.is_none() && gps.feeds.is_none());
+        let s =
+            super::gps_line::settings_from_config(&gps, cfg.gtfs_gps_clickhouse_password.clone());
+        assert_eq!(s.table, super::gps_line::DEFAULT_TABLE);
+        assert_eq!(s.days, 14);
+        assert_eq!(s.feeds, vec!["chennai_bus".to_string()]);
+        assert_eq!(s.page_rows, 100);
+        assert!(super::gps_line::GpsLine::new(s).is_ok());
         std::fs::remove_dir_all(dir).ok();
     }
 }
