@@ -135,6 +135,7 @@ fn clear_feed() -> Vec<String> {
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{FEED}'"),
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{FEED}' AND parent_station IS NOT NULL"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
     ]
 }
@@ -327,6 +328,14 @@ async fn a_commit_and_concurrent_draft_edits_never_deadlock() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }

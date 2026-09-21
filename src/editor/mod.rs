@@ -3,7 +3,8 @@
 //! Everything lives under `/internal/gtfs-editor`. The dashboard's static files
 //! (`/ui/`) are open - Pomerium sits in front of them - and every API call goes
 //! through [`auth::guard`], which verifies Pomerium's signed JWT, then each
-//! handler checks the session and role it needs. Nothing else in GIMS changes:
+//! handler checks the session, and the role it needs on the feed it is about
+//! (docs/gtfs-editor.md section 15). Nothing else in GIMS changes:
 //! the editor has its own small, lazily-connected pool on the internal DB, so a
 //! database outage cannot stop GIMS from booting.
 
@@ -377,6 +378,14 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/users/{user_id}/reset-totp",
                 web::post().to(h::user_reset_totp),
+            )
+            .route(
+                "/users/{user_id}/feeds/{gtfs_id}",
+                web::put().to(h::user_feed_put),
+            )
+            .route(
+                "/users/{user_id}/feeds/{gtfs_id}",
+                web::delete().to(h::user_feed_delete),
             )
             .default_service(web::to(h::not_found)),
     );
