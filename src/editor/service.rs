@@ -4122,7 +4122,6 @@ async fn feed_exists(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<()>
 
 /// `feed_access_granted` / `_changed` / `_revoked`: one row per feed, carrying
 /// the feed, so the feed's own history shows who was let in.
-#[allow(clippy::too_many_arguments)]
 async fn audit_access(
     conn: &mut PgConnection,
     ctx: &Ctx,

@@ -40,6 +40,10 @@ export async function api(method, path, body) {
     if (res.status === 401 && path !== "auth/session" && path !== "auth/totp/confirm") {
       window.dispatchEvent(new CustomEvent("auth:required", { detail: e }));
     }
+    // a grant taken away while the page was open (docs section 15)
+    if (res.status === 403 && e.code === "no_feed_access") {
+      window.dispatchEvent(new CustomEvent("access:changed", { detail: e }));
+    }
     throw e;
   }
   return data;
