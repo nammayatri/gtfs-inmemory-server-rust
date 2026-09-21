@@ -162,6 +162,47 @@ pub struct AppConfig {
     /// the fleet look smaller than it is, which would fire a webhook early.
     #[serde(default)]
     pub gtfs_pod_id: Option<String>,
+    /// Where the GTFS editor reads bus pings to suggest a route's map line
+    /// from GPS (docs/gtfs-editor.md section 17). Absent - the default - and
+    /// that endpoint answers 503 `gps_unavailable`; nothing else changes.
+    #[serde(default)]
+    pub gtfs_gps: Option<GtfsGpsConfig>,
+    /// The password of `gtfs_gps.user` (secrets dhall).
+    #[serde(default)]
+    pub gtfs_gps_clickhouse_password: Option<String>,
+}
+
+/// The GPS block of [`AppConfig`]. Only `url` and `user` are required.
+///
+/// The ClickHouse cluster behind it is production and shared, and its user
+/// may well have write rights: the editor reads it only through
+/// `services::clickhouse_reader`, which sends `readonly=2` with every query,
+/// allows nothing but a bounded SELECT, and runs one query at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GtfsGpsConfig {
+    /// ClickHouse's HTTP interface, e.g. "https://clickhouse.internal:8443"
+    /// (8123/8443, not the native 9000/9440).
+    pub url: String,
+    pub user: String,
+    /// `database.table` holding the pings. Default `atlas_kafka.amnex_direct_data`.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// How many days back to read. Default 14.
+    #[serde(default)]
+    pub days: Option<u32>,
+    /// The feeds whose routes these pings describe. Default `["chennai_bus"]`.
+    #[serde(default)]
+    pub feeds: Option<Vec<String>>,
+    /// Bus-days read per suggestion, spread over the days. Default 30.
+    #[serde(default)]
+    pub max_bus_days: Option<u32>,
+    /// Rows per ClickHouse answer. Default 100: some network paths to the
+    /// cluster stall on answers of a few hundred rows.
+    #[serde(default)]
+    pub page_rows: Option<u32>,
+    /// The whole suggestion, OSRM included. Default 55 s, under a proxy's 60.
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
 }
 
 impl AppConfig {

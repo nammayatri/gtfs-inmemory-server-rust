@@ -6,12 +6,14 @@ use super::context;
 use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
 use super::feed_lock;
+use super::gps_line::{self, GpsFailure};
 use super::position_reviews;
 use super::proposals;
 use super::service::{self as svc, Page, StopQuery};
 use super::validation::valid_lat_lon;
 use super::webhooks;
 use super::EditorState;
+use crate::services::osrm;
 use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use actix_web::error::{JsonPayloadError, PathError, QueryPayloadError};
 use actix_web::http::StatusCode;
@@ -467,6 +469,83 @@ pub struct PolylineQuery {
     change_set: Option<Uuid>,
 }
 
+/// How long a suggestion through the stops may take, all chunks together.
+const OSRM_ROUTE_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+
+async fn route_for_line(
+    st: &EditorState,
+    ctx: &auth::Ctx,
+    g: &str,
+    route_id: &str,
+    change_set: Option<Uuid>,
+) -> EditorResult<serde_json::Value> {
+    match change_set {
+        Some(id) => svc::preview_route(st, ctx, id, route_id).await,
+        None => {
+            let mut conn = st.pool.acquire().await?;
+            svc::route_detail(&mut conn, g, route_id).await
+        }
+    }
+}
+
+/// "KOYAMBEDU (stop ab12, row 7)" - a waypoint as a person finds it.
+fn describe_waypoint(w: &svc::Waypoint) -> String {
+    let row = w.sequence.map(|q| format!(", row {q}")).unwrap_or_default();
+    let id = w.id.as_deref().unwrap_or("?");
+    match (w.marker, w.name.as_deref().filter(|n| !n.is_empty())) {
+        (true, Some(n)) => format!("the shaping marker {n} ({id}{row})"),
+        (true, None) => format!("a shaping marker ({id}{row})"),
+        (false, Some(n)) => format!("{n} (stop {id}{row})"),
+        (false, None) => format!("stop {id}{row}"),
+    }
+}
+
+/// The 502 for a road route OSRM would not give, saying why and where.
+fn osrm_failure(f: &osrm::RouteFailure, waypoints: &[svc::Waypoint]) -> EditorError {
+    use osrm::FailReason as R;
+    let wp = |i: Option<usize>| i.and_then(|i| waypoints.get(i));
+    let (from, to) = match (f.leg, f.waypoint) {
+        (Some(l), _) => (wp(Some(l)), wp(Some(l + 1))),
+        _ => (None, None),
+    };
+    let snapped = wp(f.waypoint);
+    let why = match (f.reason, snapped, from, to) {
+        (R::NoSegment, Some(w), _, _) => format!("there is no road near {}", describe_waypoint(w)),
+        (R::NoSegment, None, _, _) => "one of the stops is not near any road".to_string(),
+        (R::NoRoute, _, Some(a), Some(b)) => format!(
+            "there is no road route from {} to {}",
+            describe_waypoint(a),
+            describe_waypoint(b)
+        ),
+        (R::NoRoute, _, _, _) => "there is no road route through them".to_string(),
+        (R::Timeout, _, _, _) => "OSRM did not answer in time".to_string(),
+        (R::Unreachable, _, _, _) => "OSRM could not be reached".to_string(),
+        (R::HttpError, _, _, _) => format!("OSRM refused the request ({})", f.message),
+    };
+    let id = |w: Option<&svc::Waypoint>| w.and_then(|w| w.id.clone());
+    EditorError::new(
+        StatusCode::BAD_GATEWAY,
+        "osrm_failed",
+        format!("OSRM could not route through these stops: {why}"),
+    )
+    .with_details(json!({
+        "reason": f.reason,
+        "osrm_code": f.osrm_code,
+        "message": f.message,
+        "leg": f.leg,
+        "from_stop_id": id(from),
+        "to_stop_id": id(to),
+        "from_sequence": from.and_then(|w| w.sequence),
+        "to_sequence": to.and_then(|w| w.sequence),
+        "from_name": from.and_then(|w| w.name.clone()),
+        "to_name": to.and_then(|w| w.name.clone()),
+        "waypoint": f.waypoint,
+        "stop_id": id(snapped),
+        "sequence": snapped.and_then(|w| w.sequence),
+        "stop_name": snapped.and_then(|w| w.name.clone()),
+    }))
+}
+
 pub async fn polyline_osrm(
     req: HttpRequest,
     st: Data,
@@ -475,39 +554,105 @@ pub async fn polyline_osrm(
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Editor).await?;
     let (g, route_id) = path.into_inner();
-    let detail = match q.change_set {
-        Some(id) => svc::preview_route(&st, &ctx, id, &route_id).await?,
-        None => {
-            let mut conn = st.pool.acquire().await?;
-            svc::route_detail(&mut conn, &g, &route_id).await?
-        }
-    };
-    let points = svc::polyline_waypoints(&detail);
-    if st.osrm_url.as_deref().unwrap_or("").is_empty() {
+    let detail = route_for_line(&st, &ctx, &g, &route_id, q.change_set).await?;
+    let waypoints = svc::polyline_waypoint_rows(&detail);
+    let Some(base) = st.osrm_url.as_deref().filter(|u| !u.is_empty()) else {
         return Err(EditorError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "osrm_unavailable",
             "no OSRM server is configured",
         ));
-    }
-    let Some((polyline, legs)) =
-        crate::services::operator::osrm_route(st.osrm_url.as_deref(), &points).await
-    else {
-        return Err(EditorError::new(
-            StatusCode::BAD_GATEWAY,
-            "osrm_failed",
-            "OSRM could not route through these stops",
-        ));
     };
-    let distance: f64 = legs.iter().map(|(d, _)| d).sum();
+    let points: Vec<(f64, f64)> = waypoints.iter().map(|w| (w.lat, w.lon)).collect();
+    let line = osrm::route_through(&st.http, base, &points, OSRM_ROUTE_BUDGET)
+        .await
+        .map_err(|f| osrm_failure(&f, &waypoints))?;
+    let distance: f64 = line.legs.iter().map(|(d, _)| d).sum();
     ok(json!({
         "route_id": route_id,
-        "encoded_polyline": polyline,
+        "encoded_polyline": osrm::encode_polyline(&line.points),
         "polyline_source": "osrm",
         "waypoints": points.len(),
         "distance_m": distance.round(),
         "saved": false,
     }))
+}
+
+/// A map line from the buses' own GPS (docs section 17): not saved, like the
+/// OSRM one - the dashboard adds it to the draft as a `route` change.
+pub async fn polyline_gps(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+    q: web::Query<PolylineQuery>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let (g, route_id) = path.into_inner();
+    let unavailable =
+        |why: String| EditorError::new(StatusCode::SERVICE_UNAVAILABLE, "gps_unavailable", why);
+    let Some(gps) = st.gps_line.clone() else {
+        return Err(unavailable(
+            "map lines from GPS are not set up on this server".into(),
+        ));
+    };
+    if !gps.serves(&g) {
+        return Err(unavailable(format!("there are no GPS pings for feed {g}")));
+    }
+    let detail = route_for_line(&st, &ctx, &g, &route_id, q.change_set).await?;
+    let stops = gps_line::served_stops(&detail);
+    let short_name = detail["short_name"].as_str().unwrap_or("").to_string();
+    let asked = gps_line::RouteQuery {
+        gtfs_id: &g,
+        route_id: &route_id,
+        short_name: &short_name,
+        stops: &stops,
+    };
+    match gps.suggest(st.osrm_url.as_deref(), asked).await {
+        Ok(v) => ok(v),
+        Err(GpsFailure::NoRouteNumber) => Err(EditorError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "gps_no_route_number",
+            "this route has no route number to find its buses by",
+        )),
+        Err(GpsFailure::NotEnoughStops(n)) => Err(EditorError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "gps_not_enough_stops",
+            format!("the route has {n} stop(s) with a position; a line from GPS needs two"),
+        )
+        .with_details(json!({"stops": n}))),
+        Err(GpsFailure::NotEnoughRuns(counts)) => {
+            let used = counts["runs_used"].as_u64().unwrap_or(0);
+            let seen = counts["runs_seen"].as_u64().unwrap_or(0);
+            let need = counts["min_runs"].as_u64().unwrap_or(0);
+            let days = counts["days"].as_u64().unwrap_or(0);
+            Err(EditorError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "gps_not_enough_runs",
+                format!(
+                    "in the last {days} days {used} of {seen} bus runs labelled {} passed this                      route's stops in order; a line needs at least {need}",
+                    short_name.trim()
+                ),
+            )
+            .with_details(counts))
+        }
+        Err(GpsFailure::Timeout) => Err(EditorError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "gps_timeout",
+            "reading the GPS pings took too long; try again in a minute",
+        )),
+        Err(GpsFailure::Query(why)) => {
+            tracing::error!(tag = "[GTFS EDITOR GPS]", error = %why);
+            Err(EditorError::new(
+                StatusCode::BAD_GATEWAY,
+                "gps_query_failed",
+                format!("the GPS pings could not be read: {why}"),
+            ))
+        }
+        Err(GpsFailure::Internal(why)) => {
+            tracing::error!(tag = "[GTFS EDITOR GPS]", error = %why);
+            Err(EditorError::internal("the GPS query was refused"))
+        }
+    }
 }
 
 #[derive(Deserialize)]

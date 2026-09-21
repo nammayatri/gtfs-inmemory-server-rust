@@ -437,6 +437,8 @@ fn app_config(dir: &Path, db_url: &str) -> AppConfig {
         gtfs_webhooks_enabled: false,
         gtfs_webhook_allowed_hosts: vec![],
         gtfs_pod_id: None,
+        gtfs_gps: None,
+        gtfs_gps_clickhouse_password: None,
     }
 }
 

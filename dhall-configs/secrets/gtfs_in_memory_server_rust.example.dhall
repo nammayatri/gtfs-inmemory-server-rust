@@ -6,5 +6,6 @@
   phone_number_hash_key = Some "TEXT",
   enable_schedule_reconciliation = False,
   osrtc_username = Some "OSRTC_USERNAME",
-  osrtc_secret_key = Some "OSRTC_PASSWORD"
+  osrtc_secret_key = Some "OSRTC_PASSWORD",
+  clickhouse_password = Some "CLICKHOUSE_PASSWORD"
 }
