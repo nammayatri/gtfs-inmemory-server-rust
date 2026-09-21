@@ -788,6 +788,12 @@ pub struct GTFSData {
     /// is what keeps station expansion out of its way.
     #[serde(default)]
     pub station_platforms_by_gtfs: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Per DB feed whose trips come from the editor's tables
+    /// (`trips_source = 'db'`, docs/gtfs-editor.md section 16.6), its trips as
+    /// `/trip/{id}` serves them. Rebuilt with the feed, never snapshotted: a
+    /// snapshot boot rebuilds DB feeds from the tables anyway.
+    #[serde(skip)]
+    pub db_trips_by_gtfs: HashMap<String, Arc<crate::services::gtfs_db_source::DbTrips>>,
 }
 
 impl GTFSData {

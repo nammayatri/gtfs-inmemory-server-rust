@@ -20,10 +20,24 @@ reproducible: every Nth route and stop in sorted order, plus the ids given with
 `/version/{gtfs_id}` is reported separately: for a DB feed it deliberately
 folds in `gtfs_feed.version`, so it is expected to differ.
 
+`--trips` is the acceptance test of docs/gtfs-editor.md section 16.6, for a
+feed whose trips come from the editor's tables (`trips_source = 'db'`) against
+the same feed's preprocessed load: every route (`/example-trip` for each),
+`/cached-data` for the feed, and `/trip/{id}?gtfs_id=` for at least
+`--trip-sample` trips (default 500) spread evenly over the trips the
+preprocessed patterns list (`--preprocessed-dir`). A `/trip` answer's `source`
+and `lastUpdated` say where and when it was produced - they differ between two
+calls to the same GIMS - and are not compared. No public API serves a pattern
+whole; `cargo run --example parity_gims -- patterns` compares those.
+
+`--ignore-key K` leaves key K out of every compared response, for a field known
+to differ for a reason that is not under test (say so when reporting a result).
+
 Exit status is 0 only when every compared response is identical.
 """
 import argparse
 import collections
+import concurrent.futures
 import json
 import sys
 import urllib.error
@@ -50,15 +64,28 @@ def fetch(base, path, body=None, timeout=300):
         return status, raw.decode(errors="replace")
 
 
+IGNORED = set()
+
+
 def normalise(v):
     if isinstance(v, dict):
-        return {k: normalise(v[k]) for k in sorted(v)}
+        return {k: normalise(v[k]) for k in sorted(v) if k not in IGNORED}
     if isinstance(v, list):
         items = [normalise(x) for x in v]
         return sorted(items, key=lambda x: json.dumps(x, sort_keys=True))
     if isinstance(v, float) and v.is_integer():
         return v
     return v
+
+
+def trip_ids(preprocessed_dir, g, at_least):
+    """At least `at_least` trip ids of feed `g`, spread evenly over the trips its
+    preprocessed patterns list, in a reproducible order."""
+    with open(f"{preprocessed_dir}/patterns.json") as f:
+        patterns = json.load(f).get(g, [])
+    ids = sorted({t["id"] for p in patterns for t in p["trips"]})
+    every = max(1, len(ids) // max(1, at_least))
+    return ids[::every]
 
 
 def first_difference(a, b, path="$"):
@@ -95,8 +122,22 @@ def main():
                          "(default: the Alwarpet Anjaneyar ids, which only chennai_bus has)")
     ap.add_argument("--all-routes", action="store_true", help="compare every route, not a sample")
     ap.add_argument("--cached-data", action="store_true", help="also compare /cached-data for the feed")
+    ap.add_argument("--trips", action="store_true",
+                    help="section 16.6: every route, /cached-data and /trip/{id} for sampled trips")
+    ap.add_argument("--preprocessed-dir", help="the preprocessed data both GIMS load (--trips samples its trips)")
+    ap.add_argument("--trip-sample", type=int, default=500, help="at least this many /trip ids a feed")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="/trip requests in flight at once (a preprocessed GIMS reads the whole shard per trip)")
+    ap.add_argument("--ignore-key", action="append", default=[],
+                    help="leave this key out of every compared response; repeat for several")
     args = ap.parse_args()
     feeds = args.gtfs_id or ["chennai_bus"]
+    if args.trips:
+        if not args.preprocessed_dir:
+            sys.exit("--trips needs --preprocessed-dir to sample trip ids from")
+        args.all_routes = True
+        args.cached_data = True
+    IGNORED.update(args.ignore_key)
 
     for base in (args.a, args.b):
         status, _ = fetch(base, "/ready")
@@ -177,6 +218,19 @@ def compare_feed(args, g):
             pb = (sb, (cb or {}).get(key, {}).get(g))
             compare(f"/cached-data {key}[{g}]", "/cached-data", a_resp=pa, b_resp=pb)
 
+    sampled_trips = []
+    if args.trips:
+        # where and when a /trip answer was produced is not data: it differs
+        # between two calls to one GIMS
+        IGNORED.update({"source", "lastUpdated"})
+        sampled_trips = trip_ids(args.preprocessed_dir, g, args.trip_sample)
+        paths = [f"/trip/{q(tid, safe='')}?gtfs_id={q(g)}" for tid in sampled_trips]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            answers = list(pool.map(lambda path: (fetch(args.a, path), fetch(args.b, path)), paths))
+        for path, (a_resp, b_resp) in zip(paths, answers):
+            compare("/trip/{id}?gtfs_id={g}", path, a_resp=a_resp, b_resp=b_resp)
+        IGNORED.difference_update({"source", "lastUpdated"} - set(args.ignore_key))
+
     va, vb = fetch(args.a, f"/version/{g}"), fetch(args.b, f"/version/{g}")
 
     width = max(len(k) for k in results)
@@ -187,7 +241,10 @@ def compare_feed(args, g):
         print(f"{group:<{width}}  {same:>9}  {diff:>9}")
         for e in examples[group]:
             print(f"{'':<{width}}    {e}")
-    print(f"\nsampled {len(sample_routes)} routes, {len(sample_stops)} stops, {len(pairs[:100])} cluster pairs")
+    print(f"\nsampled {len(sample_routes)} routes, {len(sample_stops)} stops, {len(pairs[:100])} cluster pairs"
+          + (f", {len(sampled_trips)} trips" if args.trips else ""))
+    if args.ignore_key:
+        print(f"keys left out of every comparison: {', '.join(args.ignore_key)}")
     print(f"/version/{g}: a={va[1]} b={vb[1]} (expected to differ: the DB feed folds in gtfs_feed.version)")
     print(f"{g}: PARITY OK" if total_diff == 0
           else f"{g}: PARITY FAILED: {total_diff} differing responses")
