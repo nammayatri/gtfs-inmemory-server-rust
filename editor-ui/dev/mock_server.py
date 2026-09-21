@@ -1522,7 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "unknown_change_set", "That draft does not exist.")
             rest = parts[2:]
             if not rest and method == "GET":
-                return 200, self.set_full(cs)
+                return 200, self.set_full(cs, q)
             if rest == ["changes"] and method == "POST":
                 return 201, self.add_change(u, cs, self._body())
             if len(rest) == 2 and rest[0] == "changes" and method in ("PUT", "DELETE"):
@@ -1710,19 +1710,35 @@ class Handler(BaseHTTPRequestHandler):
             "submitted_by_email": s.email_of(cs["submitted_by"]), "reviewed_by_email": s.email_of(cs["reviewed_by"]),
             "committed_by_email": s.email_of(cs["committed_by"])}
 
-    def set_full(self, cs):
+    # A draft's changes come a page at a time (docs section 16.5, "Big drafts"):
+    # `limit` (default 200, at most 500) and `cursor`. Every page carries the set,
+    # `change_count` and `next_cursor`; only the first replays the draft
+    # (validation, its summary, conflicts, can_submit).
+    def set_full(self, cs, q=None):
         s = self.store
+        q = q or {}
+        limit = min(max(int((q.get("limit") or ["200"])[0] or 200), 1), 500)
+        cursor = (q.get("cursor") or [""])[0]
+        start = int(cursor) if cursor else 0
+        page = cs["changes"][start:start + limit]
+        ids = {r.get("stop_id") for ch in page if ch["entity"] == "route_stops"
+               for r in (ch.get("after") or {}).get("rows", []) if r.get("stop_id")}
+        names = {i: s.stops[(cs["gtfs_id"], i)]["name"] for i in ids if (cs["gtfs_id"], i) in s.stops}
+        out = self.set_summary(cs) | {
+            "stop_names": names, "changes": page,
+            "next_cursor": str(start + limit) if start + limit < len(cs["changes"]) else None,
+            "feed_version": s.feeds[cs["gtfs_id"]]["version"]}
+        if cursor:
+            return out
         closed = cs["status"] in ("committed", "discarded")
         validation = [] if closed else validate_set(s, cs)
         conflicts = [] if closed else conflicts_for(s, cs)
-        ids = {r.get("stop_id") for ch in cs["changes"] if ch["entity"] == "route_stops"
-               for r in (ch.get("after") or {}).get("rows", []) if r.get("stop_id")}
-        names = {i: s.stops[(cs["gtfs_id"], i)]["name"] for i in ids if (cs["gtfs_id"], i) in s.stops}
-        return self.set_summary(cs) | {
-            "stop_names": names, "changes": cs["changes"], "validation": validation, "conflicts": conflicts,
+        return out | {
+            "validation": validation, "conflicts": conflicts,
+            "validation_summary": {"errors": sum(v["level"] == "error" for v in validation),
+                                   "warnings": sum(v["level"] == "warning" for v in validation)},
             "can_submit": (cs["status"] == "draft" and bool(cs["changes"]) and not conflicts
-                           and not any(v["level"] == "error" for v in validation)),
-            "feed_version": s.feeds[cs["gtfs_id"]]["version"]}
+                           and not any(v["level"] == "error" for v in validation))}
 
     def snapshot(self, cs, entity, key, op=None, after=None):
         proj = Projection(self.store, cs["gtfs_id"], cs["changes"])
