@@ -1,6 +1,6 @@
 //! HTTP handlers: parse, authorize, call the service, shape the response.
 
-use super::auth::{self, Role};
+use super::auth::{self, Object, Role};
 use super::bulk;
 use super::context;
 use super::crypto::{self, TotpCheck};
@@ -96,11 +96,14 @@ pub async fn me(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
     let user = auth::active_user(&req, &st).await?;
     let session = user.totp_enabled && auth::session_user(&req, &st, &user).await?;
     let locked = auth::lockout_seconds(&st, user.user_id).await?;
+    let feeds = svc::my_feeds(&st, &user).await?;
     ok(json!({
         "user_id": user.user_id,
         "email": user.email,
         "display_name": user.display_name,
         "role": user.role,
+        "is_admin": user.is_admin(),
+        "feeds": feeds,
         "status": user.status,
         "totp_enabled": user.totp_enabled,
         "session": session,
@@ -344,8 +347,8 @@ pub async fn session_delete(req: HttpRequest, st: Data) -> EditorResult<HttpResp
 // ---------------------------------------------------------------- reads
 
 pub async fn feeds(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
-    ok(svc::feeds(&st).await?)
+    let ctx = auth::signed_in(&req, &st).await?;
+    ok(svc::feeds(&st, &ctx).await?)
 }
 
 pub async fn feed_config(
@@ -353,7 +356,7 @@ pub async fn feed_config(
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     ok(svc::feed_config(&st, &path).await?)
 }
 
@@ -389,7 +392,7 @@ pub async fn stops(
     path: web::Path<String>,
     q: web::Query<StopsQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
     let query = StopQuery {
         q: q.q.clone(),
@@ -404,8 +407,8 @@ pub async fn stop(
     st: Data,
     path: web::Path<(String, String)>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
     let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(svc::stop_detail(&mut conn, &g, &id).await?)
 }
@@ -423,7 +426,7 @@ pub async fn routes(
     path: web::Path<String>,
     q: web::Query<RoutesQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
     ok(svc::list_routes(&st, &path, q.q.as_deref(), &page).await?)
 }
@@ -433,8 +436,8 @@ pub async fn route(
     st: Data,
     path: web::Path<(String, String)>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
     let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(svc::route_detail(&mut conn, &g, &id).await?)
 }
@@ -445,8 +448,8 @@ pub async fn stop_context(
     st: Data,
     path: web::Path<(String, String)>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
     let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(context::stop(&mut conn, &g, &id).await?)
 }
@@ -456,8 +459,8 @@ pub async fn route_context(
     st: Data,
     path: web::Path<(String, String)>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
     let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(context::route(&mut conn, &g, &id).await?)
 }
@@ -473,10 +476,13 @@ pub async fn polyline_osrm(
     path: web::Path<(String, String)>,
     q: web::Query<PolylineQuery>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
     let (g, route_id) = path.into_inner();
+    let ctx = auth::require_feed(&req, &st, &g, Role::Editor).await?;
     let detail = match q.change_set {
-        Some(id) => svc::preview_route(&st, &ctx, id, &route_id).await?,
+        Some(id) => {
+            also_on_set(&st, &ctx, id, Role::Editor).await?;
+            svc::preview_route(&st, &ctx, id, &route_id).await?
+        }
         None => {
             let mut conn = st.pool.acquire().await?;
             svc::route_detail(&mut conn, &g, &route_id).await?
@@ -523,7 +529,7 @@ pub async fn audit(
     path: web::Path<String>,
     q: web::Query<AuditQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
     ok(svc::audit_list(&st, &path, q.change_set, &page).await?)
 }
@@ -543,7 +549,7 @@ pub async fn change_sets(
     path: web::Path<String>,
     q: web::Query<SetsQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
     ok(svc::list_sets(
         &st,
@@ -568,7 +574,7 @@ pub async fn change_set_create(
     path: web::Path<String>,
     body: web::Json<NewSet>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_feed(&req, &st, &path, Role::Editor).await?;
     let set = svc::create_set(&st, &ctx, &path, &body.title, body.description.as_deref()).await?;
     Ok(HttpResponse::Created().json(set))
 }
@@ -578,7 +584,7 @@ pub async fn change_set(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Viewer).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Viewer).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
 
@@ -588,7 +594,7 @@ pub async fn change_add(
     path: web::Path<Uuid>,
     body: web::Json<svc::NewChange>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     let change_id = svc::add_change(&st, &ctx, *path, body.into_inner()).await?;
     let mut detail = svc::set_detail(&st, &ctx, *path).await?;
     detail["change_id"] = json!(change_id);
@@ -601,8 +607,8 @@ pub async fn change_update(
     path: web::Path<(Uuid, i64)>,
     body: web::Json<svc::ChangeUpdate>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
     let (id, change_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Editor).await?;
     svc::update_change(&st, &ctx, id, change_id, body.into_inner()).await?;
     ok(svc::set_detail(&st, &ctx, id).await?)
 }
@@ -612,8 +618,8 @@ pub async fn change_delete(
     st: Data,
     path: web::Path<(Uuid, i64)>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
     let (id, change_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Editor).await?;
     svc::delete_change(&st, &ctx, id, change_id).await?;
     ok(svc::set_detail(&st, &ctx, id).await?)
 }
@@ -623,8 +629,8 @@ pub async fn change_set_preview_route(
     st: Data,
     path: web::Path<(Uuid, String)>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Viewer).await?;
     let (id, route_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
     ok(svc::preview_route(&st, &ctx, id, &route_id).await?)
 }
 
@@ -633,7 +639,7 @@ pub async fn submit(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     svc::submit(&st, &ctx, *path).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
@@ -643,7 +649,7 @@ pub async fn reopen(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     svc::reopen(&st, &ctx, *path).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
@@ -664,7 +670,7 @@ pub async fn approve(
     path: web::Path<Uuid>,
     body: Option<web::Json<ReviewBody>>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Approver).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Approver).await?;
     let body = body.map(|b| b.into_inner()).unwrap_or_default();
     svc::review(
         &st,
@@ -684,7 +690,7 @@ pub async fn reject(
     path: web::Path<Uuid>,
     body: web::Json<ReviewBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Approver).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Approver).await?;
     svc::review(&st, &ctx, *path, false, body.comment.as_deref(), false).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
@@ -694,7 +700,7 @@ pub async fn commit(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Approver).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Approver).await?;
     ok(svc::commit(&st, &ctx, *path).await?)
 }
 
@@ -703,7 +709,7 @@ pub async fn discard(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     svc::discard(&st, &ctx, *path).await?;
     ok(svc::set_detail(&st, &ctx, *path).await?)
 }
@@ -714,7 +720,7 @@ pub async fn bulk_import(
     path: web::Path<Uuid>,
     body: web::Json<bulk::BulkRequest>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     ok(bulk::run(&st, &ctx, *path, body.into_inner()).await?)
 }
 
@@ -753,7 +759,7 @@ pub async fn station_proposals(
     path: web::Path<String>,
     q: web::Query<ProposalsQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
     ok(proposals::list(&st, &path, &q.filters()?, &page).await?)
 }
@@ -763,7 +769,7 @@ pub async fn station_proposal_summary(
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     ok(proposals::summary(&st, &path).await?)
 }
 
@@ -772,7 +778,7 @@ pub async fn station_proposal(
     st: Data,
     path: web::Path<i64>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_object(&req, &st, Object::StationProposal(*path), Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(proposals::detail(&mut conn, *path).await?)
 }
@@ -783,7 +789,8 @@ pub async fn station_proposal_approve(
     path: web::Path<i64>,
     body: web::Json<proposals::ApproveBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::StationProposal(*path), Role::Editor).await?;
+    also_on_set(&st, &ctx, body.change_set_id, Role::Editor).await?;
     ok(proposals::approve(&st, &ctx, *path, body.into_inner()).await?)
 }
 
@@ -793,7 +800,8 @@ pub async fn station_proposals_approve(
     path: web::Path<String>,
     body: web::Json<proposals::BulkApproveBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_feed(&req, &st, &path, Role::Editor).await?;
+    also_on_set(&st, &ctx, body.change_set_id, Role::Editor).await?;
     ok(proposals::approve_many(&st, &ctx, &path, body.into_inner()).await?)
 }
 
@@ -810,7 +818,7 @@ pub async fn station_proposal_reject(
     path: web::Path<i64>,
     body: Option<web::Json<NoteBody>>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::StationProposal(*path), Role::Editor).await?;
     let body = body.map(|b| b.into_inner()).unwrap_or_default();
     ok(proposals::reject(&st, &ctx, *path, body.note.as_deref()).await?)
 }
@@ -820,7 +828,7 @@ pub async fn station_proposal_reopen(
     st: Data,
     path: web::Path<i64>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::StationProposal(*path), Role::Editor).await?;
     ok(proposals::reopen(&st, &ctx, *path).await?)
 }
 
@@ -832,7 +840,7 @@ pub async fn position_reviews(
     path: web::Path<String>,
     q: web::Query<ProposalsQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
     ok(position_reviews::list(&st, &path, &q.filters()?, q.auto_fix.as_deref(), &page).await?)
 }
@@ -842,7 +850,7 @@ pub async fn position_review_summary(
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     ok(position_reviews::summary(&st, &path).await?)
 }
 
@@ -865,7 +873,10 @@ pub async fn position_review(
     path: web::Path<i64>,
     q: web::Query<ReviewDetailQuery>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Viewer).await?;
+    let ctx = auth::require_object(&req, &st, Object::PositionReview(*path), Role::Viewer).await?;
+    if let Some(id) = q.change_set {
+        also_on_set(&st, &ctx, id, Role::Viewer).await?;
+    }
     let route_ids = q.route_ids.as_deref().map(|ids| {
         ids.split(',')
             .map(str::trim)
@@ -921,7 +932,8 @@ pub async fn position_review_move(
     path: web::Path<i64>,
     body: web::Json<position_reviews::MoveBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::PositionReview(*path), Role::Editor).await?;
+    also_on_set(&st, &ctx, body.change_set_id, Role::Editor).await?;
     ok(position_reviews::move_stop(&st, &ctx, *path, body.into_inner()).await?)
 }
 
@@ -931,7 +943,8 @@ pub async fn position_review_split(
     path: web::Path<i64>,
     body: web::Json<position_reviews::SplitBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::PositionReview(*path), Role::Editor).await?;
+    also_on_set(&st, &ctx, body.change_set_id, Role::Editor).await?;
     ok(position_reviews::split(&st, &ctx, *path, body.into_inner()).await?)
 }
 
@@ -941,7 +954,8 @@ pub async fn position_review_merge(
     path: web::Path<i64>,
     body: web::Json<position_reviews::MergeBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::PositionReview(*path), Role::Editor).await?;
+    also_on_set(&st, &ctx, body.change_set_id, Role::Editor).await?;
     ok(position_reviews::merge(&st, &ctx, *path, body.into_inner()).await?)
 }
 
@@ -951,7 +965,7 @@ pub async fn position_review_confirm(
     path: web::Path<i64>,
     body: Option<web::Json<NoteBody>>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::PositionReview(*path), Role::Editor).await?;
     let body = body.map(|b| b.into_inner()).unwrap_or_default();
     ok(position_reviews::confirm(&st, &ctx, *path, body.note.as_deref()).await?)
 }
@@ -961,24 +975,32 @@ pub async fn position_review_reopen(
     st: Data,
     path: web::Path<i64>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Editor).await?;
+    let ctx = auth::require_object(&req, &st, Object::PositionReview(*path), Role::Editor).await?;
     ok(position_reviews::reopen(&st, &ctx, *path).await?)
 }
 
 // ---------------------------------------------------------------- admin
 
 pub async fn users(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Admin).await?;
+    auth::require_admin(&req, &st).await?;
     ok(svc::users(&st).await?)
 }
 
+/// `admin` makes an admin, `feeds` lets a member into feeds at once. The older
+/// `{role}` body still works: `role: "admin"` is `admin: true`, any other role a
+/// member with no grants (docs/gtfs-editor.md section 15.3).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewUser {
     email: String,
     #[serde(default)]
     display_name: Option<String>,
-    role: String,
+    #[serde(default)]
+    admin: Option<bool>,
+    #[serde(default)]
+    feeds: Vec<svc::NewGrant>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 pub async fn user_create(
@@ -986,13 +1008,15 @@ pub async fn user_create(
     st: Data,
     body: web::Json<NewUser>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_admin(&req, &st).await?;
     let user = svc::create_user(
         &st,
         &ctx,
         &body.email,
         body.display_name.as_deref(),
-        &body.role,
+        body.admin,
+        body.role.as_deref(),
+        &body.feeds,
     )
     .await?;
     Ok(HttpResponse::Created().json(user))
@@ -1001,6 +1025,8 @@ pub async fn user_create(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserPatch {
+    #[serde(default)]
+    admin: Option<bool>,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -1013,19 +1039,17 @@ pub async fn user_update(
     path: web::Path<Uuid>,
     body: web::Json<UserPatch>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_admin(&req, &st).await?;
     svc::update_user(
         &st,
         &ctx,
         *path,
+        body.admin,
         body.role.as_deref(),
         body.status.as_deref(),
     )
     .await?;
-    let user = auth::user_by_id(&st, *path)
-        .await?
-        .ok_or_else(|| EditorError::not_found("user_not_found", "no such user"))?;
-    ok(user.public_json())
+    ok(svc::user_item(&st, *path).await?)
 }
 
 pub async fn user_reset_totp(
@@ -1033,9 +1057,48 @@ pub async fn user_reset_totp(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_admin(&req, &st).await?;
     svc::reset_totp(&st, &ctx, *path).await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantBody {
+    role: String,
+}
+
+/// Create or change a member's grant on a feed; takes effect on their next
+/// request.
+pub async fn user_feed_put(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+    body: web::Json<GrantBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_admin(&req, &st).await?;
+    let (user_id, g) = path.into_inner();
+    svc::set_feed_access(&st, &ctx, user_id, &g, &body.role).await?;
+    ok(svc::user_item(&st, user_id).await?)
+}
+
+pub async fn user_feed_delete(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_admin(&req, &st).await?;
+    let (user_id, g) = path.into_inner();
+    svc::revoke_feed_access(&st, &ctx, user_id, &g).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// A change set named in a body or a query beside the object of the path: the
+/// caller needs `min` on its feed as well, so an id from a feed they cannot see
+/// answers `no_feed_access` - never a `feed_mismatch` that names that feed.
+async fn also_on_set(st: &EditorState, ctx: &auth::Ctx, id: Uuid, min: Role) -> EditorResult<()> {
+    let g = auth::feed_of(&st.pool, Object::ChangeSet(id)).await?;
+    ctx.require_feed_role(&g, min)
 }
 
 // ---------------------------------------------------------------- webhooks
@@ -1048,7 +1111,7 @@ pub async fn cache_state(
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     ok(webhooks::cache_state(&st, &path).await?)
 }
 
@@ -1056,7 +1119,7 @@ pub async fn cache_state(
 /// allow-list is the reason a URL is refused, and a viewer already sees that
 /// refusal.
 pub async fn webhook_settings(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::signed_in(&req, &st).await?;
     ok(webhooks::settings_get(&st).await?)
 }
 
@@ -1065,7 +1128,7 @@ pub async fn webhook_settings_update(
     st: Data,
     body: web::Json<webhooks::SettingsBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_admin(&req, &st).await?;
     ok(webhooks::settings_update(&st, &ctx, body.into_inner()).await?)
 }
 
@@ -1074,7 +1137,7 @@ pub async fn webhook_list(
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     ok(webhooks::list(&st, &path).await?)
 }
 
@@ -1084,7 +1147,8 @@ pub async fn webhook_create(
     path: web::Path<String>,
     body: web::Json<webhooks::WebhookBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    // a webhook calls out of the cluster: an admin's, on whichever feed
+    let ctx = auth::require_feed(&req, &st, &path, Role::Admin).await?;
     let out = webhooks::create(&st, &ctx, &path, body.into_inner()).await?;
     Ok(HttpResponse::Created().json(out))
 }
@@ -1095,7 +1159,7 @@ pub async fn webhook_update(
     path: web::Path<Uuid>,
     body: web::Json<webhooks::WebhookBody>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_object(&req, &st, Object::Webhook(*path), Role::Admin).await?;
     ok(webhooks::update(&st, &ctx, *path, body.into_inner()).await?)
 }
 
@@ -1104,7 +1168,7 @@ pub async fn webhook_delete(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_object(&req, &st, Object::Webhook(*path), Role::Admin).await?;
     ok(webhooks::delete(&st, &ctx, *path).await?)
 }
 
@@ -1113,7 +1177,7 @@ pub async fn webhook_test(
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Admin).await?;
+    let ctx = auth::require_object(&req, &st, Object::Webhook(*path), Role::Admin).await?;
     ok(webhooks::test(&st, &ctx, *path).await?)
 }
 
@@ -1129,6 +1193,6 @@ pub async fn webhook_deliveries(
     path: web::Path<String>,
     q: web::Query<DeliveriesQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require(&req, &st, Role::Viewer).await?;
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     ok(webhooks::deliveries(&st, &path, q.limit.unwrap_or(50)).await?)
 }

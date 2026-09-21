@@ -118,6 +118,7 @@ fn clear_feed(feed: &str) -> Vec<String> {
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{feed}'"),
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{feed}' AND parent_station IS NOT NULL"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{feed}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{feed}'"),
     ]
 }
@@ -389,6 +390,14 @@ async fn create_merge_bulk_and_proposals() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }

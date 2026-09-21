@@ -3,7 +3,7 @@
 // import), so its changes are filtered and paged, and maps are made only for
 // the changes on screen.
 import { get, post, del, enc, ApiError } from "./api.js";
-import { state, can } from "./state.js";
+import { state, can, isAdmin } from "./state.js";
 import {
   h, clear, toast, modal, confirmDialog, fmtDate, fmtCoord, fmtMetres, fmtCount, plural, haversine, decodePolyline,
   STATUS_LABEL, STOP_TYPE_LABEL, diffRows,
@@ -174,7 +174,9 @@ export async function showDraft(id, { conflicts = null } = {}) {
     return h("button.btn", { type: "button", class: style, disabled: !!reason, "aria-describedby": reason ? bid : null, on: { click: onClick } }, label);
   };
   const actions = [];
-  const roleReason = (role) => (can(role) ? null : `Needs the ${role} role.`);
+  // the role on this draft's own feed: a draft opened by its address may be
+  // another feed's than the one in the top bar
+  const roleReason = (role) => (can(role, cs.gtfs_id) ? null : `Needs the ${role} role.`);
   const n = cs.changes.length;
   if (cs.status === "draft") {
     actions.push(button("Submit for review", {
@@ -185,7 +187,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
         }
       },
     }));
-    if (state.draft?.change_set_id !== cs.change_set_id && can("editor")) {
+    if (state.draft?.change_set_id !== cs.change_set_id && can("editor", cs.gtfs_id)) {
       actions.push(button("Edit in this draft", { style: "secondary", onClick: async () => { useDraft(cs); toast(`Edits now go into "${cs.title}".`); location.hash = "#/"; } }));
     }
   }
@@ -194,7 +196,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
     actions.push(button("Approve", { reason: reviewReason, onClick: () => withComment("Approve this draft", "Comment (optional)", false, "Approve", "approve", "Approved.") }));
     actions.push(button("Reject", { style: "danger", reason: reviewReason, onClick: () => withComment("Reject this draft", "What needs to change", true, "Reject", "reject", "Rejected. The author can reopen it.") }));
     // the admin override of maker-checker: never the main action, always confirmed
-    if (isSubmitter && me.role === "admin") {
+    if (isSubmitter && isAdmin()) {
       actions.push(h("button.btn.danger", { type: "button", id: "self-approve", on: { click: async () => {
         if (await confirmDialog("Approve your own draft?", "You submitted this draft. Approving it yourself skips the second reviewer. Continue?", { confirm: "Approve it myself", danger: true })) {
           act("approve", { self_approve: true }, "Approved by you, as an admin override. It is recorded in the history.");
@@ -204,7 +206,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
   }
   if (cs.status === "approved") {
     actions.push(button("Commit and go live", {
-      reason: roleReason("approver") || (isSubmitter && !(cs.self_approved && me.role === "admin") ? "You submitted this change, so someone else must commit it." : null),
+      reason: roleReason("approver") || (isSubmitter && !(cs.self_approved && isAdmin()) ? "You submitted this change, so someone else must commit it." : null),
       onClick: async () => {
         if (await confirmDialog("Commit this draft?", `The ${plural(n, "change")} go live for passengers within a minute. This is recorded in the history.`, { confirm: "Commit and go live" })) {
           act("commit", undefined, "Committed. The changes are live.");
@@ -213,11 +215,11 @@ export async function showDraft(id, { conflicts = null } = {}) {
     }));
   }
   if (["submitted", "rejected", "approved"].includes(cs.status)) {
-    actions.push(button("Reopen for editing", { style: "secondary", hideIfNot: true, reason: isAuthor || isSubmitter || me.role === "admin" ? null : "Only the person who started or submitted this draft, or an admin, can reopen it.",
+    actions.push(button("Reopen for editing", { style: "secondary", hideIfNot: true, reason: isAuthor || isSubmitter || isAdmin() ? null : "Only the person who started or submitted this draft, or an admin, can reopen it.",
       onClick: () => act("reopen", undefined, "Reopened as a draft.") }));
   }
   if (!["committed", "discarded"].includes(cs.status)) {
-    actions.push(button("Discard", { style: "danger", hideIfNot: true, reason: isAuthor || me.role === "admin" ? null : "Only the person who started this draft, or an admin, can discard it.",
+    actions.push(button("Discard", { style: "danger", hideIfNot: true, reason: isAuthor || isAdmin() ? null : "Only the person who started this draft, or an admin, can discard it.",
       onClick: async () => {
         const fromProposals = cs.changes.some((c) => c.entity === "station" && c.after && c.after.proposal_id);
         const fromReviews = cs.changes.some((c) => (c.after && c.after.position_review_id) || splitOf(cs, c));
@@ -244,7 +246,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
     h("ul", list.slice(0, NOTICE_MAX).map((v) => h("li", v.message))),
     list.length > NOTICE_MAX ? h("p", `and ${fmtCount(list.length - NOTICE_MAX)} more. `, h("button.linklike", { type: "button", on: { click: showProblemChanges } }, "Show the changes with problems")) : null) : null);
 
-  const canRemove = cs.status === "draft" && can("editor");
+  const canRemove = cs.status === "draft" && can("editor", cs.gtfs_id);
   const changesBox = h("section.changes", { id: "draft-changes", "aria-label": "Changes" });
   const names = draftStopNames(cs);
 
