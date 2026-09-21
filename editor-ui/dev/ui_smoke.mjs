@@ -24,7 +24,9 @@
 // context, candidates and merge on a review, and pending changes shown on the
 // pages they change. Last the round 5 flows (round5Flows; `--round5`): the lines
 // that tie a station to its platforms, a description and a platform label on
-// stops and stations, and importing stop details.
+// stops and stations, and importing stop details. Then the map line flows
+// (mapLineFlows; `--map-line`): a line through the stops and from GPS, and the
+// reason when either fails.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1406,6 +1408,98 @@ async function stationMergeFlows() {
   await shot("sm-05-pending");
 }
 
+// ====================================================================== map lines
+// docs section 17: the two ways to suggest a route's map line - through the
+// stops, and from the buses' GPS - and, when either fails, why. The mock's
+// /__dev/map-line switch makes each suggestion answer as the server can.
+async function mapLineFlows() {
+  const setMode = (m) => evaluate(`fetch("/__dev/map-line", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify(m))} }).then((r) => r.json())`);
+  const routes = (await api("feeds/chennai_bus/routes?q=21G&limit=30")).items
+    .filter((r) => r.route_id !== "1369" && r.stop_count >= 5 && !r.deleted);
+  if (!check(routes.length > 0, "a route to suggest a map line for")) return;
+  const route = routes[0];
+  await go(`#/route/${route.route_id}`);
+  await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
+  await click("Edit name, colour and map line");
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Map line from GPS");
+  const buttons = () => evaluate(`[...document.querySelectorAll("#panel button")].map((b) => b.textContent)`);
+  await waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Suggest from GPS (last 14 days)")`, "the GPS suggestion");
+  check((await buttons()).includes("Route through stops"), "the suggestion through the stops sits beside it");
+
+  // ---- the road router: why it failed, and where
+  const osrmFails = async (mode, says) => {
+    await setMode({ osrm: mode });
+    await click("Route through stops");
+    await waitFor(`!!document.querySelector('#panel [data-failure-reason="${mode}"]')`, `the ${mode} reason`);
+    check((await text("#panel")).includes(says), `OSRM ${mode}: "${says}"`);
+  };
+  await osrmFails("no_segment", "there is no road near");
+  await osrmFails("no_route", "there is no road route from");
+  await osrmFails("timeout", "did not answer in time");
+  await shot("ml-01-osrm-reason");
+
+  // ---- GPS: not enough evidence, and not set up
+  await setMode({ osrm: "ok", gps: "not_enough_runs" });
+  await click("Suggest from GPS (last 14 days)");
+  await waitFor(`!!document.querySelector('#panel [data-failure-reason="gps_not_enough_runs"]')`, "the not-enough-runs reason");
+  const why = await text("#panel");
+  check(why.includes("Of 9 bus runs seen") && why.includes("1 passed this route's stops in order; at least 3 are needed"), "says how many runs there were and how many passed");
+  await setMode({ gps: "unavailable" });
+  await click("Suggest from GPS (last 14 days)");
+  await waitFor(`!!document.querySelector('#panel [data-failure-reason="gps_unavailable"]')`, "the unavailable reason");
+
+  // ---- GPS: partly snapped, then snapped all through
+  await setMode({ gps: "partial" });
+  await click("Suggest from GPS (last 14 days)");
+  await waitFor(`document.getElementById("panel").innerText.includes("New map line ready")`, "a partly snapped line");
+  const partial = await text("[data-gps-evidence]");
+  check(partial.includes("partly snapped by OSRM (82% of the line"), `the evidence says it is partly snapped: ${partial}`);
+  check((await text("#panel")).includes("OSRM said:"), "and what OSRM said");
+  await setMode({ gps: "ok" });
+  await click("Suggest from GPS (last 14 days)");
+  await waitFor(`(document.querySelector("[data-gps-evidence]")?.innerText || "").includes("snapped by OSRM.")`, "a snapped line");
+  const ev = await text("[data-gps-evidence]");
+  check(/^31 runs by 12 buses, \d+(–| \w+ – )\d+ \w+, 94% of stops on the line, snapped by OSRM\.$/.test(ev.trim()), `the evidence reads as a sentence: ${ev}`);
+  check((await text("#panel")).includes("from GPS"), "the line says it is from GPS");
+  await shot("ml-02-gps-line");
+
+  // ---- into the draft exactly as the OSRM suggestion goes, source gps
+  await click("Add to draft", ".sticky-actions");
+  await sleep(800);
+  const set = await api(`change-sets/${await activeDraftId()}`);
+  const change = (set.changes || []).find((c) => c.entity === "route" && c.entity_key === route.route_id);
+  check(!!change && change.after.polyline_source === "gps" && !!change.after.encoded_polyline, "the draft holds the line with polyline_source gps");
+  check(!!change && !("evidence" in change.after), "and not the evidence shown beside it");
+  await setMode({ osrm: "ok", gps: "ok" });
+}
+
+// ---- only the map lines
+if (process.argv.includes("--map-line")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await mapLineFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of map lines
+
 // ---- only round 5
 if (process.argv.includes("--round5")) {
   try {
@@ -1656,7 +1750,7 @@ try {
   await go("#/route/1369");
   await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
   await click("Edit name, colour and map line");
-  await click("Suggest a map line");
+  await click("Route through stops");
   await waitFor(`document.body.innerText.includes("New map line ready")`, "proposed map line");
   await type("#route-color", "#0B6660");
   await click("Add to draft", ".sticky-actions");
@@ -2502,6 +2596,9 @@ try {
   await deliveryFlows();
   // ================================================================ merging two stations: see stationMergeFlows above
   await stationMergeFlows();
+
+  // ================================================================ map lines through the stops and from GPS: see mapLineFlows above
+  await mapLineFlows();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

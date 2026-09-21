@@ -590,6 +590,68 @@ export async function editRouteRows(route, { created = false } = {}) {
 }
 
 // ------------------------------------------------------------------ route details
+// What goes into the draft: the line and where it came from, never the
+// evidence shown beside it.
+const lineChange = (line) => ({ encoded_polyline: line.encoded_polyline, polyline_source: line.polyline_source });
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// "12–26 Sep", "28 Aug – 10 Sep"
+export function dayRange(from, to) {
+  const d = (s) => { const [, m, day] = String(s || "").split("-").map(Number); return { m: MONTHS[(m || 1) - 1], day }; };
+  if (!from || !to) return "";
+  const a = d(from), b = d(to);
+  return a.m === b.m ? `${a.day}–${b.day} ${b.m}` : `${a.day} ${a.m} – ${b.day} ${b.m}`;
+}
+
+// "31 runs by 12 buses, 12–26 Sep, 94% of stops on the line, snapped by OSRM"
+export function gpsEvidenceText(ev) {
+  const pct = (x) => `${Math.round((Number(x) || 0) * 100)}%`;
+  const snapped = ev.matched === "osrm" ? "snapped by OSRM"
+    : ev.matched === "partial" ? `partly snapped by OSRM (${pct(ev.matched_share)} of the line; the rest is the GPS path)`
+      : ev.osrm_error ? "not snapped: OSRM failed, so this is the GPS path as recorded" : "not snapped to roads: this is the GPS path as recorded";
+  return `${plural(ev.runs_used || 0, "run")} by ${plural(ev.buses || 0, "bus", "buses")}, ${dayRange(ev.from, ev.to)}, ${pct(ev.stop_coverage)} of stops on the line, ${snapped}`;
+}
+
+function gpsEvidence(ev) {
+  const low = (Number(ev.stop_coverage) || 0) < 0.8;
+  return h("div",
+    h("p.hint", { "data-gps-evidence": "" }, `${gpsEvidenceText(ev)}.`),
+    low ? h("p.notice.warning", "Many of this route's stops are not on the line the buses drove: check the stops' positions and order before using it.") : null,
+    ev.osrm_error ? h("p.hint", `OSRM said: ${ev.osrm_error}`) : null);
+}
+
+const OSRM_REASON = {
+  no_segment: "Check that stop's position: it is not near any road the router knows. Or suggest the line from GPS instead.",
+  no_route: "Check those two stops' positions and order. Or suggest the line from GPS instead.",
+  timeout: "The road router did not answer in time. Try again in a minute, or suggest the line from GPS.",
+  unreachable: "The road router could not be reached. Try again in a minute, or suggest the line from GPS.",
+  http_error: "The road router refused the request. Suggest the line from GPS instead.",
+};
+
+function osrmFailure(e) {
+  const reason = e.details && e.details.reason;
+  return [h("p.notice.error", e.message), OSRM_REASON[reason] ? h("p.hint", { "data-failure-reason": reason }, OSRM_REASON[reason]) : null];
+}
+
+function gpsFailure(e) {
+  const d = e.details || {};
+  if (e.code === "gps_not_enough_runs") {
+    const saw = d.bus_days === 0
+      ? `No bus carrying route number ${d.route_number || "this"} was seen near these stops between ${dayRange(d.from, d.to)}.`
+      : `Of ${plural(d.runs_seen || 0, "bus run")} seen between ${dayRange(d.from, d.to)}, ${d.runs_used || 0} passed this route's stops in order; at least ${d.min_runs || 3} are needed.`;
+    return [h("p.notice.error", { "data-failure-reason": e.code }, saw),
+      h("p.hint", "Check the route number and the stops' order and positions, or route the line through the stops instead.")];
+  }
+  const hint = {
+    gps_unavailable: "Map lines from GPS are not set up for this feed. Route the line through the stops instead.",
+    gps_timeout: "Reading the GPS took too long. Try again in a minute.",
+    gps_query_failed: "The GPS store could not be read. Try again in a minute.",
+    gps_no_route_number: "Give the route its number first: the buses are found by it.",
+  }[e.code];
+  return [h("p.notice.error", { "data-failure-reason": e.code }, e.message), hint ? h("p.hint", hint) : null];
+}
+
 export async function editRouteDetails(route, { created = false } = {}) {
   if (!(await requireDraft())) return;
   const createChange = created ? createdChange("route", route.route_id) : null;
@@ -633,20 +695,38 @@ export async function editRouteDetails(route, { created = false } = {}) {
       for (let i = 1; i < pts.length; i++) d += haversine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]);
       km = fmtMetres(d);
     } catch { /* shown as-is */ }
-    clear(lineStatus, h("p.notice.ok", `New map line ready (${km}), shown dashed in teal. It is saved when you add these changes to the draft.`),
+    const from = proposed.polyline_source === "gps" ? "from GPS" : proposed.polyline_source === "osrm" ? "through the stops" : "";
+    clear(lineStatus, h("p.notice.ok", `New map line ready (${km}${from ? `, ${from}` : ""}), shown dashed in teal. It is saved when you add these changes to the draft.`),
+      proposed.evidence ? gpsEvidence(proposed.evidence) : null,
       h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line"));
   };
 
-  const suggest = async () => {
-    clear(lineStatus, h("p.hint", "Asking the road router for a line through the stops…"));
+  // one suggestion at a time: a second click while the first is out would
+  // only queue behind it on the server
+  let asking = false;
+  const ask = async (waiting, path, label, fail) => {
+    if (asking) return;
+    asking = true;
+    suggestButtons.forEach((b) => { b.disabled = true; });
+    clear(lineStatus, h("p.hint", { "aria-live": "polite" }, waiting));
     try {
-      const res = await post(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/polyline:osrm?change_set=${enc(state.draft.change_set_id)}`);
+      const res = await post(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/${path}?change_set=${enc(state.draft.change_set_id)}`);
       unsaved.touch();
-      setLine({ encoded_polyline: res.encoded_polyline, polyline_source: res.polyline_source || "osrm" }, "suggested a map line");
+      setLine({ encoded_polyline: res.encoded_polyline, polyline_source: res.polyline_source, evidence: res.evidence || null }, label);
     } catch (e) {
-      clear(lineStatus, h("p.notice.error", e.message));
+      clear(lineStatus, ...fail(e));
+    } finally {
+      asking = false;
+      suggestButtons.forEach((b) => { b.disabled = false; });
     }
   };
+  const suggest = () => ask("Asking the road router for a line through the stops…", "polyline:osrm", "suggested a map line through the stops", osrmFailure);
+  const suggestGps = () => ask(`Reading where the buses of route ${route.short_name || route.route_id} drove in the last 14 days… this can take up to a minute.`,
+    "polyline:gps", "suggested a map line from GPS", gpsFailure);
+  const suggestButtons = [
+    h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Route through stops"),
+    h("button.btn.secondary", { type: "button", on: { click: suggestGps } }, "Suggest from GPS (last 14 days)"),
+  ];
 
   const cancel = () => { unsaved.done(); map.clearRoute("proposal"); showRoute(route.route_id, { preview: created }); };
   const save = async (ev) => {
@@ -668,7 +748,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
         if (long) after.long_name = long; else delete after.long_name;
         if (color) after.color = color; else delete after.color;
         res = await updateChange(createChange, after);
-        if (proposed) res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after: proposed });
+        if (proposed) res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after: lineChange(proposed) });
       } else {
         const after = {};
         for (const k of ["short_name", "long_name"]) {
@@ -676,7 +756,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
           if (v !== (route[k] || "")) after[k] = v;
         }
         if ((color || null) !== (route.color ? route.color.toUpperCase() : null)) after.color = color || null;
-        if (proposed) Object.assign(after, proposed);
+        if (proposed) Object.assign(after, lineChange(proposed));
         if (!Object.keys(after).length) { clear(problems, h("p.notice", "Nothing has changed yet.")); return; }
         res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after, base_row_version: route.row_version });
       }
@@ -703,9 +783,9 @@ export async function editRouteDetails(route, { created = false } = {}) {
     ),
     h("section.section",
       h("h2", "Map line"),
-      h("p.hint", "The map line is the road path drawn between the stops. The road router can suggest one through this route's stops."),
+      h("p.hint", "The map line is the road path drawn between the stops. The road router can suggest one through this route's stops, or the buses can: the path this route's buses drove in the last 14 days, snapped to the roads."),
       lineStatus,
-      h("div.btn-row", h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Suggest a map line")),
+      h("div.btn-row", ...suggestButtons),
       problems),
     h("div.sticky-actions", h("div.btn-row",
       h("button.btn", { type: "submit" }, prior || createChange ? "Update in draft" : "Add to draft"),

@@ -1211,6 +1211,17 @@ class Handler(BaseHTTPRequestHandler):
             # round 4 (UX): {"off": true} answers 404 for the context endpoints, as an older server does
             s.context_off = bool(self._body().get("off"))
             return self._send(200, {"off": s.context_off})
+        if path == "/__dev/map-line" and method == "POST":
+            # docs section 17: how the two map line suggestions behave. osrm: ok,
+            # no_segment, no_route, timeout, unreachable. gps: ok, partial, none,
+            # not_enough_runs, unavailable, timeout.
+            b = self._body()
+            with LOCK:
+                if "osrm" in b:
+                    s.map_line_osrm = b["osrm"]
+                if "gps" in b:
+                    s.map_line_gps = b["gps"]
+            return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok")})
         if path == "/__dev/feed-source" and method == "POST":
             # The Delivery page only has a live version to talk about when the feed is
             # served from the DB, and the feed-config flow above deliberately leaves it
@@ -1254,6 +1265,73 @@ class Handler(BaseHTTPRequestHandler):
     def require_mutation(self, method):
         if method != "GET" and self.headers.get("X-Requested-With") != "gtfs-editor":
             raise ApiError(403, "missing_request_header", "Mutations need X-Requested-With: gtfs-editor.")
+
+    # ---- map lines (docs section 17), shaped like the server's answers
+    def map_line_osrm_failure(self, served):
+        mode = getattr(self.store, "map_line_osrm", "ok")
+        if mode == "ok":
+            return
+        def who(r):
+            return f"{r['stop_name']} (stop {r['stop_id']}, row {r['sequence']})"
+        mid = served[len(served) // 2] if served else None
+        nxt = served[len(served) // 2 + 1] if len(served) > len(served) // 2 + 1 else None
+        details = {"reason": mode, "osrm_code": None, "message": "", "leg": None, "from_stop_id": None,
+                   "to_stop_id": None, "from_sequence": None, "to_sequence": None, "from_name": None,
+                   "to_name": None, "waypoint": None, "stop_id": None, "sequence": None, "stop_name": None}
+        if mode == "no_segment" and mid:
+            i = len(served) // 2
+            details.update(osrm_code="NoSegment", message=f"Could not find a matching segment for coordinate {i}",
+                           waypoint=i, stop_id=mid["stop_id"], sequence=mid["sequence"], stop_name=mid["stop_name"])
+            why = f"there is no road near {who(mid)}"
+        elif mode == "no_route" and mid and nxt:
+            i = len(served) // 2
+            details.update(osrm_code="NoRoute", message="Impossible route between points", leg=i,
+                           from_stop_id=mid["stop_id"], to_stop_id=nxt["stop_id"], from_sequence=mid["sequence"],
+                           to_sequence=nxt["sequence"], from_name=mid["stop_name"], to_name=nxt["stop_name"])
+            why = f"there is no road route from {who(mid)} to {who(nxt)}"
+        elif mode == "timeout":
+            details.update(message="OSRM did not answer within 12 s")
+            why = "OSRM did not answer in time"
+        else:
+            details.update(reason="unreachable", message="OSRM could not be reached")
+            why = "OSRM could not be reached"
+        raise ApiError(502, "osrm_failed", f"OSRM could not route through these stops: {why}", details)
+
+    def map_line_gps(self, g, rid, d, served, pts, dist):
+        mode = getattr(self.store, "map_line_gps", "ok")
+        today = now().date()
+        frm = (today - timedelta(days=13)).isoformat()
+        number = (d.get("short_name") or "").strip()
+        if mode == "unavailable":
+            raise ApiError(503, "gps_unavailable", "map lines from GPS are not set up on this server")
+        if not number:
+            raise ApiError(422, "gps_no_route_number", "this route has no route number to find its buses by")
+        if len(pts) < 2:
+            raise ApiError(422, "gps_not_enough_stops",
+                           f"the route has {len(pts)} stop(s) with a position; a line from GPS needs two",
+                           {"stops": len(pts)})
+        if mode == "timeout":
+            raise ApiError(504, "gps_timeout", "reading the GPS pings took too long; try again in a minute")
+        counts = {"from": frm, "to": today.isoformat(), "days": 14, "route_number": number, "stops": len(pts),
+                  "bus_days": 30, "pings": 48213, "points_read": 16020, "truncated": False, "queries": 15}
+        if mode == "not_enough_runs":
+            raise ApiError(422, "gps_not_enough_runs",
+                           f"in the last 14 days 1 of 9 bus runs labelled {number} passed this route's stops in "
+                           "order; a line needs at least 3",
+                           {**counts, "runs_seen": 9, "runs_used": 1, "min_runs": 3, "buses": 4})
+        # the buses' path: the stops, nudged a few metres the way GPS is
+        line = [(la + (0.00003 if i % 2 else -0.00002), lo) for i, (la, lo) in enumerate(pts)]
+        ev = {**counts, "buses": 12, "runs_seen": 44, "runs_used": 31, "stop_coverage": 0.94,
+              "matched": "osrm", "matched_share": 1.0, "osrm_detours_skipped": 0,
+              "points": len(line), "length_m": round(dist), "cached": False}
+        if mode == "partial":
+            ev.update(matched="partial", matched_share=0.82,
+                      osrm_error="stretch 2 of 3: NoMatch: Could not match the trace.")
+        elif mode == "none":
+            ev.update(matched="none", matched_share=0.0,
+                      osrm_error="stretch 1 of 3: OSRM answered HTTP 503 without a JSON body")
+        return {"route_id": rid, "encoded_polyline": polyline_encode(line), "polyline_source": "gps",
+                "saved": False, "evidence": ev, "note": "mock: the stops, nudged"}
 
     def require_role(self, u, role):
         if ROLE_RANK[u["role"]] < ROLE_RANK[role]:
@@ -1366,16 +1444,19 @@ class Handler(BaseHTTPRequestHandler):
                 if (g, rest[1]) not in s.routes:
                     raise ApiError(404, "unknown_route", f"Route {rest[1]} does not exist.")
                 return 200, route_detail(Projection(s, g, []), rest[1])
-            if len(rest) == 3 and rest[0] == "routes" and rest[2] == "polyline:osrm" and method == "POST":
+            if len(rest) == 3 and rest[0] == "routes" and rest[2] in ("polyline:osrm", "polyline:gps") and method == "POST":
                 self.require_role(u, "editor")
                 cs = s.change_sets.get(q.get("change_set", [""])[0])
                 proj = Projection(s, g, cs["changes"] if cs else [])
                 if not proj.route(rest[1]):
                     raise ApiError(404, "unknown_route", f"Route {rest[1]} does not exist.")
                 d = route_detail(proj, rest[1])
-                pts = [(r["lat"], r["lon"]) for r in d["rows"]
-                       if r["stop_type"] not in SERVED_EXCLUDE and r["lat"] is not None]
+                served = [r for r in d["rows"] if r["stop_type"] not in SERVED_EXCLUDE and r["lat"] is not None]
+                pts = [(r["lat"], r["lon"]) for r in served]
                 dist = sum(haversine(*a, *b) for a, b in zip(pts, pts[1:]))
+                if rest[2] == "polyline:gps":
+                    return 200, self.map_line_gps(g, rest[1], d, served, pts, dist)
+                self.map_line_osrm_failure(served)
                 return 200, {"route_id": rest[1], "encoded_polyline": polyline_encode(pts),
                              "polyline_source": "osrm", "waypoints": len(pts), "distance_m": round(dist),
                              "saved": False, "note": "mock: straight lines between stops"}

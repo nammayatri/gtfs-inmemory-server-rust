@@ -353,7 +353,8 @@ below). Every list is
 | GET | `/feeds/{g}/stops/{stop_id}` | the stop row + `route_count` + `platform_count` + `routes: [{route_id, short_name, long_name, sequence, stop_type, stage_no}]` + `children` (a station's platforms, each with `route_count`) + `nearby` (≤ 60 m, nearest first, each with `distance_m` and `route_count`) + `parent` (the station row, or null) |
 | GET | `/feeds/{g}/routes?q=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows) |
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
-| POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change |
+| POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change. Asked of OSRM in chunks of at most 25 waypoints; a failure is 502 `osrm_failed` saying why and where (section 17.5) |
+| POST | `/feeds/{g}/routes/{route_id}/polyline:gps?change_set=` | `{route_id, encoded_polyline, polyline_source: "gps", saved: false, evidence}` — the path this route's buses drove over the last 14 days, snapped to roads (section 17); not saved, add it as a `route` change |
 | GET | `/feeds/{g}/stops/{stop_id}/context`, `/feeds/{g}/routes/{route_id}/context` | what is known about a stop or a route for cleanup: detours, coordinate reviews, same-named stops, its audit rows, the open drafts touching it — section 9 |
 | GET | `/feeds/{g}/audit?change_set=&limit=&cursor=` | newest first: `{audit_id, at, actor, actor_email, action, gtfs_id, change_set_id, detail}` |
 
@@ -492,7 +493,7 @@ a snapshot in read shape: the stop or route row; for a station, the row plus
 | `stop` / `update` | any of `name, lat, lon, platform_code, description, cluster_id, regional_name, hindi_name` | lat/lon together and in range; a move > 500 m is a **warning**; `platform_code` ≤ 120 and `description` ≤ 500 characters (section 11) |
 | `stop` / `create` | `{stop_id, name, lat, lon, stop_code?, platform_code?, description?, cluster_id?, regional_name?, hindi_name?}` | `entity_key` = `stop_id`; id unused; ids are 1–64 of `A–Z a–z 0–9 _ - .` (no `:` — GIMS splits ids on it) |
 | `stop` / `delete` | `null` | error if any route row still uses it |
-| `route` / `update` | any of `short_name, long_name, color, text_color, encoded_polyline, polyline_source` | colour `#RRGGBB`; polyline decodes to ≥ 2 points |
+| `route` / `update` | any of `short_name, long_name, color, text_color, encoded_polyline, polyline_source` | colour `#RRGGBB`; polyline decodes to ≥ 2 points; `polyline_source` is `osrm`, `gps`, `manual` or `imported` |
 | `route_stops` / `replace` | `{rows: [...], base_rows_hash}` — the whole ordered list | see below |
 | `station` / `create` | `{station_id, name, lat, lon, description?, member_stop_ids: [...]}` | `entity_key` = `station_id`; at least two members (`too_few_members`, refused when added: 400 `invalid_change`); members exist, are location_type 0, have no other parent |
 | `station` / `update` | `{name?, lat?, lon?, description?, member_stop_ids?}` | same; members, when sent, are at least two (to ungroup a station, delete it); a station has no `platform_code` of its own |
@@ -1928,3 +1929,273 @@ delivery goes out exactly once, and a saved policy turning the feature on, takin
 the deployment's own host away and stopping a call at send time. The fleet
 arithmetic, the precedence rule, the host validation, the placeholders and the
 backoff are unit tested in `src/services/webhook.rs`.
+
+
+## 17. A map line from GPS (2026-09-21)
+
+A route's map line is `gtfs_route.encoded_polyline` (Google polyline, precision
+5) and `polyline_source`. Only 10 of chennai_bus's 5,567 routes have one, and the
+one way to get one - a road route through the stops (`polyline:osrm`) - failed
+on master with "OSRM could not route through these stops" and no reason. The
+buses know the way even where the stops or the router's map do not, so the
+editor can now also propose the path this route's buses actually drove.
+
+```
+POST /feeds/{g}/routes/{route_id}/polyline:gps?change_set=
+```
+
+Editor role, like `polyline:osrm`. With `change_set` it asks about the route as
+that draft has it (its route number and its stops); without, the live route.
+Nothing is written: the dashboard puts the line into the draft as a `route`
+change with `polyline_source: "gps"`, exactly as it does the OSRM suggestion,
+and it goes live when someone else approves and commits the draft.
+
+```json
+{
+  "route_id": "115",
+  "encoded_polyline": "…",
+  "polyline_source": "gps",
+  "saved": false,
+  "evidence": {
+    "from": "2026-09-08", "to": "2026-09-21", "days": 14,
+    "route_number": "21G", "stops": 50,
+    "bus_days": 30, "pings": 221034, "points_read": 81002, "truncated": false, "queries": 15,
+    "buses": 12, "runs_seen": 190, "runs_used": 31,
+    "stop_coverage": 0.94,
+    "matched": "osrm", "matched_share": 0.992, "osrm_detours_skipped": 3,
+    "points": 1747, "length_m": 38050, "cached": false,
+    "consolidation": {"cells": 3120, "cells_kept": 2410, "samples_off_corridor": 212,
+                      "degraded": false, "runs_same_direction": 31, "runs_opposite_direction": 0}
+  }
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `from`, `to` | the service days (Indian time) read: the last `days`, today included |
+| `route_number` | the route's `short_name`, which is how the pings name the route |
+| `bus_days`, `pings`, `points_read` | bus-days read, the raw pings behind them, the averaged points they became |
+| `buses` | distinct vehicles among the runs used |
+| `runs_seen`, `runs_used` | bus runs found (split at feed gaps and terminal dwells), and those that passed this route's stops in order |
+| `stop_coverage` | share of the route's served stops within 30 m of the line |
+| `matched` | `osrm` - snapped to roads all through; `partial` - some stretches kept the GPS geometry; `none` - OSRM matched nothing or is not configured: the GPS path as recorded |
+| `matched_share` | share of the line's length OSRM matched |
+| `osrm_detours_skipped` | stretches OSRM matched with a loop the buses did not drive, where the GPS path was kept (17.3) |
+| `osrm_error` | the first thing OSRM said, when something went wrong |
+| `cached` | this answer came from the cache (17.4) |
+
+Errors: `503 gps_unavailable` (GPS not configured, or not for this feed), `422
+gps_no_route_number` (the route has no `short_name` to find its buses by), `422
+gps_not_enough_stops` (fewer than two served stops with a position), `422
+gps_not_enough_runs` (fewer than 3 runs passed the stops in order; `details` holds
+the evidence counts above plus `min_runs`), `504 gps_timeout` (the whole
+suggestion took longer than its limit, 55 s by default), `502 gps_query_failed`
+(ClickHouse answered with an error, or could not be reached).
+
+### 17.1 Which runs count
+
+A route NUMBER covers both directions and several variants, each its own
+route_id, and the operator-entered label is sometimes wrong. An earlier attempt
+that filtered by the number and averaged everything drew paths missing nearly all
+their stops. So a run counts only if it passes **at least 70% of this route's
+served stops, each within 60 m, in increasing sequence order**, with no more than
+30 minutes between two stops it matched. That one rule rejects the other
+direction (it meets the stops backwards), the other variants (they miss the stops
+of the stretch they do not share) and a mislabelled bus (it misses most of them).
+Close stops may be met up to 30 m out of order. A kept run is cut from its first
+matched stop to its last.
+
+Before that, a bus-day's points are cleaned: impossible jumps (over 110 km/h from
+the last kept point) are dropped, and so are **spikes** - one or two points that
+go more than 80 m off the line between their neighbours and come straight back.
+An averaged 20-second point carrying one wild fix is exactly that, and no speed
+limit catches it. The day is then split into runs at gaps in the feed longer than
+10 minutes, and where the bus stood within 100 m for 5 minutes - a terminus -
+cutting at the spot it stood, not at the edge of the radius. Runs under 10 points
+or 1 km of extent are dropped.
+
+### 17.2 Consolidation
+
+The ideas are nandi's `scripts/chennai-bus/src/cleanup/s0_gps_ingest.py`, ported:
+
+1. Every kept run is filled in every 15 m between its points (not across a gap
+   of more than 600 m, which would be a guess). A point the bus reported weighs
+   five times one filled in: between two pings 100 m apart a chord cuts every
+   corner, and the ping is where the bus was.
+2. A reference run is elected: the one through the most-travelled 30 m grid
+   cells (log-weighted, distinct cells, so a bus stuck in traffic does not win).
+3. Every sample of every run is placed along the reference **monotonically** -
+   near where its previous sample was, or a little further on past a detour the
+   reference took - starting near the run's first matched stop. That is what
+   keeps a route that ends where it began from folding onto itself.
+4. Within each grid cell, each separate pass (the same road driven out and back
+   is two passes) becomes one weighted mean point. Passes that fewer than a
+   quarter of the median number of runs went through (at least two, with four
+   runs or more) are dropped: a detour one bus took is an order of magnitude
+   thinner than the road they all drove. Fewer than 10 left and every pass is
+   kept (`degraded: true`).
+5. Passes at the same arc length (the two carriageways of one road) are merged,
+   the line is ordered along the reference, oriented first stop to last, and
+   simplified (Douglas-Peucker, 5 m).
+
+On a synthetic fleet - ten runs of a 7 km corridor with right angles, a long
+curve and a dog-leg, 8 m of noise and 2% wild fixes, plus runs the other way, a
+variant that leaves half way and buses of another route under this label - the
+line lands a median 2.0 m and a 90th percentile 5.2 m from the true road, covers
+99% of it within 15 m and is within 0.5% of its length
+(`editor::gps_line::tests::consolidated_line_lands_on_the_true_corridor`).
+
+### 17.3 Snapping with OSRM
+
+The consolidated path is resampled every 50 m and sent to OSRM
+`/match/v1/driving` in chunks of at most 100 points overlapping by 8, with
+`radiuses` 25 m, `overview=full&geometries=polyline&tidy=true&gaps=ignore`.
+Neighbouring chunks meet in the middle of their overlap, and the chunks are
+stitched point by point: between two points OSRM put in the same matching, the
+matched road; a point it tidied away is bridged along the matching.
+
+Where OSRM cannot match - a chunk that fails, or two points in different
+matchings - that stretch keeps the GPS geometry. OSRM down or not configured, the
+line is the GPS path as it is (`matched: none`).
+
+OSRM also **invents detours**: a point put on the other carriageway, then a loop
+through the next U-turn to reach it. On real 21G data a 1.9 km stretch came back
+as an 8 km matching with confidence 0. A matched stretch longer than 1.5 times
+the GPS stretch it stands for plus 60 m is therefore refused and the GPS
+geometry kept (`osrm_detours_skipped`). `matched` is `osrm` when every chunk
+answered and at least 99% of the length was matched.
+
+### 17.4 Cost, safety and the cache
+
+The pings are in ClickHouse, `atlas_kafka.amnex_direct_data`: a production
+cluster that other teams share, read with a user that can write. GIMS reads it
+only through `services::clickhouse_reader`, which enforces read-only three times,
+as nandi's `ch_client.py` does:
+
+- `readonly=2` is sent as a setting on every request, so the server refuses any
+  write whatever the statement says (2, not 1, so that `max_execution_time` can
+  still be set);
+- a statement must open with `SELECT` or `WITH` and carry a `LIMIT`; a write
+  keyword, `SETTINGS`, `FORMAT`, `INTO OUTFILE`, a `SYSTEM` command and the table
+  functions that reach outside the cluster (`url()`, `s3()`, `remote()`, …, which
+  readonly=2 still allows) are refused before anything is sent;
+- a statement holding a `;` anywhere is refused.
+
+It is unhurried: one query at a time per pod, 350 ms between queries,
+`max_execution_time` 30 s, `max_threads=2`, low `priority`; one suggestion at a
+time per pod (a second waits for the first, and then finds its answer in the
+cache when it was for the same route). Answers come back as `TabSeparated` (JSON
+formats stall on this cluster), and the password goes as HTTP basic auth: it is
+in no URL, log line, error message or `Debug` output, and a ClickHouse error
+naming the user is scrubbed.
+
+The table's sort key is the timestamp alone, so a route filter prunes nothing:
+**every query is bounded by time first**, and by `timestamp <= now()` (device
+clocks emit far-future timestamps), then by the route label, a box around the
+route's stops (+1 km), and a `LIMIT`. Raw pings are never pulled:
+
+1. **Bus-days** - one query over the window: which `deviceId`s carried the route
+   number (`routeNumber`, trimmed, case-insensitive) with at least 120 pings in
+   the box, per Indian day, the busiest few per day (`LIMIT n BY day`). At most
+   `max_bus_days` (30) are read, spread over the days: the busiest of each day in
+   turn, newest first.
+2. **Tracks** - one query per day for that day's buses: their pings in the box,
+   labelled with this route number or with none (a quarter carry no label),
+   averaged in ClickHouse to one point per 20 s, and packed one device-hour per
+   row as `t,lat,lon|…` - so a day is a few dozen rows (some network paths to the
+   cluster stall above ~300 rows; pages are 100 rows). Reading stops at 150,000
+   points (`truncated`).
+
+So a suggestion is about 15 small queries - measured on real data from a laptop,
+4 days and 6 bus-days of 21G: 5 queries, 44,387 pings, 7-11 s.
+
+The cache is in memory, per pod, keyed by (feed, route, a hash of the route
+number and its stops' ids and positions, the day). It keeps the GPS half - the
+consolidated path and its counts, or "not enough runs" - and, once OSRM has
+snapped it all through, the whole answer. A line OSRM failed to snap is not kept
+as the answer: the next click tries OSRM again, from the cached GPS half, without
+asking ClickHouse. Editing the route's stops or number changes the key. 256
+entries, the oldest dropped first.
+
+### 17.5 When the road route through the stops fails
+
+`polyline:osrm` now asks OSRM `/route` in chunks of at most 25 waypoints that
+overlap by one (the shared waypoint's point appears once in the line), within 25
+s for the whole route and 12 s per request. The success answer is unchanged. A
+failure is still `502 osrm_failed`, and now says why:
+
+```json
+{"error": {"code": "osrm_failed",
+  "message": "OSRM could not route through these stops: there is no road near KOYAMBEDU (stop ab12cd, row 7)",
+  "details": {"reason": "no_segment", "osrm_code": "NoSegment",
+              "message": "Could not find a matching segment for coordinate 6",
+              "leg": null, "from_stop_id": null, "to_stop_id": null,
+              "from_sequence": null, "to_sequence": null, "from_name": null, "to_name": null,
+              "waypoint": 6, "stop_id": "ab12cd", "sequence": 7, "stop_name": "KOYAMBEDU"}}}
+```
+
+| `reason` | when | where |
+| --- | --- | --- |
+| `no_segment` | OSRM found no road near a waypoint | `waypoint` (0-based, in the whole route), `stop_id`, `sequence`, `stop_name` |
+| `no_route` | no road route between two waypoints; the failing chunk is asked leg by leg to find which | `leg` (from waypoint `leg` to `leg + 1`), `from_stop_id`, `to_stop_id`, `from_sequence`, `to_sequence`, `from_name`, `to_name` |
+| `timeout` | OSRM did not answer in time | |
+| `unreachable` | OSRM could not be reached | |
+| `http_error` | any other answer (`osrm_code` is OSRM's `code`, or the HTTP status) | |
+
+A waypoint is a served stop or a shaping marker (`ROUTE CORRECTION`, whose id is
+its `marker_id`); jump and hidden stops are not on the bus's path. A route with
+fewer than two positioned waypoints is `no_route` with that message. Run against
+a local OSRM built from nandi's `chennai.osm.pbf`, 5,489 of chennai_bus's 5,567
+routes get a line through their stops and 78 fail, all of them routes with fewer
+than two positioned stops.
+
+### 17.6 Config
+
+An optional block in the GIMS dhall, and the password in the secrets dhall:
+
+```dhall
+gtfs_gps = Some
+  { url = "https://clickhouse.internal:8443"   -- the HTTP interface, not 9000/9440
+  , user = "gims_reader"
+  , table = Some "atlas_kafka.amnex_direct_data"
+  , days = Some 14
+  , feeds = Some [ "chennai_bus" ]
+  , max_bus_days = None Natural     -- 30
+  , page_rows = None Natural        -- 100
+  , timeout_seconds = None Natural  -- 55, under a proxy's 60
+  },
+gtfs_gps_clickhouse_password = secrets.clickhouse_password,
+```
+
+Only `url` and `user` are required. Absent (the default, as in the dev dhall),
+the endpoint is `503 gps_unavailable` and nothing else changes; so is a feed not
+in `feeds`. An invalid block (a table name that is not `db.table`, `days` outside
+1-60, a non-http URL) is logged at boot and leaves the feature off.
+
+### 17.7 Schema, dashboard and tests
+
+`db/gtfs_editor/0021_polyline_source_gps.sql` widens the `gtfs_route.polyline_source`
+CHECK to `osrm, gps, manual, upload, imported` (`upload` is another branch's; the
+union lets the two run in either order). Safe to run twice. **Apply it before an
+image with this endpoint serves drafts**: without it, committing a draft that
+holds a `gps` line fails on the CHECK.
+
+The dashboard's route editor offers **Route through stops** and **Suggest from
+GPS (last 14 days)** side by side. A GPS line shows its evidence under it - "31
+runs by 12 buses, 8–21 Sep, 94% of stops on the line, snapped by OSRM" - with a
+warning when under 80% of the stops are on it; either failure shows the server's
+reason and what to do about it. The line goes into the draft with `polyline_source:
+"gps"`, never with the evidence.
+
+Tests: `src/services/clickhouse_reader.rs` (the guard, readonly=2 and basic auth on
+the wire, TSV, no password in `Debug`), `src/services/osrm.rs` (chunk plan,
+stitching, the detour guard, the encoder against Google's example),
+`src/editor/gps_line.rs` (run selection by direction and variant, cutting, gap
+and dwell splits, the synthetic fleet, a loop route, the queries passing the
+guard); `tests/editor_gps_line_flow.rs`, registered in
+`scripts/editor_flow_test.sh`, against a fake ClickHouse and a fake OSRM on
+localhost (every statement checked for readonly=2, a SELECT, a LIMIT, a time
+bound; partial, none, the cache, 422, 503, 504, commit of a `gps` line, and each
+OSRM reason); `dev/ui_smoke.mjs --map-line` against the mock's `/__dev/map-line`
+switch. `examples/gps_line_check.rs` runs the real pipeline read-only against the
+real cluster for a few routes and writes GeoJSON to look at.
