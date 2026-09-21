@@ -132,6 +132,10 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .chip.committed { background: var(--ok-tint); color: var(--ok); }
 .chip.rejected { background: var(--danger-tint); color: var(--danger); }
 .chip.discarded { background: #eceff0; color: var(--muted); }
+.chip.system-account { background: #eceff0; color: var(--muted); }
+/* People: one role picker per feed */
+table.people .feed-cell select { min-height: 30px; width: auto; font-size: var(--fs-s); }
+table.people .feed-col { white-space: nowrap; }
 
 .notice { padding: 10px 12px; border-left: 4px solid var(--rule-strong); background: var(--surface); font-size: var(--fs-s); }
 .notice.error { border-color: var(--danger); background: var(--danger-tint); }
@@ -160,6 +164,9 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 }
 .brand { font-weight: 700; font-size: var(--fs-l); color: var(--ink); text-decoration: none; white-space: nowrap; }
 .feed-picker select { min-height: 34px; width: auto; }
+/* the role this person holds on the feed chosen beside it (docs section 15) */
+.feed-picker { display: flex; align-items: center; gap: 6px; }
+.chip.feed-role { background: var(--action-tint); color: var(--action); }
 .search { position: relative; flex: 1 1 360px; max-width: 520px; }
 .search-results {
   position: absolute; top: calc(100% + 4px); left: 0; right: 0; max-height: 70vh; overflow: auto;
