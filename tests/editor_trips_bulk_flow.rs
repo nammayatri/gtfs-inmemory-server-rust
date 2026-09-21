@@ -247,33 +247,6 @@ async fn scalar_i64(pool: &PgPool, sql: impl AsRef<str>) -> i64 {
         .get::<i64, _>(0)
 }
 
-/// The findings of one change, as `level:code`.
-fn findings_of(set: &Value, change_id: i64) -> Vec<String> {
-    set["validation"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|v| v["change_id"] == change_id)
-        .map(|v| {
-            format!(
-                "{}:{}",
-                v["level"].as_str().unwrap(),
-                v["code"].as_str().unwrap()
-            )
-        })
-        .collect()
-}
-
-fn change_of(set: &Value, change_id: i64) -> Value {
-    set["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["change_id"] == change_id)
-        .cloned()
-        .unwrap_or(Value::Null)
-}
-
 /// Rows of an upload, and what became of each: `(status, [codes])`.
 fn outcome(res: &Value) -> Vec<(String, Vec<String>)> {
     res["rows"]
