@@ -14,7 +14,8 @@
 // stops; coordinates to review (the list, a move by suggestion, raw point, map
 // click and drag, position is correct and reopen, splitting routes off a stop
 // with routes from three original stops and its draft conflict, a stop merged
-// away); importing CSV files into a draft of 1,200 changes; submit, approve and
+// away); importing CSV files into a draft of 1,200 changes, which the API answers
+// 200 at a time and the dashboard pages through; submit, approve and
 // commit by a second person, a commit conflict, people and history; a feed's
 // data source switched through a draft, approved by the admin who submitted it
 // (the override, its confirm, badge and history row); the "Stations to review"
@@ -2316,6 +2317,14 @@ try {
   await choose(".pager select", "24");
   await waitFor(`document.querySelector(".pager select").value === "24"`, "last page");
   check(await evaluate(`document.querySelectorAll(".change").length === 50 && document.getElementById("page").innerText.includes("Showing 1,151 to 1,200")`), "the last page shows the last 50 changes");
+  // the API answers it 200 changes at a time (section 16.5), and the page above
+  // paged through all of them
+  const bigDraft = (await evaluate("location.hash")).split("/").pop();
+  const firstPage = await api(`change-sets/${bigDraft}`);
+  check(firstPage.changes.length === 200 && !!firstPage.next_cursor && firstPage.change_count === 1200
+    && firstPage.validation_summary && Array.isArray(firstPage.validation), "the API answers a big draft 200 changes at a time, with its count and the replay on the first page");
+  const lastPage = await api(`change-sets/${bigDraft}?limit=500&cursor=1000`);
+  check(lastPage.changes.length === 200 && lastPage.next_cursor === null && lastPage.validation === undefined, "a later page carries only its changes");
   await shot("17-big-draft");
 
   // ================================================================ approver

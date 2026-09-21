@@ -574,13 +574,26 @@ pub async fn change_set_create(
     Ok(HttpResponse::Created().json(set))
 }
 
+/// A change set's changes come a page at a time (section 16.5, "Big drafts").
+#[derive(Deserialize)]
+pub struct ChangesQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
 pub async fn change_set(
     req: HttpRequest,
     st: Data,
     path: web::Path<Uuid>,
+    q: web::Query<ChangesQuery>,
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require(&req, &st, Role::Viewer).await?;
-    ok(svc::set_detail(&st, &ctx, *path).await?)
+    let first = q.cursor.as_deref().is_none_or(str::is_empty);
+    let page = Page::parse(
+        Some(q.limit.unwrap_or(svc::CHANGES_PAGE)),
+        q.cursor.as_deref(),
+    )?;
+    ok(svc::set_detail_page(&st, &ctx, *path, &page, first).await?)
 }
 
 pub async fn change_add(

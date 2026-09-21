@@ -136,14 +136,27 @@ pub async fn load_route_trips(
     g: &str,
     route_id: &str,
 ) -> EditorResult<Vec<StoredTrip>> {
+    Ok(load_routes_trips(conn, g, &[route_id.to_string()])
+        .await?
+        .remove(route_id)
+        .unwrap_or_default())
+}
+
+/// [`load_route_trips`] for many routes in two queries. Routes without trips
+/// are absent.
+pub async fn load_routes_trips(
+    conn: &mut PgConnection,
+    g: &str,
+    route_ids: &[String],
+) -> EditorResult<HashMap<String, Vec<StoredTrip>>> {
     let mut frequencies: HashMap<String, Vec<StoredFrequency>> = HashMap::new();
     for r in sqlx::query(
         "SELECT f.trip_id, f.start_s, f.end_s, f.headway_s, f.exact_times FROM gtfs_frequency f \
          JOIN gtfs_trip t ON t.gtfs_id = f.gtfs_id AND t.trip_id = f.trip_id \
-         WHERE t.gtfs_id = $1 AND t.route_id = $2 ORDER BY f.trip_id, f.start_s",
+         WHERE t.gtfs_id = $1 AND t.route_id = ANY($2) ORDER BY f.trip_id, f.start_s",
     )
     .bind(g)
-    .bind(route_id)
+    .bind(route_ids)
     .fetch_all(&mut *conn)
     .await?
     {
@@ -158,20 +171,22 @@ pub async fn load_route_trips(
             });
     }
     let rows = sqlx::query(
-        "SELECT trip_id, pattern_key, profile_key, service_id, direction_id, ref_s, headsign, \
+        "SELECT route_id, trip_id, pattern_key, profile_key, service_id, direction_id, ref_s, headsign, \
                 short_name, block_id, shape_id, wheelchair_accessible, bikes_allowed, sort_key, source, \
                 source_ref::text AS source_ref \
-         FROM gtfs_trip WHERE gtfs_id = $1 AND route_id = $2 ORDER BY sort_key, trip_id",
+         FROM gtfs_trip WHERE gtfs_id = $1 AND route_id = ANY($2) ORDER BY route_id, sort_key, trip_id",
     )
     .bind(g)
-    .bind(route_id)
+    .bind(route_ids)
     .fetch_all(&mut *conn)
     .await?;
-    rows.iter()
-        .map(|r| -> Result<StoredTrip, sqlx::Error> {
-            let trip_id: String = r.try_get("trip_id")?;
-            let source_ref = json_col(r, "source_ref")?;
-            Ok(StoredTrip {
+    let mut out: HashMap<String, Vec<StoredTrip>> = HashMap::new();
+    for r in &rows {
+        let trip_id: String = r.try_get("trip_id")?;
+        let source_ref = json_col(r, "source_ref")?;
+        out.entry(r.try_get("route_id")?)
+            .or_default()
+            .push(StoredTrip {
                 frequencies: frequencies.remove(&trip_id).unwrap_or_default(),
                 trip_id,
                 pattern_key: r.try_get("pattern_key")?,
@@ -188,10 +203,9 @@ pub async fn load_route_trips(
                 sort_key: r.try_get("sort_key")?,
                 source: r.try_get("source")?,
                 source_ref: (!source_ref.is_null()).then_some(source_ref),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+            });
+    }
+    Ok(out)
 }
 
 /// The profiles of a route, or of one of its patterns, in key order.
@@ -321,7 +335,7 @@ pub async fn route_timetable(
 
 /// First arrival offset of each profile, by `(pattern, profile)`: what turns a
 /// trip's reference time into the start time a person reads.
-fn first_arrivals(profiles: &[StoredProfile]) -> HashMap<(i16, i32), i32> {
+pub fn first_arrivals(profiles: &[StoredProfile]) -> HashMap<(i16, i32), i32> {
     profiles
         .iter()
         .map(|p| {
@@ -1691,6 +1705,37 @@ pub(super) async fn timing_profile_delete(
     Ok(vec![])
 }
 
+/// A live trip list as the specs a change would send, for checking it with the
+/// same rules: only what [`check_trips`] reads is carried.
+pub fn specs_of(live: &[StoredTrip], firsts: &HashMap<(i16, i32), i32>) -> Vec<TripSpec> {
+    live.iter()
+        .map(|t| TripSpec {
+            trip_id: Some(t.trip_id.clone()),
+            pattern_key: t.pattern_key,
+            profile_key: t.profile_key,
+            service_id: t.service_id.clone(),
+            direction_id: t.direction_id,
+            start_time: gtfs_timing::format_time(
+                t.ref_s
+                    + t.profile_key
+                        .and_then(|p| firsts.get(&(t.pattern_key, p)).copied())
+                        .unwrap_or(0),
+            ),
+            headsign: None,
+            short_name: None,
+            block_id: None,
+            shape_id: None,
+            wheelchair_accessible: None,
+            bikes_allowed: None,
+            frequencies: None,
+            source_ref: None,
+            source: None,
+            sort_key: None,
+            ref_s: None,
+        })
+        .collect()
+}
+
 /// Replace a route's whole trip list. A trip sent back with its id keeps its
 /// `sort_key` and `source`; a new one is sorted after the route's last and is
 /// the change's `source` (default `editor`). Only problems the edit introduces
@@ -1765,33 +1810,7 @@ pub(super) async fn route_trips_replace(
 
     // the live list, checked the same way, for what was already there
     let live = load_route_trips(conn, g, route_id).await?;
-    let live_specs: Vec<TripSpec> = live
-        .iter()
-        .map(|t| TripSpec {
-            trip_id: Some(t.trip_id.clone()),
-            pattern_key: t.pattern_key,
-            profile_key: t.profile_key,
-            service_id: t.service_id.clone(),
-            direction_id: t.direction_id,
-            start_time: gtfs_timing::format_time(
-                t.ref_s
-                    + t.profile_key
-                        .and_then(|p| profiles.get(&(t.pattern_key, p)).copied())
-                        .unwrap_or(0),
-            ),
-            headsign: None,
-            short_name: None,
-            block_id: None,
-            shape_id: None,
-            wheelchair_accessible: None,
-            bikes_allowed: None,
-            frequencies: None,
-            source_ref: None,
-            source: None,
-            sort_key: None,
-            ref_s: None,
-        })
-        .collect();
+    let live_specs = specs_of(&live, &profiles);
     let live_label = |i: usize| format!("trip {} ({})", i + 1, live[i].trip_id);
     let (live_findings, _) = check_trips(&live_specs, &rules, &live_label);
     let findings = super::validation::grade_against_live(findings, &live_findings);

@@ -69,8 +69,12 @@ impl Page {
     pub fn wrap(&self, mut items: Vec<Value>) -> Value {
         let more = items.len() as i64 > self.limit;
         items.truncate(self.limit as usize);
-        let next = more.then(|| URL_SAFE_NO_PAD.encode(format!("o:{}", self.offset + self.limit)));
-        json!({"items": items, "next_cursor": next})
+        json!({"items": items, "next_cursor": self.next_cursor(more)})
+    }
+
+    /// The cursor of the page after this one, when there is one.
+    pub fn next_cursor(&self, more: bool) -> Option<String> {
+        more.then(|| URL_SAFE_NO_PAD.encode(format!("o:{}", self.offset + self.limit)))
     }
 }
 
@@ -844,12 +848,51 @@ pub async fn load_changes(
     conn: &mut PgConnection,
     change_set_id: Uuid,
 ) -> EditorResult<Vec<ChangeRow>> {
+    select_changes(conn, change_set_id, Befores::All, None).await
+}
+
+/// A set's changes as [`evaluate`] needs them: without the `before` snapshots,
+/// which only a `feed_config` change's conflict check reads. A draft of
+/// thousands of stop lists or trip lists replays without carrying them.
+pub async fn load_changes_to_apply(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+) -> EditorResult<Vec<ChangeRow>> {
+    select_changes(conn, change_set_id, Befores::FeedConfigOnly, None).await
+}
+
+/// One page of a set's changes, in position order, with their snapshots.
+pub async fn load_changes_page(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    page: &Page,
+) -> EditorResult<Vec<ChangeRow>> {
+    select_changes(conn, change_set_id, Befores::All, Some(page)).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Befores {
+    All,
+    FeedConfigOnly,
+}
+
+async fn select_changes(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    befores: Befores,
+    page: Option<&Page>,
+) -> EditorResult<Vec<ChangeRow>> {
     let rows = sqlx::query(
         "SELECT change_id, position, entity, entity_key, op, base_row_version, \
-                before::text AS before, after::text AS after, created_by, created_at \
-         FROM gtfs_change WHERE change_set_id = $1 ORDER BY position",
+                CASE WHEN $2 OR entity = 'feed_config' THEN before::text END AS before, \
+                after::text AS after, created_by, created_at \
+         FROM gtfs_change WHERE change_set_id = $1 ORDER BY position \
+         LIMIT $3 OFFSET $4",
     )
     .bind(change_set_id)
+    .bind(befores == Befores::All)
+    .bind(page.map(|p| p.limit + 1))
+    .bind(page.map(|p| p.offset).unwrap_or(0))
     .fetch_all(&mut *conn)
     .await?;
     rows.iter()
@@ -3230,25 +3273,61 @@ async fn feed_config_update(
 
 // ---------------------------------------------------------------- set detail
 
-/// The set, its changes, and - unless it is finished - what applying it now
-/// would find. Runs the changes in a transaction that is rolled back.
+/// How many changes a change set's detail carries at once unless asked
+/// (section 16.5, "Big drafts").
+pub const CHANGES_PAGE: i64 = 200;
+
+/// The set, the first page of its changes, and - unless it is finished - what
+/// applying it now would find. Runs the changes in a transaction that is rolled
+/// back.
 pub async fn set_detail(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
-    retry_transient(|| set_detail_once(state, ctx, id)).await
+    let first = Page {
+        limit: CHANGES_PAGE,
+        offset: 0,
+    };
+    set_detail_page(state, ctx, id, &first, true).await
 }
 
-async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
+/// [`set_detail`] for one page of the changes (`limit`, `cursor`). Every page
+/// carries the set's fields, `change_count` and `next_cursor`. Only the first
+/// (`replay`) runs the draft: its `validation`, `validation_summary`,
+/// `conflicts` and `can_submit` are the whole set's, so paging through a draft
+/// of thousands of changes replays it once.
+pub async fn set_detail_page(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    page: &Page,
+    replay: bool,
+) -> EditorResult<Value> {
+    retry_transient(|| set_detail_once(state, ctx, id, page, replay)).await
+}
+
+async fn set_detail_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    page: &Page,
+    replay: bool,
+) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, false).await?;
-    let changes = load_changes(&mut tx, id).await?;
-    let ev = if matches!(set.status.as_str(), "committed" | "discarded") {
-        Evaluation::default()
+    let mut changes = load_changes_page(&mut tx, id, page).await?;
+    let more = changes.len() as i64 > page.limit;
+    changes.truncate(page.limit as usize);
+    let ev = if !replay {
+        None
+    } else if matches!(set.status.as_str(), "committed" | "discarded") {
+        Some(Evaluation::default())
     } else {
+        let all = load_changes_to_apply(&mut tx, id).await?;
         lock_feed(&mut tx, &set.gtfs_id).await?;
-        evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?
+        Some(evaluate(&mut tx, &set.gtfs_id, &all, &ctx.user.email).await?)
     };
     tx.rollback().await?;
     // Stop-order changes carry ids only; give the diff the names of every stop
-    // they reference (live names, so a stop added to a route reads as itself).
+    // the page's changes reference (live names, so a stop added to a route
+    // reads as itself).
     let referenced: Vec<String> = changes
         .iter()
         .filter(|c| c.entity == "route_stops")
@@ -3257,13 +3336,14 @@ async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResu
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let stop_names: Map<String, Value> = if referenced.is_empty() {
+    let mut conn = state.pool.acquire().await?;
+    let mut stop_names: Map<String, Value> = if referenced.is_empty() {
         Map::new()
     } else {
         sqlx::query("SELECT stop_id, name FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)")
             .bind(&set.gtfs_id)
             .bind(&referenced)
-            .fetch_all(&state.pool)
+            .fetch_all(&mut *conn)
             .await?
             .iter()
             .map(|r| -> Result<(String, Value), sqlx::Error> {
@@ -3275,26 +3355,32 @@ async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResu
             .collect::<Result<_, _>>()?
     };
     // a stop created in this draft has no live name yet: use the one it is given
-    let mut stop_names = stop_names;
-    let wanted: HashSet<&String> = referenced.iter().collect();
-    for c in changes
+    let unnamed: Vec<String> = referenced
         .iter()
-        .filter(|c| c.entity == "stop" && c.op == "create")
-    {
-        if wanted.contains(&c.entity_key) && !stop_names.contains_key(&c.entity_key) {
-            if let Some(name) = c.after["name"].as_str() {
-                stop_names.insert(c.entity_key.clone(), json!(name.trim()));
-            }
+        .filter(|id| !stop_names.contains_key(*id))
+        .cloned()
+        .collect();
+    for (key, (entity, after)) in stops_created_in_set(&mut conn, id, &unnamed).await? {
+        if let (true, Some(name)) = (entity == "stop", after["name"].as_str()) {
+            stop_names.insert(key, json!(name.trim()));
         }
     }
     let mut out = set.json;
     out["stop_names"] = Value::Object(stop_names);
     out["changes"] = json!(changes.iter().map(ChangeRow::json).collect::<Vec<_>>());
-    out["validation"] = json!(ev.validation);
-    out["conflicts"] = json!(ev.conflicts);
-    out["can_submit"] = json!(
-        set.status == "draft" && !changes.is_empty() && !ev.has_errors() && ev.conflicts.is_empty()
-    );
+    out["next_cursor"] = json!(page.next_cursor(more));
+    if let Some(ev) = ev {
+        let count = |level: &str| ev.validation.iter().filter(|v| v["level"] == level).count();
+        out["validation_summary"] = json!({"errors": count("error"), "warnings": count("warning")});
+        out["can_submit"] = json!(
+            set.status == "draft"
+                && out["change_count"].as_i64().unwrap_or(0) > 0
+                && !ev.has_errors()
+                && ev.conflicts.is_empty()
+        );
+        out["validation"] = json!(ev.validation);
+        out["conflicts"] = json!(ev.conflicts);
+    }
     Ok(out)
 }
 
@@ -3352,7 +3438,7 @@ async fn preview_once(
 ) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, false).await?;
-    let changes = load_changes(&mut tx, id).await?;
+    let changes = load_changes_to_apply(&mut tx, id).await?;
     lock_feed(&mut tx, &set.gtfs_id).await?;
     let ev = evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?;
     let route = match what {
@@ -3934,7 +4020,7 @@ pub async fn add_change_to(
 }
 
 /// Give every trip of a `route_trips` change that has no `trip_id` a new one.
-async fn mint_missing_trip_ids(
+pub(super) async fn mint_missing_trip_ids(
     conn: &mut PgConnection,
     g: &str,
     route_id: &str,
@@ -4163,7 +4249,7 @@ async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
     lock_feed_of_set(&mut tx, id).await?;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
-    let changes = load_changes(&mut tx, id).await?;
+    let changes = load_changes_to_apply(&mut tx, id).await?;
     if changes.is_empty() {
         return Err(EditorError::bad_request(
             "change_set_empty",
@@ -4410,7 +4496,7 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     {
         return Err(own_change_set(false));
     }
-    let changes = load_changes(&mut tx, id).await?;
+    let changes = load_changes_to_apply(&mut tx, id).await?;
     let ev = evaluate(&mut tx, &gtfs_id, &changes, &ctx.user.email).await?;
     if !ev.conflicts.is_empty() {
         tx.rollback().await?;
