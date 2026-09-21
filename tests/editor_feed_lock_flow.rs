@@ -146,7 +146,7 @@ fn clear_feed() -> Vec<String> {
 fn seed() -> Vec<String> {
     let mut s = clear_feed();
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor feed lock test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor feed lock test feed', 'fare_stage')"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \

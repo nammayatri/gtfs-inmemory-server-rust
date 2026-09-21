@@ -21,6 +21,7 @@ pub mod position_reviews;
 pub mod proposals;
 pub mod service;
 pub mod static_ui;
+pub mod trips;
 pub mod validation;
 pub mod webhooks;
 
@@ -253,6 +254,15 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:gps",
                 web::post().to(h::polyline_gps),
             )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/patterns/{pattern_key}",
+                web::get().to(h::route_pattern),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/trips",
+                web::get().to(h::route_trips),
+            )
+            .route("/feeds/{gtfs_id}/services", web::get().to(h::services))
             .route("/feeds/{gtfs_id}/audit", web::get().to(h::audit))
             // drafts
             .route(
@@ -276,6 +286,14 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/change-sets/{id}/preview/routes/{route_id}",
                 web::get().to(h::change_set_preview_route),
+            )
+            .route(
+                "/change-sets/{id}/preview/routes/{route_id}/patterns/{pattern_key}",
+                web::get().to(h::change_set_preview_pattern),
+            )
+            .route(
+                "/change-sets/{id}/preview/routes/{route_id}/trips",
+                web::get().to(h::change_set_preview_trips),
             )
             .route("/change-sets/{id}/submit", web::post().to(h::submit))
             .route("/change-sets/{id}/reopen", web::post().to(h::reopen))

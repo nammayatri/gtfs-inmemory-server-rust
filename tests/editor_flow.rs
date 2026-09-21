@@ -31,7 +31,7 @@ async fn setup_db(pool: &PgPool) {
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
-        format!("INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor test feed')"),
+        format!("INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor test feed', 'fare_stage')"),
         format!(
             "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) SELECT '{FEED}', 'S' || i, 'S' || i, \
              'STOP ' || i, 13.0 + i * 0.001, 80.2 FROM generate_series(1, 6) i"
