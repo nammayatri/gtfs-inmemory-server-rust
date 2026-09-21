@@ -584,6 +584,9 @@ mod tests {
             marker_lon: None,
             stop_name_override: None,
             provider_id: None,
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
         }
     }
 

@@ -534,7 +534,7 @@ impl GtfsDbSource {
             "SELECT rs.route_id, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no, rs.stop_headsign
              FROM gtfs_route_stop rs
              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
-             WHERE rs.gtfs_id = $1 AND rs.stop_type = ANY($2)
+             WHERE rs.gtfs_id = $1 AND rs.pattern_key = 1 AND rs.stop_type = ANY($2)
              ORDER BY rs.route_id, rs.sequence",
         )
         .bind(gtfs_id)

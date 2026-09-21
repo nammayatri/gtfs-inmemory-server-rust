@@ -33,7 +33,7 @@ fingerprint() {
       SELECT 's' || stop_id || name || lat || lon || coalesce(parent_station, '') || row_version AS x
         FROM gtfs_stop WHERE gtfs_id = 'chennai_bus'
       UNION ALL
-      SELECT 'r' || route_id || sequence || coalesce(stop_id, marker_id) || stop_type || stage_no || stage_name
+      SELECT 'r' || route_id || pattern_key || '.' || sequence || coalesce(stop_id, marker_id) || stop_type || stage_no || stage_name
         FROM gtfs_route_stop WHERE gtfs_id = 'chennai_bus') t"
 }
 

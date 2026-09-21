@@ -734,7 +734,7 @@ async function createFlow() {
   const routeRow = db(`SELECT short_name, long_name, color, route_type, coalesce(agency_id, ''), deleted FROM gtfs_route WHERE gtfs_id = '${FEED}' AND route_id = 'E2E-R1'`)[0];
   check(!!routeRow && routeRow[0] === "E2E1" && routeRow[1] === "E2E NEW KERB - Velachery" && routeRow[2] === "#1F5FBF" && routeRow[3] === "3" && routeRow[4] !== "" && routeRow[5] === "f",
     `gtfs_route E2E-R1: ${routeRow ? routeRow.join(" | ") : "missing"}`);
-  const rows = db(`SELECT sequence, stop_id, stop_type, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = 'E2E-R1' ORDER BY sequence`);
+  const rows = db(`SELECT sequence, stop_id, stop_type, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = 'E2E-R1' AND pattern_key = 1 ORDER BY sequence`);
   check(rows.length === 2 && rows[0].join("|") === `1|${newStop}|NEW STOP|1|E2E NEW KERB` && rows[1].join("|") === `2|${second}|INTERMEDIATE STOP|1|E2E NEW KERB`,
     `gtfs_route_stop E2E-R1: ${rows.map((r) => r.join(" ")).join("; ")}`);
 }
@@ -815,7 +815,7 @@ async function routeEditorFlow() {
   }, 10000);
   timings.route_commit_to_live_ms = live;
   check(live !== null, `the public route-stop-mapping of ${EDIT_ROUTE} calls at ${newId} as stop 8 ${live !== null ? `${live} ms after commit` : "(not within 10 s)"}`);
-  const stages = db(`SELECT sequence, stop_id, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = '${EDIT_ROUTE}' AND sequence IN (2, 3, 4, 8) ORDER BY sequence`);
+  const stages = db(`SELECT sequence, stop_id, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = '${EDIT_ROUTE}' AND pattern_key = 1 AND sequence IN (2, 3, 4, 8) ORDER BY sequence`);
   check(stages.map((r) => r.join("|")).join(";") === `2|b76f46d86f|2|MANDAVELI B.T;3|4f16bc7cab|2|MANDAVELI B.T;4|a0db25ec4b|3|a.m.s.hospital;8|${newId}|4|ADYAR B.T`,
     `gtfs_route_stop ${EDIT_ROUTE}: ${stages.map((r) => r.join(" ")).join("; ")}`);
 }

@@ -356,11 +356,14 @@ pub async fn stop_detail(
     let mut stop = stop_row(conn, gtfs_id, stop_id)
         .await?
         .ok_or_else(|| EditorError::not_found("stop_not_found", format!("no stop {stop_id}")))?;
+    // every call, on every stop order of the route (a pattern past the first
+    // is a metro short turn or express run, section 16): the stop is used there.
+    // A call on another stop order than the route's stop list says which.
     let routes = sqlx::query(
-        "SELECT rs.route_id, r.short_name, r.long_name, rs.sequence, rs.stop_type, rs.stage_no \
+        "SELECT rs.route_id, r.short_name, r.long_name, rs.pattern_key, rs.sequence, rs.stop_type, rs.stage_no \
          FROM gtfs_route_stop rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
-         WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.sequence",
+         WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(gtfs_id)
     .bind(stop_id)
@@ -368,14 +371,19 @@ pub async fn stop_detail(
     .await?
     .iter()
     .map(|r| -> Result<Value, sqlx::Error> {
-        Ok(json!({
+        let mut v = json!({
             "route_id": r.try_get::<String, _>("route_id")?,
             "short_name": r.try_get::<Option<String>, _>("short_name")?,
             "long_name": r.try_get::<Option<String>, _>("long_name")?,
             "sequence": r.try_get::<i32, _>("sequence")?,
             "stop_type": r.try_get::<String, _>("stop_type")?,
             "stage_no": r.try_get::<i32, _>("stage_no")?,
-        }))
+        });
+        let pattern: i16 = r.try_get("pattern_key")?;
+        if pattern != FIRST_PATTERN {
+            v["pattern_key"] = json!(pattern);
+        }
+        Ok(v)
     })
     .collect::<Result<Vec<_>, _>>()?;
     let children = sqlx::query(&format!(
@@ -493,7 +501,7 @@ pub async fn list_routes(
     let rows = sqlx::query(&format!(
         "SELECT {ROUTE_COLS}, \
             (SELECT count(*) FROM gtfs_route_stop rs WHERE rs.gtfs_id = r.gtfs_id \
-               AND rs.route_id = r.route_id \
+               AND rs.route_id = r.route_id AND rs.pattern_key = 1 \
                AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count \
          FROM gtfs_route r \
          WHERE r.gtfs_id = $1 AND NOT r.deleted \
@@ -527,8 +535,12 @@ pub async fn list_routes(
     Ok(page.wrap(items))
 }
 
+/// The stop order every route has (section 16): what everything that names no
+/// pattern means, so that code written before patterns keeps its meaning.
+pub const FIRST_PATTERN: i16 = 1;
+
 const ROUTE_ROW_COLS: &str = "stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
-     marker_lat, marker_lon, stop_name_override, provider_id";
+     marker_lat, marker_lon, stop_name_override, provider_id, pickup_type, drop_off_type, timepoint";
 
 fn route_row_from(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
     Ok(RouteRow {
@@ -542,19 +554,36 @@ fn route_row_from(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
         marker_lon: r.try_get("marker_lon")?,
         stop_name_override: r.try_get("stop_name_override")?,
         provider_id: r.try_get("provider_id")?,
+        pickup_type: r.try_get("pickup_type")?,
+        drop_off_type: r.try_get("drop_off_type")?,
+        timepoint: r.try_get("timepoint")?,
     })
 }
 
+/// A route's stop list: its rows of pattern 1, in sequence order.
 pub async fn load_route_rows(
     conn: &mut PgConnection,
     gtfs_id: &str,
     route_id: &str,
 ) -> EditorResult<Vec<RouteRow>> {
+    load_pattern_rows(conn, gtfs_id, route_id, FIRST_PATTERN).await
+}
+
+/// The rows of one of a route's stop orders, in sequence order. A pattern that
+/// does not exist has none.
+pub async fn load_pattern_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    route_id: &str,
+    pattern_key: i16,
+) -> EditorResult<Vec<RouteRow>> {
     let rows = sqlx::query(&format!(
-        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2 ORDER BY sequence"
+        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop \
+         WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 ORDER BY sequence"
     ))
     .bind(gtfs_id)
     .bind(route_id)
+    .bind(pattern_key)
     .fetch_all(&mut *conn)
     .await?;
     rows.iter()
@@ -570,17 +599,44 @@ pub async fn load_routes_rows(
     gtfs_id: &str,
     route_ids: &[String],
 ) -> EditorResult<HashMap<String, Vec<RouteRow>>> {
+    let keys: Vec<(String, i16)> = route_ids
+        .iter()
+        .map(|r| (r.clone(), FIRST_PATTERN))
+        .collect();
+    Ok(load_patterns_rows(conn, gtfs_id, &keys)
+        .await?
+        .into_iter()
+        .map(|((route, _), rows)| (route, rows))
+        .collect())
+}
+
+/// [`load_pattern_rows`] for many `(route, pattern)` in one query. Those without
+/// rows are absent.
+pub async fn load_patterns_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    keys: &[(String, i16)],
+) -> EditorResult<HashMap<(String, i16), Vec<RouteRow>>> {
+    let (routes, patterns): (Vec<String>, Vec<i16>) = keys.iter().cloned().unzip();
     let rows = sqlx::query(&format!(
-        "SELECT route_id, {ROUTE_ROW_COLS} FROM gtfs_route_stop \
-         WHERE gtfs_id = $1 AND route_id = ANY($2) ORDER BY route_id, sequence"
+        "SELECT rs.route_id, rs.pattern_key, {} FROM gtfs_route_stop rs \
+         JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
+           ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
+         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+        ROUTE_ROW_COLS
+            .split(", ")
+            .map(|c| format!("rs.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
     .bind(gtfs_id)
-    .bind(route_ids)
+    .bind(&routes)
+    .bind(&patterns)
     .fetch_all(&mut *conn)
     .await?;
-    let mut out: HashMap<String, Vec<RouteRow>> = HashMap::new();
+    let mut out: HashMap<(String, i16), Vec<RouteRow>> = HashMap::new();
     for r in &rows {
-        out.entry(r.try_get("route_id")?)
+        out.entry((r.try_get("route_id")?, r.try_get("pattern_key")?))
             .or_default()
             .push(route_row_from(r)?);
     }
@@ -594,22 +650,45 @@ pub async fn load_routes_read_rows(
     gtfs_id: &str,
     route_ids: &[String],
 ) -> EditorResult<HashMap<String, Vec<Value>>> {
+    let keys: Vec<(String, i16)> = route_ids
+        .iter()
+        .map(|r| (r.clone(), FIRST_PATTERN))
+        .collect();
+    Ok(load_patterns_read_rows(conn, gtfs_id, &keys)
+        .await?
+        .into_iter()
+        .map(|((route, _), rows)| (route, rows))
+        .collect())
+}
+
+/// [`load_routes_read_rows`] for `(route, pattern)` pairs.
+pub async fn load_patterns_read_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    keys: &[(String, i16)],
+) -> EditorResult<HashMap<(String, i16), Vec<Value>>> {
+    let (routes, patterns): (Vec<String>, Vec<i16>) = keys.iter().cloned().unzip();
     let rows = sqlx::query(
-        "SELECT rs.route_id, rs.sequence, rs.stop_id, coalesce(rs.stop_name_override, s.name) AS stop_name, \
+        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, \
+                coalesce(rs.stop_name_override, s.name) AS stop_name, \
                 s.lat, s.lon, s.deleted AS stop_deleted, s.parent_station, \
                 rs.stop_type, rs.stage_no, rs.stage_name, rs.marker_id, rs.marker_name, rs.marker_lat, \
-                rs.marker_lon, rs.stop_name_override, rs.provider_id \
+                rs.marker_lon, rs.stop_name_override, rs.provider_id, \
+                rs.pickup_type, rs.drop_off_type, rs.timepoint \
          FROM gtfs_route_stop rs \
+         JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
+           ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
          LEFT JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
-         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) ORDER BY rs.route_id, rs.sequence",
+         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(gtfs_id)
-    .bind(route_ids)
+    .bind(&routes)
+    .bind(&patterns)
     .fetch_all(&mut *conn)
     .await?;
-    let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut out: HashMap<(String, i16), Vec<Value>> = HashMap::new();
     for r in &rows {
-        out.entry(r.try_get("route_id")?).or_default().push(json!({
+        let mut row = json!({
             "sequence": r.try_get::<i32, _>("sequence")?,
             "stop_id": r.try_get::<Option<String>, _>("stop_id")?,
             "stop_name": r.try_get::<Option<String>, _>("stop_name")?,
@@ -626,7 +705,17 @@ pub async fn load_routes_read_rows(
             "marker_lon": r.try_get::<Option<f64>, _>("marker_lon")?,
             "stop_name_override": r.try_get::<Option<String>, _>("stop_name_override")?,
             "provider_id": r.try_get::<Option<String>, _>("provider_id")?,
-        }));
+        });
+        // the GTFS boarding fields only where a row has them, so a stop list
+        // that has none reads exactly as it did before they existed
+        for k in ["pickup_type", "drop_off_type", "timepoint"] {
+            if let Some(v) = r.try_get::<Option<i16>, _>(k)? {
+                row[k] = json!(v);
+            }
+        }
+        out.entry((r.try_get("route_id")?, r.try_get("pattern_key")?))
+            .or_default()
+            .push(row);
     }
     Ok(out)
 }
@@ -1937,34 +2026,43 @@ async fn stop_merge(
     }
     let (f, i) = (&found[from], &found[into]);
 
-    // Every row of each live route that calls the stop going away, in order:
+    // Every row of each live route that calls the stop going away, in order -
+    // on each of its stop orders, which the merge switches alike (section 16):
     // switching the id must not make a route call one stop twice in a row.
-    let mut by_route: Vec<(String, Vec<SequencedStop>)> = Vec::new();
+    let mut by_route: Vec<((String, i16), Vec<SequencedStop>)> = Vec::new();
     for r in sqlx::query(
-        "SELECT rs.route_id, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop rs \
+        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 \
-           AND rs.route_id IN (SELECT route_id FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_id = $2) \
-         ORDER BY rs.route_id, rs.sequence",
+           AND (rs.route_id, rs.pattern_key) IN \
+               (SELECT route_id, pattern_key FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_id = $2) \
+         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(g)
     .bind(from)
     .fetch_all(&mut *conn)
     .await?
     {
-        let route: String = r.try_get("route_id")?;
+        let key: (String, i16) = (r.try_get("route_id")?, r.try_get("pattern_key")?);
         let row = (
             r.try_get("sequence")?,
             r.try_get("stop_id")?,
             r.try_get("stop_type")?,
         );
         match by_route.last_mut() {
-            Some((id, rows)) if *id == route => rows.push(row),
-            _ => by_route.push((route, vec![row])),
+            Some((k, rows)) if *k == key => rows.push(row),
+            _ => by_route.push((key, vec![row])),
         }
     }
     let mut warnings = Vec::new();
-    for (route, rows) in &by_route {
+    for ((route, pattern), rows) in &by_route {
+        // a stop order past the first names itself; pattern 1 is the route's
+        // stop list and reads exactly as it did before patterns existed
+        let route = if *pattern == FIRST_PATTERN {
+            route.clone()
+        } else {
+            format!("{route} (pattern {pattern})")
+        };
         let effect = merge_effect(rows, from, into);
         for (a, b) in &effect.repeats {
             errors.push(Finding::error(
@@ -2103,6 +2201,7 @@ async fn route_stops_replace(
 ) -> Result<Vec<Finding>, ApplyError> {
     let payload: RouteStopsPayload = serde_json::from_value(after.clone())
         .map_err(|e| fail("invalid_payload", format!("rows are not valid: {e}")))?;
+    let pattern_key = FIRST_PATTERN;
     let deleted: bool = sqlx::query(
         "SELECT deleted FROM gtfs_route WHERE gtfs_id = $1 AND route_id = $2 FOR UPDATE",
     )
@@ -2169,7 +2268,7 @@ async fn route_stops_replace(
             _ => {}
         }
     }
-    let live = load_route_rows(conn, g, route_id).await?;
+    let live = load_pattern_rows(conn, g, route_id, pattern_key).await?;
     if payload.position_review_id.is_some() {
         // a split points the reviewed stop's rows at a new stop: what those rows
         // already had wrong under the old stop is not the split's doing
@@ -2196,10 +2295,11 @@ async fn route_stops_replace(
     // position) and the provider id (a new row takes the route's usual one).
     let live_meta: HashMap<i32, (Option<String>, Option<String>, Option<String>)> = sqlx::query(
         "SELECT sequence, stop_id, marker_id, provenance::text AS provenance \
-         FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2",
+         FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3",
     )
     .bind(g)
     .bind(route_id)
+    .bind(pattern_key)
     .fetch_all(&mut *conn)
     .await?
     .iter()
@@ -2234,9 +2334,15 @@ async fn route_stops_replace(
     let (mut mid, mut mname, mut mlat, mut mlon, mut over, mut prov) =
         (vec![], vec![], vec![], vec![], vec![], vec![]);
     let mut provenance: Vec<Option<String>> = Vec::with_capacity(n);
+    let (mut pickup, mut dropoff, mut timepoint) = (vec![], vec![], vec![]);
     for (i, r) in rows.iter().enumerate() {
         let s = i as i32 + 1;
         seq.push(s);
+        // a marker is not a place anyone boards
+        let served = |v: Option<i16>| if r.is_marker() { None } else { v };
+        pickup.push(served(r.pickup_type));
+        dropoff.push(served(r.drop_off_type));
+        timepoint.push(served(r.timepoint));
         stop.push(if r.is_marker() {
             None
         } else {
@@ -2280,20 +2386,26 @@ async fn route_stops_replace(
             }
         }));
     }
-    sqlx::query("DELETE FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2")
-        .bind(g)
-        .bind(route_id)
-        .execute(&mut *conn)
-        .await?;
     sqlx::query(
-        "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, \
-                                      marker_id, marker_name, marker_lat, marker_lon, stop_name_override, \
-                                      provider_id, provenance, updated_by) \
-         SELECT $1, $2, u.seq, u.stop, u.typ, u.no, u.name, u.mid, u.mname, u.mlat, u.mlon, u.over, u.prov, \
-                u.provenance::jsonb, $14 \
+        "DELETE FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3",
+    )
+    .bind(g)
+    .bind(route_id)
+    .bind(pattern_key)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO gtfs_route_stop (gtfs_id, route_id, pattern_key, sequence, stop_id, stop_type, stage_no, \
+                                      stage_name, marker_id, marker_name, marker_lat, marker_lon, \
+                                      stop_name_override, provider_id, provenance, updated_by, \
+                                      pickup_type, drop_off_type, timepoint) \
+         SELECT $1, $2, $16, u.seq, u.stop, u.typ, u.no, u.name, u.mid, u.mname, u.mlat, u.mlon, u.over, \
+                u.prov, u.provenance::jsonb, $14, u.pickup, u.dropoff, u.timepoint \
          FROM UNNEST($3::int4[], $4::text[], $5::text[], $6::int4[], $7::text[], $8::text[], $9::text[], \
-                     $10::float8[], $11::float8[], $12::text[], $13::text[], $15::text[]) \
-              AS u(seq, stop, typ, no, name, mid, mname, mlat, mlon, over, prov, provenance)",
+                     $10::float8[], $11::float8[], $12::text[], $13::text[], $15::text[], \
+                     $17::int2[], $18::int2[], $19::int2[]) \
+              AS u(seq, stop, typ, no, name, mid, mname, mlat, mlon, over, prov, provenance, \
+                   pickup, dropoff, timepoint)",
     )
     .bind(g)
     .bind(route_id)
@@ -2310,6 +2422,10 @@ async fn route_stops_replace(
     .bind(&prov)
     .bind(actor)
     .bind(&provenance)
+    .bind(pattern_key)
+    .bind(&pickup)
+    .bind(&dropoff)
+    .bind(&timepoint)
     .execute(&mut *conn)
     .await?;
     Ok(findings)
@@ -3127,8 +3243,15 @@ async fn snapshot(
                     m.insert("into_row_version".into(), json!(v));
                 }
             }
+            // one entry per route, whichever of its stop orders call the stop:
+            // `sequences` are its stop list's (pattern 1), and a route that also
+            // calls it on another stop order says which ones in `pattern_keys` -
+            // a route with only a stop list reads exactly as it always did
             let affected = sqlx::query(
-                "SELECT rs.route_id, r.short_name, array_agg(rs.sequence ORDER BY rs.sequence) AS sequences \
+                "SELECT rs.route_id, r.short_name, \
+                        coalesce(array_agg(rs.sequence ORDER BY rs.sequence) \
+                                 FILTER (WHERE rs.pattern_key = 1), '{}') AS sequences, \
+                        array_agg(DISTINCT rs.pattern_key) AS pattern_keys \
                  FROM gtfs_route_stop rs \
                  JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
                  WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 \
@@ -3140,11 +3263,16 @@ async fn snapshot(
             .await?
             .iter()
             .map(|r| -> Result<Value, sqlx::Error> {
-                Ok(json!({
+                let mut v = json!({
                     "route_id": r.try_get::<String, _>("route_id")?,
                     "short_name": r.try_get::<Option<String>, _>("short_name")?,
                     "sequences": r.try_get::<Vec<i32>, _>("sequences")?,
-                }))
+                });
+                let patterns: Vec<i16> = r.try_get("pattern_keys")?;
+                if patterns != [FIRST_PATTERN] {
+                    v["pattern_keys"] = json!(patterns);
+                }
+                Ok(v)
             })
             .collect::<Result<Vec<_>, _>>()?;
             Ok((
@@ -4244,6 +4372,9 @@ mod tests {
             marker_lon: None,
             stop_name_override: None,
             provider_id: None,
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
         };
         let mut b = a.clone();
         b.stop_id = Some("B".into());

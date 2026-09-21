@@ -113,6 +113,10 @@ impl Finding {
 
 /// One row of a route's stop order, as sent in a `route_stops` replace and as
 /// stored in `gtfs_route_stop`.
+///
+/// The GTFS boarding fields (section 16) are left out of the serialised row
+/// when unset, so the rows hash of every stop list stored before they existed -
+/// the `base_rows_hash` a draft already carries - is unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRow {
@@ -133,6 +137,12 @@ pub struct RouteRow {
     pub stop_name_override: Option<String>,
     #[serde(default)]
     pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_type: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_off_type: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timepoint: Option<i16>,
 }
 
 impl RouteRow {
@@ -1356,6 +1366,9 @@ mod tests {
             marker_lon: None,
             stop_name_override: None,
             provider_id: None,
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
         }
     }
 
@@ -1371,6 +1384,9 @@ mod tests {
             marker_lon: pos.map(|p| p.1),
             stop_name_override: None,
             provider_id: None,
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
         }
     }
 
