@@ -2221,6 +2221,66 @@ feed-A-only session); a revocation bites on the next request with the same
 session; the backfill gives `chennai_bus` grants equal to the old roles; a system
 account cannot sign in.
 
+Settled while implementing (feed access, 2026-09-21):
+
+- **The backfill runs once**: only when `0018` creates the table, as `0017`'s
+  headsign backfill does. A second run cannot hand `chennai_bus` back to someone
+  an admin has revoked since. The test runs the migration file itself twice in a
+  scratch schema.
+- **A change set named in a body or a query is resolved too**, not only the
+  object of the path: the station-proposal approvals (one and bulk), a review's
+  move / split / merge, the review's what-if merge (`?change_set=`) and
+  `polyline:osrm?change_set=`. The caller needs the endpoint's role on that set's
+  feed as well, so an id from a feed they cannot see answers 403
+  `no_feed_access` for that feed, never a `feed_mismatch` that names it.
+- The body is still parsed before any check (a malformed one is 400 whatever the
+  caller's access), as it was before for roles.
+- `/auth/me`'s `feeds` items also carry `display_name`, which the switcher shows.
+  `my_role` and `/auth/me`'s `role` for an admin are `admin`.
+- `/users` items also carry `is_admin`. `POST /users`, `PATCH /users/{id}` and
+  `PUT /users/{id}/feeds/{g}` all answer with one such item.
+- `POST /users`: `admin` and `role` may both be sent only if they agree (else
+  400 `invalid_role`). A member's `role` column is the old body's role when one
+  was named, else `viewer` - what an older image rolled back would read. `feeds`
+  refused: a role outside viewer / editor / approver is 400 `invalid_role`, a
+  feed listed twice 400 `duplicate_feed`, an unknown feed 404 `feed_not_found`
+  (`details.gtfs_id`), any feed for an admin 400 `admin_has_all_feeds`. Nothing
+  is created when any of it is refused. `user_created` adds `admin` to its detail.
+- `PATCH /users/{id}`: an empty body is 400 `nothing_to_change`; making a system
+  account an admin is 400 `system_account`. **An admin holds no grants**:
+  promoting a member deletes theirs, each audited `feed_access_revoked`
+  (`role_after: null`) on its feed, so a later demotion leaves none, as 15.3
+  says. A demoted admin's column becomes `viewer` unless the old body named
+  another role. `user_admin_changed` has no `gtfs_id` and detail `{user_id,
+  email, admin_before, admin_after}`; `user_updated` (`{user_id, email, role,
+  status}`) is still written for a status change, and for an old-body role on a
+  member that changes nothing about access.
+- `PUT` with the role the grant already has changes nothing and audits nothing;
+  a changed role also moves `granted_by` / `granted_at` to the admin making it.
+  `DELETE` for an unknown user is 404 `user_not_found`, with no grant 404
+  `grant_not_found`. Every change of one user's access (grant, revoke, promote)
+  locks that user's row first, so two admins' edits of the same person queue.
+- **Discard and reopen keep their author-or-admin rule** (section 3), so of the
+  "others" in 15.2 who may finish a revoked member's draft, editors and approvers
+  on the feed see, edit and submit it, and only an admin discards it.
+- `GET /webhook-settings` stays readable by anyone signed in, a member with no
+  feeds included: the policy is the deployment's, not a feed's.
+- A grant has no `ON DELETE` on its feed: a script that deletes a feed row (the
+  flow tests, on their own feeds) deletes its grants first.
+- In code, `auth::require(req, st, min)` is gone - a handler written against it
+  no longer compiles, rather than skipping the feed. A handler asks for
+  `signed_in`, `require_feed(g, min)`, `require_object(object, min)` (a change
+  set, proposal, review or webhook; its feed looked up first) or
+  `require_admin`; `Ctx::feed_role`, `require_feed_role` and `is_admin` do the
+  rest.
+- Dashboard: a role badge beside the feed switcher, and the account menu, read
+  the role on the chosen feed; a draft opened by its address reads the role on
+  the draft's own feed. A 403 `no_feed_access` while the page is open re-reads
+  `/auth/me`, and when the chosen feed is gone the dashboard moves to the first
+  one still held (or the no-feeds screen) and says so. The Add person form gives
+  a role on the chosen feed, or Admin; the grid does the rest. System accounts
+  show "Never signs in", and their Admin switch is off.
+
 ## 16. Trips, stop times and service calendars (2026-09-21)
 
 The rest of a feed moves into these tables: its trips, their stop times, the days
