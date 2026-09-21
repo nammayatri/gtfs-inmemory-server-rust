@@ -204,7 +204,7 @@ const VIEWER: &str = "viewer@editor-review-merge-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor review merge test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor review merge test feed', 'fare_stage')"
     ));
     // S and S2 sit 542 m east of the road their routes take between A and B,
     // where C - the same name - is; P and Q are back to back on R3

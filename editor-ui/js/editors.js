@@ -184,12 +184,16 @@ export async function deleteStop(stop) {
 
 // ------------------------------------------------------------------ route stop list
 // stop_name and lat/lon are for display; stop_name_override (a route's own
-// spelling of the stop) and provider_id are data and go back to the server.
+// spelling of the stop) and provider_id are data and go back to the server, as
+// do the GTFS fields a row may carry (section 16) - only where it has them.
+const GTFS_ROW_FIELDS = ["stop_headsign", "pickup_type", "drop_off_type", "timepoint"];
+const gtfsFields = (r) => Object.fromEntries(GTFS_ROW_FIELDS.filter((k) => r[k] != null).map((k) => [k, r[k]]));
 const toRow = (r) => ({
   stop_id: r.stop_id, stop_name: r.stop_name, lat: r.lat, lon: r.lon, parent_station: r.parent_station,
   stop_type: r.stop_type, stage_no: r.stage_no, stage_name: r.stage_name,
   marker_id: r.marker_id, marker_name: r.marker_name, marker_lat: r.marker_lat, marker_lon: r.marker_lon,
   stop_name_override: r.stop_name_override ?? null, provider_id: r.provider_id ?? null,
+  ...gtfsFields(r),
 });
 
 // `created`: the route itself is new in the draft, so there is no live list.
@@ -551,6 +555,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       marker_lat: marker(r) ? r.marker_lat ?? null : null, marker_lon: marker(r) ? r.marker_lon ?? null : null,
       stop_name_override: marker(r) ? null : r.stop_name_override ?? null,
       provider_id: r.provider_id ?? null,
+      ...(marker(r) ? {} : gtfsFields(r)),
     }));
     try {
       const res = await addChange({ entity: "route_stops", op: "replace", entity_key: route.route_id, after: { rows: payload, base_rows_hash: baseHash } });

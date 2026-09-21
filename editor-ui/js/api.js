@@ -11,8 +11,32 @@ export class ApiError extends Error {
 
 // Every call goes through here: same-origin cookies, JSON both ways, the
 // mutation header, and one error shape. An auth failure is announced so the
-// shell can show the sign-in gate instead of each screen handling it.
+// shell can show the sign-in gate instead of each screen handling it. A draft
+// answered a page of changes at a time is completed here, so every screen
+// works on its whole list.
 export async function api(method, path, body) {
+  const data = await request(method, path, body);
+  if (isPagedSet(data)) await completeChanges(data);
+  if (data && isPagedSet(data.change_set)) await completeChanges(data.change_set);
+  return data;
+}
+
+// A change set whose `changes` are one page of more (docs section 16.5, "Big
+// drafts"): the first page carries the replay (validation, conflicts), later
+// pages only their slice of changes.
+const isPagedSet = (v) => !!(v && v.change_set_id && Array.isArray(v.changes) && v.next_cursor);
+
+async function completeChanges(set) {
+  let cursor = set.next_cursor;
+  while (cursor) {
+    const page = await request("GET", `change-sets/${enc(set.change_set_id)}?limit=500&cursor=${enc(cursor)}`);
+    set.changes.push(...page.changes);
+    cursor = page.next_cursor;
+  }
+  set.next_cursor = null;
+}
+
+async function request(method, path, body) {
   const headers = { Accept: "application/json" };
   if (method !== "GET") headers["X-Requested-With"] = "gtfs-editor";
   if (body !== undefined) headers["Content-Type"] = "application/json";

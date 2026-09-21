@@ -393,7 +393,7 @@ async fn chennai_bus_is_served_exactly_as_it_was() {
            FROM gtfs_route_stop rs
            JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
            JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id AND NOT s.deleted
-          WHERE rs.gtfs_id = 'chennai_bus'
+          WHERE rs.gtfs_id = 'chennai_bus' AND rs.pattern_key = 1
             AND rs.stop_type IN ('NEW STOP', 'INTERMEDIATE STOP')
           ORDER BY rs.route_id, rs.sequence",
     )

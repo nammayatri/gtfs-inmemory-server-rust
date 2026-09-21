@@ -285,6 +285,7 @@ export const ACTION_LABEL = {
   position_review_returned: "A coordinate review went back to review",
   position_review_committed: "A fix from a coordinate review went live",
   feed_data_source_changed: "Changed a feed's data source",
+  feed_config_changed: "Changed a feed setting",
   webhook_created: "Added a webhook",
   webhook_updated: "Changed a webhook",
   webhook_deleted: "Deleted a webhook",
@@ -351,6 +352,8 @@ function detailText(a) {
     }
     case "feed_data_source_changed":
       return `${d.gtfs_id}: ${d.from ? DATA_SOURCE_LABEL[d.from] || d.from : "no row yet"} → ${DATA_SOURCE_LABEL[d.to] || d.to}`;
+    case "feed_config_changed":
+      return `${d.gtfs_id}: ${d.setting} ${d.from ?? "—"} → ${d.to ?? "—"}`;
     case "feed_access_granted":
     case "feed_access_changed":
     case "feed_access_revoked": {
