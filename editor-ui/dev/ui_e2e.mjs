@@ -384,7 +384,8 @@ async function coreFlow() {
   await waitFor(`!!document.getElementById("new-user-email")`, "people page");
   for (const [email, role] of [[EDITOR, "editor"], [APPROVER, "approver"]]) {
     await type("#new-user-email", email);
-    await evaluate(`(() => { const s = document.getElementById("new-user-role"); s.value = ${JSON.stringify(role)}; s.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`);
+    // the role given on the feed in the top bar (docs section 15)
+    await evaluate(`(() => { const s = document.getElementById("new-user-feed-role"); s.value = ${JSON.stringify(role)}; s.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`);
     await click("Add person");
     await waitFor(`document.body.innerText.includes(${JSON.stringify(email)})`, `${email} listed`);
   }
