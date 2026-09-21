@@ -125,6 +125,7 @@ async fn clear(pool: &PgPool) {
     for stmt in [
         format!("DELETE FROM gtfs_change_set WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
         format!(
             "DELETE FROM gtfs_editor_session WHERE user_id IN \
@@ -277,6 +278,25 @@ async fn feed_config_goes_through_a_draft() {
     .execute(&pool)
     .await
     .unwrap();
+    // since 0018 a member works on a feed only through a grant on it
+    for (email, role) in others {
+        let id = users["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["email"] == email)
+            .unwrap()["user_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
+        );
+        assert_eq!(s, 200, "{b}");
+    }
     let before = audit_high_water(&pool).await;
     let config = |c: &Caller| c.req("GET", &format!("/feeds/{FEED}/config"));
     let (s, b, _) = call!(&app, config(&viewer));
