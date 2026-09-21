@@ -212,7 +212,7 @@ const APPROVER: &str = "approver@editor-review-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor review test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor review test feed', 'fare_stage')"
     ));
     // S sits 542 m east of the road its routes take between A and B; T sits on
     // the east road, where R7 passes, while R5 and R6 take the west road
@@ -1638,7 +1638,7 @@ async fn position_review_timings() {
     }
     let mut setup = clear_feed(PERF_FEED);
     setup.extend([
-        format!("INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{PERF_FEED}', 'Review timing copy of chennai_bus')"),
+        format!("INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{PERF_FEED}', 'Review timing copy of chennai_bus', 'fare_stage')"),
         format!(
             "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted) \
              SELECT '{PERF_FEED}', stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted \

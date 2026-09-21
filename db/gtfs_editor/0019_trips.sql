@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS gtfs_trip (
     headsign      text,
     short_name    text,
     block_id      text,
+    shape_id      text,                       -- GTFS shape_id, as the feed has it (no shapes table yet)
     wheelchair_accessible smallint,
     bikes_allowed smallint,
     sort_key      integer     NOT NULL,       -- source order; a route's example trip is its first
@@ -175,6 +176,8 @@ CREATE TABLE IF NOT EXISTS gtfs_trip (
         REFERENCES gtfs_timing_profile (gtfs_id, route_id, pattern_key, profile_key),
     FOREIGN KEY (gtfs_id, service_id) REFERENCES gtfs_service (gtfs_id, service_id)
 );
+-- a table created before shape_id was part of it
+ALTER TABLE gtfs_trip ADD COLUMN IF NOT EXISTS shape_id text;
 CREATE INDEX IF NOT EXISTS gtfs_trip_route_idx ON gtfs_trip (gtfs_id, route_id, pattern_key, sort_key);
 
 CREATE TABLE IF NOT EXISTS gtfs_frequency (

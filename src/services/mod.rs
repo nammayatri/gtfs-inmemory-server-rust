@@ -7,6 +7,7 @@ pub mod field_generator;
 pub mod fleet_operator;
 pub mod gtfs_db_source;
 pub mod gtfs_service;
+pub mod gtfs_timing;
 pub mod metro_graph;
 pub mod operator;
 pub mod osrtc_station_cache;

@@ -17,8 +17,8 @@ use super::error::{EditorError, EditorResult};
 use super::feed_lock::{lock_feed_of_set, retry_transient};
 use super::service::{self, rows_hash, ChangeInsert};
 use super::validation::{
-    check_payload, check_route_rows, check_route_rows_labelled, grade_against_live, Finding, Level,
-    RouteRow,
+    check_payload, check_route_rows_for, check_route_rows_labelled, grade_against_live, Finding,
+    Level, RouteRow,
 };
 use super::EditorState;
 use serde::Deserialize;
@@ -574,6 +574,7 @@ async fn plan_route_stops(
                 pickup_type: None,
                 drop_off_type: None,
                 timepoint: None,
+                stop_headsign: None,
             },
         });
     }
@@ -620,6 +621,7 @@ async fn plan_route_stops(
     })
     .collect::<Result<_, _>>()?;
     let live_rows = service::load_routes_rows(conn, g, &route_ids).await?;
+    let fare_stages = service::has_fare_stages(conn, g).await?;
     let mut read_rows = if with_before {
         service::load_routes_read_rows(conn, g, &route_ids).await?
     } else {
@@ -704,8 +706,8 @@ async fn plan_route_stops(
                 let label = |k: usize| format!("sequence {}", list[k].sequence);
                 findings.extend(
                     grade_against_live(
-                        check_route_rows_labelled(&rows, &label),
-                        &check_route_rows(&current),
+                        check_route_rows_labelled(&rows, fare_stages, &label),
+                        &check_route_rows_for(&current, fare_stages),
                     )
                     .into_iter()
                     .map(|f| (f.row, f)),
