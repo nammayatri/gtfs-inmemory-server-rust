@@ -1060,7 +1060,8 @@ fn label_expr() -> String {
 }
 
 /// Step 1: bus-days that carried the route number, busiest first, at most
-/// `per_day` a day. No outer LIMIT: the caller pages it.
+/// `per_day` a day, with the first and last ping that carried it - step 2
+/// reads only around that span. No outer LIMIT: the caller pages it.
 pub fn bus_days_sql(
     table: &str,
     from: i64,
@@ -1071,7 +1072,8 @@ pub fn bus_days_sql(
     per_day: usize,
 ) -> String {
     format!(
-        "SELECT toString({COL_DEVICE}) AS device, toString(toDate({COL_TIME}, '{DAY_TZ}')) AS day, count() AS n \
+        "SELECT toString({COL_DEVICE}) AS device, toString(toDate({COL_TIME}, '{DAY_TZ}')) AS day, count() AS n, \
+         toUnixTimestamp(min({COL_TIME})) AS first_seen, toUnixTimestamp(max({COL_TIME})) AS last_seen \
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
          AND {label_expr} = {label} AND {bbox} AND toString({COL_DEVICE}) != '' \
@@ -1166,6 +1168,9 @@ pub fn spread_bus_days(rows: &[(String, String, u64)], max: usize) -> Vec<(Strin
     }
     out
 }
+
+/// Pings read before a bus-day's first labelled ping and after its last.
+const SPAN_MARGIN_S: i64 = 45 * 60;
 
 /// The unix second an Indian service day starts at.
 fn day_start(day: chrono::NaiveDate) -> i64 {
@@ -1565,20 +1570,35 @@ impl GpsLine {
                 1_000,
             )
             .await?;
+        let mut seen: HashMap<(String, String), (i64, i64)> = HashMap::new();
         let rows: Vec<(String, String, u64)> = rows
             .into_iter()
             .filter_map(|r| {
                 let (device, day, n) = (r.first()?, r.get(1)?, r.get(2)?.parse::<u64>().ok()?);
-                (!device.is_empty() && !device.contains(';'))
-                    .then(|| (device.clone(), day.clone(), n))
+                if device.is_empty() || device.contains(';') {
+                    return None;
+                }
+                let span = (r.get(3)?.parse::<i64>().ok(), r.get(4)?.parse::<i64>().ok());
+                if let (Some(a), Some(b)) = span {
+                    seen.insert((device.clone(), day.clone()), (a, b));
+                }
+                Some((device.clone(), day.clone(), n))
             })
             .collect();
         let chosen = spread_bus_days(&rows, s.max_bus_days);
 
-        // 2. their tracks, a day at a time
+        // 2. their tracks, a day at a time: only around the hours the chosen
+        // buses carried the route number (the sort key is the timestamp, so a
+        // narrower span is fewer rows read), with room for a run that began
+        // before its first labelled ping or ended after its last
         let mut by_day: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut span: HashMap<String, (i64, i64)> = HashMap::new();
         for (device, day) in &chosen {
             by_day.entry(day.clone()).or_default().push(device.clone());
+            if let Some(&(a, b)) = seen.get(&(device.clone(), day.clone())) {
+                let e = span.entry(day.clone()).or_insert((a, b));
+                *e = (e.0.min(a), e.1.max(b));
+            }
         }
         let mut tracks: BTreeMap<(String, String), Vec<Ping>> = BTreeMap::new();
         let (mut points, mut pings, mut truncated) = (0usize, 0u64, false);
@@ -1590,10 +1610,14 @@ impl GpsLine {
             let Ok(date) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") else {
                 continue;
             };
-            let (a, b) = (
+            let (mut a, mut b) = (
                 day_start(date).max(from),
                 (day_start(date) + 86_400).min(now),
             );
+            if let Some(&(first, last)) = span.get(day) {
+                a = a.max(first - SPAN_MARGIN_S);
+                b = b.min(last + SPAN_MARGIN_S + 1);
+            }
             if a >= b {
                 continue;
             }

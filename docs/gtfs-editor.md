@@ -2096,10 +2096,11 @@ route's stops (+1 km), and a `LIMIT`. Raw pings are never pulled:
 
 1. **Bus-days** - one query over the window: which `deviceId`s carried the route
    number (`routeNumber`, trimmed, case-insensitive) with at least 120 pings in
-   the box, per Indian day, the busiest few per day (`LIMIT n BY day`). At most
-   `max_bus_days` (30) are read, spread over the days: the busiest of each day in
-   turn, newest first.
-2. **Tracks** - one query per day for that day's buses: their pings in the box,
+   the box, per Indian day, the busiest few per day (`LIMIT n BY day`), and the
+   first and last ping that carried it. At most `max_bus_days` (30) are read,
+   spread over the days: the busiest of each day in turn, newest first.
+2. **Tracks** - one query per day for that day's buses, bounded to 45 minutes
+   either side of the span in which they carried the route number: their pings in the box,
    labelled with this route number or with none (a quarter carry no label),
    averaged in ClickHouse to one point per 20 s, and packed one device-hour per
    row as `t,lat,lon|…` - so a day is a few dozen rows (some network paths to the
