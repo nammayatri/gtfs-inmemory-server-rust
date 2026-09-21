@@ -471,7 +471,10 @@ async fn fake_clickhouse(
         while t < to {
             let (start, day) = ist_day(t);
             for (device, n) in [("dev-1", 700), ("dev-2", 650), ("dev-v", 600)] {
-                out.push_str(&format!("{device}\t{day}\t{n}\n"));
+                // the first and last ping of the day, as ClickHouse would see them
+                let pings = bus_pings(device, start);
+                let (first, last) = (pings[0].0, pings[pings.len() - 1].0);
+                out.push_str(&format!("{device}\t{day}\t{n}\t{first}\t{last}\n"));
             }
             t = start + 86_400;
         }
@@ -972,6 +975,20 @@ async fn a_map_line_from_gps_end_to_end() {
                 && (r.body.contains("GROUP BY device, day") || r.body.contains("deviceId) IN (")),
             "entity bound: {}",
             r.body
+        );
+    }
+    // a day's track query reads only around the hours its buses carried the
+    // route number (they ran from 06:00 to about 09:00)
+    let times = Regex::new(r"toDateTime\((\d+)\)").unwrap();
+    for r in log.iter().filter(|r| r.body.contains("arrayStringConcat")) {
+        let t: Vec<i64> = times
+            .captures_iter(&r.body)
+            .map(|c| c[1].parse().unwrap())
+            .collect();
+        assert!(
+            t[1] - t[0] <= 6 * 3600,
+            "{} s read for one day",
+            t[1] - t[0]
         );
     }
     // OSRM /match: chunks of at most 100 points, the options asked for
