@@ -2284,6 +2284,7 @@ CREATE TABLE gtfs_trip (
     headsign      text,
     short_name    text,
     block_id      text,
+    shape_id      text,                       -- GTFS shape_id as the feed has it; no shapes table yet
     wheelchair_accessible smallint,
     bikes_allowed smallint,
     sort_key      integer     NOT NULL,       -- source order; a route's example trip is its first
@@ -2345,6 +2346,47 @@ system account comes with the sync, in `0020_mtc_sync.sql` — section 16.8.)
 takes no pattern means pattern 1, so everything written before this section keeps
 its meaning.
 
+Settled while implementing:
+
+- **Pattern 1 exists for every route, whoever inserts the route.** The backfill
+  makes it for the routes there are, and a trigger (`gtfs_route_pattern_one`,
+  `AFTER INSERT ON gtfs_route`) for every route after - the editor's
+  `route/create`, and nandi's seeders, which write `gtfs_route` rows directly and
+  would otherwise leave a route whose trips have nothing to reference.
+- **A stop row belongs to its pattern**: `gtfs_route_stop (gtfs_id, route_id,
+  pattern_key)` references `gtfs_pattern` with `ON DELETE CASCADE`, so deleting
+  a stop order takes its rows (and, through `gtfs_timing_profile`'s own foreign
+  key, its profiles) with it. The primary key is rebuilt only when it does not
+  have `pattern_key` yet, so a second run does not rebuild the index.
+- `gtfs_trip.shape_id` (text, nullable) is carried in and out as the feed has it
+  (`mumbai_suburban` sets it on all 134 trips); there is no shapes table yet.
+- `gtfs_touch_row` bumps `row_version` on `gtfs_pattern`, `gtfs_timing_profile`
+  and `gtfs_service` too: those rows are the base of a `pattern`,
+  `timing_profile/delete` and `service` change, as a stop's is of a stop change.
+- **0019 goes on a database before the build that reads it**, like 0012 and
+  0017: the loader selects `pattern_key` and `trips_source`, so a DB feed fails
+  to load (and serves its preprocessed data) on a database without them.
+- What "means pattern 1" and what looks at every stop order, query by query:
+  - **pattern 1** - the editor's row loaders unless given a pattern
+    (`load_route_rows`, `load_routes_rows`, `load_routes_read_rows`, and so
+    `rows_hash`, the route detail's `rows` and `stop_count`, a draft's route
+    preview, a bulk `route_stops` upload's base), the route list's
+    `stop_count`, the route context (reviews along the route, detours), a
+    coordinate review's calls and neighbouring stops, the `polyline:osrm`
+    waypoints, and the GIMS loader of a feed whose trips are preprocessed.
+  - **every stop order** - whether a stop is in use (`stop/delete` refuses a
+    stop only a short turn calls at), a `stop/merge` (it switches the stop on
+    every stop order, and checks for a stop called twice in a row per stop
+    order), and the counts of routes calling a stop, which count routes, not
+    rows. A stop's `routes` list and a merge's `affected` list every call; an
+    entry about another stop order than the route's stop list says which
+    (`pattern_key`, `pattern_keys`), so a feed with only pattern 1 reads exactly
+    as it did.
+- A route row's GTFS fields - `stop_headsign`, `pickup_type`,
+  `drop_off_type`, `timepoint` - are read and written only where a row has
+  them: a stop list without any serialises, and hashes, exactly as it did, so
+  the `base_rows_hash` every open draft carries stays valid.
+
 ### 16.3 Building a trip's stop times
 
 For trip `t` on pattern `p`, the served rows of `p` (not ROUTE CORRECTION, JUMP
@@ -2366,34 +2408,41 @@ offsets     = t's profile, or the pattern's default timing (16.1)
   `timepoint` from the row.
 - A trip with frequency windows is exported with its `frequencies.txt` rows; its
   stop times are its reference run, as GTFS defines.
+- A stop's `stop_sequence` is its position among the pattern's served stops,
+  1 to n - what GIMS already serves as `i + 1`. Feeds whose GTFS numbers stops
+  otherwise (gaps, from 0) are renumbered by the importer only when asked to,
+  and it says so.
 
 ### 16.4 Change types
 
 | entity / op | `after` | validation |
 |---|---|---|
-| `route_stops` / `replace` | as section 3, plus optional `pattern_key` (default 1) and optional per-row `pickup_type`, `drop_off_type`, `timepoint` | as section 3, per pattern. Replacing pattern `k > 1` that does not exist creates it |
+| `route_stops` / `replace` | as section 3, plus optional `pattern_key` (default 1) and optional per-row `stop_headsign`, `pickup_type`, `drop_off_type`, `timepoint` | as section 3, per pattern; the fare-stage rules only on a feed with fare stages (below). Replacing pattern `k > 1` that does not exist creates it |
 | `pattern` / `update` | `{pattern_key, name?, direction_id?}` | pattern exists |
 | `pattern` / `delete` | `{pattern_key}` | error `pattern_in_use` while any trip runs it; pattern 1 cannot be deleted while the route exists |
 | `timing_profile` / `replace` | `{pattern_key, profile_key?, arrival_s: [...], departure_s: [...], label?, base_hash}` | one offset per served stop of the pattern (`profile_length_mismatch`); `arrival ≤ departure ≤ next arrival` (`timing_goes_backwards`); a hop faster than 100 km/h or slower than 2 km/h in straight line is a **warning** (`timing_implausible`). No `profile_key` creates one |
 | `timing_profile` / `delete` | `{pattern_key, profile_key}` | error `profile_in_use` while any trip runs to it |
 | `route_trips` / `replace` | `{trips: [...], base_trips_hash}` — the route's whole trip list | below |
-| `service` / `create` | `{service_id, days: {monday..sunday}, start_date?, end_date?, label?, dates?: [{date, exception_type}]}` | ids as for stops; at least one day or one added date; `end_date ≥ start_date` |
+| `service` / `create` | `{service_id, days: {monday..sunday}, start_date?, end_date?, label?, dates?: [{date, exception_type}]}` | ids as for stops; dates ISO `YYYY-MM-DD`; `end_date ≥ start_date`; no day and no added date is the **warning** `service_never_runs` |
 | `service` / `update` | the same fields, all optional; `dates`, when sent, replaces the list | same |
 | `service` / `delete` | `null` | error `service_in_use` while any trip uses it |
 | `route` / `update` | adds `schedule_source: "sync" \| "editor"` | — |
 | `feed_config` / `update` | adds `trips_source`, `default_run_s`, `default_dwell_s`, `schedule_sync`, `sync_running_times` | admin only, as section 3; `trips_source: "db"` needs `data_source: "db"` (`trips_need_db`) |
 
 A `route_trips` trip is `{trip_id?, pattern_key, profile_key?, service_id,
-direction_id?, start_time, headsign?, short_name?, block_id?,
+direction_id?, start_time, headsign?, short_name?, block_id?, shape_id?,
 wheelchair_accessible?, bikes_allowed?, frequencies?: [{start_time, end_time,
 headway_s, exact_times?}], source_ref?}`. `start_time` is `H:MM:SS` or `HH:MM`
 and becomes `ref_s` so that the first stop arrives at it. A trip without
 `trip_id` gets `{route_id}-ed-{8 hex}`; one sent back keeps its id, `sort_key`
-and `source`. Rules: `trip_id` is unique in the feed, not only the route
-(`trip_id_taken`); the pattern and profile exist and match (`pattern_not_found`,
-`profile_not_found`); the service exists (`service_not_found`); `start_time` is
-between 00:00:00 and 47:59:59 (`invalid_time`); frequency windows lie inside it
-and do not overlap (`frequency_overlap`); two trips of one route on the same
+and `source`. A `trip_id` is 1-128 characters with no `:` and no control
+characters (`/` is allowed: bhubaneswar and sambalpur have 5,125 such ids, and
+GIMS percent-decodes it on `/trip/{id}`). Rules: `trip_id` is unique in the
+feed, not only the route (`trip_id_taken`); the pattern and profile exist and
+match (`pattern_not_found`, `profile_not_found`); the service exists
+(`service_not_found`); `start_time` is between 00:00:00 and 47:59:59
+(`invalid_time`); frequency windows lie within 00:00:00-48:00:00 and do not
+overlap (`frequency_overlap`); two trips of one route on the same
 pattern, service and direction at the same start are a **warning**
 (`duplicate_departure`). Conflicts use `base_trips_hash` like `route_stops` uses
 `base_rows_hash`. As everywhere, only problems the edit introduces block it.
@@ -2414,6 +2463,102 @@ number of profiles and stops that were estimated, and its preview shows the new
 times. Trips on the default timing need nothing: the formula follows the list,
 which is exactly what chennai_bus does today when a stop is added.
 
+**Fare rules only for fare-stage feeds.** The stop-list rules about MTC's fare
+stages - `fare_stage_mismatch`, `first_stop_not_stage`,
+`intermediate_before_stage`, `stage_decreases`, `stage_name_missing` - apply
+only when the feed's `headsign_source` is `fare_stage`. A feed with no fare
+stages sends `stage_no` 0 and `stage_name` "" and is not blocked by them. That a
+stop exists, is live and is not a station, `stop_repeated` and `too_few_stops`
+apply everywhere.
+
+Settled while implementing:
+
+- `entity_key` is the route for `pattern`, `timing_profile` and `route_trips`
+  (the stop order and profile are in `after`), and the service id for
+  `service`; a `service/create` may leave either out, like a stop's create.
+- **Shape and rule.** What a change's own fields get wrong is refused when it is
+  added (400 `invalid_change`, `details.code`): a malformed trip or frequency
+  window, a start time that is not a time (`invalid_time`), a trip id with `:`,
+  offsets that are not whole seconds within ±47:59:59, an arrival list and a
+  departure list of different lengths or shorter than two
+  (`profile_length_mismatch`), offsets that go backwards
+  (`timing_goes_backwards`), a service's dates out of order or given one without
+  the other (`invalid_dates`). What depends on the tables is a finding of the
+  draft, checked when the draft replays: the pattern, profile and service exist
+  once earlier changes of the draft apply, the number of offsets against the
+  pattern's served stops, `trip_id_taken` against every other route's trips at
+  that point in the draft, a start the profile would put before 00:00:00 once
+  its first offset is taken off (`invalid_time`).
+- **Ids and keys a change leaves out are written into it when it is added**, so
+  a reviewer - and every later change of the draft - sees them: a trip's id
+  (also on a PUT, and by a bulk upload's real run), a new profile's
+  `profile_key` - the next after the pattern's live profiles and the ones
+  earlier changes of the draft name - with `base_hash` the hash of nothing
+  (`4f53...b945`, section 5's constant, also the hash of an empty trip list).
+- A trip `source` is `import`, `mtc` or `editor`: a new trip takes the change's
+  (default `editor`; a bulk upload's are `import`), and one already on the route
+  keeps its own. The trips read also carries `sort_key`, `ref_s` and `source`;
+  a trip sent back with them is accepted and they are ignored. A new trip is
+  sorted after the route's last, in list order; `source_ref` sent replaces the
+  stored one, left out keeps it.
+- `base_trips_hash` is sha256 of the route's trips (every stored field, their
+  frequency windows included) in `sort_key` order; a profile's `hash` sha256 of
+  its offsets and label. `pattern/update`, `pattern/delete`,
+  `timing_profile/delete`, `service/update` and `service/delete` conflict on
+  `base_row_version`, the row's `row_version` when the change was added (none
+  for a row an earlier change of the draft creates).
+- `timing_profile/replace` may carry `source` (`import`, `mtc_running_time`,
+  `manual`; default `manual` - `interpolated` is written only by a carry-over)
+  and replaces the whole profile: a `label` left out is cleared.
+  `timing_implausible` is one warning per profile naming its hops; a hop of no
+  time over no distance says nothing and is left alone.
+- `pattern/delete` of pattern 1 is the error `pattern_one`. Deleting another
+  stop order takes its rows and profiles with it.
+- A service's `days`: on a create, a day left out is false; on an update, only
+  the days sent change. `start_date` and `end_date` are sent together, and both
+  `null` makes a calendar_dates-only service. A service that never runs is
+  allowed - chennai_bus's `chennai_bus_service_2`, all days 0, carries the 8
+  GraphQL-only stub trips of routes 543001, 546001, 598001 and 918001 - with the
+  warning `service_never_runs`.
+- `feed_config`: a setting the feed already has is a warning -
+  `data_source_unchanged` as before, `feed_config_unchanged` for the others -
+  and the conflict check compares each setting the change sets with its
+  `before`. Each setting other than `data_source` that a commit switches is
+  audited `feed_config_changed`, `{gtfs_id, setting, from, to, change_id,
+  change_set_id}` (the dashboard's history needs a label for it in
+  `ACTION_LABEL`; until then it reads "Feed config changed").
+- **The carry-over.** Kept stops are the longest common subsequence of the old
+  and new stop ids, so a stop a loop calls at twice is matched twice. Stops
+  inserted between two kept ones share the time from the first's departure to
+  the second's arrival by straight-line distance, each waiting the median dwell
+  of the profile (the last stop's zero left out) when that fits, and none when
+  it does not. Before the first or after the last kept stop the speed is the
+  nearest kept hop's, else the profile's overall speed. The new last stop
+  departs when it arrives. A profile any of whose stops were estimated becomes
+  `interpolated`; stops only removed are carried over without a warning,
+  nothing having been estimated. A stop list left with fewer than two served
+  stops leaves the profiles as they are: it is an error of its own and cannot be
+  committed.
+- `route_stops/replace` writes a row's `stop_headsign` and boarding fields and
+  rewrites only the stop order it replaces. It used to drop the headsign of
+  every row it rewrote, which on a feed seeded with headsigns (section 1) erased
+  them.
+- **Reads** the new changes need: the route detail (`GET
+  /feeds/{g}/routes/{route_id}` and a draft's route preview) adds
+  `pattern_key`, `patterns: [{pattern_key, pattern_id, name, direction_id,
+  row_version, stop_count, rows_hash, trip_count}]`, `profiles:
+  [{pattern_key, profile_key, label, source, arrival_s, departure_s,
+  row_version, hash}]`, `trip_count` and `trips_hash`; `GET
+  /feeds/{g}/routes/{route_id}/patterns/{k}` is the same detail with stop order
+  `k`'s rows; `GET /feeds/{g}/routes/{route_id}/trips` is `{route_id,
+  trips_hash, trip_count, items}` in change shape; `GET /feeds/{g}/services`
+  lists the services with their dates and trip counts; and a draft's previews
+  `.../preview/routes/{route_id}/patterns/{k}` and `.../trips` show them with
+  the draft applied.
+- The dashboard edits pattern 1 and sends a row's GTFS fields back as it read
+  them; a change it finds to update in place is the one for the same stop
+  order.
+
 ### 16.5 Bulk kinds
 
 `POST /change-sets/{id}/bulk` (section 5) gains:
@@ -2421,9 +2566,9 @@ which is exactly what chennai_bus does today when a stop is added.
 | `kind` | row | becomes |
 |---|---|---|
 | `route_trips` | `{route_id, trip_id?, pattern_key, profile_key?, service_id, direction_id?, start_time, …}` — one trip | one `route_trips/replace` per route, its rows in upload order |
-| `timing_profiles` | `{route_id, pattern_key, profile_key, stop_sequence, arrival_offset, departure_offset}` — one stop of one profile | one `timing_profile/replace` per profile |
-| `services` | `{service_id, monday..sunday, start_date?, end_date?, date?, exception_type?}` | one `service/create` or `update` per service |
-| `route_stops` | adds optional `pattern_key` | one `route_stops/replace` per (route, pattern) |
+| `timing_profiles` | `{route_id, pattern_key, profile_key, stop_sequence, arrival_offset, departure_offset}` — one stop of one profile; `stop_sequence` is the stop's position among the pattern's served stops, 1 to n | one `timing_profile/replace` per profile |
+| `services` | `{service_id, monday..sunday, start_date?, end_date?, date?, exception_type?}` — one row per date, each repeating its service's days | one `service/create` or `update` per service |
+| `route_stops` | adds optional `pattern_key`, `stop_headsign`, `pickup_type`, `drop_off_type`, `timepoint` | one `route_stops/replace` per (route, pattern) |
 
 Same 5,000-row limit, dry run and one-transaction rules as section 5.
 `timing_profiles` and `route_trips` may reference patterns, profiles and
@@ -2435,6 +2580,48 @@ outlived Pomerium's 60 s. So the set endpoint takes `limit` / `cursor` for its
 `changes` (default 200) and returns `change_count` and the validation summary
 without them; the dashboard pages through. Importers keep each draft to about
 5,000 trips.
+
+Settled while implementing:
+
+- `route_trips` columns: `route_id, trip_id, pattern_key, profile_key,
+  service_id, direction_id, start_time, headsign, short_name, block_id,
+  shape_id, wheelchair_accessible, bikes_allowed, frequencies, source_ref`;
+  `frequencies` and `source_ref` are JSON, or JSON written as text (a CSV cell).
+  Trips an upload brings are `import`s. A trip id is taken when another route
+  holds it once the draft applies - live, unless the draft's trip list for that
+  route drops it, or in that trip list - and a route this upload replaces holds
+  nothing but what the upload gives it. A route whose trips the draft already
+  replaces is the warning `route_already_in_draft`.
+- `timing_profiles` columns add an optional `label` (the same on every row of
+  a profile). Offsets are whole seconds. A profile's rows must run
+  `stop_sequence` 1 to n over the pattern's served stops as the pattern stands
+  once the draft applies, else every row of it is `profile_length_mismatch`;
+  two rows for one stop are `duplicate_in_upload`. `base_hash` is the live
+  profile's, and a profile the draft already writes is the warning
+  `profile_already_in_draft`. `timing_interpolated` is not predicted by a dry
+  run: it shows in the draft's own validation once a stop list change is added.
+- `services` columns add an optional `label`. Day cells are `1` / `0` /
+  `true` / `false`, blank being `0`. Rows of one service that disagree about
+  its days, dates range or label are all `invalid_row`. The upload describes a
+  service whole: an update sends all seven days, the range (both `null` when no
+  row gives one) and the dates, which replace the list.
+- `route_stops` groups by `(route_id, pattern_key)`; `base_rows_hash` is that
+  stop order's live hash (the hash of nothing for one the route does not have),
+  and the stage rules apply as a single change's do - only on a fare-stage feed.
+- **Paging.** `GET /change-sets/{id}?limit=&cursor=`: `limit` defaults to 200,
+  at most 500; the cursor is opaque. Every page carries the set's fields,
+  `change_count`, its slice of `changes`, `stop_names` for that slice and
+  `next_cursor` (null on the last page). Only the first page - no `cursor` -
+  replays the draft: `validation`, `validation_summary: {errors, warnings}`,
+  `conflicts` and `can_submit` are there and nowhere else, so paging through a
+  draft replays it once. Every other response that carries a set - adding,
+  editing or removing a change, submit, approve, a bulk import's real run -
+  carries its first page. The replay no longer loads the changes' `before`
+  snapshots, which only the conflict check of a `feed_config` change reads.
+- The dashboard completes a paged set in one place, its API wrapper
+  (`js/api.js`), so every screen still works on the whole list; the mock pages
+  the same way, and `dev/ui_smoke.mjs` checks both on its draft of 1,200
+  changes.
 
 ### 16.6 GIMS loader
 
@@ -2454,6 +2641,60 @@ metadata's `data_source`:
 public static API — routes, patterns, stops, `/example-trip`, `/trip/{id}` for
 every trip — returns what the preprocessed load returns.
 `scripts/parity_gtfs_db.py --trips` checks it per feed.
+
+Settled while implementing:
+
+- A pattern of a DB-trips feed is built exactly as the preprocessor builds it:
+  its stops are the stop order's served rows with `stopSequence` 1 to n (16.3),
+  its times its first trip's (reference time plus that trip's profile, or the
+  feed's default timing), `desc` "Pattern for route {route}", and a route's
+  patterns come in the order of their first trip by `sort_key` - which is the
+  order the preprocessor meets them in `trips.txt`, and what decides a tie for
+  the route's longest stop order (its start and end, its route-stop mapping).
+  A route's `stopCount` counts the distinct stop codes of its patterns, and
+  `tripCount` all its trips. A stop order no trip runs is not a pattern, and a
+  route with no trip is not served; the feed's stops are still every stop a
+  stop order of a live route calls at, plus stations, as for a feed whose
+  trips are preprocessed.
+- `/trip/{id}?gtfs_id=` of a DB-trips feed is computed from an index built with
+  the feed (each trip's stop order, timing and reference time) - never read
+  from a shard or OTP, and not cached, so an edit is answered on the poll that
+  loads it. Its stops are numbered 1 to n and named as the feed's stops are.
+  Its `source` is `"db"` (a preprocessed answer says `"preprocessed"`, and
+  `"cache"` from the second call on); `source` and `lastUpdated` describe the
+  answer, not the trip, and parity leaves them out. A trip id with a `/` in it
+  is sent percent-encoded (`22B%2F1-1-OR_trip_1`) and found.
+- A feed whose trips come from the tables needs no preprocessed data at all:
+  the boot load, a snapshot boot and a first load by the poll all load it
+  without one, and the boot builds its example trips (they were built only for
+  preprocessed feeds).
+- A trip on a profile that does not exist, or a profile with another number of
+  offsets than its stop order has served stops, fails the feed's load - which
+  keeps serving what it had - rather than being re-timed quietly. The editor
+  never writes either.
+- `trips_source = 'preprocessed'` loads exactly what it did: pattern 1, the
+  preprocessed trips and shards.
+- The parity tooling runs locally only: `scripts/parity_trips_fixture.py`
+  builds a feed's GTFS from the tables (`gtfs`, so the preprocessed data and the
+  tables describe the same feed) and fills the trip tables of a local test
+  database from preprocessed data (`sql`, standing in for 16.7's importer);
+  `cargo run --example parity_gims -- serve` is a GIMS with the public static
+  APIs and none of the service binary's live-vehicle pollers (a parity run must
+  not call a vendor's API); and `-- patterns` compares a feed's preprocessed
+  patterns with the loader's, pattern by pattern, since no public API serves a
+  pattern whole.
+- Parity as built (local, 2026-09-21): chennai_bus - a GTFS built from its
+  tables with the shipped schedule's 52,606 trips, preprocessed by nandi's
+  preprocessor, against the same trips in the tables - and kochi_metro - the
+  shipped feed, whose 450 trips run on 186 timing profiles over 8 stop orders,
+  6 of them other than pattern 1. `parity_gims patterns`: 4,328 of 4,328 and 8
+  of 8 patterns identical, none missing, extra or in another order.
+  `parity_gtfs_db.py --trips`: every route (4,328 and 2) identical on
+  `/route`, `/route-stop-mapping` and `/example-trip`, the feed-wide lists and
+  `/cached-data` identical, and `/trip` identical for 502 and 450 trips. The
+  run left out `encodedPolyline`: 10 chennai_bus routes carry a polyline in the
+  tables that the generated GTFS has no shape for, and they differ in that key
+  only - route metadata (section 1's parity), not trips.
 
 ### 16.7 nandi — GTFS out and GTFS in
 
