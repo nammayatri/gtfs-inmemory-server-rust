@@ -100,11 +100,17 @@ pub async fn feed_version(conn: &mut PgConnection, gtfs_id: &str) -> EditorResul
     Ok(row.try_get("version")?)
 }
 
-pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
+/// The feeds the caller may see - every feed for an admin, else the ones they
+/// hold a grant on - each with `my_role`, the role they hold there.
+pub async fn feeds(state: &EditorState, ctx: &Ctx) -> EditorResult<Value> {
+    // a feed the caller holds no grant on does not exist for them
+    let granted: Vec<String> = ctx.user.grants.keys().cloned().collect();
     let rows = sqlx::query(
         "SELECT gtfs_id, display_name, version, data_source, released_version, released_at, updated_at \
-         FROM gtfs_feed ORDER BY gtfs_id",
+         FROM gtfs_feed WHERE $1 OR gtfs_id = ANY($2) ORDER BY gtfs_id",
     )
+    .bind(ctx.is_admin())
+    .bind(&granted)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -118,6 +124,7 @@ pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
                 "released_version": r.try_get::<Option<i64>, _>("released_version")?,
                 "released_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("released_at")?,
                 "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
+                "my_role": ctx.feed_role(&r.try_get::<String, _>("gtfs_id")?).map(auth::Role::as_str),
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3299,7 +3306,7 @@ pub async fn add_change_to(
     } = change;
     // which data source a feed is served from is an admin's call
     if entity == "feed_config" {
-        ctx.require_role(auth::Role::Admin)?;
+        ctx.require_admin()?;
     }
     let mut key = entity_key.trim().to_string();
     settle_create_key(&entity, &op, &mut key, &mut after);
@@ -3445,7 +3452,7 @@ async fn update_change_once(
         row.try_get("entity_key")?,
     );
     if entity == "feed_config" {
-        ctx.require_role(auth::Role::Admin)?;
+        ctx.require_admin()?;
     }
     let mut update = update;
     // a create's id is fixed once the change exists; a merge keeps the kept
@@ -3677,7 +3684,7 @@ pub async fn review(
     // the override is an approval, by an admin, asked for in so many words; on
     // someone else's set the flag means nothing
     let own = set.submitted_by == Some(ctx.user.user_id);
-    let may_override = approve && ctx.user.role() >= auth::Role::Admin;
+    let may_override = approve && ctx.is_admin();
     if own && !(may_override && self_approve) {
         return Err(own_change_set(may_override));
     }
@@ -3730,7 +3737,7 @@ pub async fn reopen(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
     }
     let is_author =
         set.created_by == ctx.user.user_id || set.submitted_by == Some(ctx.user.user_id);
-    if !is_author && ctx.user.role() < auth::Role::Admin {
+    if !is_author && !ctx.is_admin() {
         return Err(EditorError::forbidden(
             "not_author",
             "only its author or an admin can reopen a change set",
@@ -3766,7 +3773,7 @@ pub async fn discard(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
             format!("a {} change set cannot be discarded", set.status),
         ));
     }
-    if set.created_by != ctx.user.user_id && ctx.user.role() < auth::Role::Admin {
+    if set.created_by != ctx.user.user_id && !ctx.is_admin() {
         return Err(EditorError::forbidden(
             "not_author",
             "only its author or an admin can discard a change set",
@@ -3829,9 +3836,7 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     }
     // maker-checker covers commit too: whoever submitted cannot put it live,
     // unless they are the admin who approved it themselves
-    if set.submitted_by == Some(ctx.user.user_id)
-        && !(set.self_approved && ctx.user.role() >= auth::Role::Admin)
-    {
+    if set.submitted_by == Some(ctx.user.user_id) && !(set.self_approved && ctx.is_admin()) {
         return Err(own_change_set(false));
     }
     let changes = load_changes(&mut tx, id).await?;
@@ -3970,29 +3975,180 @@ pub async fn audit_list(
 
 // ---------------------------------------------------------------- users
 
-pub async fn users(state: &EditorState) -> EditorResult<Value> {
-    let rows = sqlx::query(
-        "SELECT user_id, email, display_name, role, totp_enabled, totp_last_step, NULL::bytea AS totp_secret_enc, \
-                status, created_at, last_login_at FROM gtfs_editor_user ORDER BY lower(email)",
+/// Users as `GET /users` lists them (docs/gtfs-editor.md section 15): the
+/// account, its kind, and every grant it holds with who gave it and when.
+/// `only` narrows it to one user.
+async fn user_items(pool: &sqlx::PgPool, only: Option<Uuid>) -> EditorResult<Vec<Value>> {
+    let grants = sqlx::query(
+        "SELECT a.user_id, a.gtfs_id::text AS gtfs_id, a.role, g.email AS granted_by_email, a.granted_at \
+         FROM gtfs_editor_feed_access a LEFT JOIN gtfs_editor_user g ON g.user_id = a.granted_by \
+         WHERE $1::uuid IS NULL OR a.user_id = $1 ORDER BY a.gtfs_id",
     )
-    .fetch_all(&state.pool)
+    .bind(only)
+    .fetch_all(pool)
     .await?;
-    let items = rows
-        .iter()
-        .map(|r| -> Result<Value, sqlx::Error> {
+    let mut feeds: HashMap<Uuid, Vec<Value>> = HashMap::new();
+    for r in &grants {
+        feeds.entry(r.try_get("user_id")?).or_default().push(json!({
+            "gtfs_id": r.try_get::<String, _>("gtfs_id")?,
+            "role": r.try_get::<String, _>("role")?,
+            "granted_by_email": r.try_get::<Option<String>, _>("granted_by_email")?,
+            "granted_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("granted_at")?,
+        }));
+    }
+    let rows = sqlx::query(
+        "SELECT user_id, email, display_name, role, kind, status, totp_enabled, created_at, last_login_at \
+         FROM gtfs_editor_user WHERE $1::uuid IS NULL OR user_id = $1 ORDER BY lower(email)",
+    )
+    .bind(only)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| -> EditorResult<Value> {
+            let user_id: Uuid = r.try_get("user_id")?;
+            let role: String = r.try_get("role")?;
             Ok(json!({
-                "user_id": r.try_get::<Uuid, _>("user_id")?,
+                "user_id": user_id,
                 "email": r.try_get::<String, _>("email")?,
                 "display_name": r.try_get::<Option<String>, _>("display_name")?,
-                "role": r.try_get::<String, _>("role")?,
+                "is_admin": role == "admin",
+                "role": role,
+                "kind": r.try_get::<String, _>("kind")?,
                 "status": r.try_get::<String, _>("status")?,
                 "totp_enabled": r.try_get::<bool, _>("totp_enabled")?,
                 "created_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?,
                 "last_login_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_login_at")?,
+                "feeds": feeds.remove(&user_id).unwrap_or_default(),
             }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({"items": items, "next_cursor": null}))
+        .collect()
+}
+
+pub async fn users(state: &EditorState) -> EditorResult<Value> {
+    Ok(json!({"items": user_items(&state.pool, None).await?, "next_cursor": null}))
+}
+
+/// One user in the `GET /users` shape: what creating a user, changing one and
+/// granting or revoking a feed answer with.
+pub async fn user_item(state: &EditorState, user_id: Uuid) -> EditorResult<Value> {
+    user_items(&state.pool, Some(user_id))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(user_not_found)
+}
+
+fn user_not_found() -> EditorError {
+    EditorError::not_found("user_not_found", "no such user")
+}
+
+/// The feeds `GET /auth/me` lists, which the dashboard's feed switcher offers:
+/// every feed as `admin` for an admin, else each feed granted, at its role.
+pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Value> {
+    let rows = sqlx::query("SELECT gtfs_id, display_name FROM gtfs_feed ORDER BY gtfs_id")
+        .fetch_all(&state.pool)
+        .await?;
+    let mut out = Vec::new();
+    for r in &rows {
+        let gtfs_id: String = r.try_get("gtfs_id")?;
+        let role = if user.is_admin() {
+            auth::Role::Admin
+        } else {
+            match user.grants.get(&gtfs_id) {
+                Some(role) => *role,
+                None => continue,
+            }
+        };
+        out.push(json!({
+            "gtfs_id": gtfs_id,
+            "display_name": r.try_get::<String, _>("display_name")?,
+            "role": role.as_str(),
+        }));
+    }
+    Ok(json!(out))
+}
+
+/// `admin`, or the older `role` body it replaces: `role: "admin"` means an
+/// admin, any other role a member. Both may be sent, but must agree.
+fn admin_flag(admin: Option<bool>, role: Option<&str>) -> EditorResult<Option<bool>> {
+    let by_role = match role {
+        None => None,
+        Some(r) => Some(
+            auth::Role::parse(r).ok_or_else(|| {
+                EditorError::bad_request(
+                    "invalid_role",
+                    "role is viewer, editor, approver or admin",
+                )
+            })? == auth::Role::Admin,
+        ),
+    };
+    match (admin, by_role) {
+        (Some(a), Some(r)) if a != r => Err(EditorError::bad_request(
+            "invalid_role",
+            "admin and role disagree; send admin alone",
+        )),
+        (a, r) => Ok(a.or(r)),
+    }
+}
+
+/// A feed a user is let into when they are created.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewGrant {
+    pub gtfs_id: String,
+    pub role: String,
+}
+
+fn invalid_grant_role() -> EditorError {
+    EditorError::bad_request(
+        "invalid_role",
+        "a feed's role is viewer, editor or approver; an admin has every feed",
+    )
+}
+
+fn admin_has_all_feeds() -> EditorError {
+    EditorError::bad_request(
+        "admin_has_all_feeds",
+        "an admin has every feed at every role; there is nothing to grant",
+    )
+}
+
+async fn feed_exists(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<()> {
+    feed_version(conn, gtfs_id)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.with_details(json!({"gtfs_id": gtfs_id})))
+}
+
+/// `feed_access_granted` / `_changed` / `_revoked`: one row per feed, carrying
+/// the feed, so the feed's own history shows who was let in.
+#[allow(clippy::too_many_arguments)]
+async fn audit_access(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    user_id: Uuid,
+    email: &str,
+    gtfs_id: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> EditorResult<()> {
+    let action = match (before, after) {
+        (None, _) => "feed_access_granted",
+        (Some(_), Some(_)) => "feed_access_changed",
+        (Some(_), None) => "feed_access_revoked",
+    };
+    auth::audit(
+        &mut *conn,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        action,
+        Some(gtfs_id),
+        None,
+        json!({"user_id": user_id, "email": email, "gtfs_id": gtfs_id,
+               "role_before": before, "role_after": after}),
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn create_user(
@@ -4000,7 +4156,9 @@ pub async fn create_user(
     ctx: &Ctx,
     email: &str,
     display_name: Option<&str>,
-    role: &str,
+    admin: Option<bool>,
+    role: Option<&str>,
+    feeds: &[NewGrant],
 ) -> EditorResult<Value> {
     let email = email.trim().to_ascii_lowercase();
     if !email.contains('@') || email.len() > 254 {
@@ -4009,20 +4167,39 @@ pub async fn create_user(
             "email is not valid",
         ));
     }
-    if auth::Role::parse(role).is_none() {
-        return Err(EditorError::bad_request(
-            "invalid_role",
-            "role is viewer, editor, approver or admin",
-        ));
+    let admin = admin_flag(admin, role)?.unwrap_or(false);
+    if admin && !feeds.is_empty() {
+        return Err(admin_has_all_feeds());
     }
+    let mut seen = HashSet::new();
+    for f in feeds {
+        auth::Role::parse_grant(&f.role).ok_or_else(invalid_grant_role)?;
+        if !seen.insert(f.gtfs_id.as_str()) {
+            return Err(EditorError::bad_request(
+                "duplicate_feed",
+                format!("feed {} is listed twice", f.gtfs_id),
+            ));
+        }
+    }
+    // the column a member keeps is what an older image would read: the role the
+    // old body named, else the least of them
+    let stored = if admin {
+        "admin"
+    } else {
+        role.filter(|r| auth::Role::parse_grant(r).is_some())
+            .unwrap_or("viewer")
+    };
     let mut tx = state.pool.begin().await?;
+    for f in feeds {
+        feed_exists(&mut tx, &f.gtfs_id).await?;
+    }
     let row = sqlx::query(
         "INSERT INTO gtfs_editor_user (email, display_name, role) VALUES ($1, $2, $3) \
          ON CONFLICT DO NOTHING RETURNING user_id",
     )
     .bind(&email)
     .bind(display_name.map(str::trim).filter(|d| !d.is_empty()))
-    .bind(role)
+    .bind(stored)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| {
@@ -4036,35 +4213,48 @@ pub async fn create_user(
         "user_created",
         None,
         None,
-        json!({"user_id": user_id, "email": email, "role": role}),
+        json!({"user_id": user_id, "email": email, "role": stored, "admin": admin}),
     )
     .await?;
+    for f in feeds {
+        sqlx::query(
+            "INSERT INTO gtfs_editor_feed_access (user_id, gtfs_id, role, granted_by) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(user_id)
+        .bind(&f.gtfs_id)
+        .bind(&f.role)
+        .bind(ctx.user.user_id)
+        .execute(&mut *tx)
+        .await?;
+        audit_access(
+            &mut tx,
+            ctx,
+            user_id,
+            &email,
+            &f.gtfs_id,
+            None,
+            Some(&f.role),
+        )
+        .await?;
+    }
     tx.commit().await?;
-    Ok(
-        json!({"user_id": user_id, "email": email, "role": role, "status": "active", "totp_enabled": false}),
-    )
+    user_item(state, user_id).await
 }
 
 pub async fn update_user(
     state: &EditorState,
     ctx: &Ctx,
     user_id: Uuid,
+    admin: Option<bool>,
     role: Option<&str>,
     status: Option<&str>,
 ) -> EditorResult<()> {
-    if role.is_none() && status.is_none() {
+    let admin = admin_flag(admin, role)?;
+    if admin.is_none() && status.is_none() {
         return Err(EditorError::bad_request(
             "nothing_to_change",
-            "send role or status",
+            "send admin or status",
         ));
-    }
-    if let Some(r) = role {
-        if auth::Role::parse(r).is_none() {
-            return Err(EditorError::bad_request(
-                "invalid_role",
-                "role is viewer, editor, approver or admin",
-            ));
-        }
     }
     if let Some(s) = status {
         if !["active", "disabled"].contains(&s) {
@@ -4075,7 +4265,7 @@ pub async fn update_user(
         }
     }
     if user_id == ctx.user.user_id
-        && (role.is_some_and(|r| r != "admin") || status.is_some_and(|s| s != "active"))
+        && (admin == Some(false) || status.is_some_and(|s| s != "active"))
     {
         return Err(EditorError::bad_request(
             "cannot_change_self",
@@ -4083,34 +4273,178 @@ pub async fn update_user(
         ));
     }
     let mut tx = state.pool.begin().await?;
-    let n = sqlx::query(
+    // the user's row is the lock every change of their access takes, so a grant
+    // and a promotion of the same person never interleave
+    let row =
+        sqlx::query("SELECT email, role, kind FROM gtfs_editor_user WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(user_not_found)?;
+    let email: String = row.try_get("email")?;
+    let was_admin = row.try_get::<String, _>("role")? == "admin";
+    if admin == Some(true) && row.try_get::<String, _>("kind")? == "system" {
+        return Err(EditorError::bad_request(
+            "system_account",
+            "a system account cannot be an admin; grant it the feeds it works on",
+        ));
+    }
+    let flipped = admin.is_some_and(|a| a != was_admin);
+    // the column: admin, or for a member the role the old body named - else the
+    // least of them for a demoted admin, and what it was for anyone else
+    let column = match admin {
+        Some(true) => Some("admin"),
+        Some(false) => role
+            .filter(|r| auth::Role::parse_grant(r).is_some())
+            .or(was_admin.then_some("viewer")),
+        None => None,
+    };
+    sqlx::query(
         "UPDATE gtfs_editor_user SET role = coalesce($2, role), status = coalesce($3, status) WHERE user_id = $1",
     )
     .bind(user_id)
-    .bind(role)
+    .bind(column)
     .bind(status)
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if n == 0 {
-        return Err(EditorError::not_found("user_not_found", "no such user"));
-    }
+    .await?;
     if status == Some("disabled") {
         sqlx::query("DELETE FROM gtfs_editor_session WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
     }
-    auth::audit(
-        &mut *tx,
-        Some(ctx.user.user_id),
-        Some(&ctx.user.email),
-        "user_updated",
-        None,
-        None,
-        json!({"user_id": user_id, "role": role, "status": status}),
+    if flipped {
+        // an admin holds no grants: a new admin's are superseded, and a demoted
+        // admin has none until an admin gives some
+        let dropped = sqlx::query(
+            "DELETE FROM gtfs_editor_feed_access WHERE user_id = $1 RETURNING gtfs_id::text AS gtfs_id, role",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for r in &dropped {
+            let (g, before): (String, String) = (r.try_get("gtfs_id")?, r.try_get("role")?);
+            audit_access(&mut tx, ctx, user_id, &email, &g, Some(&before), None).await?;
+        }
+        auth::audit(
+            &mut *tx,
+            Some(ctx.user.user_id),
+            Some(&ctx.user.email),
+            "user_admin_changed",
+            None,
+            None,
+            json!({"user_id": user_id, "email": email, "admin_before": was_admin,
+                   "admin_after": admin}),
+        )
+        .await?;
+    }
+    if status.is_some() || (role.is_some() && !flipped) {
+        auth::audit(
+            &mut *tx,
+            Some(ctx.user.user_id),
+            Some(&ctx.user.email),
+            "user_updated",
+            None,
+            None,
+            json!({"user_id": user_id, "email": email,
+                   "role": if flipped { None } else { role }, "status": status}),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `PUT /users/{user_id}/feeds/{gtfs_id}`: create or change a member's grant on
+/// one feed. Setting the role a grant already has changes and audits nothing.
+pub async fn set_feed_access(
+    state: &EditorState,
+    ctx: &Ctx,
+    user_id: Uuid,
+    gtfs_id: &str,
+    role: &str,
+) -> EditorResult<()> {
+    auth::Role::parse_grant(role).ok_or_else(invalid_grant_role)?;
+    let mut tx = state.pool.begin().await?;
+    let user =
+        sqlx::query("SELECT email, role FROM gtfs_editor_user WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(user_not_found)?;
+    if user.try_get::<String, _>("role")? == "admin" {
+        return Err(admin_has_all_feeds());
+    }
+    let email: String = user.try_get("email")?;
+    feed_exists(&mut tx, gtfs_id).await?;
+    let before: Option<String> =
+        sqlx::query("SELECT role FROM gtfs_editor_feed_access WHERE user_id = $1 AND gtfs_id = $2")
+            .bind(user_id)
+            .bind(gtfs_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.try_get("role"))
+            .transpose()?;
+    if before.as_deref() == Some(role) {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO gtfs_editor_feed_access (user_id, gtfs_id, role, granted_by) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (user_id, gtfs_id) DO UPDATE SET role = EXCLUDED.role, \
+           granted_by = EXCLUDED.granted_by, granted_at = now()",
+    )
+    .bind(user_id)
+    .bind(gtfs_id)
+    .bind(role)
+    .bind(ctx.user.user_id)
+    .execute(&mut *tx)
+    .await?;
+    audit_access(
+        &mut tx,
+        ctx,
+        user_id,
+        &email,
+        gtfs_id,
+        before.as_deref(),
+        Some(role),
     )
     .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `DELETE /users/{user_id}/feeds/{gtfs_id}`. The user's open drafts on the
+/// feed stay, for others to finish or discard; their sessions are not ended -
+/// the next request simply has no grant.
+pub async fn revoke_feed_access(
+    state: &EditorState,
+    ctx: &Ctx,
+    user_id: Uuid,
+    gtfs_id: &str,
+) -> EditorResult<()> {
+    let mut tx = state.pool.begin().await?;
+    let email: String =
+        sqlx::query("SELECT email FROM gtfs_editor_user WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(user_not_found)?
+            .try_get("email")?;
+    let before: String = sqlx::query(
+        "DELETE FROM gtfs_editor_feed_access WHERE user_id = $1 AND gtfs_id = $2 RETURNING role",
+    )
+    .bind(user_id)
+    .bind(gtfs_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        EditorError::not_found(
+            "grant_not_found",
+            format!("{email} has no grant on feed {gtfs_id}"),
+        )
+    })?
+    .try_get("role")?;
+    audit_access(&mut tx, ctx, user_id, &email, gtfs_id, Some(&before), None).await?;
     tx.commit().await?;
     Ok(())
 }
