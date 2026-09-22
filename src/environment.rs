@@ -187,9 +187,14 @@ pub struct GtfsGpsConfig {
     /// `database.table` holding the pings. Default `atlas_kafka.amnex_direct_data`.
     #[serde(default)]
     pub table: Option<String>,
-    /// How many days back to read. Default 14.
+    /// How many days back a suggestion may read, at most. Default 14. It reads
+    /// today first and stops going back once `enough_bus_days` are found.
     #[serde(default)]
     pub days: Option<u32>,
+    /// Stop reading further back once this many bus-days (a bus that carried
+    /// the route number on a day) are found. Default 12.
+    #[serde(default)]
+    pub enough_bus_days: Option<u32>,
     /// The feeds whose routes these pings describe. Default `["chennai_bus"]`.
     #[serde(default)]
     pub feeds: Option<Vec<String>>,
@@ -200,7 +205,8 @@ pub struct GtfsGpsConfig {
     /// cluster stall on answers of a few hundred rows.
     #[serde(default)]
     pub page_rows: Option<u32>,
-    /// The whole suggestion, OSRM included. Default 55 s, under a proxy's 60.
+    /// The whole suggestion, OSRM included. Default 45 s and at most 50: a
+    /// proxy in front of the editor gives a request 60.
     #[serde(default)]
     pub timeout_seconds: Option<u32>,
 }

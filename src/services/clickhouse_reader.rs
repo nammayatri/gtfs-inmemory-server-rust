@@ -28,7 +28,17 @@
 //! Transport notes learned against this deployment and encoded here: JSON
 //! output formats stall and never return, so answers come back as
 //! `TabSeparated`; and some network paths stall on answers above ~300 rows,
-//! so callers page (or pack many values into one row) and keep pages small.
+//! so callers keep answers small by packing many values into one row, and by
+//! asking for less at a time. Never by `LIMIT … OFFSET`: every page re-runs
+//! the whole scan, so a second page costs as much as the first. The table's
+//! sort key is the timestamp, so asking for a shorter span of time is what
+//! actually reads less.
+//!
+//! Each query can be given less time than the configured ceiling
+//! ([`ClickHouseReader::query_within`]), so a caller with a deadline sets the
+//! server's `max_execution_time` to what it has left. A query the server stops
+//! for running out of time is [`ClickHouseError::Timeout`], like one the
+//! network gave up on.
 //!
 //! Credentials: the password is sent as HTTP basic auth and appears in no
 //! URL, log line, error or `Debug` output. A transport error is reported
@@ -247,6 +257,16 @@ impl ClickHouseReader {
 
     /// Run one read-only statement and return its rows.
     pub async fn query(&self, sql: &str) -> Result<Vec<Vec<String>>, ClickHouseError> {
+        self.query_within(sql, self.settings.query_timeout).await
+    }
+
+    /// [`Self::query`], with the server allowed at most `limit` (and never more
+    /// than the configured ceiling) - whole seconds, at least one.
+    pub async fn query_within(
+        &self,
+        sql: &str,
+        limit: Duration,
+    ) -> Result<Vec<Vec<String>>, ClickHouseError> {
         let body = assert_read_only(sql)?;
         let mut last = self.gate.lock().await;
         if let Some(at) = *last {
@@ -255,7 +275,7 @@ impl ClickHouseReader {
                 tokio::time::sleep(wait).await;
             }
         }
-        let ceiling = self.settings.query_timeout.as_secs().max(1);
+        let ceiling = self.settings.query_timeout.min(limit).as_secs().max(1);
         let sent = self
             .http
             .post(&self.settings.url)
@@ -269,7 +289,7 @@ impl ClickHouseReader {
                 ("priority", "10"),
             ])
             .basic_auth(&self.settings.user, self.settings.password.as_deref())
-            .timeout(Duration::from_secs(ceiling + 10))
+            .timeout(Duration::from_secs(ceiling + HTTP_GRACE_S))
             .body(format!("{body} FORMAT TabSeparated"))
             .send()
             .await;
@@ -279,9 +299,17 @@ impl ClickHouseReader {
             Err(e) => Err(transport_error(e, ceiling)),
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let code = resp
+                    .headers()
+                    .get("x-clickhouse-exception-code")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 match resp.text().await {
                     Err(e) => Err(transport_error(e, ceiling)),
                     Ok(text) if status == 200 => Ok(parse_tsv(&text)),
+                    Ok(text) if server_timeout(status, code.as_deref(), &text) => {
+                        Err(ClickHouseError::Timeout(ceiling))
+                    }
                     Ok(text) => Err(ClickHouseError::Http {
                         status,
                         body: self.scrub(&text.chars().take(400).collect::<String>()),
@@ -306,30 +334,34 @@ impl ClickHouseReader {
         }
         out
     }
+}
 
-    /// Page a statement with `LIMIT page OFFSET n` until a short page or
-    /// `max_rows`. `sql` must not carry its own outer LIMIT.
-    pub async fn paged(
-        &self,
-        sql: &str,
-        page: usize,
-        max_rows: usize,
-    ) -> Result<Vec<Vec<String>>, ClickHouseError> {
-        let page = page.max(1);
-        let mut out = Vec::new();
-        let mut offset = 0;
-        while offset < max_rows {
-            let rows = self
-                .query(&format!("{sql} LIMIT {page} OFFSET {offset}"))
-                .await?;
-            let n = rows.len();
-            out.extend(rows);
-            if n < page {
-                break;
-            }
-            offset += page;
-        }
-        Ok(out)
+/// Whether ClickHouse's answer says it stopped the query for running out of
+/// time: `TIMEOUT_EXCEEDED` (159), which it sends as HTTP 408.
+fn server_timeout(status: u16, code: Option<&str>, body: &str) -> bool {
+    status == 408 || code == Some("159") || body.contains("TIMEOUT_EXCEEDED")
+}
+
+/// How long past the server's own ceiling the client waits for an answer.
+const HTTP_GRACE_S: u64 = 3;
+
+/// Where rows come from: [`ClickHouseReader`], or a stand-in in tests.
+#[async_trait::async_trait]
+pub trait RowSource: Send + Sync {
+    /// One read-only statement, the server allowed at most `limit` for it.
+    async fn rows(&self, sql: &str, limit: Duration) -> Result<Vec<Vec<String>>, ClickHouseError>;
+    /// How many statements have been sent.
+    fn sent(&self) -> u64;
+}
+
+#[async_trait::async_trait]
+impl RowSource for ClickHouseReader {
+    async fn rows(&self, sql: &str, limit: Duration) -> Result<Vec<Vec<String>>, ClickHouseError> {
+        self.query_within(sql, limit).await
+    }
+
+    fn sent(&self) -> u64 {
+        self.queries()
     }
 }
 
@@ -434,6 +466,15 @@ mod tests {
 
     /// A one-shot HTTP server: records the raw request and answers `answer`.
     async fn one_shot(answer: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        one_shot_with("200 OK", "", answer).await
+    }
+
+    /// A one-shot HTTP server answering with this status line and headers.
+    async fn one_shot_with(
+        status: &'static str,
+        headers: &'static str,
+        answer: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -462,13 +503,68 @@ mod tests {
                 }
             }
             let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{answer}",
                 answer.len()
             );
             sock.write_all(reply.as_bytes()).await.unwrap();
             String::from_utf8_lossy(&buf).to_string()
         });
         (format!("http://{addr}"), task)
+    }
+
+    #[tokio::test]
+    async fn a_query_is_given_only_the_time_left_and_a_server_timeout_is_a_timeout() {
+        let settings = |url: String| ClickHouseSettings {
+            url,
+            user: "reader".into(),
+            password: Some("pw".into()),
+            query_timeout: Duration::from_secs(30),
+            min_gap: Duration::ZERO,
+        };
+        // less than the ceiling: that is what the server is told
+        let (url, server) = one_shot("1\n").await;
+        let reader = ClickHouseReader::new(settings(url)).unwrap();
+        reader
+            .query_within("SELECT 1 LIMIT 1", Duration::from_millis(4_700))
+            .await
+            .unwrap();
+        let first = server.await.unwrap().lines().next().unwrap().to_string();
+        assert!(first.contains("max_execution_time=4&"), "{first}");
+        // never more than the ceiling, and never less than a second
+        let (url, server) = one_shot("1\n").await;
+        let reader = ClickHouseReader::new(settings(url)).unwrap();
+        reader
+            .query_within("SELECT 1 LIMIT 1", Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert!(server.await.unwrap().contains("max_execution_time=30&"));
+        let (url, server) = one_shot("1\n").await;
+        let reader = ClickHouseReader::new(settings(url)).unwrap();
+        reader
+            .query_within("SELECT 1 LIMIT 1", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(server.await.unwrap().contains("max_execution_time=1&"));
+
+        // what master saw: HTTP 408, Code 159
+        let (url, _server) = one_shot_with(
+            "408 Request Time-out",
+            "X-ClickHouse-Exception-Code: 159\r\n",
+            "Code: 159. DB::Exception: Timeout exceeded: elapsed 30020 ms, maximum: 30000 ms. (TIMEOUT_EXCEEDED)",
+        )
+        .await;
+        let reader = ClickHouseReader::new(settings(url)).unwrap();
+        let err = reader.query("SELECT 1 LIMIT 1").await.unwrap_err();
+        assert!(matches!(err, ClickHouseError::Timeout(_)), "{err:?}");
+        // another error stays an error
+        let (url, _server) =
+            one_shot_with("500 Internal Server Error", "", "Code: 60. UNKNOWN_TABLE").await;
+        let reader = ClickHouseReader::new(settings(url)).unwrap();
+        let err = reader.query("SELECT 1 LIMIT 1").await.unwrap_err();
+        assert!(
+            matches!(err, ClickHouseError::Http { status: 500, .. }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

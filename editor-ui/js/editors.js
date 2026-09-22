@@ -641,7 +641,9 @@ function gpsFailure(e) {
       ? `No bus carrying route number ${d.route_number || "this"} was seen near these stops between ${dayRange(d.from, d.to)}.`
       : `Of ${plural(d.runs_seen || 0, "bus run")} seen between ${dayRange(d.from, d.to)}, ${d.runs_used || 0} passed this route's stops in order; at least ${d.min_runs || 3} are needed.`;
     return [h("p.notice.error", { "data-failure-reason": e.code }, saw),
-      h("p.hint", "Check the route number and the stops' order and positions, or route the line through the stops instead.")];
+      d.stopped === "budget"
+        ? h("p.hint", { "data-stopped": "budget" }, `Reading stopped after ${plural(d.days_read || 0, "day")} to answer in time. Asking again usually reads further back.`)
+        : h("p.hint", "Check the route number and the stops' order and positions, or route the line through the stops instead.")];
   }
   const hint = {
     gps_unavailable: "Map lines from GPS are not set up for this feed. Route the line through the stops instead.",
@@ -721,7 +723,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
     }
   };
   const suggest = () => ask("Asking the road router for a line through the stops…", "polyline:osrm", "suggested a map line through the stops", osrmFailure);
-  const suggestGps = () => ask(`Reading where the buses of route ${route.short_name || route.route_id} drove in the last 14 days… this can take up to a minute.`,
+  const suggestGps = () => ask(`Reading where the buses of route ${route.short_name || route.route_id} drove, today first and back up to 14 days… this can take up to 45 seconds.`,
     "polyline:gps", "suggested a map line from GPS", gpsFailure);
   const suggestButtons = [
     h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Route through stops"),

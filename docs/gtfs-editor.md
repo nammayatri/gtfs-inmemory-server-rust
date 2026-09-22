@@ -1957,11 +1957,13 @@ and it goes live when someone else approves and commits the draft.
   "polyline_source": "gps",
   "saved": false,
   "evidence": {
-    "from": "2026-09-08", "to": "2026-09-21", "days": 14,
-    "route_number": "21G", "stops": 50,
-    "bus_days": 30, "pings": 221034, "points_read": 81002, "truncated": false, "queries": 15,
-    "buses": 12, "runs_seen": 190, "runs_used": 31,
-    "stop_coverage": 0.94,
+    "from": "2026-09-20", "to": "2026-09-22", "days": 14, "days_read": 3,
+    "stopped": "enough", "read_seconds": 6.5,
+    "route_number": "12G", "stops": 46,
+    "bus_days": 12, "bus_days_read": 12, "pings": 71075, "points_read": 30625,
+    "truncated": false, "queries": 6,
+    "buses": 7, "runs_seen": 94, "runs_used": 55,
+    "stop_coverage": 0.978,
     "matched": "osrm", "matched_share": 0.992, "osrm_detours_skipped": 3,
     "points": 1747, "length_m": 38050, "cached": false,
     "consolidation": {"cells": 3120, "cells_kept": 2410, "samples_off_corridor": 212,
@@ -1972,9 +1974,12 @@ and it goes live when someone else approves and commits the draft.
 
 | field | meaning |
 | --- | --- |
-| `from`, `to` | the service days (Indian time) read: the last `days`, today included |
+| `from`, `to` | the service days (Indian time) read: today back to the oldest day read |
+| `days`, `days_read` | how far back it may look (the configured lookback), and how many days it read, today first |
+| `stopped` | why it stopped going back: `enough` - it had `enough_bus_days`; `lookback` - it read all `days`; `budget` - the time for reading ran out (17.4) |
+| `read_seconds` | wall time spent reading ClickHouse |
 | `route_number` | the route's `short_name`, which is how the pings name the route |
-| `bus_days`, `pings`, `points_read` | bus-days read, the raw pings behind them, the averaged points they became |
+| `bus_days`, `bus_days_read`, `pings`, `points_read` | bus-days found, those whose tracks were read, the raw pings behind them, the averaged points they became |
 | `buses` | distinct vehicles among the runs used |
 | `runs_seen`, `runs_used` | bus runs found (split at feed gaps and terminal dwells), and those that passed this route's stops in order |
 | `stop_coverage` | share of the route's served stops within 30 m of the line |
@@ -1988,9 +1993,12 @@ Errors: `503 gps_unavailable` (GPS not configured, or not for this feed), `422
 gps_no_route_number` (the route has no `short_name` to find its buses by), `422
 gps_not_enough_stops` (fewer than two served stops with a position), `422
 gps_not_enough_runs` (fewer than 3 runs passed the stops in order; `details` holds
-the evidence counts above plus `min_runs`), `504 gps_timeout` (the whole
-suggestion took longer than its limit, 55 s by default), `502 gps_query_failed`
-(ClickHouse answered with an error, or could not be reached).
+the evidence counts above plus `min_runs` - with `stopped: "budget"` the reading
+was cut short to answer in time, and asking again reads further), `504
+gps_timeout` (the backstop: the whole suggestion ran past its limit, 45 s by
+default - only when ClickHouse does not stop a query at its
+`max_execution_time`, or another suggestion held the pod's turn too long), `502
+gps_query_failed` (ClickHouse answered with an error, or could not be reached).
 
 ### 17.1 Which runs count
 
@@ -2090,25 +2098,67 @@ in no URL, log line, error message or `Debug` output, and a ClickHouse error
 naming the user is scrubbed.
 
 The table's sort key is the timestamp alone, so a route filter prunes nothing:
-**every query is bounded by time first**, and by `timestamp <= now()` (device
-clocks emit far-future timestamps), then by the route label, a box around the
-route's stops (+1 km), and a `LIMIT`. Raw pings are never pulled:
+**every query is bounded by time first** - one day at most - and by `timestamp
+<= now()` (device clocks emit far-future timestamps), then by the route label, a
+box around the route's stops (+1 km), and a `LIMIT`. Raw pings are never pulled:
 
-1. **Bus-days** - one query over the window: which `deviceId`s carried the route
-   number (`routeNumber`, trimmed, case-insensitive) with at least 120 pings in
-   the box, per Indian day, the busiest few per day (`LIMIT n BY day`), and the
-   first and last ping that carried it. At most `max_bus_days` (30) are read,
-   spread over the days: the busiest of each day in turn, newest first.
-2. **Tracks** - one query per day for that day's buses, bounded to 45 minutes
-   either side of the span in which they carried the route number: their pings in the box,
-   labelled with this route number or with none (a quarter carry no label),
-   averaged in ClickHouse to one point per 20 s, and packed one device-hour per
-   row as `t,lat,lon|…` - so a day is a few dozen rows (some network paths to the
-   cluster stall above ~300 rows; pages are 100 rows). Reading stops at 150,000
-   points (`truncated`).
+1. **Bus-days** - one query per day, **today first**: which `deviceId`s carried
+   the route number with at least 120 pings in the box that day, the busiest 4,
+   with the first and last ping that carried it. It stops going back as soon as
+   `enough_bus_days` (12) are found, after `days` (14) days, or once 15 s have
+   gone (`stopped` says which). A busy route has enough in three days; only a
+   quiet one reads further back.
+2. **Tracks** - for each day read, newest first, that day's buses' pings, only
+   from 45 minutes before the first ping that carried the number to 45 minutes
+   after the last: in the box, labelled with this route number or with none (a
+   quarter carry no label), averaged in ClickHouse to one point per 20 s, and
+   packed one device-hour per row as `t,lat,lon|…`. An answer holds at most one
+   row per device and hour, so the query's `LIMIT` is exactly devices × hours;
+   where that would pass `page_rows` (100 - some network paths to the cluster
+   stall above ~300 rows) the day is asked for in stretches of whole hours
+   instead. **No stretch is read twice**: there is no `LIMIT … OFFSET` paging,
+   which re-runs the whole scan for every page. Reading stops at 150,000 points
+   (`truncated`).
 
-So a suggestion is about 15 small queries - measured on real data from a laptop,
-4 days and 6 bus-days of 21G: 5 queries, 44,387 pings, 7-11 s.
+**The route label** is matched as the column holds it: `routeNumber IN (…)`, a
+list of spellings made from the route's `short_name` - every upper/lower case
+combination of its letters (as typed, upper and lower when it has more than
+six), each with and without one leading and one trailing space (`12G` → 8
+spellings; ` 51AXCT` and `57Fct` are real ones). Tracks add `isNull(routeNumber)
+OR routeNumber IN ('', …)` for the unlabelled pings. Rarer spellings (two spaces,
+a stray dot) are missed: they were 0.16% of labelled pings in a day.
+
+**The time budget.** A proxy (Pomerium) gives an editor request 60 s, so the
+whole suggestion answers within `timeout` (45 s, at most 50): reading stops 8 s
+before it, leaving OSRM and the build their time; step 1 gets the first 15 s.
+Each query is sent with `max_execution_time` = the time left (never more than
+30 s), and a query is not started with less than 2 s left. When ClickHouse
+stops a query at its limit (`TIMEOUT_EXCEEDED`, HTTP 408), or the time runs out
+between queries, reading stops: the line is built from what was read, or the
+answer is 422 `gps_not_enough_runs` with the counts - in both cases with
+`stopped: "budget"`, and neither is cached, so the next click reads again (and
+the cluster has those days warm by then). 504 `gps_timeout` is left only as the
+backstop.
+
+**Why.** On master the first version failed for route 2288 (12G) with `502
+gps_query_failed`: "ClickHouse answered HTTP 408: Code: 159 TIMEOUT_EXCEEDED:
+elapsed 30020 ms, maximum: 30000 ms". Its step 1 was one query over the whole 14
+days. Measured on the real cluster with this reader's settings (readonly=2,
+`max_threads=2`, `priority=10`), that query took 40.4 s with days 8-14 cold,
+then 17.3, 10.9 and 4.9 s as the disk warmed: cold I/O over two weeks on two
+threads. `lowerUTF8(trimBoth(ifNull(toString(routeNumber), '')))` made it worse
+by converting every row of a LowCardinality(Nullable(String)) column: one
+bus-day track query took 3.6 s with it and 2.2 s with an `IN` list. The fix
+does not raise `max_threads` or the 30 s ceiling - it reads less.
+
+Measured on real data from a laptop after the fix, 14-day lookback, the defaults:
+
+| route | days read | stopped | bus-days | queries | read | runs used | stop coverage |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2288 12G, War Memorial → K.K. Nagar | 3 | enough | 12 | 6 (0.5-1.4 s each) | 6.5-6.9 s | 55 by 7 buses | 0.978, snapped by OSRM |
+| 543001 P570S, Koyambedu → Siruseri | 4 | enough | 15 | 8 (0.8-1.3 s) | 8.7 s | 39 by 6 buses | 0.938 |
+| 2143 118ET, one bus a day | 11 | budget | 11 | 22 (0.5-1.9 s) | 26.5 s | 63 by 1 bus | 1.0 |
+| 5147 S318SP (intercity), no bus labelled | 14 | lookback | 0 | 14 (0.3-0.7 s) | 8.2 s | - (422) | - |
 
 The cache is in memory, per pod, keyed by (feed, route, a hash of the route
 number and its stops' ids and positions, the day). It keeps the GPS half - the
@@ -2159,11 +2209,12 @@ gtfs_gps = Some
   { url = "https://clickhouse.internal:8443"   -- the HTTP interface, not 9000/9440
   , user = "gims_reader"
   , table = Some "atlas_kafka.amnex_direct_data"
-  , days = Some 14
+  , days = Some 14                     -- how far back it may look
+  , enough_bus_days = None Natural      -- 12: stop going back once found
   , feeds = Some [ "chennai_bus" ]
-  , max_bus_days = None Natural     -- 30
-  , page_rows = None Natural        -- 100
-  , timeout_seconds = None Natural  -- 55, under a proxy's 60
+  , max_bus_days = None Natural         -- 30
+  , page_rows = None Natural            -- 100
+  , timeout_seconds = None Natural      -- 45, at most 50: a proxy allows 60
   },
 gtfs_gps_clickhouse_password = secrets.clickhouse_password,
 ```
@@ -2172,6 +2223,8 @@ Only `url` and `user` are required. Absent (the default, as in the dev dhall),
 the endpoint is `503 gps_unavailable` and nothing else changes; so is a feed not
 in `feeds`. An invalid block (a table name that is not `db.table`, `days` outside
 1-60, a non-http URL) is logged at boot and leaves the feature off.
+`timeout_seconds` is held to 10-50 s; the step-1 share (15 s) and the time kept
+back for OSRM (8 s) shrink with a shorter timeout.
 
 ### 17.7 Schema, dashboard and tests
 
@@ -2193,10 +2246,15 @@ the wire, TSV, no password in `Debug`), `src/services/osrm.rs` (chunk plan,
 stitching, the detour guard, the encoder against Google's example),
 `src/editor/gps_line.rs` (run selection by direction and variant, cutting, gap
 and dwell splits, the synthetic fleet, a loop route, the queries passing the
-guard); `tests/editor_gps_line_flow.rs`, registered in
+guard, the label spellings, and - against a fake cluster with a latency per
+query - today first and stopping once there is enough, reading back to the
+lookback on a quiet route, the budget stopping the read on time, and a day's
+tracks never read twice); `tests/editor_gps_line_flow.rs`, registered in
 `scripts/editor_flow_test.sh`, against a fake ClickHouse and a fake OSRM on
-localhost (every statement checked for readonly=2, a SELECT, a LIMIT, a time
-bound; partial, none, the cache, 422, 503, 504, commit of a `gps` line, and each
-OSRM reason); `dev/ui_smoke.mjs --map-line` against the mock's `/__dev/map-line`
+localhost (every statement checked for readonly=2, a SELECT, a LIMIT and no
+OFFSET, a time bound, a `max_execution_time` within the budget; one day per
+bus-day query; partial, none, the cache, 422, 503, a server stopping a query at
+its limit (422 `stopped: budget`, on time, not cached) and one that does not
+(504), commit of a `gps` line, and each OSRM reason); `dev/ui_smoke.mjs --map-line` against the mock's `/__dev/map-line`
 switch. `examples/gps_line_check.rs` runs the real pipeline read-only against the
 real cluster for a few routes and writes GeoJSON to look at.

@@ -5,24 +5,28 @@
 //! READ-ONLY and small on purpose. The cluster is production and shared, and
 //! the credential in nandi's `.env` can write: every statement goes through
 //! `services::clickhouse_reader` (readonly=2 on every request, bounded SELECTs
-//! only, one at a time, a gap between them). Keep `--days` and `--bus-days`
-//! small; on some network paths answers above ~300 rows stall, so pages stay at
-//! 100 rows.
+//! only, one at a time, a gap between them). On some network paths answers
+//! above ~300 rows stall, so answers stay at 100 rows.
 //!
 //!   cargo run --example gps_line_check -- \
 //!       --env /path/to/nandi/gtfs-v3/.env \
-//!       --db postgres://postgres@127.0.0.1:55432/gims_gps_test \
-//!       --osrm http://127.0.0.1:5055 --out /tmp/gps --days 4 --bus-days 6 115 117
+//!       --db postgres://postgres@127.0.0.1:55433/gims_gps_test \
+//!       --osrm http://127.0.0.1:5055 --out /tmp/gps 115 117
+//!
+//! It reads as the endpoint does - a 14-day lookback, today first, stopping at
+//! `enough_bus_days`, inside the same time budget - and prints each statement's
+//! time. `--days N` and `--enough N` narrow it.
 //!
 //! The credentials are read from the `.env` file into this process only; they
 //! are never printed. `--schema` prints the table's column names and types.
 
 use gtfs_routes_service::editor::{gps_line, service as svc};
 use gtfs_routes_service::services::clickhouse_reader::{
-    ClickHouseReader, ClickHouseSettings, DEFAULT_MIN_GAP,
+    ClickHouseError, ClickHouseReader, ClickHouseSettings, RowSource, DEFAULT_MIN_GAP,
 };
 use gtfs_routes_service::services::osrm;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Args {
@@ -32,7 +36,8 @@ struct Args {
     out: String,
     feed: String,
     days: u32,
-    bus_days: usize,
+    /// `enough_bus_days`; the deployment's default when not given.
+    enough: Option<u32>,
     schema: bool,
     /// Re-snap the GPS path saved in an earlier output, without ClickHouse.
     rematch: Option<String>,
@@ -45,12 +50,12 @@ struct Args {
 fn args() -> Args {
     let mut a = Args {
         env: String::new(),
-        db: "postgres://postgres@127.0.0.1:55432/gims_gps_test".into(),
+        db: "postgres://postgres@127.0.0.1:55433/gims_gps_test".into(),
         osrm: None,
         out: ".".into(),
         feed: "chennai_bus".into(),
-        days: 4,
-        bus_days: 6,
+        days: 14,
+        enough: None,
         schema: false,
         rematch: None,
         sweep: false,
@@ -65,8 +70,8 @@ fn args() -> Args {
             "--out" => a.out = it.next().expect("--out DIR"),
             "--feed" => a.feed = it.next().expect("--feed ID"),
             "--days" => a.days = it.next().expect("--days N").parse().expect("a number"),
-            "--bus-days" => {
-                a.bus_days = it.next().expect("--bus-days N").parse().expect("a number")
+            "--enough" => {
+                a.enough = Some(it.next().expect("--enough N").parse().expect("a number"))
             }
             "--schema" => a.schema = true,
             "--rematch" => a.rematch = it.next(),
@@ -75,12 +80,12 @@ fn args() -> Args {
         }
     }
     assert!(
-        a.days <= 7,
-        "keep the real-data check small: --days 7 at most"
+        a.days <= 14,
+        "keep the real-data check small: --days 14 at most"
     );
     assert!(
-        a.bus_days <= 12,
-        "keep the real-data check small: --bus-days 12 at most"
+        a.enough.unwrap_or(12) <= 12,
+        "keep the real-data check small: --enough 12 at most"
     );
     assert!(
         a.db.contains("@127.0.0.1") || a.db.contains("@localhost"),
@@ -149,6 +154,43 @@ fn near_line(line: &[(f64, f64)], lat: f64, lon: f64) -> f64 {
     line.windows(2)
         .map(|w| osrm::seg_dist(p, pl.xy(w[0]), pl.xy(w[1])).0)
         .fold(f64::MAX, f64::min)
+}
+
+/// The reader, timing each statement: (what, seconds, rows, timed out).
+struct Timed {
+    inner: ClickHouseReader,
+    log: Mutex<Vec<(String, f64, usize, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl RowSource for Timed {
+    async fn rows(&self, sql: &str, limit: Duration) -> Result<Vec<Vec<String>>, ClickHouseError> {
+        let t = Instant::now();
+        let out = self.inner.query_within(sql, limit).await;
+        let what = if sql.contains("arrayStringConcat") {
+            "tracks"
+        } else {
+            "bus-days"
+        };
+        let span = sql
+            .split("toDateTime(")
+            .skip(1)
+            .take(2)
+            .map(|p| p.split(')').next().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join("..");
+        self.log.lock().unwrap().push((
+            format!("{what} {span} (limit {} s)", limit.as_secs()),
+            t.elapsed().as_secs_f64(),
+            out.as_ref().map(|r| r.len()).unwrap_or(0),
+            matches!(out, Err(ClickHouseError::Timeout(_))),
+        ));
+        out
+    }
+
+    fn sent(&self) -> u64 {
+        self.inner.queries()
+    }
 }
 
 #[tokio::main]
@@ -306,21 +348,27 @@ async fn main() {
         .expect("the local Postgres");
     let http = reqwest::Client::new();
     std::fs::create_dir_all(&a.out).expect("out dir");
-    let mut settings = gps_line::settings_from_config(
+    // the deployment's defaults, but for the lookback and a page of 100 rows
+    let settings = gps_line::settings_from_config(
         &gtfs_routes_service::environment::GtfsGpsConfig {
             url: ch.url.clone(),
             user: ch.user.clone(),
             table: None,
             days: Some(a.days),
+            enough_bus_days: a.enough,
             feeds: Some(vec![a.feed.clone()]),
-            max_bus_days: Some(a.bus_days as u32),
+            max_bus_days: None,
             page_rows: Some(100),
-            timeout_seconds: Some(300),
+            timeout_seconds: None,
         },
         ch.password.clone(),
     );
-    settings.clickhouse.query_timeout = Duration::from_secs(60);
-    let gps = gps_line::GpsLine::new(settings).expect("gps settings");
+    let read_budget = settings.timeout - settings.osrm_reserve;
+    let timed = Arc::new(Timed {
+        inner: ClickHouseReader::new(settings.clickhouse.clone()).expect("reader"),
+        log: Mutex::new(vec![]),
+    });
+    let gps = gps_line::GpsLine::with_source(settings, timed.clone()).expect("gps settings");
 
     for route_id in &a.routes {
         let mut conn = pool.acquire().await.expect("a connection");
@@ -388,14 +436,33 @@ async fn main() {
             stops: &stops,
         };
         let t = Instant::now();
-        let (raw, evidence) = match gps.gps_path(&q).await {
+        timed.log.lock().unwrap().clear();
+        let got = gps.gps_path(&q, read_budget).await;
+        let read_s = t.elapsed().as_secs_f64();
+        for (what, secs, rows, timed_out) in timed.log.lock().unwrap().iter() {
+            println!(
+                "     {what}: {secs:.2} s, {rows} rows{}",
+                if *timed_out {
+                    ", STOPPED AT ITS LIMIT"
+                } else {
+                    ""
+                }
+            );
+        }
+        let (raw, evidence) = match got {
             Ok(x) => x,
+            Err(gps_line::GpsFailure::NotEnoughRuns(ev)) => {
+                println!(
+                    "   GPS: not enough runs in {read_s:.1} s: days read {} (stopped: {}), bus-days {}, runs seen {} used {}",
+                    ev["days_read"], ev["stopped"], ev["bus_days"], ev["runs_seen"], ev["runs_used"]
+                );
+                continue;
+            }
             Err(e) => {
                 println!("   GPS: {}", scrub(format!("{e:?}")));
                 continue;
             }
         };
-        let read_s = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let answer = gps
             .finish(
@@ -410,8 +477,8 @@ async fn main() {
         let snapped = osrm::decode_polyline(answer["encoded_polyline"].as_str().unwrap_or(""))
             .unwrap_or_default();
         println!(
-            "   GPS: {} bus-days, {} pings ({} points) in {} queries, {read_s:.1} s; runs seen {} used {} by {} buses",
-            ev["bus_days"], ev["pings"], ev["points_read"], ev["queries"], ev["runs_seen"], ev["runs_used"], ev["buses"]
+            "   GPS: days read {} of {} (stopped: {}), {} bus-days, {} pings ({} points) in {} queries, {read_s:.1} s; runs seen {} used {} by {} buses",
+            ev["days_read"], ev["days"], ev["stopped"], ev["bus_days"], ev["pings"], ev["points_read"], ev["queries"], ev["runs_seen"], ev["runs_used"], ev["buses"]
         );
         println!(
             "   line: {} points, {:.1} km, stop coverage {}, matched {} (share {}), OSRM {:.1} s{}",

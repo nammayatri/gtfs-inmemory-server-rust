@@ -1446,6 +1446,11 @@ async function mapLineFlows() {
   await waitFor(`!!document.querySelector('#panel [data-failure-reason="gps_not_enough_runs"]')`, "the not-enough-runs reason");
   const why = await text("#panel");
   check(why.includes("Of 9 bus runs seen") && why.includes("1 passed this route's stops in order; at least 3 are needed"), "says how many runs there were and how many passed");
+  // cut short to answer in time: says so, and that asking again reads further
+  await setMode({ gps: "budget" });
+  await click("Suggest from GPS (last 14 days)");
+  await waitFor(`!!document.querySelector('#panel [data-stopped="budget"]')`, "the reading-stopped-early hint");
+  check((await text("#panel")).includes("Reading stopped after 6 days to answer in time"), "says reading stopped early, and after how many days");
   await setMode({ gps: "unavailable" });
   await click("Suggest from GPS (last 14 days)");
   await waitFor(`!!document.querySelector('#panel [data-failure-reason="gps_unavailable"]')`, "the unavailable reason");
