@@ -335,9 +335,11 @@ struct ChRequest {
 }
 
 /// Deterministic jitter in metres from a key.
-fn jitter(key: i64, salt: i64) -> f64 {
-    let mut x = (key as u64).wrapping_mul(0x9E3779B97F4A7C15)
-        ^ (salt as u64).wrapping_mul(0xD1B54A32D192ED03);
+/// Deterministic GPS noise in metres for time `t` on noise stream `stream` (a
+/// splitmix-style integer mixer, not cryptography).
+fn jitter(t: i64, stream: i64) -> f64 {
+    let mut x = (t as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (stream as u64).wrapping_mul(0xD1B54A32D192ED03);
     x ^= x >> 29;
     x = x.wrapping_mul(0xBF58476D1CE4E5B9);
     x ^= x >> 32;
