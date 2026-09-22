@@ -14,6 +14,7 @@ let GtfsGps =
       , user : Text
       , table : Optional Text
       , days : Optional Natural
+      , enough_bus_days : Optional Natural
       , feeds : Optional (List Text)
       , max_bus_days : Optional Natural
       , page_rows : Optional Natural
@@ -114,6 +115,7 @@ in {
   --     , user = "gims_reader"
   --     , table = Some "atlas_kafka.amnex_direct_data"
   --     , days = Some 14
+  --     , enough_bus_days = None Natural
   --     , feeds = Some [ "chennai_bus" ]
   --     , max_bus_days = None Natural
   --     , page_rows = None Natural

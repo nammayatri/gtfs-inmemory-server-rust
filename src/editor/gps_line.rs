@@ -19,15 +19,25 @@
 //!
 //! The pipeline:
 //!
-//!  1. **Bus-days** (one query over the window): which devices carried this
-//!     route number, per day, with enough pings inside a box around the
-//!     route's stops. The table's sort key is the timestamp alone, so the time
-//!     bound is what makes this cheap; the route label and the box are the
-//!     entity bound. At most `max_bus_days`, spread over the window.
-//!  2. **Tracks** (one query per day): those devices' pings on that day, still
-//!     inside the box, averaged to one point per `bucket_s` seconds, and
-//!     packed one device-hour per row - ClickHouse does the thinning, and the
-//!     row count stays small (some network paths stall above ~300 rows).
+//!  1. **Bus-days** (one query per day, today first): which devices carried
+//!     this route number that day, with enough pings inside a box around the
+//!     route's stops - the busiest few a day. It stops going back as soon as
+//!     `enough_bus_days` are found, after `days` days, or when its share of the
+//!     time is spent. The table's sort key is the timestamp alone, so a day's
+//!     bound is what makes a query cheap: one query over 14 cold days took
+//!     40 s and hit the 30 s ceiling; a day takes a second or three.
+//!  2. **Tracks** (one query per day, or per few hours of one): those devices'
+//!     pings around the hours they carried the number, still inside the box,
+//!     averaged to one point per `bucket_s` seconds, and packed one device-hour
+//!     per row - ClickHouse does the thinning, each answer is at most
+//!     `page_rows` rows (some network paths stall above ~300), and no stretch
+//!     of time is ever read twice (no `OFFSET` paging, which re-runs the scan).
+//!
+//!  Reading has a deadline: the whole suggestion answers within `timeout`
+//!  (45 s), well inside the 60 s a proxy allows a request. Each query is given
+//!  only the time left as its `max_execution_time`; when time runs out, the
+//!  line is built from what was read, or the answer is "not enough runs" with
+//!  the counts - and neither is cached, so the next click reads further.
 //!  3. **Runs**: clean (impossible jumps), split at feed gaps and terminal
 //!     dwells, match the stops, keep the runs that pass enough of them in
 //!     order, cut each from its first to its last matched stop.
@@ -42,7 +52,7 @@
 //! into a draft, like the OSRM one.
 
 use crate::services::clickhouse_reader::{
-    quote, ClickHouseError, ClickHouseReader, ClickHouseSettings,
+    quote, ClickHouseError, ClickHouseReader, ClickHouseSettings, RowSource,
 };
 use crate::services::osrm::{self, dist, seg_dist, MatchOptions, MatchQuality, Planar};
 use serde_json::{json, Value};
@@ -52,10 +62,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 pub const DEFAULT_TABLE: &str = "atlas_kafka.amnex_direct_data";
+/// How far back a suggestion may look, at most.
 pub const DEFAULT_DAYS: u32 = 14;
+/// Reading stops once this many bus-days are found. 6 bus-days of 21G gave
+/// 13-20 usable runs; twice that is plenty and leaves room for a quiet day.
+pub const DEFAULT_ENOUGH_BUS_DAYS: usize = 12;
 pub const DEFAULT_MAX_BUS_DAYS: usize = 30;
 pub const DEFAULT_PAGE_ROWS: usize = 100;
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(55);
+/// The whole suggestion, OSRM included: well inside the 60 s a proxy in front
+/// of the editor (Pomerium) allows a request.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
+/// No configured timeout may leave less room than this under 60 s.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(50);
+/// Step 1 (finding bus-days) stops looking further back after this long.
+pub const DEFAULT_BUS_DAYS_BUDGET: Duration = Duration::from_secs(15);
+/// Left for OSRM and building the line once reading stops.
+pub const DEFAULT_OSRM_RESERVE: Duration = Duration::from_secs(8);
+/// Bus-days taken from one day: the busiest few, so a busy route's answer
+/// still spans a few days rather than one.
+const BUS_DAYS_PER_DAY: usize = 4;
+/// A query is not started with less time than this left.
+const MIN_QUERY_TIME: Duration = Duration::from_secs(2);
 
 /// The table's columns. `long`, not `lon`; `deviceId` is the vehicle key
 /// (`vehicleNumber` is empty throughout).
@@ -64,8 +91,9 @@ const COL_LAT: &str = "lat";
 const COL_LON: &str = "long";
 const COL_DEVICE: &str = "deviceId";
 const COL_ROUTE: &str = "routeNumber";
-/// Service days are Indian days: a bus's night is not split at 05:30.
-const DAY_TZ: &str = "Asia/Kolkata";
+/// Service days are Indian days (UTC+05:30): a bus's night is not split at
+/// 05:30. Each day is asked for by its own bounds in unix seconds, so the
+/// server's time zone never matters.
 const DAY_OFFSET_S: i64 = 5 * 3600 + 30 * 60;
 
 /// The algorithm's knobs. The defaults are the contract (docs section 17).
@@ -1006,12 +1034,81 @@ pub fn build_line(tracks: &[Track], stops: &[Stop], p: &Params) -> Result<Built,
 
 // ---------------------------------------------------------------- queries
 
-/// The route number as the pings carry it: trimmed, lower case. None when it
-/// cannot be one (empty, too long, or holding a character the reader refuses).
+/// The route number, trimmed. None when it cannot be one (empty, too long, or
+/// holding a character the reader refuses).
 pub fn route_label(short_name: &str) -> Option<String> {
     let t = short_name.trim();
     (!t.is_empty() && t.chars().count() <= 32 && !t.contains(';') && !t.contains('\n'))
-        .then(|| t.to_lowercase())
+        .then(|| t.to_string())
+}
+
+/// Case variants are tried for every letter up to this many letters.
+const SPELLING_LETTERS: usize = 6;
+
+/// The ways the pings spell a route number, as a list the queries match with
+/// `routeNumber IN (...)`. Operators type the number by hand: `57Fct` for
+/// `57FCT`, ` 51AXCT` with a leading space. So: every upper/lower case
+/// combination of its letters (as typed, upper and lower when it has more than
+/// six), each with and without one leading and one trailing space.
+///
+/// A plain `IN` on the LowCardinality column is what keeps the query cheap:
+/// `lowerUTF8(trimBoth(...))` converted every row of the scan, and on a cold
+/// 14-day read that was the difference between answering and timing out.
+/// Rarer spellings (two spaces, a stray dot) are missed; they were 0.16% of
+/// labelled pings.
+pub fn label_spellings(short_name: &str) -> Vec<String> {
+    let Some(t) = route_label(short_name) else {
+        return vec![];
+    };
+    let chars: Vec<char> = t.chars().collect();
+    let letters: Vec<usize> = (0..chars.len())
+        .filter(|&i| chars[i].is_ascii_alphabetic())
+        .collect();
+    let mut bases: Vec<String> = Vec::new();
+    let add = |v: String, bases: &mut Vec<String>| {
+        if !bases.contains(&v) {
+            bases.push(v);
+        }
+    };
+    if letters.len() <= SPELLING_LETTERS {
+        for mask in 0u32..(1 << letters.len()) {
+            let mut c = chars.clone();
+            for (bit, &i) in letters.iter().enumerate() {
+                c[i] = if mask & (1 << bit) != 0 {
+                    c[i].to_ascii_lowercase()
+                } else {
+                    c[i].to_ascii_uppercase()
+                };
+            }
+            add(c.into_iter().collect(), &mut bases);
+        }
+    } else {
+        add(t.clone(), &mut bases);
+        add(t.to_ascii_uppercase(), &mut bases);
+        add(t.to_ascii_lowercase(), &mut bases);
+    }
+    let mut out = Vec::with_capacity(bases.len() * 4);
+    for b in &bases {
+        for v in [
+            b.clone(),
+            format!(" {b}"),
+            format!("{b} "),
+            format!(" {b} "),
+        ] {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+fn in_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|v| quote(v))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1055,33 +1152,29 @@ impl Bbox {
     }
 }
 
-fn label_expr() -> String {
-    format!("lowerUTF8(trimBoth(ifNull(toString({COL_ROUTE}), '')))")
-}
-
-/// Step 1: bus-days that carried the route number, busiest first, at most
-/// `per_day` a day, with the first and last ping that carried it - step 2
-/// reads only around that span. No outer LIMIT: the caller pages it.
+/// Step 1, for one day: the devices that carried the route number in `[from,
+/// to)` with at least `min_pings` pings in the box, busiest first, at most
+/// `limit`, with the first and last ping that carried it - step 2 reads only
+/// around that span.
 pub fn bus_days_sql(
     table: &str,
     from: i64,
     to: i64,
-    label: &str,
+    spellings: &[String],
     bbox: &Bbox,
     min_pings: u32,
-    per_day: usize,
+    limit: usize,
 ) -> String {
     format!(
-        "SELECT toString({COL_DEVICE}) AS device, toString(toDate({COL_TIME}, '{DAY_TZ}')) AS day, count() AS n, \
+        "SELECT {COL_DEVICE} AS device, count() AS n, \
          toUnixTimestamp(min({COL_TIME})) AS first_seen, toUnixTimestamp(max({COL_TIME})) AS last_seen \
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
-         AND {label_expr} = {label} AND {bbox} AND toString({COL_DEVICE}) != '' \
-         GROUP BY device, day HAVING n >= {min_pings} \
-         ORDER BY day DESC, n DESC, device \
-         LIMIT {per_day} BY day",
-        label_expr = label_expr(),
-        label = quote(label),
+         AND {COL_ROUTE} IN ({labels}) AND {bbox} AND {COL_DEVICE} != '' \
+         GROUP BY device HAVING n >= {min_pings} \
+         ORDER BY n DESC, device \
+         LIMIT {limit}",
+        labels = in_list(spellings),
         bbox = bbox.sql(),
     )
 }
@@ -1089,38 +1182,66 @@ pub fn bus_days_sql(
 /// Step 2: some devices' pings over one stretch of time, averaged to one point
 /// per `bucket_s`, packed one device-hour per row as `t,lat,lon|t,lat,lon|...`.
 /// Pings labelled with another route are left out; unlabelled ones stay (a
-/// quarter of pings carry no label). No outer LIMIT: the caller pages it.
+/// quarter of pings carry no label). At most one row per device and hour, so
+/// `limit` = devices x hours of the stretch holds the whole answer: it is never
+/// paged, and never read twice.
+#[allow(clippy::too_many_arguments)]
 pub fn tracks_sql(
     table: &str,
     from: i64,
     to: i64,
     devices: &[String],
-    label: &str,
+    spellings: &[String],
     bbox: &Bbox,
     bucket_s: i64,
+    limit: usize,
 ) -> String {
-    let list = devices
-        .iter()
-        .map(|d| quote(d))
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
         "SELECT device, intDiv(t, 3600) AS h, count() AS points, sum(n) AS pings, \
          arrayStringConcat(groupArray(concat(toString(t), ',', toString(la), ',', toString(lo))), '|') AS track \
          FROM (\
-         SELECT toString({COL_DEVICE}) AS device, intDiv(toUnixTimestamp({COL_TIME}), {bucket_s}) * {bucket_s} AS t, \
+         SELECT {COL_DEVICE} AS device, intDiv(toUnixTimestamp({COL_TIME}), {bucket_s}) * {bucket_s} AS t, \
          round(avg({COL_LAT}), 6) AS la, round(avg({COL_LON}), 6) AS lo, count() AS n \
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
-         AND toString({COL_DEVICE}) IN ({list}) \
-         AND {label_expr} IN ({label}, '') AND {bbox} \
+         AND {COL_DEVICE} IN ({list}) \
+         AND (isNull({COL_ROUTE}) OR {COL_ROUTE} IN ('', {labels})) AND {bbox} \
          GROUP BY device, t) \
          GROUP BY device, h \
-         ORDER BY device, h",
-        label_expr = label_expr(),
-        label = quote(label),
+         ORDER BY device, h \
+         LIMIT {limit}",
+        list = in_list(devices),
+        labels = in_list(spellings),
         bbox = bbox.sql(),
     )
+}
+
+/// How step 2 reads one day's `[from, to)` for `devices`: stretches of whole
+/// clock hours, and groups of devices, small enough that each answer is at
+/// most `page_rows` rows (one per device and hour). Each stretch is read once:
+/// (from, to, devices, row limit).
+pub fn track_windows(
+    from: i64,
+    to: i64,
+    devices: &[String],
+    page_rows: usize,
+) -> Vec<(i64, i64, Vec<String>, usize)> {
+    let mut out = Vec::new();
+    if from >= to || devices.is_empty() {
+        return out;
+    }
+    for group in devices.chunks(page_rows.max(1)) {
+        let hours = (page_rows / group.len()).max(1) as i64;
+        let mut h = from.div_euclid(3600);
+        let last = (to - 1).div_euclid(3600);
+        while h <= last {
+            let a = (h * 3600).max(from);
+            let b = ((h + hours) * 3600).min(to);
+            out.push((a, b, group.to_vec(), group.len() * hours as usize));
+            h += hours;
+        }
+    }
+    out
 }
 
 /// Parse one packed row's track.
@@ -1135,38 +1256,6 @@ pub fn parse_packed(track: &str) -> Vec<Ping> {
             Some(Ping { t, lat, lon })
         })
         .collect()
-}
-
-/// At most `max` bus-days, spread over the days: the busiest of each day in
-/// turn, newest day first. `rows` are (device, day, pings).
-pub fn spread_bus_days(rows: &[(String, String, u64)], max: usize) -> Vec<(String, String)> {
-    let mut by_day: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
-    for (device, day, n) in rows {
-        by_day.entry(day).or_default().push((device, *n));
-    }
-    for v in by_day.values_mut() {
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        v.dedup_by(|b, a| a.0 == b.0);
-    }
-    let days: Vec<&str> = by_day.keys().rev().copied().collect();
-    let mut out = Vec::new();
-    let mut round = 0;
-    while out.len() < max {
-        let mut any = false;
-        for d in &days {
-            if let Some((device, _)) = by_day[d].get(round) {
-                any = true;
-                if out.len() < max {
-                    out.push((device.to_string(), d.to_string()));
-                }
-            }
-        }
-        if !any {
-            break;
-        }
-        round += 1;
-    }
-    out
 }
 
 /// Pings read before a bus-day's first labelled ping and after its last.
@@ -1194,14 +1283,24 @@ pub struct GpsLineSettings {
     pub clickhouse: ClickHouseSettings,
     /// `database.table`.
     pub table: String,
+    /// How far back to look, at most.
     pub days: u32,
     /// The feeds whose routes the pings describe.
     pub feeds: Vec<String>,
+    /// Stop looking further back once this many bus-days are found.
+    pub enough_bus_days: usize,
+    /// Never read more bus-days than this.
     pub max_bus_days: usize,
     /// Rows per ClickHouse answer.
     pub page_rows: usize,
     /// The whole suggestion - waiting for another one, the queries, OSRM.
     pub timeout: Duration,
+    /// Step 1 stops looking further back after this long.
+    pub bus_days_budget: Duration,
+    /// Reading stops this long before `timeout`, for OSRM and the build.
+    pub osrm_reserve: Duration,
+    /// A query is not started with less time than this left.
+    pub min_query_time: Duration,
     pub params: Params,
 }
 
@@ -1210,7 +1309,16 @@ pub fn settings_from_config(
     c: &crate::environment::GtfsGpsConfig,
     password: Option<String>,
 ) -> GpsLineSettings {
-    let timeout = Duration::from_secs(u64::from(c.timeout_seconds.unwrap_or(55).clamp(5, 300)));
+    let timeout = c
+        .timeout_seconds
+        .map(|t| Duration::from_secs(u64::from(t)))
+        .unwrap_or(DEFAULT_TIMEOUT)
+        .clamp(Duration::from_secs(10), MAX_TIMEOUT);
+    let max_bus_days = c
+        .max_bus_days
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_BUS_DAYS)
+        .clamp(1, 200);
     GpsLineSettings {
         clickhouse: ClickHouseSettings {
             url: c.url.clone(),
@@ -1229,17 +1337,22 @@ pub fn settings_from_config(
             .feeds
             .clone()
             .unwrap_or_else(|| vec!["chennai_bus".to_string()]),
-        max_bus_days: c
-            .max_bus_days
+        enough_bus_days: c
+            .enough_bus_days
             .map(|n| n as usize)
-            .unwrap_or(DEFAULT_MAX_BUS_DAYS)
-            .clamp(1, 200),
+            .unwrap_or(DEFAULT_ENOUGH_BUS_DAYS)
+            .clamp(1, max_bus_days),
+        max_bus_days,
         page_rows: c
             .page_rows
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_PAGE_ROWS)
             .clamp(10, 10_000),
         timeout,
+        // a third of the time for finding bus-days, whatever the timeout
+        bus_days_budget: DEFAULT_BUS_DAYS_BUDGET.min(timeout / 3),
+        osrm_reserve: DEFAULT_OSRM_RESERVE.min(timeout / 4),
+        min_query_time: MIN_QUERY_TIME,
         params: Params::default(),
     }
 }
@@ -1288,7 +1401,7 @@ const CACHE_ENTRIES: usize = 256;
 
 pub struct GpsLine {
     pub settings: GpsLineSettings,
-    reader: ClickHouseReader,
+    reader: std::sync::Arc<dyn RowSource>,
     http: reqwest::Client,
     /// One suggestion at a time per pod: the cluster is shared.
     permit: Semaphore,
@@ -1321,13 +1434,25 @@ fn valid_table(t: &str) -> bool {
 
 impl GpsLine {
     pub fn new(settings: GpsLineSettings) -> Result<Self, String> {
+        let reader = ClickHouseReader::new(settings.clickhouse.clone())?;
+        Self::with_source(settings, std::sync::Arc::new(reader))
+    }
+
+    /// With rows from somewhere other than a ClickHouse reader: a test's
+    /// stand-in, or a reader wrapped to time its queries.
+    pub fn with_source(
+        settings: GpsLineSettings,
+        reader: std::sync::Arc<dyn RowSource>,
+    ) -> Result<Self, String> {
         if !valid_table(&settings.table) {
             return Err(format!("{:?} is not a table name", settings.table));
         }
         if settings.days == 0 || settings.days > 60 {
             return Err("gps days must be 1 to 60".into());
         }
-        let reader = ClickHouseReader::new(settings.clickhouse.clone())?;
+        if settings.enough_bus_days == 0 {
+            return Err("enough_bus_days must be at least 1".into());
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .build()
@@ -1347,7 +1472,7 @@ impl GpsLine {
 
     /// How many statements have been sent to ClickHouse.
     pub fn queries(&self) -> u64 {
-        self.reader.queries()
+        self.reader.sent()
     }
 
     fn cache_key(q: &RouteQuery, day: chrono::NaiveDate) -> String {
@@ -1403,7 +1528,10 @@ impl GpsLine {
         osrm_base: Option<&str>,
         q: RouteQuery<'_>,
     ) -> Result<Value, GpsFailure> {
-        let label = route_label(q.short_name).ok_or(GpsFailure::NoRouteNumber)?;
+        let spellings = label_spellings(q.short_name);
+        if spellings.is_empty() {
+            return Err(GpsFailure::NoRouteNumber);
+        }
         if q.stops.len() < 2 {
             return Err(GpsFailure::NotEnoughStops(q.stops.len()));
         }
@@ -1414,8 +1542,9 @@ impl GpsLine {
             return Ok(answer);
         }
         let deadline = Instant::now() + self.settings.timeout;
+        let read_until = deadline - self.settings.osrm_reserve;
         let work = async {
-            let (line, evidence) = self.stage(&q, &label, &key, now).await?;
+            let (line, evidence) = self.stage(&q, &spellings, &key, now, read_until).await?;
             // whoever held the permit before us may have answered this already
             if let (Some(mut answer), _) = self.cached(&key) {
                 answer["evidence"]["cached"] = json!(true);
@@ -1433,8 +1562,10 @@ impl GpsLine {
                 .await;
             // a line OSRM could not snap because it was down is not kept: the
             // next click tries OSRM again (the GPS half stays cached)
-            let settled = answer["evidence"]["matched"] == json!(MatchQuality::Osrm)
-                || osrm_base.map_or(true, |b| b.trim().is_empty());
+            // nor is one read in a hurry: the next click reads further
+            let settled = (answer["evidence"]["matched"] == json!(MatchQuality::Osrm)
+                || osrm_base.map_or(true, |b| b.trim().is_empty()))
+                && answer["evidence"]["stopped"] != "budget";
             if settled {
                 self.remember(&key, None, Some(answer.clone()));
             }
@@ -1448,37 +1579,48 @@ impl GpsLine {
 
     /// Steps 1-4: the consolidated GPS path (lat, lon) and its evidence, from
     /// the cache or from ClickHouse, one suggestion at a time per pod.
+    /// Reading stops `budget` from now.
     pub async fn gps_path(
         &self,
         q: &RouteQuery<'_>,
+        budget: Duration,
     ) -> Result<(Vec<(f64, f64)>, Value), GpsFailure> {
-        let label = route_label(q.short_name).ok_or(GpsFailure::NoRouteNumber)?;
+        let spellings = label_spellings(q.short_name);
+        if spellings.is_empty() {
+            return Err(GpsFailure::NoRouteNumber);
+        }
         if q.stops.len() < 2 {
             return Err(GpsFailure::NotEnoughStops(q.stops.len()));
         }
         let now = chrono::Utc::now().timestamp();
         let key = Self::cache_key(q, today(now));
-        self.stage(q, &label, &key, now).await
+        self.stage(q, &spellings, &key, now, Instant::now() + budget)
+            .await
     }
 
     async fn stage(
         &self,
         q: &RouteQuery<'_>,
-        label: &str,
+        spellings: &[String],
         key: &str,
         now: i64,
+        read_until: Instant,
     ) -> Result<(Vec<(f64, f64)>, Value), GpsFailure> {
         let stage = {
-            let _one_at_a_time = self
-                .permit
-                .acquire()
+            let wait = read_until.saturating_duration_since(Instant::now());
+            let _one_at_a_time = tokio::time::timeout(wait, self.permit.acquire())
                 .await
+                .map_err(|_| GpsFailure::Timeout)?
                 .map_err(|_| GpsFailure::Internal("the GPS permit is closed".into()))?;
             match self.cached(key).1 {
                 Some(stage) => stage,
                 None => {
-                    let stage = self.read_and_build(q, label, now).await?;
-                    self.remember(key, Some(stage.clone()), None);
+                    let (stage, complete) =
+                        self.read_and_build(q, spellings, now, read_until).await?;
+                    // a read cut short by the clock is not the day's answer
+                    if complete {
+                        self.remember(key, Some(stage.clone()), None);
+                    }
                     stage
                 }
             }
@@ -1530,130 +1672,155 @@ impl GpsLine {
         })
     }
 
+    /// Steps 1 to 4, reading until `read_until` at the latest. The flag is
+    /// whether reading finished on its own (enough found, or the whole
+    /// lookback read) rather than on the clock.
     async fn read_and_build(
         &self,
         q: &RouteQuery<'_>,
-        label: &str,
+        spellings: &[String],
         now: i64,
-    ) -> Result<Stage, GpsFailure> {
+        read_until: Instant,
+    ) -> Result<(Stage, bool), GpsFailure> {
         let s = &self.settings;
         let p = &s.params;
         let bbox = Bbox::around(q.stops, p.bbox_margin_m)
             .ok_or(GpsFailure::NotEnoughStops(q.stops.len()))?;
+        let started = Instant::now();
+        let queries_before = self.reader.sent();
         let last_day = today(now);
-        let first_day = last_day - chrono::Duration::days(i64::from(s.days) - 1);
-        let from = day_start(first_day);
-        let queries_before = self.reader.queries();
-        let mut evidence = json!({
-            "from": first_day.to_string(),
-            "to": last_day.to_string(),
-            "days": s.days,
-            "route_number": q.short_name.trim(),
-            "stops": q.stops.len(),
-        });
+        let lookback_start = day_start(last_day - chrono::Duration::days(i64::from(s.days) - 1));
+        // time left before `until`, or None when too little to start a query
+        let left = |until: Instant| {
+            let d = until.saturating_duration_since(Instant::now());
+            (d >= s.min_query_time).then_some(d)
+        };
 
-        // 1. bus-days
-        let per_day = (s.max_bus_days + s.days as usize - 1) / (s.days as usize) + 1;
-        let rows = self
-            .reader
-            .paged(
-                &bus_days_sql(
-                    &s.table,
-                    from,
-                    now,
-                    label,
-                    &bbox,
-                    p.min_bus_day_pings,
-                    per_day,
-                ),
-                s.page_rows,
-                1_000,
-            )
-            .await?;
-        let mut seen: HashMap<(String, String), (i64, i64)> = HashMap::new();
-        let rows: Vec<(String, String, u64)> = rows
-            .into_iter()
-            .filter_map(|r| {
-                let (device, day, n) = (r.first()?, r.get(1)?, r.get(2)?.parse::<u64>().ok()?);
-                if device.is_empty() || device.contains(';') {
-                    return None;
+        // 1. bus-days, a day at a time, today first: a busy route has enough
+        // in two or three days, and only a quiet one reads further back
+        let step1_until = read_until.min(started + s.bus_days_budget);
+        let mut chosen: Vec<(String, chrono::NaiveDate, i64, i64)> = Vec::new();
+        let mut days_read = 0u32;
+        let mut stopped = "lookback";
+        for k in 0..s.days {
+            if chosen.len() >= s.enough_bus_days.min(s.max_bus_days) {
+                stopped = "enough";
+                break;
+            }
+            let Some(time) = left(step1_until) else {
+                stopped = "budget";
+                break;
+            };
+            let date = last_day - chrono::Duration::days(i64::from(k));
+            let (a, b) = (day_start(date), (day_start(date) + 86_400).min(now));
+            let want = BUS_DAYS_PER_DAY.min(s.max_bus_days - chosen.len());
+            let sql = bus_days_sql(&s.table, a, b, spellings, &bbox, p.min_bus_day_pings, want);
+            let rows = match self.reader.rows(&sql, time).await {
+                Ok(rows) => rows,
+                Err(ClickHouseError::Timeout(_)) => {
+                    stopped = "budget";
+                    break;
                 }
-                let span = (r.get(3)?.parse::<i64>().ok(), r.get(4)?.parse::<i64>().ok());
-                if let (Some(a), Some(b)) = span {
-                    seen.insert((device.clone(), day.clone()), (a, b));
+                Err(e) => return Err(e.into()),
+            };
+            days_read += 1;
+            for r in rows.iter().take(want) {
+                let (Some(device), Some(first), Some(last)) = (
+                    r.first(),
+                    r.get(2).and_then(|v| v.parse::<i64>().ok()),
+                    r.get(3).and_then(|v| v.parse::<i64>().ok()),
+                ) else {
+                    continue;
+                };
+                if !device.is_empty() && !device.contains(';') {
+                    chosen.push((device.clone(), date, first, last));
                 }
-                Some((device.clone(), day.clone(), n))
-            })
-            .collect();
-        let chosen = spread_bus_days(&rows, s.max_bus_days);
+            }
+        }
+        let first_read = last_day - chrono::Duration::days(i64::from(days_read.max(1)) - 1);
 
         // 2. their tracks, a day at a time: only around the hours the chosen
         // buses carried the route number (the sort key is the timestamp, so a
         // narrower span is fewer rows read), with room for a run that began
-        // before its first labelled ping or ended after its last
-        let mut by_day: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut span: HashMap<String, (i64, i64)> = HashMap::new();
-        for (device, day) in &chosen {
-            by_day.entry(day.clone()).or_default().push(device.clone());
-            if let Some(&(a, b)) = seen.get(&(device.clone(), day.clone())) {
-                let e = span.entry(day.clone()).or_insert((a, b));
-                *e = (e.0.min(a), e.1.max(b));
-            }
+        // before its first labelled ping or ended after its last; each stretch
+        // read once, in answers of at most `page_rows` rows
+        let mut by_day: BTreeMap<chrono::NaiveDate, (Vec<String>, i64, i64)> = BTreeMap::new();
+        for (device, date, first, last) in &chosen {
+            let e = by_day.entry(*date).or_insert((vec![], i64::MAX, i64::MIN));
+            e.0.push(device.clone());
+            e.1 = e.1.min(*first);
+            e.2 = e.2.max(*last);
         }
-        let mut tracks: BTreeMap<(String, String), Vec<Ping>> = BTreeMap::new();
+        let mut tracks: BTreeMap<(String, chrono::NaiveDate), Vec<Ping>> = BTreeMap::new();
         let (mut points, mut pings, mut truncated) = (0usize, 0u64, false);
-        for (day, devices) in by_day.iter().rev() {
+        let mut bus_days_read = 0usize;
+        'days: for (date, (devices, first, last)) in by_day.iter().rev() {
             if points >= p.max_points {
                 truncated = true;
                 break;
             }
-            let Ok(date) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") else {
-                continue;
-            };
-            let (mut a, mut b) = (
-                day_start(date).max(from),
-                (day_start(date) + 86_400).min(now),
-            );
-            if let Some(&(first, last)) = span.get(day) {
-                a = a.max(first - SPAN_MARGIN_S);
-                b = b.min(last + SPAN_MARGIN_S + 1);
-            }
-            if a >= b {
-                continue;
-            }
-            let rows = self
-                .reader
-                .paged(
-                    &tracks_sql(&s.table, a, b, devices, label, &bbox, p.bucket_s),
-                    s.page_rows,
-                    10_000,
-                )
-                .await?;
-            for r in rows {
-                let (Some(device), Some(n), Some(track)) = (r.first(), r.get(3), r.get(4)) else {
-                    continue;
+            let a = day_start(*date)
+                .max(lookback_start)
+                .max(first - SPAN_MARGIN_S);
+            let b = (day_start(*date) + 86_400)
+                .min(now)
+                .min(last + SPAN_MARGIN_S + 1);
+            for (wa, wb, group, limit) in track_windows(a, b, devices, s.page_rows) {
+                let Some(time) = left(read_until) else {
+                    stopped = "budget";
+                    break 'days;
                 };
-                let parsed = parse_packed(track);
-                points += parsed.len();
-                pings += n.parse::<u64>().unwrap_or(0);
-                tracks
-                    .entry((device.clone(), day.clone()))
-                    .or_default()
-                    .extend(parsed);
+                let sql = tracks_sql(
+                    &s.table, wa, wb, &group, spellings, &bbox, p.bucket_s, limit,
+                );
+                let rows = match self.reader.rows(&sql, time).await {
+                    Ok(rows) => rows,
+                    Err(ClickHouseError::Timeout(_)) => {
+                        stopped = "budget";
+                        break 'days;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                for r in rows {
+                    let (Some(device), Some(n), Some(track)) = (r.first(), r.get(3), r.get(4))
+                    else {
+                        continue;
+                    };
+                    let parsed = parse_packed(track);
+                    points += parsed.len();
+                    pings += n.parse::<u64>().unwrap_or(0);
+                    tracks
+                        .entry((device.clone(), *date))
+                        .or_default()
+                        .extend(parsed);
+                }
             }
+            bus_days_read += devices.len();
         }
-        evidence["bus_days"] = json!(chosen.len());
-        evidence["pings"] = json!(pings);
-        evidence["points_read"] = json!(points);
-        evidence["truncated"] = json!(truncated);
-        evidence["queries"] = json!(self.reader.queries() - queries_before);
+        let mut evidence = json!({
+            "from": first_read.to_string(),
+            "to": last_day.to_string(),
+            "days": s.days,
+            "days_read": days_read,
+            "stopped": stopped,
+            "route_number": q.short_name.trim(),
+            "stops": q.stops.len(),
+            "bus_days": chosen.len(),
+            "bus_days_read": bus_days_read,
+            "pings": pings,
+            "points_read": points,
+            "truncated": truncated,
+            "queries": self.reader.sent() - queries_before,
+            "read_seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        });
+        let complete = stopped != "budget";
 
         // 3 and 4
         let tracks: Vec<Track> = tracks
             .into_iter()
             .map(|((device, _), pings)| Track { device, pings })
             .collect();
-        match build_line(&tracks, q.stops, p) {
+        let stage = match build_line(&tracks, q.stops, p) {
             Ok(built) => {
                 evidence["buses"] = json!(built.buses);
                 evidence["runs_seen"] = json!(built.counts.runs_seen);
@@ -1666,10 +1833,10 @@ impl GpsLine {
                     "runs_same_direction": built.consolidation.runs_same_direction,
                     "runs_opposite_direction": built.consolidation.runs_opposite_direction,
                 });
-                Ok(Stage::Line {
+                Stage::Line {
                     line: built.line,
                     evidence,
-                })
+                }
             }
             Err(counts) => {
                 evidence["runs_seen"] = json!(counts.runs_seen);
@@ -1680,9 +1847,10 @@ impl GpsLine {
                     .map(|t| t.device.as_str())
                     .collect::<BTreeSet<_>>()
                     .len());
-                Ok(Stage::NotEnough(evidence))
+                Stage::NotEnough(evidence)
             }
-        }
+        };
+        Ok((stage, complete))
     }
 }
 
@@ -2220,11 +2388,12 @@ pub mod tests {
         ];
         let bbox = Bbox::around(&stops, 1_000.0).unwrap();
         assert!(bbox.min_lat < 13.0 - 0.008 && bbox.max_lon > 80.25 + 0.008);
+        let labels = label_spellings("21G");
         let q1 = bus_days_sql(
             DEFAULT_TABLE,
             1_757_000_000,
-            1_758_000_000,
-            "21g",
+            1_757_086_400,
+            &labels,
             &bbox,
             120,
             4,
@@ -2232,15 +2401,16 @@ pub mod tests {
         let q2 = tracks_sql(
             DEFAULT_TABLE,
             1_757_000_000,
-            1_757_086_400,
+            1_757_007_200,
             &["864'1".into(), "x".into()],
-            "21g",
+            &labels,
             &bbox,
             20,
+            4,
         );
         for q in [&q1, &q2] {
-            let paged = format!("{q} LIMIT 100 OFFSET 0");
-            crate::services::clickhouse_reader::assert_read_only(&paged).unwrap();
+            crate::services::clickhouse_reader::assert_read_only(q).unwrap();
+            assert!(!q.contains("OFFSET"), "never paged by OFFSET: {q}");
             assert!(
                 q.contains("timestamp >= toDateTime(1757") && q.contains("timestamp <= now()"),
                 "time bound: {q}"
@@ -2249,16 +2419,24 @@ pub mod tests {
                 q.contains("lat BETWEEN") && q.contains("long BETWEEN"),
                 "box: {q}"
             );
+            // the column as it is: no per-row conversion of the label
+            assert!(
+                !q.contains("lowerUTF8") && !q.contains("toString(routeNumber)"),
+                "{q}"
+            );
         }
         assert!(
-            q1.contains("= '21g'") && q1.contains("LIMIT 4 BY day"),
+            q1.contains("routeNumber IN ('21G', ' 21G', '21G ', ' 21G ', '21g',")
+                && q1.ends_with("LIMIT 4"),
             "{q1}"
         );
         assert!(
-            q2.contains("IN ('864\\'1', 'x')") && q2.contains("IN ('21g', '')"),
+            q2.contains("deviceId IN ('864\\'1', 'x')")
+                && q2.contains("(isNull(routeNumber) OR routeNumber IN ('', '21G',")
+                && q2.ends_with("LIMIT 4"),
             "{q2}"
         );
-        assert_eq!(route_label(" 21G "), Some("21g".into()));
+        assert_eq!(route_label(" 21G "), Some("21G".into()));
         assert_eq!(route_label("  "), None);
         assert_eq!(route_label("a;b"), None);
         assert_eq!(
@@ -2279,29 +2457,396 @@ pub mod tests {
     }
 
     #[test]
-    fn bus_days_are_spread_over_the_window() {
-        let rows: Vec<(String, String, u64)> = [
-            ("a", "2026-09-20", 900),
-            ("b", "2026-09-20", 800),
-            ("c", "2026-09-20", 700),
-            ("a", "2026-09-19", 500),
-            ("d", "2026-09-18", 400),
-            ("e", "2026-09-18", 450),
-        ]
-        .iter()
-        .map(|(d, day, n)| (d.to_string(), day.to_string(), *n))
-        .collect();
-        let chosen = spread_bus_days(&rows, 4);
+    fn a_route_number_is_matched_as_operators_type_it() {
+        let v = label_spellings("12G");
         assert_eq!(
-            chosen,
+            v,
+            vec!["12G", " 12G", "12G ", " 12G ", "12g", " 12g", "12g ", " 12g "]
+        );
+        // stored with a stray space, typed in any case
+        let v = label_spellings(" 51AXCT");
+        assert_eq!(v.len(), 16 * 4);
+        for spelling in ["51AXCT", " 51AXCT", "51axct", "51AxCt ", " 51aXcT "] {
+            assert!(v.contains(&spelling.to_string()), "{spelling}");
+        }
+        let v = label_spellings("57FCT");
+        assert!(v.contains(&"57Fct".to_string()) && v.contains(&"57fct".to_string()));
+        // more than six letters: as typed, upper and lower only
+        let v = label_spellings("SuperFast1");
+        assert_eq!(
+            v,
             vec![
-                ("a".to_string(), "2026-09-20".to_string()),
-                ("a".to_string(), "2026-09-19".to_string()),
-                ("e".to_string(), "2026-09-18".to_string()),
-                ("b".to_string(), "2026-09-20".to_string()),
+                "SuperFast1",
+                " SuperFast1",
+                "SuperFast1 ",
+                " SuperFast1 ",
+                "SUPERFAST1",
+                " SUPERFAST1",
+                "SUPERFAST1 ",
+                " SUPERFAST1 ",
+                "superfast1",
+                " superfast1",
+                "superfast1 ",
+                " superfast1 ",
             ]
         );
-        assert_eq!(spread_bus_days(&rows, 50).len(), 6);
+        // digits only: the number and its spaces
+        assert_eq!(label_spellings("570"), vec!["570", " 570", "570 ", " 570 "]);
+        assert!(label_spellings("  ").is_empty() && label_spellings("a;b").is_empty());
+        // a quote in a number cannot leave the literal
+        let q = in_list(&label_spellings("5'A"));
+        assert!(q.starts_with("'5\\'A', ' 5\\'A'"), "{q}");
+    }
+
+    #[test]
+    fn a_days_tracks_are_cut_into_stretches_read_once() {
+        let devices: Vec<String> = (0..4).map(|i| format!("d{i}")).collect();
+        let (a, b) = (1_757_000_000 + 1_234, 1_757_000_000 + 30_000);
+        let w = track_windows(a, b, &devices, 10);
+        // 4 devices x 2 hours = 8 rows at most per answer
+        assert!(w.iter().all(|(_, _, g, limit)| g.len() == 4 && *limit == 8));
+        assert_eq!(w.first().unwrap().0, a);
+        assert_eq!(w.last().unwrap().1, b);
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "stretches meet, never overlap");
+        }
+        for (wa, wb, _, _) in &w {
+            // whole clock hours inside: one row per device and hour, at most 2
+            assert!((wb - 1).div_euclid(3600) - wa.div_euclid(3600) < 2);
+        }
+        // more devices than a page: groups of page_rows, an hour at a time
+        let many: Vec<String> = (0..25).map(|i| format!("d{i}")).collect();
+        let w = track_windows(a, a + 3_600, &many, 10);
+        assert!(w
+            .iter()
+            .all(|(_, _, g, limit)| g.len() <= 10 && *limit <= 10));
+        // every device's span is read, exactly once
+        for d in &many {
+            let mut mine: Vec<(i64, i64)> = w
+                .iter()
+                .filter(|(_, _, g, _)| g.contains(d))
+                .map(|(wa, wb, _, _)| (*wa, *wb))
+                .collect();
+            mine.sort();
+            assert_eq!((mine[0].0, mine[mine.len() - 1].1), (a, a + 3_600), "{d}");
+            assert!(mine.windows(2).all(|p| p[0].1 == p[1].0), "{d}");
+        }
+        assert!(track_windows(b, a, &devices, 10).is_empty());
+    }
+
+    // ------------------------------------------------------------ a fake cluster
+
+    /// Answers the two queries from synthetic bus-days, after `latency`; a
+    /// query given less time than that is stopped, as ClickHouse stops one at
+    /// its `max_execution_time`.
+    struct FakeRows {
+        days: BTreeMap<i64, Vec<Track>>,
+        latency: Duration,
+        log: Mutex<Vec<(String, Duration)>>,
+        overflow: std::sync::atomic::AtomicBool,
+        sent: std::sync::atomic::AtomicU64,
+    }
+
+    fn numbers(sql: &str, pattern: &str) -> Vec<i64> {
+        regex::Regex::new(pattern)
+            .unwrap()
+            .captures_iter(sql)
+            .map(|c| c[1].parse().unwrap())
+            .collect()
+    }
+
+    #[async_trait::async_trait]
+    impl RowSource for FakeRows {
+        async fn rows(
+            &self,
+            sql: &str,
+            limit: Duration,
+        ) -> Result<Vec<Vec<String>>, ClickHouseError> {
+            crate::services::clickhouse_reader::assert_read_only(sql).unwrap();
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.log.lock().unwrap().push((sql.to_string(), limit));
+            if self.latency > limit {
+                tokio::time::sleep(limit).await;
+                return Err(ClickHouseError::Timeout(limit.as_secs()));
+            }
+            tokio::time::sleep(self.latency).await;
+            let t = numbers(sql, r"toDateTime\((\d+)\)");
+            let (a, b) = (t[0], t[1]);
+            let rows_limit = *numbers(sql, r"LIMIT (\d+)").last().unwrap() as usize;
+            let day = a - (a + DAY_OFFSET_S).rem_euclid(86_400);
+            let tracks = self.days.get(&day).cloned().unwrap_or_default();
+            let mut out: Vec<Vec<String>> = vec![];
+            if sql.contains("arrayStringConcat") {
+                let list = regex::Regex::new(r"deviceId IN \(([^)]*)\)")
+                    .unwrap()
+                    .captures(sql)
+                    .unwrap()[1]
+                    .to_string();
+                let wanted: Vec<String> = list
+                    .split(", ")
+                    .map(|d| d.trim_matches('\'').to_string())
+                    .collect();
+                for tr in tracks.iter().filter(|tr| wanted.contains(&tr.device)) {
+                    let mut hours: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+                    for p in tr.pings.iter().filter(|p| p.t >= a && p.t < b) {
+                        hours
+                            .entry(p.t.div_euclid(3600))
+                            .or_default()
+                            .push(format!("{},{:.6},{:.6}", p.t, p.lat, p.lon));
+                    }
+                    for (h, pts) in hours {
+                        let n = pts.len();
+                        out.push(vec![
+                            tr.device.clone(),
+                            h.to_string(),
+                            n.to_string(),
+                            n.to_string(),
+                            pts.join("|"),
+                        ]);
+                    }
+                }
+            } else {
+                for tr in &tracks {
+                    let seen: Vec<&Ping> =
+                        tr.pings.iter().filter(|p| p.t >= a && p.t < b).collect();
+                    if seen.len() >= 120 {
+                        out.push(vec![
+                            tr.device.clone(),
+                            seen.len().to_string(),
+                            seen[0].t.to_string(),
+                            seen[seen.len() - 1].t.to_string(),
+                        ]);
+                    }
+                }
+                out.sort_by(|x, y| y[1].parse::<usize>().unwrap().cmp(&x[1].parse().unwrap()));
+            }
+            if out.len() > rows_limit {
+                // a track answer cut off by its LIMIT loses a device-hour; a
+                // bus-day answer is meant to keep only the busiest few
+                if sql.contains("arrayStringConcat") {
+                    self.overflow
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                out.truncate(rows_limit);
+            }
+            Ok(out)
+        }
+
+        fn sent(&self) -> u64 {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The fleet on the service days `ago` days before today (0 = today),
+    /// starting at 06:00 (or at midnight today, if it is not 06:00 yet), keeping
+    /// the first `per_day` buses of it.
+    fn fake(now: i64, ago: &[i64], per_day: usize, latency: Duration) -> FakeRows {
+        let truth = corridor();
+        let mut days = BTreeMap::new();
+        for &k in ago {
+            let start = day_start(today(now) - chrono::Duration::days(k));
+            let begin = if k == 0 { start } else { start + 6 * 3600 };
+            let mut rng = Rng::new(100 + k as u64);
+            let tracks: Vec<Track> = fleet(&truth, &mut rng)
+                .into_iter()
+                .take(per_day)
+                .map(|mut tr| {
+                    for p in &mut tr.pings {
+                        p.t = p.t - 1_758_000_000 + begin;
+                    }
+                    // nothing from the future: today's buses are still out
+                    tr.pings.retain(|p| p.t < now);
+                    tr
+                })
+                .collect();
+            days.insert(start, tracks);
+        }
+        FakeRows {
+            days,
+            latency,
+            log: Mutex::new(vec![]),
+            overflow: Default::default(),
+            sent: Default::default(),
+        }
+    }
+
+    fn settings_for_tests() -> GpsLineSettings {
+        GpsLineSettings {
+            clickhouse: ClickHouseSettings {
+                url: "http://127.0.0.1:1".into(),
+                user: "u".into(),
+                password: None,
+                query_timeout: Duration::from_secs(30),
+                min_gap: Duration::ZERO,
+            },
+            table: DEFAULT_TABLE.into(),
+            days: 14,
+            feeds: vec!["f".into()],
+            enough_bus_days: 12,
+            max_bus_days: 30,
+            page_rows: 100,
+            timeout: Duration::from_secs(45),
+            bus_days_budget: Duration::from_secs(15),
+            osrm_reserve: Duration::from_secs(8),
+            min_query_time: Duration::from_millis(50),
+            params: Params::default(),
+        }
+    }
+
+    async fn read_with(
+        rows: Arc<FakeRows>,
+        settings: GpsLineSettings,
+        budget: Duration,
+    ) -> (Stage, bool, Duration) {
+        let gps = GpsLine::with_source(settings, rows).unwrap();
+        let stops = stops_along(&corridor(), "S");
+        let q = RouteQuery {
+            gtfs_id: "f",
+            route_id: "r",
+            short_name: "21G",
+            stops: &stops,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let started = Instant::now();
+        let (stage, complete) = gps
+            .read_and_build(&q, &label_spellings("21G"), now, started + budget)
+            .await
+            .unwrap();
+        (stage, complete, started.elapsed())
+    }
+
+    fn evidence(stage: &Stage) -> &Value {
+        match stage {
+            Stage::Line { evidence, .. } | Stage::NotEnough(evidence) => evidence,
+        }
+    }
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_busy_route_stops_going_back_once_it_has_enough() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = Arc::new(fake(now, &(0..14).collect::<Vec<_>>(), 5, Duration::ZERO));
+        let (stage, complete, _) =
+            read_with(rows.clone(), settings_for_tests(), Duration::from_secs(30)).await;
+        let ev = evidence(&stage);
+        assert!(matches!(stage, Stage::Line { .. }), "{ev}");
+        assert!(complete);
+        // 4 a day: three days make 12 - today's may be short if it is early
+        assert_eq!(ev["stopped"], "enough", "{ev}");
+        assert!((3..=4).contains(&ev["days_read"].as_u64().unwrap()), "{ev}");
+        assert!(ev["bus_days"].as_u64().unwrap() >= 12, "{ev}");
+        let log = rows.log.lock().unwrap();
+        let bus_days: Vec<&String> = log
+            .iter()
+            .map(|(q, _)| q)
+            .filter(|q| !q.contains("arrayStringConcat"))
+            .collect();
+        assert_eq!(bus_days.len() as u64, ev["days_read"].as_u64().unwrap());
+        // newest first, one day each
+        let starts: Vec<i64> = bus_days
+            .iter()
+            .map(|q| numbers(q, r"toDateTime\((\d+)\)")[0])
+            .collect();
+        assert_eq!(starts[0], day_start(today(now)));
+        for pair in starts.windows(2) {
+            assert_eq!(pair[0] - pair[1], 86_400);
+        }
+        assert!(!rows.overflow.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_quiet_route_reads_back_to_the_lookback() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = Arc::new(fake(now, &[5], 5, Duration::ZERO));
+        let mut settings = settings_for_tests();
+        settings.days = 7;
+        let (stage, complete, _) = read_with(rows.clone(), settings, Duration::from_secs(30)).await;
+        let ev = evidence(&stage);
+        assert!(matches!(stage, Stage::Line { .. }), "{ev}");
+        assert!(complete);
+        assert_eq!(ev["stopped"], "lookback", "{ev}");
+        assert_eq!(ev["days_read"], 7);
+        assert_eq!(ev["bus_days"], 4, "the busiest four of its one day: {ev}");
+        let from = (today(now) - chrono::Duration::days(6)).to_string();
+        assert_eq!(ev["from"], from.as_str());
+    }
+
+    #[tokio::test]
+    async fn the_clock_stops_the_read_and_the_answer_is_on_time() {
+        let now = chrono::Utc::now().timestamp();
+        // one bus a day: twelve bus-days would take twelve days
+        let rows = Arc::new(fake(
+            now,
+            &(1..14).collect::<Vec<_>>(),
+            1,
+            Duration::from_millis(250),
+        ));
+        let mut settings = settings_for_tests();
+        settings.bus_days_budget = Duration::from_millis(900);
+        let budget = Duration::from_millis(2_000);
+        let (stage, complete, took) = read_with(rows.clone(), settings, budget).await;
+        let ev = evidence(&stage);
+        assert!(!complete, "a read cut short is not complete: {ev}");
+        assert_eq!(ev["stopped"], "budget", "{ev}");
+        let read = ev["days_read"].as_u64().unwrap();
+        assert!((2..=5).contains(&read), "{ev}");
+        assert!(took <= budget + Duration::from_millis(300), "{took:?}");
+        // each query was allowed no more than the time that was left
+        for (q, limit) in rows.log.lock().unwrap().iter() {
+            let bus_day = !q.contains("arrayStringConcat");
+            let cap = if bus_day { 900 } else { 2_000 };
+            assert!(limit.as_millis() <= cap, "{limit:?} for {q}");
+        }
+
+        // a cluster slower than the whole budget: the first query is stopped
+        // at the budget, nothing is read, and the answer says so on time
+        let rows = Arc::new(fake(now, &[1], 5, Duration::from_secs(5)));
+        let mut settings = settings_for_tests();
+        settings.bus_days_budget = Duration::from_millis(800);
+        let (stage, complete, took) =
+            read_with(rows.clone(), settings, Duration::from_millis(1_500)).await;
+        let ev = evidence(&stage);
+        assert!(matches!(stage, Stage::NotEnough(_)), "{ev}");
+        assert!(!complete);
+        assert_eq!(
+            (ev["days_read"].as_u64(), ev["stopped"].as_str()),
+            (Some(0), Some("budget"))
+        );
+        assert_eq!(ev["runs_used"], 0);
+        assert!(took <= Duration::from_millis(1_200), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_days_tracks_are_never_read_twice() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = Arc::new(fake(now, &[2], 5, Duration::ZERO));
+        let mut settings = settings_for_tests();
+        settings.days = 3;
+        settings.page_rows = 10;
+        let (stage, _, _) = read_with(rows.clone(), settings, Duration::from_secs(30)).await;
+        assert!(matches!(stage, Stage::Line { .. }), "{}", evidence(&stage));
+        let log = rows.log.lock().unwrap();
+        let mut windows: Vec<(i64, i64)> = log
+            .iter()
+            .filter(|(q, _)| q.contains("arrayStringConcat"))
+            .map(|(q, _)| {
+                let t = numbers(q, r"toDateTime\((\d+)\)");
+                assert!(!q.contains("OFFSET"), "{q}");
+                assert!(*numbers(q, r"LIMIT (\d+)").last().unwrap() <= 10, "{q}");
+                (t[0], t[1])
+            })
+            .collect();
+        assert!(
+            windows.len() >= 3,
+            "a day in several stretches: {windows:?}"
+        );
+        windows.sort();
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "stretches meet and never overlap");
+        }
+        // and each answer fitted its limit: nothing was cut off
+        assert!(!rows.overflow.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

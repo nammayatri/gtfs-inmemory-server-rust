@@ -624,14 +624,21 @@ pub async fn polyline_gps(
             let used = counts["runs_used"].as_u64().unwrap_or(0);
             let seen = counts["runs_seen"].as_u64().unwrap_or(0);
             let need = counts["min_runs"].as_u64().unwrap_or(0);
-            let days = counts["days"].as_u64().unwrap_or(0);
+            let days = counts["days_read"].as_u64().unwrap_or(0);
+            let mut message = format!(
+                "in the last {days} day(s) {used} of {seen} bus runs labelled {} passed this route's \
+                 stops in order; a line needs at least {need}",
+                short_name.trim()
+            );
+            if counts["stopped"] == "budget" {
+                message.push_str(
+                    ". Reading stopped early to answer in time; asking again usually reads further",
+                );
+            }
             Err(EditorError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "gps_not_enough_runs",
-                format!(
-                    "in the last {days} days {used} of {seen} bus runs labelled {} passed this                      route's stops in order; a line needs at least {need}",
-                    short_name.trim()
-                ),
+                message,
             )
             .with_details(counts))
         }

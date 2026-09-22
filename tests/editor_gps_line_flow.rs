@@ -16,7 +16,12 @@
 //!     `partial`, and with OSRM down it is the GPS path (`none`) - and a
 //!     second click then tries OSRM again without asking ClickHouse again,
 //!     while a fully snapped answer is served from the cache;
-//!   - a slow ClickHouse is 504 `gps_timeout`;
+//!   - a ClickHouse slower than the time left: each query is given only what
+//!     is left as its `max_execution_time`, and the answer is on time - 422
+//!     with `stopped: "budget"` when the server stops the query, and 504
+//!     `gps_timeout` from the backstop when it does not;
+//!   - step 1 reads one day per query, today first, and no query is paged by
+//!     `OFFSET`;
 //!   - every statement ClickHouse received was a bounded SELECT sent with
 //!     readonly=2, and the password never reached a response;
 //!   - the line goes into a draft as `polyline_source: "gps"` and commits
@@ -415,25 +420,40 @@ async fn fake_clickhouse(
             .map(str::to_string),
         body: body.clone(),
     });
+    // what the server was allowed for this query
+    let allowed: u64 = Regex::new(r"max_execution_time=(\d+)")
+        .unwrap()
+        .captures(req.query_string())
+        .map(|c| c[1].parse().unwrap())
+        .unwrap_or(30);
     let label = if body.contains("'t21g'") {
         "t21g"
     } else if body.contains("'slow'") {
-        actix_web::rt::time::sleep(Duration::from_secs(6)).await;
+        // a cold read that takes 6 s: stopped at its limit, as ClickHouse does
+        if allowed < 6 {
+            actix_web::rt::time::sleep(Duration::from_secs(allowed)).await;
+            return HttpResponse::build(actix_web::http::StatusCode::REQUEST_TIMEOUT)
+                .insert_header(("X-ClickHouse-Exception-Code", "159"))
+                .body(format!(
+                    "Code: 159. DB::Exception: Timeout exceeded: elapsed {} ms, maximum: {} ms. (TIMEOUT_EXCEEDED)",
+                    allowed * 1000 + 20,
+                    allowed * 1000
+                ));
+        }
         "slow"
+    } else if body.contains("'stuck'") {
+        // a server that does not stop at its limit
+        actix_web::rt::time::sleep(Duration::from_secs(8)).await;
+        "stuck"
     } else {
         ""
     };
-    let offset: usize = Regex::new(r"OFFSET (\d+)")
-        .unwrap()
-        .captures(&body)
-        .map(|c| c[1].parse().unwrap())
-        .unwrap_or(0);
     let times: Vec<i64> = Regex::new(r"toDateTime\((\d+)\)")
         .unwrap()
         .captures_iter(&body)
         .map(|c| c[1].parse().unwrap())
         .collect();
-    if label.is_empty() || offset > 0 || times.len() < 2 {
+    if label.is_empty() || times.len() < 2 {
         return HttpResponse::Ok().body("");
     }
     let (from, to) = (times[0], times[1]);
@@ -468,17 +488,19 @@ async fn fake_clickhouse(
                 ));
             }
         }
-    } else if body.contains(" BY day") {
-        let mut t = from;
-        while t < to {
-            let (start, day) = ist_day(t);
-            for (device, n) in [("dev-1", 700), ("dev-2", 650), ("dev-v", 600)] {
-                // the first and last ping of the day, as ClickHouse would see them
-                let pings = bus_pings(device, start);
-                let (first, last) = (pings[0].0, pings[pings.len() - 1].0);
-                out.push_str(&format!("{device}\t{day}\t{n}\t{first}\t{last}\n"));
+    } else {
+        // step 1 asks about one day at a time
+        let (start, _) = ist_day(from);
+        assert!(to - from <= 86_400, "one day per bus-day query: {body}");
+        for device in ["dev-1", "dev-2", "dev-v"] {
+            let pings: Vec<i64> = bus_pings(device, start)
+                .into_iter()
+                .map(|p| p.0)
+                .filter(|t| *t >= from && *t < to)
+                .collect();
+            if let (Some(first), Some(last)) = (pings.first(), pings.last()) {
+                out.push_str(&format!("{device}\t{}\t{first}\t{last}\n", pings.len() * 2));
             }
-            t = start + 86_400;
         }
     }
     HttpResponse::Ok().body(out)
@@ -665,6 +687,7 @@ async fn a_map_line_from_gps_end_to_end() {
     seed.extend(route_rows(GPS_FEED, "R_OLD", Some("OLDNUM"), &forward));
     seed.extend(route_rows(GPS_FEED, "R_NONUM", None, &forward));
     seed.extend(route_rows(GPS_FEED, "R_SLOW", Some("SLOW"), &forward));
+    seed.extend(route_rows(GPS_FEED, "R_STUCK", Some("STUCK"), &forward));
     exec(&pool, &seed).await;
 
     let (ch_url, ch_log) = start_clickhouse();
@@ -710,9 +733,14 @@ async fn a_map_line_from_gps_end_to_end() {
         table: gps_line::DEFAULT_TABLE.into(),
         days: 3,
         feeds: vec![GPS_FEED.into()],
+        // three buses a day: all three days are read
+        enough_bus_days: 9,
         max_bus_days: 9,
         page_rows: 100,
         timeout: Duration::from_secs(4),
+        bus_days_budget: Duration::from_millis(2_500),
+        osrm_reserve: Duration::from_millis(800),
+        min_query_time: Duration::from_millis(300),
         params: gps_line::Params::default(),
     })
     .unwrap();
@@ -762,6 +790,12 @@ async fn a_map_line_from_gps_end_to_end() {
     // variant leaves after 3 km and the reverse legs meet the stops backwards
     let used = ev["runs_used"].as_u64().unwrap();
     assert!(used >= 8, "{ev}");
+    // one bus-day query per day, today first; three buses a day, nine wanted
+    assert_eq!(ev["days_read"], 3, "{ev}");
+    assert!(
+        ev["stopped"] == "enough" || ev["stopped"] == "lookback",
+        "{ev}"
+    );
     assert!(ev["runs_seen"].as_u64().unwrap() > used, "{ev}");
     assert_eq!(ev["buses"], 2, "{ev}");
     assert!(ev["stop_coverage"].as_f64().unwrap() >= 0.95, "{ev}");
@@ -931,7 +965,34 @@ async fn a_map_line_from_gps_end_to_end() {
     assert!(!old_line.is_empty());
 
     // ---- a ClickHouse that does not answer in time
+    // each query is given what is left; the server stops it there, and the
+    // answer - not enough, with the counts - comes well inside the timeout
+    let t = std::time::Instant::now();
     let (s, b, _, _) = call!(&app, gps_of("R_SLOW"));
+    assert_eq!(s, 422, "{b}");
+    assert_eq!(code_of(&b), "gps_not_enough_runs");
+    let d = &b["error"]["details"];
+    assert_eq!(d["stopped"], "budget", "{d}");
+    assert_eq!(d["days_read"], 0, "{d}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stopped early"),
+        "{b}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(3_900),
+        "{:?}",
+        t.elapsed()
+    );
+    // a stopped read is not remembered: the next click reads again
+    let before = ch_count();
+    let (s, _, _, _) = call!(&app, gps_of("R_SLOW"));
+    assert_eq!(s, 422);
+    assert!(ch_count() > before, "a read cut short is not cached");
+    // a server that ignores its limit: the backstop answers at the timeout
+    let (s, b, _, _) = call!(&app, gps_of("R_STUCK"));
     assert_eq!(s, 504, "{b}");
     assert_eq!(code_of(&b), "gps_timeout");
 
@@ -956,10 +1017,25 @@ async fn a_map_line_from_gps_end_to_end() {
         assert!(r.body.ends_with(" FORMAT TabSeparated"), "{}", r.body);
         assert!(!r.body.contains(';'));
         assert!(
-            Regex::new(r"LIMIT \d+ OFFSET \d+ FORMAT")
-                .unwrap()
-                .is_match(&r.body),
-            "{}",
+            Regex::new(r"LIMIT \d+ FORMAT").unwrap().is_match(&r.body)
+                && !r.body.contains("OFFSET"),
+            "a LIMIT, never an OFFSET: {}",
+            r.body
+        );
+        let allowed: u64 = Regex::new(r"max_execution_time=(\d+)")
+            .unwrap()
+            .captures(&r.query)
+            .unwrap()[1]
+            .parse()
+            .unwrap();
+        assert!(
+            allowed <= 4,
+            "no query is allowed more than the budget: {}",
+            r.query
+        );
+        assert!(
+            !r.body.contains("lowerUTF8"),
+            "the label column as it is: {}",
             r.body
         );
         assert!(
@@ -973,8 +1049,8 @@ async fn a_map_line_from_gps_end_to_end() {
             r.body
         );
         assert!(
-            r.body.contains("routeNumber")
-                && (r.body.contains("GROUP BY device, day") || r.body.contains("deviceId) IN (")),
+            r.body.contains("routeNumber IN (")
+                && (r.body.contains("GROUP BY device HAVING") || r.body.contains("deviceId IN (")),
             "entity bound: {}",
             r.body
         );

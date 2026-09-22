@@ -1214,7 +1214,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__dev/map-line" and method == "POST":
             # docs section 17: how the two map line suggestions behave. osrm: ok,
             # no_segment, no_route, timeout, unreachable. gps: ok, partial, none,
-            # not_enough_runs, unavailable, timeout.
+            # not_enough_runs, budget (not enough, reading cut short), unavailable,
+            # timeout.
             b = self._body()
             with LOCK:
                 if "osrm" in b:
@@ -1300,7 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
     def map_line_gps(self, g, rid, d, served, pts, dist):
         mode = getattr(self.store, "map_line_gps", "ok")
         today = now().date()
-        frm = (today - timedelta(days=13)).isoformat()
+        frm = (today - timedelta(days=2)).isoformat()
         number = (d.get("short_name") or "").strip()
         if mode == "unavailable":
             raise ApiError(503, "gps_unavailable", "map lines from GPS are not set up on this server")
@@ -1312,13 +1313,25 @@ class Handler(BaseHTTPRequestHandler):
                            {"stops": len(pts)})
         if mode == "timeout":
             raise ApiError(504, "gps_timeout", "reading the GPS pings took too long; try again in a minute")
-        counts = {"from": frm, "to": today.isoformat(), "days": 14, "route_number": number, "stops": len(pts),
-                  "bus_days": 30, "pings": 48213, "points_read": 16020, "truncated": False, "queries": 15}
+        # as the server reads: today first, stopping once 12 bus-days are found
+        counts = {"from": frm, "to": today.isoformat(), "days": 14, "days_read": 3, "stopped": "enough",
+                  "read_seconds": 6.5, "route_number": number, "stops": len(pts), "bus_days": 12,
+                  "bus_days_read": 12, "pings": 48213, "points_read": 16020, "truncated": False, "queries": 6}
         if mode == "not_enough_runs":
             raise ApiError(422, "gps_not_enough_runs",
-                           f"in the last 14 days 1 of 9 bus runs labelled {number} passed this route's stops in "
+                           f"in the last 14 day(s) 1 of 9 bus runs labelled {number} passed this route's stops in "
                            "order; a line needs at least 3",
-                           {**counts, "runs_seen": 9, "runs_used": 1, "min_runs": 3, "buses": 4})
+                           {**counts, "from": (today - timedelta(days=13)).isoformat(), "days_read": 14,
+                            "stopped": "lookback", "bus_days": 4, "bus_days_read": 4, "runs_seen": 9,
+                            "runs_used": 1, "min_runs": 3, "buses": 4})
+        if mode == "budget":
+            raise ApiError(422, "gps_not_enough_runs",
+                           f"in the last 6 day(s) 2 of 7 bus runs labelled {number} passed this route's stops in "
+                           "order; a line needs at least 3. Reading stopped early to answer in time; asking "
+                           "again usually reads further",
+                           {**counts, "from": (today - timedelta(days=5)).isoformat(), "days_read": 6,
+                            "stopped": "budget", "bus_days": 3, "bus_days_read": 3, "runs_seen": 7,
+                            "runs_used": 2, "min_runs": 3, "buses": 3})
         # the buses' path: the stops, nudged a few metres the way GPS is
         line = [(la + (0.00003 if i % 2 else -0.00002), lo) for i, (la, lo) in enumerate(pts)]
         ev = {**counts, "buses": 12, "runs_seen": 44, "runs_used": 31, "stop_coverage": 0.94,
