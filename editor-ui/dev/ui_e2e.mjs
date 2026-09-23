@@ -832,7 +832,8 @@ async function mergeFlow() {
   await must(waitFor(`document.body.innerText.includes("Merge with a duplicate")`, "the stop's merge action"));
   await click("Merge with a duplicate");
   await must(waitFor(`document.getElementById("panel").innerText.includes("Same name")`, "nearby stops with the same name"));
-  await clickSel(`#panel button[aria-label$="(${MERGE_KEEP})"]`, `Compare with ${MERGE_KEEP}`);
+  await clickSel(`#panel button[aria-label$="(${MERGE_KEEP})"]`, `Add ${MERGE_KEEP}`);
+  await click("Compare 2 stops", "#panel");
   await must(waitFor(`!!document.querySelector("table.compare")`, "the two stops side by side"));
   const compare = await text("#panel");
   check(compare.includes("Which stop id should stay?") && compare.includes("They are 0 m apart"), "asks which stop id stays, for two stops 0 m apart");
@@ -870,11 +871,11 @@ async function importFlow() {
   await clickSel("#new-menu summary", "the New menu");
   await click("Import from a CSV file", "#new-menu");
   await must(waitFor(`!!document.getElementById("import-file")`, "the import page"));
-  const header = "stop_id,name,lat,lon,platform_code";
-  const good1 = ",E2E IMPORT ONE,12.973100,80.221200,Towards Guindy (E2E)";
-  const good3 = ",E2E IMPORT THREE,12.973500,80.221800,";
+  const header = "action,stop_id,name,lat,lon,platform_code";
+  const good1 = "add,,E2E IMPORT ONE,12.973100,80.221200,Towards Guindy (E2E)";
+  const good3 = "add,,E2E IMPORT THREE,12.973500,80.221800,";
   // row 2 uses a stop id that already exists
-  await setFile("e2e-stops.csv", [header, good1, `${STOP},E2E IMPORT TWO,12.973300,80.221500,`, good3].join("\n") + "\n");
+  await setFile("e2e-stops.csv", [header, good1, `add,${STOP},E2E IMPORT TWO,12.973300,80.221500,`, good3].join("\n") + "\n");
   await must(waitFor(`document.getElementById("page").innerText.includes("has errors") || document.getElementById("page").innerText.includes("have errors")`, "the check with an error"));
   const table = await text(".result-table");
   check(table.includes(`stop ${STOP} already exists`), "the preview says what is wrong on the bad row");
@@ -882,7 +883,7 @@ async function importFlow() {
   check(await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`), "adding is off while a row has an error");
   await shot("21-import-error");
   // the fixed file: the bad row gets no id, so one is minted
-  await setFile("e2e-stops-fixed.csv", [header, good1, ",E2E IMPORT TWO,12.973300,80.221500,", good3].join("\n") + "\n");
+  await setFile("e2e-stops-fixed.csv", [header, good1, "add,,E2E IMPORT TWO,12.973300,80.221500,", good3].join("\n") + "\n");
   await must(waitFor(`document.getElementById("page").innerText.includes("can be added")`, "the check of the fixed file"));
   const chips = await text(".summary-chips");
   check(chips.includes("3 rows") && chips.includes("0 errors") && chips.includes("3 changes"), `the fixed file checks clean (${chips.replace(/\n/g, " ")})`);

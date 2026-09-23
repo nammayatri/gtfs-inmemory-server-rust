@@ -1,22 +1,85 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, debounce, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
+import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
 import { showDraftStop, showDraftStation } from "./create.js";
-import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, routesTouched, draftTitle } from "./overlay.js";
+import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, routesTouched, draftTitle, stationMergeMembers } from "./overlay.js";
 import { stationNames, foldedList, platformsNote, stopContext, routeContext } from "./context.js";
 import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 
 const panel = () => document.getElementById("panel");
+
+// Routes and stops are each fetched this many at a time; "Load more" at the end
+// of a group fetches its next page.
+const SEARCH_PAGE = 10;
 
 // ------------------------------------------------------------------ search
 export function initSearch() {
   const input = document.getElementById("search-input");
   const box = document.getElementById("search-results");
   let items = [], active = -1, seq = 0;
+  let query = "";
+
+  // Per group: its items and next page (the API's cursor is an offset). Routes
+  // are listed before stops.
+  const groups = {
+    Routes: {
+      path: "routes", more: "Load more routes",
+      item: (r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops`, href: `#/route/${enc(r.route_id)}` }),
+    },
+    Stops: {
+      path: "stops", more: "Load more stops",
+      item: (s) => ({ group: "Stops", key: s.location_type === 1 ? "Station" : "Stop", text: s.name, sub: `${s.stop_id}, ${s.route_count} route${s.route_count === 1 ? "" : "s"}`, href: `#/stop/${enc(s.stop_id)}` }),
+    },
+  };
+  const reset = () => { for (const g of Object.values(groups)) Object.assign(g, { items: [], cursor: null, loading: false }); };
+  reset();
+  const pageUrl = (g, q, cursor) =>
+    `feeds/${enc(state.feedId)}/${g.path}?q=${enc(q)}&limit=${SEARCH_PAGE}${cursor ? `&cursor=${enc(cursor)}` : ""}`;
+
+  const render = () => {
+    items = Object.values(groups).flatMap((g) => g.items);
+    let i = 0;
+    clear(box, Object.entries(groups).map(([name, g]) => {
+      if (!g.items.length) return null;
+      const rows = g.items.map((it) => {
+        const n = i++;
+        return h("div.search-item", {
+          role: "option", id: `search-opt-${n}`, "aria-selected": String(n === active),
+          on: { mousedown: (ev) => { ev.preventDefault(); choose(it); } },
+        }, h("span.key", it.key), h("span", it.text), h("span.sub", it.sub));
+      });
+      // mousedown, not click, so the search box keeps focus and the list stays open
+      const more = g.cursor
+        ? h("button.btn.secondary.small.search-more", {
+            type: "button", disabled: g.loading,
+            on: { mousedown: (ev) => { ev.preventDefault(); loadMore(g); } },
+          }, g.loading ? "Loading…" : g.more)
+        : null;
+      return [h("div.search-group", name), rows, more];
+    }));
+  };
+
+  const loadMore = async (g) => {
+    if (!g.cursor || g.loading) return;
+    const mine = seq;
+    const scroll = box.scrollTop;
+    g.loading = true;
+    render();
+    try {
+      const page = await get(pageUrl(g, query, g.cursor));
+      if (mine !== seq) return;
+      g.items = [...g.items, ...page.items.map(g.item)];
+      g.cursor = page.next_cursor || null;
+    } catch (e) {
+      if (mine === seq) toast(e.message, "error");
+    } finally {
+      if (mine === seq) { g.loading = false; render(); box.scrollTop = scroll; }
+    }
+  };
 
   const close = () => { box.hidden = true; input.setAttribute("aria-expanded", "false"); active = -1; };
   // a search result starts a new trail, as the top bar does
@@ -33,24 +96,20 @@ export function initSearch() {
     const mine = ++seq;
     try {
       const [routes, stops] = await Promise.all([
-        get(`feeds/${enc(state.feedId)}/routes?q=${enc(q)}&limit=8`),
-        get(`feeds/${enc(state.feedId)}/stops?q=${enc(q)}&limit=8`),
+        get(pageUrl(groups.Routes, q)),
+        get(pageUrl(groups.Stops, q)),
       ]);
       if (mine !== seq) return;
-      items = [
-        ...routes.items.map((r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops`, href: `#/route/${enc(r.route_id)}` })),
-        ...stops.items.map((s) => ({ group: "Stops", key: s.location_type === 1 ? "Station" : "Stop", text: s.name, sub: `${s.stop_id}, ${s.route_count} route${s.route_count === 1 ? "" : "s"}`, href: `#/stop/${enc(s.stop_id)}` })),
-      ];
-      active = items.length ? 0 : -1;
-      let lastGroup = null;
-      clear(box, items.length ? items.map((it, i) => {
-        const header = it.group !== lastGroup ? h("div.search-group", it.group) : null;
-        lastGroup = it.group;
-        return [header, h("div.search-item", {
-          role: "option", id: `search-opt-${i}`, "aria-selected": String(i === active),
-          on: { mousedown: (ev) => { ev.preventDefault(); choose(it); } },
-        }, h("span.key", it.key), h("span", it.text), h("span.sub", it.sub))];
-      }) : h("p.search-empty", `Nothing matches "${q}". Try a route number like 45B, a stop name, or a stop id.`));
+      query = q;
+      reset();
+      groups.Routes.items = routes.items.map(groups.Routes.item);
+      groups.Routes.cursor = routes.next_cursor || null;
+      groups.Stops.items = stops.items.map(groups.Stops.item);
+      groups.Stops.cursor = stops.next_cursor || null;
+      active = groups.Routes.items.length + groups.Stops.items.length ? 0 : -1;
+      if (active === 0) render();
+      else { items = []; clear(box, h("p.search-empty", `Nothing matches "${q}". Try a route number like 45B, a stop name, or a stop id.`)); }
+      box.scrollTop = 0;
       box.hidden = false;
       input.setAttribute("aria-expanded", "true");
     } catch (e) {
@@ -122,6 +181,36 @@ export async function showHome() {
   }
 }
 
+// ------------------------------------------------------------------ stop as a file
+// Everything the panel shows about one stop, as a spreadsheet: the stop's own
+// details, repeated on one row per route that calls there (a station: one row
+// per platform). Live values, as the server has them - a draft's pending edits
+// are not in it.
+const STOP_FIELDS = ["stop_id", "stop_code", "name", "regional_name", "hindi_name", "lat", "lon",
+  "platform_code", "description", "location_type", "parent_station", "cluster_id", "position_source",
+  "route_count", "row_version", "updated_at", "updated_by"];
+
+export function stopCsv(live) {
+  const isStation = live.location_type === 1;
+  const own = STOP_FIELDS.map((k) => (live[k] === null || live[k] === undefined ? "" : String(live[k])));
+  const head = [...STOP_FIELDS];
+  const rows = [];
+  if (isStation) {
+    head.push("platform_stop_id", "platform_name", "platform_label", "platform_lat", "platform_lon", "platform_routes");
+    for (const c of live.children || []) {
+      rows.push([...own, c.stop_id, c.name ?? "", c.platform_code ?? "", c.lat ?? "", c.lon ?? "", c.route_count ?? ""].map(String));
+    }
+  } else {
+    head.push("route_id", "route_short_name", "route_long_name", "sequence", "stop_type", "stage_no");
+    for (const r of live.routes || []) {
+      rows.push([...own, r.route_id, r.short_name ?? "", r.long_name ?? "", r.sequence, r.stop_type, r.stage_no].map(String));
+    }
+  }
+  // a stop no route calls at, or a station with no platforms, is still a row
+  if (!rows.length) rows.push([...own, ...head.slice(own.length).map(() => "")]);
+  return [head, ...rows];
+}
+
 // ------------------------------------------------------------------ stop
 // The way back, for a panel opened from nowhere: once the trail has somewhere to
 // go back to, its Back control is the one to use.
@@ -155,6 +244,13 @@ export async function showStop(stopId) {
   const names = new Map();        // station names, looked up once for this panel
   const shown = (k, fmt = (v) => v) => (o.changed.has(k) ? withLive(fmt(s[k]) || "none", fmt(live[k]) || "none") : fmt(s[k]));
 
+  const download = h("button.btn.secondary", {
+    type: "button", title: `Download this ${what} and everything it is part of, as it is live now`,
+    on: { click: () => {
+      downloadCsv(`${what}-${live.stop_id}.csv`, stopCsv(live));
+      toast(`Downloaded ${what}-${live.stop_id}.csv`);
+    } },
+  }, "Download CSV");
   const actions = editor ? h("div.btn-row",
     isStation
       ? [h("button.btn", { type: "button", on: { click: () => editStation(live) } }, "Edit station"),
@@ -164,16 +260,23 @@ export async function showStop(stopId) {
          h("a.btn.secondary", { href: `#/merge/${enc(live.stop_id)}` }, "Merge with a duplicate…"),
          live.parent_station ? null : h("button.btn.secondary", { type: "button", on: { click: () => editStation(null, [live]) } }, "Club into a station"),
          live.route_count === 0 ? h("button.btn.danger", { type: "button", on: { click: () => deleteStop(live) } }, "Delete stop") : null],
-  ) : null;
+    download,
+  ) : h("div.btn-row", download);
 
   // a station's stops as the draft leaves them: who joins, who leaves
   const draftedMembers = isStation ? (o.actions.filter((a) => a.kind === "members").pop() || {}).members : null;
-  const members = !isStation ? [] : !draftedMembers ? s.children : [
+  const ownMembers = !isStation ? [] : !draftedMembers ? s.children : [
     ...draftedMembers.map((m) => {
       const c = s.children.find((x) => x.stop_id === m.stop_id);
       return c ? { ...c, platform_code: m.labelled ? m.platform_code : c.platform_code } : { stop_id: m.stop_id, name: m.stop_id, platform_code: m.platform_code, joins: true };
     }),
     ...s.children.filter((c) => !draftedMembers.some((m) => m.stop_id === c.stop_id)).map((c) => ({ ...c, leaves: true }))];
+  // and as the draft's station merges leave them: platforms merged in from other
+  // stations join, and a station merged away sends its own to the one that stays
+  const merged = isStation ? stationMergeMembers(live.stop_id) : { joining: [], into: null };
+  const members = [
+    ...ownMembers.map((c) => (merged.into && !c.leaves ? { ...c, movesTo: merged.into } : c)),
+    ...merged.joining.filter((p) => !ownMembers.some((c) => c.stop_id === p.stop_id)).map((p) => ({ ...p, joins: true }))];
   const nearbyBox = h("div", h("p.empty", "Loading…"));
   const stationLine = () => {
     if (o.changed.has("parent_station")) {
@@ -215,7 +318,9 @@ export async function showStop(stopId) {
       members.length ? h("ul.list", members.map((c) => h("li.list-item", { title: stopDetailWords(c) || null },
         h("span.key", c.platform_code || ""),
         c.leaves ? h("s", h("a", { href: `#/stop/${enc(c.stop_id)}` }, c.name)) : h("a", { href: `#/stop/${enc(c.stop_id)}` }, c.name),
-        h("span.hint", c.joins ? h("span.chip.draft", "joins in the draft") : c.leaves ? h("span.chip.draft", "leaves in the draft") : `${c.route_count} route${c.route_count === 1 ? "" : "s"}`),
+        h("span.hint", c.joins ? h("span.chip.draft", c.from_station ? `joins from ${c.from_station} in the draft` : "joins in the draft")
+          : c.movesTo ? h("span.chip.draft", `moves to ${c.movesTo} in the draft`)
+          : c.leaves ? h("span.chip.draft", "leaves in the draft") : `${c.route_count} route${c.route_count === 1 ? "" : "s"}`),
         h("span.sub", c.stop_id)))) : h("p.empty", "This station has no stops.")) : null,
     !isStation ? h("section.section",
       h("h2", `Routes stopping here (${s.routes.length})`),

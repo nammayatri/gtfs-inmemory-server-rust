@@ -18,7 +18,7 @@ js/state.js         shared state; UI preferences in localStorage (never secrets)
 js/auth.js          sign-in gate: SSO problems, TOTP enrolment (QR), code entry, lockout
 js/main.js          boot, top bar, hash router
 js/map.js           Leaflet: stops by area, routes, drag a stop, pick a stop, station selection, insets
-js/explore.js       search, stop panel, route panel with the fare-stage ladder
+js/explore.js       search (paged), stop panel with its CSV download, route panel with the fare-stage ladder
 js/editors.js       stop, route stop list, route details and map line, station editors
 js/drafts.js        the draft being edited, the draft chooser, addChange(), what the draft creates
 js/picker.js        choosing a stop: nearby suggestions, search by name or id, or a click on the map

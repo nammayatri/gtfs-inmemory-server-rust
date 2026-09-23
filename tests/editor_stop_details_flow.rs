@@ -262,6 +262,22 @@ async fn public_stops(pool: &PgPool, feed: &str) -> HashMap<String, Value> {
         .collect()
 }
 
+/// The rows of this kind all say `action: "update"` — the only one it takes
+/// (section 5). These tests were written before the column, so it is added here
+/// rather than in every row.
+fn with_action(rows: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|r| match r.as_object() {
+            Some(m) if !m.contains_key("action") => {
+                let mut m = m.clone();
+                m.insert("action".into(), serde_json::json!("update"));
+                serde_json::Value::Object(m)
+            }
+            _ => r.clone(),
+        })
+        .collect()
+}
+
 #[actix_web::test]
 async fn descriptions_labels_and_bulk_stop_updates() {
     let Some(pool) = local_pool().await else {
@@ -352,8 +368,9 @@ async fn descriptions_labels_and_bulk_stop_updates() {
             .set_json(change)
     };
     let bulk = |c: &Caller, set: &str, rows: &Vec<Value>, dry_run: bool| {
-        c.req("POST", &format!("/change-sets/{set}/bulk"))
-            .set_json(json!({"kind": "stop_updates", "rows": rows, "dry_run": dry_run}))
+        c.req("POST", &format!("/change-sets/{set}/bulk")).set_json(
+            json!({"kind": "stop_updates", "rows": with_action(rows), "dry_run": dry_run}),
+        )
     };
     let stop = |id: &str| editor_c.req("GET", &format!("/feeds/{FEED}/stops/{id}"));
     // submit (editor), approve and commit (approver)
@@ -1019,7 +1036,9 @@ async fn stop_updates_at_5000_rows() {
     let bulk = |rows: &Vec<Value>, dry_run: bool| {
         admin
             .req("POST", &format!("/change-sets/{set_id}/bulk"))
-            .set_json(json!({"kind": "stop_updates", "rows": rows, "dry_run": dry_run}))
+            .set_json(
+                json!({"kind": "stop_updates", "rows": with_action(rows), "dry_run": dry_run}),
+            )
     };
 
     for round in 1..=3 {

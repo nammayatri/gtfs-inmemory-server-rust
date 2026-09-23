@@ -172,6 +172,7 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .search-item .key { font-weight: 700; min-width: 56px; }
 .search-item .sub { grid-column: 2; font-size: var(--fs-xs); color: var(--muted); }
 .search-empty { padding: 10px 12px; color: var(--muted); font-size: var(--fs-s); }
+.search-more { display: flex; margin: 6px auto 8px; }
 .nav { display: flex; gap: 2px; }
 .nav a { padding: 6px 10px; border-radius: var(--radius); color: var(--ink); text-decoration: none; font-weight: 700; font-size: var(--fs-s); }
 .nav a[aria-current="page"] { background: var(--stage-tint); }
@@ -527,6 +528,18 @@ tr.linkrow:hover td { background: #f5f9f8; }
 .timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: var(--fs-s); }
 .timeline li { padding-left: 16px; position: relative; }
 .timeline li::before { content: ""; position: absolute; left: 0; top: .55em; width: 7px; height: 7px; border-radius: 50%; background: var(--rule-strong); }
+/* several drafts put through together, from the drafts list */
+.batch-bar {
+  position: sticky; bottom: 0; z-index: 5;
+  display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between;
+  margin-top: 10px; padding: 12px 16px;
+  background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius);
+  box-shadow: 0 -4px 16px rgba(20, 37, 42, .08);
+}
+th.tick, td.tick { width: 34px; padding-right: 0; }
+th.tick input, td.tick input { width: 18px; height: 18px; margin: 0; accent-color: var(--action); }
+td.tick input:disabled { cursor: not-allowed; }
+
 .actionbar { display: grid; gap: 8px; padding: 14px 16px; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); }
 .why-not { font-size: var(--fs-s); color: var(--muted); }
 

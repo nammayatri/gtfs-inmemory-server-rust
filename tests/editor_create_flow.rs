@@ -1029,14 +1029,14 @@ async fn create_merge_bulk_and_proposals() {
             .set_json(json!({"kind": kind, "rows": rows, "dry_run": dry_run}))
     };
     let mixed = json!([
-        {"name": "BULK A", "lat": "13.4", "lon": "80.1"},
-        {"stop_id": "BULK1", "name": "BULK B", "lat": 13.41, "lon": 80.11, "platform_code": ""},
-        {"stop_id": "S1", "name": "TAKEN", "lat": 13.42, "lon": 80.12},
-        {"name": "BAD LAT", "lat": "north", "lon": 80.1},
-        {"stop_id": "BULK2", "name": "TWICE", "lat": 13.43, "lon": 80.13},
-        {"stop_id": "BULK2", "name": "TWICE AGAIN", "lat": 13.44, "lon": 80.14},
-        {"name": "OFF THE MAP", "lat": 95, "lon": 80},
-        {"name": "NOTES", "lat": 13.45, "lon": 80.15, "notes": "x"},
+        {"action": "add", "name": "BULK A", "lat": "13.4", "lon": "80.1"},
+        {"action": "add", "stop_id": "BULK1", "name": "BULK B", "lat": 13.41, "lon": 80.11, "platform_code": ""},
+        {"action": "add", "stop_id": "S1", "name": "TAKEN", "lat": 13.42, "lon": 80.12},
+        {"action": "add", "name": "BAD LAT", "lat": "north", "lon": 80.1},
+        {"action": "add", "stop_id": "BULK2", "name": "TWICE", "lat": 13.43, "lon": 80.13},
+        {"action": "add", "stop_id": "BULK2", "name": "TWICE AGAIN", "lat": 13.44, "lon": 80.14},
+        {"action": "add", "name": "OFF THE MAP", "lat": 95, "lon": 80},
+        {"action": "add", "name": "NOTES", "lat": 13.45, "lon": 80.15, "notes": "x"},
     ]);
     let (s, out, _) = call!(&app, bulk(&editor_c, "stops", mixed.clone(), true));
     assert_eq!(s, 200, "{out}");
@@ -1100,9 +1100,9 @@ async fn create_merge_bulk_and_proposals() {
             &editor_c,
             "stops",
             json!([
-                {"name": "BULK A", "lat": "13.4", "lon": "80.1"},
-                {"stop_id": "BULK1", "name": "BULK B", "lat": 13.41, "lon": 80.11, "platform_code": ""},
-                {"stop_id": "BULK2", "name": "BULK C", "lat": 13.43, "lon": 80.13, "platform_code": "Towards BULK B"},
+                {"action": "add", "name": "BULK A", "lat": "13.4", "lon": "80.1"},
+                {"action": "add", "stop_id": "BULK1", "name": "BULK B", "lat": 13.41, "lon": 80.11, "platform_code": ""},
+                {"action": "add", "stop_id": "BULK2", "name": "BULK C", "lat": 13.43, "lon": 80.13, "platform_code": "Towards BULK B"},
             ]),
             false
         )
@@ -1127,7 +1127,7 @@ async fn create_merge_bulk_and_proposals() {
             &editor_c,
             "routes",
             json!([
-                {"route_id": "BR1", "short_name": "B1", "long_name": "BULK A To BULK C", "color": "#123abc"},
+                {"action": "add", "route_id": "BR1", "short_name": "B1", "long_name": "BULK A To BULK C", "color": "#123abc"},
             ]),
             false
         )
@@ -1138,7 +1138,7 @@ async fn create_merge_bulk_and_proposals() {
         bulk(
             &editor_c,
             "routes",
-            json!([{"route_id": "BR1", "short_name": "again"}, {"route_id": "R1", "short_name": "T1"}]),
+            json!([{"action": "add", "route_id": "BR1", "short_name": "again"}, {"action": "add", "route_id": "R1", "short_name": "T1"}]),
             true
         )
     );
@@ -1152,9 +1152,9 @@ async fn create_merge_bulk_and_proposals() {
         "{out}"
     );
     let fare_error = json!([
-        {"route_id": "BR1", "sequence": 3, "stop_id": "BULK2", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "BULK C"},
-        {"route_id": "BR1", "sequence": "1", "stop_id": bulk_minted, "stop_type": "NEW STOP", "stage_no": "1", "stage_name": "BULK A"},
-        {"route_id": "BR1", "sequence": 2, "stop_id": "BULK1", "stop_type": "INTERMEDIATE STOP", "stage_no": 2, "stage_name": "BULK C"},
+        {"action": "add", "route_id": "BR1", "sequence": 3, "stop_id": "BULK2", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "BULK C"},
+        {"action": "add", "route_id": "BR1", "sequence": "1", "stop_id": bulk_minted, "stop_type": "NEW STOP", "stage_no": "1", "stage_name": "BULK A"},
+        {"action": "add", "route_id": "BR1", "sequence": 2, "stop_id": "BULK1", "stop_type": "INTERMEDIATE STOP", "stage_no": 2, "stage_name": "BULK C"},
     ]);
     let (s, refused, _) = call!(
         &app,
@@ -1195,11 +1195,11 @@ async fn create_merge_bulk_and_proposals() {
             &editor_c,
             "route_stops",
             json!([
-                {"route_id": "BR1", "sequence": 1, "stop_id": "BULK1", "stop_type": "INTERMEDIATE STOP", "stage_no": 1, "stage_name": "BULK A"},
-                {"route_id": "BR1", "sequence": 1, "stop_id": "BULK2", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "BULK A"},
-                {"route_id": "GHOST", "sequence": 1, "stop_id": "S1", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "STOP 1"},
-                {"route_id": "R1", "sequence": 1, "stop_id": "NOSUCH", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "STOP 1"},
-                {"route_id": "R1", "sequence": 2, "stop_id": "S5", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "STOP 5"},
+                {"action": "add", "route_id": "BR1", "sequence": 1, "stop_id": "BULK1", "stop_type": "INTERMEDIATE STOP", "stage_no": 1, "stage_name": "BULK A"},
+                {"action": "add", "route_id": "BR1", "sequence": 1, "stop_id": "BULK2", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "BULK A"},
+                {"action": "add", "route_id": "GHOST", "sequence": 1, "stop_id": "S1", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "STOP 1"},
+                {"action": "update", "route_id": "R1", "sequence": 1, "stop_id": "NOSUCH", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "STOP 1"},
+                {"action": "update", "route_id": "R1", "sequence": 2, "stop_id": "S5", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "STOP 5"},
             ]),
             true
         )
@@ -1226,9 +1226,9 @@ async fn create_merge_bulk_and_proposals() {
             &editor_c,
             "route_stops",
             json!([
-                {"route_id": "BR1", "sequence": 3, "stop_id": "BULK2", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "BULK C"},
-                {"route_id": "BR1", "sequence": 1, "stop_id": bulk_minted, "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "BULK A"},
-                {"route_id": "BR1", "sequence": 2, "stop_id": "BULK1", "stop_type": "INTERMEDIATE STOP", "stage_no": 1, "stage_name": "BULK A"},
+                {"action": "add", "route_id": "BR1", "sequence": 3, "stop_id": "BULK2", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "BULK C"},
+                {"action": "add", "route_id": "BR1", "sequence": 1, "stop_id": bulk_minted, "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "BULK A"},
+                {"action": "add", "route_id": "BR1", "sequence": 2, "stop_id": "BULK1", "stop_type": "INTERMEDIATE STOP", "stage_no": 1, "stage_name": "BULK A"},
             ]),
             false
         )
@@ -1258,6 +1258,239 @@ async fn create_merge_bulk_and_proposals() {
         vec![bulk_minted.clone(), "BULK1".into(), "BULK2".into()]
     );
     assert_eq!(scalar_text(&pool, &format!("SELECT platform_code FROM gtfs_stop WHERE gtfs_id = '{FEED}' AND stop_id = 'BULK2'")).await.as_deref(), Some("Towards BULK B"));
+
+    // ================================================ bulk: update and delete
+    // a stop and a route to change and remove, live before the upload that does it
+    let (_, extra, _) = call!(&app, new_set(&editor_c, "bulk extras"));
+    let extra = extra["change_set_id"].as_str().unwrap().to_string();
+    for (kind, rows) in [
+        (
+            "stops",
+            json!([{"action": "add", "stop_id": "BULK3", "name": "BULK D", "lat": 13.46, "lon": 80.16}]),
+        ),
+        (
+            "routes",
+            json!([{"action": "add", "route_id": "BR2", "short_name": "B2"}]),
+        ),
+    ] {
+        let (s, out, _) = call!(
+            &app,
+            editor_c
+                .req("POST", &format!("/change-sets/{extra}/bulk"))
+                .set_json(json!({"kind": kind, "rows": rows, "dry_run": false}))
+        );
+        assert_eq!(s, 200, "{kind}: {out}");
+    }
+    for (who, action) in [
+        (&editor_c, "submit"),
+        (&approver, "approve"),
+        (&approver, "commit"),
+    ] {
+        let (s, b, _) = call!(
+            &app,
+            who.req("POST", &format!("/change-sets/{extra}/{action}"))
+        );
+        assert_eq!(s, 200, "{action}: {b}");
+    }
+    let (_, b2, _) = call!(&app, new_set(&editor_c, "bulk update and delete"));
+    let b2 = b2["change_set_id"].as_str().unwrap().to_string();
+    let bulk2 = |c: &Caller, kind: &str, rows: Value, dry_run: bool| {
+        c.req("POST", &format!("/change-sets/{b2}/bulk"))
+            .set_json(json!({"kind": kind, "rows": rows, "dry_run": dry_run}))
+    };
+    // every row says what it does: a blank action is refused, whatever else is right
+    let (s, out, _) = call!(
+        &app,
+        bulk2(
+            &editor_c,
+            "stops",
+            json!([{"stop_id": "BULK1", "name": "NO ACTION"}]),
+            true
+        )
+    );
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "invalid_row",
+        "{out}"
+    );
+    assert!(
+        out["rows"][0]["messages"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("action is required"),
+        "{out}"
+    );
+    // add on an id that is there, update and delete on one that is not
+    let (s, out, _) = call!(
+        &app,
+        bulk2(
+            &editor_c,
+            "stops",
+            json!([
+                {"action": "add", "stop_id": "BULK1", "name": "AGAIN", "lat": 13.4, "lon": 80.1},
+                {"action": "update", "stop_id": "NOSUCH1", "name": "GHOST"},
+                {"action": "delete", "stop_id": "NOSUCH2"},
+                {"action": "update", "stop_id": "BULK2"},
+                {"action": "delete", "stop_id": "BULK3", "name": "WITH A NAME"},
+                {"action": "sideways", "stop_id": "S1"},
+            ]),
+            true
+        )
+    );
+    assert_eq!(s, 200, "{out}");
+    let code = |i: usize| {
+        out["rows"][i]["messages"][0]["code"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    assert_eq!(
+        (0..6).map(code).collect::<Vec<_>>(),
+        vec![
+            "stop_exists",
+            "stop_not_found",
+            "stop_not_found",
+            "nothing_to_update",
+            "invalid_row",
+            "invalid_row"
+        ],
+        "{out}"
+    );
+    // the add row is planned before its id is checked, as any errored row may be;
+    // the upload is refused as a whole, so nothing of it reaches the draft
+    assert_eq!(out["summary"]["changes"], 1, "{out}");
+    assert_eq!(out["summary"]["errors"], 6, "{out}");
+    // the real thing: move and rename one stop, relabel another, delete a third,
+    // change a route's name and colour, and delete a route that has no stop list
+    let (s, out, _) = call!(
+        &app,
+        bulk2(
+            &editor_c,
+            "stops",
+            json!([
+                {"action": "update", "stop_id": "BULK1", "name": "BULK B MOVED", "lat": 13.5, "lon": 80.2},
+                {"action": "update", "stop_id": "BULK2", "platform_code": "Towards BULK A"},
+                {"action": "delete", "stop_id": "BULK3"},
+            ]),
+            false
+        )
+    );
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(
+        out["summary"],
+        json!({"rows": 3, "ok": 3, "warnings": 0, "errors": 0, "changes": 3}),
+        "{out}"
+    );
+    let ops: Vec<String> = out["changes_preview"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            format!(
+                "{}/{}",
+                c["entity"].as_str().unwrap(),
+                c["op"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(ops, vec!["stop/update", "stop/update", "stop/delete"]);
+    let (s, out, _) = call!(
+        &app,
+        bulk2(
+            &editor_c,
+            "routes",
+            json!([
+                {"action": "update", "route_id": "BR1", "long_name": "BULK A To BULK C, renamed", "color": "#abcdef"},
+                {"action": "delete", "route_id": "BR2"},
+            ]),
+            false
+        )
+    );
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["summary"]["errors"], 0, "{out}");
+    // a route's stop list is one action, and it must match what the route has
+    let (s, out, _) = call!(
+        &app,
+        bulk2(
+            &editor_c,
+            "route_stops",
+            json!([
+                {"action": "add", "route_id": "BR1", "sequence": 1, "stop_id": "BULK1", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "A"},
+                {"action": "update", "route_id": "R1", "sequence": 1, "stop_id": "S1", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "STOP 1"},
+                {"action": "add", "route_id": "R1", "sequence": 2, "stop_id": "S5", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "STOP 5"},
+            ]),
+            true
+        )
+    );
+    assert_eq!(s, 200, "{out}");
+    // BR1 has the list the earlier import gave it; R1's rows disagree with each other
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "route_stops_exist",
+        "{out}"
+    );
+    assert_eq!(
+        out["rows"][1]["messages"][0]["code"], "mixed_action",
+        "{out}"
+    );
+    assert_eq!(
+        out["rows"][2]["messages"][0]["code"], "mixed_action",
+        "{out}"
+    );
+
+    for (who, action) in [
+        (&editor_c, "submit"),
+        (&approver, "approve"),
+        (&approver, "commit"),
+    ] {
+        let (s, b, _) = call!(
+            &app,
+            who.req("POST", &format!("/change-sets/{b2}/{action}"))
+        );
+        assert_eq!(s, 200, "{action}: {b}");
+    }
+    assert_eq!(
+        scalar_text(
+            &pool,
+            &format!("SELECT name FROM gtfs_stop WHERE gtfs_id = '{FEED}' AND stop_id = 'BULK1'")
+        )
+        .await
+        .as_deref(),
+        Some("BULK B MOVED")
+    );
+    assert_eq!(
+        scalar_text(
+            &pool,
+            &format!(
+                "SELECT lat::text FROM gtfs_stop WHERE gtfs_id = '{FEED}' AND stop_id = 'BULK1'"
+            )
+        )
+        .await
+        .as_deref(),
+        Some("13.5")
+    );
+    assert_eq!(
+        scalar_text(&pool, &format!("SELECT platform_code FROM gtfs_stop WHERE gtfs_id = '{FEED}' AND stop_id = 'BULK2'")).await.as_deref(),
+        Some("Towards BULK A")
+    );
+    assert_eq!(
+        scalar_i64(&pool, &format!("SELECT count(*) FROM gtfs_stop WHERE gtfs_id = '{FEED}' AND stop_id = 'BULK3' AND deleted")).await,
+        1
+    );
+    assert_eq!(
+        scalar_text(
+            &pool,
+            &format!(
+                "SELECT long_name FROM gtfs_route WHERE gtfs_id = '{FEED}' AND route_id = 'BR1'"
+            )
+        )
+        .await
+        .as_deref(),
+        Some("BULK A To BULK C, renamed")
+    );
+    assert_eq!(
+        scalar_i64(&pool, &format!("SELECT count(*) FROM gtfs_route WHERE gtfs_id = '{FEED}' AND route_id = 'BR2' AND deleted")).await,
+        1
+    );
 
     // ======================================================== station proposals
     let (pa, pb, pc, pd) = (
@@ -1724,7 +1957,7 @@ async fn bulk_dry_run_timings() {
 
     // 2,000 new stops, ids minted
     let stops: Vec<Value> = (0..2000)
-        .map(|i| json!({"name": format!("PERF STOP {i}"), "lat": format!("{:.6}", 12.9 + (i as f64) * 0.0001), "lon": "80.2", "platform_code": "Towards somewhere"}))
+        .map(|i| json!({"action": "add", "name": format!("PERF STOP {i}"), "lat": format!("{:.6}", 12.9 + (i as f64) * 0.0001), "lon": "80.2", "platform_code": "Towards somewhere"}))
         .collect();
     // 5,000 rows: whole stop lists of real routes, re-uploaded
     let rows = sqlx::query(&format!(
@@ -1747,7 +1980,7 @@ async fn bulk_dry_run_timings() {
         }
         for r in &rows[i..end] {
             route_stops.push(json!({
-                "route_id": route, "sequence": r.get::<i32, _>("sequence"), "stop_id": r.get::<String, _>("stop_id"),
+                "action": "update", "route_id": route, "sequence": r.get::<i32, _>("sequence"), "stop_id": r.get::<String, _>("stop_id"),
                 "stop_type": r.get::<String, _>("stop_type"), "stage_no": r.get::<i32, _>("stage_no"),
                 "stage_name": r.get::<String, _>("stage_name"),
             }));
@@ -1760,7 +1993,7 @@ async fn bulk_dry_run_timings() {
     while route_stops.len() < 5000 && k < rows.len() {
         let r = &rows[k];
         route_stops.push(json!({
-            "route_id": r.get::<String, _>("route_id"), "sequence": r.get::<i32, _>("sequence"), "stop_id": r.get::<String, _>("stop_id"),
+            "action": "update", "route_id": r.get::<String, _>("route_id"), "sequence": r.get::<i32, _>("sequence"), "stop_id": r.get::<String, _>("stop_id"),
             "stop_type": r.get::<String, _>("stop_type"), "stage_no": r.get::<i32, _>("stage_no"), "stage_name": r.get::<String, _>("stage_name"),
         }));
         k += 1;

@@ -1094,28 +1094,28 @@ async function round5Flows() {
   check((await text('label[for="kind-stop_updates"]')).includes("Stop details (platform label, description)"), "it is called Stop details (platform label, description)");
   await clickSel("#kind-stop_updates", "Stop details");
   const template = await evaluate(`fetch(document.querySelector('a[download="stop_updates-template.csv"]').href).then((r) => r.text())`);
-  check(template.includes("stop_id,platform_code,description,name"), "its template downloads with its header row");
+  check(template.includes("action,stop_id,platform_code,description,name"), "its template downloads with its header row");
   // read in the browser: a column that is not one of the kind's
-  await setFile("details.csv", "stop_id,platform_code,descripton\nx,y,z\n");
+  await setFile("details.csv", "action,stop_id,platform_code,descripton\nupdate,x,y,z\n");
   await waitFor(`document.getElementById("page").innerText.includes("Did you mean")`, "a misspelt column is caught in the browser");
   // the server's errors, row by row
   const csvCell = (v) => `"${String(v).replace(/"/g, '""')}"`;
-  await setFile("details.csv", ["stop_id,platform_code,description,name",
-    `${pb.stop_id},,Opposite the smoke test bakery,`,
-    "no_such_stop_r5,Towards nowhere,,",
-    `${fx.station},Towards X,,`,
-    `${pb.stop_id},Towards twice,,`,
-    `${fx.far_near},,,`].join("\n") + "\n");
+  await setFile("details.csv", ["action,stop_id,platform_code,description,name",
+    `update,${pb.stop_id},,Opposite the smoke test bakery,`,
+    "update,no_such_stop_r5,Towards nowhere,,",
+    `update,${fx.station},Towards X,,`,
+    `update,${pb.stop_id},Towards twice,,`,
+    `update,${fx.far_near},,,`].join("\n") + "\n");
   await waitFor(`document.getElementById("page").innerText.includes("have errors")`, "the dry run with errors", 15000);
   const table = await text(".result-table");
   check(table.includes("no stop no_such_stop_r5") && table.includes("is a station") && table.includes("rows 1, 4") && table.includes("gives no platform_code"), "the table says what is wrong on each row");
   check(await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`), "adding is off while rows have errors");
   // the fixed file: one row already true, one for a stop the draft already updates
-  const fixed = ["stop_id,platform_code,description,name",
-    `${pa.stop_id},${csvCell(pa.platform_code)},,`,
-    `${pb.stop_id},,Opposite the smoke test bakery,`,
-    `${solo.stop_id},Towards Smoke Colony,,`,
-    `${fx.far_station},,A station described by a file,`].join("\n") + "\n";
+  const fixed = ["action,stop_id,platform_code,description,name",
+    `update,${pa.stop_id},${csvCell(pa.platform_code)},,`,
+    `update,${pb.stop_id},,Opposite the smoke test bakery,`,
+    `update,${solo.stop_id},Towards Smoke Colony,,`,
+    `update,${fx.far_station},,A station described by a file,`].join("\n") + "\n";
   await setFile("details-fixed.csv", fixed);
   await waitFor(`document.getElementById("page").innerText.includes("can be added")`, "the dry run of the fixed file", 15000);
   const chips = (await text(".summary-chips")).replace(/\n/g, " ");
@@ -1349,7 +1349,7 @@ async function stationMergeFlows() {
   await waitFor(`document.body.innerText.includes("Merge into another station")`, "back on the station");
   await click("Merge into another station");
   await waitFor(`document.getElementById("panel").innerText.includes("Stations close by")`, "the station picker");
-  check((await text("#panel")).includes("Merge two stations only when they are one place entered twice"), "says when two stations should be merged");
+  check((await text("#panel")).includes("Merge stations only when they are one place entered more than once"), "says when stations should be merged");
   check((await text("#panel")).includes(fx.gone), "the other station is listed close by");
   await shot("sm-01-choose");
 
@@ -1973,7 +1973,8 @@ try {
   await waitFor(`document.body.innerText.includes("Merge with a duplicate")`, "stop with merge action");
   await click("Merge with a duplicate");
   await waitFor(`document.getElementById("panel").innerText.includes("Same name")`, "nearby duplicates with the same name first");
-  await click("Compare", "#panel");
+  await click("Add", "#panel .list");
+  await click("Compare 2 stops", "#panel");
   await waitFor(`!!document.querySelector("table.compare")`, "the two stops side by side");
   const compare = await text("#panel");
   check(compare.includes("Which stop id should stay?") && compare.includes("Suggested: used by more routes"), "asks which stop id stays and suggests one");
@@ -2382,23 +2383,23 @@ try {
   await click("Import from a CSV file", "#new-menu");
   await waitFor(`!!document.getElementById("import-file")`, "import page");
   const template = await evaluate(`fetch(document.querySelector('a[download="stops-template.csv"]').href).then((r) => r.text())`);
-  check(template.includes("stop_id,name,lat,lon,platform_code"), "the stops template downloads with its header row");
+  check(template.includes("action,stop_id,name,lat,lon,platform_code"), "the stops template downloads with its header row");
   // a row that cannot be read is caught in the browser
-  await setFile("stops.csv", "stop_id,name,lat,lon,platform_code\n,Smoke A,13.1,eighty,\n");
+  await setFile("stops.csv", "action,stop_id,name,lat,lon,platform_code\nadd,,Smoke A,13.1,eighty,\n");
   await waitFor(`document.getElementById("page").innerText.includes("cannot be read")`, "unreadable row");
   check((await text("#page")).includes("lon must be a number"), "the row that cannot be read says what is wrong");
   // a misspelt column
-  await setFile("stops.csv", "stop_id,name,lat,lon,platfrom_code\n,Smoke A,13.1,80.1,x\n");
+  await setFile("stops.csv", "action,stop_id,name,lat,lon,platfrom_code\nadd,,Smoke A,13.1,80.1,x\n");
   await waitFor(`document.getElementById("page").innerText.includes("Did you mean")`, "unknown column");
   // server errors: an id in use and a duplicate in the file
-  await setFile("stops.csv", "stop_id,name,lat,lon,platform_code\nde9014549c,Smoke taken,12.91,80.11,\nsmk_dup,Smoke dup 1,12.911,80.111,\nsmk_dup,Smoke dup 2,12.912,80.112,\n");
+  await setFile("stops.csv", "action,stop_id,name,lat,lon,platform_code\nadd,de9014549c,Smoke taken,12.91,80.11,\nadd,smk_dup,Smoke dup 1,12.911,80.111,\nadd,smk_dup,Smoke dup 2,12.912,80.112,\n");
   await waitFor(`document.getElementById("page").innerText.includes("have errors")`, "dry run with errors");
   check(await evaluate(`[...document.querySelectorAll(".actionbar button")].find((b) => b.textContent.startsWith("Add"))?.disabled === true`), "adding is off while rows have errors");
   check((await text(".result-table")).includes("already exists") && (await text(".result-table")).includes("same stop id"), "the table says what to fix on each row");
   // the fixed file: 1,200 stops, one of them close to a same-named stop
-  const lines = ["stop_id,name,lat,lon,platform_code"];
-  for (let i = 0; i < 1199; i++) lines.push(`,Smoke import ${String(i).padStart(4, "0")},${(12.9 + Math.floor(i / 40) * 0.001).toFixed(6)},${(80.1 + (i % 40) * 0.001).toFixed(6)},`);
-  lines.push(`,"SIVAN TEMPLE-1",${sivan.lat + 0.0001},${sivan.lon},"Towards Luz, north"`);
+  const lines = ["action,stop_id,name,lat,lon,platform_code"];
+  for (let i = 0; i < 1199; i++) lines.push(`add,,Smoke import ${String(i).padStart(4, "0")},${(12.9 + Math.floor(i / 40) * 0.001).toFixed(6)},${(80.1 + (i % 40) * 0.001).toFixed(6)},`);
+  lines.push(`add,,"SIVAN TEMPLE-1",${sivan.lat + 0.0001},${sivan.lon},"Towards Luz, north"`);
   await setFile("stops-fixed.csv", lines.join("\r\n") + "\r\n");
   await waitFor(`document.getElementById("page").innerText.includes("can be added")`, "dry run of the fixed file", 20000);
   const summary = await text(".summary-chips");

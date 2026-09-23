@@ -3,7 +3,7 @@
 import { get, post, enc } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
 import {
-  h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, STOP_TYPE_LABEL, SERVED_EXCLUDE,
+  h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, STOP_TYPE_LABEL, SERVED_EXCLUDE,
   validateRows, renumberStages, decodePolyline, plural, ID_RE, ID_RULE,
   PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField,
 } from "./util.js";
@@ -116,6 +116,34 @@ export async function editStop(stop) {
   if (prior) setPin(Number(start.lat), Number(start.lon));
   showMoved();
 
+  // Standing at the stop is the surest way to fix a wrong point: one press puts
+  // it where you are, as one step to undo.
+  const locStatus = h("p.hint", { "aria-live": "polite" });
+  const locBtn = h("button.btn.secondary.small", { type: "button" }, "Use my location");
+  let locSeq = 0;
+  locBtn.addEventListener("click", async () => {
+    const mine = ++locSeq;
+    locBtn.disabled = true;
+    locStatus.textContent = "Finding your location…";
+    try {
+      const at = await myLocation({ fresh: true });
+      if (mine !== locSeq || !document.body.contains(f.lat)) return;
+      const before = placed, after = { lat: at.lat.toFixed(7), lon: at.lon.toFixed(7) };
+      putPin(after);
+      map.centerOn(at.lat, at.lon);
+      history.push({ label: "used your location", undo: () => putPin(before), redo: () => putPin(after) });
+      const rough = at.accuracy > LOCATION_ROUGH_METRES;
+      clear(locStatus, rough ? h("strong", `Moved to your location, but it is only accurate to about ${fmtMetres(at.accuracy)}. `)
+        : `Moved to your location (accurate to about ${fmtMetres(at.accuracy)}). `,
+        rough ? "Check the pin and drag it to the kerb." : "Drag the pin if the kerb is a little off.");
+    } catch (e) {
+      if (mine !== locSeq || !document.body.contains(f.lat)) return;
+      locStatus.textContent = `${e.message} Drag the pin on the map instead.`;
+    } finally {
+      if (mine === locSeq) locBtn.disabled = false;
+    }
+  });
+
   const cancel = () => { unsaved.done(); map.endModes(); showStop(stop.stop_id); };
   const save = async (ev) => {
     ev.preventDefault();
@@ -156,6 +184,8 @@ export async function editStop(stop) {
         h("label.field", { for: "stop-lon" }, h("span", "Longitude"), f.lon)),
       moved,
       h("p.hint", "Drag the teal pin on the map to the kerb where the bus stops."),
+      h("div.btn-row", locBtn),
+      locStatus,
       history.buttons(),
       h("div.field-row",
         h("label.field", { for: "stop-platform" }, h("span", "Platform label (optional)"), f.platform_code),

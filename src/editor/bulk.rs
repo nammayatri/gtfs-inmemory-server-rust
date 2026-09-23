@@ -70,9 +70,10 @@ impl Kind {
 
     pub fn columns(self) -> &'static [&'static str] {
         match self {
-            Kind::Stops => &["stop_id", "name", "lat", "lon", "platform_code"],
-            Kind::Routes => &["route_id", "short_name", "long_name", "color"],
+            Kind::Stops => &["action", "stop_id", "name", "lat", "lon", "platform_code"],
+            Kind::Routes => &["action", "route_id", "short_name", "long_name", "color"],
             Kind::RouteStops => &[
+                "action",
                 "route_id",
                 "sequence",
                 "stop_id",
@@ -80,8 +81,76 @@ impl Kind {
                 "stage_no",
                 "stage_name",
             ],
-            Kind::StopUpdates => &["stop_id", "platform_code", "description", "name"],
+            Kind::StopUpdates => &["action", "stop_id", "platform_code", "description", "name"],
         }
+    }
+
+    /// What `action` may say for this kind, and why not, for the rest.
+    fn refuses(self, action: Action) -> Option<String> {
+        match (self, action) {
+            (Kind::StopUpdates, Action::Add) => Some(
+                "the stop details file only updates stops; add one with the stops file, which carries its position"
+                    .into(),
+            ),
+            (Kind::StopUpdates, Action::Delete) => Some(
+                "the stop details file only updates stops; delete one with the stops file".into(),
+            ),
+            (Kind::RouteStops, Action::Delete) => Some(
+                "a route's stop list is uploaded whole: upload it with action update, leaving out the stops it should not have"
+                    .into(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// What a row asks for. Every row says which, in its `action` column.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Action {
+    Add,
+    Update,
+    Delete,
+}
+
+impl Action {
+    fn parse(s: &str) -> Option<Action> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "add" => Some(Action::Add),
+            "update" => Some(Action::Update),
+            "delete" => Some(Action::Delete),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Action::Add => "add",
+            Action::Update => "update",
+            Action::Delete => "delete",
+        }
+    }
+}
+
+/// The row's `action`, or why it cannot be read. Blank is an error, never a
+/// default: an upload says what it does to every row.
+fn cell_action(m: &Map<String, Value>, kind: Kind) -> Result<Action, String> {
+    let given = match m.get("action") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.trim().is_empty() => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("action must be text: add, update or delete".into()),
+    };
+    let Some(given) = given else {
+        return Err("action is required: add, update or delete".into());
+    };
+    let Some(action) = Action::parse(&given) else {
+        return Err(format!(
+            "action {given:?} is not one of add, update or delete"
+        ));
+    };
+    match kind.refuses(action) {
+        Some(why) => Err(format!("action {}: {why}", action.name())),
+        None => Ok(action),
     }
 }
 
@@ -236,12 +305,21 @@ async fn plan_stops(
     let mut plan = Plan::new(rows.len());
     let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
     let mut by_place: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
-    let mut ids: Vec<(usize, String)> = Vec::new();
+    // rows that create, and rows that change a stop that is already there
+    let mut adds: Vec<(usize, String)> = Vec::new();
+    let mut touches: Vec<(usize, String, Action, Map<String, Value>)> = Vec::new();
     for (i, v) in rows.iter().enumerate() {
         let m = match row_object(v, Kind::Stops) {
             Ok(m) => m,
             Err(f) => {
                 plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let action = match cell_action(m, Kind::Stops) {
+            Ok(a) => a,
+            Err(e) => {
+                plan.rows[i].findings.push(invalid_row(e));
                 continue;
             }
         };
@@ -291,62 +369,127 @@ async fn plan_stops(
         if let Some(p) = &platform {
             after.insert("platform_code".into(), json!(p));
         }
-        // exactly the single change's shape check; a stand-in id where the
-        // server will mint one
-        let key = id
-            .clone()
-            .unwrap_or_else(|| PROVISIONAL_STOP_ID.to_string());
-        let mut probe = after.clone();
-        probe.insert("stop_id".into(), json!(key));
-        if let Err(f) = check_payload("stop", "create", &key, &Value::Object(probe)) {
-            plan.rows[i].findings.push(f);
-        }
         if let Some(id) = &id {
             by_id.entry(id.clone()).or_default().push(i);
-            ids.push((i, id.clone()));
         }
-        if let (Some(name), Some(lat), Some(lon)) = (&name, lat, lon) {
-            let place = (
-                name.to_lowercase(),
-                (lat * 1e6).round() as i64,
-                (lon * 1e6).round() as i64,
-            );
-            by_place.entry(place).or_default().push(i);
+
+        if action == Action::Add {
+            // exactly the single change's shape check; a stand-in id where the
+            // server will mint one
+            let key = id
+                .clone()
+                .unwrap_or_else(|| PROVISIONAL_STOP_ID.to_string());
+            let mut probe = after.clone();
+            probe.insert("stop_id".into(), json!(key));
+            if let Err(f) = check_payload("stop", "create", &key, &Value::Object(probe)) {
+                plan.rows[i].findings.push(f);
+            }
+            if let Some(id) = &id {
+                adds.push((i, id.clone()));
+            }
+            if let (Some(name), Some(lat), Some(lon)) = (&name, lat, lon) {
+                let place = (
+                    name.to_lowercase(),
+                    (lat * 1e6).round() as i64,
+                    (lon * 1e6).round() as i64,
+                );
+                by_place.entry(place).or_default().push(i);
+            }
+            plan.changes.push(Planned {
+                entity: "stop",
+                op: "create",
+                key: id,
+                after: Value::Object(after),
+                before: Value::Null,
+                base: None,
+            });
+            plan.rows[i].change = Some(plan.changes.len() - 1);
+            continue;
         }
-        plan.changes.push(Planned {
-            entity: "stop",
-            op: "create",
-            key: id,
-            after: Value::Object(after),
-            before: Value::Null,
-            base: None,
-        });
-        plan.rows[i].change = Some(plan.changes.len() - 1);
+
+        // update and delete both name a stop that already exists
+        let Some(stop_id) = id else {
+            plan.rows[i].findings.push(invalid_row(format!(
+                "stop_id is required to {} a stop",
+                action.name()
+            )));
+            continue;
+        };
+        let mut fields = after;
+        fields.remove("stop_id");
+        if action == Action::Update && fields.is_empty() {
+            plan.rows[i].findings.push(Finding::error(
+                "nothing_to_update",
+                stop_id.as_str(),
+                format!("the row for stop {stop_id} gives no name, lat and lon, or platform_code"),
+            ));
+            continue;
+        }
+        if action == Action::Delete && !fields.is_empty() {
+            // deleting takes the id alone; a filled cell means the row was meant
+            // to change something
+            plan.rows[i].findings.push(invalid_row(format!(
+                "action delete takes stop_id alone; this row also fills in {}",
+                fields.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+            continue;
+        }
+        if action == Action::Update {
+            if let Err(f) =
+                check_payload("stop", "update", &stop_id, &Value::Object(fields.clone()))
+            {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        }
+        touches.push((i, stop_id, action, fields));
     }
     mark_duplicates(&mut plan, by_id, |id| format!("stop_id {id}"));
     mark_duplicates(&mut plan, by_place, |(name, _, _)| {
         format!("a stop named {name:?} at the same position")
     });
 
-    let wanted: Vec<String> = ids.iter().map(|(_, id)| id.clone()).collect();
-    let live: HashSet<String> = if wanted.is_empty() {
-        HashSet::new()
-    } else {
-        sqlx::query("SELECT stop_id FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)")
-            .bind(g)
-            .bind(&wanted)
-            .fetch_all(&mut *conn)
-            .await?
-            .iter()
-            .map(|r| r.try_get("stop_id"))
-            .collect::<Result<_, _>>()?
-    };
-    for (i, id) in ids {
-        if live.contains(&id) {
+    // the live rows behind every id the upload names: an add must not find one,
+    // an update or a delete must
+    let mut wanted: Vec<String> = adds.iter().map(|(_, id)| id.clone()).collect();
+    wanted.extend(touches.iter().map(|(_, id, _, _)| id.clone()));
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut live: HashMap<String, LiveStopRow> = HashMap::with_capacity(wanted.len());
+    if !wanted.is_empty() {
+        for r in sqlx::query(
+            "SELECT stop_id, lat, lon, location_type, deleted, row_version \
+             FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
+        )
+        .bind(g)
+        .bind(&wanted)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            live.insert(
+                r.try_get("stop_id")?,
+                LiveStopRow {
+                    lat: r.try_get("lat")?,
+                    lon: r.try_get("lon")?,
+                    location_type: r.try_get("location_type")?,
+                    deleted: r.try_get("deleted")?,
+                    row_version: r.try_get("row_version")?,
+                },
+            );
+        }
+    }
+    for (i, id) in adds {
+        if live.get(&id).is_some_and(|s| !s.deleted) {
             plan.rows[i].findings.push(Finding::error(
                 "stop_exists",
                 id.as_str(),
-                format!("stop {id} already exists"),
+                format!("stop {id} already exists; action update changes it"),
+            ));
+        } else if live.contains_key(&id) {
+            plan.rows[i].findings.push(Finding::error(
+                "stop_exists",
+                id.as_str(),
+                format!("stop {id} existed and was deleted; its id cannot be used again"),
             ));
         } else if let Some(c) = draft.created_stop(&id) {
             plan.rows[i].findings.push(Finding::error(
@@ -358,6 +501,81 @@ async fn plan_stops(
                 ),
             ));
         }
+    }
+    for (i, id, action, fields) in touches {
+        if let Some((into, by)) = draft.merged_into(&id) {
+            plan.rows[i].findings.push(Finding::error(
+                "stop_merged_away",
+                id.as_str(),
+                format!("stop {id} is merged into {into} by change {by} earlier in this draft; use {into}"),
+            ));
+            continue;
+        }
+        if draft.stop_deleted(&id) {
+            plan.rows[i].findings.push(Finding::error(
+                "stop_deleted",
+                id.as_str(),
+                format!("stop {id} is deleted earlier in this draft"),
+            ));
+            continue;
+        }
+        let in_draft = draft.created_stop(&id);
+        let base = match (live.get(&id), in_draft) {
+            (Some(s), _) if s.deleted => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_deleted",
+                    id.as_str(),
+                    format!("stop {id} is deleted"),
+                ));
+                continue;
+            }
+            (Some(s), _) if s.location_type == 1 => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_is_station",
+                    id.as_str(),
+                    format!("{id} is a station; stations are edited in the dashboard, not here"),
+                ));
+                continue;
+            }
+            (Some(s), _) => Some(s.row_version),
+            // a stop this draft creates: the change it carries has no live version
+            (None, Some(_)) if action == Action::Delete => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_not_live",
+                    id.as_str(),
+                    format!(
+                        "stop {id} is created in this draft; remove that change instead of deleting it"
+                    ),
+                ));
+                continue;
+            }
+            (None, Some(_)) => None,
+            (None, None) => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_not_found",
+                    id.as_str(),
+                    format!("no stop {id}; action add creates one"),
+                ));
+                continue;
+            }
+        };
+        plan.changes.push(Planned {
+            entity: "stop",
+            op: if action == Action::Delete {
+                "delete"
+            } else {
+                "update"
+            },
+            key: Some(id),
+            after: if action == Action::Delete {
+                Value::Null
+            } else {
+                Value::Object(fields)
+            },
+            before: Value::Null,
+            base,
+        });
+        plan.rows[i].change = Some(plan.changes.len() - 1);
     }
     Ok(plan)
 }
@@ -373,11 +591,20 @@ async fn plan_routes(
     let mut plan = Plan::new(rows.len());
     let agency = service::usual_agency(conn, g).await?;
     let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut adds: Vec<(usize, String)> = Vec::new();
+    let mut touches: Vec<(usize, String, Action, Map<String, Value>)> = Vec::new();
     for (i, v) in rows.iter().enumerate() {
         let m = match row_object(v, Kind::Routes) {
             Ok(m) => m,
             Err(f) => {
                 plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let action = match cell_action(m, Kind::Routes) {
+            Ok(a) => a,
+            Err(e) => {
+                plan.rows[i].findings.push(invalid_row(e));
                 continue;
             }
         };
@@ -394,69 +621,165 @@ async fn plan_routes(
             continue;
         }
         let [id, short, long, color] = cells.map(|c| c.unwrap_or_default());
-        let mut after = Map::new();
+        if let Some(id) = &id {
+            by_id.entry(id.clone()).or_default().push(i);
+        }
+        let mut fields = Map::new();
         for (k, v) in [
-            ("route_id", &id),
             ("short_name", &short),
             ("long_name", &long),
             ("color", &color),
         ] {
             if let Some(v) = v {
-                after.insert(k.into(), json!(v));
+                fields.insert(k.into(), json!(v));
             }
         }
-        after.insert("route_type".into(), json!(3));
-        if let Some(a) = &agency {
-            after.insert("agency_id".into(), json!(a));
+
+        if action == Action::Add {
+            let mut after = fields.clone();
+            if let Some(id) = &id {
+                after.insert("route_id".into(), json!(id));
+            }
+            after.insert("route_type".into(), json!(3));
+            if let Some(a) = &agency {
+                after.insert("agency_id".into(), json!(a));
+            }
+            let after = Value::Object(after);
+            let key = id.clone().unwrap_or_default();
+            if let Err(f) = check_payload("route", "create", &key, &after) {
+                plan.rows[i].findings.push(f);
+            }
+            if let Some(id) = &id {
+                adds.push((i, id.clone()));
+            }
+            plan.changes.push(Planned {
+                entity: "route",
+                op: "create",
+                key: Some(key),
+                after,
+                before: Value::Null,
+                base: None,
+            });
+            plan.rows[i].change = Some(plan.changes.len() - 1);
+            continue;
         }
-        let after = Value::Object(after);
-        let key = id.clone().unwrap_or_default();
-        if let Err(f) = check_payload("route", "create", &key, &after) {
-            plan.rows[i].findings.push(f);
+
+        let Some(route_id) = id else {
+            plan.rows[i].findings.push(invalid_row(format!(
+                "route_id is required to {} a route",
+                action.name()
+            )));
+            continue;
+        };
+        if action == Action::Update && fields.is_empty() {
+            plan.rows[i].findings.push(Finding::error(
+                "nothing_to_update",
+                route_id.as_str(),
+                format!("the row for route {route_id} gives no short_name, long_name or color"),
+            ));
+            continue;
         }
-        if let Some(id) = &id {
-            by_id.entry(id.clone()).or_default().push(i);
+        if action == Action::Delete && !fields.is_empty() {
+            plan.rows[i].findings.push(invalid_row(format!(
+                "action delete takes route_id alone; this row also fills in {}",
+                fields.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+            continue;
         }
-        plan.changes.push(Planned {
-            entity: "route",
-            op: "create",
-            key: Some(key),
-            after,
-            before: Value::Null,
-            base: None,
-        });
-        plan.rows[i].change = Some(plan.changes.len() - 1);
+        if action == Action::Update {
+            if let Err(f) =
+                check_payload("route", "update", &route_id, &Value::Object(fields.clone()))
+            {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        }
+        touches.push((i, route_id, action, fields));
     }
-    let wanted: Vec<String> = by_id.keys().cloned().collect();
-    let live: HashSet<String> = if wanted.is_empty() {
-        HashSet::new()
-    } else {
-        sqlx::query("SELECT route_id FROM gtfs_route WHERE gtfs_id = $1 AND route_id = ANY($2)")
-            .bind(g)
-            .bind(&wanted)
-            .fetch_all(&mut *conn)
-            .await?
-            .iter()
-            .map(|r| r.try_get("route_id"))
-            .collect::<Result<_, _>>()?
-    };
-    for (id, at) in &by_id {
-        let found = if live.contains(id) {
-            Some(format!("route {id} already exists"))
+
+    let mut wanted: Vec<String> = by_id.keys().cloned().collect();
+    wanted.sort_unstable();
+    let mut live: HashMap<String, (bool, i32)> = HashMap::with_capacity(wanted.len());
+    if !wanted.is_empty() {
+        for r in sqlx::query(
+            "SELECT route_id, deleted, row_version FROM gtfs_route \
+             WHERE gtfs_id = $1 AND route_id = ANY($2)",
+        )
+        .bind(g)
+        .bind(&wanted)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            live.insert(
+                r.try_get("route_id")?,
+                (r.try_get("deleted")?, r.try_get("row_version")?),
+            );
+        }
+    }
+    for (i, id) in adds {
+        let found = if live.contains_key(&id) {
+            Some(format!(
+                "route {id} already exists; action update changes it"
+            ))
         } else {
             draft
-                .created_route(id)
+                .created_route(&id)
                 .map(|cid| format!("route {id} is already created in this draft (change {cid})"))
         };
         if let Some(message) = found {
-            for i in at {
-                plan.rows[*i].findings.push(Finding::error(
-                    "route_exists",
-                    id.as_str(),
-                    message.clone(),
-                ));
-            }
+            plan.rows[i]
+                .findings
+                .push(Finding::error("route_exists", id.as_str(), message));
         }
+    }
+    for (i, id, action, fields) in touches {
+        let base = match (live.get(&id), draft.created_route(&id)) {
+            (Some((true, _)), _) => {
+                plan.rows[i].findings.push(Finding::error(
+                    "route_deleted",
+                    id.as_str(),
+                    format!("route {id} is deleted"),
+                ));
+                continue;
+            }
+            (Some((_, version)), _) => Some(*version),
+            (None, Some(_)) if action == Action::Delete => {
+                plan.rows[i].findings.push(Finding::error(
+                    "route_not_live",
+                    id.as_str(),
+                    format!(
+                        "route {id} is created in this draft; remove that change instead of deleting it"
+                    ),
+                ));
+                continue;
+            }
+            (None, Some(_)) => None,
+            (None, None) => {
+                plan.rows[i].findings.push(Finding::error(
+                    "route_not_found",
+                    id.as_str(),
+                    format!("no route {id}; action add creates one"),
+                ));
+                continue;
+            }
+        };
+        plan.changes.push(Planned {
+            entity: "route",
+            op: if action == Action::Delete {
+                "delete"
+            } else {
+                "update"
+            },
+            key: Some(id),
+            after: if action == Action::Delete {
+                Value::Null
+            } else {
+                Value::Object(fields)
+            },
+            before: Value::Null,
+            base,
+        });
+        plan.rows[i].change = Some(plan.changes.len() - 1);
     }
     mark_duplicates(&mut plan, by_id, |id| format!("route_id {id}"));
     Ok(plan)
@@ -481,11 +804,20 @@ async fn plan_route_stops(
     let mut routes: Vec<(String, Vec<StopRow>)> = Vec::new();
     let mut route_at: HashMap<String, usize> = HashMap::new();
     let mut by_seq: HashMap<(String, i32), Vec<usize>> = HashMap::new();
+    // what each route's rows say to do, and where they said it
+    let mut route_action: HashMap<String, Vec<(usize, Action)>> = HashMap::new();
     for (i, v) in rows.iter().enumerate() {
         let m = match row_object(v, Kind::RouteStops) {
             Ok(m) => m,
             Err(f) => {
                 plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let action = match cell_action(m, Kind::RouteStops) {
+            Ok(a) => a,
+            Err(e) => {
+                plan.rows[i].findings.push(invalid_row(e));
                 continue;
             }
         };
@@ -553,6 +885,10 @@ async fn plan_route_stops(
             .entry((route_id.clone(), sequence))
             .or_default()
             .push(i);
+        route_action
+            .entry(route_id.clone())
+            .or_default()
+            .push((i, action));
         let at = *route_at.entry(route_id.clone()).or_insert_with(|| {
             routes.push((route_id.clone(), Vec::new()));
             routes.len() - 1
@@ -630,6 +966,15 @@ async fn plan_route_stops(
         let current = draft.current_rows(&route_id, &live);
         let mut findings: Vec<(Option<usize>, Finding)> = Vec::new();
 
+        // a route's stop list is uploaded whole, so its rows agree on the action
+        let said = route_action.get(&route_id).cloned().unwrap_or_default();
+        let action = said.first().map(|(_, a)| *a).unwrap_or(Action::Update);
+        let mixed: Vec<usize> = said
+            .iter()
+            .filter(|(_, a)| *a != action)
+            .map(|(i, _)| *i)
+            .collect();
+        let has_rows = !current.is_empty();
         let route_state = match live_routes.get(&route_id) {
             Some(true) => Some(("route_deleted", format!("route {route_id} is deleted"))),
             _ if draft.route_deleted(&route_id) => Some((
@@ -639,6 +984,24 @@ async fn plan_route_stops(
             None if draft.created_route(&route_id).is_none() => {
                 Some(("route_not_found", format!("no route {route_id}")))
             }
+            _ if !mixed.is_empty() => Some((
+                "mixed_action",
+                format!(
+                    "route {route_id} has rows saying {} and rows saying something else; a route's whole stop list is one action",
+                    action.name()
+                ),
+            )),
+            _ if action == Action::Add && has_rows => Some((
+                "route_stops_exist",
+                format!(
+                    "route {route_id} already has a stop list of {} stops; action update replaces it",
+                    current.len()
+                ),
+            )),
+            _ if action == Action::Update && !has_rows => Some((
+                "route_stops_missing",
+                format!("route {route_id} has no stop list yet; action add gives it one"),
+            )),
             _ => None,
         };
         if let Some((code, message)) = route_state {
@@ -825,6 +1188,10 @@ async fn plan_stop_updates(
                 continue;
             }
         };
+        if let Err(e) = cell_action(m, Kind::StopUpdates) {
+            plan.rows[i].findings.push(invalid_row(e));
+            continue;
+        }
         let cells = ["stop_id", "platform_code", "description", "name"].map(|k| cell_text(m, k));
         let bad: Vec<String> = cells
             .iter()
@@ -1271,6 +1638,73 @@ mod tests {
         assert_eq!(cell_text(&m, "c"), Ok(None));
         assert_eq!(cell_text(&m, "h"), Ok(Some("7".into())));
         assert!(cell_text(&m, "i").is_err());
+    }
+
+    #[test]
+    fn every_row_says_what_it_does() {
+        let row = |v: Value| {
+            let m = v.as_object().unwrap().clone();
+            m
+        };
+        // add, update and delete, however they are typed
+        for (given, want) in [
+            ("add", Action::Add),
+            ("UPDATE", Action::Update),
+            (" delete ", Action::Delete),
+        ] {
+            assert_eq!(
+                cell_action(&row(json!({"action": given})), Kind::Stops),
+                Ok(want),
+                "{given}"
+            );
+        }
+        // blank is never a default: the upload says what it does to every row
+        for blank in [
+            json!({}),
+            json!({"action": ""}),
+            json!({"action": "  "}),
+            json!({"action": null}),
+        ] {
+            let e = cell_action(&row(blank), Kind::Stops).unwrap_err();
+            assert!(e.contains("action is required"), "{e}");
+        }
+        let e = cell_action(&row(json!({"action": "upsert"})), Kind::Stops).unwrap_err();
+        assert!(e.contains("not one of add, update or delete"), "{e}");
+        assert!(cell_action(&row(json!({"action": 1})), Kind::Stops).is_err());
+        // what each kind can be asked for
+        assert_eq!(
+            cell_action(&row(json!({"action": "delete"})), Kind::Routes),
+            Ok(Action::Delete)
+        );
+        for (kind, action, says) in [
+            (Kind::StopUpdates, "add", "carries its position"),
+            (
+                Kind::StopUpdates,
+                "delete",
+                "delete one with the stops file",
+            ),
+            (Kind::RouteStops, "delete", "leaving out the stops"),
+        ] {
+            let e = cell_action(&row(json!({"action": action})), kind).unwrap_err();
+            assert!(e.contains(says), "{kind:?} {action}: {e}");
+        }
+        assert_eq!(
+            cell_action(&row(json!({"action": "update"})), Kind::RouteStops),
+            Ok(Action::Update)
+        );
+        assert_eq!(
+            cell_action(&row(json!({"action": "update"})), Kind::StopUpdates),
+            Ok(Action::Update)
+        );
+        // and it is a column of every kind
+        for kind in [
+            Kind::Stops,
+            Kind::Routes,
+            Kind::RouteStops,
+            Kind::StopUpdates,
+        ] {
+            assert_eq!(kind.columns()[0], "action", "{kind:?}");
+        }
     }
 
     #[test]
