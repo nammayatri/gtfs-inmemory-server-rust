@@ -105,6 +105,14 @@ pub fn parse(token: &str) -> Result<ParsedToken<'_>, JwtError> {
     })
 }
 
+/// RFC 7519 NumericDate: "a JSON numeric value representing the number of
+/// seconds" - not necessarily an integer. Pomerium emits `1.790144277e+09`,
+/// which `Value::as_i64` rejects outright, so an exp read with it comes back
+/// absent and a perfectly valid token is reported expired.
+fn numeric_date(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
 /// Verify with a known public key (uncompressed SEC1 point, 65 bytes).
 pub fn verify(
     parsed: &ParsedToken<'_>,
@@ -119,17 +127,17 @@ pub fn verify(
     let c = &parsed.claims;
     let exp = c
         .get("exp")
-        .and_then(Value::as_i64)
+        .and_then(numeric_date)
         .ok_or(JwtError::Expired)?;
     if exp + LEEWAY_SECS < now_unix {
         return Err(JwtError::Expired);
     }
-    if let Some(nbf) = c.get("nbf").and_then(Value::as_i64) {
+    if let Some(nbf) = c.get("nbf").and_then(numeric_date) {
         if nbf - LEEWAY_SECS > now_unix {
             return Err(JwtError::NotYetValid);
         }
     }
-    if let Some(iat) = c.get("iat").and_then(Value::as_i64) {
+    if let Some(iat) = c.get("iat").and_then(numeric_date) {
         if iat - LEEWAY_SECS > now_unix {
             return Err(JwtError::NotYetValid);
         }
@@ -382,6 +390,41 @@ mod tests {
         // JWKS parse yields the same key
         let keys = parse_jwks(s.jwks().as_bytes()).unwrap();
         assert_eq!(keys.get("k1").unwrap(), &s.public_point());
+    }
+
+    /// Pomerium 0.17 writes NumericDate claims as JSON floats in scientific
+    /// notation (`"exp": 1.790144277e+09`). RFC 7519 allows that - `exp` is "a
+    /// JSON numeric value", not an integer - and `Value::as_i64` returns None
+    /// for it, which read as a missing exp and reported every live token as
+    /// expired. Real values from the prod assertion that exposed this.
+    #[test]
+    fn accepts_float_numeric_dates_as_pomerium_sends_them() {
+        let s = TestSigner::generate("k1");
+        let now: i64 = 1_790_143_996;
+        let tok = s.sign(json!({
+            "aud": AUD,
+            "email": "ops@nammayatri.in",
+            "iat": 1.790143954e+09,
+            "exp": 1.790144277e+09,
+        }));
+        let claims = verify(&parse(&tok).unwrap(), &s.public_point(), AUD, now)
+            .expect("a float exp that is still in the future must verify");
+        assert_eq!(claims.email, "ops@nammayatri.in");
+
+        // a float exp in the past is still rejected - the fix must not swallow expiry
+        let stale = s.sign(json!({"aud": AUD, "email": "a@b.c", "exp": 1.790143000e+09}));
+        assert_eq!(
+            verify(&parse(&stale).unwrap(), &s.public_point(), AUD, now),
+            Err(JwtError::Expired)
+        );
+
+        // a float nbf in the future is still rejected
+        let early = s.sign(json!({"aud": AUD, "email": "a@b.c",
+                                  "exp": 1.790144277e+09, "nbf": 1.790144200e+09}));
+        assert_eq!(
+            verify(&parse(&early).unwrap(), &s.public_point(), AUD, now),
+            Err(JwtError::NotYetValid)
+        );
     }
 
     #[test]
