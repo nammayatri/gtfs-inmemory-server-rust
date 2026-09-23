@@ -1269,6 +1269,16 @@ pub async fn webhook_test(
     ok(webhooks::test(&st, &ctx, *path).await?)
 }
 
+/// The Release to Nandi button (docs/gtfs-editor.md section 12.6).
+pub async fn feed_release(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require(&req, &st, Role::Approver).await?;
+    ok(webhooks::release(&st, &ctx, &path).await?)
+}
+
 #[derive(Deserialize)]
 pub struct DeliveriesQuery {
     #[serde(default)]

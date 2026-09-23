@@ -15,12 +15,14 @@ const EVENT_LABEL = {
   feed_in_sync: "Every pod is serving the edit",
   feed_committed: "A draft was committed",
   feed_reload_failed: "A pod could not load the data",
+  release_requested: "An approver asks for a Nandi release",
 };
 
 const EVENT_HELP = {
   feed_in_sync: "The safe moment to rebuild a cache that sits in front of GIMS. Waits until no pod is still serving older data.",
   feed_committed: "Fires at once, without waiting for the pods. Use it to tell people, not to rebuild a cache.",
   feed_reload_failed: "An alert: a pod is stuck on older data and needs looking at.",
+  release_requested: "Never sent on its own: only when an approver presses Release to Nandi on this page. Point it at the Jenkins job that builds and releases Nandi.",
 };
 
 const DELIVERY_LABEL = {
@@ -41,6 +43,7 @@ export function leaveWebhooks() {
 export async function showDelivery() {
   const feed = state.feedId;
   const fleetBox = h("div", h("p.empty", "Loading…"));
+  const releaseBox = h("div");
   const settingsBox = h("div");
   const hooksBox = h("div");
   const historyBox = h("div");
@@ -54,6 +57,7 @@ export async function showDelivery() {
       get(`feeds/${enc(feed)}/webhook-deliveries?limit=25`).catch((e) => ({ error: e })),
     ]);
     renderFleet(fleetBox, fleet);
+    renderRelease(releaseBox, fleet, load);
     renderSettings(settingsBox, settings, load);
     renderHooks(hooksBox, hooks, load);
     renderHistory(historyBox, history);
@@ -64,6 +68,7 @@ export async function showDelivery() {
       h("h1", "Delivery"),
       h("p.hint", "Where each pod has got to, and who is told when an edit goes live.")),
     fleetBox,
+    releaseBox,
     settingsBox,
     hooksBox,
     historyBox,
@@ -107,6 +112,60 @@ function renderFleet(box, fleet) {
           : p.up_to_date ? h("span.chip.ok", "Up to date")
           : p.data_source === "db" ? h("span.chip.warn", "Behind") : ""))))))
       : null));
+}
+
+// ------------------------------------------------------------------ Nandi
+
+// GIMS follows a commit by itself; Nandi's data is baked into images, so an edit
+// only reaches it through a Jenkins build. This button asks for that build.
+const RELEASE_REASON = {
+  webhooks_inactive: "Webhooks are off, so the request could not be sent. Turn them on under “Where GIMS may send”.",
+  no_release_webhook: "Add a webhook for release_requested to point this button at the Jenkins job.",
+  release_in_progress: "A release is already on its way.",
+};
+
+function renderRelease(box, fleet, reload) {
+  const r = fleet.release;
+  if (fleet.error || !r || fleet.data_source !== "db") return clear(box);
+  const behind = fleet.version - (r.released_version ?? 0);
+  const last = r.last_request;
+  const reason = r.reason === "nothing_to_release"
+    ? `Nandi already has v${fleet.version}.`
+    : RELEASE_REASON[r.reason] ?? null;
+
+  const press = async () => {
+    const ok = await confirmDialog(`Build and release version ${fleet.version} to Nandi?`,
+      "Jenkins exports the feed, builds the Nandi images and releases them. It takes a while; this page shows when Nandi has it.",
+      { confirm: "Release" });
+    if (!ok) return;
+    try {
+      await post(`feeds/${enc(fleet.gtfs_id)}/release`);
+      toast("Asked Jenkins to release to Nandi.");
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+    reload();
+  };
+
+  const master = r.target === "master";
+  clear(box, h("section.section",
+    h("h2", master ? "Nandi (master)" : "Nandi"),
+    master ? h("p.hint", "This is the master editor: Release to Nandi builds and releases master Nandi only. Prod's released version is shown for reference; a master release does not change it.") : null,
+    h("p.hint",
+      `Committed v${fleet.version} · `,
+      r.released_version != null
+        ? `Released to Nandi v${r.released_version}${r.released_at ? ` (${fmtDate(r.released_at)})` : ""}`
+        : "Never released to Nandi from here"),
+    behind > 0 ? h("p.notice.warning", `${plural(behind, "committed version")} ${behind === 1 ? "is" : "are"} not on Nandi yet.`) : null,
+    reason ? h("p.hint", reason) : null,
+    can("approver")
+      ? h("div.row-actions",
+          h("button.btn", { type: "button", disabled: !r.can_release, on: { click: press } }, "Release to Nandi"))
+      : null,
+    last ? h("p.hint",
+      `Last request: ${fmtDate(last.created_at)} by ${last.requested_by ?? "?"} → `,
+      last.response_status ? `Jenkins ${last.response_status} ` : "",
+      `(${DELIVERY_LABEL[last.status] ?? last.status})`) : null));
 }
 
 // ------------------------------------------------------------------ settings
@@ -225,7 +284,8 @@ function renderHooks(box, data, reload) {
         h("td", w.enabled ? h("span.chip.ok", "On") : h("span.chip", "Off")),
         h("td.row-actions", admin ? [
           h("button.btn.quiet.small", { type: "button", on: { click: () => hookForm(w, reload) } }, "Edit"),
-          h("button.btn.quiet.small", { type: "button", on: { click: () => testHook(w, reload) } }, "Test"),
+          w.event === "release_requested" ? null
+            : h("button.btn.quiet.small", { type: "button", on: { click: () => testHook(w, reload) } }, "Test"),
           h("button.btn.quiet.small.danger", { type: "button", on: { click: () => removeHook(w, reload) } }, "Delete"),
         ] : h("span.hint", "Admins only")))))))
       : h("p.empty", "No webhook yet."),
@@ -367,7 +427,7 @@ function renderHistory(box, data) {
       h("thead", h("tr", h("th", "When"), h("th", "Webhook"), h("th", "Version"), h("th", "Result"), h("th", "Detail"))),
       h("tbody", items.map((d) => h("tr",
         h("td", fmtDate(d.created_at)),
-        h("td", d.webhook || h("span.hint", "deleted"), d.kind === "test" ? h("span.chip", " test") : null),
+        h("td", d.webhook || h("span.hint", "deleted"), d.kind === "test" ? h("span.chip", " test") : d.kind === "release" ? h("span.chip", " release") : null),
         h("td", `v${d.feed_version}`),
         h("td", h("span", { class: `chip ${chipFor(d.status)}` }, DELIVERY_LABEL[d.status] || d.status),
           d.attempts > 1 ? h("div.hint", `${plural(d.attempts, "try", "tries")}`) : null),

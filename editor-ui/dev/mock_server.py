@@ -1235,6 +1235,20 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(404, "feed_not_found", "no such feed")
                 feed["data_source"] = b.get("data_source", "db")
             return self._send(200, {"gtfs_id": b.get("gtfs_id"), "data_source": feed["data_source"]})
+        if path == "/__dev/feed-release" and method == "POST":
+            # stands in for a commit (version) and for nandi's --mark-released
+            # (released_version), so the Nandi section can be driven through its states
+            b = self._body()
+            with LOCK:
+                feed = s.feeds.get(b.get("gtfs_id", ""))
+                if feed is None:
+                    raise ApiError(404, "feed_not_found", "no such feed")
+                if "version" in b:
+                    feed["version"] = int(b["version"])
+                if "released_version" in b:
+                    feed["released_version"] = int(b["released_version"])
+                    feed["released_at"] = iso(now())
+            return self._send(200, {k: feed.get(k) for k in ("gtfs_id", "version", "released_version")})
         raise ApiError(404, "not_found", "No such dev endpoint.")
 
     # ---- auth
@@ -3588,7 +3602,14 @@ def seed_round5(store):
 #   edits, and a history. Nothing is actually sent - a "test" is recorded as
 #   delivered so the page can be exercised without a receiver.
 
-WEBHOOK_EVENTS = ["feed_in_sync", "feed_committed", "feed_reload_failed"]
+WEBHOOK_EVENTS = ["feed_in_sync", "feed_committed", "feed_reload_failed", "release_requested"]
+RELEASE_WINDOW = timedelta(minutes=180)
+RELEASE_MESSAGES = {
+    "webhooks_inactive": "webhooks are off or the allow-list is empty, so nothing would be sent",
+    "no_release_webhook": "add a webhook for release_requested to point this button at the Jenkins job",
+    "nothing_to_release": "Nandi already has the committed version",
+    "release_in_progress": "a release is already on its way",
+}
 # what this "deployment" ships with, which is only the seed: once the settings
 # row below exists it decides instead (docs/gtfs-editor.md section 12.5)
 WEBHOOK_CONFIG = {"enabled": True, "allowed_hosts": ["jenkins.mock.invalid", "127.0.0.1"]}
@@ -3662,6 +3683,33 @@ def seed_webhooks(store):
     }
 
 
+def _release_state(s, g):
+    """The Release to Nandi verdict, in the server's order (docs section 12.6)."""
+    f = s.feeds[g]
+    v, rel = f["version"], f.get("released_version")
+    reqs = [d for d in s.deliveries if d["gtfs_id"] == g and d["kind"] == "release"]
+    busy = any(d["status"] in ("pending", "in_flight", "succeeded")
+               and now() - datetime.fromisoformat(d["created_at"].replace("Z", "+00:00")) < RELEASE_WINDOW
+               and d["feed_version"] > (rel or 0) for d in reqs)
+    has_hook = any(w["gtfs_id"] == g and w["enabled"] and w["event"] == "release_requested"
+                   for w in s.webhooks.values())
+    if not webhook_policy(s)["active"]:
+        reason = "webhooks_inactive"
+    elif not has_hook:
+        reason = "no_release_webhook"
+    elif rel is not None and rel >= v:
+        reason = "nothing_to_release"
+    elif busy:
+        reason = "release_in_progress"
+    else:
+        reason = None
+    last = reqs[-1] if reqs else None
+    return {"released_version": rel, "released_at": f.get("released_at"),
+            "last_request": last and {k: last[k] for k in ("delivery_id", "requested_by", "created_at",
+                                                           "status", "response_status", "feed_version")},
+            "target": "prod", "can_release": reason is None, "reason": reason}
+
+
 def _webhook_out(w):
     return {k: w[k] for k in (
         "webhook_id", "gtfs_id", "name", "event", "url", "method", "headers", "body", "enabled",
@@ -3697,7 +3745,7 @@ class WebhookHandler(PolicyHandler):
     def _api(self, method, path, q):
         parts = [unquote(p) for p in path.strip("/").split("/")]
         s = self.store
-        if len(parts) == 3 and parts[0] == "feeds" and parts[2] in ("cache-state", "webhooks", "webhook-deliveries"):
+        if len(parts) == 3 and parts[0] == "feeds" and parts[2] in ("cache-state", "webhooks", "webhook-deliveries", "release"):
             u = self.session_user()
             self.require_mutation(method)
             g = parts[1]
@@ -3715,7 +3763,31 @@ class WebhookHandler(PolicyHandler):
                              "live_pods": len(pods), "stale_pods": 0,
                              "fleet_version": min([p["loaded_version"] for p in pods], default=None),
                              "settled_at": iso(now()), "stale_after_seconds": 60,
-                             "waiting_for": waiting, "pods": pods}
+                             "waiting_for": waiting, "pods": pods,
+                             "release": _release_state(s, g)}
+            if parts[2] == "release":
+                if method != "POST":
+                    raise ApiError(405, "method_not_allowed", "POST only")
+                self.require_role(u, "approver")
+                rs = _release_state(s, g)
+                if rs["reason"]:
+                    status = 400 if rs["reason"] == "webhooks_inactive" else 409
+                    raise ApiError(status, rs["reason"], RELEASE_MESSAGES[rs["reason"]])
+                v = s.feeds[g]["version"]
+                ids = []
+                for w in s.webhooks.values():
+                    if w["gtfs_id"] == g and w["enabled"] and w["event"] == "release_requested":
+                        d = {"delivery_id": str(uuid.uuid4()), "webhook_id": w["webhook_id"],
+                             "webhook": w["name"], "gtfs_id": g, "event": w["event"],
+                             "feed_version": v, "kind": "release",
+                             "status": "succeeded", "attempts": 1, "next_attempt_at": None,
+                             "pod_count": len(s.pods.get(g, [])), "pods": None,
+                             "response_status": 201, "last_error": None, "claimed_by": "mock",
+                             "requested_by": u["email"], "created_at": iso(now()), "completed_at": iso(now())}
+                        s.deliveries.append(d)
+                        ids.append(d["delivery_id"])
+                s.add_audit(u, "release_requested", g, None, {"feed_version": v})
+                return 200, {"delivery_ids": ids, "feed_version": v, "status": "pending"}
             if parts[2] == "webhook-deliveries":
                 items = [d for d in s.deliveries if d["gtfs_id"] == g]
                 return 200, {"items": list(reversed(items))[:int(q.get("limit", ["50"])[0])]}
@@ -3777,6 +3849,9 @@ class WebhookHandler(PolicyHandler):
                 raise ApiError(404, "webhook_not_found", "no such webhook")
             self.require_role(u, "admin")
             if len(parts) == 3 and parts[2] == "test" and method == "POST":
+                if w["event"] == "release_requested":
+                    raise ApiError(400, "release_webhook_untestable",
+                                   "a release webhook starts a real Nandi release; use Release to Nandi instead")
                 if not webhook_policy(s)["active"]:
                     raise ApiError(400, "webhooks_inactive",
                                    "webhooks are off or the allow-list is empty, "

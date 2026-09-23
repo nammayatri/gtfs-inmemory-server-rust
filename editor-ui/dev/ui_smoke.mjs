@@ -1223,6 +1223,15 @@ async function deliveryFlows() {
     "with nothing saved it says the deployment's configuration is what GIMS goes by");
   await shot("wh-01-empty");
 
+  // the Nandi section (docs section 12.6): the button says why it cannot be pressed
+  const rel = (body) => evaluate(`fetch("/__dev/feed-release", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify({ gtfs_id: "chennai_bus", ...body }))} }).then(() => true)`);
+  await rel({ version: 7, released_version: 5 });
+  await waitFor(`document.querySelector("#page").innerText.includes("Released to Nandi v5")`, "the Nandi section shows what Nandi has");
+  check((await text("#page")).includes("2 committed versions are not on Nandi yet"), "it counts what is waiting");
+  check((await text("#page")).includes("Add a webhook for release_requested"), "with no release webhook it says what to add");
+  check(await evaluate(`[...document.querySelectorAll("#page button")].find((b) => b.innerText === "Release to Nandi")?.disabled === true`), "and the button is disabled");
+  await shot("wh-01b-nandi-no-hook");
+
   // the policy is editable here: a host that is not a host name is refused,
   // and a host the deployment never allowed can be added (docs section 12.5)
   await click("Change these settings", "#page");
@@ -1238,6 +1247,31 @@ async function deliveryFlows() {
   check((await text("#page")).includes("jenkins.mock.invalid, jenkins.c2.sso.internal.svc.movingtech.net"),
     "a host the deployment never allowed is now allowed, and the repeat was dropped");
   await shot("wh-02-policy");
+
+  // a release webhook turns the button on; pressing it asks Jenkins once
+  await click("Add a webhook", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the webhook form opens for the release hook");
+  await type("dialog input[type=text]:nth-of-type(1)", "nandi release");
+  await evaluate(`(() => { const s = document.querySelector("dialog select"); s.value = "release_requested"; s.dispatchEvent(new Event("change", { bubbles: true })); })()`);
+  await evaluate(`(() => { const el = document.querySelectorAll("dialog input[type=text]")[1]; el.value = "https://jenkins.mock.invalid/job/ny-internal/job/nandi/job/main/buildWithParameters?token=\${JENKINS_TOKEN}&releaseFromEditor=true"; el.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  await click("Add", "dialog");
+  await waitFor(`!document.querySelector("dialog")`, "the release webhook is added");
+  check((await text("#page")).includes("An approver asks for a Nandi release"), "the event is named in words");
+  check(await evaluate(`![...document.querySelectorAll("#page button")].some((b) => b.innerText === "Test")`), "a release webhook has no Test button: it would start a real release");
+  await waitFor(`[...document.querySelectorAll("#page button")].find((b) => b.innerText === "Release to Nandi")?.disabled === false`, "the button is enabled once a release webhook exists");
+  await click("Release to Nandi", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "pressing it asks to confirm");
+  await click("Release", "dialog");
+  await waitFor(`document.querySelector("#page").innerText.includes("A release is already on its way")`, "once asked, it says a release is on its way");
+  check((await text("#page")).includes("by admin@nammayatri.in"), "and who asked");
+  await shot("wh-02b-nandi-requested");
+  await rel({ released_version: 7 });
+  await waitFor(`document.querySelector("#page").innerText.includes("Nandi already has v7")`, "once Jenkins marks it, the section says Nandi has it", 12000);
+  await shot("wh-02c-nandi-released");
+  await click("Delete", "#page");
+  await waitFor(`!!document.querySelector("dialog")`, "the delete confirm opens for the release hook");
+  await click("Delete", "dialog");
+  await waitFor(`document.querySelector("#page").innerText.includes("No webhook yet.")`, "the release hook is gone");
 
   // a URL the deployment does not allow is refused, in the form
   await click("Add a webhook", "#page");
@@ -1300,6 +1334,7 @@ async function deliveryFlows() {
   check(history.includes("Sent a test webhook call"), "the history says a test was sent");
   check(history.includes("Deleted a webhook"), "the history says a webhook was deleted");
   check(history.includes("Changed where GIMS may send webhooks"), "the history says the policy was changed");
+  check(history.includes("Asked for a Nandi release"), "the history says a release was asked for");
 }
 
 // ---- only delivery

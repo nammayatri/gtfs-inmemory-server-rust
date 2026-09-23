@@ -145,6 +145,11 @@ pub struct AppConfig {
     /// and from then on this value does nothing (docs section 12.5).
     #[serde(default)]
     pub gtfs_webhooks_enabled: bool,
+    /// This is the master (UAT) deployment. Master and prod share one editor
+    /// database, so the Release to Nandi button sends `target=master` from here
+    /// and `target=prod` from prod (docs/gtfs-editor.md section 12.6).
+    #[serde(default)]
+    pub is_master: bool,
     /// Hosts a webhook may call. An entry written `.example.com` matches that
     /// domain and its subdomains.
     ///

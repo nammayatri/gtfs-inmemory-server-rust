@@ -29,8 +29,9 @@ maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
 behind the cleanup context reads (section 9), `0012` adds the nullable
 `gtfs_stop.description` (section 11), `0013` adds the webhook and pod cache
 state tables (section 12), `0016` adds `gtfs_webhook_settings`, the webhook
-policy row that supersedes the dhall config (section 12.5). All six are safe to
-run twice. **`0012`
+policy row that supersedes the dhall config (section 12.5), `0022` adds the
+`release_requested` event and the `release` delivery kind (section 12.6). All
+seven are safe to run twice. **`0012`
 goes on a database before the build that reads it:** both the editor and the
 GIMS loader select the column, so a DB feed fails to load (and serves its
 preprocessed data) on a database without it.)
@@ -1818,6 +1819,7 @@ commit ──▶ gtfs_feed.version = N
 | `feed_in_sync` | every live pod is serving the committed version, and has been for `settle_seconds` | rebuild a downstream cache |
 | `feed_committed` | a draft was committed, at once, without waiting for the pods | notify a chat channel |
 | `feed_reload_failed` | a pod could not load a version and is serving older data | alert |
+| `release_requested` | never on its own: only when an approver presses **Release to Nandi** | start the Jenkins job that builds and releases Nandi |
 
 A webhook only ever fires for a version that appeared **after** it was
 configured, so adding one to a quiet feed does not immediately trigger a
@@ -1994,6 +1996,54 @@ the deployment's own host away and stopping a call at send time. The fleet
 arithmetic, the precedence rule, the host validation, the placeholders and the
 backoff are unit tested in `src/services/webhook.rs`.
 
+
+### 12.6 Release to Nandi (2026-09-23)
+
+GIMS follows a commit by itself (pods poll `gtfs_feed.version`). Nandi does not:
+its data is baked into images, so an edit is on Nandi only after an export, a
+GTFS build, an image build and an autopilot release. The Delivery page's
+**Nandi** section shows `version` against `released_version` and has a
+**Release to Nandi** button (Approver, Admin).
+
+`POST /feeds/{g}/release` queues one `kind = 'release'` delivery per enabled
+`release_requested` webhook, for the committed version, and audits
+`release_requested`. Refused, in this order: `webhooks_inactive` (400),
+`no_release_webhook`, `nothing_to_release` (`released_version >= version`),
+`release_in_progress` (409) - a release delivery from the last 3 hours (the
+release job's timeout; the Nandi build itself runs well past half an hour) that
+is pending or delivered and whose version is not yet released. A failed
+delivery never blocks; a stuck build stops blocking after 3 hours. The check
+and the insert run under the feed lock, so two clicks queue one release.
+A release webhook has no **Test**: its URL is a real prod release, and Test
+would skip every check above (`release_webhook_untestable`).
+`GET /feeds/{g}/cache-state` carries the same verdict as `release`
+(`released_version`, `released_at`, `last_request`, `can_release`, `reason`).
+
+**Master or prod.** Master and prod share this database, so the press records
+its target on the delivery (`gtfs_webhook_delivery.target`): `master` when the
+deployment's dhall sets `is_master = True`, else `prod`. The URL passes it on as
+`${event:target}`, so whichever pod sends the request, Jenkins releases the
+Nandi the button was pressed for. `released_version` is prod's: a master
+release never records one, so on master `nothing_to_release` does not apply and
+only a request not yet delivered counts as in progress.
+
+The webhook starts nandi's own pipeline (`ny-internal/nandi/main`) with
+`releaseFromEditor` on:
+
+    POST https://<jenkins>/job/ny-internal/job/nandi/job/main/buildWithParameters?token=${env:JENKINS_TOKEN}&releaseFromEditor=true&buildNormalNandi=true&nandiTarget=${event:target}
+
+Its first stage runs `release_from_db.sh` with `MARK_RELEASED=false`, then commits
+and pushes the zip and fails unless `origin/main` holds it, so every image is
+built from the new zip. After the images are pushed it creates the Nandi release
+in system-control-centre (`POST /releases/create`, service `BECKN_NANDI_PROD`),
+left for someone to approve there unless `sccPreApprove`, and waits for SCC to
+report `COMPLETED`; only then does it run `export_mapping_from_db.py
+--mark-released`. `released_version` therefore never moves for a build or a
+rollout that failed, or one nobody approved. Jenkins needs the secret-file
+credential `nandi-chennai-bus-env` (the generator's `.env`), the secret-text
+credential `scc-sync-api-key` (SCC's `SYNC_CLUSTER_API_KEY`) and push access for
+the ny-jenkins key; run the job once by hand after the parameters are added, so
+`buildWithParameters` knows them.
 
 ## 17. A map line from GPS (2026-09-21)
 
