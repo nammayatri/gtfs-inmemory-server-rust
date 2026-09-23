@@ -37,6 +37,9 @@ pub struct EditorState {
     pub pool: PgPool,
     pub jwks: jwt::JwksCache,
     pub audience: String,
+    /// Label shown in the authenticator app, so an operator enrolled on more
+    /// than one deployment can tell the entries apart.
+    pub totp_issuer: String,
     pub bootstrap_admins: HashSet<String>,
     pub secrets: crypto::SecretBox,
     pub session_hours: i64,
@@ -54,6 +57,8 @@ pub struct EditorState {
 
 pub struct EditorSettings {
     pub jwks_url: String,
+    /// Label shown in the authenticator app (`gtfs_editor_totp_issuer`).
+    pub totp_issuer: String,
     pub audience: String,
     pub bootstrap_admins: Vec<String>,
     pub totp_key_b64: String,
@@ -78,6 +83,10 @@ impl EditorState {
             pool,
             jwks: jwt::JwksCache::new(s.jwks_url),
             audience: s.audience.trim().to_string(),
+            totp_issuer: match s.totp_issuer.trim() {
+                "" => "GTFS Editor".to_string(),
+                t => t.to_string(),
+            },
             bootstrap_admins: s
                 .bootstrap_admins
                 .iter()
@@ -141,6 +150,10 @@ impl EditorState {
         };
         let settings = EditorSettings {
             jwks_url,
+            totp_issuer: config
+                .gtfs_editor_totp_issuer
+                .clone()
+                .unwrap_or_else(|| "GTFS Editor".to_string()),
             audience,
             bootstrap_admins: config.gtfs_editor_bootstrap_admins.clone(),
             totp_key_b64,

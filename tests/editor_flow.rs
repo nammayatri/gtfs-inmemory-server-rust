@@ -166,6 +166,7 @@ async fn editor_end_to_end() {
     let state = EditorState::build(
         pool.clone(),
         EditorSettings {
+            totp_issuer: "GTFS Editor TEST".into(),
             jwks_url: format!("file://{}", jwks.display()),
             audience: AUD.into(),
             bootstrap_admins: vec![ADMIN.to_uppercase()],
@@ -242,10 +243,19 @@ async fn editor_end_to_end() {
     assert_eq!((s, code_of(&b)), (401, "totp_enrollment_required"));
     let (s, b, _) = call!(&app, admin.req("POST", "/auth/totp/enroll"));
     assert_eq!(s, 200, "{b}");
-    assert!(b["otpauth_uri"]
-        .as_str()
-        .unwrap()
-        .starts_with("otpauth://totp/"));
+    // The issuer is what the authenticator app shows, and it comes from the
+    // deployment's config (gtfs_editor_totp_issuer) - so an operator enrolled on
+    // master and on prod can tell the two entries apart.
+    let uri = b["otpauth_uri"].as_str().unwrap();
+    assert!(uri.starts_with("otpauth://totp/"), "{uri}");
+    assert!(
+        uri.contains("otpauth://totp/GTFS%20Editor%20TEST:"),
+        "the label must carry the configured issuer: {uri}"
+    );
+    assert!(
+        uri.contains("issuer=GTFS%20Editor%20TEST"),
+        "the issuer parameter must carry it too: {uri}"
+    );
     let admin_secret = crypto::base32_decode(b["secret_base32"].as_str().unwrap()).unwrap();
     let (s, b, _) = call!(
         &app,

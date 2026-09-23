@@ -186,6 +186,7 @@ fn state(pool: &PgPool, signer: &TestSigner) -> (EditorState, std::path::PathBuf
     let st = EditorState::build(
         pool.clone(),
         EditorSettings {
+            totp_issuer: "GTFS Editor".into(),
             jwks_url: format!("file://{}", jwks.display()),
             audience: AUD.into(),
             bootstrap_admins: vec![ADMIN.to_string()],
