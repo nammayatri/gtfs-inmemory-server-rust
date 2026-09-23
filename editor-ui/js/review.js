@@ -26,6 +26,44 @@ const selfApprovedChip = (cs) => (cs.self_approved
   : null);
 
 // ------------------------------------------------------------------ list
+// Tabs where several drafts can be put through in one go, and what that does.
+const BATCH = {
+  draft: [{ action: "submit", label: "Submit for review", then: null }],
+  submitted: [
+    { action: "approve", label: "Approve", then: null },
+    { action: "approve", label: "Approve and commit", then: "commit" },
+  ],
+  approved: [{ action: "commit", label: "Commit and go live", then: null }],
+};
+
+// What this person may do with one draft here: `ok` to tick it, `override` when
+// doing so is the admin's self-approval (they submitted it themselves, so no
+// second person reviews it), `why` when they may not. The same rules as the
+// draft's own page, so nothing here can do what that page would refuse.
+function batchState(cs, action) {
+  const me = state.me;
+  if (action === "submit") {
+    // any editor may submit any draft; what stops one is its own state, and the
+    // problems the server finds when it is sent
+    if (!can("editor")) return { ok: false, why: "needs the editor role" };
+    return cs.change_count > 0
+      ? { ok: true, override: false }
+      : { ok: false, why: "it has no changes yet" };
+  }
+  if (!can("approver")) return { ok: false, why: "needs the approver role" };
+  if (me.email !== cs.submitted_by_email) return { ok: true, override: false };
+  // their own draft
+  if (action === "approve") {
+    return me.role === "admin"
+      ? { ok: true, override: true, why: "you submitted it: approving it yourself skips the second reviewer" }
+      : { ok: false, why: "you submitted it, so someone else must review it" };
+  }
+  // committing one's own draft is only for the admin who self-approved it
+  return cs.self_approved && me.role === "admin"
+    ? { ok: true, override: true, why: "you submitted and self-approved it" }
+    : { ok: false, why: "you submitted it, so someone else must commit it" };
+}
+
 export async function showDraftList(status = "draft") {
   const body = h("div");
   const tabs = h("div.tabs", { role: "tablist" }, TABS.map(([key, label]) => h("button", {
@@ -53,18 +91,156 @@ export async function showDraftList(status = "draft") {
         discarded: "No drafts have been discarded.",
       }[status]));
     }
-    clear(body, h("div.table-wrap", h("table",
-      h("thead", h("tr", h("th", "Title"), h("th", "Changes"), h("th", "Started by"), h("th", status === "draft" ? "Last edited" : "Last step"), h("th", "Status"))),
-      h("tbody", res.items.map((cs) => {
-        const tr = h("tr.linkrow",
-          h("td", h("a", { href: `#/drafts/${enc(cs.change_set_id)}` }, cs.title)),
-          h("td.num", fmtCount(cs.change_count)),
-          h("td", cs.created_by_email || ""),
-          h("td", fmtDate(cs.updated_at)),
-          h("td", h("span", { class: `chip ${cs.status}` }, STATUS_LABEL[cs.status]), " ", selfApprovedChip(cs)));
-        tr.addEventListener("click", (ev) => { if (ev.target.tagName !== "A") location.hash = `#/drafts/${enc(cs.change_set_id)}`; });
-        return tr;
-      })))));
+    // several at once, on the tabs where that means something
+    const steps = BATCH[status] || [];
+    const mine = new Map(res.items.map((cs) => [cs.change_set_id, batchState(cs, steps[0] && steps[0].action)]));
+    // the column shows for anyone who could act on this tab at all, even when no
+    // row here is theirs, so a draft that cannot be ticked says why instead of
+    // simply missing
+    const canBatch = steps.length > 0 && can(steps[0].action === "submit" ? "editor" : "approver");
+    const chosen = new Set();
+    const bar = h("div.batch-bar", { hidden: true, role: "status" });
+    const allBox = h("input", { type: "checkbox", "aria-label": "Select every draft you can act on" });
+
+    const drawBar = () => {
+      const n = chosen.size;
+      bar.hidden = !n;
+      if (!n) { allBox.checked = false; allBox.indeterminate = false; return; }
+      const eligible = res.items.filter((cs) => mine.get(cs.change_set_id).ok).length;
+      allBox.checked = n === eligible;
+      allBox.indeterminate = n > 0 && n < eligible;
+      const picked = res.items.filter((cs) => chosen.has(cs.change_set_id));
+      const changes = picked.reduce((t, cs) => t + cs.change_count, 0);
+      const overrides = picked.filter((cs) => mine.get(cs.change_set_id).override).length;
+      clear(bar,
+        h("span", h("strong", `${plural(n, "draft")} selected`), ` · ${plural(changes, "change")}`,
+          overrides ? h("span.chip.override", { style: OVERRIDE_CHIP_STYLE, title: "You submitted these, so no second person reviews them." },
+            overrides === n ? "your own" : `${fmtCount(overrides)} your own`) : null),
+        h("div.btn-row", ...steps.map((step) => h("button", {
+          type: "button", class: `btn${overrides ? " danger" : ""}`, on: { click: () => runBatch(step) },
+        }, `${step.label} ${fmtCount(n)}${overrides ? ` (${fmtCount(overrides)} as admin override)` : ""}`)),
+          h("button.btn.quiet", { type: "button", on: { click: () => { chosen.clear(); redrawBoxes(); drawBar(); } } }, "Clear")));
+    };
+    const redrawBoxes = () => {
+      body.querySelectorAll("input[data-set]").forEach((b) => { b.checked = chosen.has(b.dataset.set); });
+    };
+    const toggle = (id, on) => { if (on) chosen.add(id); else chosen.delete(id); drawBar(); };
+
+    // Each draft goes through on its own, in the order shown: a commit is one
+    // transaction per draft, and a later one can still be overtaken by an
+    // earlier one, so the run reports each draft rather than stopping.
+    const runBatch = async (step) => {
+      const picked = res.items.filter((cs) => chosen.has(cs.change_set_id));
+      const own = picked.filter((cs) => mine.get(cs.change_set_id).override);
+      const others = picked.filter((cs) => !mine.get(cs.change_set_id).override);
+      const what = step.then ? "approved and committed"
+        : { commit: "committed", approve: "approved", submit: "submitted for review" }[step.action];
+      // a mixed selection says which drafts are the person's own, since those
+      // skip the second reviewer while the rest do not
+      const ok = await confirmDialog(`${step.label} ${plural(picked.length, "draft")}?`,
+        `${picked.map((cs) => cs.title).join(", ")}. `
+        + (own.length
+          ? `${own.length === picked.length ? "All of them were" : `${fmtCount(own.length)} of them (${own.map((cs) => cs.title).join(", ")}) ${own.length === 1 ? "was" : "were"}`} submitted by you: approving ${own.length === 1 ? "it" : "them"} yourself skips the second reviewer, and ${own.length === 1 ? "it is" : "they are"} recorded as self-approved. `
+            + (others.length ? `The other ${plural(others.length, "draft")} ${others.length === 1 ? "is" : "are"} reviewed normally. ` : "")
+          : "")
+        + (step.action === "submit"
+          ? "They can no longer be edited unless they are reopened, and someone other than the person who submitted each must approve it. One that cannot be submitted is reported and the rest carry on."
+          : step.then || step.action === "commit"
+            ? "Each is committed on its own, oldest first, and goes live as it commits. One that fails is reported and the rest carry on."
+            : "Each is approved on its own; approving does not make anything live."),
+        { confirm: step.label, danger: own.length > 0 });
+      if (!ok) return;
+      bar.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      const done = [], failed = [];
+      for (const [i, cs] of picked.entries()) {
+        clear(bar, h("span", `${step.label}: ${fmtCount(i + 1)} of ${fmtCount(picked.length)}…`));
+        bar.hidden = false;
+        // which step it reached matters: approved-but-not-committed is a state
+        // the person has to know about, since the draft is waiting to commit
+        let stage = step.action;
+        try {
+          const isOwn = mine.get(cs.change_set_id).override;
+          await post(`change-sets/${enc(cs.change_set_id)}/${step.action}`,
+            step.action === "approve" ? { comment: "", ...(isOwn ? { self_approve: true } : {}) } : undefined);
+          if (step.then) {
+            stage = step.then;
+            await post(`change-sets/${enc(cs.change_set_id)}/${step.then}`, undefined);
+          }
+          done.push(cs);
+        } catch (e) {
+          const why = e instanceof ApiError && e.code === "change_set_conflicts"
+            ? "some of its changes were overtaken by another commit"
+            : e instanceof ApiError && e.code === "validation_failed"
+              ? "it has problems to fix first"
+              : e.message;
+          failed.push({ cs, why, stage, approved: stage === "commit" && step.then });
+        }
+      }
+      if (done.length && (step.then || step.action === "commit")) map.refreshStops();
+      if (state.draft && done.some((cs) => cs.change_set_id === state.draft.change_set_id)) useDraft(null);
+      const selfApproved = done.filter((cs) => mine.get(cs.change_set_id).override).length;
+      const note = selfApproved && step.action === "approve" ? ` ${fmtCount(selfApproved)} self-approved.` : "";
+      toast(failed.length
+        ? `${plural(done.length, "draft")} ${what}; ${plural(failed.length, "draft")} could not be.${note}`
+        : `${plural(done.length, "draft")} ${what}.${note}`, failed.length ? "error" : "");
+      await showDraftList(status);
+      if (failed.length) {
+        const after = document.querySelector(".page-inner .tabs");
+        after?.insertAdjacentElement("afterend", h("div.notice.error", { role: "alert" },
+          h("p", h("strong", `${plural(failed.length, "draft")} did not go through`)),
+          h("ul", failed.map(({ cs, why, stage, approved }) => h("li",
+            h("a", { href: `#/drafts/${enc(cs.change_set_id)}` }, cs.title),
+            approved ? `: approved, but not committed — ${why}. It is waiting under Approved.`
+              : `: not ${{ commit: "committed", approve: "approved", submit: "submitted" }[stage]} — ${why}.`))),
+          done.length ? h("p", `${plural(done.length, "draft")} went through: ${done.map((cs) => cs.title).join(", ")}.`) : null));
+      }
+    };
+
+    allBox.addEventListener("change", () => {
+      chosen.clear();
+      if (allBox.checked) res.items.forEach((cs) => { if (mine.get(cs.change_set_id).ok) chosen.add(cs.change_set_id); });
+      redrawBoxes();
+      drawBar();
+    });
+
+    clear(body,
+      canBatch ? h("p.hint", !res.items.some((cs) => mine.get(cs.change_set_id).ok)
+        ? status === "draft"
+          ? "None of these can be sent for review yet: a draft needs at least one change."
+          : "None of these are yours to act on: someone other than the person who submitted a draft reviews it."
+        : res.items.some((cs) => mine.get(cs.change_set_id).override)
+          ? "Tick the drafts to put through together. The ones marked “your draft” you submitted yourself: as an admin you may put them through, and they are recorded as self-approved."
+          : status === "draft"
+            ? "Tick the drafts to send for review together, or open one to see its changes."
+            : "Tick the drafts to put through together, or open one to see its changes.") : null,
+      h("div.table-wrap", h("table",
+        h("thead", h("tr",
+          canBatch ? h("th.tick", allBox) : null,
+          h("th", "Title"), h("th", "Changes"), h("th", "Started by"), h("th", status === "draft" ? "Last edited" : "Last step"), h("th", "Status"))),
+        h("tbody", res.items.map((cs) => {
+          const state_ = mine.get(cs.change_set_id);
+          const box = canBatch
+            ? h("input", { type: "checkbox", "data-set": cs.change_set_id, disabled: !state_.ok,
+                "aria-label": `Select ${cs.title}${state_.override ? " (your own draft: admin override)" : ""}`, title: state_.why || null,
+                on: { click: (ev) => ev.stopPropagation(), change: (ev) => toggle(cs.change_set_id, ev.target.checked) } })
+            : null;
+          const tr = h("tr.linkrow",
+            canBatch ? h("td.tick", { title: state_.why || null }, box) : null,
+            h("td", h("a", { href: `#/drafts/${enc(cs.change_set_id)}` }, cs.title)),
+            h("td.num", fmtCount(cs.change_count)),
+            h("td", cs.created_by_email || ""),
+            h("td", fmtDate(cs.updated_at)),
+            h("td", h("span", { class: `chip ${cs.status}` }, STATUS_LABEL[cs.status]), " ", selfApprovedChip(cs), " ",
+              state_.override && !cs.self_approved
+                ? h("span.chip.override", { style: OVERRIDE_CHIP_STYLE, title: state_.why }, "your draft")
+                : null));
+          tr.addEventListener("click", (ev) => {
+            if (ev.target.tagName === "A" || ev.target.tagName === "INPUT") return;
+            location.hash = `#/drafts/${enc(cs.change_set_id)}`;
+          });
+          return tr;
+        })))),
+      bar);
   } catch (e) {
     clear(body, h("p.notice.error", e.message));
   }

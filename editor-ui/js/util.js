@@ -1,4 +1,5 @@
 // Small DOM, formatting, geometry and route-validation helpers shared by screens.
+import { toCsv } from "./csv.js";
 
 // ------------------------------------------------------------------ DOM
 // h("div.class#id", {attrs, on: {click}}, ...children). Children may be
@@ -338,4 +339,42 @@ export function diffRows(before, after) {
     }
   });
   return out.filter((d) => d.kind !== "moved-away");
+}
+
+// ------------------------------------------------------------------ location
+// The device's position, for placing a stop where the person editing it stands: {lat, lon, accuracy} in metres, or an Error whose message says why not.
+// `fresh`: a new fix, not one the browser kept from the last half minute.
+export function myLocation({ fresh = false } = {}) {
+  if (!("geolocation" in navigator)) return Promise.reject(new Error("This browser cannot tell your location."));
+  const ask = (enableHighAccuracy) => new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({ lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy }),
+      reject,
+      { enableHighAccuracy, timeout: 15000, maximumAge: fresh ? 0 : 30000 });
+  });
+  // A laptop has no GPS, and a high-accuracy request can fail where the plain
+  // (Wi-Fi) one works: ask again the plain way before giving up.
+  return ask(true).catch((e) => (e.code === 1 ? Promise.reject(e) : ask(false))).catch((e) => {
+    // the browser's own words help most when the cause is outside the page
+    const detail = e.message ? ` (${e.message})` : "";
+    throw new Error(e.code === 1 ? "Location is blocked for this site in your browser."
+      : e.code === 3 ? `Finding your location took too long${detail}.`
+      : `Your browser allows this site, but could not find where you are${detail}. On a Mac, check that the browser itself is allowed in System Settings → Privacy & Security → Location Services, and that Wi-Fi is on.`);
+  });
+}
+// past this the fix is a neighbourhood, not a kerb
+export const LOCATION_ROUGH_METRES = 50;
+
+// ------------------------------------------------------------------ download
+// Hand the browser a CSV of `records` (the first row is the header) under
+// `filename`. The byte order mark makes spreadsheet programs read it as UTF-8,
+// so Tamil names survive, as the import templates do.
+export function downloadCsv(filename, records) {
+  const url = URL.createObjectURL(new Blob(["\ufeff" + toCsv(records)], { type: "text/csv;charset=utf-8" }));
+  const a = h("a", { href: url, download: filename, style: "display:none" });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // let the download start before the blob goes
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }

@@ -157,8 +157,9 @@ export async function removeChange(changeId) {
 }
 
 // Add (or merge into) a change. Returns {draft, problems} where problems are the
-// server's validation entries for this change.
-export async function addChange(change, { merge = true } = {}) {
+// server's validation entries for this change. `quiet` leaves the toast to the
+// caller, for one that adds several changes as one step.
+export async function addChange(change, { merge = true, quiet = false } = {}) {
   const draft = await requireDraft();
   if (!draft) return null;
   const prior = merge ? existingChange(change.entity, change.entity_key) : null;
@@ -182,7 +183,7 @@ export async function addChange(change, { merge = true } = {}) {
   const mine = prior ? prior.change_id : cs.change_id ?? cs.changes[cs.changes.length - 1].change_id;
   const problems = (cs.validation || []).filter((v) => v.change_id === mine);
   const errors = problems.filter((p) => p.level === "error").length;
-  toast(errors ? `Added to "${cs.title}" with ${errors} problem${errors === 1 ? "" : "s"} to fix before submitting.`
+  if (!quiet) toast(errors ? `Added to "${cs.title}" with ${errors} problem${errors === 1 ? "" : "s"} to fix before submitting.`
     : `Added to draft "${cs.title}".`, errors ? "error" : "");
   return { draft: cs, problems, changeId: mine };
 }

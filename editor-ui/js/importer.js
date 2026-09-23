@@ -17,9 +17,10 @@ const STOP_TYPES = ["NEW STOP", "INTERMEDIATE STOP", "JUMP STOP", "HIDDEN STOP"]
 
 const text = (v) => v.trim();
 const optional = (v) => (v.trim() === "" ? undefined : v.trim());
-function number(name) {
+function number(name, { blankOk = false } = {}) {
   return (v) => {
     const s = v.trim();
+    if (s === "" && blankOk) return undefined;
     const n = Number(s);
     if (s === "" || !Number.isFinite(n)) throw new Error(`${name} must be a number, for example ${name === "lat" ? "13.0827" : "80.2707"}.`);
     return n;
@@ -30,6 +31,18 @@ function whole(name) {
     const s = v.trim();
     if (!/^-?\d+$/.test(s)) throw new Error(`${name} must be a whole number.`);
     return Number(s);
+  };
+}
+// Every row says what it does. Blank is never a default: an upload that means to
+// change a stop says so.
+const ACTIONS = ["add", "update", "delete"];
+function action(allowed, why) {
+  return (v) => {
+    const s = v.trim().toLowerCase();
+    if (s === "") throw new Error("action is empty. Every row says add, update or delete.");
+    if (!ACTIONS.includes(s)) throw new Error(`action must be add, update or delete, not “${v.trim()}”.`);
+    if (!allowed.includes(s)) throw new Error(`action ${s}: ${why[s]}`);
+    return s;
   };
 }
 function stopType(v) {
@@ -43,31 +56,64 @@ function stopType(v) {
 const KINDS = {
   stops: {
     label: "Stops",
-    what: "New stops. Each row becomes one new stop in the draft.",
+    what: "Stops to add, change or remove. Each row says which in its action column.",
     columns: [
-      { name: "stop_id", required: false, read: optional, help: "Optional. Leave empty and the editor makes an id." },
-      { name: "name", required: true, read: text, help: "The name passengers see." },
-      { name: "lat", required: true, read: number("lat"), help: "Latitude, for example 13.0827." },
-      { name: "lon", required: true, read: number("lon"), help: "Longitude, for example 80.2707." },
-      { name: "platform_code", required: false, read: optional, help: "Optional platform label, for example Towards Guindy." },
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(ACTIONS, {}), help: "add a stop, update one that exists, or delete one." },
+      { name: "stop_id", required: false, read: optional, help: "Required to update or delete. For add, leave it empty and the editor makes an id." },
+      { name: "name", required: false, read: optional, help: "The name passengers see. Required to add; for update, leave empty to keep the name." },
+      { name: "lat", required: false, read: number("lat", { blankOk: true }), help: "Latitude, for example 13.0827. Required to add; for update, give lat and lon together." },
+      { name: "lon", required: false, read: number("lon", { blankOk: true }), help: "Longitude, for example 80.2707." },
+      { name: "platform_code", required: false, read: optional, help: "Platform label, for example Towards Guindy. Leave empty to keep it." },
     ],
-    show: ["stop_id", "name", "lat", "lon", "platform_code"],
+    show: ["action", "stop_id", "name", "lat", "lon", "platform_code"],
+    // what one row needs, once its action is known
+    rowCheck: (row) => {
+      const has = (k) => row[k] !== undefined && row[k] !== "";
+      const problems = [];
+      if (row.action === "add") {
+        for (const k of ["name", "lat", "lon"]) if (!has(k)) problems.push(`${k} is empty. A row that adds a stop needs name, lat and lon.`);
+      } else if (row.action) {
+        if (!has("stop_id")) problems.push(`stop_id is empty. A row that says ${row.action} names the stop it changes.`);
+        if (row.action === "update") {
+          if (!["name", "lat", "lon", "platform_code"].some(has)) problems.push("Nothing to update: fill in name, lat and lon, or platform_code.");
+          if (has("lat") !== has("lon")) problems.push("Give lat and lon together to move a stop.");
+        }
+        if (row.action === "delete") {
+          const filled = ["name", "lat", "lon", "platform_code"].filter(has);
+          if (filled.length) problems.push(`A row that deletes takes stop_id alone; this one also fills in ${filled.join(", ")}.`);
+        }
+      }
+      return problems;
+    },
   },
   routes: {
     label: "Routes",
-    what: "New routes. Each row becomes one new route; import their stop lists next.",
+    what: "Routes to add, change or remove. Each row says which in its action column; import stop lists separately.",
     columns: [
-      { name: "route_id", required: true, read: text, help: "A new, unused id." },
-      { name: "short_name", required: true, read: text, help: "The route number passengers see, for example 570X." },
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(ACTIONS, {}), help: "add a route, update one that exists, or delete one." },
+      { name: "route_id", required: true, read: text, help: "A new, unused id to add; the route's own id to update or delete." },
+      { name: "short_name", required: false, read: optional, help: "The route number passengers see, for example 570X. Required to add." },
       { name: "long_name", required: false, read: optional, help: "Optional route name." },
       { name: "color", required: false, read: optional, help: "Optional colour as #RRGGBB." },
     ],
-    show: ["route_id", "short_name", "long_name", "color"],
+    show: ["action", "route_id", "short_name", "long_name", "color"],
+    rowCheck: (row) => {
+      const has = (k) => row[k] !== undefined && row[k] !== "";
+      const problems = [];
+      if (row.action === "add" && !has("short_name")) problems.push("short_name is empty. A row that adds a route needs it.");
+      if (row.action === "update" && !["short_name", "long_name", "color"].some(has)) problems.push("Nothing to update: fill in short_name, long_name or color.");
+      if (row.action === "delete") {
+        const filled = ["short_name", "long_name", "color"].filter(has);
+        if (filled.length) problems.push(`A row that deletes takes route_id alone; this one also fills in ${filled.join(", ")}.`);
+      }
+      return problems;
+    },
   },
   route_stops: {
     label: "Route stop lists",
-    what: "Whole stop lists. All rows of one route_id replace that route's stop list, in sequence order.",
+    what: "Whole stop lists. All rows of one route_id are that route's stop list, in sequence order: action add for a route that has none yet, update to replace the list it has.",
     columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(["add", "update"], { delete: "a route's stop list is uploaded whole. Upload it with update, leaving out the stops it should not have." }), help: "add for a route with no stop list yet, update to replace the list it has. The rows of one route all say the same." },
       { name: "route_id", required: true, read: text, help: "An existing route, or one new in your draft." },
       { name: "sequence", required: true, read: whole("sequence"), help: "Position in the route: 1, 2, 3…" },
       { name: "stop_id", required: true, read: text, help: "An existing stop, or one new in your draft." },
@@ -75,19 +121,20 @@ const KINDS = {
       { name: "stage_no", required: true, read: whole("stage_no"), help: "Fare stage number." },
       { name: "stage_name", required: true, read: text, help: "Fare stage name." },
     ],
-    show: ["route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"],
+    show: ["action", "route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"],
   },
   stop_updates: {
     label: "Stop details (platform label, description)",
     short: "stop details",
     what: "Details of stops that exist. Each row changes one stop; an empty cell leaves that detail as it is.",
     columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(["update"], { add: "this file only changes stops that exist. Add one with the stops file, which carries its position.", delete: "delete a stop with the stops file." }), help: "update. Adding and deleting are done with the stops file." },
       { name: "stop_id", required: true, read: text, help: "An existing stop. A station's id may be used for its description or name." },
       { name: "platform_code", required: false, read: optional, help: "The platform or direction passengers see, for example Towards Guindy. At most 120 characters. Not for a station." },
       { name: "description", required: false, read: optional, help: "Where the stop is, in words. At most 500 characters." },
       { name: "name", required: false, read: optional, help: "A new name. Leave empty to keep the name." },
     ],
-    show: ["stop_id", "platform_code", "description", "name"],
+    show: ["action", "stop_id", "platform_code", "description", "name"],
     // the server says which stop each row names, and where it is
     now: true,
   },
@@ -153,7 +200,7 @@ export function readFile(kind, csvText) {
       const i = header.indexOf(col.name);
       if (i < 0) return;
       const raw = rec[i] ?? "";
-      if (col.required && raw.trim() === "") { problems.push(`${col.name} is empty.`); return; }
+      if (col.required && raw.trim() === "") { problems.push(col.emptyMessage || `${col.name} is empty.`); return; }
       try {
         const v = col.read(raw);
         if (v !== undefined) row[col.name] = v;
@@ -161,6 +208,7 @@ export function readFile(kind, csvText) {
         problems.push(e.message);
       }
     });
+    if (!problems.length && spec.rowCheck) problems.push(...spec.rowCheck(row));
     sheetRows.push(r + 1);
     if (problems.length) rowProblems.set(rows.length, problems);
     rows.push(row);
@@ -222,7 +270,7 @@ export function showImport(kind) {
     clear(root,
       h("div.title-block",
         h("h1", "Import from a CSV file"),
-        h("p.hint", "Add many new stops or routes, replace route stop lists, or set the platform labels and descriptions of many stops, at once. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
+        h("p.hint", "Add, change or remove many stops or routes, replace route stop lists, or set the platform labels and descriptions of many stops, at once. Every row says what it does in its action column: add, update or delete. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
       view.added ? h("div.notice.ok", { role: "status" },
         h("p", h("strong", view.added.message)),
         h("div.btn-row", h("a.btn.small", { href: `#/drafts/${enc(view.added.draftId)}` }, "Open the draft"))) : null,
@@ -347,6 +395,11 @@ export function showImport(kind) {
         h("span", { class: `chip ${s.warnings ? "submitted" : ""}` }, plural(s.warnings, "warning")),
         h("span", { class: `chip ${s.errors ? "rejected" : ""}` }, plural(s.errors, "error")),
         s.unchanged ? h("span.chip.unchanged-count", `${fmtCount(s.unchanged)} unchanged, not added`) : null,
+        ...ACTIONS.map((a) => {
+          // what the file asks for, whatever the check made of it
+          const n = view.resultFor.read.rows.filter((r) => r.action === a).length;
+          return n ? h("span.chip", `${fmtCount(n)} to ${a}`) : null;
+        }),
         h("span.chip", `${plural(s.changes, "change")} to add`)),
       s.errors
         ? h("div.notice.error", h("p", h("strong", `${plural(s.errors, "row")} ${s.errors === 1 ? "has" : "have"} errors.`), " Nothing can be added until they are fixed. Fix the file, then choose it again above."))

@@ -703,6 +703,11 @@ export function dragStop(stop, onMove, onDone = null) {
 // lon) fires on every placement, onDone(lat, lon) once per click or finished drag
 // (one step to undo). Returns set(lat, lon) for typed positions; set(null) takes
 // the pin off again.
+// Bring a point into view, close enough to see the kerb.
+export function centerOn(lat, lon, { zoom: z = 18 } = {}) {
+  map.setView([lat, lon], Math.max(map.getZoom(), z));
+}
+
 export function placePoint(onPlace, { at = null, onDone = null } = {}) {
   endModes();
   const box = map.getContainer();
@@ -1118,17 +1123,32 @@ export function showPositionReview({ stopId, current, loaded = null, raw = null,
 
 // Two stops side by side for a merge: the one that stays and the one that goes.
 export function showPair(keep, drop) {
+  showGroup(keep, drop ? [drop] : []);
+}
+
+// A stop merge: the stop that stays, and the ones that go, each tied to it.
+export function showGroup(keep, drops) {
   layers.pair.clearLayers();
-  if (!keep || !drop) return;
-  quietIds = new Set([keep.stop_id, drop.stop_id]);
-  reserved = [{ lat: keep.lat, lon: keep.lon, text: `Stays: ${keep.stop_id}`, side: "left" }, { lat: drop.lat, lon: drop.lon, text: `Goes: ${drop.stop_id}`, side: "right" }];
-  L.polyline([[keep.lat, keep.lon], [drop.lat, drop.lon]], { renderer: lines, color: INK, weight: 2, dashArray: "4 6", interactive: false }).addTo(layers.pair);
-  for (const [s, label, color] of [[keep, `Stays: ${keep.stop_id}`, ACTION], [drop, `Goes: ${drop.stop_id}`, "#b42318"]]) {
-    L.circleMarker([s.lat, s.lon], { renderer: lines, radius: 13, color, weight: 3, fill: false, interactive: false }).addTo(layers.pair);
-    L.tooltip({ permanent: true, direction: s === keep ? "left" : "right", offset: [s === keep ? -15 : 15, 0], className: "member-label", interactive: false, opacity: 1 })
-      .setLatLng([s.lat, s.lon]).setContent(text(label)).addTo(layers.pair);
+  if (!keep || !drops.length) return;
+  quietIds = new Set([keep.stop_id, ...drops.map((d) => d.stop_id)]);
+  // the kept stop's label on the side away from the others
+  const side = (s) => (s === keep ? (drops.every((d) => d.lon >= keep.lon) ? "left" : "right") : s.lon >= keep.lon ? "right" : "left");
+  const label = (s) => (s === keep ? `Stays: ${s.stop_id}` : `Goes: ${s.stop_id}`);
+  reserved = [keep, ...drops].map((s) => ({ lat: s.lat, lon: s.lon, text: label(s), side: side(s) }));
+  for (const d of drops) {
+    L.polyline([[keep.lat, keep.lon], [d.lat, d.lon]], { renderer: lines, color: INK, weight: 2, dashArray: "4 6", interactive: false }).addTo(layers.pair);
   }
-  fitPoints([keep, drop], { maxZoom: 19, pad: 0.8 });
+  // stops on the same spot and side stack their labels instead of hiding each other
+  const placed = [];
+  for (const s of [keep, ...drops]) {
+    const left = side(s) === "left";
+    const under = placed.filter((p) => p.left === left && Math.abs(p.lat - s.lat) < 0.00002 && Math.abs(p.lon - s.lon) < 0.00002).length;
+    placed.push({ lat: s.lat, lon: s.lon, left });
+    L.circleMarker([s.lat, s.lon], { renderer: lines, radius: 13, color: s === keep ? ACTION : "#b42318", weight: 3, fill: false, interactive: false }).addTo(layers.pair);
+    L.tooltip({ permanent: true, direction: left ? "left" : "right", offset: [left ? -15 : 15, under * 26], className: "member-label", interactive: false, opacity: 1 })
+      .setLatLng([s.lat, s.lon]).setContent(text(label(s))).addTo(layers.pair);
+  }
+  fitPoints([keep, ...drops], { maxZoom: 19, pad: 0.8 });
   redrawLabels();
 }
 

@@ -2132,15 +2132,51 @@ class Handler(BaseHTTPRequestHandler):
             if k not in allowed:
                 msg(i, "unknown_field", f"The column {k} is not used when importing {what}.")
 
+    # Every row says what it does; blank is an error, never a default.
+    REFUSED = {
+        ("stop_updates", "add"): "the stop details file only updates stops; add one with the stops file, which carries its position",
+        ("stop_updates", "delete"): "the stop details file only updates stops; delete one with the stops file",
+        ("route_stops", "delete"): "a route's stop list is uploaded whole: upload it with action update, leaving out the stops it should not have",
+    }
+
+    @classmethod
+    def _row_action(cls, r, kind, msg, i):
+        given = r.get("action")
+        given = given.strip() if isinstance(given, str) else given
+        if given in (None, ""):
+            msg(i, "invalid_row", "action is required: add, update or delete")
+            return None
+        if not isinstance(given, str):
+            msg(i, "invalid_row", "action must be text: add, update or delete")
+            return None
+        action = given.lower()
+        if action not in ("add", "update", "delete"):
+            msg(i, "invalid_row", f"action {given!r} is not one of add, update or delete")
+            return None
+        why = cls.REFUSED.get((kind, action))
+        if why:
+            msg(i, "invalid_row", f"action {action}: {why}")
+            return None
+        return action
+
     def bulk_stops(self, g, proj, rows, msg, results):
         grid = StopGrid(st for st in proj.all_stops() if st and not st.get("deleted") and st.get("location_type") == 0)
         seen, changes = {}, []
         for i, r in enumerate(rows):
             if not isinstance(r, dict):
                 continue
-            self._unknown_columns(r, {"stop_id", "name", "lat", "lon", "platform_code"}, "stops", msg, i)
+            self._unknown_columns(r, {"action", "stop_id", "name", "lat", "lon", "platform_code"}, "stops", msg, i)
+            action = self._row_action(r, "stops", msg, i)
+            if action is None:
+                continue
             sid = r.get("stop_id")
             sid = sid.strip() if isinstance(sid, str) else sid
+            if action in ("update", "delete"):
+                c = self._bulk_stop_touch(proj, action, sid, r, msg, i)
+                if c:
+                    changes.append(c)
+                    results[i]["change"] = {k: c[k] for k in ("entity", "op", "entity_key")}
+                continue
             name = r.get("name").strip() if isinstance(r.get("name"), str) else ""
             lat, lon, pc = r.get("lat"), r.get("lon"), r.get("platform_code")
             if sid not in (None, ""):
@@ -2181,6 +2217,50 @@ class Handler(BaseHTTPRequestHandler):
             results[i]["change"] = {"entity": "stop", "op": "create", "entity_key": sid}
         return changes
 
+    @staticmethod
+    def _bulk_stop_touch(proj, action, sid, r, msg, i):
+        """One stops row that says update or delete: the change, or None with a message."""
+        if not sid:
+            msg(i, "invalid_row", f"stop_id is required to {action} a stop")
+            return None
+        st = proj.stop(sid)
+        if not st:
+            msg(i, "stop_not_found", f"no stop {sid}; action add creates one")
+            return None
+        if st.get("deleted"):
+            msg(i, "stop_deleted", f"stop {sid} is deleted")
+            return None
+        if st.get("location_type") == 1:
+            msg(i, "stop_is_station", f"{sid} is a station; stations are edited in the dashboard, not here")
+            return None
+        fields = {}
+        for k in ("name", "lat", "lon", "platform_code"):
+            v = r.get(k)
+            if isinstance(v, str):
+                v = v.strip()
+            if v not in (None, ""):
+                fields[k] = v
+        if action == "delete":
+            if fields:
+                msg(i, "invalid_row", f"action delete takes stop_id alone; this row also fills in {', '.join(sorted(fields))}")
+                return None
+            return {"entity": "stop", "op": "delete", "entity_key": sid, "after": None,
+                    "base_row_version": st.get("row_version"), "_rows": [i]}
+        if not fields:
+            msg(i, "nothing_to_update", f"the row for stop {sid} gives no name, lat and lon, or platform_code")
+            return None
+        if ("lat" in fields) != ("lon" in fields):
+            msg(i, "invalid_payload", "give lat and lon together to move a stop")
+            return None
+        if "lat" in fields and not valid_position(fields.get("lat"), fields.get("lon")):
+            msg(i, "bad_position", "lat and lon must be numbers in range, for example 13.0827 and 80.2707.")
+            return None
+        if "platform_code" in fields and len(str(fields["platform_code"])) > PLATFORM_MAX:
+            msg(i, "platform_code_too_long", f"A platform label can be at most {PLATFORM_MAX} characters.")
+            return None
+        return {"entity": "stop", "op": "update", "entity_key": sid, "after": fields,
+                "base_row_version": st.get("row_version"), "_rows": [i]}
+
     def bulk_stop_updates(self, g, proj, rows, msg, results):
         """{stop_id, platform_code?, description?, name?}: one stop/update (a station:
         station/update) per row, with exactly the cells given (docs section 11)."""
@@ -2194,7 +2274,9 @@ class Handler(BaseHTTPRequestHandler):
         for i, r in enumerate(rows):
             if not isinstance(r, dict):
                 continue
-            bad = [k for k in r if k not in ("stop_id",) + fields]
+            if self._row_action(r, "stop_updates", msg, i) is None:
+                continue
+            bad = [k for k in r if k not in ("action", "stop_id") + fields]
             if bad:
                 msg(i, "invalid_row", f"{bad[0]!r} is not a column of a stop_updates row (columns: stop_id, "
                                       "platform_code, description, name)")
@@ -2253,8 +2335,17 @@ class Handler(BaseHTTPRequestHandler):
         for i, r in enumerate(rows):
             if not isinstance(r, dict):
                 continue
-            self._unknown_columns(r, {"route_id", "short_name", "long_name", "color"}, "routes", msg, i)
+            self._unknown_columns(r, {"action", "route_id", "short_name", "long_name", "color"}, "routes", msg, i)
+            action = self._row_action(r, "routes", msg, i)
+            if action is None:
+                continue
             rid = r.get("route_id").strip() if isinstance(r.get("route_id"), str) else r.get("route_id")
+            if action in ("update", "delete"):
+                c = self._bulk_route_touch(proj, action, rid, r, msg, i)
+                if c:
+                    changes.append(c)
+                    results[i]["change"] = {k: c[k] for k in ("entity", "op", "entity_key")}
+                continue
             short = r.get("short_name").strip() if isinstance(r.get("short_name"), str) else ""
             color = r.get("color")
             if not isinstance(rid, str) or not rid:
@@ -2281,19 +2372,59 @@ class Handler(BaseHTTPRequestHandler):
             results[i]["change"] = {"entity": "route", "op": "create", "entity_key": rid}
         return changes
 
+    @staticmethod
+    def _bulk_route_touch(proj, action, rid, r, msg, i):
+        """One routes row that says update or delete."""
+        if not isinstance(rid, str) or not rid:
+            msg(i, "invalid_row", f"route_id is required to {action} a route")
+            return None
+        rt = proj.route(rid)
+        if not rt:
+            msg(i, "route_not_found", f"no route {rid}; action add creates one")
+            return None
+        if rt.get("deleted"):
+            msg(i, "route_deleted", f"route {rid} is deleted")
+            return None
+        fields = {}
+        for k in ("short_name", "long_name", "color"):
+            v = r.get(k)
+            if isinstance(v, str):
+                v = v.strip()
+            if v not in (None, ""):
+                fields[k] = v
+        if action == "delete":
+            if fields:
+                msg(i, "invalid_row", f"action delete takes route_id alone; this row also fills in {', '.join(sorted(fields))}")
+                return None
+            return {"entity": "route", "op": "delete", "entity_key": rid, "after": None,
+                    "base_row_version": rt.get("row_version"), "_rows": [i]}
+        if not fields:
+            msg(i, "nothing_to_update", f"the row for route {rid} gives no short_name, long_name or color")
+            return None
+        if "color" in fields and not COLOR_RE.match(str(fields["color"])):
+            msg(i, "bad_color", "Colour must look like #1A7F5A.")
+            return None
+        return {"entity": "route", "op": "update", "entity_key": rid, "after": fields,
+                "base_row_version": rt.get("row_version"), "_rows": [i]}
+
     def bulk_route_stops(self, g, proj, rows, msg, results):
         s = self.store
         live = Projection(s, g, [])
         by_route = {}
+        said = {}          # route_id -> [(row, action)]: a list is uploaded whole
         for i, r in enumerate(rows):
             if not isinstance(r, dict):
                 continue
-            self._unknown_columns(r, {"route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"},
+            self._unknown_columns(r, {"action", "route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"},
                                   "route stop lists", msg, i)
+            action = self._row_action(r, "route_stops", msg, i)
+            if action is None:
+                continue
             rid = r.get("route_id").strip() if isinstance(r.get("route_id"), str) else None
             if not rid:
                 msg(i, "missing_field", "Each row needs the route_id of its route.")
                 continue
+            said.setdefault(rid, []).append((i, action))
             rt = proj.route(rid)
             if not rt or rt.get("deleted"):
                 msg(i, "unknown_route", f"Route {rid} does not exist, in the feed or in this draft.")
@@ -2327,6 +2458,23 @@ class Handler(BaseHTTPRequestHandler):
         for rid, idxs in by_route.items():
             rt = proj.route(rid)
             if not rt or rt.get("deleted"):
+                continue
+            actions = said.get(rid, [])
+            action = actions[0][1] if actions else "update"
+            mixed = [i for i, a in actions if a != action]
+            has_rows = bool(proj.route_rows(rid))
+            if mixed:
+                for i in idxs:
+                    msg(i, "mixed_action", f"route {rid} has rows saying {action} and rows saying something else; "
+                                           "a route's whole stop list is one action")
+                continue
+            if action == "add" and has_rows:
+                for i in idxs:
+                    msg(i, "route_stops_exist", f"route {rid} already has a stop list; action update replaces it")
+                continue
+            if action == "update" and not has_rows:
+                for i in idxs:
+                    msg(i, "route_stops_missing", f"route {rid} has no stop list yet; action add gives it one")
                 continue
             seqs = {}
             for i in idxs:

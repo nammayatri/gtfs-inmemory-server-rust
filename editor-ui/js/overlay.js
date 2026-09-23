@@ -217,7 +217,7 @@ export function draftedParents(stops) {
   const out = new Map();
   if (!state.draft || !state.draft.changes.length) return out;
   const idx = build();
-  if (!idx.joins.size && !idx.leaves.size) return out;
+  if (!idx.joins.size && !idx.leaves.size && !idx.movesTo.size) return out;
   for (const s of stops) {
     if (!s || !s.stop_id) continue;
     const join = idx.joins.get(s.stop_id);
@@ -226,6 +226,22 @@ export function draftedParents(stops) {
     else if (movedBy) out.set(s.stop_id, { parent_station: (movedBy.after || {}).into_station_id, change: movedBy });
     else if (!join && idx.leaves.has(s.stop_id)) out.set(s.stop_id, { parent_station: null, change: idx.leaves.get(s.stop_id) });
   }
+  return out;
+}
+
+// A station's platforms as the draft's station merges leave them: `joining`, the
+// platforms merges into this station bring ({stop_id, name, platform_code,
+// route_count, from_station}), and `into`, the station this one's own platforms
+// move to when the draft merges it away (null when it does not).
+export function stationMergeMembers(stationId) {
+  const out = { joining: [], into: null };
+  if (!state.draft || !state.draft.changes.length) return out;
+  const idx = build();
+  for (const c of idx.stationAbsorbs.get(stationId) || []) {
+    for (const p of (c.before && c.before.moving_platforms) || []) out.joining.push({ ...p, from_station: c.entity_key });
+  }
+  const gone = (idx.byKey.get(`station|${stationId}`) || []).find((c) => c.op === "merge");
+  if (gone) out.into = (gone.after || {}).into_station_id || null;
   return out;
 }
 

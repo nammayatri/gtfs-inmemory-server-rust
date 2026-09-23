@@ -3,7 +3,7 @@
 // that so far exists only in the draft. (New station is the station editor.)
 import { get, enc, ApiError } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
-import { h, clear, toast, confirmDialog, debounce, fmtCoord, fmtMetres, haversine, ID_RE, ID_RULE, PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField } from "./util.js";
+import { h, clear, toast, confirmDialog, debounce, fmtCoord, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, ID_RE, ID_RULE, PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField } from "./util.js";
 import * as map from "./map.js";
 import { addChange, requireDraft, createdChange, createdStops, updateChange, removeChange } from "./drafts.js";
 import { editRouteRows, problemList } from "./editors.js";
@@ -127,6 +127,39 @@ export async function newStop(change = null) {
   f.lat.addEventListener("input", typed);
   f.lon.addEventListener("input", typed);
 
+  // The new stop starts where the person adding it is, when the browser can say:
+  // on the kerb, that is the stop. The pin stays draggable, and the map click
+  // still moves it.
+  const locStatus = h("p.hint", { "aria-live": "polite" });
+  const locBtn = h("button.btn.secondary.small", { type: "button" }, "Use my location");
+  let locSeq = 0;
+  const useMyLocation = async ({ auto = false } = {}) => {
+    const mine = ++locSeq;
+    locBtn.disabled = true;
+    locStatus.textContent = "Finding your location…";
+    try {
+      // the button means here, now; opening the form can take a recent fix
+      const at = await myLocation({ fresh: !auto });
+      // gone from this form, asked again, or (on the automatic try) placed by hand meanwhile
+      if (mine !== locSeq || !document.body.contains(f.lat) || (auto && lat != null)) return;
+      const before = placed, after = { lat: at.lat, lon: at.lon };
+      putPin(after);
+      map.centerOn(at.lat, at.lon);
+      history.push({ label: "used your location", undo: () => putPin(before), redo: () => putPin(after) });
+      if (!auto) touch();
+      const rough = at.accuracy > LOCATION_ROUGH_METRES;
+      clear(locStatus, rough ? h("strong", `Placed at your location, but it is only accurate to about ${fmtMetres(at.accuracy)}. `)
+        : `Placed at your location (accurate to about ${fmtMetres(at.accuracy)}). `,
+        rough ? "Check the pin and drag it to the kerb." : "Drag the pin if the kerb is a little off.");
+    } catch (e) {
+      if (mine !== locSeq || !document.body.contains(f.lat)) return;
+      locStatus.textContent = `${e.message} Click the map where the bus stops instead.`;
+    } finally {
+      if (mine === locSeq) locBtn.disabled = false;
+    }
+  };
+  locBtn.addEventListener("click", () => useMyLocation());
+
   const cancel = () => {
     dirty = false;
     setLeaveGuard(null);
@@ -198,6 +231,8 @@ export async function newStop(change = null) {
       h("p.hint", `It goes into draft "${state.draft.title}". Nothing changes for passengers until someone else approves the draft and it is committed.`),
       h("h2", "1. Place it"),
       where,
+      h("div.btn-row", locBtn),
+      locStatus,
       history.buttons(),
       h("div.field-row",
         h("label.field", { for: "new-stop-lat" }, h("span", "Latitude"), f.lat),
@@ -216,6 +251,8 @@ export async function newStop(change = null) {
   ));
   showWhere();
   if (lat != null) checkNearby();
+  // a stop not placed yet starts at the person's location
+  else if (!editing) useMyLocation({ auto: true });
   f.name.focus();
 }
 

@@ -611,6 +611,40 @@ reviewer. Continue?"; a self-approved draft carries a "self-approved" badge in i
 header and list row, and its history row is highlighted with an "admin override"
 badge.
 
+**One stop as a file (2026-09-22).** A stop's panel has **Download CSV** (for
+everyone, viewers included): the stop's own details - id, code, names, position,
+platform label, description, station, cluster, position source, row version -
+repeated on one row per route that calls there, with that route's id, names,
+`sequence`, `stop_type` and `stage_no`. A station's file carries one row per
+platform instead (`platform_stop_id`, name, label, position, routes). It is the
+live row as the server has it, not the draft's pending version, and it is built
+in the browser from the stop read the panel already has, so there is no endpoint
+for it.
+
+**Several drafts at once (2026-09-22).** The drafts list ticks drafts on the
+"Drafts", "Waiting for review" and "Approved" tabs (the column shows for an approver, with
+a disabled tick and the reason on any draft that is not theirs to act on - the
+maker-checker rule of section 2). An **admin may tick their own** submitted
+drafts: each is marked "your draft", the bar counts them ("2 your own"), the
+buttons name the override ("Approve and commit 3 (2 as admin override)") and turn
+danger-red, and the confirm says which drafts skip the second reviewer and which
+are reviewed normally. A mixed selection is sent draft by draft - `self_approve:
+true` only on the person's own - so each lands exactly as its own page would, and
+those come back marked self-approved. On the "Drafts" tab an editor ticks drafts
+and sends them for review together ("Submit for review N"); one with no changes
+cannot be ticked ("it has no changes yet"), and one the server refuses
+(`validation_failed`) is reported like any other failure while the rest go. On the "Approved" tab the submitter may
+tick only what they self-approved as an admin (`own_change_set` otherwise); a
+draft of theirs that someone else approved stays for that someone else to commit. A bar counts what is ticked and offers **Approve**,
+**Approve and commit** (submitted) or **Commit and go live** (approved). It is
+the same `POST /change-sets/{id}/approve` and `/commit` per draft, run in the
+order listed: each commit stays one transaction on its own, and the feed version
+moves after each, so a later draft can still be overtaken. A run therefore never
+stops at the first failure - it reports every draft: which went live, and which
+did not and why (a conflict, or problems to fix), saying "approved, but not
+committed" for one whose commit failed after its approval, since it is then
+waiting under Approved.
+
 Tests: `editor-ui/dev/mock_server.py` + `dev/ui_smoke.mjs` (UI against an
 in-memory mock of this contract), and `dev/ui_e2e.mjs` (the real UI, the real
 GIMS, the dev Pomerium proxy, a local Postgres). The e2e signs in through the
@@ -829,12 +863,40 @@ Settled while implementing:
 `POST /change-sets/{id}/bulk` (editor+, draft only), body
 `{kind, rows, dry_run}` with at most 5,000 rows:
 
-| `kind` | row | becomes |
-|---|---|---|
-| `stops` | `{stop_id?, name, lat, lon, platform_code?}` | one `stop/create` per row |
-| `routes` | `{route_id, short_name, long_name?, color?}` | one `route/create` per row |
-| `route_stops` | `{route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`) |
-| `stop_updates` | `{stop_id, platform_code?, description?, name?}` | one `stop/update` per row (a station: `station/update`), with exactly the cells given — section 11 |
+Every row carries `action` (2026-09-22): `add`, `update` or `delete`, in any
+case. It is **required** — a blank or missing `action` is `invalid_row`, never a
+default, so an upload always says what it does to each row. What each kind
+accepts, and what the row becomes:
+
+| `kind` | `action` | row | becomes |
+|---|---|---|---|
+| `stops` | `add` | `{action, stop_id?, name, lat, lon, platform_code?}` | one `stop/create` per row |
+| `stops` | `update` | `{action, stop_id, name?, lat?, lon?, platform_code?}` | one `stop/update` per row, with exactly the cells given (`lat` and `lon` together) |
+| `stops` | `delete` | `{action, stop_id}` | one `stop/delete` per row; any other cell filled is `invalid_row` |
+| `routes` | `add` | `{action, route_id, short_name, long_name?, color?}` | one `route/create` per row |
+| `routes` | `update` | `{action, route_id, short_name?, long_name?, color?}` | one `route/update` per row, with exactly the cells given |
+| `routes` | `delete` | `{action, route_id}` | one `route/delete` per row; any other cell filled is `invalid_row` |
+| `route_stops` | `add` \| `update` | `{action, route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`) |
+| `stop_updates` | `update` | `{action, stop_id, platform_code?, description?, name?}` | one `stop/update` per row (a station: `station/update`), with exactly the cells given — section 11 |
+
+- **`stops`**: `add` refuses an id that is live or already created in this draft
+  (`stop_exists`, whose message points at `update`); `update` and `delete` refuse
+  an id that is not there (`stop_not_found`, pointing at `add`), a deleted one
+  (`stop_deleted`), a station (`stop_is_station`), one merged away earlier in the
+  draft (`stop_merged_away`), and, for `delete`, one this draft creates
+  (`stop_not_live` — remove that change instead). An `update` giving no cell to
+  change is `nothing_to_update`.
+- **`routes`**: the same shape — `route_exists`, `route_not_found`,
+  `route_deleted`, `route_not_live`, `nothing_to_update`.
+- **`route_stops`**: a route's whole list is one action, so every row of a
+  `route_id` says the same (`mixed_action`). `add` is for a route with no stop
+  list yet (`route_stops_exist` if it has one), `update` replaces the list it has
+  (`route_stops_missing` if it has none). `delete` is refused for this kind:
+  upload the list with `update`, leaving out the stops it should not have.
+- **`stop_updates`** takes `update` alone; `add` and `delete` are refused,
+  pointing at the `stops` file (it carries the position a new stop needs).
+- A blank cell still means "not given": it leaves that field as it is on an
+  `update`, rather than clearing it.
 
 Response (both modes): `{dry_run, summary: {rows, ok, warnings, errors, changes},
 rows: [{row, status: ok|warning|error, messages: [{code, message}], change:
@@ -1584,11 +1646,13 @@ Settled while implementing:
 `bulk_imported` audit row). A row is
 
 ```json
-{"stop_id": "29db2391b0", "platform_code": "Towards THIRUPORUR", "description": "…", "name": "…"}
+{"action": "update", "stop_id": "29db2391b0", "platform_code": "Towards THIRUPORUR", "description": "…", "name": "…"}
 ```
 
-`stop_id` is required; `platform_code`, `description` and `name` are each
-optional, and at least one must be given. Each row becomes one `stop/update`
+`action` is required and is `update` for every row of this kind (section 5):
+`add` and `delete` are refused, pointing at the `stops` file, which carries the
+position a new stop needs. `stop_id` is required; `platform_code`, `description`
+and `name` are each optional, and at least one must be given. Each row becomes one `stop/update`
 whose `after` holds **exactly the cells given**, `base_row_version` the stop's
 current `row_version`, and `before` the stop row in read shape — the change
 `POST /change-sets/{id}/changes` would have stored. A blank or `null` cell is
