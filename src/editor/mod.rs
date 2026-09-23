@@ -50,6 +50,8 @@ pub struct EditorState {
     pub gps_line: Option<Arc<gps_line::GpsLine>>,
     /// For the OSRM calls.
     pub http: reqwest::Client,
+    /// Release to Nandi targets master Nandi, not prod (dhall `is_master`).
+    pub is_master: bool,
 }
 
 pub struct EditorSettings {
@@ -90,6 +92,7 @@ impl EditorState {
             osrm_url: s.osrm_url,
             webhook_policy: s.webhook_policy,
             gps_line: None,
+            is_master: false,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .build()
@@ -157,6 +160,7 @@ impl EditorState {
         match Self::build(pool, settings) {
             Ok(mut state) => {
                 info!("GTFS editor enabled at /internal/gtfs-editor");
+                state.is_master = config.is_master;
                 if let Some(gps) = &config.gtfs_gps {
                     let settings = gps_line::settings_from_config(
                         gps,
@@ -365,6 +369,7 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/webhooks/{id}", web::patch().to(h::webhook_update))
             .route("/webhooks/{id}", web::delete().to(h::webhook_delete))
             .route("/webhooks/{id}/test", web::post().to(h::webhook_test))
+            .route("/feeds/{gtfs_id}/release", web::post().to(h::feed_release))
             // admin
             .route("/users", web::get().to(h::users))
             .route("/users", web::post().to(h::user_create))

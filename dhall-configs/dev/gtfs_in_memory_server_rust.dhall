@@ -101,6 +101,8 @@ in {
   -- editing here changes nothing (section 12.5) - the same way gtfs_feed.
   -- data_source supersedes gtfs_db_feeds above.
   gtfs_webhooks_enabled = False,
+  -- the master (UAT) deployment: Release to Nandi targets master Nandi, not prod
+  is_master = False,
   gtfs_webhook_allowed_hosts = [] : List Text,
   -- Defaults to $POD_NAME, then the hostname. Two pods must never share it.
   gtfs_pod_id = None Text,

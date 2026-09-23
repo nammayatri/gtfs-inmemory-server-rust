@@ -34,6 +34,7 @@ use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::postgres::PgPool;
+use sqlx::PgConnection;
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -44,6 +45,9 @@ use uuid::Uuid;
 pub const EVENT_IN_SYNC: &str = "feed_in_sync";
 pub const EVENT_COMMITTED: &str = "feed_committed";
 pub const EVENT_RELOAD_FAILED: &str = "feed_reload_failed";
+/// Sent only when an approver asks for it (the Release to Nandi button), never
+/// by `enqueue_due`.
+pub const EVENT_RELEASE_REQUESTED: &str = "release_requested";
 
 /// A claim older than this is assumed to belong to a pod that died mid-request
 /// and is handed back. Well clear of the largest allowed request timeout (300s)
@@ -768,7 +772,8 @@ async fn load_armed(pool: &PgPool) -> AppResult<Vec<(Webhook, i64, DateTime<Utc>
                 w.request_timeout_seconds, w.max_attempts, \
                 f.version AS feed_version, f.updated_at AS version_at \
            FROM gtfs_webhook w JOIN gtfs_feed f ON f.gtfs_id = w.gtfs_id \
-          WHERE w.enabled AND f.updated_at > w.created_at",
+          WHERE w.enabled AND f.updated_at > w.created_at \
+            AND w.event <> 'release_requested'",
     )
     .fetch_all(pool)
     .await
@@ -953,6 +958,7 @@ struct Claim {
     feed_version: i64,
     attempts: i32,
     pod_count: Option<i32>,
+    target: Option<String>,
 }
 
 /// Claim one due delivery. `SKIP LOCKED` lets several pods drain a backlog in
@@ -968,7 +974,7 @@ async fn claim_one(pool: &PgPool, pod: &PodIdentity) -> AppResult<Option<Claim>>
                  ORDER BY next_attempt_at \
                  FOR UPDATE SKIP LOCKED LIMIT 1) \
           RETURNING d.delivery_id, d.webhook_id, d.gtfs_id, d.event, d.feed_version, \
-                    d.attempts, d.pod_count",
+                    d.attempts, d.pod_count, d.target",
     )
     .bind(&pod.pod_id)
     .fetch_optional(pool)
@@ -983,6 +989,7 @@ async fn claim_one(pool: &PgPool, pod: &PodIdentity) -> AppResult<Option<Claim>>
             feed_version: r.try_get("feed_version").map_err(db)?,
             attempts: r.try_get("attempts").map_err(db)?,
             pod_count: r.try_get("pod_count").map_err(db)?,
+            target: r.try_get("target").map_err(db)?,
         })
     })
     .transpose()
@@ -1067,6 +1074,9 @@ fn event_payload(claim: &Claim, w: &Webhook) -> Map<String, Value> {
     m.insert("webhook".into(), json!(w.name));
     m.insert("pod_count".into(), json!(claim.pod_count));
     m.insert("fired_at".into(), json!(Utc::now()));
+    if let Some(t) = &claim.target {
+        m.insert("target".into(), json!(t));
+    }
     m
 }
 
@@ -1221,6 +1231,35 @@ pub async fn enqueue_test(pool: &PgPool, webhook_id: Uuid, requested_by: &str) -
     .try_get("delivery_id")
     .map_err(db)?;
     Ok(id)
+}
+
+/// Queue the Release to Nandi request: one `kind = 'release'` delivery per
+/// enabled `release_requested` webhook of the feed, for its committed version.
+/// Runs in the caller's transaction, which holds the feed lock.
+pub async fn enqueue_release(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    requested_by: &str,
+    target: &str,
+) -> AppResult<Vec<Uuid>> {
+    let rows = sqlx::query(
+        "INSERT INTO gtfs_webhook_delivery \
+           (webhook_id, gtfs_id, event, feed_version, kind, status, next_attempt_at, requested_by, \
+            target) \
+         SELECT w.webhook_id, w.gtfs_id, w.event, f.version, 'release', 'pending', now(), $2, $3 \
+           FROM gtfs_webhook w JOIN gtfs_feed f ON f.gtfs_id = w.gtfs_id \
+          WHERE w.gtfs_id = $1 AND w.enabled AND w.event = 'release_requested' \
+         RETURNING delivery_id",
+    )
+    .bind(gtfs_id)
+    .bind(requested_by)
+    .bind(target)
+    .fetch_all(conn)
+    .await
+    .map_err(db)?;
+    rows.iter()
+        .map(|r| r.try_get("delivery_id").map_err(db))
+        .collect()
 }
 
 #[cfg(test)]

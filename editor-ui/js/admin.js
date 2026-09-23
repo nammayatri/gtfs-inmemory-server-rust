@@ -236,6 +236,7 @@ export const ACTION_LABEL = {
   webhook_updated: "Changed a webhook",
   webhook_deleted: "Deleted a webhook",
   webhook_tested: "Sent a test webhook call",
+  release_requested: "Asked for a Nandi release",
   webhook_settings_updated: "Changed where GIMS may send webhooks",
 };
 

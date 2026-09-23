@@ -20,10 +20,11 @@ use super::auth::{self, Ctx, Role};
 use super::error::{EditorError, EditorResult};
 use super::EditorState;
 use crate::services::webhook::{self, check_host, fleet_from, EffectivePolicy, PodState};
+use actix_web::http::StatusCode;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 /// Longest a webhook may wait before the dashboard considers the fleet stale,
@@ -41,9 +42,13 @@ const EVENTS: &[&str] = &[
     webhook::EVENT_IN_SYNC,
     webhook::EVENT_COMMITTED,
     webhook::EVENT_RELOAD_FAILED,
+    webhook::EVENT_RELEASE_REQUESTED,
 ];
 
 const METHODS: &[&str] = &["POST", "PUT", "GET"];
+
+const WEBHOOKS_INACTIVE: &str =
+    "webhooks are off or the allow-list is empty, so nothing would be sent";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebhookBody {
@@ -142,6 +147,7 @@ async fn check_url(state: &EditorState, url: &str) -> EditorResult<()> {
         ("webhook", json!("probe")),
         ("pod_count", json!(0)),
         ("fired_at", json!(Utc::now())),
+        ("target", json!("prod")),
     ] {
         probe.insert(k.into(), v);
     }
@@ -509,9 +515,19 @@ pub async fn delete(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorR
 pub async fn test(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorResult<Value> {
     ctx.require_role(Role::Admin)?;
     if !live_policy(state).await.policy.is_active() {
+        return Err(bad("webhooks_inactive", WEBHOOKS_INACTIVE));
+    }
+    let event: Option<String> =
+        sqlx::query_scalar("SELECT event FROM gtfs_webhook WHERE webhook_id = $1")
+            .bind(webhook_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    // its URL starts a real Nandi build and prod release, past every check the
+    // Release to Nandi button makes
+    if event.as_deref() == Some(webhook::EVENT_RELEASE_REQUESTED) {
         return Err(bad(
-            "webhooks_inactive",
-            "webhooks are off or the allow-list is empty, so nothing would be sent",
+            "release_webhook_untestable",
+            "a release webhook starts a real Nandi release; use Release to Nandi instead",
         ));
     }
     let delivery_id = webhook::enqueue_test(&state.pool, webhook_id, &ctx.user.email)
@@ -572,6 +588,176 @@ pub async fn deliveries(state: &EditorState, gtfs_id: &str, limit: i64) -> Edito
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({"items": items}))
+}
+
+// ------------------------------------------------------------ release to Nandi
+
+/// How long a request that Jenkins accepted keeps the button locked while its
+/// version is not yet marked released: the release job's own timeout, since
+/// the Nandi image build runs well past half an hour, and a build stuck longer
+/// than that should not stop anyone asking again.
+const RELEASE_WINDOW_MINUTES: i32 = 180;
+
+/// Why the Release to Nandi button may not be pressed now, or `None` when it
+/// may. In this order, so the reason names the first thing to fix.
+fn release_refusal(
+    policy_active: bool,
+    has_webhook: bool,
+    version: i64,
+    released: Option<i64>,
+    in_progress: bool,
+    is_master: bool,
+) -> Option<(StatusCode, &'static str, &'static str)> {
+    if !policy_active {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "webhooks_inactive",
+            WEBHOOKS_INACTIVE,
+        ));
+    }
+    if !has_webhook {
+        return Some((
+            StatusCode::CONFLICT,
+            "no_release_webhook",
+            "add a webhook for release_requested to point this button at the Jenkins job",
+        ));
+    }
+    // released_version is prod's; master never records a release
+    if !is_master && released.is_some_and(|r| r >= version) {
+        return Some((
+            StatusCode::CONFLICT,
+            "nothing_to_release",
+            "Nandi already has the committed version",
+        ));
+    }
+    if in_progress {
+        return Some((
+            StatusCode::CONFLICT,
+            "release_in_progress",
+            "a release is already on its way",
+        ));
+    }
+    None
+}
+
+struct ReleaseState {
+    version: i64,
+    released_version: Option<i64>,
+    released_at: Option<chrono::DateTime<Utc>>,
+    has_webhook: bool,
+    in_progress: bool,
+    last_request: Value,
+}
+
+impl ReleaseState {
+    fn refusal(
+        &self,
+        policy_active: bool,
+        is_master: bool,
+    ) -> Option<(StatusCode, &'static str, &'static str)> {
+        release_refusal(
+            policy_active,
+            self.has_webhook,
+            self.version,
+            self.released_version,
+            self.in_progress,
+            is_master,
+        )
+    }
+}
+
+fn target(is_master: bool) -> &'static str {
+    if is_master {
+        "master"
+    } else {
+        "prod"
+    }
+}
+
+async fn release_state(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    target: &str,
+) -> EditorResult<ReleaseState> {
+    let f = sqlx::query(
+        "SELECT f.version, f.released_version, f.released_at, \
+                EXISTS (SELECT 1 FROM gtfs_webhook w \
+                         WHERE w.gtfs_id = f.gtfs_id AND w.enabled \
+                           AND w.event = 'release_requested') AS has_webhook, \
+                EXISTS (SELECT 1 FROM gtfs_webhook_delivery d \
+                         WHERE d.gtfs_id = f.gtfs_id AND d.kind = 'release' AND d.target = $3 \
+                           AND d.created_at > now() - make_interval(mins => $2) \
+                           AND (d.status IN ('pending', 'in_flight') \
+                                OR ($3 = 'prod' AND d.status = 'succeeded' \
+                                    AND d.feed_version > coalesce(f.released_version, 0)))) \
+                  AS in_progress, \
+                l.delivery_id, l.requested_by, l.created_at, l.status, l.response_status, \
+                l.feed_version \
+           FROM gtfs_feed f \
+           LEFT JOIN LATERAL ( \
+                SELECT delivery_id, requested_by, created_at, status, response_status, feed_version \
+                  FROM gtfs_webhook_delivery \
+                 WHERE gtfs_id = f.gtfs_id AND kind = 'release' AND target = $3 \
+                 ORDER BY created_at DESC LIMIT 1) l ON true \
+          WHERE f.gtfs_id = $1",
+    )
+    .bind(gtfs_id)
+    .bind(RELEASE_WINDOW_MINUTES)
+    .bind(target)
+    .fetch_optional(conn)
+    .await?
+    .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
+    let last_request = match f.try_get::<Option<Uuid>, _>("delivery_id")? {
+        Some(id) => json!({
+            "delivery_id": id,
+            "requested_by": f.try_get::<Option<String>, _>("requested_by")?,
+            "created_at": f.try_get::<chrono::DateTime<Utc>, _>("created_at")?,
+            "status": f.try_get::<String, _>("status")?,
+            "response_status": f.try_get::<Option<i32>, _>("response_status")?,
+            "feed_version": f.try_get::<i64, _>("feed_version")?,
+        }),
+        None => Value::Null,
+    };
+    Ok(ReleaseState {
+        version: f.try_get("version")?,
+        released_version: f.try_get("released_version")?,
+        released_at: f.try_get("released_at")?,
+        has_webhook: f.try_get("has_webhook")?,
+        in_progress: f.try_get("in_progress")?,
+        last_request,
+    })
+}
+
+/// The Release to Nandi button: queue the request for the committed version.
+/// The check and the insert share one transaction under the feed lock, so two
+/// clicks at once queue one release.
+pub async fn release(state: &EditorState, ctx: &Ctx, gtfs_id: &str) -> EditorResult<Value> {
+    ctx.require_role(Role::Approver)?;
+    let active = live_policy(state).await.policy.is_active();
+    let mut tx = state.pool.begin().await?;
+    super::feed_lock::lock_feed(&mut tx, gtfs_id).await?;
+    let target = target(state.is_master);
+    let rs = release_state(&mut tx, gtfs_id, target).await?;
+    if let Some((status, code, message)) = rs.refusal(active, state.is_master) {
+        return Err(EditorError::new(status, code, message));
+    }
+    let ids = webhook::enqueue_release(&mut tx, gtfs_id, &ctx.user.email, target)
+        .await
+        .map_err(|e| EditorError::internal(e.to_string()))?;
+    auth::audit(
+        &mut *tx,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "release_requested",
+        Some(gtfs_id),
+        None,
+        json!({"feed_version": rs.version, "target": target, "delivery_ids": ids}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(
+        json!({"delivery_ids": ids, "feed_version": rs.version, "target": target, "status": "pending"}),
+    )
 }
 
 /// Which version of the feed each pod is serving, and whether the fleet has
@@ -641,6 +827,13 @@ pub async fn cache_state(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
     let now = Utc::now();
     let fleet = fleet_from(states, now, stale_after);
     let in_sync = !fleet.live.is_empty() && fleet.laggards(version).is_empty();
+    let rs = release_state(
+        &mut *state.pool.acquire().await?,
+        gtfs_id,
+        target(state.is_master),
+    )
+    .await?;
+    let refusal = rs.refusal(live_policy(state).await.policy.is_active(), state.is_master);
     Ok(json!({
         "gtfs_id": gtfs_id,
         "data_source": data_source,
@@ -658,6 +851,14 @@ pub async fn cache_state(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
             .map(|p| json!({"pod_id": p.pod_id, "loaded_version": p.loaded_version}))
             .collect::<Vec<_>>(),
         "pods": pods,
+        "release": {
+            "released_version": rs.released_version,
+            "released_at": rs.released_at,
+            "last_request": rs.last_request,
+            "target": target(state.is_master),
+            "can_release": refusal.is_none(),
+            "reason": refusal.map(|(_, code, _)| code),
+        },
     }))
 }
 
@@ -674,6 +875,45 @@ mod tests {
         assert!(check_method("DELETE").is_err());
         // lowercase is the caller's job to normalise, so it is refused here
         assert!(check_method("post").is_err());
+    }
+
+    #[test]
+    fn a_release_is_refused_for_the_first_thing_to_fix() {
+        let code = |active, hook, v, rel, busy| {
+            release_refusal(active, hook, v, rel, busy, false).map(|(_, c, _)| c)
+        };
+        assert_eq!(
+            code(false, false, 2, Some(1), true),
+            Some("webhooks_inactive")
+        );
+        assert_eq!(
+            code(true, false, 2, Some(1), true),
+            Some("no_release_webhook")
+        );
+        assert_eq!(
+            code(true, true, 2, Some(2), true),
+            Some("nothing_to_release")
+        );
+        assert_eq!(
+            code(true, true, 2, Some(5), false),
+            Some("nothing_to_release")
+        );
+        assert_eq!(
+            code(true, true, 2, Some(1), true),
+            Some("release_in_progress")
+        );
+        assert_eq!(code(true, true, 2, Some(1), false), None);
+        // a feed never released has everything to release
+        assert_eq!(code(true, true, 1, None, false), None);
+        // master never records a release, so prod's released_version is no bar
+        let master = |rel, busy| release_refusal(true, true, 2, rel, busy, true).map(|(_, c, _)| c);
+        assert_eq!(master(Some(2), false), None);
+        assert_eq!(master(Some(2), true), Some("release_in_progress"));
+    }
+
+    #[test]
+    fn release_requested_is_a_known_event() {
+        assert!(check_event("release_requested").is_ok());
     }
 
     #[test]
