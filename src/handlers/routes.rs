@@ -1426,7 +1426,7 @@ pub fn merge_stop_and_mapping(
         cluster_id: stop.cluster_id.as_deref().map(Arc::from),
         location_type: stop.location_type.clone(),
         stage_number: None,
-        stop_type: None,
+        is_stage_stop: None,
     }
 }
 

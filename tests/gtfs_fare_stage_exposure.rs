@@ -38,7 +38,7 @@ fn write_preprocessed(dir: &Path) {
             platform_code: None,
             headsign: Some(headsign.to_string()),
             stage_number: None,
-            stop_type: None,
+            is_stage_stop: None,
         }
     };
     let stop = |i: usize| {
@@ -261,7 +261,7 @@ fn stages(v: &Value) -> HashMap<String, (Value, Value)> {
         .map(|m| {
             (
                 m["stopCode"].as_str().unwrap_or_default().to_string(),
-                (m["stageNumber"].clone(), m["stopType"].clone()),
+                (m["stageNumber"].clone(), m["isStageStop"].clone()),
             )
         })
         .collect()
@@ -289,13 +289,9 @@ async fn route_stop_mapping_carries_the_fare_stage() {
     let by_stop = stages(&body);
     assert_eq!(by_stop.len(), STOPS.len(), "{body}");
 
-    assert_eq!(by_stop["A1"], (json!(1), json!("NEW STOP")), "{body}");
-    assert_eq!(by_stop["B1"], (json!(2), json!("NEW STOP")), "{body}");
-    assert_eq!(
-        by_stop["B2"],
-        (json!(2), json!("INTERMEDIATE STOP")),
-        "{body}"
-    );
+    assert_eq!(by_stop["A1"], (json!(1), json!(true)), "{body}");
+    assert_eq!(by_stop["B1"], (json!(2), json!(true)), "{body}");
+    assert_eq!(by_stop["B2"], (json!(2), json!(false)), "{body}");
     assert_eq!(by_stop["NOSTAGE"], (json!(null), json!(null)), "{body}");
 
     let req = test::TestRequest::get()
@@ -313,7 +309,7 @@ async fn route_stop_mapping_carries_the_fare_stage() {
             other => panic!("unexpected route {other}: {body}"),
         };
         assert_eq!(row["stageNumber"], json!(expected), "{body}");
-        assert_eq!(row["stopType"], json!("INTERMEDIATE STOP"), "{body}");
+        assert_eq!(row["isStageStop"], json!(false), "{body}");
     }
 
     let req = test::TestRequest::get()
@@ -325,7 +321,7 @@ async fn route_stop_mapping_carries_the_fare_stage() {
     assert_eq!(body["stopCode"], "B1", "{body}");
     let obj = body.as_object().unwrap();
     assert!(!obj.contains_key("stageNumber"), "{body}");
-    assert!(!obj.contains_key("stopType"), "{body}");
+    assert!(!obj.contains_key("isStageStop"), "{body}");
 
     let req = test::TestRequest::get()
         .uri(&format!("/route-stop-mapping/{FEED}/route/R2"))
@@ -334,8 +330,8 @@ async fn route_stop_mapping_carries_the_fare_stage() {
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = serde_json::from_slice(&test::read_body(resp).await).unwrap();
     let r2 = stages(&body);
-    assert_eq!(r2["B1"], (json!(9), json!("NEW STOP")), "{body}");
-    assert_eq!(r2["B2"], (json!(9), json!("INTERMEDIATE STOP")), "{body}");
+    assert_eq!(r2["B1"], (json!(9), json!(true)), "{body}");
+    assert_eq!(r2["B2"], (json!(9), json!(false)), "{body}");
 
     let req = test::TestRequest::get()
         .uri(&format!("/route-stop-mapping/{FEED}/stop/B1"))
@@ -352,7 +348,7 @@ async fn route_stop_mapping_carries_the_fare_stage() {
             other => panic!("unexpected route {other}: {body}"),
         };
         assert_eq!(row["stageNumber"], json!(expected), "{body}");
-        assert_eq!(row["stopType"], json!("NEW STOP"), "{body}");
+        assert_eq!(row["isStageStop"], json!(true), "{body}");
     }
 
     let req = test::TestRequest::get()

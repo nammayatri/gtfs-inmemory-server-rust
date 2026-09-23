@@ -20,9 +20,7 @@
 //!   `{'fareStageNumber': 'N', 'isStageStop': true}` on a NEW STOP.
 //! - **routes**: routes with a pattern.
 
-use crate::editor::validation::{
-    is_stage_boundary, INTERMEDIATE_STOP, NEW_STOP, SERVED_STOP_TYPES,
-};
+use crate::editor::validation::{is_stage_boundary, SERVED_STOP_TYPES};
 use crate::models::{GTFSStop, LatLong, NandiPatternDetails, NandiRoutesRes, NandiStop, NandiTrip};
 use crate::tools::error::{AppError, AppResult};
 use sqlx::postgres::PgPool;
@@ -212,7 +210,7 @@ pub fn headsign(stage_no: i32, stop_type: &str) -> String {
 pub fn parse_headsign_stage(
     headsign: &str,
     feed_uses_fare_stages: bool,
-) -> (Option<i32>, Option<&'static str>) {
+) -> (Option<i32>, Option<bool>) {
     let raw = headsign.trim();
     if raw.is_empty() {
         return (None, None);
@@ -222,7 +220,7 @@ pub fn parse_headsign_stage(
             return (None, None);
         }
         return match parse_stage_no(raw) {
-            Some(stage_no) => (Some(stage_no), Some(INTERMEDIATE_STOP)),
+            Some(stage_no) => (Some(stage_no), Some(false)),
             None => (None, None),
         };
     }
@@ -235,12 +233,12 @@ pub fn parse_headsign_stage(
     if stage_raw.is_some() && stage_no.is_none() {
         return (None, None);
     }
-    let stop_type = match flag_raw {
-        Some(v) if v.eq_ignore_ascii_case("true") => Some(NEW_STOP),
-        Some(v) if v.eq_ignore_ascii_case("false") => Some(INTERMEDIATE_STOP),
+    let is_stage_stop = match flag_raw {
+        Some(v) if v.eq_ignore_ascii_case("true") => Some(true),
+        Some(v) if v.eq_ignore_ascii_case("false") => Some(false),
         _ => None,
     };
-    (stage_no, stop_type)
+    (stage_no, is_stage_stop)
 }
 
 pub fn is_fare_stage_dict(headsign: &str) -> bool {
@@ -663,7 +661,7 @@ impl GtfsDbSource {
                     platform_code: None,
                     headsign: Some(headsign(*stage_no, stop_type)),
                     stage_number: Some(*stage_no),
-                    stop_type: Some(stop_type.clone()),
+                    is_stage_stop: Some(is_stage_boundary(stop_type)),
                 });
             }
             let (Some(first), Some(end)) = (pattern_stops.first(), pattern_stops.last()) else {
@@ -737,11 +735,11 @@ mod tests {
         for stage_no in [1, 3, 12, 47] {
             assert_eq!(
                 parse_headsign_stage(&headsign(stage_no, "NEW STOP"), true),
-                (Some(stage_no), Some(NEW_STOP))
+                (Some(stage_no), Some(true))
             );
             assert_eq!(
                 parse_headsign_stage(&headsign(stage_no, "INTERMEDIATE STOP"), true),
-                (Some(stage_no), Some(INTERMEDIATE_STOP))
+                (Some(stage_no), Some(false))
             );
         }
     }
@@ -750,11 +748,11 @@ mod tests {
     fn parse_headsign_stage_tolerates_the_dialect() {
         assert_eq!(
             parse_headsign_stage("{'isStageStop': True, 'fareStageNumber': '7'}", true),
-            (Some(7), Some(NEW_STOP))
+            (Some(7), Some(true))
         );
         assert_eq!(
             parse_headsign_stage("{\"fareStageNumber\":\"7\",\"isStageStop\":false}", true),
-            (Some(7), Some(INTERMEDIATE_STOP))
+            (Some(7), Some(false))
         );
     }
 
@@ -770,7 +768,7 @@ mod tests {
         );
         assert_eq!(
             parse_headsign_stage("{'isStageStop': true}", true),
-            (None, Some(NEW_STOP))
+            (None, Some(true))
         );
     }
 
@@ -821,23 +819,20 @@ mod tests {
                 "{'stopName': 'fareStageNumber', 'fareStageNumber': '5', 'isStageStop': true}",
                 true
             ),
-            (Some(5), Some(NEW_STOP))
+            (Some(5), Some(true))
         );
         assert_eq!(
             parse_headsign_stage(
                 "{\"stopName\": \"isStageStop\", \"fareStageNumber\": \"5\", \"isStageStop\": false}",
                 true
             ),
-            (Some(5), Some(INTERMEDIATE_STOP))
+            (Some(5), Some(false))
         );
     }
 
     #[test]
     fn a_bare_number_is_a_stage_only_on_a_feed_that_uses_fare_stages() {
-        assert_eq!(
-            parse_headsign_stage("3", true),
-            (Some(3), Some(INTERMEDIATE_STOP))
-        );
+        assert_eq!(parse_headsign_stage("3", true), (Some(3), Some(false)));
         for raw in ["3", "500", "-4", "+7"] {
             assert_eq!(parse_headsign_stage(raw, false), (None, None), "{raw}");
         }
@@ -878,7 +873,7 @@ mod tests {
     fn the_db_and_preprocessed_paths_report_the_same_stage() {
         for stage_no in [1, 2, 7, 23, 104] {
             for stop_type in SERVED_STOP_TYPES {
-                let from_columns = (Some(stage_no), Some(stop_type));
+                let from_columns = (Some(stage_no), Some(is_stage_boundary(stop_type)));
                 let from_headsign = parse_headsign_stage(&headsign(stage_no, stop_type), true);
                 assert_eq!(
                     from_columns, from_headsign,
@@ -890,7 +885,13 @@ mod tests {
 
     #[test]
     fn served_stop_types_are_the_ones_the_headsign_can_carry() {
-        assert_eq!(SERVED_STOP_TYPES, [NEW_STOP, INTERMEDIATE_STOP]);
+        assert_eq!(
+            SERVED_STOP_TYPES,
+            [
+                crate::editor::validation::NEW_STOP,
+                crate::editor::validation::INTERMEDIATE_STOP
+            ]
+        );
     }
 
     #[test]
@@ -914,7 +915,7 @@ mod tests {
             platform_code: None,
             headsign: None,
             stage_number: None,
-            stop_type: None,
+            is_stage_stop: None,
         };
         let pat = |id: &str, n: i32, trips: usize| NandiPatternDetails {
             id: id.into(),

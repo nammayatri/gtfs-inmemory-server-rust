@@ -1729,7 +1729,6 @@ impl GTFSService {
             })
             .filter_map(|p| p.route_id.split(':').next())
             .collect();
-        let mut stop_type_arcs: HashMap<String, Arc<str>> = HashMap::new();
 
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
 
@@ -1813,28 +1812,20 @@ impl GTFSService {
                             .map(Arc::from)
                     });
 
-                let (stage_number, stop_type) =
-                    if stop.stage_number.is_some() || stop.stop_type.is_some() {
-                        (stop.stage_number, stop.stop_type.as_deref())
+                let (stage_number, is_stage_stop) =
+                    if stop.stage_number.is_some() || stop.is_stage_stop.is_some() {
+                        (stop.stage_number, stop.is_stage_stop)
                     } else {
                         stop.headsign
                             .as_deref()
                             .map(|h| parse_headsign_stage(h, fare_stage_feed))
                             .unwrap_or((None, None))
                     };
-                let stop_type = stop_type.map(|t| match stop_type_arcs.get(t) {
-                    Some(a) => a.clone(),
-                    None => {
-                        let a: Arc<str> = Arc::from(t);
-                        stop_type_arcs.insert(t.to_string(), a.clone());
-                        a
-                    }
-                });
 
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
                     stage_number,
-                    stop_type,
+                    is_stage_stop,
                     provider_code,
                     route_code: route_code_arc.clone(),
                     sequence_num: (seq + 1) as i32,
@@ -2063,7 +2054,7 @@ impl GTFSService {
                     stops.push(Arc::new(RouteStopMapping {
                         estimated_travel_time_from_previous_stop: None,
                         stage_number: None,
-                        stop_type: None,
+                        is_stage_stop: None,
                         provider_code: Arc::from("GTFS"),
                         route_code: Arc::from("UNKNOWN"),
                         sequence_num: 0,

@@ -501,8 +501,8 @@ pub struct NandiStop {
     pub headsign: Option<String>,
     #[serde(rename = "stageNumber", default)]
     pub stage_number: Option<i32>,
-    #[serde(rename = "stopType", default)]
-    pub stop_type: Option<String>,
+    #[serde(rename = "isStageStop", default)]
+    pub is_stage_stop: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -613,9 +613,12 @@ pub struct RouteStopMapping {
         skip_serializing_if = "Option::is_none"
     )]
     pub stage_number: Option<i32>,
-    #[serde(rename = "stopType", default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>)]
-    pub stop_type: Option<Arc<str>>,
+    #[serde(
+        rename = "isStageStop",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub is_stage_stop: Option<bool>,
 }
 
 /// One direct route connecting a source cluster to a destination cluster, with
