@@ -10,6 +10,7 @@ pub mod model;
 pub mod read;
 pub mod rules;
 pub mod spec;
+pub mod validate;
 pub mod write;
 
 use serde::Serialize;

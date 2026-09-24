@@ -1097,6 +1097,9 @@ pub struct ImportReport {
     pub round_trip_sample: Vec<crate::gtfs::compare::Diff>,
     pub seeded: bool,
     pub feed_version: Option<i64>,
+    /// What the zip breaks of the GTFS reference, as the feed report reads it:
+    /// kept, as the import keeps what the feed ships.
+    pub validation: crate::gtfs::validate::Report,
 }
 
 /// The gtfs_id a zip names in feed_info.txt, as nandi's preprocessor reads it.
@@ -1147,6 +1150,10 @@ pub async fn import_zip(
         round_trip_sample: vec![],
         seeded: false,
         feed_version: None,
+        validation: crate::gtfs::validate::summarise(
+            &crate::gtfs::validate::validate(&m, &chrono::Utc::now().date_naive().to_string()),
+            5,
+        ),
     };
     if report.errors > 0 {
         return Ok(report);
