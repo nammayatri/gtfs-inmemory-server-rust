@@ -18,6 +18,9 @@
 //!     orders are compared, never written. Without --write it is a dry run.
 //! gtfs_feed export --db URL --gtfs-id G --out FILE
 //!     the feed's GTFS zip, from the tables.
+//! gtfs_feed validate (--zip Z | --db URL --gtfs-id G) [--today YYYY-MM-DD] [--show N]
+//!     the feed report: what the zip, or the feed as its tables hold it,
+//!     breaks of the GTFS reference, counted by kind.
 //! gtfs_feed compare --a Z --b Z [--files F,F] [--show N]
 //!     two zips compared keyed, as the round trip compares: what differs,
 //!     file by file and field by field.
@@ -26,7 +29,7 @@
 //! `--db` is never read from the environment: say which database, every time.
 
 use gtfs_routes_service::editor::{draft_import, feed_io};
-use gtfs_routes_service::gtfs::{compare, model, read, write, Level};
+use gtfs_routes_service::gtfs::{compare, model, read, validate, write, Level};
 use std::process::ExitCode;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -42,6 +45,7 @@ fn usage() -> ExitCode {
          gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]\n       \
          gtfs_feed draft-import --db URL --zip Z --as EMAIL [--gtfs-id G] [--files F,F] [--write]\n       \
          gtfs_feed export --db URL --gtfs-id G --out FILE\n       \
+         gtfs_feed validate (--zip Z | --db URL --gtfs-id G) [--today D] [--show N]\n       \
          gtfs_feed compare --a Z --b Z [--files F,F] [--show N]"
     );
     ExitCode::from(2)
@@ -241,6 +245,76 @@ fn feed_id_of(raw: &read::RawFeed) -> Option<String> {
     Some(t.cell(row, "feed_id").trim().to_string()).filter(|s| !s.is_empty())
 }
 
+async fn validate(args: &[String]) -> ExitCode {
+    let show: usize = arg(args, "--show")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let today = arg(args, "--today").unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
+    let (m, mut findings, what) = if let Some(zip) = arg(args, "--zip") {
+        let read = std::fs::read(&zip)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| read::read_zip(&bytes));
+        let (raw, mut findings) = match read {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{zip}: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let gtfs_id = arg(args, "--gtfs-id")
+            .or_else(|| feed_id_of(&raw))
+            .unwrap_or_else(|| "feed".into());
+        let (m, more) = model::FeedModel::from_raw(&raw, &gtfs_id, model::BuildOptions::default());
+        findings.extend(more);
+        (m, findings, zip)
+    } else {
+        let Some(g) = arg(args, "--gtfs-id") else {
+            return usage();
+        };
+        let pool = match pool(args).await {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        let mut conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cannot connect: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match feed_io::load_model(&mut conn, &g).await {
+            Ok((m, findings)) => (m, findings, format!("feed {g}")),
+            Err(e) => {
+                eprintln!("{}: {}", e.code, e.message);
+                return ExitCode::from(1);
+            }
+        }
+    };
+    findings.extend(validate::validate(&m, &today));
+    let report = validate::summarise(&findings, show);
+    println!(
+        "{what}: {} errors, {} warnings (today {today})",
+        report.errors, report.warnings
+    );
+    for c in &report.codes {
+        println!(
+            "  {:<7} {:<26} {:<22} {}",
+            format!("{:?}", c.level).to_lowercase(),
+            c.code,
+            c.file.as_deref().unwrap_or(""),
+            c.count
+        );
+        for s in &c.samples {
+            println!("          {s}");
+        }
+    }
+    if report.errors > 0 {
+        ExitCode::from(4)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn compare_zips(args: &[String]) -> ExitCode {
     let (Some(a), Some(b)) = (arg(args, "--a"), arg(args, "--b")) else {
         return usage();
@@ -369,6 +443,7 @@ async fn main() -> ExitCode {
         Some("draft-import") => draft_import(&args[1..]).await,
         Some("export") => export(&args[1..]).await,
         Some("compare") => compare_zips(&args[1..]),
+        Some("validate") => validate(&args[1..]).await,
         _ => usage(),
     }
 }

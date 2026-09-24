@@ -13,6 +13,7 @@
 //!   transfer starts from, a station with entrances);
 //! - a route calls only at stops: a station's node in an uploaded stop list
 //!   is refused;
+//! - the feed report says what the feed breaks of the reference;
 //! - a stop merge moves the pathways, transfers, areas and join rules naming
 //!   the duplicate to the stop kept, dropping any that would say twice what
 //!   another already says.
@@ -355,6 +356,24 @@ async fn existing_entities_carry_every_gtfs_field() {
         let pool = pool.clone();
         async move { scalar_text(&pool, &sql).await }
     };
+
+    // ---- the feed report: SELF is its own station, which is kept and said
+    let (s, v, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/feeds/{FEED}/validation"))
+    );
+    assert_eq!(s, 200, "{v}");
+    let codes = v["report"]["codes"].as_array().unwrap();
+    let self_parent = codes
+        .iter()
+        .find(|c| c["code"] == "parent_is_itself")
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(
+        (&self_parent["level"], &self_parent["count"]),
+        (&json!("warning"), &json!(1)),
+        "{v}"
+    );
+    assert_eq!(v["counts"]["trips.txt"], 6, "{v}");
 
     // ---- the fields, set through a draft
     let a = open_set!("platforms, entrances, routes");

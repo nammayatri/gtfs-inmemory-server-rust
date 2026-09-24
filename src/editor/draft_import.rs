@@ -93,6 +93,8 @@ pub struct DraftImportReport {
     /// What to do next, when there is something.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// What the zip breaks of the GTFS reference, as the feed report reads it.
+    pub validation: crate::gtfs::validate::Report,
 }
 
 /// How the zip's stop orders sit on the feed's.
@@ -224,6 +226,10 @@ pub async fn draft_import(
         },
     );
     report.findings.extend(more);
+    report.validation = crate::gtfs::validate::summarise(
+        &crate::gtfs::validate::validate(&zip, &chrono::Utc::now().date_naive().to_string()),
+        5,
+    );
     if crate::gtfs::has_errors(&report.findings) {
         tx.rollback().await?;
         return Ok(report);

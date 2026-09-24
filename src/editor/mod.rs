@@ -237,6 +237,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/feeds", web::get().to(h::feeds))
             .route("/feeds/{gtfs_id}/gtfs.zip", web::get().to(h::feed_gtfs_zip))
             .route("/feeds/{gtfs_id}/files", web::get().to(h::files))
+            .route(
+                "/feeds/{gtfs_id}/validation",
+                web::get().to(h::feed_validation),
+            )
             .route("/feeds/{gtfs_id}/files/{file}", web::get().to(h::file_rows))
             .route(
                 "/feeds/{gtfs_id}/files/{file}/{key}",

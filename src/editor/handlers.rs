@@ -471,6 +471,27 @@ pub async fn feed_gtfs_zip(
         .body(bytes))
 }
 
+/// What the feed breaks of the GTFS reference as it stands (section 18): the
+/// report its zip would get, counted by kind.
+pub async fn feed_validation(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    let (m, mut findings) = feed_io::load_model(&mut conn, &g).await?;
+    let today = chrono::Utc::now().date_naive().to_string();
+    findings.extend(crate::gtfs::validate::validate(&m, &today));
+    ok(json!({
+        "gtfs_id": g,
+        "today": today,
+        "counts": m.counts(),
+        "report": crate::gtfs::validate::summarise(&findings, 20),
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct ImportQuery {
     /// `true` writes a seed; anything else is a dry run.
