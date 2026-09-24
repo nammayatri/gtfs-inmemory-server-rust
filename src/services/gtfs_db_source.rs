@@ -1198,7 +1198,8 @@ impl GtfsDbSource {
             let mut groups: Vec<(Vec<&str>, Vec<&Trip>)> = Vec::new();
             let mut group_at: HashMap<Vec<&str>, usize> = HashMap::new();
             for t in trips {
-                if !pattern_at.contains_key(&t.pattern) {
+                if let std::collections::hash_map::Entry::Vacant(slot) = pattern_at.entry(t.pattern)
+                {
                     let rows = rows_by_pattern
                         .get(&(route_id.clone(), t.pattern))
                         .filter(|rows| !rows.is_empty())
@@ -1229,7 +1230,7 @@ impl GtfsDbSource {
                         route_id: prefixed(&route_id),
                         stops: trip_stops,
                     });
-                    pattern_at.insert(t.pattern, (index.patterns.len() as u32 - 1, rows.len()));
+                    slot.insert((index.patterns.len() as u32 - 1, rows.len()));
                 }
                 let (at, n) = pattern_at[&t.pattern];
                 let timing = match t.profile {

@@ -93,14 +93,12 @@ pub fn row_findings(file: &str, row: &Row) -> Vec<RuleFinding> {
                 ));
             }
         }
-        "routes.txt" => {
-            if !has(row, "route_short_name") && !has(row, "route_long_name") {
-                out.push(err(
-                    "missing_field",
-                    "route_short_name",
-                    "a route needs a short name, a long name, or both",
-                ));
-            }
+        "routes.txt" if !has(row, "route_short_name") && !has(row, "route_long_name") => {
+            out.push(err(
+                "missing_field",
+                "route_short_name",
+                "a route needs a short name, a long name, or both",
+            ));
         }
         "calendar.txt" => {
             if let (Some(a), Some(b)) = (text(row, "start_date"), text(row, "end_date")) {
