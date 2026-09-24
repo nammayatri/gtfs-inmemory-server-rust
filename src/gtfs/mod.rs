@@ -8,6 +8,7 @@
 pub mod compare;
 pub mod model;
 pub mod read;
+pub mod rules;
 pub mod spec;
 pub mod write;
 
