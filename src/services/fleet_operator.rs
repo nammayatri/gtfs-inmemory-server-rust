@@ -7,7 +7,9 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
+use crate::services::service_hopper::today_ist;
 use crate::tools::error::{AppError, AppResult};
+use chrono::Datelike;
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
@@ -428,10 +430,214 @@ impl DBFleetOperatorService {
                 is_flexi,
                 duty_date,
             }),
+            // No online waybill for this anchor -- before giving up, check whether there's an
+            // upcoming one for today that should go online right now. This is what lets a
+            // driver's very first currentOperation call of the day (the same call their app
+            // already makes before showing "start trip") silently activate their duty, with no
+            // separate "start duty" step and no new endpoint.
+            None if crate::services::operator::repeater_automation_enabled(gtfs_id) => {
+                self.resolve_and_flip_upcoming_waybill(gtfs_id, anchor)
+                    .await
+            }
             None => Err(AppError::NotFound(
                 "No active (online) waybill found for the provided anchor.".to_string(),
             )),
         }
+    }
+
+    /// Only reached when `resolve_waybill` found nothing online. Finds an `upcoming` waybill for
+    /// today (IST) on the same anchor and flips it online, guarded the same way a
+    /// dashboard-triggered go-online would be: the schedule trip can't already be online
+    /// elsewhere (shared trip rows -- consequence of the repeater's core constraint, but it
+    /// applies to every non-flexi waybill, not just repeater-generated ones), and neither the
+    /// vehicle nor the crew can already be online on a different waybill.
+    async fn resolve_and_flip_upcoming_waybill(
+        &self,
+        gtfs_id: &str,
+        anchor: &WaybillAnchor,
+    ) -> AppResult<WaybillRow> {
+        let today = today_ist().format("%Y-%m-%d").to_string();
+
+        let base_select = r#"
+            SELECT
+                waybill_id::text,
+                waybill_no,
+                vehicle_no,
+                conductor_token_no,
+                driver_token_no,
+                schedule_trip_id::text,
+                is_flexi,
+                duty_date
+            FROM waybills_internal
+            WHERE gtfs_id = $1
+              AND status = 'upcoming'
+              AND duty_date = $2
+              AND deleted = false
+        "#;
+
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<String>,
+        )> = match anchor {
+            WaybillAnchor::DriverToken(token) => {
+                let sql = format!(
+                    "{} AND driver_token_no = $3 ORDER BY updated_at DESC LIMIT 1",
+                    base_select
+                );
+                sqlx::query_as(&sql)
+                    .bind(gtfs_id)
+                    .bind(&today)
+                    .bind(token)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "resolve_and_flip_upcoming_waybill (driver_token) failed: {}",
+                            e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?
+            }
+            WaybillAnchor::ConductorToken(token) => {
+                let sql = format!(
+                    "{} AND conductor_token_no = $3 ORDER BY updated_at DESC LIMIT 1",
+                    base_select
+                );
+                sqlx::query_as(&sql)
+                    .bind(gtfs_id)
+                    .bind(&today)
+                    .bind(token)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "resolve_and_flip_upcoming_waybill (conductor_token) failed: {}",
+                            e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?
+            }
+            WaybillAnchor::VehicleNumber(vehicle_no) => {
+                let sql = format!(
+                    "{} AND vehicle_no = $3 ORDER BY updated_at DESC LIMIT 1",
+                    base_select
+                );
+                sqlx::query_as(&sql)
+                    .bind(gtfs_id)
+                    .bind(&today)
+                    .bind(vehicle_no)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "resolve_and_flip_upcoming_waybill (vehicle_no) failed: {}",
+                            e
+                        );
+                        AppError::Internal(e.to_string())
+                    })?
+            }
+        };
+
+        let Some((
+            waybill_id,
+            waybill_no,
+            vehicle_no,
+            conductor_token_no,
+            driver_token_no,
+            schedule_trip_id,
+            is_flexi,
+            duty_date,
+        )) = row
+        else {
+            return Err(AppError::NotFound(
+                "No active (online) waybill found for the provided anchor.".to_string(),
+            ));
+        };
+
+        if !is_flexi {
+            if let Some(ref st_id) = schedule_trip_id {
+                let schedule_trip_online: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM waybills_internal
+                     WHERE gtfs_id = $1 AND schedule_trip_id::text = $2 AND status = 'online' AND deleted = false)",
+                )
+                .bind(gtfs_id)
+                .bind(st_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+                if schedule_trip_online {
+                    return Err(AppError::BadRequest(format!(
+                        "schedule_trip_id '{}' is already online on another waybill",
+                        st_id
+                    )));
+                }
+            }
+        }
+
+        let vehicle_or_crew_online: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM waybills_internal
+             WHERE gtfs_id = $1 AND status = 'online' AND deleted = false AND waybill_id::text != $2
+               AND (vehicle_no = $3 OR driver_token_no = $4 OR conductor_token_no = $5))",
+        )
+        .bind(gtfs_id)
+        .bind(&waybill_id)
+        .bind(&vehicle_no)
+        .bind(&driver_token_no)
+        .bind(&conductor_token_no)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+        if vehicle_or_crew_online {
+            return Err(AppError::BadRequest(
+                "vehicle or crew is already online on another waybill".to_string(),
+            ));
+        }
+
+        // Guards passed: hand the shared trip rows back clean (yesterday's is_active_trip /
+        // is_completed must not leak into today's duty) before flipping online.
+        if is_flexi {
+            sqlx::query(
+                "UPDATE bus_schedule_trip_flexi_internal SET is_active_trip = false, is_completed = false
+                 WHERE waybill_id::text = $1 AND deleted = false",
+            )
+            .bind(&waybill_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        } else if let Some(ref st_id) = schedule_trip_id {
+            sqlx::query(
+                "UPDATE bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false
+                 WHERE schedule_trip_id::text = $1 AND deleted = false",
+            )
+            .bind(st_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+
+        sqlx::query("UPDATE waybills_internal SET status = 'online', updated_at = now() WHERE waybill_id::text = $1")
+            .bind(&waybill_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        Ok(WaybillRow {
+            waybill_id,
+            waybill_no,
+            vehicle_no,
+            conductor_token_no,
+            driver_token_no,
+            schedule_trip_id,
+            is_flexi,
+            duty_date,
+        })
     }
 
     // ── Trip count ───────────────────────────────────────────────────────────
@@ -614,8 +820,176 @@ impl DBFleetOperatorService {
 
     // ── Trip start/end ───────────────────────────────────────────────────────
 
+    /// Closes a waybill whose last trip just ended and hands the shared trip rows back clean for
+    /// tomorrow's duty -- the same status + reset semantics `update_waybill_status` already
+    /// applies for "closed" (see operator.rs), just triggered by trip completion instead of a
+    /// dashboard action. Best-effort by design: a failure here is logged, never propagated -- it
+    /// must never turn a driver's already-successful end-trip tap into a visible error; ops can
+    /// close the waybill by hand from the dashboard if this doesn't fire.
+    async fn close_waybill_after_last_trip(&self, waybill: &WaybillRow) {
+        let result: AppResult<()> = async {
+            sqlx::query(
+                "UPDATE waybills_internal SET status = 'closed', updated_at = now() WHERE waybill_id::text = $1",
+            )
+            .bind(&waybill.waybill_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            if waybill.is_flexi {
+                sqlx::query(
+                    "UPDATE bus_schedule_trip_flexi_internal SET is_active_trip = false, is_completed = false
+                     WHERE waybill_id::text = $1 AND deleted = false",
+                )
+                .bind(&waybill.waybill_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            } else if let Some(schedule_trip_id) = &waybill.schedule_trip_id {
+                sqlx::query(
+                    "UPDATE bus_schedule_trip_detail_internal SET is_active_trip = false, is_completed = false
+                     WHERE schedule_trip_id::text = $1 AND deleted = false",
+                )
+                .bind(schedule_trip_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            error!(
+                "close_waybill_after_last_trip: failed for waybill_id={}: {} -- ops can close it manually from the dashboard",
+                waybill.waybill_id, e
+            );
+        }
+    }
+
+    /// After a duty closes, if its schedule trip has an active repeat, create the next
+    /// occurrence -- the exact same idempotent insert `generate`/the reconciler tick use
+    /// (`operator::create_repeat_waybill`), just triggered by this specific close instead of a
+    /// manual or ticked sweep. Only ever the primary path, never the only one: if this fails, or
+    /// the duty never closes at all (breakdown, no-show), the reconciler tick catches it later
+    /// purely from calendar dates, independent of whether this fired. Best-effort for the same
+    /// reason close_waybill_after_last_trip is -- must never turn a driver's end-trip tap into
+    /// an error.
+    async fn create_successor_if_repeat_active(&self, gtfs_id: &str, waybill: &WaybillRow) {
+        if waybill.is_flexi {
+            return; // Repeat only ever applies to non-flexi (schedule-based) waybills.
+        }
+        let Some(schedule_trip_id) = waybill.schedule_trip_id.clone() else {
+            return;
+        };
+        let Some(closed_duty_date) = waybill.duty_date.clone() else {
+            return;
+        };
+
+        let result: AppResult<()> = async {
+            #[allow(clippy::type_complexity)]
+            let row: Option<(
+                String,
+                Option<chrono::NaiveDate>,
+                Vec<i16>,
+                String,
+                Option<String>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT repeat_status, valid_until, recurrence_days,
+                        schedule_id::text, schedule_number_name, start_time
+                 FROM public.bus_schedule_trip_internal
+                 WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
+            )
+            .bind(&schedule_trip_id)
+            .bind(gtfs_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            let Some((
+                repeat_status,
+                valid_until,
+                recurrence_days,
+                schedule_id,
+                schedule_trip_name,
+                schedule_start_time,
+            )) = row
+            else {
+                return Ok(());
+            };
+            if repeat_status != "active" {
+                return Ok(());
+            }
+
+            let from_date = chrono::NaiveDate::parse_from_str(&closed_duty_date, "%Y-%m-%d")
+                .map_err(|e| {
+                    AppError::Internal(format!("bad duty_date '{}': {}", closed_duty_date, e))
+                })?;
+
+            // Walk forward to the next flagged weekday, capped well beyond any realistic
+            // recurrence gap so a data problem (e.g. an empty recurrence_days that slipped past
+            // activation validation some other way) can't spin this forever.
+            let mut candidate = from_date + chrono::Duration::days(1);
+            let mut next_date = None;
+            for _ in 0..60 {
+                if let Some(until) = valid_until {
+                    if candidate > until {
+                        break;
+                    }
+                }
+                let iso_weekday = i16::try_from(candidate.weekday().number_from_monday()).unwrap_or(0);
+                if recurrence_days.contains(&iso_weekday) {
+                    next_date = Some(candidate);
+                    break;
+                }
+                candidate += chrono::Duration::days(1);
+            }
+
+            let Some(next_date) = next_date else {
+                return Ok(());
+            };
+            let next_duty_date = next_date.format("%Y-%m-%d").to_string();
+
+            let already_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM public.waybills_internal
+                 WHERE gtfs_id = $1 AND schedule_trip_id::text = $2 AND duty_date = $3 AND deleted = false)",
+            )
+            .bind(gtfs_id)
+            .bind(&schedule_trip_id)
+            .bind(&next_duty_date)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+            if already_exists {
+                return Ok(()); // already generated ahead of time -- nothing to do
+            }
+
+            crate::services::operator::create_repeat_waybill(
+                &self.pool,
+                gtfs_id,
+                &schedule_trip_id,
+                &next_duty_date,
+                &schedule_id,
+                schedule_trip_name.as_deref(),
+                schedule_start_time.as_deref(),
+            )
+            .await
+            .map(|_| ())
+        }
+        .await;
+
+        if let Err(e) = result {
+            error!(
+                "create_successor_if_repeat_active: failed for waybill_id={} schedule_trip_id={}: {} -- the reconciler tick will catch this",
+                waybill.waybill_id, schedule_trip_id, e
+            );
+        }
+    }
+
     async fn apply_trip_action(
         &self,
+        gtfs_id: &str,
         waybill: &WaybillRow,
         action: &TripAction,
         trip_number: i32,
@@ -826,6 +1200,28 @@ impl DBFleetOperatorService {
                             );
                             AppError::Internal(e.to_string())
                         })?;
+                    }
+                }
+
+                // Last trip on this waybill just ended: close it out. Reuses get_trip_numbers
+                // (the same real/dead/inactive/deleted predicates the readers already use)
+                // instead of re-deriving "is any trip left" with a second copy of that logic.
+                // Gated on the master switch -- see REPEATER_AUTOMATION_ENABLED_GTFS_IDS.
+                if crate::services::operator::repeater_automation_enabled(gtfs_id) {
+                    match self.get_trip_numbers(waybill).await {
+                        Ok(trip_numbers) => {
+                            if !trip_numbers.iter().any(|&n| n > i64::from(trip_number)) {
+                                self.close_waybill_after_last_trip(waybill).await;
+                                self.create_successor_if_repeat_active(gtfs_id, waybill)
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "apply_trip_action end: could not check remaining trips for waybill_id={}: {} -- skipping auto-close",
+                                waybill.waybill_id, e
+                            );
+                        }
                     }
                 }
             }
@@ -1041,7 +1437,7 @@ impl FleetOperatorService for DBFleetOperatorService {
         if action != TripAction::Reset {
             self.validate_trip_exists(&waybill, trip_number).await?;
         }
-        self.apply_trip_action(&waybill, &action, trip_number, timestamp)
+        self.apply_trip_action(gtfs_id, &waybill, &action, trip_number, timestamp)
             .await?;
         Ok(TripActionResponse { success: true })
     }
