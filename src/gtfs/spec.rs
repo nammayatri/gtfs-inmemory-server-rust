@@ -204,7 +204,7 @@ pub enum Key {
     /// One id field is the key (`pathway_id`).
     Field(&'static str),
     /// The file has no id of its own (`transfers.txt`): each row gets a minted
-    /// `record_id`, and these fields together must still be unique.
+    /// `row_id`, and these fields together must still be unique.
     Minted { natural: &'static [&'static str] },
     /// One row per feed (`feed_info.txt`); the key is the gtfs_id.
     Feed,
@@ -1235,6 +1235,19 @@ pub fn references_to(file: &str, field: &str) -> Vec<(&'static FileSpec, &'stati
         }
     }
     out
+}
+
+/// The column type a record table gives a field of this type.
+pub fn sql_type(ty: FieldType) -> &'static str {
+    match ty {
+        Id => "text COLLATE \"C\"",
+        Text | Url | Email | Phone | Language | Timezone | Color | CurrencyCode
+        | CurrencyAmount => "text",
+        Date => "date",
+        Time | Integer { .. } | Enum(_) => "integer",
+        Latitude | Longitude | Float { .. } => "double precision",
+        Json => "jsonb",
+    }
 }
 
 // ---------------------------------------------------------------- values

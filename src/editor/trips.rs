@@ -54,7 +54,9 @@ pub struct StoredFrequency {
     pub start_s: i32,
     pub end_s: i32,
     pub headway_s: i32,
-    pub exact_times: i16,
+    /// None: the feed left it blank (0022), which reads as 0. A stored 0 hashes
+    /// exactly as it did before the column could be blank.
+    pub exact_times: Option<i16>,
 }
 
 /// A `gtfs_trip` row with its frequency windows, in the field order the trips
@@ -1323,7 +1325,7 @@ pub fn check_trips(
                     start_s: a,
                     end_s: b,
                     headway_s: f.headway_s,
-                    exact_times: f.exact_times.unwrap_or(0),
+                    exact_times: f.exact_times,
                 }),
                 _ => err(
                     "invalid_time",
