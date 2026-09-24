@@ -739,3 +739,28 @@ h1 .live-value, .title-block .live-value { display: block; font-weight: 400; whi
 .break { overflow-wrap: anywhere; word-break: break-word; }
 code.break { display: inline-block; max-width: 46ch; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ------------------------------------------------------------------ GTFS files, trips, calendar, feed (section 18) */
+.gtfs-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px 14px; }
+.gtfs-more { border: 1px solid var(--rule); border-radius: 8px; padding: 8px 12px; background: var(--surface); }
+.gtfs-more > summary { cursor: pointer; font-weight: 700; }
+.gtfs-more[open] > summary { margin-bottom: 8px; }
+.req { color: var(--danger); }
+.enum-other { display: flex; gap: 6px; }
+.files-group, .feed-section { margin-top: 20px; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 12px 0; }
+.file-table td, .board-table td, .report-table td, .timing-table td { vertical-align: top; }
+.file-table td { max-width: 18em; overflow-wrap: anywhere; }
+.record-form { display: grid; gap: 14px; margin-top: 12px; }
+.record-form textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+nav.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+button.tab { border: 1px solid var(--rule); background: var(--surface); border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; }
+button.tab[aria-pressed="true"] { background: var(--action); border-color: var(--action); color: #fff; }
+.board-group { margin: 12px 0; }
+.board-group h3 { margin: 0 0 6px; font-size: 15px; }
+.add-trips { display: grid; gap: 8px; margin-top: 16px; padding: 12px; border: 1px dashed var(--rule-strong); border-radius: 8px; }
+.timing { margin-top: 24px; }
+.timing-table input { width: 6em; }
+.report .samples { margin: 0; padding-left: 16px; font-size: 13px; color: var(--muted); }
+fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var(--rule); border-radius: 8px; padding: 8px 12px; }
+.calendar-table code { letter-spacing: 2px; }

@@ -9,6 +9,7 @@ import {
 } from "./util.js";
 import * as map from "./map.js";
 import { addChange, existingChange, createdChange, requireDraft, updateChange } from "./drafts.js";
+import { fileSpec, fieldsForm, cellText } from "./gtfs.js";
 import { stopPicker } from "./picker.js";
 import { showStop, showRoute } from "./explore.js";
 import { undoScope } from "./undo.js";
@@ -57,6 +58,38 @@ function guard(what) {
 }
 
 // ------------------------------------------------------------------ stop
+// The rest of a stop's or route's GTFS fields (section 18), in a section of
+// its own under the editor's usual fields: built from the spec, started from
+// what the detail read says (`gtfs`) with the draft's change laid over it.
+// Returns {el, read(live, prior)} where read gives the fields to send or
+// {errors}; a field put back to what is live is sent when the draft changes it.
+function gtfsSection(file, fields, live, prior, idPrefix, intro) {
+  const start = { ...(live || {}) };
+  if (prior) for (const k of fields) if (k in prior) start[k] = prior[k];
+  let form = null;
+  const el = h("details.gtfs-more", h("summary", "More GTFS fields"), h("p.empty", "Loading…"));
+  fileSpec(file).then((fs) => {
+    form = fieldsForm(fs, fields, start, idPrefix);
+    clear(el, h("summary", "More GTFS fields"), h("p.hint", intro), form.el);
+  }).catch(() => clear(el, h("summary", "More GTFS fields"), h("p.notice.error", "The GTFS reference could not be read; these fields keep what they have.")));
+  const read = () => {
+    if (!form) return { after: {} };
+    const { values, errors } = form.read();
+    if (errors.length) return { errors };
+    const after = {};
+    for (const [k, v] of Object.entries(values)) {
+      const was = live ? live[k] ?? null : null;
+      const drafted = !!(prior && k in prior);
+      if (cellText(v) !== cellText(was) || (drafted && cellText(v) !== cellText(prior[k]))) after[k] = v;
+    }
+    return { after };
+  };
+  return { el, read };
+}
+
+const STOP_GTFS = ["tts_stop_name", "zone_id", "stop_url", "stop_timezone", "wheelchair_boarding", "level_id", "stop_access"];
+const ROUTE_GTFS = ["route_desc", "route_url", "route_sort_order", "continuous_pickup", "continuous_drop_off", "network_id", "agency_id", "route_type"];
+
 export async function editStop(stop) {
   if (!(await requireDraft())) return;
   const prior = existingChange("stop", stop.stop_id);
@@ -71,6 +104,10 @@ export async function editStop(stop) {
     regional_name: h("input", { type: "text", id: "stop-regional", value: start.regional_name || "", lang: "ta" }),
   };
   const unsaved = guard(`Your changes to ${stop.name} are not in the draft yet.`);
+  // an entrance, node or boarding area says what it is and where it stands; a
+  // platform's station is set by a station change
+  const more = gtfsSection("stops.txt", stop.location_type > 1 ? [...STOP_GTFS, "location_type", "parent_station"] : STOP_GTFS,
+    stop.gtfs, prior && prior.after, "stop-gtfs", "Fields of stops.txt the feed may carry: the name read aloud, fare zone, web page, time zone, step-free boarding, level and access.");
   const moved = h("p.hint", { "aria-live": "polite" });
   const problems = h("div");
   // a finished drag of the pin, and each field once left, is one step to undo
@@ -159,6 +196,9 @@ export async function editStop(stop) {
       const drafted = !!(prior && prior.after && k in prior.after);
       if (v !== (stop[k] || null) || (drafted && v !== (prior.after[k] ?? null))) after[k] = v;
     }
+    const extra = more.read();
+    if (extra.errors) { clear(problems, h("div.notice.error", h("ul", extra.errors.map((e) => h("li", e))))); return; }
+    Object.assign(after, extra.after);
     if (!Object.keys(after).length) { clear(problems, h("p.notice", "Nothing has changed yet.")); return; }
     try {
       const res = await addChange({ entity: "stop", op: "update", entity_key: stop.stop_id, after, base_row_version: stop.row_version });
@@ -192,6 +232,7 @@ export async function editStop(stop) {
         h("label.field", { for: "stop-regional" }, h("span", "Tamil name (optional)"), f.regional_name)),
       h("p.hint", { id: "stop-platform-help" }, PLATFORM_HELP),
       description.el,
+      more.el,
       problems),
     h("div.sticky-actions", h("div.btn-row",
       h("button.btn", { type: "submit" }, prior ? "Update in draft" : "Add to draft"),
@@ -707,6 +748,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
   f.color.addEventListener("input", () => { if (/^#[0-9a-f]{6}$/i.test(f.color.value)) swatch.value = f.color.value; });
   const lineStatus = h("div");
   const problems = h("div");
+  const more = gtfsSection("routes.txt", ROUTE_GTFS, createChange ? createChange.after : route.gtfs, createChange ? null : prior && prior.after, "route-gtfs",
+    "Fields of routes.txt the feed may carry: a description, a web page, the order apps list routes in, continuous stopping, its network, agency and type.");
   const history = undoScope("this route");
   history.fields([[f.short_name, "the route number"], [f.long_name, "the route name"], [f.color, "the colour"]]);
   // a colour picked from the swatch is one step, like a typed one
@@ -774,6 +817,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
       f.color.setAttribute("aria-invalid", "true");
       return;
     }
+    const extra = more.read();
+    if (extra.errors) { clear(problems, h("div.notice.error", h("ul", extra.errors.map((e) => h("li", e))))); return; }
     try {
       let res = null;
       if (createChange) {
@@ -784,6 +829,9 @@ export async function editRouteDetails(route, { created = false } = {}) {
         const long = f.long_name.value.trim();
         if (long) after.long_name = long; else delete after.long_name;
         if (color) after.color = color; else delete after.color;
+        for (const [k, v] of Object.entries(extra.after)) {
+          if (v === null) delete after[k]; else after[k] = v;
+        }
         res = await updateChange(createChange, after);
         if (proposed) res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after: lineChange(proposed) });
       } else {
@@ -794,6 +842,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
         }
         if ((color || null) !== (route.color ? route.color.toUpperCase() : null)) after.color = color || null;
         if (proposed) Object.assign(after, lineChange(proposed));
+        Object.assign(after, extra.after);
         if (!Object.keys(after).length) { clear(problems, h("p.notice", "Nothing has changed yet.")); return; }
         res = await addChange({ entity: "route", op: "update", entity_key: route.route_id, after, base_row_version: route.row_version });
       }
@@ -817,6 +866,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
       h("label.field", { for: "route-long" }, h("span", "Route name"), f.long_name),
       h("label.field", { for: "route-color" }, h("span", "Colour on maps (optional)"), h("div.btn-row", swatch, h("div", { style: "flex:1" }, f.color))),
       history.buttons(),
+      more.el,
     ),
     h("section.section",
       h("h2", "Map line"),

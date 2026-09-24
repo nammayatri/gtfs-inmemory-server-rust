@@ -372,6 +372,15 @@ pub async fn stop_detail(
     let mut stop = stop_row(conn, gtfs_id, stop_id)
         .await?
         .ok_or_else(|| EditorError::not_found("stop_not_found", format!("no stop {stop_id}")))?;
+    // the rest of its stops.txt fields, by their GTFS names (section 18)
+    stop["gtfs"] = super::records::gtfs_fields(
+        conn,
+        gtfs_id,
+        "stops.txt",
+        stop_id,
+        super::records::STOP_GTFS_FIELDS,
+    )
+    .await?;
     // every call, on every stop order of the route (a pattern past the first
     // is a metro short turn or express run, section 16): the stop is used there.
     // A call on another stop order than the route's stop list says which.
@@ -815,6 +824,14 @@ pub async fn route_pattern_detail(
         .count();
     route["stop_count"] = json!(served);
     route["pattern_key"] = json!(pattern_key);
+    // the rest of its routes.txt fields, by their GTFS names (section 18)
+    let fields: Vec<&str> = super::records::ROUTE_GTFS_FIELDS
+        .iter()
+        .copied()
+        .chain(["agency_id", "route_type", "route_text_color"])
+        .collect();
+    route["gtfs"] =
+        super::records::gtfs_fields(conn, gtfs_id, "routes.txt", route_id, &fields).await?;
     route["rows"] = json!(rows);
     route["rows_hash"] = json!(hash);
     if let (Some(r), Value::Object(t)) = (
@@ -4061,6 +4078,18 @@ async fn snapshot(
                     .unwrap_or_default();
                 with_members(&mut row, &members);
             }
+            // the rest of its stops.txt fields, as the detail read carries them,
+            // so a review shows what a change to them was (section 18)
+            if !is_station && version.is_some() {
+                row["gtfs"] = super::records::gtfs_fields(
+                    conn,
+                    g,
+                    "stops.txt",
+                    key,
+                    super::records::STOP_GTFS_FIELDS,
+                )
+                .await?;
+            }
             Ok((row, version))
         }
         ("stop", "merge") => {
@@ -4161,8 +4190,15 @@ async fn snapshot(
             ))
         }
         ("route", "update" | "delete") => {
-            if let Some(row) = route_row(conn, g, key).await? {
+            if let Some(mut row) = route_row(conn, g, key).await? {
                 let v = row["row_version"].as_i64().map(|v| v as i32);
+                let fields: Vec<&str> = super::records::ROUTE_GTFS_FIELDS
+                    .iter()
+                    .copied()
+                    .chain(["agency_id", "route_type"])
+                    .collect();
+                row["gtfs"] =
+                    super::records::gtfs_fields(conn, g, "routes.txt", key, &fields).await?;
                 return Ok((row, v));
             }
             let (_, created) = created_in_set(conn, change_set_id, true, key)
