@@ -106,7 +106,7 @@ const LOCATION_TYPES: &[(i64, &str)] = &[
     (4, "boarding area"),
 ];
 /// The basic route types, then the extended (Hierarchical Vehicle Type) ones
-/// the reference allows; the editor accepts every value 100-1799 besides.
+/// the reference allows; the editor accepts every value 100-1702 besides.
 const ROUTE_TYPES: &[(i64, &str)] = &[
     (0, "tram"),
     (1, "subway or metro"),
@@ -1344,7 +1344,7 @@ fn number_in(ty: FieldType, n: f64) -> Result<(), String> {
 
 /// A route type the reference allows: a basic one, or an extended one.
 pub fn route_type_ok(n: i64) -> bool {
-    ROUTE_TYPES.iter().any(|(v, _)| *v == n) || (100..=1799).contains(&n)
+    ROUTE_TYPES.iter().any(|(v, _)| *v == n) || (100..=1702).contains(&n)
 }
 
 fn enum_ok(values: &[(i64, &str)], n: i64, is_route_type: bool) -> bool {
@@ -1486,7 +1486,7 @@ fn canon_str(field: &FieldSpec, s: &str) -> Result<Value, String> {
 fn enum_message(values: &[(i64, &str)], is_route_type: bool) -> String {
     let list: Vec<String> = values.iter().map(|(v, _)| v.to_string()).collect();
     if is_route_type {
-        format!("must be one of {} or 100-1799", list.join(", "))
+        format!("must be one of {} or 100-1702", list.join(", "))
     } else {
         format!("must be one of {}", list.join(", "))
     }

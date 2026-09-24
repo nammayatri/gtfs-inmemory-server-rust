@@ -161,7 +161,7 @@ impl Finding {
 /// out of the serialised row when unset, so the rows hash of every stop list
 /// stored before they were read - the `base_rows_hash` a draft already carries -
 /// is unchanged.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRow {
     #[serde(default)]
@@ -190,6 +190,21 @@ pub struct RouteRow {
     /// GTFS `stop_headsign`, the row's own (section 1, "The headsign").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_headsign: Option<String>,
+    /// The rest of a stop time besides its time (section 18): the feed's own
+    /// `stop_sequence` (only when it numbers its stops otherwise than 1 to n),
+    /// continuous stopping, the distance along the shape and the booking rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous_pickup: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous_drop_off: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_dist_traveled: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_booking_rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_off_booking_rule_id: Option<String>,
 }
 
 impl RouteRow {
@@ -874,7 +889,7 @@ pub fn check_payload(
     match (entity, op) {
         ("stop", "update") => {
             let m = obj(after, what)?;
-            let allowed = [
+            let mut allowed = vec![
                 "name",
                 "lat",
                 "lon",
@@ -885,7 +900,10 @@ pub fn check_payload(
                 "hindi_name",
                 "position_review_id",
             ];
+            // the rest of stops.txt, by its GTFS names (section 18)
+            allowed.extend(super::records::STOP_GTFS_FIELDS);
             allow_only(m, &allowed, what)?;
+            super::records::check_fields("stops.txt", m, super::records::STOP_GTFS_FIELDS, what)?;
             if m.keys().all(|k| k == "position_review_id") {
                 return Err(Finding::error(
                     "invalid_payload",
@@ -920,23 +938,29 @@ pub fn check_payload(
         }
         ("stop", "create") => {
             let m = obj(after, what)?;
-            allow_only(
-                m,
-                &[
-                    "stop_id",
-                    "name",
-                    "lat",
-                    "lon",
-                    "stop_code",
-                    "platform_code",
-                    "description",
-                    "cluster_id",
-                    "regional_name",
-                    "hindi_name",
-                    "position_review_id",
-                ],
-                what,
-            )?;
+            let mut allowed = vec![
+                "stop_id",
+                "name",
+                "lat",
+                "lon",
+                "stop_code",
+                "platform_code",
+                "description",
+                "cluster_id",
+                "regional_name",
+                "hindi_name",
+                "position_review_id",
+            ];
+            allowed.extend(super::records::STOP_GTFS_FIELDS);
+            allow_only(m, &allowed, what)?;
+            super::records::check_fields("stops.txt", m, super::records::STOP_GTFS_FIELDS, what)?;
+            if m.get("location_type").and_then(Value::as_i64) == Some(1) {
+                return Err(Finding::error(
+                    "use_station_change",
+                    "location_type",
+                    format!("{what}: a station is made with station/create"),
+                ));
+            }
             position_review_id(m, what)?;
             let id = req_string(m, "stop_id", what)?;
             check_entity_id("stop_id", id)?;
@@ -1025,18 +1049,27 @@ pub fn check_payload(
         }
         ("route", "create") => {
             let m = obj(after, what)?;
-            allow_only(
-                m,
-                &[
-                    "route_id",
-                    "short_name",
-                    "long_name",
-                    "route_type",
-                    "color",
-                    "agency_id",
-                ],
-                what,
-            )?;
+            let mut allowed = vec![
+                "route_id",
+                "short_name",
+                "long_name",
+                "route_type",
+                "color",
+                "text_color",
+                "agency_id",
+            ];
+            allowed.extend(super::records::ROUTE_GTFS_FIELDS);
+            allow_only(m, &allowed, what)?;
+            super::records::check_fields("routes.txt", m, super::records::ROUTE_GTFS_FIELDS, what)?;
+            if let Some(c) = m.get("text_color").and_then(Value::as_str) {
+                if !is_hex_color(c) {
+                    return Err(Finding::error(
+                        "invalid_color",
+                        c,
+                        format!("{what}: text_color must be #RRGGBB"),
+                    ));
+                }
+            }
             let id = req_string(m, "route_id", what)?;
             check_entity_id("route_id", id)?;
             if id != entity_key {
@@ -1074,19 +1107,33 @@ pub fn check_payload(
         }
         ("route", "update") => {
             let m = obj(after, what)?;
-            allow_only(
-                m,
-                &[
-                    "short_name",
-                    "long_name",
-                    "color",
-                    "text_color",
-                    "encoded_polyline",
-                    "polyline_source",
-                    "schedule_source",
-                ],
-                what,
-            )?;
+            let mut allowed = vec![
+                "short_name",
+                "long_name",
+                "color",
+                "text_color",
+                "encoded_polyline",
+                "polyline_source",
+                "schedule_source",
+                "agency_id",
+                "route_type",
+            ];
+            // the rest of routes.txt, by its GTFS names (section 18)
+            allowed.extend(super::records::ROUTE_GTFS_FIELDS);
+            allow_only(m, &allowed, what)?;
+            super::records::check_fields("routes.txt", m, super::records::ROUTE_GTFS_FIELDS, what)?;
+            opt_string(m, "agency_id", what)?;
+            match m.get("route_type") {
+                None => {}
+                Some(v) if v.as_i64().is_some_and(valid_route_type) => {}
+                Some(v) => {
+                    return Err(Finding::error(
+                        "invalid_route_type",
+                        v.to_string(),
+                        format!("{what}: route_type {v} is not a GTFS route type"),
+                    ))
+                }
+            }
             if m.is_empty() {
                 return Err(Finding::error(
                     "invalid_payload",
@@ -1182,11 +1229,44 @@ pub fn check_payload(
                     format!("{what}: rows are not valid: {e}"),
                 )
             })?;
+            let mut numbered = (0usize, 0usize);
+            let mut last_sequence: Option<i32> = None;
             for (i, r) in rows.iter().enumerate() {
+                if r.is_served() {
+                    numbered.0 += 1;
+                    if let Some(s) = r.stop_sequence {
+                        numbered.1 += 1;
+                        if s < 0 || last_sequence.is_some_and(|l| s < l) {
+                            return Err(Finding::error(
+                                "invalid_payload",
+                                "stop_sequence",
+                                format!(
+                                    "{what}: row {}: stop_sequence runs up from 0 along the stop list",
+                                    i + 1
+                                ),
+                            ));
+                        }
+                        last_sequence = Some(s);
+                    }
+                }
+                if r.shape_dist_traveled
+                    .is_some_and(|d| !d.is_finite() || d < 0.0)
+                {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "shape_dist_traveled",
+                        format!(
+                            "{what}: row {}: shape_dist_traveled is a distance, 0 or more",
+                            i + 1
+                        ),
+                    ));
+                }
                 for (key, v, max) in [
                     ("pickup_type", r.pickup_type, 3),
                     ("drop_off_type", r.drop_off_type, 3),
                     ("timepoint", r.timepoint, 1),
+                    ("continuous_pickup", r.continuous_pickup, 3),
+                    ("continuous_drop_off", r.continuous_drop_off, 3),
                 ] {
                     if v.is_some_and(|v| !(0..=max).contains(&v)) {
                         return Err(Finding::error(
@@ -1196,6 +1276,17 @@ pub fn check_payload(
                         ));
                     }
                 }
+            }
+            // a stop list numbers every served stop its own way, or none
+            if numbered.1 > 0 && numbered.1 < numbered.0 {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "stop_sequence",
+                    format!(
+                        "{what}: {} of {} served rows have a stop_sequence; give every one of them one, or none",
+                        numbered.1, numbered.0
+                    ),
+                ));
             }
             Ok(())
         }
@@ -1563,6 +1654,7 @@ mod tests {
             drop_off_type: None,
             timepoint: None,
             stop_headsign: None,
+            ..Default::default()
         }
     }
 
@@ -1582,6 +1674,7 @@ mod tests {
             drop_off_type: None,
             timepoint: None,
             stop_headsign: None,
+            ..Default::default()
         }
     }
 
@@ -2020,9 +2113,19 @@ mod tests {
             code(json!({"route_id": "R9", "short_name": "9", "route_type": "3"})),
             "invalid_route_type"
         );
+        // routes.txt's own fields, text_color among them (section 18)
+        assert!(ok(
+            json!({"route_id": "R9", "short_name": "9", "text_color": "#000000",
+            "route_url": "https://example.com/9", "route_sort_order": 4})
+        )
+        .is_ok());
         assert_eq!(
-            code(json!({"route_id": "R9", "short_name": "9", "text_color": "#000000"})),
-            "invalid_payload"
+            code(json!({"route_id": "R9", "short_name": "9", "text_color": "black"})),
+            "invalid_color"
+        );
+        assert_eq!(
+            code(json!({"route_id": "R9", "short_name": "9", "continuous_pickup": 7})),
+            "invalid_value"
         );
         assert!(check_payload("route", "delete", "R9", &Value::Null).is_ok());
         assert!(check_payload("route", "delete", "R9", &json!({})).is_err());

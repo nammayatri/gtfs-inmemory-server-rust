@@ -558,7 +558,8 @@ pub const FIRST_PATTERN: i16 = 1;
 
 const ROUTE_ROW_COLS: &str = "stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
      marker_lat, marker_lon, stop_name_override, provider_id, pickup_type, drop_off_type, timepoint, \
-     stop_headsign";
+     stop_headsign, stop_sequence, continuous_pickup, continuous_drop_off, shape_dist_traveled, \
+     pickup_booking_rule_id, drop_off_booking_rule_id";
 
 fn route_row_from(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
     Ok(RouteRow {
@@ -576,6 +577,12 @@ fn route_row_from(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
         drop_off_type: r.try_get("drop_off_type")?,
         timepoint: r.try_get("timepoint")?,
         stop_headsign: r.try_get("stop_headsign")?,
+        stop_sequence: r.try_get("stop_sequence")?,
+        continuous_pickup: r.try_get("continuous_pickup")?,
+        continuous_drop_off: r.try_get("continuous_drop_off")?,
+        shape_dist_traveled: r.try_get("shape_dist_traveled")?,
+        pickup_booking_rule_id: r.try_get("pickup_booking_rule_id")?,
+        drop_off_booking_rule_id: r.try_get("drop_off_booking_rule_id")?,
     })
 }
 
@@ -693,7 +700,9 @@ pub async fn load_patterns_read_rows(
                 s.lat, s.lon, s.deleted AS stop_deleted, s.parent_station, \
                 rs.stop_type, rs.stage_no, rs.stage_name, rs.marker_id, rs.marker_name, rs.marker_lat, \
                 rs.marker_lon, rs.stop_name_override, rs.provider_id, \
-                rs.pickup_type, rs.drop_off_type, rs.timepoint, rs.stop_headsign \
+                rs.pickup_type, rs.drop_off_type, rs.timepoint, rs.stop_headsign, rs.stop_sequence, \
+                rs.continuous_pickup, rs.continuous_drop_off, rs.shape_dist_traveled, \
+                rs.pickup_booking_rule_id, rs.drop_off_booking_rule_id \
          FROM gtfs_route_stop rs \
          JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
            ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
@@ -727,13 +736,31 @@ pub async fn load_patterns_read_rows(
         });
         // the GTFS fields only where a row has them, so a stop list that has
         // none reads exactly as it did before they were read
-        for k in ["pickup_type", "drop_off_type", "timepoint"] {
+        for k in [
+            "pickup_type",
+            "drop_off_type",
+            "timepoint",
+            "continuous_pickup",
+            "continuous_drop_off",
+        ] {
             if let Some(v) = r.try_get::<Option<i16>, _>(k)? {
                 row[k] = json!(v);
             }
         }
-        if let Some(h) = r.try_get::<Option<String>, _>("stop_headsign")? {
-            row["stop_headsign"] = json!(h);
+        for k in [
+            "stop_headsign",
+            "pickup_booking_rule_id",
+            "drop_off_booking_rule_id",
+        ] {
+            if let Some(v) = r.try_get::<Option<String>, _>(k)? {
+                row[k] = json!(v);
+            }
+        }
+        if let Some(v) = r.try_get::<Option<i32>, _>("stop_sequence")? {
+            row["stop_sequence"] = json!(v);
+        }
+        if let Some(v) = r.try_get::<Option<f64>, _>("shape_dist_traveled")? {
+            row["shape_dist_traveled"] = json!(v);
         }
         out.entry((r.try_get("route_id")?, r.try_get("pattern_key")?))
             .or_default()
@@ -1856,6 +1883,18 @@ async fn apply_change(
     }
 }
 
+/// What a person calls a location type.
+pub(super) fn stop_kind(location_type: i16) -> &'static str {
+    match location_type {
+        0 => "a stop",
+        1 => "a station",
+        2 => "an entrance or exit",
+        3 => "a generic node",
+        4 => "a boarding area",
+        _ => "a location",
+    }
+}
+
 struct LiveStop {
     lat: f64,
     lon: f64,
@@ -1909,6 +1948,9 @@ async fn stop_update(
         ));
     }
     let m = after.as_object().expect("payload checked");
+    let before = super::records::gtfs_row(conn, g, "stops.txt", id)
+        .await?
+        .unwrap_or_default();
     let mut warnings = Vec::new();
     let moved = m.contains_key("lat");
     let (lat, lon) = (
@@ -1967,7 +2009,79 @@ async fn stop_update(
     .bind(description)
     .execute(&mut *conn)
     .await?;
+    warnings.extend(stop_gtfs_fields(conn, g, id, m, &before, live.location_type).await?);
     Ok(warnings)
+}
+
+/// The GTFS fields of stops.txt a stop change sets by name (section 18): what
+/// they are written as, and what the stop is then - graded against what it
+/// was, refused when the change breaks a rule of the reference. A stop that
+/// routes call at stays a stop, a station is made and unmade by station
+/// changes, and so is the station above a platform.
+async fn stop_gtfs_fields(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    m: &serde_json::Map<String, Value>,
+    before: &crate::gtfs::model::Row,
+    was_type: i16,
+) -> Result<Vec<Finding>, ApplyError> {
+    let sets = |f: &str| m.contains_key(f);
+    if !super::records::STOP_GTFS_FIELDS.iter().any(|f| sets(f)) {
+        return Ok(vec![]);
+    }
+    let new_type = match m.get("location_type") {
+        Some(v) => v.as_i64().unwrap_or(0) as i16,
+        None => was_type,
+    };
+    if new_type == 1 && was_type != 1 {
+        return Err(fail(
+            "use_station_change",
+            format!("{id} becomes a station through station/create, which groups its platforms"),
+        ));
+    }
+    if new_type != 0 && was_type == 0 {
+        let routes: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+             JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+             WHERE rs.gtfs_id = $1 AND rs.stop_id = $2",
+        )
+        .bind(g)
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if routes > 0 {
+            return Err(fail(
+                "stop_in_use",
+                format!("stop {id} is on {routes} route(s); a place a route calls at stays a stop (location_type 0)"),
+            ));
+        }
+    }
+    if sets("parent_station") && new_type == 0 {
+        return Err(fail(
+            "use_station_change",
+            format!("the station above platform {id} is set by a station change"),
+        ));
+    }
+    super::records::write_fields(
+        conn,
+        g,
+        "gtfs_stop",
+        "stop_id",
+        id,
+        "stops.txt",
+        m,
+        super::records::STOP_GTFS_FIELDS,
+    )
+    .await?;
+    let after = super::records::gtfs_row(conn, g, "stops.txt", id)
+        .await?
+        .unwrap_or_default();
+    let found = super::records::stop_findings(conn, g, id, before, &after).await?;
+    if found.iter().any(|f| f.level == Level::Error) {
+        return Err(ApplyError::Findings(found));
+    }
+    Ok(found)
 }
 
 async fn stop_create(
@@ -2007,7 +2121,8 @@ async fn stop_create(
             format!("stop {} already exists", s("stop_id").unwrap_or("")),
         ));
     }
-    Ok(vec![])
+    let id = s("stop_id").unwrap_or("");
+    stop_gtfs_fields(conn, g, id, m, &crate::gtfs::model::Row::new(), 0).await
 }
 
 async fn stop_delete(
@@ -2056,6 +2171,22 @@ async fn stop_delete(
             ),
         ));
     }
+    // what else names the stop (section 18): pathways, transfers, areas,
+    // location groups, fare join rules, and a boarding area standing on it
+    let users: Vec<_> = super::records::used_by(conn, g, "stops.txt", "stop_id", id)
+        .await?
+        .into_iter()
+        .filter(|(file, _, _)| file != "stop_times.txt")
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            "stop_in_use",
+            format!(
+                "stop {id} is named by {}; change or remove those first",
+                super::records::say_users(&users)
+            ),
+        ));
+    }
     sqlx::query(
         "UPDATE gtfs_stop SET deleted = true, parent_station = NULL, updated_by = $3 \
          WHERE gtfs_id = $1 AND stop_id = $2",
@@ -2088,6 +2219,9 @@ async fn route_update(
         return Err(fail("route_deleted", format!("route {id} is deleted")));
     }
     let m = after.as_object().expect("payload checked");
+    let before = super::records::gtfs_row(conn, g, "routes.txt", id)
+        .await?
+        .unwrap_or_default();
     let (has_short, short) = field(m, "short_name");
     let (has_long, long) = field(m, "long_name");
     let (has_color, color) = field(m, "color");
@@ -2128,7 +2262,41 @@ async fn route_update(
     .bind(schedule)
     .execute(&mut *conn)
     .await?;
-    Ok(vec![])
+    route_gtfs_fields(conn, g, id, m, &before).await
+}
+
+/// The fields of routes.txt a route change sets by their GTFS names (section
+/// 18), and what the route is then: graded against what it was, refused when
+/// the change breaks a rule of the reference or names an agency the feed does
+/// not have.
+async fn route_gtfs_fields(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    m: &serde_json::Map<String, Value>,
+    before: &crate::gtfs::model::Row,
+) -> Result<Vec<Finding>, ApplyError> {
+    let mut fields: Vec<&str> = super::records::ROUTE_GTFS_FIELDS.to_vec();
+    fields.extend(["agency_id", "route_type"]);
+    super::records::write_fields(
+        conn,
+        g,
+        "gtfs_route",
+        "route_id",
+        id,
+        "routes.txt",
+        m,
+        &fields,
+    )
+    .await?;
+    let after = super::records::gtfs_row(conn, g, "routes.txt", id)
+        .await?
+        .unwrap_or_default();
+    let found = super::records::route_findings(conn, g, before, &after).await?;
+    if found.iter().any(|f| f.level == Level::Error) {
+        return Err(ApplyError::Findings(found));
+    }
+    Ok(found)
 }
 
 async fn route_create(
@@ -2166,7 +2334,17 @@ async fn route_create(
     if created.is_none() {
         return Err(fail("route_exists", format!("route {id} already exists")));
     }
-    Ok(vec![])
+    if let Some(text_color) = s("text_color") {
+        sqlx::query(
+            "UPDATE gtfs_route SET text_color = upper($3) WHERE gtfs_id = $1 AND route_id = $2",
+        )
+        .bind(g)
+        .bind(id)
+        .bind(text_color)
+        .execute(&mut *conn)
+        .await?;
+    }
+    route_gtfs_fields(conn, g, id, m, &crate::gtfs::model::Row::new()).await
 }
 
 /// Soft delete: the route and its rows stay, marked deleted, and GIMS stops
@@ -2205,6 +2383,22 @@ async fn route_delete(
                     .map(i64::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+        ));
+    }
+    // what else names the route: transfers, fare rules, attributions, its
+    // network (its own trips go with it)
+    let users: Vec<_> = super::records::used_by(conn, g, "routes.txt", "route_id", id)
+        .await?
+        .into_iter()
+        .filter(|(file, _, _)| file != "trips.txt")
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            "route_in_use",
+            format!(
+                "route {id} is named by {}; change or remove those first",
+                super::records::say_users(&users)
             ),
         ));
     }
@@ -2303,6 +2497,14 @@ async fn stop_merge(
                 "stop_is_station",
                 id,
                 format!("{id} is a station; only stops are merged"),
+            )),
+            Some(s) if s.location_type != 0 => errors.push(Finding::error(
+                "not_a_stop",
+                id,
+                format!(
+                    "{id} is {}; only stops are merged",
+                    stop_kind(s.location_type)
+                ),
             )),
             _ => {}
         }
@@ -2444,7 +2646,10 @@ async fn stop_merge(
         .execute(&mut *conn)
         .await?;
     }
-    // 4. the duplicate
+    // 4. what else names the duplicate names the kept stop (section 18):
+    // pathways, transfers, areas, location groups, and its boarding areas
+    let records = super::records::repoint_stop(conn, g, from, into, true).await?;
+    // 5. the duplicate
     sqlx::query(
         "UPDATE gtfs_stop SET deleted = true, parent_station = NULL, \
             provenance = coalesce(provenance, '{}'::jsonb) || jsonb_build_object('merged_into', $3::text), \
@@ -2464,6 +2669,7 @@ async fn stop_merge(
         .insert(from.to_string(), (into.to_string(), c.change_id, false));
     state.merges.push(json!({
         "change_id": c.change_id, "from": from, "into": into, "routes": routes, "rows": moved.len(),
+        "records": records,
         "keep_name": if keep_name_from { "from" } else { "into" },
         "keep_position": if keep_position_from { "from" } else { "into" },
     }));
@@ -2566,6 +2772,14 @@ async fn route_stops_replace(
                 id.as_str(),
                 format!("{id} is a station; a route calls at one of its platforms"),
             )),
+            Some((t, _)) if *t != 0 => findings.push(Finding::error(
+                "not_a_stop",
+                id.as_str(),
+                format!(
+                    "{id} is {} (location_type {t}); a route calls at a stop or platform",
+                    stop_kind(*t)
+                ),
+            )),
             _ => {}
         }
     }
@@ -2637,6 +2851,14 @@ async fn route_stops_replace(
         (vec![], vec![], vec![], vec![], vec![], vec![]);
     let mut provenance: Vec<Option<String>> = Vec::with_capacity(n);
     let (mut pickup, mut dropoff, mut timepoint, mut headsign) = (vec![], vec![], vec![], vec![]);
+    let (
+        mut gtfs_seq,
+        mut cont_pickup,
+        mut cont_dropoff,
+        mut dist,
+        mut pickup_rule,
+        mut dropoff_rule,
+    ) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     for (i, r) in rows.iter().enumerate() {
         let s = i as i32 + 1;
         seq.push(s);
@@ -2645,6 +2867,21 @@ async fn route_stops_replace(
         pickup.push(served(r.pickup_type));
         dropoff.push(served(r.drop_off_type));
         timepoint.push(served(r.timepoint));
+        cont_pickup.push(served(r.continuous_pickup));
+        cont_dropoff.push(served(r.continuous_drop_off));
+        let marker = r.is_marker();
+        gtfs_seq.push(if marker { None } else { r.stop_sequence });
+        dist.push(if marker { None } else { r.shape_dist_traveled });
+        pickup_rule.push(if marker {
+            None
+        } else {
+            r.pickup_booking_rule_id.clone()
+        });
+        dropoff_rule.push(if marker {
+            None
+        } else {
+            r.drop_off_booking_rule_id.clone()
+        });
         headsign.push(if r.is_marker() {
             None
         } else {
@@ -2720,14 +2957,18 @@ async fn route_stops_replace(
         "INSERT INTO gtfs_route_stop (gtfs_id, route_id, pattern_key, sequence, stop_id, stop_type, stage_no, \
                                       stage_name, marker_id, marker_name, marker_lat, marker_lon, \
                                       stop_name_override, provider_id, provenance, updated_by, \
-                                      pickup_type, drop_off_type, timepoint, stop_headsign) \
+                                      pickup_type, drop_off_type, timepoint, stop_headsign, stop_sequence, \
+                                      continuous_pickup, continuous_drop_off, shape_dist_traveled, \
+                                      pickup_booking_rule_id, drop_off_booking_rule_id) \
          SELECT $1, $2, $16, u.seq, u.stop, u.typ, u.no, u.name, u.mid, u.mname, u.mlat, u.mlon, u.over, \
-                u.prov, u.provenance::jsonb, $14, u.pickup, u.dropoff, u.timepoint, u.headsign \
+                u.prov, u.provenance::jsonb, $14, u.pickup, u.dropoff, u.timepoint, u.headsign, u.gseq, \
+                u.cpickup, u.cdropoff, u.dist, u.prule, u.drule \
          FROM UNNEST($3::int4[], $4::text[], $5::text[], $6::int4[], $7::text[], $8::text[], $9::text[], \
                      $10::float8[], $11::float8[], $12::text[], $13::text[], $15::text[], \
-                     $17::int2[], $18::int2[], $19::int2[], $20::text[]) \
+                     $17::int2[], $18::int2[], $19::int2[], $20::text[], $21::int4[], $22::int2[], \
+                     $23::int2[], $24::float8[], $25::text[], $26::text[]) \
               AS u(seq, stop, typ, no, name, mid, mname, mlat, mlon, over, prov, provenance, \
-                   pickup, dropoff, timepoint, headsign)",
+                   pickup, dropoff, timepoint, headsign, gseq, cpickup, cdropoff, dist, prule, drule)",
     )
     .bind(g)
     .bind(route_id)
@@ -2749,6 +2990,12 @@ async fn route_stops_replace(
     .bind(&dropoff)
     .bind(&timepoint)
     .bind(&headsign)
+    .bind(&gtfs_seq)
+    .bind(&cont_pickup)
+    .bind(&cont_dropoff)
+    .bind(&dist)
+    .bind(&pickup_rule)
+    .bind(&dropoff_rule)
     .execute(&mut *conn)
     .await?;
     // the pattern's stored timings follow its new stops, in this same change
@@ -2844,6 +3091,14 @@ async fn check_members(
                 "member_is_station",
                 id.as_str(),
                 format!("{id} is itself a station"),
+            )),
+            Some(s) if s.location_type != 0 => findings.push(Finding::error(
+                "not_a_stop",
+                id.as_str(),
+                format!(
+                    "{id} is {}; a station's members are its platforms",
+                    stop_kind(s.location_type)
+                ),
             )),
             Some(s) if s.parent_station.as_deref().is_some_and(|p| p != station_id) => findings
                 .push(Finding::error(
@@ -2953,7 +3208,8 @@ async fn station_update(
         check_members(conn, g, id, &members).await?;
         sqlx::query(
             "UPDATE gtfs_stop SET parent_station = NULL, updated_by = $4 \
-             WHERE gtfs_id = $1 AND parent_station = $2 AND NOT (stop_id = ANY($3))",
+             WHERE gtfs_id = $1 AND parent_station = $2 AND NOT (stop_id = ANY($3)) \
+               AND location_type = 0",
         )
         .bind(g)
         .bind(id)
@@ -2973,8 +3229,34 @@ async fn station_delete(
     actor: &str,
 ) -> Result<Vec<Finding>, ApplyError> {
     live_station(conn, g, id).await?;
+    let inside: Vec<(String, i16)> = sqlx::query_as(
+        "SELECT stop_id, location_type FROM gtfs_stop \
+         WHERE gtfs_id = $1 AND parent_station = $2 AND location_type IN (2, 3) AND NOT deleted \
+         ORDER BY stop_id",
+    )
+    .bind(g)
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !inside.is_empty() {
+        let list: Vec<String> = inside
+            .iter()
+            .take(5)
+            .map(|(s, t)| format!("{s} ({})", stop_kind(*t)))
+            .collect();
+        return Err(fail(
+            "station_has_entrances",
+            format!(
+                "station {id} has {} entrance(s) and node(s) ({}{}); delete them or move them to another station first",
+                inside.len(),
+                list.join(", "),
+                if inside.len() > 5 { ", ..." } else { "" }
+            ),
+        ));
+    }
     sqlx::query(
-        "UPDATE gtfs_stop SET parent_station = NULL, updated_by = $3 WHERE gtfs_id = $1 AND parent_station = $2",
+        "UPDATE gtfs_stop SET parent_station = NULL, updated_by = $3 \
+         WHERE gtfs_id = $1 AND parent_station = $2 AND location_type = 0",
     )
     .bind(g)
     .bind(id)
@@ -3212,6 +3494,9 @@ async fn station_merge(
         .execute(&mut *conn)
         .await?;
     }
+    // what names the station that goes names the one that stays (section 18);
+    // its platforms, entrances and nodes moved with the parent above
+    let records = super::records::repoint_stop(conn, g, from, into, false).await?;
     // 3. the station that goes: the same `merged_into` key a stop merge writes,
     // which is what the loader turns into an alias
     sqlx::query(
@@ -3232,6 +3517,7 @@ async fn station_merge(
         .insert(from.to_string(), (into.to_string(), c.change_id, true));
     state.station_merges.push(json!({
         "change_id": c.change_id, "from": from, "into": into, "platforms_moved": moved,
+        "records": records,
         "keep_name": if keep_name_from { "from" } else { "into" },
         "keep_position": if keep_position_from { "from" } else { "into" },
     }));
@@ -5409,6 +5695,7 @@ mod tests {
             drop_off_type: None,
             timepoint: None,
             stop_headsign: None,
+            ..Default::default()
         };
         let mut b = a.clone();
         b.stop_id = Some("B".into());
