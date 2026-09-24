@@ -1,6 +1,7 @@
 pub mod editor;
 pub mod environment;
 pub mod graphql;
+pub mod gtfs;
 pub mod handlers;
 pub mod middleware;
 pub mod models;

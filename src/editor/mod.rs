@@ -230,6 +230,7 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/auth/session", web::post().to(h::session_create))
             .route("/auth/session", web::delete().to(h::session_delete))
             // live data
+            .route("/gtfs-spec", web::get().to(h::gtfs_spec))
             .route("/feeds", web::get().to(h::feeds))
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))

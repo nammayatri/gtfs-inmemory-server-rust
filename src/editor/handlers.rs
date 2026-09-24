@@ -349,6 +349,14 @@ pub async fn session_delete(req: HttpRequest, st: Data) -> EditorResult<HttpResp
 
 // ---------------------------------------------------------------- reads
 
+/// The GTFS reference as data (section 18): every file and field, what each
+/// may hold, what it points at and where the editor keeps it. The dashboard
+/// builds its file list and forms from this.
+pub async fn gtfs_spec(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
+    auth::signed_in(&req, &st).await?;
+    ok(crate::gtfs::spec::spec_json())
+}
+
 pub async fn feeds(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
     let ctx = auth::signed_in(&req, &st).await?;
     ok(svc::feeds(&st, &ctx).await?)
