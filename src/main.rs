@@ -35,6 +35,9 @@ async fn main() -> anyhow::Result<()> {
     // Create application state
     let port = app_config.port;
     let polling_enabled = app_config.polling_enabled;
+    let repeater_lookahead_days = app_config.repeater_lookahead_days;
+    let repeater_tick_interval_secs = app_config.repeater_tick_interval_secs;
+    let repeater_min_run_interval_secs = app_config.repeater_min_run_interval_secs;
     let editor_state = gtfs_routes_service::editor::EditorState::init(&app_config).await;
     let app_state = environment::AppState::new(app_config).await?;
 
@@ -68,6 +71,19 @@ async fn main() -> anyhow::Result<()> {
             osrtc_cache.start_background_refresh_task().await;
         });
     }
+
+    // Waybill repeater reconciler: safety net for the operators in
+    // REPEATER_AUTOMATION_ENABLED_GTFS_IDS (empty by default). See operator.rs.
+    let operator_service_clone = app_state.operator_service.clone();
+    tokio::spawn(async move {
+        gtfs_routes_service::services::operator::run_repeater_reconciler_tick(
+            operator_service_clone,
+            repeater_lookahead_days,
+            repeater_tick_interval_secs,
+            repeater_min_run_interval_secs,
+        )
+        .await;
+    });
 
     // Keep the service-hopper indexes in step with the GTFS feed.
     //
