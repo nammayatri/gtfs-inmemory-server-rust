@@ -473,13 +473,22 @@ pub async fn feed_gtfs_zip(
 
 #[derive(Deserialize)]
 pub struct ImportQuery {
-    /// `true` writes; anything else is a dry run.
+    /// `true` writes a seed; anything else is a dry run.
     pub seed: Option<bool>,
+    /// `drafts`: bring the zip into a feed that has rows, through change sets
+    /// (section 18); `seed` (the default): load a feed that has none.
+    pub mode: Option<String>,
+    /// mode `drafts`: `false` writes the change sets; a dry run otherwise.
+    pub dry_run: Option<bool>,
+    /// mode `drafts`: the files it may write, comma separated.
+    pub files: Option<String>,
 }
 
 /// Load a feed that has no rows yet from its GTFS zip, the request's body
 /// (section 18). Admin only: it writes a whole feed without a draft, which is
-/// allowed only while there is nothing a draft could have been based on.
+/// allowed only while there is nothing a draft could have been based on. With
+/// `mode=drafts` it instead drafts change sets that bring the zip into a feed
+/// that has rows, for review like any other.
 pub async fn feed_import(
     req: HttpRequest,
     st: Data,
@@ -494,6 +503,29 @@ pub async fn feed_import(
         email: Some(ctx.user.email.clone()),
         label: ctx.user.email.clone(),
     };
+    match q.mode.as_deref() {
+        None | Some("seed") => {}
+        Some("drafts") => {
+            let opts = super::draft_import::DraftImport {
+                files: q
+                    .files
+                    .as_deref()
+                    .map(|f| f.split(',').map(str::to_string).collect()),
+                dry_run: q.dry_run.unwrap_or(true),
+                user_id: ctx.user.user_id,
+                email: ctx.user.email.clone(),
+            };
+            let report =
+                super::draft_import::draft_import(&st.pool, &body, Some(&g), &opts).await?;
+            return ok(json!(report));
+        }
+        Some(other) => {
+            return Err(EditorError::bad_request(
+                "invalid_mode",
+                format!("mode {other:?} is not seed or drafts"),
+            ))
+        }
+    }
     let dry_run = !q.seed.unwrap_or(false);
     let report = feed_io::import_zip(&st.pool, &body, Some(&g), dry_run, &who).await?;
     ok(json!(report))

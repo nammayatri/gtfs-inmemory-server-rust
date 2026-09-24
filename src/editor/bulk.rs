@@ -3022,6 +3022,108 @@ pub async fn run(
 /// On the feed's lock like every other draft write, so it never collides with a
 /// commit; retried whole after a serialization failure. The bool says whether
 /// the response carries the set detail (a dry run's does not).
+/// The upload's rows, planned against the draft as it stands.
+async fn plan_kind(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    kind: Kind,
+    req: &BulkRequest,
+    draft: &DraftView,
+    actor: &str,
+) -> EditorResult<Plan> {
+    let (rows, with_before) = (&req.rows, !req.dry_run);
+    Ok(match kind {
+        Kind::Stops => plan_stops(conn, g, rows, draft).await?,
+        Kind::Routes => plan_routes(conn, g, rows, draft).await?,
+        Kind::RouteStops => plan_route_stops(conn, g, rows, draft, with_before).await?,
+        Kind::StopUpdates => {
+            plan_stop_updates(conn, g, change_set_id, rows, draft, with_before).await?
+        }
+        Kind::RouteTrips => plan_route_trips(conn, g, rows, draft, with_before).await?,
+        Kind::TimingProfiles => plan_timing_profiles(conn, g, rows, draft, with_before).await?,
+        Kind::Services => plan_services(conn, g, rows, draft, with_before).await?,
+        Kind::Records => {
+            let fspec = records_file(req.file.as_deref())?;
+            plan_records(conn, g, change_set_id, fspec, rows, actor).await?
+        }
+    })
+}
+
+/// Append a plan's changes to the draft, minting the stop and trip ids its
+/// rows left blank as single changes would. Returns the new change ids.
+async fn insert_plan(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    user_id: Uuid,
+    plan: &mut Plan,
+) -> EditorResult<Vec<i64>> {
+    let unnamed: Vec<usize> = plan
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.key.is_none())
+        .map(|(k, _)| k)
+        .collect();
+    let minted = service::mint_stop_ids(conn, g, unnamed.len()).await?;
+    for (k, id) in unnamed.into_iter().zip(minted) {
+        let c = &mut plan.changes[k];
+        c.after["stop_id"] = json!(id);
+        c.key = Some(id);
+    }
+    // a trip uploaded without an id gets one, as a single change's would
+    for c in plan
+        .changes
+        .iter_mut()
+        .filter(|c| c.entity == "route_trips")
+    {
+        let route = c.key.clone().unwrap_or_default();
+        service::mint_missing_trip_ids(conn, g, &route, &mut c.after).await?;
+    }
+    let inserts: Vec<ChangeInsert> = plan
+        .changes
+        .iter()
+        .map(|c| ChangeInsert {
+            entity: c.entity.into(),
+            op: c.op.into(),
+            entity_key: c.key.clone().unwrap_or_default(),
+            base_row_version: c.base,
+            before: c.before.clone(),
+            after: c.after.clone(),
+        })
+        .collect();
+    service::insert_changes(conn, change_set_id, user_id, &inserts).await
+}
+
+/// An upload an import builds itself (section 18): `rows` of `kind` planned
+/// against the draft as it stands, exactly as an upload of them would be, and
+/// appended to it when no row has an error. Returns each row's findings and
+/// the new change ids (none when a row has an error).
+pub(super) async fn plan_into_set(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    (user_id, actor): (Uuid, &str),
+    kind: Kind,
+    rows: Vec<Value>,
+) -> EditorResult<(Vec<Vec<Finding>>, Vec<i64>)> {
+    let req = BulkRequest {
+        kind: kind.name().to_string(),
+        rows,
+        dry_run: false,
+        file: None,
+    };
+    let draft = DraftView::load(conn, change_set_id).await?;
+    let mut plan = plan_kind(conn, g, change_set_id, kind, &req, &draft, actor).await?;
+    let findings: Vec<Vec<Finding>> = plan.rows.iter().map(|o| o.findings.clone()).collect();
+    if plan.has_errors() {
+        return Ok((findings, vec![]));
+    }
+    let ids = insert_plan(conn, g, change_set_id, user_id, &mut plan).await?;
+    Ok((findings, ids))
+}
+
 async fn run_once(
     state: &EditorState,
     ctx: &Ctx,
@@ -3035,31 +3137,16 @@ async fn run_once(
     service::editable(&set)?;
     let g = set.gtfs_id.clone();
     let draft = DraftView::load(&mut tx, change_set_id).await?;
-    let mut plan = match kind {
-        Kind::Stops => plan_stops(&mut tx, &g, &req.rows, &draft).await?,
-        Kind::Routes => plan_routes(&mut tx, &g, &req.rows, &draft).await?,
-        Kind::RouteStops => plan_route_stops(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?,
-        Kind::StopUpdates => {
-            plan_stop_updates(&mut tx, &g, change_set_id, &req.rows, &draft, !req.dry_run).await?
-        }
-        Kind::RouteTrips => plan_route_trips(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?,
-        Kind::TimingProfiles => {
-            plan_timing_profiles(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?
-        }
-        Kind::Services => plan_services(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?,
-        Kind::Records => {
-            let fspec = records_file(req.file.as_deref())?;
-            plan_records(
-                &mut tx,
-                &g,
-                change_set_id,
-                fspec,
-                &req.rows,
-                &ctx.user.email,
-            )
-            .await?
-        }
-    };
+    let mut plan = plan_kind(
+        &mut tx,
+        &g,
+        change_set_id,
+        kind,
+        req,
+        &draft,
+        &ctx.user.email,
+    )
+    .await?;
     if req.dry_run {
         tx.rollback().await?;
         return Ok((respond(true, kind, &plan, &[]), false));
@@ -3082,42 +3169,7 @@ async fn run_once(
         tx.rollback().await?;
         return Ok((respond(false, kind, &plan, &[]), true));
     }
-    let unnamed: Vec<usize> = plan
-        .changes
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.key.is_none())
-        .map(|(k, _)| k)
-        .collect();
-    let minted = service::mint_stop_ids(&mut tx, &g, unnamed.len()).await?;
-    for (k, id) in unnamed.into_iter().zip(minted) {
-        let c = &mut plan.changes[k];
-        c.after["stop_id"] = json!(id);
-        c.key = Some(id);
-    }
-    // a trip uploaded without an id gets one, as a single change's would
-    for c in plan
-        .changes
-        .iter_mut()
-        .filter(|c| c.entity == "route_trips")
-    {
-        let route = c.key.clone().unwrap_or_default();
-        service::mint_missing_trip_ids(&mut tx, &g, &route, &mut c.after).await?;
-    }
-    let inserts: Vec<ChangeInsert> = plan
-        .changes
-        .iter()
-        .map(|c| ChangeInsert {
-            entity: c.entity.into(),
-            op: c.op.into(),
-            entity_key: c.key.clone().unwrap_or_default(),
-            base_row_version: c.base,
-            before: c.before.clone(),
-            after: c.after.clone(),
-        })
-        .collect();
-    let change_ids =
-        service::insert_changes(&mut tx, change_set_id, ctx.user.user_id, &inserts).await?;
+    let change_ids = insert_plan(&mut tx, &g, change_set_id, ctx.user.user_id, &mut plan).await?;
     sqlx::query("UPDATE gtfs_change_set SET updated_at = now() WHERE change_set_id = $1")
         .bind(change_set_id)
         .execute(&mut *tx)

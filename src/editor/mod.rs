@@ -13,6 +13,7 @@ pub mod bulk;
 pub mod context;
 pub mod crypto;
 pub mod draft;
+pub mod draft_import;
 pub mod error;
 pub mod feed_io;
 pub mod feed_lock;
