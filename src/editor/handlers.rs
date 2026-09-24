@@ -10,6 +10,7 @@ use super::feed_lock;
 use super::gps_line::{self, GpsFailure};
 use super::position_reviews;
 use super::proposals;
+use super::records;
 use super::service::{self as svc, Page, StopQuery};
 use super::trips;
 use super::validation::valid_lat_lon;
@@ -362,6 +363,89 @@ pub async fn gtfs_spec(req: HttpRequest, st: Data) -> EditorResult<HttpResponse>
 pub async fn feeds(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
     let ctx = auth::signed_in(&req, &st).await?;
     ok(svc::feeds(&st, &ctx).await?)
+}
+
+// ---------------------------------------------------------------- GTFS files (section 18)
+
+#[derive(Deserialize)]
+pub struct FilesQuery {
+    pub q: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+/// The record file `file` names (`pathways.txt` or `pathways`); a file the
+/// editor keeps in tables of its own is read through its own endpoints.
+fn record_file(file: &str) -> EditorResult<&'static crate::gtfs::spec::FileSpec> {
+    let fspec = crate::gtfs::spec::file(file).ok_or_else(|| {
+        EditorError::not_found(
+            "file_not_found",
+            format!("{file} is not a file of the GTFS reference"),
+        )
+    })?;
+    if fspec.table().is_none() {
+        return Err(EditorError::bad_request(
+            "not_a_record_file",
+            format!(
+                "{} is kept in the editor's own tables: read it through /stops, /routes, /routes/{{id}}/trips or /services",
+                fspec.name
+            ),
+        ));
+    }
+    Ok(fspec)
+}
+
+/// Every file of the reference, with how many rows the feed has in each.
+pub async fn files(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(records::list_files(&mut conn, &path).await?)
+}
+
+/// A record file's rows, paged, `q` matching any of their text.
+pub async fn file_rows(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+    q: web::Query<FilesQuery>,
+) -> EditorResult<HttpResponse> {
+    let (g, file) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let fspec = record_file(&file)?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    let mut conn = st.pool.acquire().await?;
+    ok(records::list_records(&mut conn, &g, fspec, q.q.as_deref(), &page).await?)
+}
+
+/// One record, with what points at it.
+pub async fn file_row(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String, String)>,
+) -> EditorResult<HttpResponse> {
+    let (g, file, key) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let fspec = record_file(&file)?;
+    let mut conn = st.pool.acquire().await?;
+    ok(records::record_detail(&mut conn, &g, fspec, &key).await?)
+}
+
+/// A record file's rows with a draft applied.
+pub async fn change_set_preview_file(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+    q: web::Query<FilesQuery>,
+) -> EditorResult<HttpResponse> {
+    let (id, file) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    let fspec = record_file(&file)?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    ok(svc::preview_records(&st, &ctx, id, fspec, q.q.as_deref(), &page).await?)
 }
 
 /// A feed's whole GTFS as the zip it publishes, from the tables (section 18).

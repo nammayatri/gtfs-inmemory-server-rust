@@ -252,6 +252,10 @@ async fn a_feed_is_seeded_from_its_zip_and_exports_it_back() {
     );
 
     // ---- the seed
+    let started: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let report = feed_io::import_zip(&pool, &zip, None, false, &who)
         .await
         .unwrap();
@@ -332,10 +336,11 @@ async fn a_feed_is_seeded_from_its_zip_and_exports_it_back() {
     assert_eq!((lt, cluster.as_deref()), (0, Some("c7")));
     let audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM gtfs_audit_log WHERE gtfs_id = $1 AND action = 'seed' \
-         AND detail->>'zip_sha256' = $2",
+         AND detail->>'zip_sha256' = $2 AND at >= $3",
     )
     .bind(FEED)
     .bind(&report.zip_sha256)
+    .bind(started)
     .fetch_one(&pool)
     .await
     .unwrap();

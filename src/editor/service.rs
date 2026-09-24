@@ -1354,6 +1354,9 @@ fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: 
         }
         "station" => format!("Station {key}"),
         "feed_config" => format!("The data source of feed {key}"),
+        e if super::records::spec_for(e).is_some() => {
+            super::records::describe(super::records::spec_for(e).expect("a record file"), key)
+        }
         _ if key != c.entity_key => format!("Stop {key} (kept by the merge of {})", c.entity_key),
         _ => format!("Stop {key}"),
     };
@@ -1412,6 +1415,9 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
             ("route", key),
         ],
         ("service", "create") => vec![("service", key)],
+        (e, "create") if super::records::spec_for(e).is_some() => {
+            vec![("record", format!("{e}#{key}"))]
+        }
         // replacing a stop order that does not exist creates it
         ("route_stops", "replace") => vec![("pattern", format!("{key}#{}", pattern_of(&c.after)))],
         _ => vec![],
@@ -1570,6 +1576,20 @@ async fn conflict_for(
                 .find(|p| Some(p.profile_key as i64) == profile)
                 .map(|p| p.row_version);
             if live.is_some() || c.base_row_version.is_some() {
+                out.extend(version_conflict(c, key, live, c.base_row_version));
+            }
+        }
+        (e, op) if super::records::spec_for(e).is_some() => {
+            let fspec = super::records::spec_for(e).expect("a record file");
+            if op == "create" {
+                if super::records::live_version(conn, g, fspec, key)
+                    .await?
+                    .is_some()
+                {
+                    out.push(conflict(c, "exists", Value::Null, json!(key)));
+                }
+            } else if !in_draft("record", &format!("{e}#{key}")) {
+                let live = super::records::live_version(conn, g, fspec, key).await?;
                 out.extend(version_conflict(c, key, live, c.base_row_version));
             }
         }
@@ -1746,6 +1766,12 @@ fn referenced_stops(c: &ChangeRow) -> Vec<String> {
             }
             v
         }
+        (e, "create" | "update") if super::records::spec_for(e).is_some() => {
+            super::records::referenced_stops(
+                super::records::spec_for(e).expect("a record file"),
+                &c.after,
+            )
+        }
         ("route_stops", "replace") => c.after["rows"]
             .as_array()
             .map(|rows| {
@@ -1819,6 +1845,10 @@ async fn apply_change(
         ("service", "create") => super::trips::service_create(conn, g, &c.after, actor).await,
         ("service", "update") => super::trips::service_update(conn, g, key, &c.after, actor).await,
         ("service", "delete") => super::trips::service_delete(conn, g, key).await,
+        (e, _) if super::records::spec_for(e).is_some() => {
+            let fspec = super::records::spec_for(e).expect("a record file");
+            super::records::apply(conn, g, fspec, c, actor).await
+        }
         (e, o) => Err(fail(
             "invalid_change",
             format!("unsupported change {e}/{o}"),
@@ -3496,6 +3526,32 @@ async fn preview_once(
     Ok(route)
 }
 
+/// A record file's rows (section 18) with a draft applied: applied, read,
+/// rolled back, like a route preview.
+pub async fn preview_records(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    fspec: &'static crate::gtfs::spec::FileSpec,
+    q: Option<&str>,
+    page: &Page,
+) -> EditorResult<Value> {
+    retry_transient(|| async {
+        let mut tx = state.pool.begin().await?;
+        let set = load_set(&mut tx, id, false).await?;
+        let changes = load_changes_to_apply(&mut tx, id).await?;
+        lock_feed(&mut tx, &set.gtfs_id).await?;
+        let ev = evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?;
+        let rows = super::records::list_records(&mut tx, &set.gtfs_id, fspec, q, page).await;
+        tx.rollback().await?;
+        let mut rows = rows?;
+        rows["validation"] = json!(ev.validation);
+        rows["conflicts"] = json!(ev.conflicts);
+        Ok(rows)
+    })
+    .await
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewChange {
@@ -3682,6 +3738,9 @@ async fn snapshot(
     key: &str,
     after: &mut Value,
 ) -> EditorResult<(Value, Option<i32>)> {
+    if let Some(fspec) = super::records::spec_for(entity) {
+        return super::records::snapshot(conn, change_set_id, g, fspec, op, key).await;
+    }
     let station_mismatch = |is_station: bool| {
         EditorError::bad_request(
             if is_station {
@@ -3949,6 +4008,26 @@ pub async fn add_change_to(
     }
     let mut key = entity_key.trim().to_string();
     settle_create_key(&entity, &op, &mut key, &mut after);
+    // a record file with no id of its own gets one; feed_info is the feed's
+    if let Some(fspec) = super::records::spec_for(&entity) {
+        match fspec.key() {
+            Some(crate::gtfs::spec::Key::Feed) if key.is_empty() => key = set.gtfs_id.clone(),
+            Some(crate::gtfs::spec::Key::Feed) if key != set.gtfs_id => {
+                return Err(EditorError::bad_request(
+                    "invalid_change",
+                    format!(
+                        "{entity}/{op}: entity_key must be the change set's feed, {}",
+                        set.gtfs_id
+                    ),
+                )
+                .with_details(json!({"code": "feed_mismatch"})));
+            }
+            Some(crate::gtfs::spec::Key::Minted { .. }) if op == "create" && key.is_empty() => {
+                key = super::records::mint_row_id();
+            }
+            _ => {}
+        }
+    }
     let mint = entity == "stop" && op == "create" && key.is_empty() && after.is_object();
     let invalid = |f: Finding| {
         EditorError::bad_request("invalid_change", f.message.clone())
