@@ -27,6 +27,7 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         route_id: &str,
         gtfs_id: &str,
         vehicle_number: Option<&str>,
+        max_duty_date: Option<&str>,
     ) -> AppResult<Vec<VehicleData>>;
     async fn get_waybill_by_waybill_and_trip(
         &self,
@@ -95,6 +96,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         _route_id: &str,
         _gtfs_id: &str,
         _vehicle_number: Option<&str>,
+        _max_duty_date: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
         Ok(Vec::new())
     }
@@ -192,8 +194,13 @@ impl DBVehicleReaderInternal {
         elapsed >= Duration::from_secs(STATION_ETA_CACHE_DURATION)
     }
 
-    fn get_waybills_by_route_cache_key(&self, gtfs_id: &str, route_id: &str) -> String {
-        format!("{}_{}", gtfs_id, route_id)
+    fn get_waybills_by_route_cache_key(
+        &self,
+        gtfs_id: &str,
+        route_id: &str,
+        max_duty_date: Option<&str>,
+    ) -> String {
+        format!("{}_{}_{}", gtfs_id, route_id, max_duty_date.unwrap_or("*"))
     }
 
     fn get_station_eta_cache_key(&self, gtfs_id: &str) -> String {
@@ -931,6 +938,7 @@ impl DBVehicleReaderInternal {
         route_id: &str,
         gtfs_id: &str,
         vehicle_number: Option<&str>,
+        max_duty_date: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
         let pool = match &self.pool {
             Some(p) => p,
@@ -945,8 +953,8 @@ impl DBVehicleReaderInternal {
         let is_filtered = vehicle_number.is_some();
 
         // Only cache unfiltered results to prevent unbounded cache growth
-        let cache_key =
-            (!is_filtered).then(|| self.get_waybills_by_route_cache_key(gtfs_id, route_id));
+        let cache_key = (!is_filtered)
+            .then(|| self.get_waybills_by_route_cache_key(gtfs_id, route_id, max_duty_date));
 
         // Check cache first (only for unfiltered queries)
         if let Some(ref key) = cache_key {
@@ -1027,6 +1035,7 @@ impl DBVehicleReaderInternal {
                         AND w.deleted = false
                         AND w.gtfs_id = $2
                         AND w.vehicle_no = $3
+                        AND (w.status = 'online' OR $4::text IS NULL OR w.duty_date <= $4)
                         AND (
                             (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                             OR
@@ -1100,6 +1109,7 @@ impl DBVehicleReaderInternal {
                         w.status in ('online', 'upcoming')
                         AND w.deleted = false
                         AND w.gtfs_id = $2
+                        AND (w.status = 'online' OR $3::text IS NULL OR w.duty_date <= $3)
                         AND (
                             (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
                             OR
@@ -1120,6 +1130,7 @@ impl DBVehicleReaderInternal {
         } else {
             query_builder
         };
+        let query_builder = query_builder.bind(max_duty_date);
 
         match query_builder.fetch_all(pool).await {
             Ok(rows) => {
@@ -1330,8 +1341,9 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         route_id: &str,
         gtfs_id: &str,
         vehicle_number: Option<&str>,
+        max_duty_date: Option<&str>,
     ) -> AppResult<Vec<VehicleData>> {
-        self.get_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number)
+        self.get_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number, max_duty_date)
             .await
     }
 

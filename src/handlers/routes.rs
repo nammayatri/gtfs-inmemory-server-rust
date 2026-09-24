@@ -25,9 +25,9 @@ use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
     BusScheduleDetail, BusScheduleDetails, GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee,
-    NandiRoutesRes, RouteStopMapping, StopCodeFromProviderStopCodeResponse, TripDetails,
-    UpdateWaybillDetailsBody, VehicleData, VehicleMetadataResponse, VehicleOperationData,
-    VehicleServiceTypeResponse,
+    NandiRoutesRes, RepeatWalkEntry, RouteStopMapping, ScheduleTripRepeatConfig,
+    StopCodeFromProviderStopCodeResponse, TripDetails, UpdateWaybillDetailsBody, VehicleData,
+    VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
@@ -146,6 +146,22 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     )
                     .route("/waybill/fleet", web::post().to(update_waybill_fleet))
                     .route("/waybill/tablet", web::post().to(update_waybill_tablet))
+                    .route(
+                        "/schedule-trip/{schedule_trip_id}/repeat",
+                        web::get().to(get_schedule_trip_repeat),
+                    )
+                    .route(
+                        "/schedule-trip/{schedule_trip_id}/repeat",
+                        web::post().to(set_schedule_trip_repeat),
+                    )
+                    .route(
+                        "/waybill-repeats/preview",
+                        web::post().to(preview_waybill_repeats),
+                    )
+                    .route(
+                        "/waybill-repeats/generate",
+                        web::post().to(generate_waybill_repeats),
+                    )
                     .route("/waybills", web::get().to(get_waybills))
                     .route("/station-eta/upsert", web::post().to(upsert_station_eta))
                     .route("/vehicles/upsert", web::post().to(upsert_vehicles))
@@ -3070,6 +3086,12 @@ pub struct BusRouteScheduleQuery {
     pub just_external: Option<bool>,
     #[serde(rename = "vehicleNumber")]
     pub vehicle_number: Option<String>,
+    /// "YYYY-MM-DD". Bounds how far into the future an `upcoming` waybill is shown; `online`
+    /// waybills are always shown regardless. Missing -> no filter, matching pre-existing
+    /// behaviour for any caller that doesn't opt in (rider-app always sends this explicitly,
+    /// via `checkAheadDaysSchedule`).
+    #[serde(rename = "maxDutyDate")]
+    pub max_duty_date: Option<String>,
 }
 
 #[utoipa::path(
@@ -3198,6 +3220,9 @@ pub async fn get_bus_route_schedule(
     query: web::Query<BusRouteScheduleQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, route_id) = path.into_inner();
+    // No maxDutyDate sent -> no upper bound, same as before this param existed. Only a caller
+    // that explicitly opts in (rider-app, via checkAheadDaysSchedule) gets the date-bounded view.
+    let max_duty_date = query.max_duty_date.clone();
 
     // Operator gtfs_ids (e.g. chennai_bus, kolkata_bus) - internal DB flow
     // Single join query returns waybills + trip (bstd & bstf) times
@@ -3232,7 +3257,12 @@ pub async fn get_bus_route_schedule(
         if fetch_internal {
             let mut int_rows = app_state
                 .db_vehicle_reader_internal
-                .get_waybills_by_route_id(&route_id, &gtfs_id, vehicle_number)
+                .get_waybills_by_route_id(
+                    &route_id,
+                    &gtfs_id,
+                    vehicle_number,
+                    max_duty_date.as_deref(),
+                )
                 .await?;
             all_rows.append(&mut int_rows);
         }
@@ -3715,6 +3745,37 @@ pub struct UpdateWaybillTabletBody {
     #[schema(value_type = String)]
     pub waybill_id: IdValue,
     pub tablet_id: String,
+}
+
+/// Full replace, not sparse -- repeat config is one small, cohesive decision (when, which days,
+/// on or off), not a set of independently-editable fields the way waybill details are.
+#[derive(Deserialize, ToSchema)]
+pub struct SetScheduleTripRepeatBody {
+    pub repeat_status: String,
+    pub valid_from: Option<chrono::NaiveDate>,
+    /// Omit (or null) to repeat forever once active.
+    pub valid_until: Option<chrono::NaiveDate>,
+    /// ISO weekday numbers, 1=Monday..7=Sunday. Empty means "never fires" -- rejected if
+    /// repeat_status is "active".
+    #[serde(default)]
+    pub recurrence_days: Vec<i16>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct RepeatPreviewQuery {
+    pub from: chrono::NaiveDate,
+    pub to: chrono::NaiveDate,
+    /// Comma-separated schedule_trip_ids to scope to. Omit for every active repeat.
+    pub schedule_trip_ids: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct RepeatGenerateBody {
+    pub from: chrono::NaiveDate,
+    pub to: chrono::NaiveDate,
+    /// Omit for every active repeat.
+    #[serde(default)]
+    pub schedule_trip_ids: Option<Vec<String>>,
 }
 
 #[utoipa::path(
@@ -4661,6 +4722,124 @@ pub async fn update_waybill_tablet(
         "message": "waybill tablet id updated",
         "rows_affected": rows
     })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/schedule-trip/{schedule_trip_id}/repeat",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("schedule_trip_id" = String, Path, description = "Schedule trip id"),
+    ),
+    responses((status = 200, description = "Repeat config for this schedule trip", body = ScheduleTripRepeatConfig))
+)]
+pub async fn get_schedule_trip_repeat(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, schedule_trip_id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let cfg = app_state
+        .operator_service
+        .get_schedule_trip_repeat_config(&gtfs_id, &schedule_trip_id)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(cfg))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/schedule-trip/{schedule_trip_id}/repeat",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("schedule_trip_id" = String, Path, description = "Schedule trip id"),
+    ),
+    request_body = SetScheduleTripRepeatBody,
+    responses((status = 200, description = "Repeat config updated", body = ScheduleTripRepeatConfig))
+)]
+pub async fn set_schedule_trip_repeat(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    body: Json<SetScheduleTripRepeatBody>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, schedule_trip_id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let cfg = app_state
+        .operator_service
+        .set_schedule_trip_repeat_config(
+            &gtfs_id,
+            &schedule_trip_id,
+            &body.repeat_status,
+            body.valid_from,
+            body.valid_until,
+            body.recurrence_days.clone(),
+        )
+        .await?;
+
+    Ok(HttpResponse::Ok().json(cfg))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill-repeats/preview",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("from" = chrono::NaiveDate, Query, description = "Range start (inclusive)"),
+        ("to" = chrono::NaiveDate, Query, description = "Range end (inclusive)"),
+        ("schedule_trip_ids" = Option<String>, Query, description = "Comma-separated schedule_trip_ids; omit for every active repeat"),
+    ),
+    responses((status = 200, description = "Dry-run verdicts, no writes", body = [RepeatWalkEntry]))
+)]
+pub async fn preview_waybill_repeats(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<RepeatPreviewQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let schedule_trip_ids = query.schedule_trip_ids.as_ref().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+    });
+
+    let entries = app_state
+        .operator_service
+        .preview_waybill_repeats(&gtfs_id, query.from, query.to, schedule_trip_ids)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(entries))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/waybill-repeats/generate",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = RepeatGenerateBody,
+    responses((status = 200, description = "Waybills created (or already existing) for the range", body = [RepeatWalkEntry]))
+)]
+pub async fn generate_waybill_repeats(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    body: Json<RepeatGenerateBody>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+
+    let entries = app_state
+        .operator_service
+        .generate_waybill_repeats(&gtfs_id, body.from, body.to, body.schedule_trip_ids.clone())
+        .await?;
+
+    Ok(HttpResponse::Ok().json(entries))
 }
 
 #[utoipa::path(

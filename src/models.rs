@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -422,6 +422,39 @@ pub struct UpdateWaybillDetailsBody {
     pub no_of_device: Option<i64>,
     pub device_serial_number: Option<String>,
     pub status: Option<String>,
+}
+
+/// Recurrence config for a schedule trip. Deliberately holds nothing about vehicle, crew, or
+/// device -- that data already lives on, and changes independently on, the actual waybills;
+/// generation reads it from the most recent one rather than duplicating it here.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct ScheduleTripRepeatConfig {
+    pub schedule_trip_id: String,
+    pub repeat_status: String,
+    /// None until a repeat is first configured.
+    pub valid_from: Option<NaiveDate>,
+    /// None = repeats forever (once active).
+    pub valid_until: Option<NaiveDate>,
+    /// ISO weekday numbers, 1=Monday..7=Sunday. Empty by default -- a repeat only fires on days
+    /// someone has explicitly picked, never on every day just because repeat_status is active.
+    pub recurrence_days: Vec<i16>,
+}
+
+pub fn repeat_statuses() -> Vec<&'static str> {
+    vec!["active", "inactive"]
+}
+
+/// One (schedule_trip_id, date) verdict from a preview or generate walk.
+/// `off_day`: that date's weekday isn't in recurrence_days. `out_of_window`: outside
+/// valid_from/valid_until. `exists`: a waybill is already there. `ok`: preview would create one.
+/// `created`: generate actually created one.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RepeatWalkEntry {
+    pub schedule_trip_id: String,
+    pub duty_date: String,
+    pub verdict: String,
+    pub waybill_id: Option<String>,
+    pub waybill_no: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

@@ -7,9 +7,12 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::models::{IdValue, ServiceTierType};
+use crate::models::{
+    repeat_statuses, IdValue, RepeatWalkEntry, ScheduleTripRepeatConfig, ServiceTierType,
+};
 use crate::services::field_generator;
 use crate::tools::error::{AppError, AppResult};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 pub fn shift_types() -> Vec<&'static str> {
     vec![
@@ -47,6 +50,140 @@ pub fn waybill_statuses() -> Vec<&'static str> {
 }
 
 pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"];
+
+/// Master switch for the waybill repeater's automatic behaviours: auto-close on last trip,
+/// the go-online fallback in resolve_waybill, successor-creation on close, and the reconciler
+/// tick. Empty by default -- none of this fires for any operator until explicitly opted in here,
+/// since all four touch waybill status directly and that feeds CUMTA-style settlement. Adding a
+/// gtfs_id here requires a code change and a deploy, deliberately -- this is a rollout control,
+/// not something meant to be toggled casually.
+pub const REPEATER_AUTOMATION_ENABLED_GTFS_IDS: &[&str] = &["kolkata_bus"];
+
+pub fn repeater_automation_enabled(gtfs_id: &str) -> bool {
+    REPEATER_AUTOMATION_ENABLED_GTFS_IDS.contains(&gtfs_id)
+}
+
+/// Background safety net for the waybill repeater: periodically fills any missing occurrence for
+/// every gtfs_id in REPEATER_AUTOMATION_ENABLED_GTFS_IDS, purely by calendar date -- it does not
+/// care whether the prior occurrence's close (and the successor that should have triggered) ever
+/// actually happened. Reuses generate_waybill_repeats, the exact same path a manual dashboard
+/// generate call uses, so there is exactly one way waybills ever get created here, not two that
+/// could drift apart.
+pub async fn run_repeater_reconciler_tick(
+    operator_service: Arc<dyn OperatorService>,
+    lookahead_days: i64,
+    tick_interval_secs: u64,
+    min_run_interval_secs: i64,
+) {
+    // Reserved lock key -- advisory lock keys are a single global namespace per DB, so a new
+    // lock added elsewhere must pick a different value. Not config: nothing should ever have a
+    // legitimate reason to want a different value here.
+    const RECONCILER_LOCK_KEY: i64 = 891_234_567_890_123;
+    let min_run_interval = chrono::Duration::seconds(min_run_interval_secs);
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
+    interval.tick().await; // discard the immediate first tick, matching the OSRTC cache pattern
+    loop {
+        interval.tick().await;
+        if REPEATER_AUTOMATION_ENABLED_GTFS_IDS.is_empty() {
+            continue;
+        }
+        // Transaction-scoped lock (pg_advisory_xact_lock), not session-scoped: a session-scoped
+        // lock only releases when its connection actually closes, but if this task panics while
+        // the pod itself keeps running, the connection just gets Drop-returned to the pool still
+        // open -- the lock would stay held, stuck on some now-unrelated future borrower of that
+        // connection, until the pool eventually recycles it (db_max_lifetime). A transaction
+        // releases its xact lock the instant the transaction ends, and sqlx::Transaction's Drop
+        // sends an implicit ROLLBACK if it's dropped without an explicit commit -- including
+        // during a panic-unwind -- so a panic anywhere in this tick releases the lock almost
+        // immediately instead of leaving it stuck for up to an hour.
+        let Some(pool) = operator_service.pool() else {
+            continue; // mock/no-DB mode: nothing to reconcile
+        };
+        let mut txn = match pool.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                error!(
+                    "repeater reconciler: could not open a transaction for the lock: {}",
+                    e
+                );
+                continue;
+            }
+        };
+        let acquired: bool = match sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(RECONCILER_LOCK_KEY)
+            .fetch_one(&mut *txn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("repeater reconciler: advisory lock check failed: {}", e);
+                continue; // txn drops here -> implicit rollback; the lock was never acquired
+            }
+        };
+        if !acquired {
+            continue; // another replica already holds the lock for this tick; txn rolls back, harmless
+        }
+
+        // Checked (and later updated) inside the same transaction as the lock, so a panic before
+        // reaching the commit below rolls back the timestamp write too -- a tick that crashed
+        // partway through never gets to fool the next tick into thinking it's already been run.
+        let last_run_at: Option<DateTime<Utc>> =
+            match sqlx::query_scalar("SELECT last_run_at FROM public.repeater_reconciler_state")
+                .fetch_optional(&mut *txn)
+                .await
+            {
+                Ok(v) => v.flatten(),
+                Err(e) => {
+                    error!("repeater reconciler: could not read last_run_at: {}", e);
+                    continue;
+                }
+            };
+        if let Some(last_run_at) = last_run_at {
+            if Utc::now() - last_run_at < min_run_interval {
+                continue; // not due yet -- some replica already ran this within the last hour
+            }
+        }
+
+        let today = crate::services::service_hopper::today_ist();
+        let to = today + chrono::Duration::days(lookahead_days);
+        for gtfs_id in REPEATER_AUTOMATION_ENABLED_GTFS_IDS {
+            match operator_service
+                .generate_waybill_repeats(gtfs_id, today, to, None)
+                .await
+            {
+                Ok(entries) => {
+                    let created = entries.iter().filter(|e| e.verdict == "created").count();
+                    if created > 0 {
+                        info!(
+                            "repeater reconciler: created {} waybill(s) for gtfs_id={}",
+                            created, gtfs_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "repeater reconciler: generate failed for gtfs_id={}: {}",
+                        gtfs_id, e
+                    );
+                }
+            }
+        }
+
+        if let Err(e) =
+            sqlx::query("UPDATE public.repeater_reconciler_state SET last_run_at = now()")
+                .execute(&mut *txn)
+                .await
+        {
+            error!("repeater reconciler: could not record last_run_at: {}", e);
+        }
+
+        // Releases the xact lock and durably commits last_run_at together, in one step.
+        if let Err(e) = txn.commit().await {
+            error!("repeater reconciler: could not commit: {}", e);
+        }
+    }
+}
 
 /// gtfs_ids that should only use the internal reader (no external fetch)
 pub const INTERNAL_ONLY_GTFS_IDS: &[&str] = &["kolkata_bus"];
@@ -1224,6 +1361,41 @@ pub trait OperatorService: Send + Sync {
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>>;
     async fn get_depot_names_and_ids(&self, gtfs_id: &str) -> AppResult<Vec<DepotRow>>;
 
+    // ── Waybill Repeater ────────────────────────────────────────────────
+    // Recurrence lives on the schedule trip itself -- see ScheduleTripRepeatConfig.
+
+    async fn get_schedule_trip_repeat_config(
+        &self,
+        gtfs_id: &str,
+        schedule_trip_id: &str,
+    ) -> AppResult<ScheduleTripRepeatConfig>;
+
+    async fn set_schedule_trip_repeat_config(
+        &self,
+        gtfs_id: &str,
+        schedule_trip_id: &str,
+        repeat_status: &str,
+        valid_from: Option<NaiveDate>,
+        valid_until: Option<NaiveDate>,
+        recurrence_days: Vec<i16>,
+    ) -> AppResult<ScheduleTripRepeatConfig>;
+
+    async fn preview_waybill_repeats(
+        &self,
+        gtfs_id: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        schedule_trip_ids: Option<Vec<String>>,
+    ) -> AppResult<Vec<RepeatWalkEntry>>;
+
+    async fn generate_waybill_repeats(
+        &self,
+        gtfs_id: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        schedule_trip_ids: Option<Vec<String>>,
+    ) -> AppResult<Vec<RepeatWalkEntry>>;
+
     async fn query_vehicles(
         &self,
         gtfs_id: &str,
@@ -1448,6 +1620,46 @@ impl OperatorService for MockOperatorService {
     }
 
     async fn get_depot_names_and_ids(&self, _gtfs_id: &str) -> AppResult<Vec<DepotRow>> {
+        mock_err!()
+    }
+
+    async fn get_schedule_trip_repeat_config(
+        &self,
+        _gtfs_id: &str,
+        _schedule_trip_id: &str,
+    ) -> AppResult<ScheduleTripRepeatConfig> {
+        mock_err!()
+    }
+
+    async fn set_schedule_trip_repeat_config(
+        &self,
+        _gtfs_id: &str,
+        _schedule_trip_id: &str,
+        _repeat_status: &str,
+        _valid_from: Option<NaiveDate>,
+        _valid_until: Option<NaiveDate>,
+        _recurrence_days: Vec<i16>,
+    ) -> AppResult<ScheduleTripRepeatConfig> {
+        mock_err!()
+    }
+
+    async fn preview_waybill_repeats(
+        &self,
+        _gtfs_id: &str,
+        _from: NaiveDate,
+        _to: NaiveDate,
+        _schedule_trip_ids: Option<Vec<String>>,
+    ) -> AppResult<Vec<RepeatWalkEntry>> {
+        mock_err!()
+    }
+
+    async fn generate_waybill_repeats(
+        &self,
+        _gtfs_id: &str,
+        _from: NaiveDate,
+        _to: NaiveDate,
+        _schedule_trip_ids: Option<Vec<String>>,
+    ) -> AppResult<Vec<RepeatWalkEntry>> {
         mock_err!()
     }
 
@@ -1866,6 +2078,315 @@ async fn fetch_schedule_meta_for_trip(
     .fetch_optional(pool)
     .await
     .map_err(|e| AppError::DbError(format!("fetch_schedule_meta_for_trip: {}", e)))
+}
+
+// ── Waybill Repeater: generation ─────────────────────────────────────────
+
+/// Every non-derivable field on a repeat-generated waybill is copied forward from the most
+/// recent real waybill on this schedule trip -- vehicle/crew/device/shift_type/schedule_type
+/// have no other source at all, and entity_id/service_type_id/service_type are copied forward
+/// too rather than re-derived from bus_schedule_internal/service_type_internal: simpler, and
+/// consistent with how the rest of this struct already works. The tradeoff: if a schedule's
+/// depot or service type is ever corrected after waybills already exist against it, that
+/// correction won't reach newly-generated waybills until a waybill is created some other way
+/// (e.g. manually) with the corrected value, since generation only ever looks backward at what
+/// the last waybill said.
+#[derive(Debug, sqlx::FromRow)]
+struct LatestWaybillFields {
+    vehicle_no: String,
+    driver_token_no: String,
+    conductor_token_no: Option<String>,
+    driver_name: Option<String>,
+    conductor_name: Option<String>,
+    no_of_device: i32,
+    device_serial_number: Option<String>,
+    shift_type_id: String,
+    schedule_type: Option<String>,
+    schedule_no: Option<String>,
+    entity_id: Option<String>,
+    service_type_id: Option<String>,
+    service_type: Option<String>,
+}
+
+async fn fetch_latest_waybill_fields(
+    pool: &PgPool,
+    gtfs_id: &str,
+    schedule_trip_id: &str,
+) -> AppResult<Option<LatestWaybillFields>> {
+    sqlx::query_as::<_, LatestWaybillFields>(
+        "SELECT vehicle_no, driver_token_no, conductor_token_no, driver_name, conductor_name,
+                no_of_device, device_serial_number, shift_type_id::text, schedule_type,
+                schedule_no, entity_id::text, service_type_id::text, service_type
+         FROM public.waybills_internal
+         WHERE gtfs_id = $1 AND schedule_trip_id::text = $2 AND deleted = false
+         ORDER BY duty_date DESC
+         LIMIT 1",
+    )
+    .bind(gtfs_id)
+    .bind(schedule_trip_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DbError(format!("fetch_latest_waybill_fields: {}", e)))
+}
+
+/// Creates the next occurrence for one (schedule_trip_id, date). `None` means no prior waybill
+/// to copy vehicle/crew/depot/service-type from, or a concurrent caller's insert won the race
+/// first (ON CONFLICT DO NOTHING via `uq_waybills_schedule_trip_duty_date_active`).
+///
+/// `schedule_id`/`schedule_trip_name`/`schedule_start_time` come from the caller (already fetched
+/// by `walk_schedule_trip_repeats`'s trips query).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_repeat_waybill(
+    pool: &PgPool,
+    gtfs_id: &str,
+    schedule_trip_id: &str,
+    duty_date: &str,
+    schedule_id: &str,
+    schedule_trip_name: Option<&str>,
+    schedule_start_time: Option<&str>,
+) -> AppResult<Option<(String, String)>> {
+    let Some(latest) = fetch_latest_waybill_fields(pool, gtfs_id, schedule_trip_id).await? else {
+        return Ok(None);
+    };
+
+    let waybill_no = field_generator::generate_waybill_number();
+
+    let inserted: Option<String> = sqlx::query_scalar(
+        "INSERT INTO public.waybills_internal
+           (waybill_no, gtfs_id, duty_date, schedule_trip_id, vehicle_no, driver_token_no,
+            conductor_token_no, driver_name, conductor_name, no_of_device, device_serial_number,
+            shift_type_id, schedule_type, schedule_id, schedule_no, schedule_trip_name,
+            schedule_start_time, entity_id, service_type_id, service_type,
+            status, deleted, is_flexi)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                 'upcoming', false, false)
+         ON CONFLICT (gtfs_id, schedule_trip_id, duty_date) WHERE deleted = false DO NOTHING
+         RETURNING waybill_id::text",
+    )
+    .bind(&waybill_no)
+    .bind(gtfs_id)
+    .bind(duty_date)
+    .bind(schedule_trip_id)
+    .bind(&latest.vehicle_no)
+    .bind(&latest.driver_token_no)
+    .bind(&latest.conductor_token_no)
+    .bind(&latest.driver_name)
+    .bind(&latest.conductor_name)
+    .bind(latest.no_of_device)
+    .bind(&latest.device_serial_number)
+    .bind(&latest.shift_type_id)
+    .bind(&latest.schedule_type)
+    .bind(schedule_id)
+    .bind(&latest.schedule_no)
+    .bind(schedule_trip_name)
+    .bind(schedule_start_time)
+    .bind(&latest.entity_id)
+    .bind(&latest.service_type_id)
+    .bind(&latest.service_type)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DbError(format!("create_repeat_waybill (insert): {}", e)))?;
+
+    // None here means the conflict fired -- a concurrent caller already created this exact
+    // (gtfs_id, schedule_trip_id, duty_date) between our existence check and this insert.
+    Ok(inserted.map(|waybill_id| (waybill_id, waybill_no)))
+}
+
+/// The shared walk behind both preview (dry_run=true) and generate (dry_run=false): every active
+/// schedule trip, every calendar date in the range, classified against recurrence_days and the
+/// valid window, with an existence check making repeated calls a no-op regardless of who's
+/// calling -- a manual generate, the on-close trigger, or the reconciler tick (once those exist).
+async fn walk_schedule_trip_repeats(
+    pool: &PgPool,
+    gtfs_id: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+    schedule_trip_ids: Option<&[String]>,
+    dry_run: bool,
+) -> AppResult<Vec<RepeatWalkEntry>> {
+    // generated_till skips trips already fully walked through this window -- filtered here so
+    // the DB query excludes them, not just the per-date loop.
+    #[allow(clippy::type_complexity)]
+    let trips: Vec<(
+        String,
+        NaiveDate,
+        Option<NaiveDate>,
+        Vec<i16>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<NaiveDate>,
+    )> = match schedule_trip_ids {
+        Some(ids) => sqlx::query_as(
+            "SELECT schedule_trip_id::text, valid_from, valid_until, recurrence_days,
+                    schedule_id::text, schedule_number_name, start_time, generated_till
+             FROM public.bus_schedule_trip_internal
+             WHERE gtfs_id = $1 AND repeat_status = 'active' AND valid_from IS NOT NULL
+               AND schedule_trip_id::text = ANY($2)
+               AND (generated_till IS NULL OR generated_till < $3)",
+        )
+        .bind(gtfs_id)
+        .bind(ids)
+        .bind(to)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("walk_schedule_trip_repeats (trips): {}", e)))?,
+        None => sqlx::query_as(
+            "SELECT schedule_trip_id::text, valid_from, valid_until, recurrence_days,
+                    schedule_id::text, schedule_number_name, start_time, generated_till
+             FROM public.bus_schedule_trip_internal
+             WHERE gtfs_id = $1 AND repeat_status = 'active' AND valid_from IS NOT NULL
+               AND (generated_till IS NULL OR generated_till < $2)",
+        )
+        .bind(gtfs_id)
+        .bind(to)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("walk_schedule_trip_repeats (trips): {}", e)))?,
+    };
+
+    let mut entries = Vec::new();
+
+    for (
+        schedule_trip_id,
+        valid_from,
+        valid_until,
+        recurrence_days,
+        schedule_id,
+        schedule_trip_name,
+        schedule_start_time,
+        generated_till,
+    ) in trips
+    {
+        // Resume just past the watermark; `from` is still a floor.
+        let mut date = generated_till
+            .map(|g| std::cmp::max(from, g + chrono::Duration::days(1)))
+            .unwrap_or(from);
+
+        // watermark_stuck freezes the watermark at skipped_no_prior_waybill -- every other
+        // verdict is permanent, but a trip with no waybill history yet must keep retrying
+        // rather than being marked "done" while still blocked.
+        let mut watermark = generated_till;
+        let mut watermark_stuck = false;
+
+        while date <= to {
+            let duty_date = date.format("%Y-%m-%d").to_string();
+            let iso_weekday = i16::try_from(date.weekday().number_from_monday()).unwrap_or(0);
+
+            let verdict = if date < valid_from || valid_until.is_some_and(|u| date > u) {
+                Some("out_of_window")
+            } else if !recurrence_days.contains(&iso_weekday) {
+                Some("off_day")
+            } else {
+                None
+            };
+
+            if let Some(verdict) = verdict {
+                entries.push(RepeatWalkEntry {
+                    schedule_trip_id: schedule_trip_id.clone(),
+                    duty_date,
+                    verdict: verdict.to_string(),
+                    waybill_id: None,
+                    waybill_no: None,
+                });
+                if !watermark_stuck {
+                    watermark = Some(date);
+                }
+                date += chrono::Duration::days(1);
+                continue;
+            }
+
+            let existing_id: Option<(String,)> = sqlx::query_as(
+                "SELECT waybill_id::text FROM public.waybills_internal
+                 WHERE gtfs_id = $1 AND schedule_trip_id::text = $2 AND duty_date = $3 AND deleted = false",
+            )
+            .bind(gtfs_id)
+            .bind(&schedule_trip_id)
+            .bind(&duty_date)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("walk_schedule_trip_repeats (existence): {}", e)))?;
+
+            if let Some((waybill_id,)) = existing_id {
+                entries.push(RepeatWalkEntry {
+                    schedule_trip_id: schedule_trip_id.clone(),
+                    duty_date,
+                    verdict: "exists".to_string(),
+                    waybill_id: Some(waybill_id),
+                    waybill_no: None,
+                });
+                if !watermark_stuck {
+                    watermark = Some(date);
+                }
+            } else if dry_run {
+                entries.push(RepeatWalkEntry {
+                    schedule_trip_id: schedule_trip_id.clone(),
+                    duty_date,
+                    verdict: "ok".to_string(),
+                    waybill_id: None,
+                    waybill_no: None,
+                });
+            } else {
+                match create_repeat_waybill(
+                    pool,
+                    gtfs_id,
+                    &schedule_trip_id,
+                    &duty_date,
+                    &schedule_id,
+                    schedule_trip_name.as_deref(),
+                    schedule_start_time.as_deref(),
+                )
+                .await?
+                {
+                    Some((waybill_id, waybill_no)) => {
+                        entries.push(RepeatWalkEntry {
+                            schedule_trip_id: schedule_trip_id.clone(),
+                            duty_date,
+                            verdict: "created".to_string(),
+                            waybill_id: Some(waybill_id),
+                            waybill_no: Some(waybill_no),
+                        });
+                        if !watermark_stuck {
+                            watermark = Some(date);
+                        }
+                    }
+                    None => {
+                        entries.push(RepeatWalkEntry {
+                            schedule_trip_id: schedule_trip_id.clone(),
+                            duty_date,
+                            verdict: "skipped_no_prior_waybill".to_string(),
+                            waybill_id: None,
+                            waybill_no: None,
+                        });
+                        watermark_stuck = true;
+                    }
+                }
+            }
+            date += chrono::Duration::days(1);
+        }
+
+        // dry_run never writes anything, so it must not advance the watermark either.
+        if !dry_run {
+            if let Some(w) = watermark {
+                if generated_till != Some(w) {
+                    sqlx::query(
+                        "UPDATE public.bus_schedule_trip_internal SET generated_till = $3
+                         WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
+                    )
+                    .bind(&schedule_trip_id)
+                    .bind(gtfs_id)
+                    .bind(w)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| {
+                        AppError::DbError(format!("walk_schedule_trip_repeats (watermark): {}", e))
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 #[async_trait]
@@ -2416,6 +2937,142 @@ impl OperatorService for DBOperatorService {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::DbError(format!("get_depot_names_and_ids: {}", e)))
+    }
+
+    // ── Waybill Repeater ────────────────────────────────────────────────
+    // Recurrence lives on the schedule trip itself -- no separate table, and deliberately no
+    // vehicle/crew/device here (generation derives those from the most recent actual waybill).
+
+    async fn get_schedule_trip_repeat_config(
+        &self,
+        gtfs_id: &str,
+        schedule_trip_id: &str,
+    ) -> AppResult<ScheduleTripRepeatConfig> {
+        sqlx::query_as::<_, ScheduleTripRepeatConfig>(
+            "SELECT schedule_trip_id::text, repeat_status, valid_from, valid_until, recurrence_days
+             FROM public.bus_schedule_trip_internal
+             WHERE schedule_trip_id::text = $1 AND gtfs_id = $2",
+        )
+        .bind(schedule_trip_id)
+        .bind(gtfs_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_schedule_trip_repeat_config: {}", e)))?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "schedule_trip_id '{}' not found for gtfs_id '{}'",
+                schedule_trip_id, gtfs_id
+            ))
+        })
+    }
+
+    async fn set_schedule_trip_repeat_config(
+        &self,
+        gtfs_id: &str,
+        schedule_trip_id: &str,
+        repeat_status: &str,
+        valid_from: Option<NaiveDate>,
+        valid_until: Option<NaiveDate>,
+        recurrence_days: Vec<i16>,
+    ) -> AppResult<ScheduleTripRepeatConfig> {
+        if !repeat_statuses().contains(&repeat_status) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid repeat_status '{}'. Valid: {:?}",
+                repeat_status,
+                repeat_statuses()
+            )));
+        }
+        // Activating with no start date or no days picked is never meaningful -- it would either
+        // not know when to start, or never fire at all. Deactivating has no such requirement.
+        if repeat_status == "active" {
+            if valid_from.is_none() {
+                return Err(AppError::BadRequest(
+                    "valid_from is required to activate a repeat".to_string(),
+                ));
+            }
+            if recurrence_days.is_empty() {
+                return Err(AppError::BadRequest(
+                    "recurrence_days must include at least one day to activate a repeat"
+                        .to_string(),
+                ));
+            }
+        }
+        if let (Some(from), Some(until)) = (valid_from, valid_until) {
+            if until < from {
+                return Err(AppError::BadRequest(
+                    "valid_until cannot be before valid_from".to_string(),
+                ));
+            }
+        }
+        for day in &recurrence_days {
+            if !(1..=7).contains(day) {
+                return Err(AppError::BadRequest(format!(
+                    "recurrence_days values must be 1-7 (ISO weekday, 1=Monday), got {}",
+                    day
+                )));
+            }
+        }
+
+        // Reset generated_till -- a changed window/day set can un-skip a previously out_of_window
+        // or off_day date, so a stale watermark must not survive the edit.
+        sqlx::query_as::<_, ScheduleTripRepeatConfig>(
+            "UPDATE public.bus_schedule_trip_internal
+             SET repeat_status = $3, valid_from = $4, valid_until = $5, recurrence_days = $6,
+                 generated_till = NULL, updated_at = now()
+             WHERE schedule_trip_id::text = $1 AND gtfs_id = $2
+             RETURNING schedule_trip_id::text, repeat_status, valid_from, valid_until, recurrence_days",
+        )
+        .bind(schedule_trip_id)
+        .bind(gtfs_id)
+        .bind(repeat_status)
+        .bind(valid_from)
+        .bind(valid_until)
+        .bind(&recurrence_days)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("set_schedule_trip_repeat_config: {}", e)))?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "schedule_trip_id '{}' not found for gtfs_id '{}'",
+                schedule_trip_id, gtfs_id
+            ))
+        })
+    }
+
+    async fn preview_waybill_repeats(
+        &self,
+        gtfs_id: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        schedule_trip_ids: Option<Vec<String>>,
+    ) -> AppResult<Vec<RepeatWalkEntry>> {
+        walk_schedule_trip_repeats(
+            &self.pool,
+            gtfs_id,
+            from,
+            to,
+            schedule_trip_ids.as_deref(),
+            true,
+        )
+        .await
+    }
+
+    async fn generate_waybill_repeats(
+        &self,
+        gtfs_id: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        schedule_trip_ids: Option<Vec<String>>,
+    ) -> AppResult<Vec<RepeatWalkEntry>> {
+        walk_schedule_trip_repeats(
+            &self.pool,
+            gtfs_id,
+            from,
+            to,
+            schedule_trip_ids.as_deref(),
+            false,
+        )
+        .await
     }
 
     async fn query_vehicles(

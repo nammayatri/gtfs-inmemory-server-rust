@@ -91,6 +91,12 @@ in {
   gtfs_db_feeds = [] : List Text,
   gtfs_version_poll_seconds = 5,
 
+  -- How many days ahead the waybill repeater's hourly reconciler keeps `upcoming`
+  -- waybills generated, for every operator in REPEATER_AUTOMATION_ENABLED_GTFS_IDS.
+  repeater_lookahead_days = 7,
+  repeater_tick_interval_secs = 300,
+  repeater_min_run_interval_secs = 3600,
+
   -- Outbound webhooks (docs/gtfs-editor.md section 12). Off here: each pod
   -- reports the feed version it is serving only when this is True, and a
   -- webhook can fire only if its URL's host is in the allow-list, which is

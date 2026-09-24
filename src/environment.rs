@@ -112,6 +112,21 @@ pub struct AppConfig {
     /// rebuilds the ones that moved.
     #[serde(default = "default_gtfs_version_poll_seconds")]
     pub gtfs_version_poll_seconds: u64,
+    /// How many days ahead the waybill repeater's hourly reconciler keeps `upcoming` waybills
+    /// generated for every operator in REPEATER_AUTOMATION_ENABLED_GTFS_IDS. Defaulted so
+    /// existing dhall configs (that predate this field) still parse.
+    #[serde(default = "default_repeater_lookahead_days")]
+    pub repeater_lookahead_days: i64,
+    /// How often each replica checks in -- not how often the reconciler actually runs; see
+    /// repeater_min_run_interval_secs. Should be meaningfully shorter than that value, or
+    /// whichever replica checks in right before the hour is up won't check again until another
+    /// full interval later, defeating the point of checking often.
+    #[serde(default = "default_repeater_tick_interval_secs")]
+    pub repeater_tick_interval_secs: u64,
+    /// The real once-per-run throttle, enforced via a DB timestamp rather than any one
+    /// replica's clock.
+    #[serde(default = "default_repeater_min_run_interval_secs")]
+    pub repeater_min_run_interval_secs: i64,
     /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
     /// existing dhall configs still parse; the editor stays off unless enabled.
     #[serde(default)]
@@ -234,6 +249,18 @@ fn default_preprocessed_data_dir() -> String {
 
 fn default_gtfs_version_poll_seconds() -> u64 {
     5
+}
+
+fn default_repeater_lookahead_days() -> i64 {
+    7
+}
+
+fn default_repeater_tick_interval_secs() -> u64 {
+    300
+}
+
+fn default_repeater_min_run_interval_secs() -> i64 {
+    3600
 }
 
 impl OtpConfig {
