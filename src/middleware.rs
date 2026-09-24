@@ -45,11 +45,13 @@ impl RootSpanBuilder for DomainRootSpanBuilder {
             .and_then(|merchant_id| merchant_id.to_str().ok())
             .map(|str| str.to_string());
 
+        // Never put a credential in a span: a token is logged as a short hash,
+        // which still correlates a caller's requests without being replayable.
         let token = request
             .headers()
             .get("token")
             .and_then(|token| token.to_str().ok())
-            .map(|str| str.to_string());
+            .map(redacted_digest);
 
         tracing_actix_web::root_span!(request, request_id, merchant_id, token)
     }
@@ -189,7 +191,38 @@ fn get_method(request: &HttpRequest) -> String {
 /// # Returns
 /// * `String` - A formatted string representation of the headers.
 fn get_headers(request: &HttpRequest) -> String {
-    format!("{:?}", request.headers())
+    let mut out: Vec<String> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str();
+            if is_sensitive_header(name) {
+                format!("{name}: <redacted>")
+            } else {
+                format!("{name}: {:?}", value)
+            }
+        })
+        .collect();
+    out.sort();
+    format!("{{{}}}", out.join(", "))
+}
+
+/// Headers that carry a credential and must never reach a log line.
+pub fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "x-pomerium-jwt-assertion"
+            | "cookie"
+            | "set-cookie"
+            | "authorization"
+            | "proxy-authorization"
+            | "token"
+    )
+}
+
+fn redacted_digest(value: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
+    format!("sha256:{}", hex::encode(&digest.as_ref()[..6]))
 }
 
 /// Calculate and log metrics from HTTP requests and responses.
@@ -231,5 +264,28 @@ fn calculate_metrics(
             "SUCCESS",
             time
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test::TestRequest;
+
+    #[test]
+    fn credentials_never_appear_in_logged_headers() {
+        let req = TestRequest::default()
+            .insert_header(("x-pomerium-jwt-assertion", "eyJsecret.jwt.value"))
+            .insert_header(("cookie", "gtfs_editor_session=abc123"))
+            .insert_header(("authorization", "Bearer topsecret"))
+            .insert_header(("token", "driver-token-xyz"))
+            .insert_header(("x-request-id", "req-1"))
+            .to_http_request();
+        let logged = get_headers(&req);
+        for secret in ["eyJsecret", "abc123", "topsecret", "driver-token-xyz"] {
+            assert!(!logged.contains(secret), "{secret} leaked into {logged}");
+        }
+        assert!(logged.contains("req-1"));
+        assert!(redacted_digest("driver-token-xyz").starts_with("sha256:"));
     }
 }

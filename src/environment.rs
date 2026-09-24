@@ -22,10 +22,12 @@ use crate::services::{
     metro_graph::MetroGraph,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
     osrtc_station_cache::OsrtcStationCache,
+    service_hopper::{load_all as load_service_hopper, FeedHoppers},
     trip_service::TripService,
 };
 use crate::tools::dhall::read_dhall_config as dhall_read_config;
 use crate::tools::error::AppError;
+use arc_swap::ArcSwap;
 use shared::tools::logger::LoggerConfig;
 use tracing::{error, info};
 
@@ -92,10 +94,161 @@ pub struct AppConfig {
     /// route polylines during reprocess. Absent/empty ⇒ polyline step is skipped.
     #[serde(default)]
     pub osrm_url: Option<String>,
+    /// Static fallback list of feeds served from the `gtfs_*` tables over
+    /// `internal_database_url` instead of the preprocessed files (trips still
+    /// come from the preprocessed data either way). This is no longer the
+    /// only way to turn DB mode on: `gtfs_feed.data_source` in Postgres is now
+    /// the live, per-feed, authoritative setting (docs/gtfs-editor.md "Feed
+    /// data source"), editable without a restart from the `/internal/gtfs-editor`
+    /// dashboard. This list only matters for a feed that has no `gtfs_feed`
+    /// row yet - it is then treated as `data_source = 'db'` from boot, so an
+    /// operator relying on this old config still gets DB mode without first
+    /// creating a row by hand. Once a row exists for a feed, that row wins,
+    /// even if it says `preprocessed` and the feed is still named here. Empty
+    /// (the default) keeps every feed without a row on preprocessed data.
+    #[serde(default)]
+    pub gtfs_db_feeds: Vec<String>,
+    /// How often each pod checks `gtfs_feed.version` for the DB feeds and
+    /// rebuilds the ones that moved.
+    #[serde(default = "default_gtfs_version_poll_seconds")]
+    pub gtfs_version_poll_seconds: u64,
+    /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
+    /// existing dhall configs still parse; the editor stays off unless enabled.
+    #[serde(default)]
+    pub gtfs_editor_enabled: bool,
+    /// JWKS of the Pomerium that fronts the editor: https://... or file:///...
+    #[serde(default)]
+    pub gtfs_editor_pomerium_jwks_url: Option<String>,
+    /// Expected `aud` of the Pomerium JWT: the dashboard host.
+    #[serde(default)]
+    pub gtfs_editor_audience: Option<String>,
+    /// Emails created as admins on their first authenticated request.
+    #[serde(default)]
+    pub gtfs_editor_bootstrap_admins: Vec<String>,
+    /// Base64 32-byte key that encrypts TOTP secrets (secrets dhall).
+    #[serde(default)]
+    pub gtfs_editor_totp_key: Option<String>,
+    #[serde(default)]
+    pub gtfs_editor_session_hours: Option<u64>,
+    /// Directory the dashboard's static files are served from.
+    #[serde(default)]
+    pub gtfs_editor_ui_dir: Option<String>,
+    /// Outbound webhooks (docs/gtfs-editor.md section 12): GIMS calls a
+    /// configured URL when something happens to a DB feed - most usefully once
+    /// every pod is serving a committed edit, which is when a downstream cache
+    /// such as the S3/CloudFront frontline layer can safely be rebuilt.
+    ///
+    /// Off by default. Turning it on also needs a non-empty
+    /// `gtfs_webhook_allowed_hosts`: see that field.
+    ///
+    /// Only the **seed**: a saved `gtfs_webhook_settings` row supersedes it,
+    /// and from then on this value does nothing (docs section 12.5).
+    #[serde(default)]
+    pub gtfs_webhooks_enabled: bool,
+    /// Hosts a webhook may call. An entry written `.example.com` matches that
+    /// domain and its subdomains.
+    ///
+    /// Empty (the default) means no webhook can fire, even with
+    /// `gtfs_webhooks_enabled = True`: the feature fails closed.
+    ///
+    /// Only the **seed**, on the same terms as `gtfs_webhooks_enabled`: this
+    /// is the list in force until an admin saves one from the dashboard, and
+    /// is ignored afterwards.
+    #[serde(default)]
+    pub gtfs_webhook_allowed_hosts: Vec<String>,
+    /// How this pod identifies itself when it reports which feed version it is
+    /// serving. Defaults to the `POD_NAME` environment variable (the downward
+    /// API), then the hostname. Two pods must never share it: a shared id makes
+    /// the fleet look smaller than it is, which would fire a webhook early.
+    #[serde(default)]
+    pub gtfs_pod_id: Option<String>,
+    /// Where the GTFS editor reads bus pings to suggest a route's map line
+    /// from GPS (docs/gtfs-editor.md section 17). Absent - the default - and
+    /// that endpoint answers 503 `gps_unavailable`; nothing else changes.
+    #[serde(default)]
+    pub gtfs_gps: Option<GtfsGpsConfig>,
+    /// The password of `gtfs_gps.user` (secrets dhall).
+    #[serde(default)]
+    pub gtfs_gps_clickhouse_password: Option<String>,
+}
+
+/// The GPS block of [`AppConfig`]. Only `url` and `user` are required.
+///
+/// The ClickHouse cluster behind it is production and shared, and its user
+/// may well have write rights: the editor reads it only through
+/// `services::clickhouse_reader`, which sends `readonly=2` with every query,
+/// allows nothing but a bounded SELECT, and runs one query at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GtfsGpsConfig {
+    /// ClickHouse's HTTP interface, e.g. "https://clickhouse.internal:8443"
+    /// (8123/8443, not the native 9000/9440).
+    pub url: String,
+    pub user: String,
+    /// `database.table` holding the pings. Default `atlas_kafka.amnex_direct_data`.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// How many days back a suggestion may read, at most. Default 14. It reads
+    /// today first and stops going back once `enough_bus_days` are found.
+    #[serde(default)]
+    pub days: Option<u32>,
+    /// Stop reading further back once this many bus-days (a bus that carried
+    /// the route number on a day) are found. Default 12.
+    #[serde(default)]
+    pub enough_bus_days: Option<u32>,
+    /// The feeds whose routes these pings describe. Default `["chennai_bus"]`.
+    #[serde(default)]
+    pub feeds: Option<Vec<String>>,
+    /// Bus-days read per suggestion, spread over the days. Default 30.
+    #[serde(default)]
+    pub max_bus_days: Option<u32>,
+    /// Rows per ClickHouse answer. Default 100: some network paths to the
+    /// cluster stall on answers of a few hundred rows.
+    #[serde(default)]
+    pub page_rows: Option<u32>,
+    /// The whole suggestion, OSRM included. Default 45 s and at most 50: a
+    /// proxy in front of the editor gives a request 60.
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+}
+
+impl AppConfig {
+    /// The deployment's webhook policy, which seeds
+    /// `services::webhook::LivePolicy` and is what is in force only while no
+    /// `gtfs_webhook_settings` row has been saved.
+    pub fn webhook_policy(&self) -> crate::services::webhook::WebhookPolicy {
+        crate::services::webhook::WebhookPolicy {
+            enabled: self.gtfs_webhooks_enabled,
+            allowed_hosts: self
+                .gtfs_webhook_allowed_hosts
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        }
+    }
+    /// Longest an ops ETA override may run. Bounds the failure mode where an override set
+    /// during a disruption outlives it because nobody came back to clear it.
+    #[serde(default)]
+    pub max_eta_override_seconds: Option<u64>,
+}
+
+/// 12 hours — longer than any single disruption an ops shift would sit through, short enough
+/// that a forgotten override cannot survive into the next day.
+const MAX_ETA_OVERRIDE_SECONDS_DEFAULT: u64 = 43200;
+
+impl AppConfig {
+    pub fn max_eta_override_seconds(&self) -> u64 {
+        self.max_eta_override_seconds
+            .unwrap_or(MAX_ETA_OVERRIDE_SECONDS_DEFAULT)
+    }
 }
 
 fn default_preprocessed_data_dir() -> String {
     "./assets".to_string()
+}
+
+fn default_gtfs_version_poll_seconds() -> u64 {
+    5
 }
 
 impl OtpConfig {
@@ -168,6 +321,13 @@ pub struct AppState {
     pub vehicle_service_sub_types: Arc<HashMap<String, HashMap<String, Vec<String>>>>,
     /// Metro transit graphs loaded from preprocessed JSON (gtfs_id -> MetroGraph)
     pub metro_graphs: Arc<HashMap<String, MetroGraph>>,
+    /// Precomputed metro interchange indexes (gtfs_id -> per-day-type graphs).
+    ///
+    /// Loaded at startup from the Nandi planner's `metro_hops.json` and swapped
+    /// wholesale when the preprocessed data refreshes, so readers never block
+    /// and never observe a half-loaded index. See
+    /// [`crate::services::service_hopper`].
+    pub service_hopper: Arc<ArcSwap<HashMap<String, Arc<FeedHoppers>>>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
@@ -385,6 +545,10 @@ impl AppState {
         let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
         let metro_graphs = Arc::new(Self::load_metro_graphs(&app_config));
 
+        let service_hopper = Arc::new(ArcSwap::from_pointee(load_service_hopper(
+            &app_config.preprocessed_data_dir,
+        )));
+
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
 
@@ -403,12 +567,25 @@ impl AppState {
             fleet_list: Arc::new(Self::load_fleet_list().await?),
             vehicle_service_sub_types: Arc::new(Self::load_vehicle_service_sub_types().await?),
             metro_graphs,
+            service_hopper,
             depot_manager_details,
             fleet_tag_list: Arc::new(Self::load_fleet_tag_list().await?),
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Ok(app_state)
+    }
+
+    /// Re-read `metro_hops.json` and swap the indexes in atomically.
+    ///
+    /// Called by the background watcher after the feed refreshes. The planner
+    /// writes the artifact in the same preprocessor run that produces the rest
+    /// of the preprocessed data, so a GTFS refresh is the signal that a newer
+    /// artifact may be on disk. Reloading is milliseconds for a metro-sized
+    /// feed, so this is cheaper than reasoning about what changed.
+    pub fn rebuild_service_hopper(&self) {
+        let indexes = load_service_hopper(&self.config.preprocessed_data_dir);
+        self.service_hopper.store(Arc::new(indexes));
     }
 
     async fn load_fleet_tag_list() -> Result<HashMap<String, HashMap<String, String>>> {

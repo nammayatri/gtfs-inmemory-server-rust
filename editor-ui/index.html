@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GTFS editor</title>
+  <link rel="stylesheet" href="vendor/leaflet-1.9.4/leaflet.css">
+  <link rel="stylesheet" href="css/app.css">
+  <script src="vendor/leaflet-1.9.4/leaflet.js"></script>
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <div id="gate" class="gate" hidden></div>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <a class="brand" href="#/">GTFS editor</a>
+      <label class="feed-picker">
+        <span class="visually-hidden">Feed</span>
+        <select id="feed-select"></select>
+      </label>
+      <div class="search" role="search">
+        <label for="search-input" class="visually-hidden">Search stops and routes</label>
+        <input id="search-input" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search a stop, stop id or route number"
+               aria-controls="search-results" aria-expanded="false">
+        <div id="search-results" class="search-results" role="listbox" hidden></div>
+      </div>
+      <nav class="nav" aria-label="Main">
+        <a href="#/" data-nav="map">Map</a>
+        <a href="#/coordinates" data-nav="coordinates">Coordinates to review <span id="coordinates-count" class="nav-count" hidden></span></a>
+        <a href="#/stations" data-nav="stations" hidden>Stations to review <span id="stations-count" class="nav-count" hidden></span></a>
+        <a href="#/drafts" data-nav="drafts">Drafts</a>
+        <a href="#/audit" data-nav="audit">History</a>
+        <a href="#/admin" data-nav="admin" hidden>People</a>
+        <a href="#/feed-settings" data-nav="feed-settings" hidden>Feed settings</a>
+        <a href="#/delivery" data-nav="delivery">Delivery</a>
+      </nav>
+      <details class="new-menu" id="new-menu" hidden>
+        <summary class="btn small">New</summary>
+        <div class="new-menu-body">
+          <a href="#/new/stop"><strong>New stop</strong><span>Place it on the map</span></a>
+          <a href="#/new/route"><strong>New route</strong><span>Then build its stop list</span></a>
+          <a href="#/new/station"><strong>New station</strong><span>Group the stops of one place</span></a>
+          <a href="#/import"><strong>Import from a CSV file</strong><span>Many stops, routes, stop lists or stop details</span></a>
+        </div>
+      </details>
+      <button id="draft-chip" class="draft-chip" type="button" hidden></button>
+      <details class="user-menu">
+        <summary id="user-summary"></summary>
+        <div class="user-menu-body">
+          <p id="user-role"></p>
+          <button id="sign-out" type="button" class="btn quiet">Sign out</button>
+        </div>
+      </details>
+    </header>
+
+    <nav id="trail" class="trail is-empty" aria-label="Where you came from"></nav>
+
+    <main class="workspace" id="workspace">
+      <aside id="panel" class="panel" aria-live="polite"></aside>
+      <section class="map-wrap" aria-label="Map">
+        <div id="map" class="map"></div>
+        <div id="map-banner" class="map-banner" role="status" hidden></div>
+        <p id="map-hint" class="map-hint" hidden>Zoom in to see stops</p>
+      </section>
+    </main>
+
+    <main id="page" class="page" hidden></main>
+  </div>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

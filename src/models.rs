@@ -258,6 +258,13 @@ pub struct VehicleData {
     pub is_active_trip: Option<bool>,
     #[sqlx(default)]
     pub is_completed: Option<bool>,
+    /// Segment-time variant for this trip: an active override if one is in force, otherwise
+    /// the schedule's default. `None` resolves to the feed's default variant.
+    #[sqlx(default)]
+    pub effective_variant_id: Option<String>,
+    /// Set only while an override is in force; bounds how long a caller may cache this row.
+    #[sqlx(default)]
+    pub override_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -499,6 +506,10 @@ pub struct NandiStop {
     /// quotes come back empty.
     #[serde(default)]
     pub headsign: Option<String>,
+    #[serde(rename = "stageNumber", default)]
+    pub stage_number: Option<i32>,
+    #[serde(rename = "isStageStop", default)]
+    pub is_stage_stop: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -597,9 +608,24 @@ pub struct RouteStopMapping {
     #[serde(rename = "parentStopCode")]
     #[schema(value_type = Option<String>)]
     pub parent_stop_code: Option<Arc<str>>,
+    #[serde(rename = "locationType", default = "default_location_type")]
+    #[schema(value_type = String)]
+    pub location_type: String,
     #[serde(rename = "clusterId")]
     #[schema(value_type = Option<String>)]
     pub cluster_id: Option<Arc<str>>,
+    #[serde(
+        rename = "stageNumber",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stage_number: Option<i32>,
+    #[serde(
+        rename = "isStageStop",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub is_stage_stop: Option<bool>,
 }
 
 /// One direct route connecting a source cluster to a destination cluster, with
@@ -630,6 +656,13 @@ pub struct Stop {
     pub vehicle_type: String,
 }
 
+/// GTFS treats a blank location_type as 0 (a boardable stop). Feeds published
+/// before the station layer existed carry no value at all, so both the stop and
+/// the mapping default to platform rather than failing to deserialise.
+pub(crate) fn default_location_type() -> String {
+    "0".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GTFSStop {
     pub id: String,
@@ -639,6 +672,18 @@ pub struct GTFSStop {
     pub lon: f64,
     #[serde(rename = "stationId")]
     pub station_id: Option<String>,
+    /// GTFS location_type: "0" platform, "1" station. Riders are shown stations
+    /// and platforms are grouped beneath them, so consumers need to tell them
+    /// apart. Defaults to platform for feeds published before this field existed.
+    #[serde(rename = "locationType", default = "default_location_type")]
+    pub location_type: String,
+    /// Compass direction buses head when leaving this platform (N, SW, ...).
+    #[serde(
+        rename = "platformCode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub platform_code: Option<String>,
     pub cluster: Option<String>,
     #[serde(rename = "hindiName")]
     pub hindi_name: Option<String>,
@@ -648,6 +693,11 @@ pub struct GTFSStop {
     pub info_json: Option<String>,
     #[serde(rename = "clusterId", default, skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
+    /// GTFS stop_desc: free text shown beside the name. Only a DB-backed feed
+    /// has one (the editor's `gtfs_stop.description`); it is left out when
+    /// absent, so a stop without one serialises exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,6 +772,29 @@ pub struct GTFSData {
     /// Pre-computed unique stops list per GTFS (avoids recomputation on every /stops request)
     #[serde(skip)]
     pub pre_computed_stops_by_gtfs: HashMap<String, Vec<Arc<RouteStopMapping>>>,
+    /// `gtfs_feed.version` each DB-backed feed was built at. A feed missing here
+    /// is serving preprocessed data (not a DB feed, or its DB load failed).
+    #[serde(default)]
+    pub db_feed_versions: HashMap<String, i64>,
+    /// Per DB feed, the stop codes the editor has merged away, each pointing at
+    /// the code of the stop that survived its merge chain (docs/gtfs-editor.md
+    /// section 1, "Merged-away stop ids keep answering"). Rebuilt with the feed
+    /// on every reload, so it always describes the merges committed so far.
+    /// A preprocessed feed has no entry: it has no merges to know about.
+    #[serde(default)]
+    pub stop_aliases_by_gtfs: HashMap<String, HashMap<String, String>>,
+    /// Per feed, each **station** stop code (`location_type = 1`) pointing at the
+    /// codes of the platforms beneath it, sorted (docs/gtfs-editor.md section 1,
+    /// "A station code answers everywhere a stop code does"). Rebuilt with the
+    /// feed on every reload, so a station committed in the editor starts
+    /// expanding on the same poll that brings its rows in.
+    ///
+    /// Only a code that is itself a station row is a key, and a platform that
+    /// shares its station's code is not listed under it. A feed with no station
+    /// rows - every preprocessed feed - therefore has **no entry at all**, which
+    /// is what keeps station expansion out of its way.
+    #[serde(default)]
+    pub station_platforms_by_gtfs: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 impl GTFSData {
@@ -799,6 +872,18 @@ impl GTFSData {
                 stats.children_bytes += parent.len() + 24;
                 for child in children {
                     stats.children_bytes += child.len() + 24;
+                }
+            }
+        }
+
+        // Station -> platforms mapping, counted with the children mapping it
+        // sits beside: both are the same shape, one keyed by parent stop, the
+        // other only by a station row.
+        for stations in self.station_platforms_by_gtfs.values() {
+            for (station, platforms) in stations {
+                stats.children_bytes += station.len() + 24;
+                for platform in platforms {
+                    stats.children_bytes += platform.len() + 24;
                 }
             }
         }
@@ -977,9 +1062,61 @@ pub struct BusScheduleDetail {
     pub waybill_no: Option<String>,
     #[serde(rename = "is_completed", skip_serializing_if = "Option::is_none")]
     pub is_completed: Option<bool>,
+    #[serde(rename = "eta_variant_id", skip_serializing_if = "Option::is_none")]
+    pub eta_variant_id: Option<String>,
+    /// Epoch seconds. Present only while an override is in force, so a caller can cap its
+    /// cache at the moment this answer stops being true instead of guessing a TTL.
+    #[serde(
+        rename = "override_expires_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub override_expires_at: Option<i64>,
 }
 
 pub type BusScheduleDetails = Vec<BusScheduleDetail>;
+
+/// Segment times for one feed, split by variant: `variant_id → (from_stop, to_stop) → seconds`.
+pub type StationEtaMap = HashMap<String, HashMap<(String, String), i32>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct EtaVariant {
+    pub variant_id: String,
+    pub gtfs_id: String,
+    pub code: String,
+    pub display_name: String,
+    pub is_default: bool,
+    pub band_start_time: Option<String>,
+    pub band_end_time: Option<String>,
+}
+
+/// An override currently in force, keyed the way the backend addresses a trip
+/// (`waybill_no` + `trip_number`) rather than by the storage key, and carrying `route_id`
+/// so a route-scoped cache can be bypassed too.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct ActiveTripEtaOverride {
+    pub waybill_no: String,
+    pub trip_number: i32,
+    pub route_id: Option<String>,
+    pub variant_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StationEtaEntry {
+    pub source_station_code: String,
+    pub destination_station_code: String,
+    pub eta_in_seconds: i32,
+}
+
+/// A stored segment time as ops sees it: the entry plus the variant it belongs to, so one
+/// response can carry several variants without the caller having to ask per variant.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct StationEtaRow {
+    pub variant_id: String,
+    pub source_station_code: String,
+    pub destination_station_code: String,
+    pub eta_in_seconds: i32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RouteLastScheduleTime {
