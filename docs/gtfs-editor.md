@@ -35,11 +35,11 @@ policy row that supersedes the dhall config (section 12.5), `0017` adds
 at all ("The headsign" below), `0018` adds per-feed access grants and system
 accounts (section 15), `0019` adds patterns, timing profiles, trips, frequencies
 and service calendars (section 16), `0020` the MTC sync's system account (section
-16.8), `0022` adds the `release_requested` event and the `release` delivery kind
-(section 12.6). All are safe to run twice. **`0012` and `0017`
-go on a database before the build that reads them:** both the editor and the
-GIMS loader select those columns, so a DB feed fails to load (and serves its
-preprocessed data) on a database without them.)
+16.8), `0021` lets a map line come from GPS (section 17), `0022` holds every other
+file and field of the GTFS reference (section 18). All are safe to run twice.
+**`0012`, `0017` and `0022` go on a database before the build that reads
+them:** both the editor and the GIMS loader select those columns, so a DB feed
+fails to load (and serves its preprocessed data) on a database without them.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -2926,9 +2926,9 @@ credential and nobody's session.
 ### 16.11 Not in this section
 
 `pathways.txt`, `transfers.txt`, `levels.txt`, per-pattern `shapes.txt`, fare
-tables, translations and attributions. Until they move, a feed whose GTFS has any
-of them keeps being built by its own scripts; its trips can still be edited
-here, but the build that publishes its GTFS does not read them yet.
+tables, translations and attributions - every other file of the reference - are
+section 18, which also loads every shipped feed into the tables and publishes a
+feed's GTFS from them.
 `station_eta` (live ETA between stop pairs, and PR #205's time bands on it) is a
 separate thing — the live prediction, not the published timetable — and stays
 where it is.
@@ -3308,3 +3308,381 @@ its limit (422 `stopped: budget`, on time, not cached) and one that does not
 (504), commit of a `gps` line, and each OSRM reason); `dev/ui_smoke.mjs --map-line` against the mock's `/__dev/map-line`
 switch. `examples/gps_line_check.rs` runs the real pipeline read-only against the
 real cluster for a few routes and writes GeoJSON to look at.
+
+## 18. The whole GTFS reference, and every feed in the tables (2026-09-24)
+
+Until now the editor held part of a feed: stops, stations, routes and their stop
+orders, map lines, and since section 16 trips and calendars. Everything else a
+feed ships - agency, feed_info, levels, pathways, transfers, shapes, fares v1 and
+v2, areas, networks, translations, attributions, the Flex files - and many
+columns of the files it did hold stayed in the zips nandi builds. This section
+puts every file and field of the GTFS Schedule reference in the tables, editable
+through drafts like everything else; loads every shipped feed from its zip; and
+writes a feed's GTFS back out of the tables, byte-stable, for nandi to publish.
+
+Decided with the owner before building:
+
+- **First load.** A feed with no rows gets one audited `seed` transaction from its
+  zip (18.4). Everything after that goes through drafts. A feed that already has
+  rows - chennai_bus, edited through drafts since it was seeded from the MTC
+  mapping - gets the rest of its zip through drafts (18.8), never a seed.
+- **GTFS-Flex.** `locations.geojson`, `location_groups.txt`,
+  `location_group_stops.txt` and `booking_rules.txt` are stored, edited and
+  exported. A `stop_times` row that calls at a zone rather than a stop is an
+  import finding and is not stored.
+- **Dashboard.** All of it: the files, the section 16.9 trips and calendar
+  screens, the review diffs, and import / export / the feed report (18.10).
+- **Publishing.** nandi's release builds the zip with this exporter once a feed's
+  trips are in the tables, on a nandi branch not pushed yet (18.11).
+
+### 18.1 The reference as data (`src/gtfs/spec.rs`)
+
+`FILES` lists the 32 files of the reference - the 30 `.txt` files, Fares v1 and
+v2 included, and `locations.geojson` - with every field's type (id, text, URL,
+email, phone, language, timezone, colour, currency code and amount, date, time,
+integer and float ranges, latitude, longitude, enum, JSON), whether it is
+required, optional or conditionally required (with the condition in words), and
+which `file.field` it may name. Two fields are ours, not the reference's, and
+say so (`extension`): `stops.info_json` (chennai_bus's and kolkata_bus's cluster
+ids) and `feed_info.feed_id` (the gtfs_id nandi's preprocessor reads).
+
+Each file is stored one of two ways. **Bespoke**: the editor's own tables -
+`stops`, `routes`, `trips`, `stop_times` (as stop orders and timings),
+`frequencies`, `calendar`, `calendar_dates`. **Record**: a table `gtfs_<entity>`
+per file, with its key: the file's own id (`pathway_id`), a minted `row_id` for a
+file with none (`transfers.txt`, keyed naturally on its reference fields), or
+the feed itself (`feed_info.txt`). `GET /internal/gtfs-editor/gtfs-spec` serves
+the whole registry; the dashboard builds its forms from it.
+
+Values are canonical everywhere the editor keeps or compares them: dates ISO
+`YYYY-MM-DD`, times seconds after midnight (a trip past midnight is `25:10:00`,
+`48 * 3600` excluded), colours `#RRGGBB`, amounts as written. `from_text`,
+`from_api`, `to_api` and `to_text` convert.
+
+### 18.2 A zip, the model, the zip again (`src/gtfs/{read,model,write,compare}.rs`)
+
+- **`read`** reads a zip as its files: a folder inside the zip (sambalpur,
+  kolkata_metro), a byte order mark, CRLF, ragged rows, and macOS `._*` and
+  `.DS_Store` litter are all taken as the preprocessor takes them. A file the
+  reference does not have (sambalpur's `feed.txt`) is a warning, and left out.
+- **`model`** is the feed as the tables hold it. A **pattern** is a route's stop
+  order together with what each stop time says besides the time -
+  `stop_sequence`, `stop_headsign`, pickup and drop-off, `timepoint`, continuous
+  stopping, `shape_dist_traveled`, booking rules; trips of one stop order that
+  differ in any of those are separate patterns, which GIMS serves as one (18.7).
+  A route's first pattern is its longest stop order, the first on a tie, as the
+  preprocessor picks it. A **timing profile** is a pattern's offsets from a trip's
+  first arrival; a feed's default timing needs none. `stop_sequence` is kept
+  only when it is not 1 to n.
+- **`write`** writes every file back, byte-stable: same model, same bytes.
+- **`compare`** compares two feeds keyed and canonicalised per file (a blank
+  `location_type` is 0, `5:30:00` is `05:30:00`); a key given twice is told apart
+  by file order.
+
+What the shipped feeds do that the reference forbids is **kept, with a warning**,
+never dropped silently: kolkata_metro's 55 stops that are their own
+`parent_station`, a trip whose times go backwards (kolkata_metro, 53 in
+chennai_suburban), two stops of one trip with one `stop_sequence`
+(chennai_metro's 2,775 trips), a trip that calls at one stop (chennai_bus's
+150); tabs in bhubaneswar's names are text like any other. A value that cannot
+be read in an optional field leaves the cell out (chennai_metro's `-1:59:35`); a
+bad row of a record file leaves the row out (chennai_metro's pathway with
+`is_bidirectional` "1x"); either is a warning naming file, line and field, and
+the round trip expects it missing. A stop time with no time is an error (`untimed_stop_time`): the editor
+keeps a time at every stop.
+
+`gtfs_feed roundtrip --zip Z` reads, models, writes and compares one zip. **All 16
+shipped zips round-trip with 0 differences.** `gtfs_feed compare --a Z --b Z`
+compares any two.
+
+### 18.3 Schema - `0022_gtfs_full_spec.sql`
+
+- `gtfs_stop` gains `tts_stop_name`, `zone_id`, `stop_url`, `stop_timezone`,
+  `wheelchair_boarding`, `level_id`, `stop_access` and `sort_key` (the stop's line
+  in stops.txt: GIMS keeps the last of several stops that share a code, so the
+  order is data). `location_type` widens to 0-4; the CHECKs that allowed a parent
+  only on a stop and forbade a stop its own parent go, their rules becoming
+  findings (18.6) so kolkata_metro's self-parents load.
+- `gtfs_route` gains `route_desc`, `route_url`, `route_sort_order`,
+  `continuous_pickup`, `continuous_drop_off`, `network_id`, `sort_key`;
+  `gtfs_route_stop` gains `stop_sequence` (NULL is 1 to n), `continuous_*`,
+  `shape_dist_traveled` and the booking rule ids; `gtfs_trip` gains
+  `cars_allowed`; `gtfs_frequency.exact_times` may be NULL; a timing profile
+  needs one stop, not two (chennai_bus's one-stop trips).
+- `gtfs_feed.stops_scope`: `served` (the default; the loader serves the stops a
+  route calls at, as it always has) or `all` (every stop and station, which is
+  what the preprocessor emits for a feed built from its zip; a seed sets it).
+- 25 record tables, one per record file, generated from the spec: their fields
+  as columns, `row_id` for a file with no id of its own, a unique index on the
+  natural key (with `coalesce` for its nullable parts), `sort_key`,
+  `row_version`, `created_at`, `updated_at`, `updated_by`.
+- `gtfs_touch_row` bumps `row_version` on any table that has one (it used to
+  name its tables, so a new table would have silently lost optimistic locking);
+  `gtfs_change.entity` widens to the record entities.
+- One `gtfs_agency` row per existing feed, from `agency_name` and its routes'
+  usual `agency_id`. No URL or timezone is made up: the feed report says they
+  are missing (18.9), and a draft import fills them (18.8).
+
+No hard foreign keys point at stops, routes, trips or agencies - those are
+soft-deleted or replaced whole. References are checked as findings instead, a
+deleted row counting as missing. Safe to run twice; **apply it before the image
+that reads it**.
+
+### 18.4 The seed: a feed with no rows (`src/editor/feed_io.rs`)
+
+`import_zip` builds the model, then in one transaction takes the feed lock,
+refuses a feed with any row (soft-deleted ones included, `feed_not_empty`) or an
+open draft (`feed_has_open_drafts`), inserts every file in batches, reads the feed
+back through the exporter and compares it with the zip, and commits only if
+nothing differs. It sets `stops_scope = 'all'`, the feed's default timing, bumps
+the version and audits `seed` with the zip's sha256, the counts and the
+findings. A missing `gtfs_feed` row is made, named after the feed's agency
+(`display_name`; the publisher is often a city body that publishes several
+feeds - CUMTA publishes Chennai's bus and metro).
+
+`gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]` (a dry run without
+`--seed`), or `POST /feeds/{g}/import?seed=true` with the zip as the body (admin,
+64 MB). The report carries the feed report of the zip (18.9).
+
+### 18.5 Every record file through drafts (`src/editor/records.rs`)
+
+A change's `entity` is the file's singular name (`agency`, `level`, `pathway`,
+`transfer`, `fare_product`, `booking_rule`, ...) with `create`, `update` and
+`delete`; `feed_info` is the feed's one row, keyed by the gtfs_id; a `shape`
+sends its `points` whole. `after` holds GTFS field names and values; on an
+update an absent field is unchanged and `null` clears it. A create of a file
+with no id gets `row_id` `r_` + 10 hex when it is added. Every dispatch site of
+the change engine (shape check, keys, snapshot, conflicts, stops a change
+references, apply, preview, bulk) handles records first, and a test holds every
+entity the engine can see against those sites.
+
+Findings when the draft replays: `reference_not_found` (a field naming a row that
+does not exist once the draft applies), `record_in_use` (deleting a row others
+name, from the spec's reverse references), `duplicate_record` (a row saying what
+another says), the row rules of the file (`rules.rs`: a pathway's ends and
+bidirectional stairs, a transfer's type and the ids it needs, a timeframe's
+times, a fare transfer rule's limits, a booking rule's notice, a translation's
+target, an attribution's role, ...). As
+everywhere, what the live data already breaks is a warning, not a block.
+
+Reads: `GET /feeds/{g}/files` (every file and its row count), `GET
+/feeds/{g}/files/{file}?q&limit&cursor` (a file's rows in file order, `q`
+matching any value), `GET /feeds/{g}/files/{file}/{key}` (one row and what
+names it, `used_by`), `GET /change-sets/{id}/preview/files/{file}` (with the
+draft applied). Bulk kind `records` with `file` takes rows by their GTFS names,
+under the section 5 rules.
+
+### 18.6 Stops, routes, stop orders and trips carry every field
+
+- `stop/create` and `stop/update` take `tts_stop_name`, `zone_id`, `stop_url`,
+  `stop_timezone`, `wheelchair_boarding`, `level_id`, `stop_access`, and
+  `location_type` / `parent_station` under the reference's rules: an entrance
+  or node stands in a station, a boarding area on a platform
+  (`parent_wrong_type`), nothing is its own parent (`parent_is_itself`). A stop a
+  route calls at stays a stop (`stop_in_use`); a platform's station is still set
+  by a station change and a station still made by `station/create`
+  (`use_station_change`).
+- Only a stop (type 0) is a route stop, a station member or a merge side
+  (`not_a_stop`). `station/delete` refuses a station with entrances or nodes
+  (`station_has_entrances`); `station/update` detaches only its platforms.
+- `route/create` and `route/update` take `route_desc`, `route_url`,
+  `route_sort_order`, `continuous_*`, `network_id`, and an editable `agency_id`
+  (a finding when the feed has no such agency) and `route_type` (the basic types
+  and the extended 100-1702).
+- `route_stops` rows take `stop_sequence` (all or none of a stop order's served
+  rows, never decreasing), `continuous_*`, `shape_dist_traveled` and booking rule
+  ids; `route_trips` trips take `cars_allowed`, and in a feed that keeps its
+  shapes a trip's `shape_id` must be one (chennai_bus, whose shapes are drawn
+  elsewhere, is not checked).
+- Deleting what a record names is refused: a stop (`stop_in_use`), a route
+  (`route_in_use`), a service (`service_in_use`), a trip dropped from its route
+  (`trip_in_use`).
+- A stop merge and a station merge move the pathways, transfers, areas, location
+  group members and join rules naming the one that goes to the one kept (and a
+  stop merge its boarding areas), dropping a row that would then say what
+  another says.
+- Bulk `stops`, `routes`, `route_stops` and `route_trips` take the same columns.
+- The stop and route details, and the snapshot a change carries, have the fields
+  as `gtfs`, for the dashboard's forms and diffs.
+
+### 18.7 The GIMS loader (`src/services/gtfs_db_source.rs`)
+
+- A route is named by its own agency (`agency_id` looked up in `gtfs_agency`, as
+  the preprocessor looks it up), falling back to `gtfs_feed.agency_name`. Of the
+  shipped feeds only amsterdam has several.
+- `stops_scope = 'all'` serves every stop and station, not only those a route
+  calls at; never an entrance, node or boarding area. Stops are served in
+  `sort_key` order.
+- Split patterns - one stop order with different per-stop fields - are one
+  public pattern: the trips of both, in trip order, with the first trip's stops
+  and headsigns. A stored `stop_sequence` is served in the pattern and in
+  `/trip`.
+- chennai_bus is untouched: `stops_scope = 'served'`, its fare-stage headsigns,
+  and its trips from the preprocessed build until its `trips_source` flips.
+
+**Parity.** For the 14 feeds with a shipped zip and preprocessed output (amsterdam
+aside, for disk), GIMS serving the preprocessed build and GIMS serving the seeded
+tables (`data_source = trips_source = 'db'`) were compared endpoint by endpoint
+(`scripts/parity_gtfs_db.py --trips --all-routes`) and pattern by pattern
+(`examples/parity_gims.rs patterns`: 1,813 of 1,813 identical). Every difference
+is one the tables mean to make: the DB side serves what the preprocessed build
+leaves out - a route's colour (`color`), a stop's description (`description`,
+from `stop_desc`) and its platform label (`platform`, `platformCode`, from
+`platform_code`).
+
+### 18.8 A zip into a feed that has rows, through drafts (`src/editor/draft_import.rs`)
+
+The zip is read into the model a seed builds, with the feed's own default
+timing, and set beside the feed as its tables hold it. What differs becomes
+change sets, in two steps, because the second needs the first live:
+
+1. **Records and calendars**: every record file the zip has, as it has it (a
+   field it leaves out is cleared), its services, the splits its trips need (a
+   stop order the feed has, with other per-stop fields; a split's headsign is
+   never one the fare stage already gives), and the timing profiles. One set.
+2. **Trips**: once that set is committed, a `route_trips/replace` for every route
+   whose trips differ, at most 5,000 trips a set, a route never split.
+
+Stops, routes and the feed's own stop orders are compared and reported
+(`differences`), never written. A trip on the default timing carries only its
+start time, so a route whose one stop order in the zip the feed has otherwise
+gets its trips on the feed's first stop order (`moved`: a zip made before the
+stop order was edited says when the route runs, not where); any other route
+whose stop order the feed does not have keeps its trips, and is reported
+(`routes_left`), as is a route with trips the zip does not mention. A trip on
+the default timing keeps the explicit profile a seed gave that timing, so
+importing a seeded feed's own zip finds nothing to do. The changes are planned
+as uploads of the same rows are (`bulk::plan_into_set`) and each set is replayed
+as a review would; any error writes nothing.
+
+`gtfs_feed draft-import --db URL --zip Z --as EMAIL [--files F,F] [--write]`, or
+`POST /feeds/{g}/import?mode=drafts[&files=][&dry_run=false]` (admin; a dry run
+unless asked). Audited `gtfs_draft_import`.
+
+**chennai_bus, locally** (seeded from nandi's mapping, as master was, then the
+shipped zip): step 1 was 4 changes - the agency's URL, timezone and language,
+feed_info, the two services; step 2 was 11 sets of 52,606 trips. Committed, the
+feed exported again gives the zip's `agency`, `feed_info`, `calendar` and
+`trips` exactly, and the `stop_times` of the 3,811 routes whose stop order the
+editor has as the zip does; the 517 others differ only where the editor's stop
+order does. Run again, the import finds nothing to do.
+
+### 18.9 The feed report (`src/gtfs/validate.rs`)
+
+What a whole feed breaks of the reference, on the model a zip or the tables
+give, so one report reads a zip before it is imported and a feed as it stands:
+required files and fields; the row rules; every reference the spec names; a
+parent of the right type and a stop that is its own parent (a warning); pathways
+that end at a station; times and `shape_dist_traveled` that go backwards;
+services that never run, a feed none of whose services runs today or later, and
+feed_info's end date; several agencies sharing one timezone and named by every
+route; and, as warnings, what nothing uses - an agency, a route with no trips, a
+service, a shape, a level, a stop no stop order calls at. Counted by kind, with
+samples.
+
+`GET /feeds/{g}/validation` (viewer), `gtfs_feed validate (--zip Z | --db URL
+--gtfs-id G)`, and the seed's and the draft import's reports. On the shipped
+zips: kolkata_metro's 127 platforms whose parent is not a station (its 55
+self-parented stations) and one backward trip, chennai_suburban's 53 backward
+trips, and warnings for unused stops, routes, shapes and services and for
+feed_info dates past - chennai_metro (2025-07-17), kochi_metro, mumbai_suburban.
+
+### 18.10 Dashboard
+
+- **Files** (`#/files`): every file with its row count and whether the feed must
+  have it; a file's rows, paged and searched, live or with the draft applied;
+  one row as a form built from the spec (typed inputs, enums as choices,
+  references offered from the rows they may name) with what names it; add,
+  change and delete into the draft; a CSV of rows through the importer.
+- **Trips and timing** (`#/trips/{route}`, from the route panel): each stop
+  order's trips as a departure board by direction and service; add, remove and
+  shift departures, a run "every N minutes from ... until ...", headway windows;
+  beside the stops, the stop order's timing, whose minutes between stops make a
+  new timing or change one.
+- **Calendar** (`#/calendar`): services with their days, range, dates and trip
+  counts; add, change and delete.
+- **Feed** (`#/feed`): where the feed is served from, the GTFS zip the tables
+  give, the feed report, and for an admin a zip imported as a seed or as drafts,
+  previewed first.
+- The stop and route editors gain "More GTFS fields"; drafts show records, trip
+  lists (added, removed, changed), timings, services and stop orders as what
+  they change; Feed settings switch where trips come from; the importer takes
+  trips, timings, services and any record file.
+
+`dev/ui_e2e.mjs --only feed,files,gtfs_fields,trips,calendar` with
+`E2E_FEED=chennai_metro` runs one real flow per screen against a real GIMS and
+the local database, each drafted, approved and committed and checked in the
+database. `dev/mock_server.py` and `dev/ui_smoke.mjs` do not cover these screens
+yet: the smoke needs the master-copy sample, which the local database this was
+built on could not give.
+
+### 18.11 nandi: publishing from the tables
+
+On the nandi branch `feat/gtfs-exporter-release` (from `feat/editor-release-job`,
+local, not pushed), `scripts/chennai-bus/editor/release_from_db.sh` keeps its gate
+(the mapping, stop metadata and alias sidecar exported; nothing built when the
+feed version has not moved; `--mark-released` after) and builds with
+`editor/build_from_exporter.py` once the feed's `trips_source` is `db`, with the
+generator until then; `GTFS_RELEASE_BUILDER=exporter|generator` forces one. The
+builder runs `gtfs_feed export` (`GTFS_FEED_BIN`; the password reaches it through
+`PGPASSWORD`, never the command line), moves a service's or feed_info's start
+that is before today, and has not ended, to today - the rolling window the
+generator has always published - and packages and commits the files with the
+generator's own `package_and_commit_gtfs`. **The Jenkins image needs the
+`gtfs_feed` binary** (copied from the GIMS image) before chennai_bus's trips flip.
+
+### 18.12 Runbook: master, then prod
+
+1. `0022` on the database (after `0018`..`0021`), then the image.
+2. Each feed with no rows, one at a time: `gtfs_feed import --db URL --zip
+   nandi/assets/<feed>.gtfs.zip` (a dry run: the round trip must be empty and the
+   findings the expected ones), then again with `--seed`.
+3. chennai_bus: `gtfs_feed draft-import --db URL --zip ... --as <person>` - read
+   `differences` and `stop_orders` - then `--write`; approve and commit that set;
+   run it again with `--write` for the trip sets; approve and commit each. `gtfs_feed
+   export` then `gtfs_feed compare` against the shipped zip: differences only on
+   the routes the report called `moved`.
+4. Parity for each feed as 18.7, with its `data_source` and `trips_source`
+   pointed at the tables on a GIMS of its own.
+5. A `feed_config` draft per feed switches `data_source` to `db`, then another
+   `trips_source`, each approved and committed by a second person - never both at
+   once, and never for chennai_bus before its trip sets are committed and the
+   Jenkins image carries `gtfs_feed`.
+
+Going back is the same draft the other way.
+
+### 18.13 Known deviations, and what is not here
+
+- lat and lon stay NOT NULL for location types 3 and 4, which the reference lets
+  omit them: no shipped feed does, and every reader takes them as numbers.
+- A stop time with no time is refused at import (`untimed_stop_time`), and a
+  stop time calling at a Flex zone is a finding and not stored.
+- `stop_code` is not editable; a stop's code stays what it was seeded or created
+  with.
+- A draft import never writes stops, routes or the feed's own stop orders.
+- The MTC sync (16.8) is still to build.
+
+Settled while implementing:
+
+- Minted keys (`row_id`) are the column name for a file with no id of its own:
+  `translations.txt` has a field called `record_id`, so the column could not be.
+- JSON crosses sqlx as text (the `json` feature is off), and `serde_json`'s
+  `float_roundtrip` keeps a coordinate from moving one ulp on the way through.
+- A `location_type` left blank compares as 0, the reference's default and the
+  column's.
+- The seed and the draft import both set the feed's default timing before
+  building the model, so a trip on it stores no profile, or reuses the explicit
+  one a seed made.
+
+Tests: `src/gtfs/*` unit tests (the spec, reading, the model's patterns and
+warnings, byte-stable writing, the compare, the row rules, the feed report);
+`tests/gtfs_io_roundtrip.rs` (the fixture in `tests/support/gtfs_fixture.rs` -
+a row in every file of the reference and the awkward cases the shipped feeds
+have - round-trips; `#[ignore]`d, every `$NANDI_ASSETS/*.gtfs.zip`);
+`tests/editor_feed_io_flow.rs` (seed, refusals, audit, export);
+`tests/gtfs_db_full_spec_flow.rs` (the loader on a seeded feed);
+`tests/editor_records_flow.rs` (records through drafts, findings, conflicts,
+bulk, reads); `tests/editor_full_spec_flow.rs` (18.6, the details, the feed
+report); `tests/editor_draft_import_flow.rs` (both steps, splits, moved and left
+routes, a second run that does nothing, the endpoint) - all registered in
+`scripts/editor_flow_test.sh`.
