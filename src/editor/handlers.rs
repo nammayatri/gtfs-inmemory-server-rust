@@ -164,7 +164,7 @@ pub async fn totp_enroll(req: HttpRequest, st: Data) -> EditorResult<HttpRespons
     )
     .await?;
     let b32 = crypto::base32_encode(&secret);
-    let issuer = "GTFS Editor";
+    let issuer = st.totp_issuer.as_str();
     let uri = format!(
         "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30",
         urlencoding::encode(issuer),

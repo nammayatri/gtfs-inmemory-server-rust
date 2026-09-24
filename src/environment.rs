@@ -133,6 +133,12 @@ pub struct AppConfig {
     /// Directory the dashboard's static files are served from.
     #[serde(default)]
     pub gtfs_editor_ui_dir: Option<String>,
+    /// What the authenticator app shows for this deployment, e.g. "GTFS Editor
+    /// PROD". Defaults to "GTFS Editor". Set it per environment, otherwise an
+    /// operator enrolled on both master and prod sees two identical entries and
+    /// cannot tell which code belongs where.
+    #[serde(default)]
+    pub gtfs_editor_totp_issuer: Option<String>,
     /// Outbound webhooks (docs/gtfs-editor.md section 12): GIMS calls a
     /// configured URL when something happens to a DB feed - most usefully once
     /// every pod is serving a committed edit, which is when a downstream cache
