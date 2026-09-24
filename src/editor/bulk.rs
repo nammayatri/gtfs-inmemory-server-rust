@@ -15,6 +15,7 @@ use super::auth::{self, Ctx};
 use super::draft::{DraftView, StopTexts};
 use super::error::{EditorError, EditorResult};
 use super::feed_lock::{lock_feed_of_set, retry_transient};
+use super::records::{ROUTE_GTFS_FIELDS, STOP_GTFS_FIELDS};
 use super::service::{self, rows_hash, ChangeInsert, FIRST_PATTERN};
 use super::trips::{self, check_trips, TripRules, TripSpec};
 use super::validation::{
@@ -22,6 +23,7 @@ use super::validation::{
     Level, RouteRow,
 };
 use super::EditorState;
+use crate::gtfs::spec;
 use crate::services::gtfs_timing::{Offsets, MAX_TIME_S};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -88,8 +90,40 @@ impl Kind {
 
     pub fn columns(self) -> &'static [&'static str] {
         match self {
-            Kind::Stops => &["action", "stop_id", "name", "lat", "lon", "platform_code"],
-            Kind::Routes => &["action", "route_id", "short_name", "long_name", "color"],
+            // then records::STOP_GTFS_FIELDS, by their stops.txt names
+            Kind::Stops => &[
+                "action",
+                "stop_id",
+                "name",
+                "lat",
+                "lon",
+                "platform_code",
+                "tts_stop_name",
+                "zone_id",
+                "stop_url",
+                "stop_timezone",
+                "wheelchair_boarding",
+                "level_id",
+                "stop_access",
+                "location_type",
+                "parent_station",
+            ],
+            // then records::ROUTE_GTFS_FIELDS and the route's agency and type
+            Kind::Routes => &[
+                "action",
+                "route_id",
+                "short_name",
+                "long_name",
+                "color",
+                "route_desc",
+                "route_url",
+                "route_sort_order",
+                "continuous_pickup",
+                "continuous_drop_off",
+                "network_id",
+                "agency_id",
+                "route_type",
+            ],
             Kind::RouteStops => &[
                 "action",
                 "route_id",
@@ -103,6 +137,12 @@ impl Kind {
                 "pickup_type",
                 "drop_off_type",
                 "timepoint",
+                "stop_sequence",
+                "continuous_pickup",
+                "continuous_drop_off",
+                "shape_dist_traveled",
+                "pickup_booking_rule_id",
+                "drop_off_booking_rule_id",
             ],
             Kind::StopUpdates => &["action", "stop_id", "platform_code", "description", "name"],
             Kind::RouteTrips => &[
@@ -120,6 +160,7 @@ impl Kind {
                 "shape_id",
                 "wheelchair_accessible",
                 "bikes_allowed",
+                "cars_allowed",
                 "frequencies",
                 "source_ref",
             ],
@@ -346,6 +387,36 @@ pub fn cell_i32(m: &Map<String, Value>, key: &str) -> Result<Option<i32>, String
     }
 }
 
+/// The GTFS `fields` of `file` a row fills in, into `into` as a change sends
+/// them: each cell read as the file writes it (`2`, `https://…`), blank being
+/// not given.
+fn gtfs_cells(
+    m: &Map<String, Value>,
+    file: &str,
+    fields: &[&str],
+    into: &mut Map<String, Value>,
+    bad: &mut Vec<String>,
+) {
+    let fspec = spec::file(file).expect("a file of the reference");
+    for f in fields {
+        let text = match cell_text(m, f) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(e) => {
+                bad.push(e);
+                continue;
+            }
+        };
+        let fs = fspec.field(f).expect("a field of the file");
+        match spec::from_text(fs, &text) {
+            Ok(v) => {
+                into.insert(f.to_string(), spec::to_api(fs, &v));
+            }
+            Err(why) => bad.push(format!("{f} {why}")),
+        }
+    }
+}
+
 /// Mark every row of each group with more than one member as a duplicate.
 fn mark_duplicates<K: std::hash::Hash + Eq>(
     plan: &mut Plan,
@@ -448,6 +519,14 @@ async fn plan_stops(
         if let Some(p) = &platform {
             after.insert("platform_code".into(), json!(p));
         }
+        let mut bad = Vec::new();
+        gtfs_cells(m, "stops.txt", STOP_GTFS_FIELDS, &mut after, &mut bad);
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
         if let Some(id) = &id {
             by_id.entry(id.clone()).or_default().push(i);
         }
@@ -500,7 +579,7 @@ async fn plan_stops(
             plan.rows[i].findings.push(Finding::error(
                 "nothing_to_update",
                 stop_id.as_str(),
-                format!("the row for stop {stop_id} gives no name, lat and lon, or platform_code"),
+                format!("the row for stop {stop_id} gives no name, lat and lon, platform_code or other stops.txt field"),
             ));
             continue;
         }
@@ -700,9 +779,6 @@ async fn plan_routes(
             continue;
         }
         let [id, short, long, color] = cells.map(|c| c.unwrap_or_default());
-        if let Some(id) = &id {
-            by_id.entry(id.clone()).or_default().push(i);
-        }
         let mut fields = Map::new();
         for (k, v) in [
             ("short_name", &short),
@@ -713,15 +789,32 @@ async fn plan_routes(
                 fields.insert(k.into(), json!(v));
             }
         }
+        let mut bad = Vec::new();
+        let gtfs: Vec<&str> = ROUTE_GTFS_FIELDS
+            .iter()
+            .copied()
+            .chain(["agency_id", "route_type"])
+            .collect();
+        gtfs_cells(m, "routes.txt", &gtfs, &mut fields, &mut bad);
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
+        if let Some(id) = &id {
+            by_id.entry(id.clone()).or_default().push(i);
+        }
 
         if action == Action::Add {
             let mut after = fields.clone();
             if let Some(id) = &id {
                 after.insert("route_id".into(), json!(id));
             }
-            after.insert("route_type".into(), json!(3));
+            // a bus of the feed's usual agency, unless the row says otherwise
+            after.entry("route_type").or_insert(json!(3));
             if let Some(a) = &agency {
-                after.insert("agency_id".into(), json!(a));
+                after.entry("agency_id").or_insert(json!(a));
             }
             let after = Value::Object(after);
             let key = id.clone().unwrap_or_default();
@@ -754,7 +847,7 @@ async fn plan_routes(
             plan.rows[i].findings.push(Finding::error(
                 "nothing_to_update",
                 route_id.as_str(),
-                format!("the row for route {route_id} gives no short_name, long_name or color"),
+                format!("the row for route {route_id} gives no short_name, long_name, color or other routes.txt field"),
             ));
             continue;
         }
@@ -955,6 +1048,25 @@ async fn plan_route_stops(
             bad.push(e);
             None
         });
+        let (continuous_pickup, continuous_drop_off) = (
+            small("continuous_pickup", 3, &mut bad),
+            small("continuous_drop_off", 3, &mut bad),
+        );
+        let stop_sequence = cell_i32(m, "stop_sequence").unwrap_or_else(|e| {
+            bad.push(e);
+            None
+        });
+        let shape_dist_traveled = cell_f64(m, "shape_dist_traveled").unwrap_or_else(|e| {
+            bad.push(e);
+            None
+        });
+        let [pickup_rule, drop_off_rule] = ["pickup_booking_rule_id", "drop_off_booking_rule_id"]
+            .map(|k| {
+                cell_text(m, k).unwrap_or_else(|e| {
+                    bad.push(e);
+                    None
+                })
+            });
         let (
             Some(route_id),
             Some(stop_id),
@@ -1006,6 +1118,12 @@ async fn plan_route_stops(
                 drop_off_type: dropoff,
                 timepoint,
                 stop_headsign: headsign,
+                stop_sequence,
+                continuous_pickup,
+                continuous_drop_off,
+                shape_dist_traveled,
+                pickup_booking_rule_id: pickup_rule,
+                drop_off_booking_rule_id: drop_off_rule,
             },
         });
     }
@@ -1131,6 +1249,13 @@ async fn plan_route_stops(
                             "stop_is_station",
                             format!("{id} is a station; a route calls at one of its platforms"),
                         )),
+                        Some((t, _)) if t != 0 => Some((
+                            "not_a_stop",
+                            format!(
+                                "{id} is {} (location_type {t}); a route calls at a stop or platform",
+                                service::stop_kind(t)
+                            ),
+                        )),
                         _ => None,
                     }
                 };
@@ -1206,13 +1331,27 @@ async fn plan_route_stops(
                     ("pickup_type", r.pickup_type),
                     ("drop_off_type", r.drop_off_type),
                     ("timepoint", r.timepoint),
+                    ("continuous_pickup", r.continuous_pickup),
+                    ("continuous_drop_off", r.continuous_drop_off),
                 ] {
                     if let Some(v) = v {
                         o[k] = json!(v);
                     }
                 }
-                if let Some(h) = &r.stop_headsign {
-                    o["stop_headsign"] = json!(h);
+                for (k, v) in [
+                    ("stop_headsign", &r.stop_headsign),
+                    ("pickup_booking_rule_id", &r.pickup_booking_rule_id),
+                    ("drop_off_booking_rule_id", &r.drop_off_booking_rule_id),
+                ] {
+                    if let Some(v) = v {
+                        o[k] = json!(v);
+                    }
+                }
+                if let Some(n) = r.stop_sequence {
+                    o["stop_sequence"] = json!(n);
+                }
+                if let Some(d) = r.shape_dist_traveled {
+                    o["shape_dist_traveled"] = json!(d);
                 }
                 o
             })
@@ -1454,6 +1593,7 @@ async fn plan_route_trips(
             "direction_id",
             "wheelchair_accessible",
             "bikes_allowed",
+            "cars_allowed",
         ] {
             match cell_i32(m, k) {
                 Ok(Some(n)) => {
@@ -3109,6 +3249,37 @@ mod tests {
         )
         .is_ok());
         assert!(row_object(&json!({"stop_id": "S", "lat": 13.0}), Kind::StopUpdates).is_err());
+    }
+
+    #[test]
+    fn stops_and_routes_take_every_gtfs_field_their_changes_take() {
+        for f in STOP_GTFS_FIELDS {
+            assert!(Kind::Stops.columns().contains(f), "{f}");
+        }
+        for f in ROUTE_GTFS_FIELDS.iter().chain(&["agency_id", "route_type"]) {
+            assert!(Kind::Routes.columns().contains(f), "{f}");
+        }
+    }
+
+    #[test]
+    fn gtfs_cells_read_a_cell_as_the_file_writes_it() {
+        let m = json!({"wheelchair_boarding": "1", "stop_url": " ", "zone_id": 7})
+            .as_object()
+            .unwrap()
+            .clone();
+        let (mut into, mut bad) = (Map::new(), Vec::new());
+        gtfs_cells(&m, "stops.txt", STOP_GTFS_FIELDS, &mut into, &mut bad);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(
+            into,
+            *json!({"wheelchair_boarding": 1, "zone_id": "7"})
+                .as_object()
+                .unwrap()
+        );
+        let m = json!({"route_type": "bus"}).as_object().unwrap().clone();
+        gtfs_cells(&m, "routes.txt", &["route_type"], &mut into, &mut bad);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].starts_with("route_type"));
     }
 
     #[test]

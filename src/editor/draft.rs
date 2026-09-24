@@ -727,6 +727,7 @@ mod tests {
             drop_off_type: None,
             timepoint: None,
             stop_headsign: None,
+            ..Default::default()
         }
     }
 

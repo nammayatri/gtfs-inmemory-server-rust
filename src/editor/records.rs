@@ -1258,6 +1258,281 @@ pub async fn record_detail(
     Ok(out)
 }
 
+// ---------------------------------------------------------------- the editor's own tables' GTFS fields
+
+/// Fields of stops.txt the stop changes set by their GTFS names since 0022:
+/// each is a `gtfs_stop` column of the same name.
+pub const STOP_GTFS_FIELDS: &[&str] = &[
+    "tts_stop_name",
+    "zone_id",
+    "stop_url",
+    "stop_timezone",
+    "wheelchair_boarding",
+    "level_id",
+    "stop_access",
+    "location_type",
+    "parent_station",
+];
+
+/// Fields of routes.txt the route changes set by their GTFS names since 0022:
+/// each is a `gtfs_route` column of the same name.
+pub const ROUTE_GTFS_FIELDS: &[&str] = &[
+    "route_desc",
+    "route_url",
+    "route_sort_order",
+    "continuous_pickup",
+    "continuous_drop_off",
+    "network_id",
+];
+
+/// Shape check of the `fields` of `file` a change sends: each a value of its
+/// type (null or blank clears it).
+pub fn check_fields(
+    file: &str,
+    m: &Map<String, Value>,
+    fields: &[&str],
+    what: &str,
+) -> Result<(), Finding> {
+    let fspec = spec::file(file).expect("a file of the reference");
+    for f in fields {
+        let Some(v) = m.get(*f) else { continue };
+        let fs = fspec.field(f).expect("a field of the file");
+        if let Err(why) = spec::from_api(fs, v) {
+            return Err(invalid("invalid_value", f, format!("{what}: {f} {why}")));
+        }
+    }
+    Ok(())
+}
+
+/// Write the `fields` of `file` a change sends into row `key` of `table`:
+/// canonical values, a null or blank one clearing the column.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_fields(
+    conn: &mut PgConnection,
+    g: &str,
+    table: &str,
+    key_col: &str,
+    key: &str,
+    file: &str,
+    m: &Map<String, Value>,
+    fields: &[&str],
+) -> Result<(), sqlx::Error> {
+    let fspec = spec::file(file).expect("a file of the reference");
+    let mut given = Map::new();
+    for f in fields {
+        let Some(v) = m.get(*f) else { continue };
+        let fs = fspec.field(f).expect("a field of the file");
+        given.insert(
+            f.to_string(),
+            spec::from_api(fs, v).ok().flatten().unwrap_or(Value::Null),
+        );
+    }
+    if given.is_empty() {
+        return Ok(());
+    }
+    let cols: Vec<&str> = given.keys().map(String::as_str).collect();
+    let cols = cols.join(", ");
+    // a single column still takes the row form
+    let sql = format!(
+        "UPDATE {table} SET ({cols}) = (SELECT {cols} FROM jsonb_populate_record(NULL::{table}, $3::jsonb)) \
+         WHERE gtfs_id = $1 AND {key_col} = $2"
+    );
+    let sql = if given.len() == 1 {
+        format!(
+            "UPDATE {table} SET {cols} = (SELECT {cols} FROM jsonb_populate_record(NULL::{table}, $3::jsonb)) \
+             WHERE gtfs_id = $1 AND {key_col} = $2"
+        )
+    } else {
+        sql
+    };
+    sqlx::query(&sql)
+        .bind(g)
+        .bind(key)
+        .bind(Value::Object(given).to_string())
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// A stop or a route as its GTFS row (stops.txt / routes.txt field names,
+/// canonical), live or not.
+pub(super) async fn gtfs_row(
+    conn: &mut PgConnection,
+    g: &str,
+    file: &str,
+    key: &str,
+) -> Result<Option<Row>, sqlx::Error> {
+    let (table, key_col, columns) = match file {
+        "stops.txt" => ("gtfs_stop", "stop_id", STOP_COLUMNS),
+        "routes.txt" => ("gtfs_route", "route_id", ROUTE_COLUMNS),
+        _ => return Ok(None),
+    };
+    let row: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT to_jsonb(t)::text FROM {table} t WHERE t.gtfs_id = $1 AND t.{key_col} = $2"
+    ))
+    .bind(g)
+    .bind(key)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|text| {
+        let stored: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let fspec = spec::file(file).expect("a file of the reference");
+        super::feed_io::fields_of(fspec, &stored, columns, key, &mut Vec::new())
+    }))
+}
+
+/// What a stop change leaves broken, by the reference: the row's own rules and
+/// the stops and levels it names, graded against the stop as it was; and what
+/// its parent is - a station above a platform, an entrance or a node, a
+/// platform above a boarding area.
+pub(super) async fn stop_findings(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    before: &Row,
+    after: &Row,
+) -> Result<Vec<Finding>, sqlx::Error> {
+    let fspec = spec::file("stops.txt").expect("stops.txt");
+    let mut found = grade_against_live(rule_findings(fspec, after), &rule_findings(fspec, before));
+    let changed: Vec<&str> = fspec
+        .fields
+        .iter()
+        .map(|f| f.name)
+        .filter(|f| after.get(f) != before.get(f))
+        .collect();
+    found.extend(dangling(conn, g, fspec, after, &changed).await?);
+    let lt = after
+        .get("location_type")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let parent = after.get("parent_station").and_then(Value::as_str);
+    if changed.contains(&"parent_station") || changed.contains(&"location_type") {
+        if let Some(p) = parent.filter(|p| *p != id) {
+            let parent_type: Option<i16> = sqlx::query_scalar(
+                "SELECT location_type FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = $2 AND NOT deleted",
+            )
+            .bind(g)
+            .bind(p)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let want: i16 = if lt == 4 { 0 } else { 1 };
+            if parent_type.is_some_and(|t| t != want) {
+                found.push(Finding::error(
+                    "parent_wrong_type",
+                    "parent_station",
+                    if want == 0 {
+                        format!("a boarding area stands on a platform; {p} is not one")
+                    } else {
+                        format!("{id}'s parent_station is a station; {p} is not one")
+                    },
+                ));
+            }
+        }
+        if parent == Some(id) {
+            found.push(Finding::error(
+                "parent_is_itself",
+                "parent_station",
+                format!("stop {id} cannot be its own parent_station"),
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// What a route change leaves broken, by the reference: the row's own rules
+/// and the agency it names, graded against the route as it was.
+pub(super) async fn route_findings(
+    conn: &mut PgConnection,
+    g: &str,
+    before: &Row,
+    after: &Row,
+) -> Result<Vec<Finding>, sqlx::Error> {
+    let fspec = spec::file("routes.txt").expect("routes.txt");
+    let mut found = grade_against_live(rule_findings(fspec, after), &rule_findings(fspec, before));
+    let changed: Vec<&str> = fspec
+        .fields
+        .iter()
+        .map(|f| f.name)
+        .filter(|f| after.get(f) != before.get(f))
+        .collect();
+    // an agency_id is a reference only in a feed that keeps agencies (0022
+    // gives every feed its one)
+    let has_agencies: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM gtfs_agency WHERE gtfs_id = $1)")
+            .bind(g)
+            .fetch_one(&mut *conn)
+            .await?;
+    let changed: Vec<&str> = changed
+        .into_iter()
+        .filter(|f| *f != "agency_id" || has_agencies)
+        .collect();
+    found.extend(dangling(conn, g, fspec, after, &changed).await?);
+    Ok(found)
+}
+
+/// Point every record that names stop `from` at `into` (a merge, section 18):
+/// pathways, transfers, stops in areas and in location groups, fare leg join
+/// rules - and, for a stop merge, the boarding areas standing on it. A row the
+/// switch would make say what another row already says is removed rather than
+/// kept twice. Returns how many rows now name `into`.
+pub(super) async fn repoint_stop(
+    conn: &mut PgConnection,
+    g: &str,
+    from: &str,
+    into: &str,
+    boarding_areas: bool,
+) -> Result<u64, sqlx::Error> {
+    let mut moved = 0;
+    for (src, fs) in spec::references_to("stops.txt", "stop_id") {
+        let Some(tbl) = src.table() else { continue };
+        let col = fs.name;
+        if let Some(Key::Minted { natural }) = src.key() {
+            let same: Vec<String> = natural
+                .iter()
+                .map(|n| {
+                    if *n == col {
+                        format!("coalesce(o.{n}::text, '') = $3")
+                    } else {
+                        format!("coalesce(o.{n}::text, '') = coalesce(t.{n}::text, '')")
+                    }
+                })
+                .collect();
+            sqlx::query(&format!(
+                "DELETE FROM {tbl} t WHERE t.gtfs_id = $1 AND t.{col} = $2 AND EXISTS \
+                 (SELECT 1 FROM {tbl} o WHERE o.gtfs_id = t.gtfs_id AND o.row_id <> t.row_id AND {})",
+                same.join(" AND ")
+            ))
+            .bind(g)
+            .bind(from)
+            .bind(into)
+            .execute(&mut *conn)
+            .await?;
+        }
+        moved += sqlx::query(&format!(
+            "UPDATE {tbl} SET {col} = $3 WHERE gtfs_id = $1 AND {col} = $2"
+        ))
+        .bind(g)
+        .bind(from)
+        .bind(into)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
+    if boarding_areas {
+        moved += sqlx::query(
+            "UPDATE gtfs_stop SET parent_station = $3 \
+             WHERE gtfs_id = $1 AND parent_station = $2 AND location_type = 4 AND NOT deleted",
+        )
+        .bind(g)
+        .bind(from)
+        .bind(into)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
+    Ok(moved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

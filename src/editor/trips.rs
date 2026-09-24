@@ -79,6 +79,10 @@ pub struct StoredTrip {
     pub source: String,
     pub source_ref: Option<Value>,
     pub frequencies: Vec<StoredFrequency>,
+    /// GTFS `cars_allowed` (0022): left out of the hash when unset, so the
+    /// `base_trips_hash` of every draft made before it existed stays valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cars_allowed: Option<i16>,
 }
 
 /// Fingerprint of a route's whole trip list, in `sort_key` order; a
@@ -174,7 +178,8 @@ pub async fn load_routes_trips(
     }
     let rows = sqlx::query(
         "SELECT route_id, trip_id, pattern_key, profile_key, service_id, direction_id, ref_s, headsign, \
-                short_name, block_id, shape_id, wheelchair_accessible, bikes_allowed, sort_key, source, \
+                short_name, block_id, shape_id, wheelchair_accessible, bikes_allowed, cars_allowed, \
+                sort_key, source, \
                 source_ref::text AS source_ref \
          FROM gtfs_trip WHERE gtfs_id = $1 AND route_id = ANY($2) ORDER BY route_id, sort_key, trip_id",
     )
@@ -202,6 +207,7 @@ pub async fn load_routes_trips(
                 shape_id: r.try_get("shape_id")?,
                 wheelchair_accessible: r.try_get("wheelchair_accessible")?,
                 bikes_allowed: r.try_get("bikes_allowed")?,
+                cars_allowed: r.try_get("cars_allowed")?,
                 sort_key: r.try_get("sort_key")?,
                 source: r.try_get("source")?,
                 source_ref: (!source_ref.is_null()).then_some(source_ref),
@@ -366,6 +372,7 @@ pub fn trip_json(t: &StoredTrip, first_arrival: i32) -> Value {
         "shape_id": t.shape_id,
         "wheelchair_accessible": t.wheelchair_accessible,
         "bikes_allowed": t.bikes_allowed,
+        "cars_allowed": t.cars_allowed,
         "frequencies": t.frequencies.iter().map(|f| json!({
             "start_time": gtfs_timing::format_time(f.start_s),
             "end_time": gtfs_timing::format_time(f.end_s),
@@ -875,6 +882,8 @@ pub struct TripSpec {
     #[serde(default)]
     pub bikes_allowed: Option<i16>,
     #[serde(default)]
+    pub cars_allowed: Option<i16>,
+    #[serde(default)]
     pub frequencies: Option<Vec<FrequencySpec>>,
     #[serde(default)]
     pub source_ref: Option<Value>,
@@ -977,6 +986,7 @@ pub fn check_route_trips_payload(after: &Value) -> Result<(), Finding> {
             ("direction_id", t.direction_id, 1),
             ("wheelchair_accessible", t.wheelchair_accessible, 2),
             ("bikes_allowed", t.bikes_allowed, 2),
+            ("cars_allowed", t.cars_allowed, 2),
         ] {
             if v.is_some_and(|v| !(0..=max).contains(&v)) {
                 return Err(at(key, format!("{key} is from 0 to {max}")));
@@ -1729,6 +1739,7 @@ pub fn specs_of(live: &[StoredTrip], firsts: &HashMap<(i16, i32), i32>) -> Vec<T
             shape_id: None,
             wheelchair_accessible: None,
             bikes_allowed: None,
+            cars_allowed: None,
             frequencies: None,
             source_ref: None,
             source: None,
@@ -1820,6 +1831,11 @@ pub(super) async fn route_trips_replace(
         return Err(ApplyError::Findings(findings));
     }
 
+    let findings = [findings, trip_references(conn, g, &trips, &live).await?].concat();
+    if findings.iter().any(|f| f.level == Level::Error) {
+        return Err(ApplyError::Findings(findings));
+    }
+
     let kept: HashMap<&str, &StoredTrip> = live.iter().map(|t| (t.trip_id.as_str(), t)).collect();
     let mut next_sort = live.iter().map(|t| t.sort_key).max().unwrap_or(0);
     let text = |v: &Option<String>| {
@@ -1853,6 +1869,7 @@ pub(super) async fn route_trips_replace(
             shape_id: text(&t.shape_id),
             wheelchair_accessible: t.wheelchair_accessible,
             bikes_allowed: t.bikes_allowed,
+            cars_allowed: t.cars_allowed,
             sort_key,
             source,
             source_ref: t.source_ref.clone().filter(|v| !v.is_null()).or(stored_ref),
@@ -1870,14 +1887,14 @@ pub(super) async fn route_trips_replace(
         "INSERT INTO gtfs_trip (gtfs_id, trip_id, route_id, pattern_key, profile_key, service_id, \
                                 direction_id, ref_s, headsign, short_name, block_id, \
                                 wheelchair_accessible, bikes_allowed, sort_key, source, source_ref, \
-                                updated_by, shape_id) \
+                                updated_by, shape_id, cars_allowed) \
          SELECT $1, u.id, $2, u.pattern, u.profile, u.service, u.direction, u.ref, u.headsign, u.short, \
-                u.block, u.wheel, u.bikes, u.sort, u.source, u.sref::jsonb, $3, u.shape \
+                u.block, u.wheel, u.bikes, u.sort, u.source, u.sref::jsonb, $3, u.shape, u.cars \
          FROM UNNEST($4::text[], $5::int2[], $6::int4[], $7::text[], $8::int2[], $9::int4[], \
                      $10::text[], $11::text[], $12::text[], $13::int2[], $14::int2[], $15::int4[], \
-                     $16::text[], $17::text[], $18::text[]) \
+                     $16::text[], $17::text[], $18::text[], $19::int2[]) \
               AS u(id, pattern, profile, service, direction, ref, headsign, short, block, wheel, bikes, \
-                   sort, source, sref, shape)",
+                   sort, source, sref, shape, cars)",
     )
     .bind(g)
     .bind(route_id)
@@ -1897,6 +1914,7 @@ pub(super) async fn route_trips_replace(
     .bind(rows.iter().map(|t| t.source.clone()).collect::<Vec<_>>())
     .bind(col(&|t| t.source_ref.as_ref().map(Value::to_string)))
     .bind(col(&|t| t.shape_id.clone()))
+    .bind(small(&|t| t.cars_allowed))
     .execute(&mut *conn)
     .await?;
     let windows: Vec<(&str, &StoredFrequency)> = rows
@@ -1919,6 +1937,94 @@ pub(super) async fn route_trips_replace(
         .await?;
     }
     Ok(findings)
+}
+
+/// What a route's new trip list does to what names its trips (section 18): in
+/// a feed that keeps its shapes, a shape a trip takes must be one the feed has
+/// - an error when the edit gives it, a warning when the live trip already had
+/// it - and a trip a transfer or an attribution names cannot be dropped from
+/// the route. A feed with no shapes in the tables (chennai_bus, whose shapes
+/// are drawn elsewhere) is not checked, as a feed without agencies is not.
+async fn trip_references(
+    conn: &mut PgConnection,
+    g: &str,
+    trips: &[TripSpec],
+    live: &[StoredTrip],
+) -> Result<Vec<Finding>, ApplyError> {
+    let mut out = Vec::new();
+    let live_shapes: HashSet<(&str, &str)> = live
+        .iter()
+        .filter_map(|t| Some((t.trip_id.as_str(), t.shape_id.as_deref()?)))
+        .collect();
+    let named: Vec<String> = trips
+        .iter()
+        .filter_map(|t| t.shape_id.as_deref().map(str::trim))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let keeps_shapes = !named.is_empty()
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM gtfs_shape WHERE gtfs_id = $1)",
+        )
+        .bind(g)
+        .fetch_one(&mut *conn)
+        .await?;
+    if keeps_shapes {
+        let found: HashSet<String> = sqlx::query_scalar(
+            "SELECT shape_id FROM gtfs_shape WHERE gtfs_id = $1 AND shape_id = ANY($2)",
+        )
+        .bind(g)
+        .bind(&named)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect();
+        for t in trips {
+            let Some(shape) = t
+                .shape_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if found.contains(shape) {
+                continue;
+            }
+            let id = t.id().unwrap_or("");
+            let message = format!("trip {id} takes shape {shape}, which the feed does not have");
+            out.push(if live_shapes.contains(&(id, shape)) {
+                Finding::warning(
+                    "reference_not_found",
+                    id,
+                    format!("{message} (already present before this edit)"),
+                )
+            } else {
+                Finding::error("reference_not_found", id, message)
+            });
+        }
+    }
+    let staying: HashSet<&str> = trips.iter().filter_map(TripSpec::id).collect();
+    for t in live
+        .iter()
+        .filter(|t| !staying.contains(t.trip_id.as_str()))
+    {
+        let users = super::records::used_by(conn, g, "trips.txt", "trip_id", &t.trip_id).await?;
+        if !users.is_empty() {
+            out.push(Finding::error(
+                "trip_in_use",
+                t.trip_id.as_str(),
+                format!(
+                    "trip {} is named by {}; change or remove those before dropping it",
+                    t.trip_id,
+                    super::records::say_users(&users)
+                ),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Carry every stored profile of a pattern over onto its new stop list, inside
@@ -2196,6 +2302,21 @@ pub(super) async fn service_delete(
         return Err(fail(
             "service_in_use",
             format!("{n} trip(s) run on service {id}; move them first"),
+        ));
+    }
+    // timeframes and booking rules name a service too (section 18)
+    let users: Vec<_> = super::records::used_by(conn, g, "calendar.txt", "service_id", id)
+        .await?
+        .into_iter()
+        .filter(|(file, _, _)| file != "trips.txt")
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            "service_in_use",
+            format!(
+                "service {id} is named by {}; change or remove those first",
+                super::records::say_users(&users)
+            ),
         ));
     }
     sqlx::query("DELETE FROM gtfs_service WHERE gtfs_id = $1 AND service_id = $2")

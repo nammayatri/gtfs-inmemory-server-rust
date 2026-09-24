@@ -112,7 +112,7 @@ fn canonical(
 }
 
 /// The GTFS fields of a stored row, by a field -> column map.
-fn fields_of(
+pub(super) fn fields_of(
     fspec: &FileSpec,
     row: &Value,
     columns: &[(&str, &str)],
