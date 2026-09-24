@@ -16,6 +16,10 @@ import { editStation } from "./editors.js";
 import { showMerge } from "./merge.js";
 import { showStationMerge } from "./station_merge.js";
 import { showImport } from "./importer.js";
+import { showFiles, showFile, showRecord } from "./files.js";
+import { showTrips } from "./trips.js";
+import { showCalendar } from "./calendar.js";
+import { showFeed } from "./feed.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
 
@@ -215,7 +219,19 @@ function route() {
   } else if (parts[0] === "station-merge" && parts[1]) {
     markNav("map"); showWorkspace(true); showStationMerge(parts[1], params.get("with"));
   } else if (parts[0] === "import") {
-    markNav("import"); showWorkspace(false); showImport(params.get("kind"));
+    markNav("import"); showWorkspace(false); showImport(params.get("kind"), params.get("file"));
+  } else if (parts[0] === "files" && parts[1] && parts[2]) {
+    markNav("files"); showWorkspace(false); showRecord(parts[1], parts[2]);
+  } else if (parts[0] === "files" && parts[1]) {
+    markNav("files"); showWorkspace(false); showFile(parts[1]);
+  } else if (parts[0] === "files") {
+    markNav("files"); showWorkspace(false); showFiles();
+  } else if (parts[0] === "trips" && parts[1]) {
+    markNav("map"); showWorkspace(false); showTrips(parts[1], { pattern: params.get("pattern") });
+  } else if (parts[0] === "calendar") {
+    markNav("calendar"); showWorkspace(false); showCalendar();
+  } else if (parts[0] === "feed") {
+    markNav("feed"); showWorkspace(false); showFeed();
   } else if (parts[0] === "drafts" && parts[1]) {
     markNav("drafts"); showWorkspace(false); showDraft(parts[1]);
   } else if (parts[0] === "drafts") {

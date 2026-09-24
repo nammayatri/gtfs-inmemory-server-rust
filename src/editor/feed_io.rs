@@ -629,14 +629,18 @@ pub async fn seed(
         .and_then(|a| a.values.get("agency_name"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let display = m
-        .records
-        .get("feed_info")
-        .and_then(|f| f.first())
-        .and_then(|f| f.values.get("feed_publisher_name"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| agency_name.clone())
+    // named after who runs it: the publisher is often a city body that
+    // publishes several feeds (CUMTA publishes Chennai's bus and metro)
+    let display = agency_name
+        .clone()
+        .or_else(|| {
+            m.records
+                .get("feed_info")
+                .and_then(|f| f.first())
+                .and_then(|f| f.values.get("feed_publisher_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| g.to_string());
     sqlx::query(
         "INSERT INTO gtfs_feed (gtfs_id, display_name, agency_name) VALUES ($1, $2, $3) \

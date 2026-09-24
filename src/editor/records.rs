@@ -1381,6 +1381,26 @@ pub(super) async fn gtfs_row(
     }))
 }
 
+/// The GTFS `fields` of stop or route `key` as the API writes them, `null`
+/// where unset: what the stop and route details carry as `gtfs` for the
+/// dashboard's forms.
+pub async fn gtfs_fields(
+    conn: &mut PgConnection,
+    g: &str,
+    file: &str,
+    key: &str,
+    fields: &[&str],
+) -> Result<Value, sqlx::Error> {
+    let row = gtfs_row(conn, g, file, key).await?.unwrap_or_default();
+    let fspec = spec::file(file).expect("a file of the reference");
+    let mut out = Map::new();
+    for f in fields {
+        let fs = fspec.field(f).expect("a field of the file");
+        out.insert(f.to_string(), spec::to_api(fs, &row.get(f).cloned()));
+    }
+    Ok(Value::Object(out))
+}
+
 /// What a stop change leaves broken, by the reference: the row's own rules and
 /// the stops and levels it names, graded against the stop as it was; and what
 /// its parent is - a station above a platform, an entrance or a node, a

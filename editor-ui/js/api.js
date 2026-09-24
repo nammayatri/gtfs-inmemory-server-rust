@@ -36,17 +36,18 @@ async function completeChanges(set) {
   set.next_cursor = null;
 }
 
-async function request(method, path, body) {
+async function request(method, path, body, raw) {
   const headers = { Accept: "application/json" };
   if (method !== "GET") headers["X-Requested-With"] = "gtfs-editor";
   if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (raw) headers["Content-Type"] = raw.type;
   let res;
   try {
     res = await fetch(API_BASE + path.replace(/^\//, ""), {
       method,
       headers,
       credentials: "same-origin",
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: raw ? raw.bytes : body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (e) {
     throw new ApiError(0, "network", "The editor server could not be reached. Check your VPN connection and try again.");
@@ -78,5 +79,8 @@ export const post = (path, body) => api("POST", path, body === undefined ? {} : 
 export const put = (path, body) => api("PUT", path, body);
 export const patch = (path, body) => api("PATCH", path, body);
 export const del = (path) => api("DELETE", path);
+
+// A file's bytes as the body (a GTFS zip to import, section 18).
+export const postBytes = (path, bytes, type = "application/zip") => request("POST", path, undefined, { bytes, type });
 
 export const enc = encodeURIComponent;

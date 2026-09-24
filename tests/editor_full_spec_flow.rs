@@ -457,6 +457,35 @@ async fn existing_entities_carry_every_gtfs_field() {
             .as_deref(),
         Some("Z9|0|https://m.example/p2|L0")
     );
+    // the details carry them by their GTFS names, for the dashboard's forms
+    let (s, p2, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/feeds/{FEED}/stops/P2"))
+    );
+    assert_eq!(s, 200, "{p2}");
+    assert_eq!(
+        (
+            &p2["gtfs"]["zone_id"],
+            &p2["gtfs"]["wheelchair_boarding"],
+            &p2["gtfs"]["tts_stop_name"]
+        ),
+        (&json!("Z9"), &json!(0), &Value::Null),
+        "{p2}"
+    );
+    let (s, r2, _) = call!(
+        &app,
+        editor_c.req("GET", &format!("/feeds/{FEED}/routes/R2"))
+    );
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(
+        (
+            &r2["gtfs"]["route_url"],
+            &r2["gtfs"]["agency_id"],
+            &r2["gtfs"]["route_type"]
+        ),
+        (&json!("https://b.example/21g"), &json!("A1"), &json!(3)),
+        "{r2}"
+    );
     assert_eq!(
         stop("E2", "location_type, parent_station, level_id")
             .await

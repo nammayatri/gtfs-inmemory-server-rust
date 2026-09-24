@@ -174,19 +174,20 @@ export async function showFeedSettings() {
   const load = async () => {
     try {
       const feeds = (await get("feeds")).items;
-      // the drafts that already carry a switch, per feed
-      const pending = new Map(await Promise.all(feeds.map(async (f) => {
+      // each feed's settings, and the drafts that already carry a switch
+      const configs = new Map(await Promise.all(feeds.map(async (f) => {
         try {
-          return [f.gtfs_id, (await get(`feeds/${enc(f.gtfs_id)}/config`)).pending || []];
+          return [f.gtfs_id, await get(`feeds/${enc(f.gtfs_id)}/config`)];
         } catch {
-          return [f.gtfs_id, []];
+          return [f.gtfs_id, {}];
         }
       })));
+      const pending = new Map([...configs.entries()].map(([g, c]) => [g, c.pending || []]));
       clear(tableBox, h("div.table-wrap", h("table",
-        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Feed version"), h("th", "Waiting in a draft"), h("th", ""))),
+        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Trips from"), h("th", "Feed version"), h("th", "Waiting in a draft"), h("th", ""))),
         h("tbody", feeds.length
-          ? feeds.map((f) => feedRow(f, pending.get(f.gtfs_id) || [], load))
-          : h("tr", h("td", { colspan: "5" }, "No feeds yet."))))));
+          ? feeds.map((f) => feedRow(f, pending.get(f.gtfs_id) || [], configs.get(f.gtfs_id) || {}, load))
+          : h("tr", h("td", { colspan: "6" }, "No feeds yet."))))));
     } catch (e) {
       clear(tableBox, h("p.notice.error", e.message));
     }
@@ -200,7 +201,7 @@ export async function showFeedSettings() {
   load();
 }
 
-function feedRow(f, pending, reload) {
+function feedRow(f, pending, config, reload) {
   const isDb = f.data_source === "db";
   const target = isDb ? "preprocessed" : "db";
   const name = f.display_name || f.gtfs_id;
@@ -220,9 +221,28 @@ function feedRow(f, pending, reload) {
     }
     reload();
   };
+  // trips from the tables need the feed served from them (trips_need_db)
+  const trips = config.trips_source;
+  const tripsTarget = trips === "db" ? "preprocessed" : "db";
+  const switchTrips = async () => {
+    const ok = await confirmDialog(
+      `Add a switch of ${name}'s trips to ${DATA_SOURCE_LABEL[tripsTarget].toLowerCase()} to your draft?`,
+      "Trips, their stop times and calendars then come from where you choose, once the draft is committed. Check the feed's trips first: the feed report and the Trips pages show them.",
+      { confirm: "Add to draft" },
+    );
+    if (!ok) return;
+    try {
+      await addChange({ entity: "feed_config", op: "update", entity_key: f.gtfs_id, after: { trips_source: tripsTarget } });
+    } catch (e) {
+      toast(e.message, "error");
+    }
+    reload();
+  };
   return h("tr",
     h("td", h("strong", name), f.display_name ? h("div.hint", f.gtfs_id) : null),
     h("td", DATA_SOURCE_LABEL[f.data_source] || f.data_source),
+    h("td", trips ? DATA_SOURCE_LABEL[trips] || trips : "",
+      trips && current ? h("div", h("button.btn.quiet.small", { type: "button", on: { click: switchTrips } }, `Switch to ${DATA_SOURCE_LABEL[tripsTarget].toLowerCase()}`)) : null),
     h("td", f.version),
     h("td.feed-pending", pending.length
       ? h("ul.list", pending.map((p) => h("li",
@@ -242,6 +262,7 @@ function feedRow(f, pending, reload) {
 // Exported for dev/ui_e2e.mjs, which checks every action in the database has one.
 export const ACTION_LABEL = {
   seed: "Loaded the feed data",
+  gtfs_draft_import: "Drafted changes from a GTFS zip",
   release: "Released the feed",
   user_bootstrapped: "First admin sign-in",
   totp_enroll_started: "Started two-step sign-in set-up",
