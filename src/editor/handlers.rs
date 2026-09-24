@@ -5,6 +5,7 @@ use super::bulk;
 use super::context;
 use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
+use super::feed_io;
 use super::feed_lock;
 use super::gps_line::{self, GpsFailure};
 use super::position_reviews;
@@ -14,6 +15,7 @@ use super::trips;
 use super::validation::valid_lat_lon;
 use super::webhooks;
 use super::EditorState;
+use crate::gtfs::write as gtfs_write;
 use crate::services::osrm;
 use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use actix_web::error::{JsonPayloadError, PathError, QueryPayloadError};
@@ -360,6 +362,57 @@ pub async fn gtfs_spec(req: HttpRequest, st: Data) -> EditorResult<HttpResponse>
 pub async fn feeds(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
     let ctx = auth::signed_in(&req, &st).await?;
     ok(svc::feeds(&st, &ctx).await?)
+}
+
+/// A feed's whole GTFS as the zip it publishes, from the tables (section 18).
+pub async fn feed_gtfs_zip(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    let (m, findings) = feed_io::load_model(&mut conn, &g).await?;
+    let bytes = gtfs_write::zip_bytes(&gtfs_write::to_raw(&m))
+        .map_err(|e| EditorError::new(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", e))?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/zip")
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{g}.gtfs.zip\""),
+        ))
+        // values the tables hold that the reference does not accept, left out
+        .insert_header(("X-Export-Findings", findings.len().to_string()))
+        .body(bytes))
+}
+
+#[derive(Deserialize)]
+pub struct ImportQuery {
+    /// `true` writes; anything else is a dry run.
+    pub seed: Option<bool>,
+}
+
+/// Load a feed that has no rows yet from its GTFS zip, the request's body
+/// (section 18). Admin only: it writes a whole feed without a draft, which is
+/// allowed only while there is nothing a draft could have been based on.
+pub async fn feed_import(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<ImportQuery>,
+    body: web::Bytes,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    let ctx = auth::require_admin(&req, &st).await?;
+    let who = feed_io::Importer {
+        user_id: Some(ctx.user.user_id),
+        email: Some(ctx.user.email.clone()),
+        label: ctx.user.email.clone(),
+    };
+    let dry_run = !q.seed.unwrap_or(false);
+    let report = feed_io::import_zip(&st.pool, &body, Some(&g), dry_run, &who).await?;
+    ok(json!(report))
 }
 
 pub async fn feed_config(

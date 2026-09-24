@@ -50,6 +50,12 @@ fn key_fields(spec: &FileSpec) -> Vec<&'static str> {
 fn canon(spec: &FileSpec, field: &str, raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
+        // a stop's type is never blank in the tables (NOT NULL, 0): the
+        // reference's own "empty means 0", and what the preprocessor reads a
+        // missing column as
+        if spec.name == "stops.txt" && field == "location_type" {
+            return Some("0".into());
+        }
         return None;
     }
     let Some(fs) = spec.field(field) else {
@@ -86,10 +92,13 @@ fn rows_by_key(spec: &FileSpec, t: &RawTable) -> BTreeMap<String, Vec<(String, O
     // told apart by the order the file has them in
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for row in &t.rows {
-        let cells: Vec<(String, Option<String>)> = fields
+        let mut cells: Vec<(String, Option<String>)> = fields
             .iter()
             .map(|f| (f.to_string(), canon(spec, f, t.cell(row, f))))
             .collect();
+        if spec.name == "stops.txt" && !fields.contains(&"location_type") {
+            cells.push(("location_type".into(), canon(spec, "location_type", "")));
+        }
         let key = if keys.is_empty() {
             String::new()
         } else if spec.key().is_some() && spec.name != "shapes.txt" {

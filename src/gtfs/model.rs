@@ -153,7 +153,7 @@ pub struct Shape {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     /// The row's key: its id, the gtfs_id for feed_info, or a minted
-    /// `record_id` for a file with no id of its own.
+    /// `row_id` for a file with no id of its own.
     pub key: String,
     pub values: Row,
     pub sort_key: Option<i32>,

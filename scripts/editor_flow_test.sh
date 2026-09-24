@@ -8,9 +8,9 @@
 # tests/gtfs_station_code_flow.rs, tests/gtfs_headsign_flow.rs,
 # tests/editor_webhook_flow.rs, tests/editor_webhook_settings_flow.rs,
 # tests/editor_feed_access_flow.rs, tests/editor_trips_flow.rs,
-# tests/editor_trips_bulk_flow.rs, tests/gtfs_db_trips_flow.rs and
-# tests/editor_gps_line_flow.rs (which also starts a fake ClickHouse and a fake
-# OSRM on localhost), which use
+# tests/editor_trips_bulk_flow.rs, tests/gtfs_db_trips_flow.rs,
+# tests/editor_feed_io_flow.rs and tests/editor_gps_line_flow.rs (which also
+# starts a fake ClickHouse and a fake OSRM on localhost), which use
 # their own feeds and accounts, then proves the chennai_bus rows were not touched
 # - reseeding them from nandi if they were - and that its station proposals, its
 # position reviews and its feed row (data source and version) were not touched
@@ -72,7 +72,7 @@ EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow \
   --test editor_station_merge_flow --test gtfs_stop_alias_flow --test gtfs_station_code_flow \
   --test gtfs_headsign_flow --test editor_webhook_flow --test editor_webhook_settings_flow \
   --test editor_feed_access_flow --test editor_trips_flow --test editor_trips_bulk_flow \
-  --test gtfs_db_trips_flow --test editor_gps_line_flow \
+  --test gtfs_db_trips_flow --test editor_feed_io_flow --test editor_gps_line_flow \
   -- --nocapture || status=$?
 
 proposals_after="$(proposals)"
