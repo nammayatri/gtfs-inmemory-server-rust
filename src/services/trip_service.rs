@@ -278,7 +278,7 @@ impl TripService {
                 stop_id: s.id.clone(),
                 stop_code: s.code.clone(),
                 stop_name: s.name.clone(),
-                sequence: i as i32 + 1,
+                sequence: s.sequence.unwrap_or(i as i32 + 1),
                 lat: s.lat,
                 lon: s.lon,
             })
@@ -291,7 +291,7 @@ impl TripService {
                 stop_code: s.code.clone(),
                 arrival_time: Some(*arrival),
                 departure_time: Some(*departure),
-                sequence: i as i32 + 1,
+                sequence: s.sequence.unwrap_or(i as i32 + 1),
             })
             .collect();
         TripApiResponse {

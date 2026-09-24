@@ -86,6 +86,9 @@ pub struct TripStop {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
+    /// The feed's own `stop_sequence` when it numbers its stops otherwise than
+    /// 1 to n (0022); None is the stop's position, from 1.
+    pub sequence: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -122,7 +125,7 @@ pub struct DbTrip {
     pub route_id: String,
     pub direction: Option<i32>,
     /// The pattern's served stops with `(arrival, departure)`, in order; a
-    /// stop's sequence is its position, from 1.
+    /// stop's sequence is its own, else its position, from 1.
     pub stops: Vec<(TripStop, i32, i32)>,
 }
 
@@ -605,6 +608,27 @@ pub fn plan_feed_actions(
     out
 }
 
+/// The agency name a route is served with. A feed with agency rows (0022)
+/// names a route by its agency_id exactly as the preprocessor does - blank
+/// looks up the agency with no id, and an id with no agency names nothing; a
+/// feed without them keeps the one name `gtfs_feed.agency_name`.
+struct RouteAgency {
+    agencies: HashMap<String, Option<String>>,
+    fallback: Option<String>,
+}
+
+impl RouteAgency {
+    fn name(&self, agency_id: Option<String>) -> Option<String> {
+        if self.agencies.is_empty() {
+            return self.fallback.clone();
+        }
+        self.agencies
+            .get(agency_id.as_deref().unwrap_or(""))
+            .cloned()
+            .flatten()
+    }
+}
+
 /// One `gtfs_route_stop` row a pattern is built from, already filtered to the
 /// served types and ordered by `sequence`.
 #[derive(Debug)]
@@ -615,6 +639,8 @@ struct ServedRow {
     /// 0 on a feed that has no fare stages (migration 0017).
     stage_no: i32,
     headsign: Option<String>,
+    /// The feed's own stop_sequence, when it is not the row's place (0022).
+    stop_sequence: Option<i32>,
 }
 
 struct StopRow {
@@ -628,6 +654,8 @@ struct StopRow {
     platform_code: Option<String>,
     cluster_id: Option<String>,
     description: Option<String>,
+    /// The stop's line in the stops.txt it was imported from (0022).
+    sort_key: Option<i32>,
 }
 
 pub struct GtfsDbSource {
@@ -723,7 +751,8 @@ impl GtfsDbSource {
     ) -> AppResult<DbFeed> {
         let started = std::time::Instant::now();
         let feed = sqlx::query(
-            "SELECT version, agency_name, headsign_source, trips_source, default_run_s, default_dwell_s \
+            "SELECT version, agency_name, headsign_source, trips_source, default_run_s, default_dwell_s, \
+                    stops_scope \
              FROM gtfs_feed WHERE gtfs_id = $1",
         )
         .bind(gtfs_id)
@@ -732,7 +761,27 @@ impl GtfsDbSource {
         .map_err(db_err)?
         .ok_or_else(|| AppError::Internal(format!("gtfs_feed has no row for {}", gtfs_id)))?;
         let version: i64 = feed.try_get("version").map_err(db_err)?;
-        let agency_name: Option<String> = feed.try_get("agency_name").map_err(db_err)?;
+        let feed_agency: Option<String> = feed.try_get("agency_name").map_err(db_err)?;
+        let all_stops = feed.try_get::<String, _>("stops_scope").map_err(db_err)? == "all";
+        // agency_id -> name (0022); a route is named by its own agency_id the
+        // way the preprocessor names it, and a feed with no agency rows keeps
+        // the one name gtfs_feed has
+        let mut agencies: HashMap<String, Option<String>> = HashMap::new();
+        for r in sqlx::query("SELECT agency_id, agency_name FROM gtfs_agency WHERE gtfs_id = $1")
+            .bind(gtfs_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        {
+            agencies.insert(
+                r.try_get("agency_id").map_err(db_err)?,
+                r.try_get("agency_name").map_err(db_err)?,
+            );
+        }
+        let agency_of = RouteAgency {
+            agencies,
+            fallback: feed_agency,
+        };
         let headsign_source = HeadsignSource::from_column(
             &feed
                 .try_get::<String, _>("headsign_source")
@@ -746,7 +795,7 @@ impl GtfsDbSource {
         );
 
         let route_rows = sqlx::query(
-            "SELECT route_id, short_name, long_name, route_type, color, encoded_polyline
+            "SELECT route_id, short_name, long_name, route_type, color, encoded_polyline, agency_id
              FROM gtfs_route WHERE gtfs_id = $1 AND NOT deleted",
         )
         .bind(gtfs_id)
@@ -758,7 +807,7 @@ impl GtfsDbSource {
         // order a route, pattern 1; one whose trips are in the tables, all of them
         let served = sqlx::query(
             "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no,
-                    rs.stop_headsign
+                    rs.stop_headsign, rs.stop_sequence
              FROM gtfs_route_stop rs
              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
              WHERE rs.gtfs_id = $1 AND (rs.pattern_key = 1 OR $3) AND rs.stop_type = ANY($2)
@@ -773,7 +822,7 @@ impl GtfsDbSource {
 
         let stop_rows = sqlx::query(
             "SELECT stop_id, stop_code, name, lat, lon, location_type, parent_station,
-                    platform_code, cluster_id, description
+                    platform_code, cluster_id, description, sort_key
              FROM gtfs_stop WHERE gtfs_id = $1 AND NOT deleted",
         )
         .bind(gtfs_id)
@@ -810,6 +859,7 @@ impl GtfsDbSource {
                 platform_code: r.try_get("platform_code").map_err(db_err)?,
                 cluster_id: r.try_get("cluster_id").map_err(db_err)?,
                 description: r.try_get("description").map_err(db_err)?,
+                sort_key: r.try_get("sort_key").map_err(db_err)?,
             };
             stops.insert(s.stop_id.clone(), s);
         }
@@ -830,6 +880,7 @@ impl GtfsDbSource {
                     stop_type: r.try_get("stop_type").map_err(db_err)?,
                     stage_no: r.try_get("stage_no").map_err(db_err)?,
                     headsign: r.try_get("stop_headsign").map_err(db_err)?,
+                    stop_sequence: r.try_get("stop_sequence").map_err(db_err)?,
                 });
         }
 
@@ -867,19 +918,29 @@ impl GtfsDbSource {
         };
 
         // Stops: everything a served row references (whether or not its route
-        // runs trips - the generator writes those too), plus stations.
+        // runs trips - the generator writes those too), plus stations; or, for
+        // a feed imported whole (stops_scope 'all'), every stop and station, as
+        // the preprocessor reads them from stops.txt. Never an entrance, a
+        // generic node or a boarding area, which the preprocessor leaves out
+        // too: they share a station's code and would take over its name. In
+        // the order the feed had them: GIMS keeps the last of several stops
+        // sharing a code.
         let mut referenced: HashSet<&str> = HashSet::new();
         for rows in rows_by_pattern.values() {
             for row in rows {
                 referenced.insert(row.stop_id.as_str());
             }
         }
-        let mut stop_ids: Vec<&String> = stops
+        let mut stop_ids: Vec<(&Option<i32>, &String)> = stops
             .values()
-            .filter(|s| s.location_type == 1 || referenced.contains(s.stop_id.as_str()))
-            .map(|s| &s.stop_id)
+            .filter(|s| s.location_type <= 1)
+            .filter(|s| {
+                all_stops || s.location_type == 1 || referenced.contains(s.stop_id.as_str())
+            })
+            .map(|s| (&s.sort_key, &s.stop_id))
             .collect();
-        stop_ids.sort();
+        stop_ids.sort_by(|a, b| (a.0.is_none(), a.0, a.1).cmp(&(b.0.is_none(), b.0, b.1)));
+        let stop_ids: Vec<&String> = stop_ids.into_iter().map(|(_, id)| id).collect();
         for id in stop_ids {
             let s = &stops[id];
             out.stops.push(GTFSStop {
@@ -910,7 +971,7 @@ impl GtfsDbSource {
                     &route_rows,
                     &rows_by_pattern,
                     &stops,
-                    agency_name,
+                    &agency_of,
                     headsign_source,
                     default_timing,
                     &mut out,
@@ -1002,7 +1063,7 @@ impl GtfsDbSource {
                 short_name: r.try_get("short_name").map_err(db_err)?,
                 long_name: r.try_get("long_name").map_err(db_err)?,
                 mode: route_mode(route_type),
-                agency_name: agency_name.clone(),
+                agency_name: agency_of.name(r.try_get("agency_id").map_err(db_err)?),
                 color: r.try_get("color").map_err(db_err)?,
                 trip_count: Some(overlay.trip_count),
                 stop_count: Some(codes.len() as i32),
@@ -1053,7 +1114,7 @@ impl GtfsDbSource {
         route_rows: &[sqlx::postgres::PgRow],
         rows_by_pattern: &BTreeMap<(String, i16), Vec<ServedRow>>,
         stops: &HashMap<String, StopRow>,
-        agency_name: Option<String>,
+        agency_of: &RouteAgency,
         headsign_source: HeadsignSource,
         (run_s, dwell_s): (i32, i32),
         out: &mut DbFeed,
@@ -1126,105 +1187,113 @@ impl GtfsDbSource {
                 dropped += 1;
                 continue;
             };
-            // the route's stop orders in the order of their first trip
-            let mut order: Vec<i16> = Vec::new();
-            let mut by_pattern: HashMap<i16, Vec<&Trip>> = HashMap::new();
+            // Every stop order a trip runs gets its entry for /trip; the public
+            // patterns are the stop orders as the preprocessor groups them, by
+            // their stops alone, so two stop orders that differ only in what a
+            // stop time says besides its stop (a pickup, a headsign, a
+            // stop_sequence - 0022 keeps those apart) are one pattern. Its
+            // stops and times are its first trip's, and its trips every trip of
+            // either, in trip order, as the preprocessor meets them.
+            let mut pattern_at: HashMap<i16, (u32, usize)> = HashMap::new();
+            let mut groups: Vec<(Vec<&str>, Vec<&Trip>)> = Vec::new();
+            let mut group_at: HashMap<Vec<&str>, usize> = HashMap::new();
             for t in trips {
-                by_pattern
-                    .entry(t.pattern)
-                    .or_insert_with(|| {
-                        order.push(t.pattern);
-                        Vec::new()
-                    })
-                    .push(t);
-            }
-            let mut codes: HashSet<String> = HashSet::new();
-            let mut longest: Option<(usize, LatLong, LatLong)> = None;
-            for k in order {
-                let rows = rows_by_pattern
-                    .get(&(route_id.clone(), k))
-                    .filter(|rows| !rows.is_empty())
-                    .ok_or_else(|| {
-                        AppError::Internal(format!(
-                            "{} route {} runs trips on pattern {} that calls at no stop",
-                            gtfs_id, route_id, k
-                        ))
-                    })?;
-                let mut row_stops = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let Some(s) = stops.get(&row.stop_id) else {
-                        return Err(AppError::Internal(format!(
-                            "{} route {} uses stop {} that is missing or deleted",
-                            gtfs_id, route_id, row.stop_id
-                        )));
-                    };
-                    row_stops.push((row, s));
-                }
-                let n = row_stops.len();
-                let pattern_at = index.patterns.len() as u32;
-                index.patterns.push(TripPattern {
-                    route_id: prefixed(&route_id),
-                    stops: row_stops
-                        .iter()
-                        .map(|(_, s)| TripStop {
+                if !pattern_at.contains_key(&t.pattern) {
+                    let rows = rows_by_pattern
+                        .get(&(route_id.clone(), t.pattern))
+                        .filter(|rows| !rows.is_empty())
+                        .ok_or_else(|| {
+                            AppError::Internal(format!(
+                                "{} route {} runs trips on pattern {} that calls at no stop",
+                                gtfs_id, route_id, t.pattern
+                            ))
+                        })?;
+                    let mut trip_stops = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let Some(s) = stops.get(&row.stop_id) else {
+                            return Err(AppError::Internal(format!(
+                                "{} route {} uses stop {} that is missing or deleted",
+                                gtfs_id, route_id, row.stop_id
+                            )));
+                        };
+                        trip_stops.push(TripStop {
                             id: prefixed(&s.stop_id),
                             code: s.stop_code.clone().unwrap_or_else(|| s.stop_id.clone()),
                             name: s.name.clone(),
                             lat: s.lat,
                             lon: s.lon,
-                        })
-                        .collect(),
-                });
-                let pattern_trips = &by_pattern[&k];
-                for t in pattern_trips {
-                    let timing = match t.profile {
-                        Some(p) => {
-                            let key = (route_id.clone(), k, p);
-                            match timing_at.get(&key) {
-                                Some(at) => *at,
-                                None => {
-                                    let offsets = profiles.get(&key).cloned().ok_or_else(|| {
-                                        AppError::Internal(format!(
-                                            "{} trip {} runs to profile {} of pattern {} of route {}, which does not exist",
-                                            gtfs_id, t.id, p, k, route_id
-                                        ))
-                                    })?;
-                                    if offsets.len() != n {
-                                        return Err(AppError::Internal(format!(
-                                            "{} profile {} of pattern {} of route {} times {} stops and the pattern serves {}",
-                                            gtfs_id, p, k, route_id, offsets.len(), n
-                                        )));
-                                    }
-                                    index.offsets.push(offsets);
-                                    let at = index.offsets.len() as u32 - 1;
-                                    timing_at.insert(key, at);
-                                    at
+                            sequence: row.stop_sequence,
+                        });
+                    }
+                    index.patterns.push(TripPattern {
+                        route_id: prefixed(&route_id),
+                        stops: trip_stops,
+                    });
+                    pattern_at.insert(t.pattern, (index.patterns.len() as u32 - 1, rows.len()));
+                }
+                let (at, n) = pattern_at[&t.pattern];
+                let timing = match t.profile {
+                    Some(p) => {
+                        let key = (route_id.clone(), t.pattern, p);
+                        match timing_at.get(&key) {
+                            Some(at) => *at,
+                            None => {
+                                let offsets = profiles.get(&key).cloned().ok_or_else(|| {
+                                    AppError::Internal(format!(
+                                        "{} trip {} runs to profile {} of pattern {} of route {}, which does not exist",
+                                        gtfs_id, t.id, p, t.pattern, route_id
+                                    ))
+                                })?;
+                                if offsets.len() != n {
+                                    return Err(AppError::Internal(format!(
+                                        "{} profile {} of pattern {} of route {} times {} stops and the pattern serves {}",
+                                        gtfs_id, p, t.pattern, route_id, offsets.len(), n
+                                    )));
                                 }
+                                index.offsets.push(offsets);
+                                let at = index.offsets.len() as u32 - 1;
+                                timing_at.insert(key, at);
+                                at
                             }
                         }
-                        None => *default_at.entry(n).or_insert_with(|| {
-                            index
-                                .offsets
-                                .push(Arc::new(gtfs_timing::default_offsets(n, run_s, dwell_s)));
-                            index.offsets.len() as u32 - 1
-                        }),
-                    };
-                    index.trips.insert(
-                        t.id.clone(),
-                        TripRef {
-                            pattern: pattern_at,
-                            offsets: timing,
-                            ref_s: t.ref_s,
-                            direction: t.direction,
-                        },
-                    );
-                }
-                // the pattern's times are its first trip's
-                let first = index.trips[&pattern_trips[0].id].offsets;
-                let times =
-                    gtfs_timing::stop_times(pattern_trips[0].ref_s, &index.offsets[first as usize]);
+                    }
+                    None => *default_at.entry(n).or_insert_with(|| {
+                        index
+                            .offsets
+                            .push(Arc::new(gtfs_timing::default_offsets(n, run_s, dwell_s)));
+                        index.offsets.len() as u32 - 1
+                    }),
+                };
+                index.trips.insert(
+                    t.id.clone(),
+                    TripRef {
+                        pattern: at,
+                        offsets: timing,
+                        ref_s: t.ref_s,
+                        direction: t.direction,
+                    },
+                );
+                let ids: Vec<&str> = rows_by_pattern[&(route_id.clone(), t.pattern)]
+                    .iter()
+                    .map(|r| r.stop_id.as_str())
+                    .collect();
+                let g = *group_at.entry(ids.clone()).or_insert_with(|| {
+                    groups.push((ids, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[g].1.push(t);
+            }
+            let mut codes: HashSet<String> = HashSet::new();
+            let mut longest: Option<(usize, LatLong, LatLong)> = None;
+            for (ids, group_trips) in &groups {
+                let first = group_trips[0];
+                let rows = &rows_by_pattern[&(route_id.clone(), first.pattern)];
+                let n = rows.len();
+                let offsets = &index.offsets[index.trips[&first.id].offsets as usize];
+                let times = gtfs_timing::stop_times(first.ref_s, offsets);
                 let mut pattern_stops = Vec::with_capacity(n);
-                for (i, (row, s)) in row_stops.iter().enumerate() {
+                for (i, row) in rows.iter().enumerate() {
+                    let s = &stops[&row.stop_id];
                     let code = s.stop_code.clone().unwrap_or_else(|| s.stop_id.clone());
                     codes.insert(code.clone());
                     let stage = stage_columns(
@@ -1241,8 +1310,8 @@ impl GtfsDbSource {
                         lon: s.lon,
                         arrival_time: Some(times[i].0),
                         departure_time: Some(times[i].1),
-                        stop_sequence: Some(i as i32 + 1),
-                        platform_code: None,
+                        stop_sequence: Some(row.stop_sequence.unwrap_or(i as i32 + 1)),
+                        platform_code: s.platform_code.clone(),
                         headsign: headsign(
                             row.headsign.as_deref(),
                             headsign_source,
@@ -1269,13 +1338,12 @@ impl GtfsDbSource {
                         },
                     ));
                 }
-                let ids: Vec<&str> = row_stops.iter().map(|(_, s)| s.stop_id.as_str()).collect();
                 out.patterns.push(NandiPatternDetails {
-                    id: gtfs_timing::pattern_id(gtfs_id, &route_id, &ids),
+                    id: gtfs_timing::pattern_id(gtfs_id, &route_id, ids),
                     desc: Some(format!("Pattern for route {}", route_id)),
                     route_id: prefixed(&route_id),
                     stops: pattern_stops,
-                    trips: pattern_trips
+                    trips: group_trips
                         .iter()
                         .map(|t| NandiTrip {
                             id: t.id.clone(),
@@ -1293,7 +1361,7 @@ impl GtfsDbSource {
                 short_name: r.try_get("short_name").map_err(db_err)?,
                 long_name: r.try_get("long_name").map_err(db_err)?,
                 mode: route_mode(route_type),
-                agency_name: agency_name.clone(),
+                agency_name: agency_of.name(r.try_get("agency_id").map_err(db_err)?),
                 color: r.try_get("color").map_err(db_err)?,
                 trip_count: Some(trips.len() as i32),
                 stop_count: Some(codes.len() as i32),
