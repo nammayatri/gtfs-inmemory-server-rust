@@ -820,7 +820,8 @@ pub fn create_id_field(entity: &str, op: &str) -> Option<&'static str> {
         ("route", "create") => Some("route_id"),
         ("station", "create") => Some("station_id"),
         ("service", "create") => Some("service_id"),
-        _ => None,
+        // a record file keyed by an id field of its own (section 18)
+        _ => super::records::create_key_field(entity, op),
     }
 }
 
@@ -864,6 +865,10 @@ pub fn check_payload(
     entity_key: &str,
     after: &Value,
 ) -> Result<(), Finding> {
+    // every file the editor keeps as records has one shape check, the spec's
+    if let Some(fspec) = super::records::spec_for(entity) {
+        return super::records::check_payload(fspec, op, entity_key, after);
+    }
     let what = format!("{entity}/{op}");
     let what = what.as_str();
     match (entity, op) {

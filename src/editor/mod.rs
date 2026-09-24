@@ -21,6 +21,7 @@ pub mod handlers;
 pub mod jwt;
 pub mod position_reviews;
 pub mod proposals;
+pub mod records;
 pub mod service;
 pub mod static_ui;
 pub mod trips;
@@ -238,6 +239,12 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/gtfs-spec", web::get().to(h::gtfs_spec))
             .route("/feeds", web::get().to(h::feeds))
             .route("/feeds/{gtfs_id}/gtfs.zip", web::get().to(h::feed_gtfs_zip))
+            .route("/feeds/{gtfs_id}/files", web::get().to(h::files))
+            .route("/feeds/{gtfs_id}/files/{file}", web::get().to(h::file_rows))
+            .route(
+                "/feeds/{gtfs_id}/files/{file}/{key}",
+                web::get().to(h::file_row),
+            )
             // a feed's zip is the body: allowed up to 64 MB (chennai_bus's is 12)
             .service(
                 web::resource("/feeds/{gtfs_id}/import")
@@ -304,6 +311,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/change-sets/{id}/preview/routes/{route_id}/patterns/{pattern_key}",
                 web::get().to(h::change_set_preview_pattern),
+            )
+            .route(
+                "/change-sets/{id}/preview/files/{file}",
+                web::get().to(h::change_set_preview_file),
             )
             .route(
                 "/change-sets/{id}/preview/routes/{route_id}/trips",

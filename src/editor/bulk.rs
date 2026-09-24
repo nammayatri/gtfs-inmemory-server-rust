@@ -40,6 +40,9 @@ pub struct BulkRequest {
     pub kind: String,
     pub rows: Vec<Value>,
     pub dry_run: bool,
+    /// kind `records`: the file the rows are of (`pathways.txt`, section 18).
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +54,8 @@ pub enum Kind {
     RouteTrips,
     TimingProfiles,
     Services,
+    /// Rows of any file the editor keeps as records (section 18).
+    Records,
 }
 
 impl Kind {
@@ -63,6 +68,7 @@ impl Kind {
             "route_trips" => Some(Kind::RouteTrips),
             "timing_profiles" => Some(Kind::TimingProfiles),
             "services" => Some(Kind::Services),
+            "records" => Some(Kind::Records),
             _ => None,
         }
     }
@@ -76,6 +82,7 @@ impl Kind {
             Kind::RouteTrips => "route_trips",
             Kind::TimingProfiles => "timing_profiles",
             Kind::Services => "services",
+            Kind::Records => "records",
         }
     }
 
@@ -142,6 +149,8 @@ impl Kind {
                 "exception_type",
                 "label",
             ],
+            // the file's own fields, checked by plan_records
+            Kind::Records => &[],
         }
     }
 
@@ -2542,6 +2551,240 @@ async fn plan_stop_updates(
 
 // ---------------------------------------------------------------- run
 
+// ---------------------------------------------------------------- records (section 18)
+
+/// The record file a `records` upload names.
+fn records_file(file: Option<&str>) -> EditorResult<&'static crate::gtfs::spec::FileSpec> {
+    let file = file
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .ok_or_else(|| {
+            EditorError::bad_request(
+                "file_required",
+                "a records upload says which file it is: file",
+            )
+        })?;
+    let fspec = crate::gtfs::spec::file(file).ok_or_else(|| {
+        EditorError::bad_request(
+            "invalid_file",
+            format!("{file} is not a file of the GTFS reference"),
+        )
+    })?;
+    if fspec.table().is_none() {
+        return Err(EditorError::bad_request(
+            "invalid_file",
+            format!(
+                "{} has an upload of its own: stops, routes, route_stops, route_trips, timing_profiles or services",
+                fspec.name
+            ),
+        ));
+    }
+    Ok(fspec)
+}
+
+/// `records` rows: one row of `fspec`'s file each, by its own field names, with
+/// an `action`: `add` creates the row, `update` sets the cells given (a blank
+/// cell is not given), `delete` removes it. A file with no id of its own names
+/// an existing row by `row_id`. One change per row, each found exactly as the
+/// draft would find it: the rows are replayed after the draft's own changes, in
+/// a savepoint that is rolled back.
+async fn plan_records(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    fspec: &'static crate::gtfs::spec::FileSpec,
+    rows: &[Value],
+    actor: &str,
+) -> EditorResult<Plan> {
+    use crate::gtfs::spec::Key;
+    let entity = fspec.entity().expect("a record file");
+    let is_shape = entity == "shape";
+    let mut plan = Plan::new(rows.len());
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, v) in rows.iter().enumerate() {
+        let Some(m) = v.as_object() else {
+            plan.rows[i]
+                .findings
+                .push(invalid_row("a row is an object of column: value"));
+            continue;
+        };
+        let known = |k: &str| {
+            k == "action"
+                || (k == "row_id" && matches!(fspec.key(), Some(Key::Minted { .. })))
+                || (is_shape && k == "points")
+                || fspec.field(k).is_some()
+        };
+        if let Some(k) = m.keys().find(|k| !known(k)) {
+            plan.rows[i].findings.push(invalid_row(format!(
+                "{k:?} is not a column of {} (columns: action, {})",
+                fspec.name,
+                fspec
+                    .fields
+                    .iter()
+                    .map(|f| f.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+            continue;
+        }
+        let action = match cell_action(m, Kind::Records) {
+            Ok(a) => a,
+            Err(e) => {
+                plan.rows[i].findings.push(invalid_row(e));
+                continue;
+            }
+        };
+        let mut after = Map::new();
+        for (k, v) in m {
+            if k == "action" || k == "row_id" {
+                continue;
+            }
+            match v {
+                Value::Null => {}
+                Value::String(s) if s.trim().is_empty() => {}
+                // a CSV cell of points is JSON written as text
+                Value::String(s) if k == "points" => match serde_json::from_str::<Value>(s) {
+                    Ok(p) => {
+                        after.insert(k.clone(), p);
+                    }
+                    Err(_) => {
+                        after.insert(k.clone(), v.clone());
+                    }
+                },
+                _ => {
+                    after.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let named = |f: &str| {
+            m.get(f).and_then(|v| match v {
+                Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+        };
+        let key = match fspec.key() {
+            Some(Key::Field(f)) => named(f),
+            Some(Key::Minted { .. }) if action == Action::Add => {
+                if named("row_id").is_some() {
+                    plan.rows[i].findings.push(invalid_row(
+                        "a new row gets its row_id when it is added; leave row_id blank",
+                    ));
+                    continue;
+                }
+                Some(super::records::mint_row_id())
+            }
+            Some(Key::Minted { .. }) => named("row_id"),
+            _ => Some(g.to_string()),
+        };
+        let Some(key) = key else {
+            let field = match fspec.key() {
+                Some(Key::Field(f)) => f,
+                _ => "row_id",
+            };
+            plan.rows[i].findings.push(invalid_row(format!(
+                "{field} is required to {}",
+                action.name()
+            )));
+            continue;
+        };
+        let (op, after) = match action {
+            Action::Add => ("create", Value::Object(after)),
+            Action::Update => ("update", Value::Object(after)),
+            Action::Delete => ("delete", Value::Null),
+        };
+        if let Err(f) = super::records::check_payload(fspec, op, &key, &after) {
+            plan.rows[i].findings.push(f);
+            continue;
+        }
+        by_key.entry(key.clone()).or_default().push(i);
+        plan.rows[i].change = Some(plan.changes.len());
+        plan.changes.push(Planned {
+            entity,
+            op,
+            key: Some(key),
+            after,
+            before: Value::Null,
+            base: None,
+        });
+    }
+    mark_duplicates(&mut plan, by_key, |k| format!("{} {k}", fspec.name));
+
+    // an update or a delete is based on the live row, as a single change is
+    let keys: Vec<String> = plan
+        .changes
+        .iter()
+        .filter(|c| c.op != "create")
+        .filter_map(|c| c.key.clone())
+        .collect();
+    let live = super::records::live_rows(conn, g, fspec, &keys).await?;
+    for c in plan.changes.iter_mut().filter(|c| c.op != "create") {
+        if let Some((before, version)) = c.key.as_ref().and_then(|k| live.get(k)) {
+            c.before = before.clone();
+            c.base = Some(*version);
+        }
+    }
+
+    // what the draft would find: its own changes, then these, replayed and
+    // rolled back
+    let mut all = service::load_changes_to_apply(conn, change_set_id).await?;
+    let next = all.iter().map(|c| c.position).max().unwrap_or(0);
+    let probe_id = |k: usize| -(k as i64) - 1;
+    for (k, c) in plan.changes.iter().enumerate() {
+        all.push(service::ChangeRow {
+            change_id: probe_id(k),
+            position: next + 1 + k as i32,
+            entity: c.entity.into(),
+            entity_key: c.key.clone().unwrap_or_default(),
+            op: c.op.into(),
+            base_row_version: c.base,
+            before: Value::Null,
+            after: c.after.clone(),
+            created_by: Uuid::nil(),
+            created_at: chrono::Utc::now(),
+        });
+    }
+    sqlx::query("SAVEPOINT bulk_records")
+        .execute(&mut *conn)
+        .await?;
+    let ev = service::evaluate(conn, g, &all, actor).await;
+    sqlx::query("ROLLBACK TO SAVEPOINT bulk_records")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT bulk_records")
+        .execute(&mut *conn)
+        .await?;
+    let ev = ev?;
+    let row_of: HashMap<i64, Vec<usize>> = {
+        let mut m: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, o) in plan.rows.iter().enumerate() {
+            if let Some(k) = o.change {
+                m.entry(probe_id(k)).or_default().push(i);
+            }
+        }
+        m
+    };
+    for v in ev.validation.iter().chain(ev.conflicts.iter()) {
+        let Some(rows) = v["change_id"].as_i64().and_then(|id| row_of.get(&id)) else {
+            continue;
+        };
+        let code = v["code"]
+            .as_str()
+            .or(v["reason"].as_str())
+            .unwrap_or("conflict");
+        let message = v["message"].as_str().unwrap_or("").to_string();
+        let f = if v["level"] == "warning" {
+            Finding::warning(code, "", message)
+        } else {
+            Finding::error(code, "", message)
+        };
+        for i in rows {
+            plan.rows[*i].findings.push(f.clone());
+        }
+    }
+    Ok(plan)
+}
+
 fn respond(dry_run: bool, kind: Kind, plan: &Plan, change_ids: &[i64]) -> Value {
     let (mut ok, mut warnings, mut errors, mut unchanged) = (0, 0, 0, 0);
     let rows: Vec<Value> = plan
@@ -2607,7 +2850,7 @@ pub async fn run(
     let kind = Kind::parse(&req.kind).ok_or_else(|| {
         EditorError::bad_request(
             "invalid_kind",
-            "kind is stops, routes, route_stops, stop_updates, route_trips, timing_profiles or services",
+            "kind is stops, routes, route_stops, stop_updates, route_trips, timing_profiles, services, or records with a file",
         )
     })?;
     if req.rows.is_empty() {
@@ -2664,6 +2907,18 @@ async fn run_once(
             plan_timing_profiles(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?
         }
         Kind::Services => plan_services(&mut tx, &g, &req.rows, &draft, !req.dry_run).await?,
+        Kind::Records => {
+            let fspec = records_file(req.file.as_deref())?;
+            plan_records(
+                &mut tx,
+                &g,
+                change_set_id,
+                fspec,
+                &req.rows,
+                &ctx.user.email,
+            )
+            .await?
+        }
     };
     if req.dry_run {
         tx.rollback().await?;
