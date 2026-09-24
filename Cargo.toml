@@ -23,7 +23,10 @@ tokio = { version = "1.0", features = ["full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1.0"
+# float_roundtrip: parse a float to the exact double its text names (the default
+# parser may be one bit off), so a GTFS value read back out of Postgres is the
+# value that went in (docs/gtfs-editor.md section 18).
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 # Self-describing binary (de)serialization for the preprocessed boot snapshot.
 # MessagePack with map-encoded structs is used so serde field attributes
 # (skip_serializing_if / skip_serializing / rename / default) round-trip exactly

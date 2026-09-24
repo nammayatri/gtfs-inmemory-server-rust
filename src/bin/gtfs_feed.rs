@@ -6,8 +6,18 @@
 //!     read Z, build the model the tables would hold, write it back out and
 //!     compare: what an import would keep, what it would drop, and whether
 //!     the export gives the feed back. Touches no database.
+//! gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]
+//!     seed feed G (default: the feed_id Z names), which must have no rows
+//!     yet, from Z: written, read back, compared with Z in one transaction,
+//!     committed only with --seed and when nothing differs. Without --seed it
+//!     is a dry run that writes nothing.
+//! gtfs_feed export --db URL --gtfs-id G --out FILE
+//!     the feed's GTFS zip, from the tables.
 //! ```
+//!
+//! `--db` is never read from the environment: say which database, every time.
 
+use gtfs_routes_service::editor::feed_io;
 use gtfs_routes_service::gtfs::{compare, model, read, write, Level};
 use std::process::ExitCode;
 
@@ -19,8 +29,139 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: gtfs_feed roundtrip --zip Z [--gtfs-id G] [--show N]");
+    eprintln!(
+        "usage: gtfs_feed roundtrip --zip Z [--gtfs-id G] [--show N]\n       \
+         gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]\n       \
+         gtfs_feed export --db URL --gtfs-id G --out FILE"
+    );
     ExitCode::from(2)
+}
+
+/// The database, as the person running this named it; its host is echoed so
+/// nobody seeds the wrong one by accident.
+async fn pool(args: &[String]) -> Result<sqlx::PgPool, ExitCode> {
+    let Some(url) = arg(args, "--db") else {
+        return Err(usage());
+    };
+    let host = url
+        .split('@')
+        .nth(1)
+        .and_then(|h| h.split('/').next())
+        .unwrap_or("?");
+    eprintln!("database: {host}");
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .map_err(|e| {
+            eprintln!("cannot connect: {e}");
+            ExitCode::from(1)
+        })
+}
+
+async fn import(args: &[String]) -> ExitCode {
+    let Some(zip) = arg(args, "--zip") else {
+        return usage();
+    };
+    let pool = match pool(args).await {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let bytes = match std::fs::read(&zip) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{zip}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let seed = args.iter().any(|a| a == "--seed");
+    let who = feed_io::Importer {
+        user_id: None,
+        email: None,
+        label: "gtfs_feed import".into(),
+    };
+    let started = std::time::Instant::now();
+    match feed_io::import_zip(
+        &pool,
+        &bytes,
+        arg(args, "--gtfs-id").as_deref(),
+        !seed,
+        &who,
+    )
+    .await
+    {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "gtfs_id": report.gtfs_id,
+                    "dry_run": report.dry_run,
+                    "seeded": report.seeded,
+                    "feed_version": report.feed_version,
+                    "counts": report.counts,
+                    "errors": report.errors,
+                    "warnings": report.warnings,
+                    "findings": report.findings,
+                    "round_trip": report.round_trip,
+                    "round_trip_sample": report.round_trip_sample,
+                    "ms": started.elapsed().as_millis() as u64,
+                }))
+                .unwrap_or_default()
+            );
+            if report.errors > 0 || !report.round_trip.is_empty() || (seed && !report.seeded) {
+                ExitCode::from(4)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("{}: {}", e.code, e.message);
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn export(args: &[String]) -> ExitCode {
+    let (Some(g), Some(out)) = (arg(args, "--gtfs-id"), arg(args, "--out")) else {
+        return usage();
+    };
+    let pool = match pool(args).await {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (m, findings) = match feed_io::load_model(&mut conn, &g).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}: {}", e.code, e.message);
+            return ExitCode::from(1);
+        }
+    };
+    for f in &findings {
+        eprintln!("{:?} {} {}", f.level, f.code, f.message);
+    }
+    let bytes = match write::zip_bytes(&write::to_raw(&m)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = std::fs::write(&out, &bytes) {
+        eprintln!("{out}: {e}");
+        return ExitCode::from(1);
+    }
+    println!("{out}: {} bytes", bytes.len());
+    for (file, n) in m.counts() {
+        println!("  {file:<24} {n}");
+    }
+    ExitCode::SUCCESS
 }
 
 /// The gtfs_id a zip names in feed_info.txt, as nandi's preprocessor reads it.
@@ -100,10 +241,13 @@ fn roundtrip(args: &[String]) -> ExitCode {
     }
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("roundtrip") => roundtrip(&args[1..]),
+        Some("import") => import(&args[1..]).await,
+        Some("export") => export(&args[1..]).await,
         _ => usage(),
     }
 }

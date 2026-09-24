@@ -14,6 +14,7 @@ pub mod context;
 pub mod crypto;
 pub mod draft;
 pub mod error;
+pub mod feed_io;
 pub mod feed_lock;
 pub mod gps_line;
 pub mod handlers;
@@ -236,6 +237,13 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             // live data
             .route("/gtfs-spec", web::get().to(h::gtfs_spec))
             .route("/feeds", web::get().to(h::feeds))
+            .route("/feeds/{gtfs_id}/gtfs.zip", web::get().to(h::feed_gtfs_zip))
+            // a feed's zip is the body: allowed up to 64 MB (chennai_bus's is 12)
+            .service(
+                web::resource("/feeds/{gtfs_id}/import")
+                    .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+                    .route(web::post().to(h::feed_import)),
+            )
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))
             .route("/feeds/{gtfs_id}/stops/{stop_id}", web::get().to(h::stop))
