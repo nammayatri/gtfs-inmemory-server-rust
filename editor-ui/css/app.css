@@ -155,19 +155,22 @@ table.people .feed-col { white-space: nowrap; }
 .code-input { font-size: 26px !important; letter-spacing: .35em; text-align: center; max-width: 220px; }
 
 /* ------------------------------------------------------------ shell */
-.app { height: 100%; display: grid; grid-template-rows: var(--topbar-h) auto minmax(0, 1fr); }
+/* the top bar keeps one row while it fits and takes a second rather than
+   overflowing the window when it does not */
+.app { height: 100%; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
 .topbar {
-  display: flex; align-items: center; gap: 14px; padding: 0 14px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 14px;
+  min-height: var(--topbar-h);
   background: var(--surface); border-bottom: 1px solid var(--rule);
   /* above the map: Leaflet's controls are z-index 1000 inside .map-wrap */
   position: relative; z-index: 1100;
 }
 .brand { font-weight: 700; font-size: var(--fs-l); color: var(--ink); text-decoration: none; white-space: nowrap; }
-.feed-picker select { min-height: 34px; width: auto; }
+.feed-picker select { min-height: 34px; width: auto; max-width: 13rem; text-overflow: ellipsis; }
 /* the role this person holds on the feed chosen beside it (docs section 15) */
 .feed-picker { display: flex; align-items: center; gap: 6px; }
 .chip.feed-role { background: var(--action-tint); color: var(--action); }
-.search { position: relative; flex: 1 1 360px; max-width: 520px; }
+.search { position: relative; flex: 1 1 0; min-width: 150px; max-width: 520px; }
 .search-results {
   position: absolute; top: calc(100% + 4px); left: 0; right: 0; max-height: 70vh; overflow: auto;
   background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius);
@@ -185,11 +188,31 @@ table.people .feed-col { white-space: nowrap; }
 .nav a[aria-current="page"] { background: var(--stage-tint); }
 .nav a:hover { background: var(--action-tint); }
 .nav a { white-space: nowrap; }
+.nav { align-items: center; }
+/* a menu among the top bar's links (Feed data) */
+.nav-menu { position: relative; }
+.nav-menu summary {
+  list-style: none; cursor: pointer; padding: 6px 10px; border-radius: var(--radius);
+  font-weight: 700; font-size: var(--fs-s); white-space: nowrap;
+}
+.nav-menu summary::-webkit-details-marker { display: none; }
+.nav-menu summary::after { content: "▾"; margin-left: 3px; font-size: 11px; }
+.nav-menu summary:hover { background: var(--action-tint); }
+.nav-menu summary.current, .nav-menu[open] summary { background: var(--stage-tint); }
+.nav-menu-body {
+  position: absolute; left: 0; top: calc(100% + 6px); width: 280px; padding: 6px; display: grid; gap: 2px;
+  background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(20, 37, 42, .14);
+}
+.nav .nav-menu-body a { display: grid; gap: 1px; padding: 8px 10px; white-space: normal; }
+.nav .nav-menu-body a span { font-size: var(--fs-xs); color: var(--muted); font-weight: 400; }
 .nav-count {
   display: inline-block; min-width: 20px; margin-left: 4px; padding: 0 6px; border-radius: 999px;
   background: var(--draft-tint); color: var(--draft); font-size: var(--fs-xs); text-align: center;
 }
 .new-menu { position: relative; }
+/* New, the draft and the person keep to the right end of their row */
+.topbar .new-menu { margin-left: auto; }
 .new-menu summary { list-style: none; }
 .new-menu summary::-webkit-details-marker { display: none; }
 .new-menu summary::after { content: "▾"; margin-left: 2px; font-size: 11px; }
