@@ -157,6 +157,7 @@ async fn clear(pool: &PgPool) {
         format!("DELETE FROM gtfs_pod_feed_state WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_webhook_delivery WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_webhook WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
         format!(
             "DELETE FROM gtfs_editor_session WHERE user_id IN \

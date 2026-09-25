@@ -28,7 +28,7 @@ js/merge.js         merging duplicate stops: choose, compare, which id stays, wh
 js/importer.js      bulk import from CSV: templates, reading the file, dry-run check, add to draft
 js/csv.js           RFC 4180 CSV reader and writer (no DOM; tested by dev/csv_test.mjs)
 js/review.js        drafts by status, one draft's diff (filtered and paged) and its actions
-js/admin.js         people (roles, access, two-step reset) and history
+js/admin.js         people (who may work on which feed, admins, two-step reset) and history
 js/overlay.js       what the active draft does to a stop, station or route, for display ("pending, not live")
 js/context.js       stations listed once instead of their platforms; the "Cleanup context" of a stop and a route
 js/undo.js          undo / redo of what is on the screen and not yet in a draft (Ctrl/Cmd+Z)
@@ -79,7 +79,13 @@ dev/                development only - never served by GIMS
   added/removed/moved/changed, station membership and platform labels, merges
   with the routes they update, new routes. Changes are filtered by kind or
   problem and paged 50 at a time, so an import of thousands stays usable.
-- **History** (`#/audit`) and **People** (`#/admin`, admins only).
+- **History** (`#/audit`) and **People** (`#/admin`, admins only): one row per
+  person, one role picker per feed (none, viewer, editor, approver), an Admin
+  switch, system accounts labelled.
+- **Feeds** - the top bar offers only the feeds this person holds, with their
+  role on the chosen one beside it; every button follows that role. Someone
+  with no feed sees "You have no feeds yet — ask an admin" (section 15 of the
+  contract).
 
 Edits always go into a draft, remembered per person and feed in this browser.
 
@@ -99,7 +105,8 @@ The smoke test needs a freshly started mock (it creates drafts and commits).
 
 The mock injects a purple DEV bar (not part of the dashboard) that stands in for
 Pomerium: choose who you are - admin, two editors, an approver, a viewer, a user
-who has not set up two-step sign-in, or no SSO identity - and it shows that
+who has not set up two-step sign-in, a member of a second, small feed, one with
+no feed at all, a system account, or no SSO identity - and it shows that
 person's current authenticator code. TOTP, sessions, roles, maker-checker,
 validation, row-version conflicts and the feed version bump are real, and so
 are creating stops and routes (minted ids), bulk import with its dry run, stop

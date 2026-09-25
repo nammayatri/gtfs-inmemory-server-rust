@@ -259,7 +259,7 @@ pub async fn route(conn: &mut PgConnection, g: &str, route_id: &str) -> EditorRe
         "SELECT rs.stop_id, rs.sequence, r.review_id, r.status \
          FROM gtfs_route_stop rs \
          JOIN gtfs_position_review r ON r.gtfs_id = rs.gtfs_id AND r.stop_id = rs.stop_id \
-         WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND r.status = ANY($3) \
+         WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.pattern_key = 1 AND r.status = ANY($3) \
          ORDER BY rs.sequence, r.review_id",
     )
     .bind(g)
@@ -282,7 +282,7 @@ pub async fn route(conn: &mut PgConnection, g: &str, route_id: &str) -> EditorRe
     let served: Vec<(i32, String, String, f64, f64)> = sqlx::query(
         "SELECT rs.sequence, rs.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop rs \
          JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
-         WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.stop_type <> ALL($3) \
+         WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.pattern_key = 1 AND rs.stop_type <> ALL($3) \
          ORDER BY rs.sequence",
     )
     .bind(g)

@@ -4,7 +4,8 @@
 Serves the dashboard at /internal/gtfs-editor/ui/ and implements the contract in
 docs/gtfs-editor.md in memory: sections 2-3 (access, reads, drafts), 5 (creating
 stops and routes, bulk import with a dry run), 6 (station proposals and their
-lifecycle) and 8 (coordinate reviews and their lifecycle). It is seeded from
+lifecycle), 8 (coordinate reviews and their lifecycle) and 15 (who may work on
+which feed: grants, admins, system accounts). It is seeded from
 dev/sample.json.gz (written by dev/export_sample.py from a LOCAL Postgres); when
 the sample has no coordinate reviews, a few are made up from the stops whose
 routes detour most to reach them. Nothing it does leaves this process.
@@ -1194,7 +1195,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"email": email, "users": [user_out(x) for x in s.users.values()],
                                     "current_code": totp(secret) if secret else None,
                                     "round5": getattr(s, "round5", None),
-                                    "station_merge": getattr(s, "station_merge", None)})
+                                    "station_merge": getattr(s, "station_merge", None),
+                                    "feed_access": getattr(s, "feed_access", None)})
         if path == "/__dev/as" and method == "POST":
             email = self._body().get("email") or ""
             return self._send(200, {"ok": True}, [
@@ -1534,7 +1536,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "unknown_change_set", "That draft does not exist.")
             rest = parts[2:]
             if not rest and method == "GET":
-                return 200, self.set_full(cs)
+                return 200, self.set_full(cs, q)
             if rest == ["changes"] and method == "POST":
                 return 201, self.add_change(u, cs, self._body())
             if len(rest) == 2 and rest[0] == "changes" and method in ("PUT", "DELETE"):
@@ -1722,19 +1724,35 @@ class Handler(BaseHTTPRequestHandler):
             "submitted_by_email": s.email_of(cs["submitted_by"]), "reviewed_by_email": s.email_of(cs["reviewed_by"]),
             "committed_by_email": s.email_of(cs["committed_by"])}
 
-    def set_full(self, cs):
+    # A draft's changes come a page at a time (docs section 16.5, "Big drafts"):
+    # `limit` (default 200, at most 500) and `cursor`. Every page carries the set,
+    # `change_count` and `next_cursor`; only the first replays the draft
+    # (validation, its summary, conflicts, can_submit).
+    def set_full(self, cs, q=None):
         s = self.store
+        q = q or {}
+        limit = min(max(int((q.get("limit") or ["200"])[0] or 200), 1), 500)
+        cursor = (q.get("cursor") or [""])[0]
+        start = int(cursor) if cursor else 0
+        page = cs["changes"][start:start + limit]
+        ids = {r.get("stop_id") for ch in page if ch["entity"] == "route_stops"
+               for r in (ch.get("after") or {}).get("rows", []) if r.get("stop_id")}
+        names = {i: s.stops[(cs["gtfs_id"], i)]["name"] for i in ids if (cs["gtfs_id"], i) in s.stops}
+        out = self.set_summary(cs) | {
+            "stop_names": names, "changes": page,
+            "next_cursor": str(start + limit) if start + limit < len(cs["changes"]) else None,
+            "feed_version": s.feeds[cs["gtfs_id"]]["version"]}
+        if cursor:
+            return out
         closed = cs["status"] in ("committed", "discarded")
         validation = [] if closed else validate_set(s, cs)
         conflicts = [] if closed else conflicts_for(s, cs)
-        ids = {r.get("stop_id") for ch in cs["changes"] if ch["entity"] == "route_stops"
-               for r in (ch.get("after") or {}).get("rows", []) if r.get("stop_id")}
-        names = {i: s.stops[(cs["gtfs_id"], i)]["name"] for i in ids if (cs["gtfs_id"], i) in s.stops}
-        return self.set_summary(cs) | {
-            "stop_names": names, "changes": cs["changes"], "validation": validation, "conflicts": conflicts,
+        return out | {
+            "validation": validation, "conflicts": conflicts,
+            "validation_summary": {"errors": sum(v["level"] == "error" for v in validation),
+                                   "warnings": sum(v["level"] == "warning" for v in validation)},
             "can_submit": (cs["status"] == "draft" and bool(cs["changes"]) and not conflicts
-                           and not any(v["level"] == "error" for v in validation)),
-            "feed_version": s.feeds[cs["gtfs_id"]]["version"]}
+                           and not any(v["level"] == "error" for v in validation))}
 
     def snapshot(self, cs, entity, key, op=None, after=None):
         proj = Projection(self.store, cs["gtfs_id"], cs["changes"])
@@ -3960,6 +3978,280 @@ def seed_station_merge(store):
 # ====================================================================== end of station merge
 
 
+# ====================================================================== feed access (docs section 15)
+# Who may work on which feed. An admin is global; everyone else works on a feed
+# only through a grant carrying the role held there, and a feed without one does
+# not exist for them. Kept together here: the role check reads the feed the
+# request is about (its {gtfs_id}, or the feed of the change set, proposal,
+# review or webhook it names), /auth/me and /feeds list only the caller's feeds,
+# the users API takes `admin` and `feeds`, grants are PUT / DELETE
+# /users/{id}/feeds/{g}, and a system account cannot sign in. The fixtures: a
+# second, small feed; every member granted the first feed at their role (0018's
+# backfill); a member on the second feed only, one with no feed at all, and a
+# system account.
+SECOND_FEED = "dev_second_feed"
+FA_SECOND_EDITOR = "second.editor@nammayatri.in"
+FA_NO_FEEDS = "nofeeds@nammayatri.in"
+FA_SYSTEM = "mtc-sync@nammayatri.in"
+FEED_ROLES = ("viewer", "editor", "approver")
+
+
+def seed_feed_access(store):
+    g = next(iter(store.feeds), None)
+    t = iso(now())
+    for u in store.users.values():
+        u.setdefault("kind", "person")
+        u.setdefault("grants", {})
+        if g and u["role"] != "admin":
+            u["grants"][g] = {"role": u["role"], "granted_by_email": None, "granted_at": t}
+    # the second feed: the stops of the first feed's first route, and that route
+    src = next(((rid, rows) for (gg, rid), rows in sorted(store.rows.items())
+                if gg == g and sum(1 for r in rows if r["stop_id"]) >= 3), None)
+    if g and src:
+        store.feeds[SECOND_FEED] = {"gtfs_id": SECOND_FEED, "display_name": "Second feed (dev)", "version": 1,
+                                    "data_source": "preprocessed", "agency_name": None, "released_version": None}
+        rid, rows = src
+        rows = [dict(r, gtfs_id=SECOND_FEED, route_id="SF-1", sequence=i + 1) for i, r in enumerate(rows[:8])]
+        for r in rows:
+            if r["stop_id"] and (g, r["stop_id"]) in store.stops:
+                store.stops[(SECOND_FEED, r["stop_id"])] = dict(store.stops[(g, r["stop_id"])], gtfs_id=SECOND_FEED,
+                                                                parent_station=None)
+                store.stop_routes.setdefault((SECOND_FEED, r["stop_id"]), []).append(("SF-1", r["sequence"]))
+        store.routes[(SECOND_FEED, "SF-1")] = dict(store.routes[(g, rid)], gtfs_id=SECOND_FEED, route_id="SF-1",
+                                                   short_name="SF1")
+        store.rows[(SECOND_FEED, "SF-1")] = rows
+        store.stops_stamp += 1
+    for email, name, role, kind, grants in (
+            (FA_SECOND_EDITOR, "Divya (second feed)", "viewer", "person", {g: "viewer", SECOND_FEED: "editor"}),
+            (FA_NO_FEEDS, "No feeds yet (dev)", "viewer", "person", {}),
+            (FA_SYSTEM, "MTC sync", "editor", "system", {g: "editor"})):
+        uid = str(uuid.uuid4())
+        system = kind == "system"
+        store.users[uid] = {"user_id": uid, "email": email, "display_name": name, "role": role, "kind": kind,
+                            "status": "active", "totp_enabled": not system,
+                            "totp_secret": None if system else DEV_SECRET, "pending_secret": None,
+                            "totp_last_step": None, "created_at": t, "last_login_at": None,
+                            "grants": {f: {"role": r, "granted_by_email": "admin@nammayatri.in", "granted_at": t}
+                                       for f, r in grants.items() if f in store.feeds}}
+    store.feed_access = {"second_feed": SECOND_FEED if SECOND_FEED in store.feeds else None,
+                         "second_editor": FA_SECOND_EDITOR, "no_feeds": FA_NO_FEEDS, "system": FA_SYSTEM}
+
+
+def access_user_out(u):
+    return user_out(u) | {
+        "is_admin": u["role"] == "admin", "kind": u.get("kind", "person"),
+        "feeds": [{"gtfs_id": f, **gr} for f, gr in sorted(u.get("grants", {}).items())],
+    }
+
+
+def _admin_flag(b):
+    """`admin`, or the older `role` it replaces; both may be sent if they agree."""
+    by_role = None
+    if b.get("role") is not None:
+        if b["role"] not in ROLE_RANK:
+            raise ApiError(400, "invalid_role", "role is viewer, editor, approver or admin")
+        by_role = b["role"] == "admin"
+    admin = b.get("admin")
+    if admin is not None and by_role is not None and bool(admin) != by_role:
+        raise ApiError(400, "invalid_role", "admin and role disagree; send admin alone")
+    return by_role if admin is None else bool(admin)
+
+
+class FeedAccessHandler(WebhookHandler):
+    feed = None
+
+    def identity(self):
+        email, u = super().identity()
+        if u.get("kind") == "system":
+            raise ApiError(403, "account_disabled", "this editor account is turned off; ask an admin")
+        return email, u
+
+    @staticmethod
+    def feed_role(u, g):
+        if u["role"] == "admin":
+            return "admin"
+        return (u.get("grants", {}).get(g) or {}).get("role")
+
+    def require_role(self, u, role):
+        # the role on the feed this request is about; an admin's for the rest
+        g = self.feed
+        have = "admin" if u["role"] == "admin" else None
+        if g is not None:
+            have = self.feed_role(u, g)
+            if have is None:
+                raise ApiError(403, "no_feed_access", f"you have no access to feed {g}; ask an admin",
+                               {"gtfs_id": g})
+        if have is None or ROLE_RANK[have] < ROLE_RANK[role]:
+            raise ApiError(403, "role_required", f"this needs the {role} role or higher")
+
+    def _feed_of(self, parts):
+        s = self.store
+        if len(parts) < 2:
+            return None
+        key = parts[1]
+        found = {
+            "feeds": lambda: {"gtfs_id": key} if key in s.feeds else None,
+            "change-sets": lambda: s.change_sets.get(key),
+            "station-proposals": lambda: s.proposals.get(int(key)) if key.isdigit() else None,
+            "position-reviews": lambda: s.reviews.get(int(key)) if key.isdigit() else None,
+            "webhooks": lambda: s.webhooks.get(key),
+        }.get(parts[0], lambda: None)()
+        return found["gtfs_id"] if found else None
+
+    def my_feeds(self, u):
+        return [{"gtfs_id": g, "display_name": f.get("display_name"), "role": self.feed_role(u, g)}
+                for g, f in self.store.feeds.items() if self.feed_role(u, g)]
+
+    def _api(self, method, path, q):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        s = self.store
+        self.feed = None
+        if parts == ["auth", "me"] and method == "GET":
+            status, body = super()._api(method, path, q)
+            _, u = self.identity()
+            return status, body | {"is_admin": u["role"] == "admin", "feeds": self.my_feeds(u)}
+        if parts[0] == "auth":
+            return super()._api(method, path, q)
+        if parts == ["feeds"] and method == "GET":
+            u = self.session_user()
+            return 200, {"items": [{k: f.get(k) for k in ("gtfs_id", "display_name", "version", "data_source",
+                                                          "released_version")} | {"my_role": self.feed_role(u, g)}
+                                   for g, f in s.feeds.items() if self.feed_role(u, g)],
+                         "next_cursor": None}
+        if parts[0] == "users" and not (len(parts) == 3 and parts[2] == "reset-totp"):
+            return self.users_api(method, parts)
+        g = self._feed_of(parts)
+        if g is not None:
+            u = self.session_user()
+            self.require_mutation(method)
+            self.feed = g
+            self.require_role(u, "viewer")
+            # a change set named in a query or a body answers for its own feed
+            named = (q.get("change_set") or [None])[0]
+            if not named and method in ("POST", "PUT", "PATCH"):
+                named = self._body().get("change_set_id")
+            other = s.change_sets.get(named) if isinstance(named, str) else None
+            if other and not self.feed_role(u, other["gtfs_id"]):
+                raise ApiError(403, "no_feed_access", f"you have no access to feed {other['gtfs_id']}; ask an admin",
+                               {"gtfs_id": other["gtfs_id"]})
+        return super()._api(method, path, q)
+
+    def _dev(self, method, path, q):
+        if path == "/__dev/grant" and method == "POST":
+            # a grant changed by another admin while this page stays open:
+            # {email, gtfs_id, role}, a null role taking the grant away
+            b = self._body()
+            with LOCK:
+                t = self.store.user_by_email(b.get("email") or "")
+                if not t:
+                    raise ApiError(404, "user_not_found", "no such user")
+                if b.get("role"):
+                    t.setdefault("grants", {})[b.get("gtfs_id")] = {
+                        "role": b["role"], "granted_by_email": "admin@nammayatri.in", "granted_at": iso(now())}
+                else:
+                    t.setdefault("grants", {}).pop(b.get("gtfs_id"), None)
+                out = access_user_out(t)
+            return self._send(200, out)
+        return super()._dev(method, path, q)
+
+    def users_api(self, method, parts):
+        s = self.store
+        u = self.session_user()
+        self.require_mutation(method)
+        self.require_role(u, "admin")
+        audit_access = lambda t, g, before, after: s.add_audit(
+            u, {None: "feed_access_granted"}.get(before, "feed_access_changed" if after else "feed_access_revoked"),
+            g, None, {"user_id": t["user_id"], "email": t["email"], "gtfs_id": g,
+                      "role_before": before, "role_after": after})
+        if parts == ["users"] and method == "GET":
+            return 200, {"items": [access_user_out(x) for x in sorted(s.users.values(), key=lambda x: x["email"])],
+                         "next_cursor": None}
+        if parts == ["users"] and method == "POST":
+            b = self._body()
+            email = (b.get("email") or "").strip().lower()
+            if not re.match(r"^[^@\s]+@[^@\s]+$", email):
+                raise ApiError(400, "invalid_email", "email is not valid")
+            admin = bool(_admin_flag(b))
+            feeds = b.get("feeds") or []
+            if admin and feeds:
+                raise ApiError(400, "admin_has_all_feeds", "an admin has every feed at every role; there is nothing to grant")
+            seen = set()
+            for f in feeds:
+                if f.get("role") not in FEED_ROLES:
+                    raise ApiError(400, "invalid_role", "a feed's role is viewer, editor or approver; an admin has every feed")
+                if f.get("gtfs_id") in seen:
+                    raise ApiError(400, "duplicate_feed", f"feed {f.get('gtfs_id')} is listed twice")
+                seen.add(f.get("gtfs_id"))
+                if f.get("gtfs_id") not in s.feeds:
+                    raise ApiError(404, "feed_not_found", f"no feed {f.get('gtfs_id')}", {"gtfs_id": f.get("gtfs_id")})
+            if s.user_by_email(email):
+                raise ApiError(409, "user_exists", f"{email} already has an account")
+            uid, t = str(uuid.uuid4()), iso(now())
+            role = "admin" if admin else (b.get("role") if b.get("role") in FEED_ROLES else "viewer")
+            s.users[uid] = {"user_id": uid, "email": email, "display_name": b.get("display_name") or None,
+                            "role": role, "kind": "person", "status": "active", "totp_enabled": False,
+                            "totp_secret": None, "pending_secret": None, "totp_last_step": None,
+                            "created_at": t, "last_login_at": None, "grants": {}}
+            s.add_audit(u, "user_created", detail={"user_id": uid, "email": email, "role": role, "admin": admin})
+            for f in feeds:
+                s.users[uid]["grants"][f["gtfs_id"]] = {"role": f["role"], "granted_by_email": u["email"], "granted_at": t}
+                audit_access(s.users[uid], f["gtfs_id"], None, f["role"])
+            return 201, access_user_out(s.users[uid])
+        t = s.users.get(parts[1]) if len(parts) >= 2 else None
+        if not t:
+            raise ApiError(404, "user_not_found", "no such user")
+        if len(parts) == 2 and method == "PATCH":
+            b = self._body()
+            admin, status = _admin_flag(b), b.get("status")
+            if admin is None and status is None:
+                raise ApiError(400, "nothing_to_change", "send admin or status")
+            if status not in (None, "active", "disabled"):
+                raise ApiError(400, "invalid_status", "status is active or disabled")
+            if t["user_id"] == u["user_id"] and (admin is False or (status or "active") != "active"):
+                raise ApiError(400, "cannot_change_self", "an admin cannot demote or disable their own account")
+            if admin and t.get("kind") == "system":
+                raise ApiError(400, "system_account", "a system account cannot be an admin; grant it the feeds it works on")
+            was = t["role"] == "admin"
+            if admin is not None and admin != was:
+                for g, gr in sorted(t.get("grants", {}).items()):
+                    audit_access(t, g, gr["role"], None)
+                t["grants"] = {}
+                t["role"] = "admin" if admin else (b.get("role") if b.get("role") in FEED_ROLES else "viewer")
+                s.add_audit(u, "user_admin_changed", detail={"user_id": t["user_id"], "email": t["email"],
+                                                             "admin_before": was, "admin_after": admin})
+            elif admin is False and b.get("role") in FEED_ROLES:
+                t["role"] = b["role"]
+            if status:
+                t["status"] = status
+                if status == "disabled":
+                    for k in [k for k, v in s.sessions.items() if v["user_id"] == t["user_id"]]:
+                        s.sessions.pop(k)
+                s.add_audit(u, "user_updated", detail={"user_id": t["user_id"], "email": t["email"], "status": status})
+            return 200, access_user_out(t)
+        if len(parts) == 4 and parts[2] == "feeds" and method in ("PUT", "DELETE"):
+            g = parts[3]
+            before = (t.get("grants", {}).get(g) or {}).get("role")
+            if method == "PUT":
+                role = self._body().get("role")
+                if role not in FEED_ROLES:
+                    raise ApiError(400, "invalid_role", "a feed's role is viewer, editor or approver; an admin has every feed")
+                if t["role"] == "admin":
+                    raise ApiError(400, "admin_has_all_feeds", "an admin has every feed at every role; there is nothing to grant")
+                if g not in s.feeds:
+                    raise ApiError(404, "feed_not_found", f"no feed {g}", {"gtfs_id": g})
+                if before != role:
+                    t.setdefault("grants", {})[g] = {"role": role, "granted_by_email": u["email"], "granted_at": iso(now())}
+                    audit_access(t, g, before, role)
+                return 200, access_user_out(t)
+            if before is None:
+                raise ApiError(404, "grant_not_found", f"{t['email']} has no grant on feed {g}")
+            t["grants"].pop(g)
+            audit_access(t, g, before, None)
+            return 204, None
+        raise ApiError(404, "endpoint_not_found", "no such editor endpoint")
+# ====================================================================== end of feed access
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
@@ -3973,8 +4265,9 @@ def main():
     seed_round5(Handler.store)
     seed_webhooks(Handler.store)
     seed_station_merge(Handler.store)
+    seed_feed_access(Handler.store)
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), WebhookHandler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), FeedAccessHandler).serve_forever()
 
 
 if __name__ == "__main__":

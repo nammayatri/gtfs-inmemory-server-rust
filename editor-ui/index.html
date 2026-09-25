@@ -18,6 +18,7 @@
       <label class="feed-picker">
         <span class="visually-hidden">Feed</span>
         <select id="feed-select"></select>
+        <span id="feed-role" class="chip feed-role" hidden></span>
       </label>
       <div class="search" role="search">
         <label for="search-input" class="visually-hidden">Search stops and routes</label>
@@ -30,6 +31,14 @@
         <a href="#/" data-nav="map">Map</a>
         <a href="#/coordinates" data-nav="coordinates">Coordinates to review <span id="coordinates-count" class="nav-count" hidden></span></a>
         <a href="#/stations" data-nav="stations" hidden>Stations to review <span id="stations-count" class="nav-count" hidden></span></a>
+        <details class="nav-menu" id="feed-menu">
+          <summary>Feed data</summary>
+          <div class="nav-menu-body">
+            <a href="#/feed" data-nav="feed"><strong>Feed</strong><span>The feed report, its GTFS zip, and importing one</span></a>
+            <a href="#/files" data-nav="files"><strong>GTFS files</strong><span>Every file of the feed and its rows</span></a>
+            <a href="#/calendar" data-nav="calendar"><strong>Calendar</strong><span>Services and the days they run</span></a>
+          </div>
+        </details>
         <a href="#/drafts" data-nav="drafts">Drafts</a>
         <a href="#/audit" data-nav="audit">History</a>
         <a href="#/admin" data-nav="admin" hidden>People</a>

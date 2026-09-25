@@ -9,6 +9,7 @@ import { h, clear, toast, confirmDialog, fmtCount, plural, STOP_TYPE_LABEL } fro
 import { parseCsv, toCsv, CsvError } from "./csv.js";
 import * as map from "./map.js";
 import { requireDraft, refreshDraft, useDraft } from "./drafts.js";
+import { loadSpec, keyOf } from "./gtfs.js";
 
 const page = () => document.getElementById("page");
 const MAX_ROWS = 5000;
@@ -53,6 +54,28 @@ function stopType(v) {
 
 // What each kind of file holds. `read` turns a cell into the API value (undefined
 // leaves the field out) or throws a message for that row.
+// a GTFS field a row may fill in by its GTFS name (section 18); blank leaves it
+const gtfsColumn = (name, help) => ({ name, required: false, read: optional, help });
+const STOP_GTFS = [
+  gtfsColumn("tts_stop_name", "The name as read aloud."), gtfsColumn("zone_id", "Fare zone."), gtfsColumn("stop_url", "A web page about the stop."),
+  gtfsColumn("stop_timezone", "Only when it differs from the agency's, for example Asia/Kolkata."), gtfsColumn("wheelchair_boarding", "0 unknown, 1 possible, 2 not possible."),
+  gtfsColumn("level_id", "A level of levels.txt."), gtfsColumn("stop_access", "0 or 1, for a stop in a station."),
+  gtfsColumn("location_type", "0 stop or platform, 2 entrance, 3 node, 4 boarding area (a station is made on the map)."), gtfsColumn("parent_station", "The station an entrance or node stands in; the platform a boarding area stands on."),
+];
+const ROUTE_GTFS = [
+  gtfsColumn("route_desc", "A description."), gtfsColumn("route_url", "A web page about the route."), gtfsColumn("route_sort_order", "Where apps list it: a whole number."),
+  gtfsColumn("continuous_pickup", "0 anywhere, 1 no, 2 phone the agency, 3 ask the driver."), gtfsColumn("continuous_drop_off", "As continuous_pickup."),
+  gtfsColumn("network_id", "A network of networks.txt."), gtfsColumn("agency_id", "An agency of agency.txt."), gtfsColumn("route_type", "3 bus, 1 metro, 2 rail, or an extended type 100-1702."),
+];
+const ROUTE_STOP_GTFS = [
+  gtfsColumn("pattern_key", "Which stop order of the route: 1 (the default) or another."), gtfsColumn("stop_headsign", "The headsign at this stop."),
+  gtfsColumn("pickup_type", "0 regular, 1 none, 2 phone, 3 ask the driver."), gtfsColumn("drop_off_type", "As pickup_type."), gtfsColumn("timepoint", "1 exact times, 0 approximate."),
+  gtfsColumn("stop_sequence", "The feed's own numbering of the stop, when it is not 1, 2, 3…"), gtfsColumn("continuous_pickup", "As routes.txt."), gtfsColumn("continuous_drop_off", "As routes.txt."),
+  gtfsColumn("shape_dist_traveled", "Distance along the shape."), gtfsColumn("pickup_booking_rule_id", "A booking rule."), gtfsColumn("drop_off_booking_rule_id", "A booking rule."),
+];
+const STOP_GTFS_NAMES = STOP_GTFS.map((c) => c.name);
+const ROUTE_GTFS_NAMES = ROUTE_GTFS.map((c) => c.name);
+
 const KINDS = {
   stops: {
     label: "Stops",
@@ -64,6 +87,7 @@ const KINDS = {
       { name: "lat", required: false, read: number("lat", { blankOk: true }), help: "Latitude, for example 13.0827. Required to add; for update, give lat and lon together." },
       { name: "lon", required: false, read: number("lon", { blankOk: true }), help: "Longitude, for example 80.2707." },
       { name: "platform_code", required: false, read: optional, help: "Platform label, for example Towards Guindy. Leave empty to keep it." },
+      ...STOP_GTFS,
     ],
     show: ["action", "stop_id", "name", "lat", "lon", "platform_code"],
     // what one row needs, once its action is known
@@ -75,11 +99,11 @@ const KINDS = {
       } else if (row.action) {
         if (!has("stop_id")) problems.push(`stop_id is empty. A row that says ${row.action} names the stop it changes.`);
         if (row.action === "update") {
-          if (!["name", "lat", "lon", "platform_code"].some(has)) problems.push("Nothing to update: fill in name, lat and lon, or platform_code.");
+          if (!["name", "lat", "lon", "platform_code", ...STOP_GTFS_NAMES].some(has)) problems.push("Nothing to update: fill in name, lat and lon, platform_code or another stops.txt field.");
           if (has("lat") !== has("lon")) problems.push("Give lat and lon together to move a stop.");
         }
         if (row.action === "delete") {
-          const filled = ["name", "lat", "lon", "platform_code"].filter(has);
+          const filled = ["name", "lat", "lon", "platform_code", ...STOP_GTFS_NAMES].filter(has);
           if (filled.length) problems.push(`A row that deletes takes stop_id alone; this one also fills in ${filled.join(", ")}.`);
         }
       }
@@ -95,15 +119,16 @@ const KINDS = {
       { name: "short_name", required: false, read: optional, help: "The route number passengers see, for example 570X. Required to add." },
       { name: "long_name", required: false, read: optional, help: "Optional route name." },
       { name: "color", required: false, read: optional, help: "Optional colour as #RRGGBB." },
+      ...ROUTE_GTFS,
     ],
     show: ["action", "route_id", "short_name", "long_name", "color"],
     rowCheck: (row) => {
       const has = (k) => row[k] !== undefined && row[k] !== "";
       const problems = [];
       if (row.action === "add" && !has("short_name")) problems.push("short_name is empty. A row that adds a route needs it.");
-      if (row.action === "update" && !["short_name", "long_name", "color"].some(has)) problems.push("Nothing to update: fill in short_name, long_name or color.");
+      if (row.action === "update" && !["short_name", "long_name", "color", ...ROUTE_GTFS_NAMES].some(has)) problems.push("Nothing to update: fill in short_name, long_name, color or another routes.txt field.");
       if (row.action === "delete") {
-        const filled = ["short_name", "long_name", "color"].filter(has);
+        const filled = ["short_name", "long_name", "color", ...ROUTE_GTFS_NAMES].filter(has);
         if (filled.length) problems.push(`A row that deletes takes route_id alone; this one also fills in ${filled.join(", ")}.`);
       }
       return problems;
@@ -120,8 +145,58 @@ const KINDS = {
       { name: "stop_type", required: true, read: stopType, help: STOP_TYPES.join(", ") },
       { name: "stage_no", required: true, read: whole("stage_no"), help: "Fare stage number." },
       { name: "stage_name", required: true, read: text, help: "Fare stage name." },
+      ...ROUTE_STOP_GTFS,
     ],
     show: ["action", "route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"],
+  },
+  route_trips: {
+    label: "Trips",
+    short: "trips",
+    what: "Whole trip lists. All rows of one route_id are that route's trips: add for a route with none yet, update to replace the ones it has.",
+    columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add or update.", read: action(["add", "update"], { delete: "a route's trips are uploaded whole. Upload them with update, leaving out the trips it should not have." }), help: "add or update; the rows of one route all say the same." },
+      { name: "route_id", required: true, read: text, help: "The route the trip runs on." },
+      { name: "trip_id", required: false, read: optional, help: "Leave empty and the editor makes one." },
+      { name: "pattern_key", required: true, read: whole("pattern_key"), help: "The stop order it runs: 1, 2…" },
+      gtfsColumn("profile_key", "Its timing; empty for the feed's default timing."),
+      { name: "service_id", required: true, read: text, help: "The service it runs on." },
+      { name: "start_time", required: true, read: text, help: "When it leaves its first stop, HH:MM or H:MM:SS (up to 47:59:59)." },
+      gtfsColumn("direction_id", "0 or 1."), gtfsColumn("headsign", "trip_headsign."), gtfsColumn("short_name", "trip_short_name."),
+      gtfsColumn("block_id", "Its block."), gtfsColumn("shape_id", "A shape of shapes.txt."), gtfsColumn("wheelchair_accessible", "0, 1 or 2."),
+      gtfsColumn("bikes_allowed", "0, 1 or 2."), gtfsColumn("cars_allowed", "0, 1 or 2."),
+      gtfsColumn("frequencies", "Headway windows as JSON: [{\"start_time\":\"06:00:00\",\"end_time\":\"09:00:00\",\"headway_s\":600}]."),
+      gtfsColumn("source_ref", "Where it came from, as JSON."),
+    ],
+    show: ["action", "route_id", "trip_id", "pattern_key", "service_id", "start_time"],
+  },
+  timing_profiles: {
+    label: "Timings",
+    short: "timings",
+    what: "Timings of stop orders: one row per stop of a timing, the offsets in seconds from the trip's start.",
+    columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add or update.", read: action(["add", "update"], { delete: "a timing is uploaded whole; delete one in the draft instead." }), help: "add a timing, or update one that exists." },
+      { name: "route_id", required: true, read: text, help: "The route." },
+      { name: "pattern_key", required: true, read: whole("pattern_key"), help: "Its stop order." },
+      { name: "profile_key", required: true, read: whole("profile_key"), help: "Which timing of that stop order." },
+      { name: "stop_sequence", required: true, read: whole("stop_sequence"), help: "The stop's place among the stops a passenger can board: 1 to n." },
+      { name: "arrival_offset", required: true, read: whole("arrival_offset"), help: "Seconds from the start to arriving there." },
+      { name: "departure_offset", required: true, read: whole("departure_offset"), help: "Seconds from the start to leaving there." },
+      gtfsColumn("label", "A name for the timing."),
+    ],
+    show: ["action", "route_id", "pattern_key", "profile_key", "stop_sequence", "arrival_offset", "departure_offset"],
+  },
+  services: {
+    label: "Services (calendar)",
+    short: "services",
+    what: "When trips run: one row per service, or one per added or taken-away date, each repeating its service's days.",
+    columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add or update.", read: action(["add", "update"], { delete: "a service is uploaded whole; delete one in the draft instead." }), help: "add or update." },
+      { name: "service_id", required: true, read: text, help: "The service." },
+      ...["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].map((d) => gtfsColumn(d, "1 if it runs that day of the week.")),
+      gtfsColumn("start_date", "First day, YYYY-MM-DD."), gtfsColumn("end_date", "Last day, YYYY-MM-DD."),
+      gtfsColumn("date", "A date it runs, or does not, YYYY-MM-DD."), gtfsColumn("exception_type", "1 runs that date, 2 does not."), gtfsColumn("label", "A name for the service."),
+    ],
+    show: ["action", "service_id", "monday", "saturday", "sunday", "start_date", "end_date", "date"],
   },
   stop_updates: {
     label: "Stop details (platform label, description)",
@@ -218,20 +293,52 @@ export function readFile(kind, csvText) {
   return { rows, sheetRows, fileProblems, rowProblems };
 }
 
+// Rows of any file the editor keeps as records (section 18): the file's own
+// fields, by their GTFS names, and the action.
+function recordsKind(fspec) {
+  const key = keyOf(fspec);
+  return {
+    label: "Rows of a GTFS file",
+    short: `rows of ${fspec.file}`,
+    what: "Rows of any other file of the GTFS reference: pathways, transfers, fares, levels, translations and the rest, one row each.",
+    columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(ACTIONS, {}), help: "add a row, update one that exists, or delete one." },
+      key.minted ? { name: "row_id", required: false, read: optional, help: "The row's id: empty to add, required to update or delete." } : null,
+      ...fspec.fields.map((f) => ({ name: f.name, required: false, read: optional, help: `${f.type}${f.presence === "required" ? ", required" : f.presence === "conditional" ? `, ${f.note || "conditionally required"}` : ""}.` })),
+    ].filter(Boolean),
+    show: ["action", ...(key.minted ? ["row_id"] : []), ...fspec.fields.slice(0, 6).map((f) => f.name)],
+    file: fspec.file,
+  };
+}
+
 const templates = {};
 function templateHref(kind) {
-  if (!templates[kind]) {
+  const id = `${kind}:${KINDS[kind].file || ""}`;
+  if (!templates[id]) {
     // a byte order mark, so spreadsheet programs open Tamil names as UTF-8
     const blob = new Blob(["\ufeff" + toCsv([KINDS[kind].columns.map((c) => c.name)])], { type: "text/csv;charset=utf-8" });
-    templates[kind] = URL.createObjectURL(blob);
+    templates[id] = URL.createObjectURL(blob);
   }
-  return templates[kind];
+  return templates[id];
 }
 
 // ------------------------------------------------------------------ page
 const view = { kind: "stops", file: null, read: null, result: null, resultFor: null, filter: "problems", page: 1, added: null };
 
-export function showImport(kind) {
+export async function showImport(kind, file) {
+  // the record files come from the reference; a file named in the address is chosen
+  try {
+    const spec = await loadSpec();
+    const files = spec.files.filter((f) => f.storage === "record");
+    view.recordFiles = files;
+    const chosen = files.find((f) => f.file === (file || view.recordFile)) || files[0];
+    if (chosen) {
+      view.recordFile = chosen.file;
+      KINDS.records = recordsKind(chosen);
+    }
+  } catch {
+    /* without the reference, the kinds the editor always had */
+  }
   if (kind && KINDS[kind]) view.kind = kind;
   if (!can("editor")) {
     return clear(page(), h("div.page-inner", h("h1", "Import from a CSV file"), h("p.notice", "Importing needs the editor role. Ask an admin.")));
@@ -267,6 +374,13 @@ export function showImport(kind) {
       if (file) takeFile(file);
     });
 
+    const recordPicker = view.kind === "records" && view.recordFiles ? h("label.field.inline-field", { for: "import-record-file" }, h("span", "Which file"),
+      h("select", { id: "import-record-file", on: { change: (ev) => {
+        view.recordFile = ev.target.value;
+        KINDS.records = recordsKind(view.recordFiles.find((f) => f.file === view.recordFile));
+        resetFile();
+        render();
+      } } }, view.recordFiles.map((f) => h("option", { value: f.file, selected: f.file === view.recordFile }, `${f.file} · ${f.label}`)))) : null;
     clear(root,
       h("div.title-block",
         h("h1", "Import from a CSV file"),
@@ -277,6 +391,7 @@ export function showImport(kind) {
       h("section.import-step",
         h("h2", "1. What does the file hold?"),
         kinds,
+        recordPicker,
         h("details.columns",
           h("summary", `Columns for ${spec.short || spec.label.toLowerCase()}`),
           h("table.column-table", h("tbody", spec.columns.map((c) => h("tr", h("th", { scope: "row" }, h("code", c.name)), h("td", c.required ? "Required" : "Optional"), h("td", c.help)))))),
@@ -295,6 +410,8 @@ export function showImport(kind) {
   };
 
   const resetFile = () => Object.assign(view, { file: null, read: null, result: null, resultFor: null, filter: "problems", page: 1 });
+  // a records upload says which file its rows are of
+  const bulkBody = (dryRun) => ({ kind: view.kind, rows: view.read.rows, dry_run: dryRun, ...(view.kind === "records" ? { file: view.recordFile } : {}) });
 
   async function takeFile(file) {
     view.added = null;
@@ -320,7 +437,7 @@ export function showImport(kind) {
     view.checking = true;
     render();
     try {
-      const res = await post(`change-sets/${enc(draft.change_set_id)}/bulk`, { kind: view.kind, rows: view.read.rows, dry_run: true });
+      const res = await post(`change-sets/${enc(draft.change_set_id)}/bulk`, bulkBody(true));
       Object.assign(view, { result: res, resultFor: { read: view.read, draftId: draft.change_set_id }, page: 1 });
       view.filter = res.summary.errors || res.summary.warnings ? "problems" : "all";
     } catch (e) {
@@ -345,7 +462,7 @@ export function showImport(kind) {
       { confirm: `Add ${fmtCount(n)} to draft` });
     if (!ok) return;
     try {
-      const done = await post(`change-sets/${enc(draft.change_set_id)}/bulk`, { kind: view.kind, rows: view.read.rows, dry_run: false });
+      const done = await post(`change-sets/${enc(draft.change_set_id)}/bulk`, bulkBody(false));
       if (done && done.change_set && done.change_set.change_set_id) useDraft(done.change_set);
       else await refreshDraft();
       view.added = { message: `Added ${plural(done.summary.changes, "change")} from ${view.file.name} to draft “${draft.title}”.`, draftId: draft.change_set_id };

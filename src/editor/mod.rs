@@ -3,7 +3,8 @@
 //! Everything lives under `/internal/gtfs-editor`. The dashboard's static files
 //! (`/ui/`) are open - Pomerium sits in front of them - and every API call goes
 //! through [`auth::guard`], which verifies Pomerium's signed JWT, then each
-//! handler checks the session and role it needs. Nothing else in GIMS changes:
+//! handler checks the session, and the role it needs on the feed it is about
+//! (docs/gtfs-editor.md section 15). Nothing else in GIMS changes:
 //! the editor has its own small, lazily-connected pool on the internal DB, so a
 //! database outage cannot stop GIMS from booting.
 
@@ -12,15 +13,19 @@ pub mod bulk;
 pub mod context;
 pub mod crypto;
 pub mod draft;
+pub mod draft_import;
 pub mod error;
+pub mod feed_io;
 pub mod feed_lock;
 pub mod gps_line;
 pub mod handlers;
 pub mod jwt;
 pub mod position_reviews;
 pub mod proposals;
+pub mod records;
 pub mod service;
 pub mod static_ui;
+pub mod trips;
 pub mod validation;
 pub mod webhooks;
 
@@ -232,7 +237,25 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/auth/session", web::post().to(h::session_create))
             .route("/auth/session", web::delete().to(h::session_delete))
             // live data
+            .route("/gtfs-spec", web::get().to(h::gtfs_spec))
             .route("/feeds", web::get().to(h::feeds))
+            .route("/feeds/{gtfs_id}/gtfs.zip", web::get().to(h::feed_gtfs_zip))
+            .route("/feeds/{gtfs_id}/files", web::get().to(h::files))
+            .route(
+                "/feeds/{gtfs_id}/validation",
+                web::get().to(h::feed_validation),
+            )
+            .route("/feeds/{gtfs_id}/files/{file}", web::get().to(h::file_rows))
+            .route(
+                "/feeds/{gtfs_id}/files/{file}/{key}",
+                web::get().to(h::file_row),
+            )
+            // a feed's zip is the body: allowed up to 64 MB (chennai_bus's is 12)
+            .service(
+                web::resource("/feeds/{gtfs_id}/import")
+                    .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+                    .route(web::post().to(h::feed_import)),
+            )
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))
             .route("/feeds/{gtfs_id}/stops/{stop_id}", web::get().to(h::stop))
@@ -257,6 +280,15 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:gps",
                 web::post().to(h::polyline_gps),
             )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/patterns/{pattern_key}",
+                web::get().to(h::route_pattern),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/trips",
+                web::get().to(h::route_trips),
+            )
+            .route("/feeds/{gtfs_id}/services", web::get().to(h::services))
             .route("/feeds/{gtfs_id}/audit", web::get().to(h::audit))
             // drafts
             .route(
@@ -280,6 +312,18 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/change-sets/{id}/preview/routes/{route_id}",
                 web::get().to(h::change_set_preview_route),
+            )
+            .route(
+                "/change-sets/{id}/preview/routes/{route_id}/patterns/{pattern_key}",
+                web::get().to(h::change_set_preview_pattern),
+            )
+            .route(
+                "/change-sets/{id}/preview/files/{file}",
+                web::get().to(h::change_set_preview_file),
+            )
+            .route(
+                "/change-sets/{id}/preview/routes/{route_id}/trips",
+                web::get().to(h::change_set_preview_trips),
             )
             .route("/change-sets/{id}/submit", web::post().to(h::submit))
             .route("/change-sets/{id}/reopen", web::post().to(h::reopen))
@@ -377,6 +421,14 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/users/{user_id}/reset-totp",
                 web::post().to(h::user_reset_totp),
+            )
+            .route(
+                "/users/{user_id}/feeds/{gtfs_id}",
+                web::put().to(h::user_feed_put),
+            )
+            .route(
+                "/users/{user_id}/feeds/{gtfs_id}",
+                web::delete().to(h::user_feed_delete),
             )
             .default_service(web::to(h::not_found)),
     );

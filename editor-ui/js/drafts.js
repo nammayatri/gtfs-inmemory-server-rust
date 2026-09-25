@@ -119,10 +119,13 @@ export async function requireDraft(reason) {
 
 // The change already in the draft for this entity, if any - editing the same
 // stop twice updates one change instead of stacking two. Only edits merge this
-// way; a create, delete or merge is its own change.
-export function existingChange(entity, key) {
+// way; a create, delete or merge is its own change. A route's stop lists are
+// one per stop order (section 16): the dashboard edits pattern 1.
+const patternOf = (c) => (c.after && c.after.pattern_key) || 1;
+export function existingChange(entity, key, pattern = 1) {
   if (!state.draft) return null;
-  return state.draft.changes.find((c) => c.entity === entity && c.entity_key === key && (c.op === "update" || c.op === "replace")) || null;
+  return state.draft.changes.find((c) => c.entity === entity && c.entity_key === key && (c.op === "update" || c.op === "replace")
+    && (entity !== "route_stops" || patternOf(c) === pattern)) || null;
 }
 
 // What the draft creates. Stops and routes created in a draft count as existing
@@ -162,7 +165,7 @@ export async function removeChange(changeId) {
 export async function addChange(change, { merge = true, quiet = false } = {}) {
   const draft = await requireDraft();
   if (!draft) return null;
-  const prior = merge ? existingChange(change.entity, change.entity_key) : null;
+  const prior = merge ? existingChange(change.entity, change.entity_key, patternOf(change)) : null;
   let cs;
   try {
     if (prior && prior.op === change.op) {

@@ -66,6 +66,7 @@ impl Caller<'_> {
             "GET" => test::TestRequest::get(),
             "POST" => test::TestRequest::post(),
             "PATCH" => test::TestRequest::patch(),
+            "PUT" => test::TestRequest::put(),
             _ => unreachable!(),
         }
         .uri(&format!("{BASE}{path}"))
@@ -147,6 +148,7 @@ fn clear_feed(feed: &str, emails: &[&str]) -> Vec<String> {
         format!("DELETE FROM gtfs_route_stop WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{feed}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{feed}'"),
         format!(
             "UPDATE gtfs_editor_user SET totp_enabled = false, totp_secret_enc = NULL, totp_last_step = NULL, \
@@ -184,10 +186,12 @@ fn settings(
     )
 }
 
-/// Sign `admin` in (bootstrap), create the others with their roles, sign them in.
+/// Sign `admin` in (bootstrap), create the others with their roles on `feed`
+/// (since 0018 a member works on a feed only through a grant), sign them in.
 async fn sign_in_all<'a, S>(
     app: &S,
     signer: &'a TestSigner,
+    feed: &str,
     admin: &str,
     others: &[(&str, &str)],
 ) -> Vec<Caller<'a>>
@@ -250,6 +254,13 @@ where
             admin_c
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        let (s, b, _, _) = call!(
+            app,
+            admin_c
+                .req("PUT", &format!("/users/{id}/feeds/{feed}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
         let mut c = Caller {
@@ -706,6 +717,7 @@ async fn a_map_line_from_gps_end_to_end() {
     let callers = sign_in_all(
         &plain_app,
         &signer,
+        GPS_FEED,
         GPS_ADMIN,
         &[(GPS_EDITOR, "editor"), (GPS_APPROVER, "approver")],
     )
@@ -760,13 +772,20 @@ async fn a_map_line_from_gps_end_to_end() {
     };
     let ch_count = || ch_log.lock().unwrap().len();
 
-    // a feed the pings are not for
+    // a feed the pings are not for: asked by the admin, who may see every
+    // feed; an editor with no grant on it is refused before GPS is looked at
+    let (s, b, _, _) = call!(
+        &app,
+        callers[0].req("POST", "/feeds/some_other_feed/routes/R_FWD/polyline:gps")
+    );
+    assert_eq!(s, 503, "{b}");
+    assert_eq!(code_of(&b), "gps_unavailable");
     let (s, b, _, _) = call!(
         &app,
         editor_c.req("POST", "/feeds/some_other_feed/routes/R_FWD/polyline:gps")
     );
-    assert_eq!(s, 503, "{b}");
-    assert_eq!(code_of(&b), "gps_unavailable");
+    assert_eq!(s, 403, "{b}");
+    assert_eq!(code_of(&b), "no_feed_access");
 
     // ---- the route, while OSRM fails every second stretch: partial
     osrm_state.mode.store(2, Ordering::SeqCst);
@@ -1130,7 +1149,14 @@ async fn a_route_through_the_stops_says_why_it_failed() {
         )
     }))
     .await;
-    let callers = sign_in_all(&app, &signer, OSRM_ADMIN, &[(OSRM_EDITOR, "editor")]).await;
+    let callers = sign_in_all(
+        &app,
+        &signer,
+        OSRM_FEED,
+        OSRM_ADMIN,
+        &[(OSRM_EDITOR, "editor")],
+    )
+    .await;
     let editor_c = &callers[1];
     let osrm_of = |route: &str| {
         editor_c.req(

@@ -178,6 +178,7 @@ async fn clear(pool: &PgPool) {
         format!("DELETE FROM gtfs_webhook_delivery WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_webhook WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_change_set WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
         format!(
             "DELETE FROM gtfs_editor_session WHERE user_id IN \
@@ -361,6 +362,17 @@ async fn a_webhook_fires_once_the_whole_fleet_is_serving_the_edit() {
     .execute(&pool)
     .await
     .unwrap();
+    // an editor on this very feed (since 0018 a member holds a feed through a
+    // grant), so the refusal is about the role and not about the feed
+    sqlx::query(
+        "INSERT INTO gtfs_editor_feed_access (user_id, gtfs_id, role) \
+         SELECT user_id, $2, 'editor' FROM gtfs_editor_user WHERE lower(email) = lower($1)",
+    )
+    .bind(EDITOR_USER)
+    .bind(FEED)
+    .execute(&pool)
+    .await
+    .unwrap();
     sign_in(&app, &mut editor_user).await;
     let (s, b, _) = call!(
         &app,
@@ -368,7 +380,11 @@ async fn a_webhook_fires_once_the_whole_fleet_is_serving_the_edit() {
             .req("POST", &format!("/feeds/{FEED}/webhooks"))
             .set_json(json!({"name": "nope", "url": format!("{base_url}/build")}))
     );
-    assert_eq!(s, 403, "an editor must not configure a webhook: {b}");
+    assert_eq!(
+        (s, code_of(&b)),
+        (403, "role_required"),
+        "an editor must not configure a webhook: {b}"
+    );
 
     // ---------------------------------------------------- create it properly
     let (s, hook, _) = call!(

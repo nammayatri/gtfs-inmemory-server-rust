@@ -16,7 +16,7 @@
 //! list itself is [`settings_update`] - admin only, and audited like every
 //! other change here.
 
-use super::auth::{self, Ctx, Role};
+use super::auth::{self, Ctx};
 use super::error::{EditorError, EditorResult};
 use super::EditorState;
 use crate::services::webhook::{self, check_host, fleet_from, EffectivePolicy, PodState};
@@ -256,7 +256,7 @@ pub async fn settings_update(
     ctx: &Ctx,
     b: SettingsBody,
 ) -> EditorResult<Value> {
-    ctx.require_role(Role::Admin)?;
+    ctx.require_admin()?;
     let before = live_policy(state).await;
     let enabled = b.enabled.unwrap_or(before.policy.enabled);
     let hosts = match &b.allowed_hosts {
@@ -306,7 +306,7 @@ pub async fn create(
     gtfs_id: &str,
     b: WebhookBody,
 ) -> EditorResult<Value> {
-    ctx.require_role(Role::Admin)?;
+    ctx.require_admin()?;
     let name = b
         .name
         .as_deref()
@@ -404,7 +404,7 @@ pub async fn update(
     webhook_id: Uuid,
     b: WebhookBody,
 ) -> EditorResult<Value> {
-    ctx.require_role(Role::Admin)?;
+    ctx.require_admin()?;
     if let Some(e) = b.event.as_deref() {
         check_event(e)?;
     }
@@ -488,7 +488,7 @@ pub async fn update(
 }
 
 pub async fn delete(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorResult<Value> {
-    ctx.require_role(Role::Admin)?;
+    ctx.require_admin()?;
     let row = sqlx::query("DELETE FROM gtfs_webhook WHERE webhook_id = $1 RETURNING gtfs_id, name")
         .bind(webhook_id)
         .fetch_optional(&state.pool)
@@ -513,7 +513,7 @@ pub async fn delete(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorR
 /// like a real one, so a green test proves the whole path: the allow-list, the
 /// placeholders, the pod's egress and the receiver's own authentication.
 pub async fn test(state: &EditorState, ctx: &Ctx, webhook_id: Uuid) -> EditorResult<Value> {
-    ctx.require_role(Role::Admin)?;
+    ctx.require_admin()?;
     if !live_policy(state).await.policy.is_active() {
         return Err(bad("webhooks_inactive", WEBHOOKS_INACTIVE));
     }
@@ -732,7 +732,7 @@ async fn release_state(
 /// The check and the insert share one transaction under the feed lock, so two
 /// clicks at once queue one release.
 pub async fn release(state: &EditorState, ctx: &Ctx, gtfs_id: &str) -> EditorResult<Value> {
-    ctx.require_role(Role::Approver)?;
+    ctx.require_feed_role(gtfs_id, super::auth::Role::Approver)?;
     let active = live_policy(state).await.policy.is_active();
     let mut tx = state.pool.begin().await?;
     super::feed_lock::lock_feed(&mut tx, gtfs_id).await?;

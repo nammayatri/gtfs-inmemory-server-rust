@@ -122,6 +122,7 @@ fn clear_feed(feed: &str) -> Vec<String> {
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{feed}'"),
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{feed}' AND parent_station IS NOT NULL"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{feed}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{feed}'"),
     ]
 }
@@ -207,7 +208,7 @@ const APPROVER: &str = "approver@editor-details-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor stop details test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor stop details test feed', 'fare_stage')"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \
@@ -343,6 +344,14 @@ async fn descriptions_labels_and_bulk_stop_updates() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }
@@ -980,7 +989,7 @@ async fn stop_updates_at_5000_rows() {
     }
     let mut setup = clear_feed(PERF_FEED);
     setup.extend([
-        format!("INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{PERF_FEED}', 'Stop details timing copy of chennai_bus')"),
+        format!("INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{PERF_FEED}', 'Stop details timing copy of chennai_bus', 'fare_stage')"),
         format!(
             "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted) \
              SELECT '{PERF_FEED}', stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted \

@@ -11,6 +11,7 @@
 //! says why).
 
 use super::error::EditorResult;
+use super::service::{pattern_of, FIRST_PATTERN};
 use super::validation::{station_members, MemberSpec, RouteRow};
 use serde_json::Value;
 use sqlx::{PgConnection, Row};
@@ -118,8 +119,20 @@ pub struct DraftView {
     updated_stops: HashMap<String, i64>,
     created_routes: HashMap<String, i64>,
     deleted_routes: HashSet<String>,
-    /// route -> (index of the change, change id, rows as the apply stores them)
-    replaces: HashMap<String, (usize, i64, Vec<RouteRow>)>,
+    /// (route, pattern) -> (index of the change, change id, rows as the apply
+    /// stores them)
+    replaces: HashMap<(String, i16), (usize, i64, Vec<RouteRow>)>,
+    /// (route, pattern) -> whether the stop order exists once the draft applies,
+    /// for those the draft creates (a replace, a route's create) or deletes
+    patterns: HashMap<(String, i16), bool>,
+    /// (route, pattern, profile) -> the first arrival offset of the profile the
+    /// draft writes, or `None` for one it deletes
+    profiles: HashMap<(String, i16, i32), Option<i32>>,
+    /// service -> whether it exists once the draft applies, for those the draft
+    /// creates or deletes
+    services: HashMap<String, bool>,
+    /// route -> (change id, the trip ids of the draft's last trip list for it)
+    route_trips: HashMap<String, (i64, Vec<String>)>,
     /// (index of the change, from, into), in order
     merges: Vec<(usize, String, String)>,
     station_ops: Vec<StationOp>,
@@ -289,6 +302,7 @@ impl DraftView {
                     v.created_routes
                         .entry(key.to_string())
                         .or_insert(c.change_id);
+                    v.patterns.insert((key.to_string(), FIRST_PATTERN), true);
                 }
                 ("route", "delete") => {
                     v.deleted_routes.insert(key.to_string());
@@ -298,10 +312,60 @@ impl DraftView {
                         .get("rows")
                         .cloned()
                         .and_then(|r| serde_json::from_value::<Vec<RouteRow>>(r).ok());
+                    let pattern = pattern_of(a);
                     if let Some(rows) = rows {
-                        v.replaces
-                            .insert(key.to_string(), (idx, c.change_id, stored_rows(key, &rows)));
+                        v.replaces.insert(
+                            (key.to_string(), pattern),
+                            (idx, c.change_id, stored_rows(key, &rows)),
+                        );
+                        v.patterns.insert((key.to_string(), pattern), true);
                     }
+                }
+                ("pattern", "delete") => {
+                    let pattern = pattern_of(a);
+                    v.patterns.insert((key.to_string(), pattern), false);
+                    v.replaces.remove(&(key.to_string(), pattern));
+                    v.profiles
+                        .retain(|(r, p, _), _| !(r == key && *p == pattern));
+                }
+                ("timing_profile", "replace" | "delete") => {
+                    let Some(profile) = a.get("profile_key").and_then(Value::as_i64) else {
+                        continue;
+                    };
+                    let first = a
+                        .get("arrival_s")
+                        .and_then(Value::as_array)
+                        .and_then(|o| o.first())
+                        .and_then(Value::as_i64)
+                        .map(|f| f as i32);
+                    v.profiles.insert(
+                        (key.to_string(), pattern_of(a), profile as i32),
+                        if c.op == "replace" {
+                            first.or(Some(0))
+                        } else {
+                            None
+                        },
+                    );
+                }
+                ("service", "create") => {
+                    v.services.insert(key.to_string(), true);
+                }
+                ("service", "delete") => {
+                    v.services.insert(key.to_string(), false);
+                }
+                ("route_trips", "replace") => {
+                    let ids = a
+                        .get("trips")
+                        .and_then(Value::as_array)
+                        .map(|trips| {
+                            trips
+                                .iter()
+                                .filter_map(|t| t.get("trip_id").and_then(Value::as_str))
+                                .map(|t| t.trim().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    v.route_trips.insert(key.to_string(), (c.change_id, ids));
                 }
                 _ => {}
             }
@@ -348,13 +412,31 @@ impl DraftView {
 
     /// The change id of the draft's last stop-list replace of a route.
     pub fn replaced_by(&self, route_id: &str) -> Option<i64> {
-        self.replaces.get(route_id).map(|(_, cid, _)| *cid)
+        self.pattern_replaced_by(route_id, FIRST_PATTERN)
+    }
+
+    /// The change id of the draft's last replace of one of a route's stop
+    /// orders.
+    pub fn pattern_replaced_by(&self, route_id: &str, pattern: i16) -> Option<i64> {
+        self.replaces
+            .get(&(route_id.to_string(), pattern))
+            .map(|(_, cid, _)| *cid)
     }
 
     /// A route's rows once the draft applies, given its live rows: the last
     /// replace (or the live rows), with every later merge's stop switched.
     pub fn current_rows(&self, route_id: &str, live: &[RouteRow]) -> Vec<RouteRow> {
-        let (after, mut rows) = match self.replaces.get(route_id) {
+        self.current_pattern_rows(route_id, FIRST_PATTERN, live)
+    }
+
+    /// [`DraftView::current_rows`] for one of a route's stop orders.
+    pub fn current_pattern_rows(
+        &self,
+        route_id: &str,
+        pattern: i16,
+        live: &[RouteRow],
+    ) -> Vec<RouteRow> {
+        let (after, mut rows) = match self.replaces.get(&(route_id.to_string(), pattern)) {
             Some((idx, _, rows)) => (Some(*idx), rows.clone()),
             None => (None, live.to_vec()),
         };
@@ -369,6 +451,63 @@ impl DraftView {
             }
         }
         rows
+    }
+
+    /// Whether a route's stop order exists once the draft applies, given
+    /// whether it exists live.
+    pub fn pattern_exists(&self, route_id: &str, pattern: i16, live: bool) -> bool {
+        self.patterns
+            .get(&(route_id.to_string(), pattern))
+            .copied()
+            .unwrap_or(live)
+            && !self.route_deleted(route_id)
+    }
+
+    /// A profile's first arrival offset once the draft applies, given the live
+    /// one; `None` when it does not exist then. A profile of a stop order the
+    /// draft deletes goes with it.
+    pub fn profile_first_arrival(
+        &self,
+        route_id: &str,
+        pattern: i16,
+        profile: i32,
+        live: Option<i32>,
+    ) -> Option<i32> {
+        if self.patterns.get(&(route_id.to_string(), pattern)) == Some(&false) {
+            return None;
+        }
+        match self.profiles.get(&(route_id.to_string(), pattern, profile)) {
+            Some(written) => *written,
+            None => live,
+        }
+    }
+
+    /// The profiles the draft writes for a route: `(pattern, profile, first
+    /// arrival)`.
+    pub fn written_profiles(&self, route_id: &str) -> Vec<(i16, i32, i32)> {
+        self.profiles
+            .iter()
+            .filter(|((r, _, _), _)| r == route_id)
+            .filter_map(|((_, p, k), first)| Some((*p, *k, (*first)?)))
+            .collect()
+    }
+
+    /// Whether a service exists once the draft applies, given whether it
+    /// exists live.
+    pub fn service_exists(&self, service_id: &str, live: bool) -> bool {
+        self.services.get(service_id).copied().unwrap_or(live)
+    }
+
+    /// The draft's last trip list of a route: its change id and trip ids.
+    pub fn route_trips(&self, route_id: &str) -> Option<(i64, &[String])> {
+        self.route_trips
+            .get(route_id)
+            .map(|(cid, ids)| (*cid, ids.as_slice()))
+    }
+
+    /// Every route the draft gives a trip list, with its trip ids.
+    pub fn trip_lists(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
+        self.route_trips.iter().map(|(r, (_, ids))| (r, ids))
     }
 
     /// Stops a merge in the draft takes a station from; a parent simulation
@@ -584,6 +723,11 @@ mod tests {
             marker_lon: None,
             stop_name_override: None,
             provider_id: None,
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
+            stop_headsign: None,
+            ..Default::default()
         }
     }
 

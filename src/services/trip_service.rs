@@ -8,6 +8,7 @@ use crate::graphql::{
     get_trip_query, TripApiResponse, TripCacheEntry, TripCacheStats, TripGraphQLResponse,
     TripQueryVariables, TripScheduleResponse, TripStopResponse,
 };
+use crate::services::gtfs_db_source::DbTrip;
 use crate::services::gtfs_service::GTFSService;
 use crate::tools::error::{AppError, AppResult};
 
@@ -76,6 +77,22 @@ impl TripService {
         gtfs_id: Option<String>,
         city: Option<String>,
     ) -> AppResult<TripApiResponse> {
+        // A feed whose trips live in the editor's tables (docs/gtfs-editor.md
+        // section 16.6) answers from them: no shard, no OTP call, and no cache -
+        // the trips are already in memory, and an edit shows on the poll that
+        // loads it.
+        if let Some(gid) = gtfs_id.as_deref() {
+            if let Some(found) = self.gtfs_service.db_trip(gid, trip_id) {
+                let Some(trip) = found else {
+                    return Err(AppError::NotFound(format!(
+                        "Trip {} not found in {}",
+                        trip_id, gid
+                    )));
+                };
+                return Ok(self.db_trip_response(gid, trip_id, trip).await);
+            }
+        }
+
         // Create a stable cache key that doesn't include the date
         let cache_key = format!(
             "{}:{}:{}",
@@ -233,6 +250,60 @@ impl TripService {
             last_updated: Utc::now(),
             source: "preprocessed".to_string(),
         }))
+    }
+
+    /// A trip computed from the tables in the shape a shard trip is served in:
+    /// stops numbered from 1 in the pattern's order, the route's long name.
+    async fn db_trip_response(
+        &self,
+        gtfs_id: &str,
+        trip_id: &str,
+        trip: DbTrip,
+    ) -> TripApiResponse {
+        let code = trip
+            .route_id
+            .split(':')
+            .next_back()
+            .unwrap_or(&trip.route_id)
+            .to_string();
+        let route_name = match self.gtfs_service.get_route(gtfs_id, &code).await {
+            Ok(r) => r.long_name,
+            Err(_) => None,
+        };
+        let stops = trip
+            .stops
+            .iter()
+            .enumerate()
+            .map(|(i, (s, _, _))| TripStopResponse {
+                stop_id: s.id.clone(),
+                stop_code: s.code.clone(),
+                stop_name: s.name.clone(),
+                sequence: s.sequence.unwrap_or(i as i32 + 1),
+                lat: s.lat,
+                lon: s.lon,
+            })
+            .collect();
+        let schedule = trip
+            .stops
+            .iter()
+            .enumerate()
+            .map(|(i, (s, arrival, departure))| TripScheduleResponse {
+                stop_code: s.code.clone(),
+                arrival_time: Some(*arrival),
+                departure_time: Some(*departure),
+                sequence: s.sequence.unwrap_or(i as i32 + 1),
+            })
+            .collect();
+        TripApiResponse {
+            trip_id: trip_id.to_string(),
+            route_id: trip.route_id,
+            route_name,
+            direction: trip.direction,
+            stops,
+            schedule,
+            last_updated: Utc::now(),
+            source: "db".to_string(),
+        }
     }
 
     async fn get_from_cache(&self, cache_key: &str) -> AppResult<Option<TripApiResponse>> {

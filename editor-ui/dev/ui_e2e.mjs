@@ -38,9 +38,21 @@
 //             committed and checked in gtfs_stop, gtfs_route_stop and the reviews.
 //             Without a mixed-origins review in the database it adds one for
 //             THIRUPORUR THANDALAM (29db2391b0), shaped like the load.
+//
+// The full-spec flows (docs section 18), each drafted, approved and committed
+// and checked in the database; `--only feed,files,gtfs_fields,trips,calendar`
+// with E2E_FEED=chennai_metro runs just them:
+//   feed        the feed report, the zip the tables give, and a drafts import
+//               preview of the feed's own shipped zip (nothing to do on a feed
+//               as seeded; the flows below tag what they write, so they can
+//               run again)
+//   files       a new level and a pathway's sign, from the GTFS files page
+//   gtfs_fields a stop's zone and step-free boarding, a route's web page
+//   trips       four late departures added as a run, and a slower timing
+//   calendar    a Sunday service
 import { spawn, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
+import { mkdirSync, writeFileSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,7 +60,11 @@ const PROXY = process.env.PROXY || "http://localhost:18080";
 const GIMS = process.env.GIMS || "http://127.0.0.1:18010";
 const UI_PATH = "/internal/gtfs-editor/ui/";
 const MAPJS = `${PROXY}${UI_PATH}js/map.js`;
-const FEED = "chennai_bus";
+// the feed the flows work on: chennai_bus by default; the full-spec flows
+// (section 18) want one seeded from its zip with stations and pathways, for
+// example E2E_FEED=chennai_metro against a gims_full_spec database
+const FEED = process.env.E2E_FEED || "chennai_bus";
+const NANDI_ASSETS = process.env.NANDI_ASSETS || "/Users/vicky/Documents/nandi/assets";
 const CHROME = process.env.CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const CDP_PORT = Number(process.env.CDP_PORT || 9334);
 const PSQL = process.env.PSQL || "psql";
@@ -378,13 +394,19 @@ async function coreFlow() {
   await waitFor(`!document.getElementById("app").hidden`, "app after admin enrolment");
   check(true, "bootstrap admin enrols with a real authenticator code");
   signedInAs = ADMIN;
+  // people are added with a role on the feed chosen in the top bar
+  if (await evaluate(`[...document.querySelectorAll("#feed-select option")].some((o) => o.value === ${JSON.stringify(FEED)})`)) {
+    await choose("#feed-select", FEED);
+    await sleep(800);
+  }
 
   // admin adds the editor and the approver
   await go("#/admin");
   await waitFor(`!!document.getElementById("new-user-email")`, "people page");
   for (const [email, role] of [[EDITOR, "editor"], [APPROVER, "approver"]]) {
     await type("#new-user-email", email);
-    await evaluate(`(() => { const s = document.getElementById("new-user-role"); s.value = ${JSON.stringify(role)}; s.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`);
+    // the role given on the feed in the top bar (docs section 15)
+    await evaluate(`(() => { const s = document.getElementById("new-user-feed-role"); s.value = ${JSON.stringify(role)}; s.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`);
     await click("Add person");
     await waitFor(`document.body.innerText.includes(${JSON.stringify(email)})`, `${email} listed`);
   }
@@ -734,7 +756,7 @@ async function createFlow() {
   const routeRow = db(`SELECT short_name, long_name, color, route_type, coalesce(agency_id, ''), deleted FROM gtfs_route WHERE gtfs_id = '${FEED}' AND route_id = 'E2E-R1'`)[0];
   check(!!routeRow && routeRow[0] === "E2E1" && routeRow[1] === "E2E NEW KERB - Velachery" && routeRow[2] === "#1F5FBF" && routeRow[3] === "3" && routeRow[4] !== "" && routeRow[5] === "f",
     `gtfs_route E2E-R1: ${routeRow ? routeRow.join(" | ") : "missing"}`);
-  const rows = db(`SELECT sequence, stop_id, stop_type, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = 'E2E-R1' ORDER BY sequence`);
+  const rows = db(`SELECT sequence, stop_id, stop_type, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = 'E2E-R1' AND pattern_key = 1 ORDER BY sequence`);
   check(rows.length === 2 && rows[0].join("|") === `1|${newStop}|NEW STOP|1|E2E NEW KERB` && rows[1].join("|") === `2|${second}|INTERMEDIATE STOP|1|E2E NEW KERB`,
     `gtfs_route_stop E2E-R1: ${rows.map((r) => r.join(" ")).join("; ")}`);
 }
@@ -815,7 +837,7 @@ async function routeEditorFlow() {
   }, 10000);
   timings.route_commit_to_live_ms = live;
   check(live !== null, `the public route-stop-mapping of ${EDIT_ROUTE} calls at ${newId} as stop 8 ${live !== null ? `${live} ms after commit` : "(not within 10 s)"}`);
-  const stages = db(`SELECT sequence, stop_id, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = '${EDIT_ROUTE}' AND sequence IN (2, 3, 4, 8) ORDER BY sequence`);
+  const stages = db(`SELECT sequence, stop_id, stage_no, stage_name FROM gtfs_route_stop WHERE gtfs_id = '${FEED}' AND route_id = '${EDIT_ROUTE}' AND pattern_key = 1 AND sequence IN (2, 3, 4, 8) ORDER BY sequence`);
   check(stages.map((r) => r.join("|")).join(";") === `2|b76f46d86f|2|MANDAVELI B.T;3|4f16bc7cab|2|MANDAVELI B.T;4|a0db25ec4b|3|a.m.s.hospital;8|${newId}|4|ADYAR B.T`,
     `gtfs_route_stop ${EDIT_ROUTE}: ${stages.map((r) => r.join(" ")).join("; ")}`);
 }
@@ -1170,6 +1192,171 @@ async function historyFlow() {
   await shot("23-history");
 }
 
+// ------------------------------------------------------------------ full spec (section 18)
+const feedSql = () => sqlText(FEED);
+// every value a full-spec flow writes carries this run's tag, so the flows can
+// run again on a feed an earlier run edited
+const TAG = Date.now().toString(36).slice(-5).toUpperCase();
+
+async function feedFlow() {
+  await freshStart(ADMIN);
+  await go("#/feed");
+  await must(waitFor(`!!document.getElementById("check-feed")`, "the feed page"));
+  await clickSel("#check-feed", "Check the feed");
+  await must(waitFor(`!!document.querySelector(".report-table") || document.body.innerText.includes("Nothing to report")`, "the feed report", 60000));
+  const api = await editorApi("GET", `feeds/${FEED}/validation`);
+  check(api.status === 200 && (await text("#page")).includes(`${api.body.report.errors.toLocaleString("en-IN")} error`), `the report on the page is the API's (${api.body && api.body.report.errors} errors, ${api.body && api.body.report.warnings} warnings)`);
+  await shot("30-feed-report");
+  const zip = await evaluate(`fetch(document.getElementById("download-zip").href, { credentials: "same-origin" })
+    .then(async (r) => ({ status: r.status, magic: [...new Uint8Array(await r.arrayBuffer()).slice(0, 2)].join(",") }))`);
+  check(zip.status === 200 && zip.magic === "80,75", "Download the GTFS zip gives a zip");
+  // the feed's own shipped zip, into drafts: a feed seeded from it has nothing to take
+  const path = join(NANDI_ASSETS, `${FEED.replace(/_/g, ".")}.gtfs.zip`);
+  let bytes = null;
+  try { bytes = readFileSync(path); } catch { console.log(`     (no ${path}: the import preview is skipped)`); }
+  if (bytes && bytes.length < 8e6) {
+    await evaluate(`(() => { const b = Uint8Array.from(atob(${JSON.stringify(bytes.toString("base64"))}), (c) => c.charCodeAt(0));
+      const input = document.getElementById("import-zip"); const dt = new DataTransfer();
+      dt.items.add(new File([b], "feed.gtfs.zip", { type: "application/zip" }));
+      input.files = dt.files; input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+    await sleep(800);
+    await clickSel("#mode-drafts", "Bring into drafts");
+    await clickSel("#import-check", "Check without writing");
+    await must(waitFor(`document.body.innerText.includes("The feed already holds what the zip says") || document.body.innerText.includes("Would draft")`, "the import preview", 120000));
+    // a feed as seeded takes nothing; one an earlier run edited takes its edits back
+    const preview = await text("#page");
+    check(!preview.includes("stop the import"), `the shipped zip previews without problems (${preview.includes("The feed already holds") ? "nothing to draft" : "it would draft the feed back to the zip"})`);
+    await shot("31-feed-import");
+  }
+}
+
+async function filesFlow() {
+  await freshStart(EDITOR);
+  await go("#/files");
+  await must(waitFor(`!!document.querySelector('tr[data-file="levels.txt"]')`, "the files page"));
+  const shown = Number((await text('tr[data-file="pathways.txt"] td.num')).replace(/,/g, ""));
+  const inDb = Number(db(`SELECT count(*) FROM gtfs_pathway WHERE gtfs_id = ${feedSql()}`)[0][0]);
+  check(shown === inDb, `the files page counts ${shown} pathways, as the database has ${inDb}`);
+  await shot("32-files");
+  await go("#/files/levels.txt/new");
+  await must(waitFor(`!!document.getElementById("rec-level_id")`, "the new level form"));
+  await type("#rec-level_id", `E2E_L${TAG}`);
+  await type("#rec-level_index", "1");
+  await type("#rec-level_name", "E2E mezzanine");
+  await click("Add to draft", "#page");
+  await chooseNewDraft("E2E: a level and a pathway sign");
+  await must(waitFor(`location.hash === "#/files/levels.txt"`, "back on the levels file"));
+  const pw = db(`SELECT pathway_id FROM gtfs_pathway WHERE gtfs_id = ${feedSql()} ORDER BY pathway_id LIMIT 1`)[0]?.[0];
+  if (pw) {
+    await go(`#/files/pathways.txt/${encodeURIComponent(pw)}`);
+    await must(waitFor(`!!document.getElementById("rec-signposted_as")`, "the pathway form"));
+    await type("#rec-signposted_as", `E2E platforms ${TAG}`);
+    await click("Add change to draft", "#page");
+    await must(waitFor(`location.hash === "#/files/pathways.txt"`, "back on the pathways file"));
+  }
+  const draftId = await draftIdOf(EDITOR);
+  await go(`#/drafts/${draftId}`);
+  await must(waitFor(`document.body.innerText.includes("levels.txt E2E_L${TAG}")`, "the level in the draft"));
+  if (pw) check((await text("#page")).includes(`E2E platforms ${TAG}`), "the draft shows the pathway's new sign");
+  await shot("33-files-draft");
+  await submitDraft(draftId, "the files draft");
+  await approveAndCommit(draftId, "the files draft");
+  check(db(`SELECT level_name FROM gtfs_level WHERE gtfs_id = ${feedSql()} AND level_id = 'E2E_L${TAG}'`)[0]?.[0] === "E2E mezzanine", "the new level is committed");
+  if (pw) check(db(`SELECT signposted_as FROM gtfs_pathway WHERE gtfs_id = ${feedSql()} AND pathway_id = ${sqlText(pw)}`)[0]?.[0] === `E2E platforms ${TAG}`, "the pathway's sign is committed");
+}
+
+async function gtfsFieldsFlow() {
+  await freshStart(EDITOR);
+  const stop = db(`SELECT stop_id FROM gtfs_stop WHERE gtfs_id = ${feedSql()} AND location_type = 0 AND NOT deleted ORDER BY stop_id LIMIT 1`)[0][0];
+  await go(`#/stop/${encodeURIComponent(stop)}`);
+  await must(waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Edit stop")`, "the stop panel"));
+  await click("Edit stop", "#panel");
+  await chooseNewDraft("E2E: GTFS fields of a stop and a route");
+  await must(waitFor(`!!document.querySelector("details.gtfs-more")`, "More GTFS fields on the stop"));
+  await evaluate(`document.querySelector("details.gtfs-more").open = true; true`);
+  await must(waitFor(`!!document.getElementById("stop-gtfs-zone_id")`, "the zone field"));
+  await type("#stop-gtfs-zone_id", `E2E_Z${TAG}`);
+  await choose("#stop-gtfs-wheelchair_boarding", "1");
+  await click("Add to draft", "#panel");
+  await must(waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Edit stop")`, "back on the stop"));
+  const route = db(`SELECT route_id FROM gtfs_route WHERE gtfs_id = ${feedSql()} AND NOT deleted ORDER BY route_id LIMIT 1`)[0][0];
+  await go(`#/route/${encodeURIComponent(route)}`);
+  await must(waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent.startsWith("Edit name"))`, "the route panel"));
+  await click("Edit name, colour and map line", "#panel");
+  await must(waitFor(`!!document.querySelector("details.gtfs-more")`, "More GTFS fields on the route"));
+  await evaluate(`document.querySelector("details.gtfs-more").open = true; true`);
+  await must(waitFor(`!!document.getElementById("route-gtfs-route_url")`, "the route_url field"));
+  await type("#route-gtfs-route_url", `https://e2e.example/route/${TAG}`);
+  await click("Add to draft", "#panel");
+  await sleep(800);
+  const draftId = await draftIdOf(EDITOR);
+  await go(`#/drafts/${draftId}`);
+  await must(waitFor(`document.body.innerText.includes("E2E_Z${TAG}")`, "the stop's zone in the draft"));
+  check((await text("#page")).includes(`https://e2e.example/route/${TAG}`), "the draft shows the route's web page");
+  await shot("34-gtfs-fields-draft");
+  await submitDraft(draftId, "the GTFS fields draft");
+  await approveAndCommit(draftId, "the GTFS fields draft");
+  check(db(`SELECT concat_ws('|', zone_id, wheelchair_boarding) FROM gtfs_stop WHERE gtfs_id = ${feedSql()} AND stop_id = ${sqlText(stop)}`)[0]?.[0] === `E2E_Z${TAG}|1`, "the stop's zone and boarding are committed");
+  check(db(`SELECT route_url FROM gtfs_route WHERE gtfs_id = ${feedSql()} AND route_id = ${sqlText(route)}`)[0]?.[0] === `https://e2e.example/route/${TAG}`, "the route's web page is committed");
+}
+
+async function tripsFlow() {
+  await freshStart(EDITOR);
+  const [route, count] = db(`SELECT route_id, count(*) FROM gtfs_trip WHERE gtfs_id = ${feedSql()} GROUP BY route_id ORDER BY count(*) DESC, route_id LIMIT 1`)[0];
+  await go(`#/route/${encodeURIComponent(route)}`);
+  await must(waitFor(`[...document.querySelectorAll("#panel a")].some((a) => a.textContent === "Trips and timing")`, "Trips and timing on the route"));
+  await click("Trips and timing", "#panel");
+  await must(waitFor(`!!document.getElementById("add-start") && document.querySelectorAll(".board-table tbody tr").length > 0`, "the departure board"));
+  await shot("35-trips");
+  await type("#add-start", "23:00");
+  await type("#add-every", "10");
+  await type("#add-until", "23:30");
+  await click("Add", ".add-trips");
+  await must(waitFor(`!document.querySelector(".trips-save").hidden`, "the save bar"));
+  await click("Save the trips to the draft", "#page");
+  await chooseNewDraft("E2E: late trips and a slower timing");
+  await must(waitFor(`document.querySelector(".trips-save") && document.querySelector(".trips-save").hidden && !!document.querySelector(".timing-table input.hop")`, "the trips saved"));
+  await evaluate(`(() => { const i = document.querySelector(".timing-table input.hop"); i.value = String(Number(i.value) + 1);
+    i.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  await type("#timing-label", `E2E slower ${TAG}`);
+  await click("Add as a new timing to the draft", "#page");
+  await must(waitFor(`document.body.innerText.includes("The timing is in your draft")`, "the timing in the draft"));
+  const draftId = await draftIdOf(EDITOR);
+  await go(`#/drafts/${draftId}`);
+  await must(waitFor(`document.body.innerText.includes("Trips of route")`, "the trip list in the draft"));
+  check((await text("#page")).includes("Added (4)"), "the draft shows four trips added");
+  check((await text("#page")).includes("Timing of route"), "the draft shows the timing");
+  await shot("36-trips-draft");
+  await submitDraft(draftId, "the trips draft");
+  await approveAndCommit(draftId, "the trips draft");
+  check(Number(db(`SELECT count(*) FROM gtfs_trip WHERE gtfs_id = ${feedSql()} AND route_id = ${sqlText(route)}`)[0][0]) === Number(count) + 4, "the four trips are committed");
+  check(Number(db(`SELECT count(*) FROM gtfs_timing_profile WHERE gtfs_id = ${feedSql()} AND route_id = ${sqlText(route)} AND label = 'E2E slower ${TAG}'`)[0][0]) === 1, "the timing is committed");
+}
+
+async function calendarFlow() {
+  await freshStart(EDITOR);
+  await go("#/calendar");
+  await must(waitFor(`document.querySelectorAll(".calendar-table tbody tr").length > 0`, "the calendar"));
+  const rows = await evaluate(`document.querySelectorAll(".calendar-table tbody tr").length`);
+  check(rows === Number(db(`SELECT count(*) FROM gtfs_service WHERE gtfs_id = ${feedSql()}`)[0][0]), `the calendar lists the feed's ${rows} services`);
+  await shot("37-calendar");
+  await click("Add a service", "#page");
+  await must(waitFor(`!!document.getElementById("svc-id")`, "the service form"));
+  await type("#svc-id", `E2E_SUN_${TAG}`);
+  await clickSel("#svc-sunday", "Sunday");
+  await type("#svc-start", "2026-10-01");
+  await type("#svc-end", "2026-12-31");
+  await click("Add to draft", "dialog");
+  await chooseNewDraft("E2E: a Sunday service");
+  await sleep(800);
+  const draftId = await draftIdOf(EDITOR);
+  await go(`#/drafts/${draftId}`);
+  await must(waitFor(`document.body.innerText.includes("Service E2E_SUN_${TAG}")`, "the service in the draft"));
+  await submitDraft(draftId, "the calendar draft");
+  await approveAndCommit(draftId, "the calendar draft");
+  check(db(`SELECT concat_ws('|', sunday, monday, start_date, end_date) FROM gtfs_service WHERE gtfs_id = ${feedSql()} AND service_id = 'E2E_SUN_${TAG}'`)[0]?.[0] === "t|f|2026-10-01|2026-12-31", "the Sunday service is committed");
+}
+
 try {
   await connect();
   await send("Page.enable");
@@ -1187,6 +1374,11 @@ try {
   await flow("import", importFlow);
   await flow("coordinates", coordinatesFlow);
   await flow("history", historyFlow);
+  await flow("feed", feedFlow);
+  await flow("files", filesFlow);
+  await flow("gtfs_fields", gtfsFieldsFlow);
+  await flow("trips", tripsFlow);
+  await flow("calendar", calendarFlow);
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {
   failures.push(e.message);

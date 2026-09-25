@@ -6,7 +6,9 @@
 //!      from a token whose signature, audience and expiry check out.
 //!   2. A session cookie created after a valid TOTP code - the second factor.
 //!      The session's user must be the JWT's user.
-//!   3. The user's role.
+//!   3. The user's role on the feed the request is about (docs/gtfs-editor.md
+//!      section 15): an admin holds every feed at every role; anyone else holds
+//!      a feed only through a grant on it, loaded with the user on every request.
 //!
 //! Mutations additionally need `X-Requested-With: gtfs-editor`, which a
 //! cross-site form cannot send.
@@ -22,7 +24,8 @@ use actix_web::middleware::Next;
 use actix_web::{web, HttpRequest, ResponseError};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub const SESSION_COOKIE: &str = "gtfs_editor_session";
@@ -33,6 +36,7 @@ pub const CSRF_VALUE: &str = "gtfs-editor";
 pub const NO_SSO_IDENTITY: &str = "no_sso_identity";
 pub const NOT_REGISTERED: &str = "not_registered";
 pub const ACCOUNT_DISABLED: &str = "account_disabled";
+pub const NO_FEED_ACCESS: &str = "no_feed_access";
 
 /// Failed codes allowed in the window before sign-in locks.
 pub const MAX_FAILED_CODES: i64 = 5;
@@ -61,6 +65,20 @@ impl Role {
             _ => None,
         }
     }
+
+    /// A role a grant may carry: every role but admin, which is global.
+    pub fn parse_grant(s: &str) -> Option<Role> {
+        Self::parse(s).filter(|r| *r != Role::Admin)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Editor => "editor",
+            Role::Approver => "approver",
+            Role::Admin => "admin",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +86,14 @@ pub struct User {
     pub user_id: Uuid,
     pub email: String,
     pub display_name: Option<String>,
+    /// The column as stored. Only `admin` means anything since 0018; the other
+    /// values are kept for an older image rolled back onto the database.
     pub role: String,
+    /// `person`, or `system` for an account nobody signs in with.
+    pub kind: String,
+    /// The feeds this user holds a grant on, and the role held on each. An admin
+    /// holds none: an admin has every feed.
+    pub grants: BTreeMap<String, Role>,
     pub totp_enabled: bool,
     pub totp_last_step: Option<i64>,
     pub totp_secret_enc: Option<Vec<u8>>,
@@ -78,41 +103,73 @@ pub struct User {
 }
 
 impl User {
-    pub fn role(&self) -> Role {
-        Role::parse(&self.role).unwrap_or(Role::Viewer)
+    /// The one global role: every feed, at every role.
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
     }
 
-    pub fn public_json(&self) -> Value {
-        json!({
-            "user_id": self.user_id,
-            "email": self.email,
-            "display_name": self.display_name,
-            "role": self.role,
-            "status": self.status,
-            "totp_enabled": self.totp_enabled,
-            "created_at": self.created_at,
-            "last_login_at": self.last_login_at,
-        })
+    pub fn is_system(&self) -> bool {
+        self.kind == "system"
     }
 }
 
-/// Verified caller: identity, second factor and an active account.
+/// Verified caller: identity, second factor and an active account, with the
+/// grants it held when this request came in.
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub user: User,
 }
 
 impl Ctx {
-    pub fn require_role(&self, min: Role) -> EditorResult<()> {
-        if self.user.role() >= min {
-            Ok(())
+    pub fn is_admin(&self) -> bool {
+        self.user.is_admin()
+    }
+
+    /// The caller's role on feed `g`: `Admin` for an admin, else the grant's
+    /// role, else none - the feed does not exist for them.
+    pub fn feed_role(&self, g: &str) -> Option<Role> {
+        if self.is_admin() {
+            Some(Role::Admin)
         } else {
-            Err(EditorError::forbidden(
-                "role_required",
-                format!("this needs the {:?} role or higher", min).to_lowercase(),
-            ))
+            self.user.grants.get(g).copied()
         }
     }
+
+    /// At least `min` on feed `g`: 403 `no_feed_access` without a grant there,
+    /// 403 `role_required` with one that is too low.
+    pub fn require_feed_role(&self, g: &str, min: Role) -> EditorResult<()> {
+        match self.feed_role(g) {
+            None => Err(no_feed_access(g)),
+            Some(role) if role >= min => Ok(()),
+            Some(_) => Err(role_required(min)),
+        }
+    }
+
+    /// Users, grants, webhook settings: an admin's, whatever the feed.
+    pub fn require_admin(&self) -> EditorResult<()> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(role_required(Role::Admin))
+        }
+    }
+}
+
+pub fn role_required(min: Role) -> EditorError {
+    EditorError::forbidden(
+        "role_required",
+        format!("this needs the {} role or higher", min.as_str()),
+    )
+}
+
+/// The same answer for a feed the caller has no grant on and for an object that
+/// belongs to one, so an id from another feed says nothing about that feed.
+pub fn no_feed_access(g: &str) -> EditorError {
+    EditorError::forbidden(
+        NO_FEED_ACCESS,
+        format!("you have no access to feed {g}; ask an admin"),
+    )
+    .with_details(json!({"gtfs_id": g}))
 }
 
 fn is_safe_method(m: &Method) -> bool {
@@ -189,11 +246,20 @@ pub fn identity(req: &HttpRequest) -> EditorResult<Identity> {
 }
 
 fn user_from_row(r: &sqlx::postgres::PgRow) -> Result<User, sqlx::Error> {
+    let feeds: Vec<String> = r.try_get("grant_feeds")?;
+    let roles: Vec<String> = r.try_get("grant_roles")?;
     Ok(User {
         user_id: r.try_get("user_id")?,
         email: r.try_get("email")?,
         display_name: r.try_get("display_name")?,
         role: r.try_get("role")?,
+        kind: r.try_get("kind")?,
+        // the table's CHECK allows only grant roles; anything else is no grant
+        grants: feeds
+            .into_iter()
+            .zip(roles)
+            .filter_map(|(g, role)| Some((g, Role::parse_grant(&role)?)))
+            .collect(),
         totp_enabled: r.try_get("totp_enabled")?,
         totp_last_step: r.try_get("totp_last_step")?,
         totp_secret_enc: r.try_get("totp_secret_enc")?,
@@ -203,12 +269,19 @@ fn user_from_row(r: &sqlx::postgres::PgRow) -> Result<User, sqlx::Error> {
     })
 }
 
-const USER_COLUMNS: &str = "user_id, email, display_name, role, totp_enabled, totp_last_step, \
-     totp_secret_enc, status, created_at, last_login_at";
+/// A user and their grants, in one join: `{USER_SELECT} WHERE ... GROUP BY
+/// u.user_id`. Every request reads it, so a grant or a revocation bites on the
+/// holder's next request.
+const USER_SELECT: &str =
+    "SELECT u.user_id, u.email, u.display_name, u.role, u.kind, u.totp_enabled, \
+     u.totp_last_step, u.totp_secret_enc, u.status, u.created_at, u.last_login_at, \
+     array_remove(array_agg(a.gtfs_id::text ORDER BY a.gtfs_id), NULL) AS grant_feeds, \
+     array_remove(array_agg(a.role ORDER BY a.gtfs_id), NULL) AS grant_roles \
+     FROM gtfs_editor_user u LEFT JOIN gtfs_editor_feed_access a ON a.user_id = u.user_id";
 
 pub async fn user_by_id(state: &EditorState, user_id: Uuid) -> EditorResult<Option<User>> {
     let row = sqlx::query(&format!(
-        "SELECT {USER_COLUMNS} FROM gtfs_editor_user WHERE user_id = $1"
+        "{USER_SELECT} WHERE u.user_id = $1 GROUP BY u.user_id"
     ))
     .bind(user_id)
     .fetch_optional(&state.pool)
@@ -220,7 +293,7 @@ pub async fn user_by_id(state: &EditorState, user_id: Uuid) -> EditorResult<Opti
 pub async fn user_for_email(state: &EditorState, email: &str) -> EditorResult<Option<User>> {
     let fetch = || async {
         sqlx::query(&format!(
-            "SELECT {USER_COLUMNS} FROM gtfs_editor_user WHERE lower(email) = lower($1)"
+            "{USER_SELECT} WHERE lower(u.email) = lower($1) GROUP BY u.user_id"
         ))
         .bind(email)
         .fetch_optional(&state.pool)
@@ -269,12 +342,15 @@ pub fn account_disabled() -> EditorError {
     )
 }
 
+/// The JWT's account, if it may sign in at all. Every sign-in path starts here,
+/// so a system account (section 15) is refused on all of them - whatever SSO
+/// identity turns up with its email.
 pub async fn active_user(req: &HttpRequest, state: &EditorState) -> EditorResult<User> {
     let id = identity(req)?;
     let user = user_for_email(state, &id.email)
         .await?
         .ok_or_else(|| not_registered(&id.email))?;
-    if user.status != "active" {
+    if user.status != "active" || user.is_system() {
         return Err(account_disabled());
     }
     Ok(user)
@@ -303,9 +379,10 @@ pub async fn session_user(
     Ok(row.is_some())
 }
 
-/// Everything a data endpoint needs: JWT identity, active account, a second-
-/// factor session for that same account, and at least `min` role.
-pub async fn require(req: &HttpRequest, state: &EditorState, min: Role) -> EditorResult<Ctx> {
+/// Everything a data endpoint needs before its feed is known: JWT identity,
+/// active account, a second-factor session for that same account. The caller's
+/// grants come with it; what it may do on a feed is [`Ctx::require_feed_role`].
+pub async fn signed_in(req: &HttpRequest, state: &EditorState) -> EditorResult<Ctx> {
     let user = active_user(req, state).await?;
     if !user.totp_enabled {
         return Err(EditorError::unauthorized(
@@ -319,8 +396,95 @@ pub async fn require(req: &HttpRequest, state: &EditorState, min: Role) -> Edito
             "enter a code from your authenticator app",
         ));
     }
-    let ctx = Ctx { user };
-    ctx.require_role(min)?;
+    Ok(Ctx { user })
+}
+
+/// [`signed_in`], and at least `min` on feed `g` (a path's `{gtfs_id}`).
+pub async fn require_feed(
+    req: &HttpRequest,
+    state: &EditorState,
+    g: &str,
+    min: Role,
+) -> EditorResult<Ctx> {
+    let ctx = signed_in(req, state).await?;
+    ctx.require_feed_role(g, min)?;
+    Ok(ctx)
+}
+
+/// [`signed_in`], and an admin.
+pub async fn require_admin(req: &HttpRequest, state: &EditorState) -> EditorResult<Ctx> {
+    let ctx = signed_in(req, state).await?;
+    ctx.require_admin()?;
+    Ok(ctx)
+}
+
+/// What a path keyed by an object names. Its feed is looked up before any role
+/// is checked, so the role is always the one held on that object's feed.
+#[derive(Debug, Clone, Copy)]
+pub enum Object {
+    ChangeSet(Uuid),
+    StationProposal(i64),
+    PositionReview(i64),
+    Webhook(Uuid),
+}
+
+/// The feed an object belongs to; 404 when there is no such object. An object
+/// never moves to another feed, so the answer holds for the whole request.
+pub async fn feed_of(pool: &PgPool, object: Object) -> EditorResult<String> {
+    let row = match object {
+        Object::ChangeSet(id) => {
+            sqlx::query("SELECT gtfs_id FROM gtfs_change_set WHERE change_set_id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+        }
+        Object::StationProposal(id) => {
+            sqlx::query("SELECT gtfs_id FROM gtfs_station_proposal WHERE proposal_id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+        }
+        Object::PositionReview(id) => {
+            sqlx::query("SELECT gtfs_id FROM gtfs_position_review WHERE review_id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+        }
+        Object::Webhook(id) => {
+            sqlx::query("SELECT gtfs_id FROM gtfs_webhook WHERE webhook_id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+        }
+    };
+    match row {
+        Some(r) => Ok(r.try_get("gtfs_id")?),
+        // the same codes and words as each object's own loader
+        None => Err(match object {
+            Object::ChangeSet(_) => {
+                EditorError::not_found("change_set_not_found", "no such change set")
+            }
+            Object::StationProposal(id) => {
+                EditorError::not_found("proposal_not_found", format!("no proposal {id}"))
+            }
+            Object::PositionReview(id) => {
+                EditorError::not_found("review_not_found", format!("no position review {id}"))
+            }
+            Object::Webhook(_) => EditorError::not_found("webhook_not_found", "no such webhook"),
+        }),
+    }
+}
+
+/// [`signed_in`], then the object's feed, then at least `min` there.
+pub async fn require_object(
+    req: &HttpRequest,
+    state: &EditorState,
+    object: Object,
+    min: Role,
+) -> EditorResult<Ctx> {
+    let ctx = signed_in(req, state).await?;
+    let g = feed_of(&state.pool, object).await?;
+    ctx.require_feed_role(&g, min)?;
     Ok(ctx)
 }
 
@@ -429,4 +593,74 @@ where
     .execute(executor)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(role: &str, grants: &[(&str, Role)]) -> Ctx {
+        Ctx {
+            user: User {
+                user_id: Uuid::nil(),
+                email: "someone@example.invalid".into(),
+                display_name: None,
+                role: role.into(),
+                kind: "person".into(),
+                grants: grants.iter().map(|(g, r)| (g.to_string(), *r)).collect(),
+                totp_enabled: true,
+                totp_last_step: None,
+                totp_secret_enc: None,
+                status: "active".into(),
+                created_at: Utc::now(),
+                last_login_at: None,
+            },
+        }
+    }
+
+    fn code(r: EditorResult<()>) -> Option<(u16, &'static str, Value)> {
+        r.err().map(|e| (e.status.as_u16(), e.code, e.details))
+    }
+
+    /// Docs section 15.2: the grant's role on its feed, nothing elsewhere, and
+    /// the column's old role counts for nothing but `admin`.
+    #[test]
+    fn a_members_role_is_the_one_granted_on_that_feed() {
+        let c = ctx("approver", &[("a", Role::Editor)]);
+        assert_eq!(c.feed_role("a"), Some(Role::Editor));
+        assert_eq!(c.feed_role("b"), None);
+        assert!(c.require_feed_role("a", Role::Viewer).is_ok());
+        assert!(c.require_feed_role("a", Role::Editor).is_ok());
+        assert_eq!(
+            code(c.require_feed_role("a", Role::Approver)),
+            Some((403, "role_required", Value::Null))
+        );
+        assert_eq!(
+            code(c.require_feed_role("b", Role::Viewer)),
+            Some((403, NO_FEED_ACCESS, json!({"gtfs_id": "b"})))
+        );
+        assert!(!c.is_admin());
+        assert_eq!(
+            code(c.require_admin()),
+            Some((403, "role_required", Value::Null))
+        );
+    }
+
+    #[test]
+    fn an_admin_has_every_feed_at_every_role() {
+        let c = ctx("admin", &[]);
+        assert_eq!(c.feed_role("any"), Some(Role::Admin));
+        assert!(c.require_feed_role("any", Role::Admin).is_ok());
+        assert!(c.require_admin().is_ok());
+    }
+
+    #[test]
+    fn a_grant_never_carries_admin() {
+        assert_eq!(Role::parse_grant("approver"), Some(Role::Approver));
+        assert_eq!(Role::parse_grant("admin"), None);
+        assert_eq!(Role::parse_grant("owner"), None);
+        for r in [Role::Viewer, Role::Editor, Role::Approver, Role::Admin] {
+            assert_eq!(Role::parse(r.as_str()), Some(r));
+        }
+    }
 }

@@ -1,10 +1,10 @@
 # GTFS metadata editor
 
-Ops edit a feed's **metadata** — stops, route stop order, route names and
-polylines, and stations (stops clubbed under a parent) — in the internal DB. A
-second person approves; commit applies the change and every GIMS pod reloads that
-feed within seconds. Trip times are **not** editable: they keep coming from the
-nightly GTFS build, which now reads the same tables.
+Ops edit a feed in the internal DB — stops, route stop orders, route names and
+polylines, stations (stops clubbed under a parent), and since section 16 its
+trips, stop times and service calendars. A second person approves; commit applies
+the change and every GIMS pod reloads that feed within seconds. Who may work on
+which feed is section 15.
 
 ```
 ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
@@ -19,7 +19,7 @@ ops ─VPN─▶ <editor sign-in host>   (Pomerium, your SSO domain)
       and rebuild only the feed that moved         mapping, releases only if version moved
 ```
 
-Schema: `db/gtfs_editor/0001..0016*.sql` (`0001..0008` applied to master
+Schema: `db/gtfs_editor/0001..0017*.sql` (`0001..0008` applied to master
 `mtc_internal_master`; `0006` lets a change's `op` be `merge`, `0007` holds
 coordinate reviews, `0008` makes `gtfs_feed.data_source` live and backfills
 `chennai_bus` to `'db'` — see section 3's "Feed data source". **Not yet on
@@ -29,12 +29,17 @@ maker-checker CHECK for a set so marked (section 2), `0011` adds the indexes
 behind the cleanup context reads (section 9), `0012` adds the nullable
 `gtfs_stop.description` (section 11), `0013` adds the webhook and pod cache
 state tables (section 12), `0016` adds `gtfs_webhook_settings`, the webhook
-policy row that supersedes the dhall config (section 12.5), `0022` adds the
-`release_requested` event and the `release` delivery kind (section 12.6). All
-seven are safe to run twice. **`0012`
-goes on a database before the build that reads it:** both the editor and the
-GIMS loader select the column, so a DB feed fails to load (and serves its
-preprocessed data) on a database without it.)
+policy row that supersedes the dhall config (section 12.5), `0017` adds
+`gtfs_route_stop.stop_headsign` and `gtfs_feed.headsign_source`, and gives
+`stage_no` / `stage_name` defaults so a feed with no fare stages can have a route
+at all ("The headsign" below), `0018` adds per-feed access grants and system
+accounts (section 15), `0019` adds patterns, timing profiles, trips, frequencies
+and service calendars (section 16), `0020` the MTC sync's system account (section
+16.8), `0021` lets a map line come from GPS (section 17), `0022` is the release
+button's (section 12.6), `0023` holds every other file and field of the GTFS
+reference (section 18). All are safe to run twice. **`0012`, `0017` and `0023`
+go on a database before the build that reads them:** both the editor and the GIMS loader select those columns, so a DB feed
+fails to load (and serves its preprocessed data) on a database without them.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -65,19 +70,135 @@ produced from a GTFS built out of these tables:
   load serves it. Station rows (`location_type = 1`) are emitted too.
 - **patterns** — one per route that has trips. Stops are the route's *served*
   rows (`stop_type` not in ROUTE CORRECTION / JUMP STOP / HIDDEN STOP) in
-  `sequence` order, `stopSequence = i + 1`. Times follow the generator:
-  `arrival = start + 135·i`, `departure = arrival + 15` (last stop:
-  `departure = arrival`), where `start` is the preprocessed example trip's first
-  arrival. `headsign` = stage number, or
-  `{'fareStageNumber': 'N', 'isStageStop': true}` on NEW STOP rows. `trips` =
-  the preprocessed pattern's trips.
+  `sequence` order, `stopSequence = i + 1`. Times are the preprocessed example
+  trip's own, where the DB calls at the same stops in the same order; where it
+  does not, they follow the generator: `arrival = start + 135·i`,
+  `departure = arrival + 15` (last stop: `departure = arrival`), `start` being
+  the example trip's first arrival ("The timetable" below). `headsign` = the
+  row's `stop_headsign`, or what the feed's `headsign_source` falls back to
+  ("The headsign" below). `trips` = the preprocessed pattern's trips.
 - **routes** — routes with a pattern: `shortName`, `longName`, `mode` (from
   `route_type`), `agencyName` (`gtfs_feed.agency_name`), `color`,
   `encodedPolyline`, `tripCount`, `stopCount`, `startPoint`/`endPoint` from the
   pattern.
 
 **Parity is the acceptance test**: loaded from the seeded tables, every public
-static API for `chennai_bus` must return what the preprocessed load returns.
+static API for a feed must return what the preprocessed load returns.
+`scripts/parity_gtfs_db.py` takes `--gtfs-id` once per feed and compares them all
+in one run.
+
+### The headsign
+
+A stop headsign has two sources, in this order:
+
+| | |
+|---|---|
+| `gtfs_route_stop.stop_headsign` | the row's own, GTFS `stop_headsign`. Wins whenever it is set; blank counts as unset. |
+| `gtfs_feed.headsign_source` | what a row with none falls back to: `'fare_stage'` synthesises MTC's — the stage number, or `{'fareStageNumber': 'N', 'isStageStop': true}` on a NEW STOP — and `'none'` serves no headsign at all. |
+
+Until `0017` the fare-stage synthesis was the only source, which is MTC bus
+semantics: `chennai_bus` is the one feed that has fare stages, and every other
+feed serves `headsign: null` today. Seeding one of them into these tables as they
+stood would have turned that null into a stage number derived from columns the
+feed has no meaning for — a "fare stage 1" on a metro platform, in the rider app,
+with nothing upstream that could have produced it.
+
+So `'none'` is the **default** for a feed row, and the `0017` backfill sets
+`'fare_stage'` on every feed that existed when it ran. A feed seeded afterwards
+therefore keeps serving exactly what it serves today, and `chennai_bus` — whose
+rows all have a null `stop_headsign` — still gets the synthesis on every row.
+`tests/gtfs_headsign_flow.rs` asserts that against its real rows: every headsign
+the loader builds equals the one the pre-`0017` code built from the same row.
+
+`stage_no` and `stage_name` stay NOT NULL and keep their meaning for a fare-stage
+feed (an INTERMEDIATE STOP carries the preceding NEW STOP's stage — section 6's
+fare invariant). For a feed with `headsign_source = 'none'` they are internal and
+default to `0` / `''`: nothing public reads either column, and a seeder does not
+have to invent fare stages to insert a route.
+
+### The timetable
+
+The editor does not own trip times, so a DB feed carries them over from the
+preprocessed example trip — **per route, all of them or none**:
+
+- the DB calls at the same stops in the same order as the example trip: every
+  stop keeps its real arrival and departure, so a metro that runs to a timetable
+  goes on serving it;
+- it does not (the editor has since inserted, moved or dropped a stop): the whole
+  route falls back to the generator's spacing. There are no times for a shape
+  that never ran, and keeping the ones that still match would put an inserted
+  stop *ahead* of the stop before it — a mixed schedule is worse than a synthetic
+  one.
+
+This is a no-op for `chennai_bus` by construction: its GTFS is built by
+`generate_trips_from_db.py`, whose times are `start + 135·i` with 15 s of dwell,
+so the preprocessed data agrees with the formula on all 71,269 of its pattern
+stops and both branches produce the same bytes. For any other feed the formula
+was never right — it would replace a real timetable with a stop every 135
+seconds, which is what `tests/gtfs_headsign_flow.rs` and the `schedule` unit
+tests pin down.
+
+One thing a DB feed still cannot carry over shows up in `/example-trip` for a
+route with **several** preprocessed patterns: `gtfs_route_stop` holds one stop
+order per route, so the feed keeps the longest pattern (the one the route-stop
+mapping was already built from) and the example trip becomes that pattern's, not
+the first one's. A feed whose routes are 1:1 with patterns is unaffected.
+
+### Seeding a feed that is not chennai_bus
+
+`chennai_bus` was seeded from nandi's own sources. Every other feed arrives
+preprocessed in the data image, so the only description of it that exists is what
+GIMS is serving: `scripts/chennai-bus/editor/seed_gtfs_feeds.py` in nandi reads
+`/cached-data`, `/routes/{gtfs_id}` and each route's `/example-trip` and writes
+the SQL. Read it from the **same** GIMS the rows are going into — master and prod
+do not serve the same feed list.
+
+What a feed's rows have to be, all of it forced by how GIMS keys its reads:
+
+- **one stop row per stop *code***, carrying the `stop_id` GIMS serves for that
+  code today. Codes are what every public read is keyed by; ids are external
+  (`SWA|0101`, a hex digest) and minting new ones breaks every caller holding
+  one.
+- **name and position from the route-stop mapping**, not from the stops map.
+  Preprocessed metro data spells a station, its platforms and its entrance gates
+  with one code and the stops map keeps whichever was read last, so a code can
+  sit there under a gate's name while every route that calls at it says the
+  station's. `/stops`, every route-stop read and a route's start and end points
+  are built from the mapping, so that is the spelling that has to be stored.
+- **a parent row for every `stationId`**, as a station when a served stop already
+  answers to that code (the metro case, where GIMS goes on serving the platform)
+  and otherwise as a plain unreferenced stop, which anchors `parent_station`
+  without adding a station to `/stops` that the feed never served.
+- **`stop_headsign` per row** where the feed serves one, and `stop_type`
+  NEW STOP everywhere: the other types are MTC fare and shaping rows.
+
+Measured against a local GIMS pair, every route and every stop compared
+(`scripts/parity_gtfs_db.py --all-routes --every 1`), this reproduces `kochi_metro`,
+`mumbai_metro`, `mumbai_suburban` and `delhi_bus_nammayatri_application_mock`
+byte for byte. Three differences survive it, and they are properties of the
+tables, not of the seeder:
+
+- **stops no route calls at disappear.** The loader emits stations and stops a
+  served row references, so a stop in the preprocessed data that no pattern
+  visits is not in a DB feed at all: it stops answering `/stop/{g}/{code}`, and
+  it stops being an alternate of the stop it shares a name with
+  (`/alternateStops`: 32 of 2,620 stops for `bhubaneshwar_bus`, 24 of 330 for
+  `sambalpur_bus`, 222 of 446 for `kolkata_bus`, where half the stops are
+  unserved).
+- **one agency per feed.** `gtfs_feed.agency_name` covers the whole feed, so a
+  feed whose routes name two agencies (`kolkata_bus`: "KolkataBus" and "Moving
+  Tech") cannot serve both.
+- **platform-level reads on a feed with stations.** `/station-children` answers
+  with the platform *ids* under a station, and `/example-trip` names the platform
+  its trip called at; one row per code keeps one of those ids, so both change on
+  `bangalore_metro`, `chennai_metro`, `delhi_metro`, `chennai_suburban` and
+  `kolkata_metro`. `kolkata_metro` cannot be seeded at all as it stands: its
+  stops are their own `stationId`, which the schema forbids
+  (`parent_station IS DISTINCT FROM stop_id`).
+
+Parity first, flip second: seeding a feed changes nothing until an admin's
+`feed_config` change moves its `data_source` to `'db'` (section 3), and a feed
+flipped with missing rows serves a broken feed to riders.
 
 Reload: every `gtfs_version_poll_seconds`, `SELECT gtfs_id, version FROM
 gtfs_feed WHERE gtfs_id = ANY($db_feeds)`. A feed whose version differs from the
@@ -290,6 +411,8 @@ feed in `gtfs_db_feeds` and one without.
   submits · `approver` approves, rejects and commits — **never a set they
   submitted, neither approve nor commit** · `admin` everything plus users, the
   feed's data source (a `feed_config` change, section 3), and the override below.
+  **Since section 15 an admin is the only global role:** `viewer` / `editor` /
+  `approver` are held per feed, through a grant an admin gives.
 - **Admin self-approval (the one exception to maker-checker).** An admin may
   approve a set they submitted by saying so: `POST /change-sets/{id}/approve`
   with `{self_approve: true}`. Without the flag the admin gets the same 403
@@ -1996,6 +2119,819 @@ the deployment's own host away and stopping a call at send time. The fleet
 arithmetic, the precedence rule, the host validation, the placeholders and the
 backoff are unit tested in `src/services/webhook.rs`.
 
+## 15. Feed access — who may work on which feed (2026-09-21)
+
+Until now a user's role applied to every feed. With other cities' feeds moving
+into these tables, a Kolkata operator must not draft, approve or even browse
+Chennai's drafts, and the other way round.
+
+**The rule.** An **admin** is global: every feed at every role, plus users,
+grants, webhook settings and the self-approval override (section 2), all as
+before. Everyone else works on a feed only through a **grant** on that feed, and
+the grant carries the role they hold there — `viewer < editor < approver`,
+ordered as before. No grant: the feed does not exist for them. **Only admins
+grant and revoke**; there is no per-feed admin.
+
+### 15.1 Schema — `0018_feed_access.sql`
+
+```sql
+CREATE TABLE gtfs_editor_feed_access (
+    user_id     uuid        NOT NULL REFERENCES gtfs_editor_user (user_id) ON DELETE CASCADE,
+    gtfs_id     text COLLATE "C" NOT NULL REFERENCES gtfs_feed (gtfs_id),
+    role        text        NOT NULL CHECK (role IN ('viewer', 'editor', 'approver')),
+    granted_by  uuid        REFERENCES gtfs_editor_user (user_id),
+    granted_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, gtfs_id)
+);
+CREATE INDEX gtfs_editor_feed_access_feed_idx ON gtfs_editor_feed_access (gtfs_id);
+
+ALTER TABLE gtfs_editor_user ADD COLUMN kind text NOT NULL DEFAULT 'person'
+    CHECK (kind IN ('person', 'system'));
+```
+
+- **Backfill** (same migration, `ON CONFLICT DO NOTHING`): every non-admin user
+  gets a grant on `chennai_bus`, when that feed row exists, at the role they hold
+  today. It is the only feed anyone has edited, so nobody loses anything and
+  nobody gains a feed.
+- **`gtfs_editor_user.role` keeps its column and values.** From 0018 only
+  `admin` means anything. `viewer` / `editor` / `approver` on a non-admin stay as
+  they were, so an older image rolled back onto this database still works; this
+  image ignores them. The dashboard calls such a user a "member".
+- **`kind = 'system'`** marks an account no person signs in with — the MTC sync
+  of section 16.8. It has no TOTP secret, is never a bootstrap admin, and every
+  sign-in path refuses it (403 `account_disabled`) even if an SSO identity with
+  its email turned up. It shows in drafts and the audit log under its display
+  name. Only migrations create one; admins grant it feeds like anyone else.
+
+### 15.2 Checks
+
+`Ctx::feed_role(g)` is the caller's role on feed `g`: `Admin` for an admin, else
+the grant's role, else none. Grants are loaded with the user on every request (one
+join), so a grant or a revocation takes effect on the caller's next request;
+sessions are not ended.
+
+- A path with `{gtfs_id}` checks that feed. A path keyed by an object resolves
+  the object's feed first: `/change-sets/{id}` and everything under it,
+  `/station-proposals/{id}`, `/position-reviews/{id}`, `/webhooks/{id}`.
+- No grant: 403 `no_feed_access`, `details: {gtfs_id}` — for reads and writes
+  alike, and for an id that belongs to a feed the caller cannot see (404 stays for
+  what does not exist in a feed they can see). Grant too low: 403
+  `role_required`, as today.
+- **The role each endpoint needs does not change**; only where it is looked up
+  does. Admin-only stays admin-only: `feed_config` changes, users, grants, webhook
+  settings, and a feed's webhooks (they call out of the cluster).
+- `GET /feeds` lists the feeds the caller may see, each with `my_role`; an admin
+  sees every feed.
+- Maker-checker stays per set: an approver on a feed approves other people's sets
+  there, never their own. The admin self-approval override is unchanged.
+- A revoked user's open drafts stay. Others with access to the feed can see,
+  edit, submit or discard them; the revoked user cannot open them.
+
+### 15.3 API
+
+| method | path | body → response |
+|---|---|---|
+| GET | `/auth/me` | adds `is_admin` and `feeds: [{gtfs_id, role}]` (an admin: every feed, `role: "admin"`) |
+| GET | `/users` | each item adds `kind` and `feeds: [{gtfs_id, role, granted_by_email, granted_at}]` |
+| POST | `/users` | `{email, display_name?, admin?: bool, feeds?: [{gtfs_id, role}]}` → 201. The old `{role}` body still works: `role: "admin"` means `admin: true`; any other value creates a member with no grants |
+| PATCH | `/users/{user_id}` | `{admin?: bool, status?}`; the old `{role}` still works the same way. An admin still cannot demote or disable themselves. A demoted admin has no grants until given some |
+| PUT | `/users/{user_id}/feeds/{gtfs_id}` | admin; `{role}` → the user. Creates or changes the grant. 400 `invalid_role`, 400 `admin_has_all_feeds` for an admin, 404 `feed_not_found` |
+| DELETE | `/users/{user_id}/feeds/{gtfs_id}` | admin → 204; 404 when there was no grant |
+
+Audit (rows carry the feed, so the feed's own history shows who was let in):
+`feed_access_granted`, `feed_access_changed`, `feed_access_revoked` with
+`{user_id, email, gtfs_id, role_before, role_after}`, and `user_admin_changed`
+for promoting or demoting an admin.
+
+### 15.4 Dashboard
+
+- The feed switcher lists only `/auth/me`'s feeds, and preselects the only one.
+  A signed-in user with none sees "You have no feeds yet — ask an admin", not an
+  empty dashboard.
+- Admin → Users: one row per user, one column per feed, each cell a role picker
+  (none / viewer / editor / approver), and an Admin switch per user. System
+  accounts are labelled as such.
+- Every role badge and every disabled button reads the role on the current feed.
+
+### 15.5 Tests
+
+`tests/editor_feed_access_flow.rs` (registered in `scripts/editor_flow_test.sh`):
+two feeds; users at every level on one and none on the other. Every endpoint group
+answers 403 `no_feed_access` across feeds and `role_required` within one;
+object-keyed paths resolve their feed (feed B's change set opened by id from a
+feed-A-only session); a revocation bites on the next request with the same
+session; the backfill gives `chennai_bus` grants equal to the old roles; a system
+account cannot sign in.
+
+Settled while implementing (feed access, 2026-09-21):
+
+- **The backfill runs once**: only when `0018` creates the table, as `0017`'s
+  headsign backfill does. A second run cannot hand `chennai_bus` back to someone
+  an admin has revoked since. The test runs the migration file itself twice in a
+  scratch schema.
+- **A change set named in a body or a query is resolved too**, not only the
+  object of the path: the station-proposal approvals (one and bulk), a review's
+  move / split / merge, the review's what-if merge (`?change_set=`) and
+  `polyline:osrm?change_set=`. The caller needs the endpoint's role on that set's
+  feed as well, so an id from a feed they cannot see answers 403
+  `no_feed_access` for that feed, never a `feed_mismatch` that names it.
+- The body is still parsed before any check (a malformed one is 400 whatever the
+  caller's access), as it was before for roles.
+- `/auth/me`'s `feeds` items also carry `display_name`, which the switcher shows.
+  `my_role` and `/auth/me`'s `role` for an admin are `admin`.
+- `/users` items also carry `is_admin`. `POST /users`, `PATCH /users/{id}` and
+  `PUT /users/{id}/feeds/{g}` all answer with one such item.
+- `POST /users`: `admin` and `role` may both be sent only if they agree (else
+  400 `invalid_role`). A member's `role` column is the old body's role when one
+  was named, else `viewer` - what an older image rolled back would read. `feeds`
+  refused: a role outside viewer / editor / approver is 400 `invalid_role`, a
+  feed listed twice 400 `duplicate_feed`, an unknown feed 404 `feed_not_found`
+  (`details.gtfs_id`), any feed for an admin 400 `admin_has_all_feeds`. Nothing
+  is created when any of it is refused. `user_created` adds `admin` to its detail.
+- `PATCH /users/{id}`: an empty body is 400 `nothing_to_change`; making a system
+  account an admin is 400 `system_account`. **An admin holds no grants**:
+  promoting a member deletes theirs, each audited `feed_access_revoked`
+  (`role_after: null`) on its feed, so a later demotion leaves none, as 15.3
+  says. A demoted admin's column becomes `viewer` unless the old body named
+  another role. `user_admin_changed` has no `gtfs_id` and detail `{user_id,
+  email, admin_before, admin_after}`; `user_updated` (`{user_id, email, role,
+  status}`) is still written for a status change, and for an old-body role on a
+  member that changes nothing about access.
+- `PUT` with the role the grant already has changes nothing and audits nothing;
+  a changed role also moves `granted_by` / `granted_at` to the admin making it.
+  `DELETE` for an unknown user is 404 `user_not_found`, with no grant 404
+  `grant_not_found`. Every change of one user's access (grant, revoke, promote)
+  locks that user's row first, so two admins' edits of the same person queue.
+- **Discard and reopen keep their author-or-admin rule** (section 3), so of the
+  "others" in 15.2 who may finish a revoked member's draft, editors and approvers
+  on the feed see, edit and submit it, and only an admin discards it.
+- `GET /webhook-settings` stays readable by anyone signed in, a member with no
+  feeds included: the policy is the deployment's, not a feed's.
+- A grant has no `ON DELETE` on its feed: a script that deletes a feed row (the
+  flow tests, on their own feeds) deletes its grants first.
+- In code, `auth::require(req, st, min)` is gone - a handler written against it
+  no longer compiles, rather than skipping the feed. A handler asks for
+  `signed_in`, `require_feed(g, min)`, `require_object(object, min)` (a change
+  set, proposal, review or webhook; its feed looked up first) or
+  `require_admin`; `Ctx::feed_role`, `require_feed_role` and `is_admin` do the
+  rest.
+- Dashboard: a role badge beside the feed switcher, and the account menu, read
+  the role on the chosen feed; a draft opened by its address reads the role on
+  the draft's own feed. A 403 `no_feed_access` while the page is open re-reads
+  `/auth/me`, and when the chosen feed is gone the dashboard moves to the first
+  one still held (or the no-feeds screen) and says so. The Add person form gives
+  a role on the chosen feed, or Admin; the grid does the rest. System accounts
+  show "Never signs in", and their Admin switch is off.
+
+## 16. Trips, stop times and service calendars (2026-09-21)
+
+The rest of a feed moves into these tables: its trips, their stop times, the days
+they run and headway-based service. The tables then hold the whole timetable,
+not just the metadata around it, and it is edited through drafts like everything
+else. Measured before designing it:
+
+- **chennai_bus** — only the 52,606 trip start times are real data. Every stop
+  time after the first is `start + 135·i` (15 s dwell, 120 s to the next stop) on
+  all 1,315,546 hops, one stop order per route. MTC's own schedule rows carry a
+  `running_time` for 74% of the regular trips (median 18 km/h; about 15% longer
+  than the formula), which nandi has never read.
+- **Other feeds are not shaped like that.** BMRC runs up to 18 stop orders on one
+  route, Delhi Metro and Kolkata Metro 6, Chennai Metro and Kochi 4. BMRC's
+  busiest stop order has 459 trips taking 80–106 minutes on 17 different
+  timings; Delhi Metro has 663 timings over 55 stop orders. Kolkata bus and the
+  Mumbai metros are headway-based (`frequencies.txt`); BMRC, Chennai Metro and
+  Chennai suburban use `calendar_dates.txt`.
+
+So the model is general and chennai_bus is its simplest case: one pattern per
+route, no stored timing, one service.
+
+### 16.1 The model
+
+- A route has one or more **patterns** — stop orders. Pattern 1 is the stop list
+  every route already has in `gtfs_route_stop`; metro and suburban routes add
+  more (short turns, express runs). The **public pattern id is computed**, the
+  way `gtfs_preprocessor.py` computes it —
+  `{g}:{route}:{md5(served stop ids joined by "|")[:8]}` — so it is never stored
+  and a DB feed serves the same ids the preprocessed one did. Editing a pattern's
+  stops changes its public id, exactly as a rebuild would.
+- A **timing profile** belongs to one pattern: an arrival and a departure offset
+  for each of its served stops, in seconds from the trip's reference time. It is
+  stored once and shared by every trip that runs to it. chennai_bus needs none
+  (its 3,888 timings are all the default below); Delhi Metro's 21,825 trips need
+  663; every other feed together about 3,250.
+- The **default timing** of a pattern is not stored: stop `i` arrives at
+  `i·(run + dwell)` and departs `dwell` later, the last stop departing when it
+  arrives, with the feed's `default_run_s` (120) and `default_dwell_s` (15). It
+  is the generator's formula to the second. A trip with no profile runs to it.
+- A **trip** is a pattern, a profile (or the default), a service, a direction and
+  a reference time, plus optional frequency windows. **Its stop times are its
+  reference time plus the profile's offsets.** Nothing per stop per trip is
+  stored.
+- A **service** is days of the week, a date range, and dates added or removed.
+
+### 16.2 Schema — `0019_trips.sql`
+
+```sql
+-- Several stop orders per route. Every existing row is pattern 1.
+ALTER TABLE gtfs_route_stop ADD COLUMN pattern_key smallint NOT NULL DEFAULT 1
+    CHECK (pattern_key > 0);
+ALTER TABLE gtfs_route_stop ADD COLUMN pickup_type   smallint CHECK (pickup_type   BETWEEN 0 AND 3);
+ALTER TABLE gtfs_route_stop ADD COLUMN drop_off_type smallint CHECK (drop_off_type BETWEEN 0 AND 3);
+ALTER TABLE gtfs_route_stop ADD COLUMN timepoint     smallint CHECK (timepoint IN (0, 1));
+-- primary key becomes (gtfs_id, route_id, pattern_key, sequence)
+
+CREATE TABLE gtfs_pattern (
+    gtfs_id       text COLLATE "C" NOT NULL,
+    route_id      text COLLATE "C" NOT NULL,
+    pattern_key   smallint    NOT NULL CHECK (pattern_key > 0),
+    name          text,                       -- ops' label: "short turn to Majestic"
+    direction_id  smallint    CHECK (direction_id IN (0, 1)),
+    row_version   integer     NOT NULL DEFAULT 1,
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    updated_by    text,
+    PRIMARY KEY (gtfs_id, route_id, pattern_key),
+    FOREIGN KEY (gtfs_id, route_id) REFERENCES gtfs_route (gtfs_id, route_id) ON DELETE CASCADE
+);
+-- backfilled: pattern 1 for every route
+
+CREATE TABLE gtfs_timing_profile (
+    gtfs_id       text COLLATE "C" NOT NULL,
+    route_id      text COLLATE "C" NOT NULL,
+    pattern_key   smallint    NOT NULL,
+    profile_key   integer     NOT NULL CHECK (profile_key > 0),
+    arrival_s     integer[]   NOT NULL,       -- one per served stop, in sequence order
+    departure_s   integer[]   NOT NULL,
+    label         text,                       -- "peak", "MTC 70 min"
+    source        text        NOT NULL CHECK (source IN
+                  ('import', 'mtc_running_time', 'manual', 'interpolated')),
+    row_version   integer     NOT NULL DEFAULT 1,
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    updated_by    text,
+    PRIMARY KEY (gtfs_id, route_id, pattern_key, profile_key),
+    FOREIGN KEY (gtfs_id, route_id, pattern_key)
+        REFERENCES gtfs_pattern (gtfs_id, route_id, pattern_key) ON DELETE CASCADE,
+    CHECK (cardinality(arrival_s) = cardinality(departure_s) AND cardinality(arrival_s) >= 2)
+);
+
+CREATE TABLE gtfs_service (
+    gtfs_id     text COLLATE "C" NOT NULL REFERENCES gtfs_feed (gtfs_id),
+    service_id  text COLLATE "C" NOT NULL,
+    monday boolean NOT NULL, tuesday boolean NOT NULL, wednesday boolean NOT NULL,
+    thursday boolean NOT NULL, friday boolean NOT NULL, saturday boolean NOT NULL,
+    sunday boolean NOT NULL,
+    start_date  date,                         -- both NULL: a calendar_dates-only service
+    end_date    date,
+    label       text,
+    row_version integer     NOT NULL DEFAULT 1,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    updated_by  text,
+    PRIMARY KEY (gtfs_id, service_id),
+    CHECK ((start_date IS NULL) = (end_date IS NULL)),
+    CHECK (end_date >= start_date)
+);
+
+CREATE TABLE gtfs_service_date (
+    gtfs_id        text COLLATE "C" NOT NULL,
+    service_id     text COLLATE "C" NOT NULL,
+    service_date   date     NOT NULL,
+    exception_type smallint NOT NULL CHECK (exception_type IN (1, 2)),
+    PRIMARY KEY (gtfs_id, service_id, service_date),
+    FOREIGN KEY (gtfs_id, service_id) REFERENCES gtfs_service (gtfs_id, service_id) ON DELETE CASCADE
+);
+
+CREATE TABLE gtfs_trip (
+    gtfs_id       text COLLATE "C" NOT NULL,
+    trip_id       text COLLATE "C" NOT NULL,
+    route_id      text COLLATE "C" NOT NULL,
+    pattern_key   smallint    NOT NULL,
+    profile_key   integer,                    -- NULL: the pattern's default timing
+    service_id    text COLLATE "C" NOT NULL,
+    direction_id  smallint    CHECK (direction_id IN (0, 1)),
+    ref_s         integer     NOT NULL CHECK (ref_s BETWEEN 0 AND 172799),
+    headsign      text,
+    short_name    text,
+    block_id      text,
+    shape_id      text,                       -- GTFS shape_id as the feed has it; no shapes table yet
+    wheelchair_accessible smallint,
+    bikes_allowed smallint,
+    sort_key      integer     NOT NULL,       -- source order; a route's example trip is its first
+    source        text        NOT NULL CHECK (source IN ('import', 'mtc', 'editor')),
+    source_ref    jsonb,                      -- MTC: {schedule_trip_detail_id, schedule_number, service_type_code}
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    updated_by    text,
+    PRIMARY KEY (gtfs_id, trip_id),
+    FOREIGN KEY (gtfs_id, route_id, pattern_key)
+        REFERENCES gtfs_pattern (gtfs_id, route_id, pattern_key),
+    FOREIGN KEY (gtfs_id, route_id, pattern_key, profile_key)
+        REFERENCES gtfs_timing_profile (gtfs_id, route_id, pattern_key, profile_key),
+    FOREIGN KEY (gtfs_id, service_id) REFERENCES gtfs_service (gtfs_id, service_id)
+);
+CREATE INDEX gtfs_trip_route_idx ON gtfs_trip (gtfs_id, route_id, pattern_key, sort_key);
+
+CREATE TABLE gtfs_frequency (
+    gtfs_id      text COLLATE "C" NOT NULL,
+    trip_id      text COLLATE "C" NOT NULL,
+    start_s      integer  NOT NULL,
+    end_s        integer  NOT NULL CHECK (end_s > start_s),
+    headway_s    integer  NOT NULL CHECK (headway_s > 0),
+    exact_times  smallint NOT NULL DEFAULT 0 CHECK (exact_times IN (0, 1)),
+    PRIMARY KEY (gtfs_id, trip_id, start_s),
+    FOREIGN KEY (gtfs_id, trip_id) REFERENCES gtfs_trip (gtfs_id, trip_id) ON DELETE CASCADE
+);
+
+ALTER TABLE gtfs_feed ADD COLUMN trips_source       text    NOT NULL DEFAULT 'preprocessed'
+    CHECK (trips_source IN ('preprocessed', 'db'));
+ALTER TABLE gtfs_feed ADD COLUMN default_run_s      integer NOT NULL DEFAULT 120;
+ALTER TABLE gtfs_feed ADD COLUMN default_dwell_s    integer NOT NULL DEFAULT 15;
+ALTER TABLE gtfs_feed ADD COLUMN schedule_sync      text    NOT NULL DEFAULT 'none'
+    CHECK (schedule_sync IN ('none', 'mtc'));
+ALTER TABLE gtfs_feed ADD COLUMN sync_running_times boolean NOT NULL DEFAULT false;
+ALTER TABLE gtfs_feed ADD CONSTRAINT gtfs_feed_trips_need_db
+    CHECK (trips_source = 'preprocessed' OR data_source = 'db');
+
+ALTER TABLE gtfs_route ADD COLUMN schedule_source text NOT NULL DEFAULT 'sync'
+    CHECK (schedule_source IN ('sync', 'editor'));
+
+CREATE TABLE gtfs_sync_run (
+    run_id        uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    gtfs_id       text COLLATE "C" NOT NULL REFERENCES gtfs_feed (gtfs_id),
+    run_key       text        NOT NULL,       -- "2026-09-22" for the daily run; "manual:<uuid>"
+    started_at    timestamptz NOT NULL DEFAULT now(),
+    finished_at   timestamptz,
+    status        text        NOT NULL CHECK (status IN ('running', 'no_change', 'drafted', 'failed')),
+    change_set_id uuid        REFERENCES gtfs_change_set (change_set_id),
+    summary       jsonb,
+    UNIQUE (gtfs_id, run_key)
+);
+```
+
+The migration also widens `gtfs_change.entity` to add `pattern`,
+`timing_profile`, `route_trips` and `service`. Safe to run twice. (The sync's
+system account comes with the sync, in `0020_mtc_sync.sql` — section 16.8.)
+
+**Every query that means "a route's stop list" gains `pattern_key`.** Code that
+takes no pattern means pattern 1, so everything written before this section keeps
+its meaning.
+
+Settled while implementing:
+
+- **Pattern 1 exists for every route, whoever inserts the route.** The backfill
+  makes it for the routes there are, and a trigger (`gtfs_route_pattern_one`,
+  `AFTER INSERT ON gtfs_route`) for every route after - the editor's
+  `route/create`, and nandi's seeders, which write `gtfs_route` rows directly and
+  would otherwise leave a route whose trips have nothing to reference.
+- **A stop row belongs to its pattern**: `gtfs_route_stop (gtfs_id, route_id,
+  pattern_key)` references `gtfs_pattern` with `ON DELETE CASCADE`, so deleting
+  a stop order takes its rows (and, through `gtfs_timing_profile`'s own foreign
+  key, its profiles) with it. The primary key is rebuilt only when it does not
+  have `pattern_key` yet, so a second run does not rebuild the index.
+- `gtfs_trip.shape_id` (text, nullable) is carried in and out as the feed has it
+  (`mumbai_suburban` sets it on all 134 trips); there is no shapes table yet.
+- `gtfs_touch_row` bumps `row_version` on `gtfs_pattern`, `gtfs_timing_profile`
+  and `gtfs_service` too: those rows are the base of a `pattern`,
+  `timing_profile/delete` and `service` change, as a stop's is of a stop change.
+- **0019 goes on a database before the build that reads it**, like 0012 and
+  0017: the loader selects `pattern_key` and `trips_source`, so a DB feed fails
+  to load (and serves its preprocessed data) on a database without them.
+- What "means pattern 1" and what looks at every stop order, query by query:
+  - **pattern 1** - the editor's row loaders unless given a pattern
+    (`load_route_rows`, `load_routes_rows`, `load_routes_read_rows`, and so
+    `rows_hash`, the route detail's `rows` and `stop_count`, a draft's route
+    preview, a bulk `route_stops` upload's base), the route list's
+    `stop_count`, the route context (reviews along the route, detours), a
+    coordinate review's calls and neighbouring stops, the `polyline:osrm`
+    waypoints, and the GIMS loader of a feed whose trips are preprocessed.
+  - **every stop order** - whether a stop is in use (`stop/delete` refuses a
+    stop only a short turn calls at), a `stop/merge` (it switches the stop on
+    every stop order, and checks for a stop called twice in a row per stop
+    order), and the counts of routes calling a stop, which count routes, not
+    rows. A stop's `routes` list and a merge's `affected` list every call; an
+    entry about another stop order than the route's stop list says which
+    (`pattern_key`, `pattern_keys`), so a feed with only pattern 1 reads exactly
+    as it did.
+- A route row's GTFS fields - `stop_headsign`, `pickup_type`,
+  `drop_off_type`, `timepoint` - are read and written only where a row has
+  them: a stop list without any serialises, and hashes, exactly as it did, so
+  the `base_rows_hash` every open draft carries stays valid.
+
+### 16.3 Building a trip's stop times
+
+For trip `t` on pattern `p`, the served rows of `p` (not ROUTE CORRECTION, JUMP
+STOP or HIDDEN STOP) in sequence order, stop `i`:
+
+```
+arrival_i   = t.ref_s + offsets.arrival[i]
+departure_i = t.ref_s + offsets.departure[i]
+offsets     = t's profile, or the pattern's default timing (16.1)
+```
+
+- The **start time** a person sees is `arrival_0`. A profile imported from a
+  feed starts at 0; after an edit that removes a pattern's first stop it may not
+  (16.4, "Stop lists and stored timings"), which is why the column is `ref_s`
+  and not a start time: removing a first stop must not rewrite every trip.
+- Times past 24:00 are allowed and written as GTFS writes them (`26:07:15`).
+- `stop_headsign` comes from the row's own `stop_headsign`, or the feed's
+  `headsign_source` fallback (section 1); `pickup_type`, `drop_off_type` and
+  `timepoint` from the row.
+- A trip with frequency windows is exported with its `frequencies.txt` rows; its
+  stop times are its reference run, as GTFS defines.
+- A stop's `stop_sequence` is its position among the pattern's served stops,
+  1 to n - what GIMS already serves as `i + 1`. Feeds whose GTFS numbers stops
+  otherwise (gaps, from 0) are renumbered by the importer only when asked to,
+  and it says so.
+
+### 16.4 Change types
+
+| entity / op | `after` | validation |
+|---|---|---|
+| `route_stops` / `replace` | as section 3, plus optional `pattern_key` (default 1) and optional per-row `stop_headsign`, `pickup_type`, `drop_off_type`, `timepoint` | as section 3, per pattern; the fare-stage rules only on a feed with fare stages (below). Replacing pattern `k > 1` that does not exist creates it |
+| `pattern` / `update` | `{pattern_key, name?, direction_id?}` | pattern exists |
+| `pattern` / `delete` | `{pattern_key}` | error `pattern_in_use` while any trip runs it; pattern 1 cannot be deleted while the route exists |
+| `timing_profile` / `replace` | `{pattern_key, profile_key?, arrival_s: [...], departure_s: [...], label?, base_hash}` | one offset per served stop of the pattern (`profile_length_mismatch`); `arrival ≤ departure ≤ next arrival` (`timing_goes_backwards`); a hop faster than 100 km/h or slower than 2 km/h in straight line is a **warning** (`timing_implausible`). No `profile_key` creates one |
+| `timing_profile` / `delete` | `{pattern_key, profile_key}` | error `profile_in_use` while any trip runs to it |
+| `route_trips` / `replace` | `{trips: [...], base_trips_hash}` — the route's whole trip list | below |
+| `service` / `create` | `{service_id, days: {monday..sunday}, start_date?, end_date?, label?, dates?: [{date, exception_type}]}` | ids as for stops; dates ISO `YYYY-MM-DD`; `end_date ≥ start_date`; no day and no added date is the **warning** `service_never_runs` |
+| `service` / `update` | the same fields, all optional; `dates`, when sent, replaces the list | same |
+| `service` / `delete` | `null` | error `service_in_use` while any trip uses it |
+| `route` / `update` | adds `schedule_source: "sync" \| "editor"` | — |
+| `feed_config` / `update` | adds `trips_source`, `default_run_s`, `default_dwell_s`, `schedule_sync`, `sync_running_times` | admin only, as section 3; `trips_source: "db"` needs `data_source: "db"` (`trips_need_db`) |
+
+A `route_trips` trip is `{trip_id?, pattern_key, profile_key?, service_id,
+direction_id?, start_time, headsign?, short_name?, block_id?, shape_id?,
+wheelchair_accessible?, bikes_allowed?, frequencies?: [{start_time, end_time,
+headway_s, exact_times?}], source_ref?}`. `start_time` is `H:MM:SS` or `HH:MM`
+and becomes `ref_s` so that the first stop arrives at it. A trip without
+`trip_id` gets `{route_id}-ed-{8 hex}`; one sent back keeps its id, `sort_key`
+and `source`. A `trip_id` is 1-128 characters with no `:` and no control
+characters (`/` is allowed: bhubaneswar and sambalpur have 5,125 such ids, and
+GIMS percent-decodes it on `/trip/{id}`). Rules: `trip_id` is unique in the
+feed, not only the route (`trip_id_taken`); the pattern and profile exist and
+match (`pattern_not_found`, `profile_not_found`); the service exists
+(`service_not_found`); `start_time` is between 00:00:00 and 47:59:59
+(`invalid_time`); frequency windows lie within 00:00:00-48:00:00 and do not
+overlap (`frequency_overlap`); two trips of one route on the same
+pattern, service and direction at the same start are a **warning**
+(`duplicate_departure`). Conflicts use `base_trips_hash` like `route_stops` uses
+`base_rows_hash`. As everywhere, only problems the edit introduces block it.
+
+**Stop lists and stored timings.** When a `route_stops` change alters a pattern
+that has stored profiles, every one of its profiles is carried over in the same
+change, so a trip never runs to offsets that no longer line up:
+
+- stops kept (matched in order by stop id) keep their offsets;
+- an inserted stop gets an arrival interpolated between its kept neighbours by
+  straight-line distance, and the pattern's median dwell; one inserted before the
+  first or after the last kept stop is placed at the speed of the nearest hop;
+- a removed stop's offsets go; removing the first stop leaves the rest where they
+  were, so every trip keeps its clock times (16.3).
+
+The change's validation then carries the warning `timing_interpolated` with the
+number of profiles and stops that were estimated, and its preview shows the new
+times. Trips on the default timing need nothing: the formula follows the list,
+which is exactly what chennai_bus does today when a stop is added.
+
+**Fare rules only for fare-stage feeds.** The stop-list rules about MTC's fare
+stages - `fare_stage_mismatch`, `first_stop_not_stage`,
+`intermediate_before_stage`, `stage_decreases`, `stage_name_missing` - apply
+only when the feed's `headsign_source` is `fare_stage`. A feed with no fare
+stages sends `stage_no` 0 and `stage_name` "" and is not blocked by them. That a
+stop exists, is live and is not a station, `stop_repeated` and `too_few_stops`
+apply everywhere.
+
+Settled while implementing:
+
+- `entity_key` is the route for `pattern`, `timing_profile` and `route_trips`
+  (the stop order and profile are in `after`), and the service id for
+  `service`; a `service/create` may leave either out, like a stop's create.
+- **Shape and rule.** What a change's own fields get wrong is refused when it is
+  added (400 `invalid_change`, `details.code`): a malformed trip or frequency
+  window, a start time that is not a time (`invalid_time`), a trip id with `:`,
+  offsets that are not whole seconds within ±47:59:59, an arrival list and a
+  departure list of different lengths or shorter than two
+  (`profile_length_mismatch`), offsets that go backwards
+  (`timing_goes_backwards`), a service's dates out of order or given one without
+  the other (`invalid_dates`). What depends on the tables is a finding of the
+  draft, checked when the draft replays: the pattern, profile and service exist
+  once earlier changes of the draft apply, the number of offsets against the
+  pattern's served stops, `trip_id_taken` against every other route's trips at
+  that point in the draft, a start the profile would put before 00:00:00 once
+  its first offset is taken off (`invalid_time`).
+- **Ids and keys a change leaves out are written into it when it is added**, so
+  a reviewer - and every later change of the draft - sees them: a trip's id
+  (also on a PUT, and by a bulk upload's real run), a new profile's
+  `profile_key` - the next after the pattern's live profiles and the ones
+  earlier changes of the draft name - with `base_hash` the hash of nothing
+  (`4f53...b945`, section 5's constant, also the hash of an empty trip list).
+- A trip `source` is `import`, `mtc` or `editor`: a new trip takes the change's
+  (default `editor`; a bulk upload's are `import`), and one already on the route
+  keeps its own. The trips read also carries `sort_key`, `ref_s` and `source`;
+  a trip sent back with them is accepted and they are ignored. A new trip is
+  sorted after the route's last, in list order; `source_ref` sent replaces the
+  stored one, left out keeps it.
+- `base_trips_hash` is sha256 of the route's trips (every stored field, their
+  frequency windows included) in `sort_key` order; a profile's `hash` sha256 of
+  its offsets and label. `pattern/update`, `pattern/delete`,
+  `timing_profile/delete`, `service/update` and `service/delete` conflict on
+  `base_row_version`, the row's `row_version` when the change was added (none
+  for a row an earlier change of the draft creates).
+- `timing_profile/replace` may carry `source` (`import`, `mtc_running_time`,
+  `manual`; default `manual` - `interpolated` is written only by a carry-over)
+  and replaces the whole profile: a `label` left out is cleared.
+  `timing_implausible` is one warning per profile naming its hops; a hop of no
+  time over no distance says nothing and is left alone.
+- `pattern/delete` of pattern 1 is the error `pattern_one`. Deleting another
+  stop order takes its rows and profiles with it.
+- A service's `days`: on a create, a day left out is false; on an update, only
+  the days sent change. `start_date` and `end_date` are sent together, and both
+  `null` makes a calendar_dates-only service. A service that never runs is
+  allowed - chennai_bus's `chennai_bus_service_2`, all days 0, carries the 8
+  GraphQL-only stub trips of routes 543001, 546001, 598001 and 918001 - with the
+  warning `service_never_runs`.
+- `feed_config`: a setting the feed already has is a warning -
+  `data_source_unchanged` as before, `feed_config_unchanged` for the others -
+  and the conflict check compares each setting the change sets with its
+  `before`. Each setting other than `data_source` that a commit switches is
+  audited `feed_config_changed`, `{gtfs_id, setting, from, to, change_id,
+  change_set_id}` (the dashboard's history needs a label for it in
+  `ACTION_LABEL`; until then it reads "Feed config changed").
+- **The carry-over.** Kept stops are the longest common subsequence of the old
+  and new stop ids, so a stop a loop calls at twice is matched twice. Stops
+  inserted between two kept ones share the time from the first's departure to
+  the second's arrival by straight-line distance, each waiting the median dwell
+  of the profile (the last stop's zero left out) when that fits, and none when
+  it does not. Before the first or after the last kept stop the speed is the
+  nearest kept hop's, else the profile's overall speed. The new last stop
+  departs when it arrives. A profile any of whose stops were estimated becomes
+  `interpolated`; stops only removed are carried over without a warning,
+  nothing having been estimated. A stop list left with fewer than two served
+  stops leaves the profiles as they are: it is an error of its own and cannot be
+  committed.
+- `route_stops/replace` writes a row's `stop_headsign` and boarding fields and
+  rewrites only the stop order it replaces. It used to drop the headsign of
+  every row it rewrote, which on a feed seeded with headsigns (section 1) erased
+  them.
+- **Reads** the new changes need: the route detail (`GET
+  /feeds/{g}/routes/{route_id}` and a draft's route preview) adds
+  `pattern_key`, `patterns: [{pattern_key, pattern_id, name, direction_id,
+  row_version, stop_count, rows_hash, trip_count}]`, `profiles:
+  [{pattern_key, profile_key, label, source, arrival_s, departure_s,
+  row_version, hash}]`, `trip_count` and `trips_hash`; `GET
+  /feeds/{g}/routes/{route_id}/patterns/{k}` is the same detail with stop order
+  `k`'s rows; `GET /feeds/{g}/routes/{route_id}/trips` is `{route_id,
+  trips_hash, trip_count, items}` in change shape; `GET /feeds/{g}/services`
+  lists the services with their dates and trip counts; and a draft's previews
+  `.../preview/routes/{route_id}/patterns/{k}` and `.../trips` show them with
+  the draft applied.
+- The dashboard edits pattern 1 and sends a row's GTFS fields back as it read
+  them; a change it finds to update in place is the one for the same stop
+  order.
+
+### 16.5 Bulk kinds
+
+`POST /change-sets/{id}/bulk` (section 5) gains:
+
+| `kind` | row | becomes |
+|---|---|---|
+| `route_trips` | `{route_id, trip_id?, pattern_key, profile_key?, service_id, direction_id?, start_time, …}` — one trip | one `route_trips/replace` per route, its rows in upload order |
+| `timing_profiles` | `{route_id, pattern_key, profile_key, stop_sequence, arrival_offset, departure_offset}` — one stop of one profile; `stop_sequence` is the stop's position among the pattern's served stops, 1 to n | one `timing_profile/replace` per profile |
+| `services` | `{service_id, monday..sunday, start_date?, end_date?, date?, exception_type?}` — one row per date, each repeating its service's days | one `service/create` or `update` per service |
+| `route_stops` | adds optional `pattern_key`, `stop_headsign`, `pickup_type`, `drop_off_type`, `timepoint` | one `route_stops/replace` per (route, pattern) |
+
+Same 5,000-row limit, dry run and one-transaction rules as section 5.
+`timing_profiles` and `route_trips` may reference patterns, profiles and
+services created earlier in the same draft.
+
+**Big drafts.** An import is thousands of changes, and `GET /change-sets/{id}`
+answers every change with its `before` snapshot; at 10,000 changes that already
+outlived Pomerium's 60 s. So the set endpoint takes `limit` / `cursor` for its
+`changes` (default 200) and returns `change_count` and the validation summary
+without them; the dashboard pages through. Importers keep each draft to about
+5,000 trips.
+
+Settled while implementing:
+
+- `route_trips` columns: `route_id, trip_id, pattern_key, profile_key,
+  service_id, direction_id, start_time, headsign, short_name, block_id,
+  shape_id, wheelchair_accessible, bikes_allowed, frequencies, source_ref`;
+  `frequencies` and `source_ref` are JSON, or JSON written as text (a CSV cell).
+  Trips an upload brings are `import`s. A trip id is taken when another route
+  holds it once the draft applies - live, unless the draft's trip list for that
+  route drops it, or in that trip list - and a route this upload replaces holds
+  nothing but what the upload gives it. A route whose trips the draft already
+  replaces is the warning `route_already_in_draft`.
+- `timing_profiles` columns add an optional `label` (the same on every row of
+  a profile). Offsets are whole seconds. A profile's rows must run
+  `stop_sequence` 1 to n over the pattern's served stops as the pattern stands
+  once the draft applies, else every row of it is `profile_length_mismatch`;
+  two rows for one stop are `duplicate_in_upload`. `base_hash` is the live
+  profile's, and a profile the draft already writes is the warning
+  `profile_already_in_draft`. `timing_interpolated` is not predicted by a dry
+  run: it shows in the draft's own validation once a stop list change is added.
+- `services` columns add an optional `label`. Day cells are `1` / `0` /
+  `true` / `false`, blank being `0`. Rows of one service that disagree about
+  its days, dates range or label are all `invalid_row`. The upload describes a
+  service whole: an update sends all seven days, the range (both `null` when no
+  row gives one) and the dates, which replace the list.
+- `route_stops` groups by `(route_id, pattern_key)`; `base_rows_hash` is that
+  stop order's live hash (the hash of nothing for one the route does not have),
+  and the stage rules apply as a single change's do - only on a fare-stage feed.
+- **Paging.** `GET /change-sets/{id}?limit=&cursor=`: `limit` defaults to 200,
+  at most 500; the cursor is opaque. Every page carries the set's fields,
+  `change_count`, its slice of `changes`, `stop_names` for that slice and
+  `next_cursor` (null on the last page). Only the first page - no `cursor` -
+  replays the draft: `validation`, `validation_summary: {errors, warnings}`,
+  `conflicts` and `can_submit` are there and nowhere else, so paging through a
+  draft replays it once. Every other response that carries a set - adding,
+  editing or removing a change, submit, approve, a bulk import's real run -
+  carries its first page. The replay no longer loads the changes' `before`
+  snapshots, which only the conflict check of a `feed_config` change reads.
+- The dashboard completes a paged set in one place, its API wrapper
+  (`js/api.js`), so every screen still works on the whole list; the mock pages
+  the same way, and `dev/ui_smoke.mjs` checks both on its draft of 1,200
+  changes.
+
+### 16.6 GIMS loader
+
+A feed's `trips_source` decides where its trips come from, independently of its
+metadata's `data_source`:
+
+- **`preprocessed`** (every feed at first): unchanged — section 1, trips from
+  the preprocessed patterns, only the longest pattern per route.
+- **`db`**: patterns, trips and times come from these tables. Every pattern with
+  at least one trip is served, with its computed public id (16.1); its `trips` are
+  its trips in `sort_key` order, and its example trip is the first. `tripCount`
+  is the route's trip count. `/trip/{id}` for a DB feed is computed from the
+  trip (16.3) — no shard, no OTP call. `/example-trip` is the first trip.
+
+**Parity is the acceptance test, as in section 1**: loaded with
+`trips_source = 'db'` from tables imported out of a feed's current GTFS, every
+public static API — routes, patterns, stops, `/example-trip`, `/trip/{id}` for
+every trip — returns what the preprocessed load returns.
+`scripts/parity_gtfs_db.py --trips` checks it per feed.
+
+Settled while implementing:
+
+- A pattern of a DB-trips feed is built exactly as the preprocessor builds it:
+  its stops are the stop order's served rows with `stopSequence` 1 to n (16.3),
+  its times its first trip's (reference time plus that trip's profile, or the
+  feed's default timing), `desc` "Pattern for route {route}", and a route's
+  patterns come in the order of their first trip by `sort_key` - which is the
+  order the preprocessor meets them in `trips.txt`, and what decides a tie for
+  the route's longest stop order (its start and end, its route-stop mapping).
+  A route's `stopCount` counts the distinct stop codes of its patterns, and
+  `tripCount` all its trips. A stop order no trip runs is not a pattern, and a
+  route with no trip is not served; the feed's stops are still every stop a
+  stop order of a live route calls at, plus stations, as for a feed whose
+  trips are preprocessed.
+- `/trip/{id}?gtfs_id=` of a DB-trips feed is computed from an index built with
+  the feed (each trip's stop order, timing and reference time) - never read
+  from a shard or OTP, and not cached, so an edit is answered on the poll that
+  loads it. Its stops are numbered 1 to n and named as the feed's stops are.
+  Its `source` is `"db"` (a preprocessed answer says `"preprocessed"`, and
+  `"cache"` from the second call on); `source` and `lastUpdated` describe the
+  answer, not the trip, and parity leaves them out. A trip id with a `/` in it
+  is sent percent-encoded (`22B%2F1-1-OR_trip_1`) and found.
+- A feed whose trips come from the tables needs no preprocessed data at all:
+  the boot load, a snapshot boot and a first load by the poll all load it
+  without one, and the boot builds its example trips (they were built only for
+  preprocessed feeds).
+- A trip on a profile that does not exist, or a profile with another number of
+  offsets than its stop order has served stops, fails the feed's load - which
+  keeps serving what it had - rather than being re-timed quietly. The editor
+  never writes either.
+- `trips_source = 'preprocessed'` loads exactly what it did: pattern 1, the
+  preprocessed trips and shards.
+- The parity tooling runs locally only: `scripts/parity_trips_fixture.py`
+  builds a feed's GTFS from the tables (`gtfs`, so the preprocessed data and the
+  tables describe the same feed) and fills the trip tables of a local test
+  database from preprocessed data (`sql`, standing in for 16.7's importer);
+  `cargo run --example parity_gims -- serve` is a GIMS with the public static
+  APIs and none of the service binary's live-vehicle pollers (a parity run must
+  not call a vendor's API); and `-- patterns` compares a feed's preprocessed
+  patterns with the loader's, pattern by pattern, since no public API serves a
+  pattern whole.
+- Parity as built (local, 2026-09-21): chennai_bus - a GTFS built from its
+  tables with the shipped schedule's 52,606 trips, preprocessed by nandi's
+  preprocessor, against the same trips in the tables - and kochi_metro - the
+  shipped feed, whose 450 trips run on 186 timing profiles over 8 stop orders,
+  6 of them other than pattern 1. `parity_gims patterns`: 4,328 of 4,328 and 8
+  of 8 patterns identical, none missing, extra or in another order.
+  `parity_gtfs_db.py --trips`: every route (4,328 and 2) identical on
+  `/route`, `/route-stop-mapping` and `/example-trip`, the feed-wide lists and
+  `/cached-data` identical, and `/trip` identical for 502 and 450 trips. The
+  run left out `encodedPolyline`: 10 chennai_bus routes carry a polyline in the
+  tables that the generated GTFS has no shape for, and they differ in that key
+  only - route metadata (section 1's parity), not trips.
+
+### 16.7 nandi — GTFS out and GTFS in
+
+Both are nandi scripts under `scripts/chennai-bus/editor/`. Neither writes the
+feed tables; the importer adds changes to a draft through this API, like every
+other tool.
+
+- **`export_trips_from_db.py --feed g`** writes `trips.txt`, `stop_times.txt`,
+  `calendar.txt`, `calendar_dates.txt` and `frequencies.txt` from the tables,
+  sorted for a byte-stable output. In `GTFS_MAPPING_SOURCE=db` mode the Chennai
+  build uses them instead of querying MTC: `generate_trips_from_db.py` keeps
+  writing stops and routes, and stops writing trips, stop times and the calendar.
+- **`import_gtfs_trips.py --zip Z --feed g`** reads a feed's GTFS and turns it
+  into bulk uploads: services, then extra patterns, then timing profiles, then
+  trips, grouped into drafts of at most ~5,000 trips. Patterns are the distinct
+  stop orders of a route's trips (the preprocessor's rule); profiles are the
+  distinct offset lists of a pattern's trips, and a pattern whose trips all match
+  the default timing stores none. Before uploading it exports what it would have
+  written and compares it with the zip — `trips`, `stop_times`, `calendar`,
+  `calendar_dates` and `frequencies`, keyed by `(trip_id, stop_sequence)` — and
+  refuses to upload if they differ, listing every field it cannot represent (for
+  example `pickup_type` differing between trips of one stop order).
+- **Realtime** (`chennai-bus-trip-updates.py`): resolves each waybill to the
+  stored trip by route, service type, direction and start time instead of
+  rebuilding a trip id from the waybill, takes stop times from the export, and
+  writes GTFS-RT `time` as a POSIX timestamp (today it is seconds since midnight).
+
+### 16.8 The MTC sync (chennai_bus)
+
+A feed with `schedule_sync = 'mtc'` gets a draft each day proposing what changed
+in MTC's schedules. It runs inside GIMS, which already reads MTC's operational
+database (`database_url`) and holds the editor code, so it needs no new
+credential and nobody's session.
+
+- **When**: daily at `gtfs_mtc_sync_time` (dhall, default `"04:00"` IST), on
+  exactly one pod — the pod that inserts `gtfs_sync_run (gtfs_id, run_key =
+  today)` first runs it; the others see the row and skip. An admin can run it at
+  once: `POST /feeds/{g}/sync` → 202 `{run_id}`; `GET /feeds/{g}/sync-runs` lists
+  runs with their summaries.
+- **What it reads**: the rows nandi's schedule SQL reads — waybills of the last
+  45 days joined to `bus_schedule_trip_detail`, and every schedule row for an
+  active route with no waybill in that window — in a read-only transaction with a
+  statement timeout. Dead trips (`trip_type = 'dead-trip'`) are left out, as
+  GIMS's own schedule queries already do; the deployed feed carries 62.
+- **Matching**: a trip is the slot (route, service type, direction, start time).
+  MTC's `schedule_trip_detail_id` for a slot changes from day to day without the
+  timetable changing — one day in March, 619 of 737 "new" trip ids were exactly
+  that — so the slot is the identity and the stored `trip_id` never changes. A new
+  slot gets `{route}-{service type}-{UP|DOWN}-{smallest detail id in the slot}`,
+  the id format the feed has always used. Several MTC schedules in one slot stay
+  one trip, as today. MTC start times written with a dot (`5.10`) are read as
+  05:10; the generator turned them into 00:00.
+- **Scope**: routes with `schedule_source = 'sync'` only. A route MTC schedules
+  that the feed does not have is listed in the run's summary, never created.
+- **Running times**: with `sync_running_times` on, a trip whose MTC running time
+  is positive and plausible (5–60 km/h over the pattern's straight-line length)
+  runs to a profile "MTC N min" — the stops spread by straight-line distance so
+  the last one arrives N minutes after the first, 15 s dwell — shared by every
+  trip on that pattern with the same N. Otherwise the default timing. Off by
+  default, so turning it on is its own reviewed change.
+- **The account**: `0020_mtc_sync.sql` creates `mtc-sync` (`kind = 'system'`,
+  section 15; it needs `0018`) with an `editor` grant on `chennai_bus`.
+- **The draft**: one per run, titled "MTC schedule sync YYYY-MM-DD", created and
+  submitted by `mtc-sync`: one `route_trips/replace` per route whose trips
+  differ, plus the profiles they need. No difference, no draft (`no_change`). A
+  previous sync draft still not approved is discarded when a new one is made
+  (audited `change_set_superseded`); the new one carries everything. An approver
+  approves and commits it like any other; the system account can never approve.
+  Expected size: 29 routes changed in one day of March, 250 over 25 days.
+
+### 16.9 Dashboard
+
+- **Route page → Trips**: the route's trips by pattern and direction as a
+  departure board (start time, service, profile); add, remove and shift
+  departures; "every N minutes from … to …" adds a run of them; frequency windows
+  edited in place.
+- **Route page → Stops**: a pattern picker when the route has more than one; the
+  timing of the selected profile beside each stop (arrival and hop minutes), with
+  the total trip time; editing hop times makes or changes a profile.
+- **Calendar** page: services with their days, dates and trip counts.
+- **Drafts**: sync drafts carry a "MTC sync" badge; the list filters on it.
+- **Feed settings**: the new `feed_config` fields, with the sync runs.
+
+### 16.10 Rollout (chennai_bus first)
+
+1. `0018` and `0019` on master; the image that reads them.
+2. Import chennai_bus's services and trips from the shipped zip
+   (`import_gtfs_trips.py`, about 11 drafts); approve and commit.
+   `trips_source` still `preprocessed`.
+3. Parity: `parity_gtfs_db.py --trips` for chennai_bus, and
+   `export_trips_from_db.py` against the shipped zip, keyed. The only expected
+   difference is `calendar.txt`'s start date, which the generator sets to the
+   build date and the tables hold fixed.
+4. A `feed_config` draft sets `trips_source = 'db'`; nandi's nightly build
+   switches to the export.
+5. A `feed_config` draft sets `schedule_sync = 'mtc'`. The first sync draft is
+   the dead trips and the `5.10` times — reviewed on their own, not mixed into
+   the migration.
+6. Later: `sync_running_times`.
+7. Other feeds, one at a time: import, round trip, parity, switch.
+
+### 16.11 Not in this section
+
+`pathways.txt`, `transfers.txt`, `levels.txt`, per-pattern `shapes.txt`, fare
+tables, translations and attributions - every other file of the reference - are
+section 18, which also loads every shipped feed into the tables and publishes a
+feed's GTFS from them.
+`station_eta` (live ETA between stop pairs, and PR #205's time bands on it) is a
+separate thing — the live prediction, not the published timetable — and stays
+where it is.
 
 ### 12.6 Release to Nandi (2026-09-23)
 
@@ -2372,3 +3308,383 @@ its limit (422 `stopped: budget`, on time, not cached) and one that does not
 (504), commit of a `gps` line, and each OSRM reason); `dev/ui_smoke.mjs --map-line` against the mock's `/__dev/map-line`
 switch. `examples/gps_line_check.rs` runs the real pipeline read-only against the
 real cluster for a few routes and writes GeoJSON to look at.
+
+## 18. The whole GTFS reference, and every feed in the tables (2026-09-24)
+
+Until now the editor held part of a feed: stops, stations, routes and their stop
+orders, map lines, and since section 16 trips and calendars. Everything else a
+feed ships - agency, feed_info, levels, pathways, transfers, shapes, fares v1 and
+v2, areas, networks, translations, attributions, the Flex files - and many
+columns of the files it did hold stayed in the zips nandi builds. This section
+puts every file and field of the GTFS Schedule reference in the tables, editable
+through drafts like everything else; loads every shipped feed from its zip; and
+writes a feed's GTFS back out of the tables, byte-stable, for nandi to publish.
+
+Decided with the owner before building:
+
+- **First load.** A feed with no rows gets one audited `seed` transaction from its
+  zip (18.4). Everything after that goes through drafts. A feed that already has
+  rows - chennai_bus, edited through drafts since it was seeded from the MTC
+  mapping - gets the rest of its zip through drafts (18.8), never a seed.
+- **GTFS-Flex.** `locations.geojson`, `location_groups.txt`,
+  `location_group_stops.txt` and `booking_rules.txt` are stored, edited and
+  exported. A `stop_times` row that calls at a zone rather than a stop is an
+  import finding and is not stored.
+- **Dashboard.** All of it: the files, the section 16.9 trips and calendar
+  screens, the review diffs, and import / export / the feed report (18.10).
+- **Publishing.** nandi's release builds the zip with this exporter once a feed's
+  trips are in the tables, on a nandi branch not pushed yet (18.11).
+
+### 18.1 The reference as data (`src/gtfs/spec.rs`)
+
+`FILES` lists the 32 files of the reference - the 30 `.txt` files, Fares v1 and
+v2 included, and `locations.geojson` - with every field's type (id, text, URL,
+email, phone, language, timezone, colour, currency code and amount, date, time,
+integer and float ranges, latitude, longitude, enum, JSON), whether it is
+required, optional or conditionally required (with the condition in words), and
+which `file.field` it may name. Two fields are ours, not the reference's, and
+say so (`extension`): `stops.info_json` (chennai_bus's and kolkata_bus's cluster
+ids) and `feed_info.feed_id` (the gtfs_id nandi's preprocessor reads).
+
+Each file is stored one of two ways. **Bespoke**: the editor's own tables -
+`stops`, `routes`, `trips`, `stop_times` (as stop orders and timings),
+`frequencies`, `calendar`, `calendar_dates`. **Record**: a table `gtfs_<entity>`
+per file, with its key: the file's own id (`pathway_id`), a minted `row_id` for a
+file with none (`transfers.txt`, keyed naturally on its reference fields), or
+the feed itself (`feed_info.txt`). `GET /internal/gtfs-editor/gtfs-spec` serves
+the whole registry; the dashboard builds its forms from it.
+
+Values are canonical everywhere the editor keeps or compares them: dates ISO
+`YYYY-MM-DD`, times seconds after midnight (a trip past midnight is `25:10:00`,
+`48 * 3600` excluded), colours `#RRGGBB`, amounts as written. `from_text`,
+`from_api`, `to_api` and `to_text` convert.
+
+### 18.2 A zip, the model, the zip again (`src/gtfs/{read,model,write,compare}.rs`)
+
+- **`read`** reads a zip as its files: a folder inside the zip (sambalpur,
+  kolkata_metro), a byte order mark, CRLF, ragged rows, and macOS `._*` and
+  `.DS_Store` litter are all taken as the preprocessor takes them. A file the
+  reference does not have (sambalpur's `feed.txt`) is a warning, and left out.
+- **`model`** is the feed as the tables hold it. A **pattern** is a route's stop
+  order together with what each stop time says besides the time -
+  `stop_sequence`, `stop_headsign`, pickup and drop-off, `timepoint`, continuous
+  stopping, `shape_dist_traveled`, booking rules; trips of one stop order that
+  differ in any of those are separate patterns, which GIMS serves as one (18.7).
+  A route's first pattern is its longest stop order, the first on a tie, as the
+  preprocessor picks it. A **timing profile** is a pattern's offsets from a trip's
+  first arrival; a feed's default timing needs none. `stop_sequence` is kept
+  only when it is not 1 to n.
+- **`write`** writes every file back, byte-stable: same model, same bytes.
+- **`compare`** compares two feeds keyed and canonicalised per file (a blank
+  `location_type` is 0, `5:30:00` is `05:30:00`); a key given twice is told apart
+  by file order.
+
+What the shipped feeds do that the reference forbids is **kept, with a warning**,
+never dropped silently: kolkata_metro's 55 stops that are their own
+`parent_station`, a trip whose times go backwards (kolkata_metro, 53 in
+chennai_suburban), two stops of one trip with one `stop_sequence`
+(chennai_metro's 2,775 trips), a trip that calls at one stop (chennai_bus's
+150); tabs in bhubaneswar's names are text like any other. A value that cannot
+be read in an optional field leaves the cell out (chennai_metro's `-1:59:35`); a
+bad row of a record file leaves the row out (chennai_metro's pathway with
+`is_bidirectional` "1x"); either is a warning naming file, line and field, and
+the round trip expects it missing. A stop time with no time is an error (`untimed_stop_time`): the editor
+keeps a time at every stop.
+
+`gtfs_feed roundtrip --zip Z` reads, models, writes and compares one zip. **All 16
+shipped zips round-trip with 0 differences.** `gtfs_feed compare --a Z --b Z`
+compares any two.
+
+### 18.3 Schema - `0023_gtfs_full_spec.sql`
+
+- `gtfs_stop` gains `tts_stop_name`, `zone_id`, `stop_url`, `stop_timezone`,
+  `wheelchair_boarding`, `level_id`, `stop_access` and `sort_key` (the stop's line
+  in stops.txt: GIMS keeps the last of several stops that share a code, so the
+  order is data). `location_type` widens to 0-4; the CHECKs that allowed a parent
+  only on a stop and forbade a stop its own parent go, their rules becoming
+  findings (18.6) so kolkata_metro's self-parents load.
+- `gtfs_route` gains `route_desc`, `route_url`, `route_sort_order`,
+  `continuous_pickup`, `continuous_drop_off`, `network_id`, `sort_key`;
+  `gtfs_route_stop` gains `stop_sequence` (NULL is 1 to n), `continuous_*`,
+  `shape_dist_traveled` and the booking rule ids; `gtfs_trip` gains
+  `cars_allowed`; `gtfs_frequency.exact_times` may be NULL; a timing profile
+  needs one stop, not two (chennai_bus's one-stop trips).
+- `gtfs_feed.stops_scope`: `served` (the default; the loader serves the stops a
+  route calls at, as it always has) or `all` (every stop and station, which is
+  what the preprocessor emits for a feed built from its zip; a seed sets it).
+- 25 record tables, one per record file, generated from the spec: their fields
+  as columns, `row_id` for a file with no id of its own, a unique index on the
+  natural key (with `coalesce` for its nullable parts), `sort_key`,
+  `row_version`, `created_at`, `updated_at`, `updated_by`.
+- `gtfs_touch_row` bumps `row_version` on any table that has one (it used to
+  name its tables, so a new table would have silently lost optimistic locking);
+  `gtfs_change.entity` widens to the record entities.
+- One `gtfs_agency` row per existing feed, from `agency_name` and its routes'
+  usual `agency_id`. No URL or timezone is made up: the feed report says they
+  are missing (18.9), and a draft import fills them (18.8).
+
+No hard foreign keys point at stops, routes, trips or agencies - those are
+soft-deleted or replaced whole. References are checked as findings instead, a
+deleted row counting as missing. Safe to run twice; **apply it before the image
+that reads it**.
+
+### 18.4 The seed: a feed with no rows (`src/editor/feed_io.rs`)
+
+`import_zip` builds the model, then in one transaction takes the feed lock,
+refuses a feed with any row (soft-deleted ones included, `feed_not_empty`) or an
+open draft (`feed_has_open_drafts`), inserts every file in batches, reads the feed
+back through the exporter and compares it with the zip, and commits only if
+nothing differs. It sets `stops_scope = 'all'`, the feed's default timing, bumps
+the version and audits `seed` with the zip's sha256, the counts and the
+findings. A missing `gtfs_feed` row is made, named after the feed's agency
+(`display_name`; the publisher is often a city body that publishes several
+feeds - CUMTA publishes Chennai's bus and metro).
+
+`gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]` (a dry run without
+`--seed`), or `POST /feeds/{g}/import?seed=true` with the zip as the body (admin,
+64 MB). The report carries the feed report of the zip (18.9).
+
+### 18.5 Every record file through drafts (`src/editor/records.rs`)
+
+A change's `entity` is the file's singular name (`agency`, `level`, `pathway`,
+`transfer`, `fare_product`, `booking_rule`, ...) with `create`, `update` and
+`delete`; `feed_info` is the feed's one row, keyed by the gtfs_id; a `shape`
+sends its `points` whole. `after` holds GTFS field names and values; on an
+update an absent field is unchanged and `null` clears it. A create of a file
+with no id gets `row_id` `r_` + 10 hex when it is added. Every dispatch site of
+the change engine (shape check, keys, snapshot, conflicts, stops a change
+references, apply, preview, bulk) handles records first, and a test holds every
+entity the engine can see against those sites.
+
+Findings when the draft replays: `reference_not_found` (a field naming a row that
+does not exist once the draft applies), `record_in_use` (deleting a row others
+name, from the spec's reverse references), `duplicate_record` (a row saying what
+another says), the row rules of the file (`rules.rs`: a pathway's ends and
+bidirectional stairs, a transfer's type and the ids it needs, a timeframe's
+times, a fare transfer rule's limits, a booking rule's notice, a translation's
+target, an attribution's role, ...). As
+everywhere, what the live data already breaks is a warning, not a block.
+
+Reads: `GET /feeds/{g}/files` (every file and its row count), `GET
+/feeds/{g}/files/{file}?q&limit&cursor` (a file's rows in file order, `q`
+matching any value), `GET /feeds/{g}/files/{file}/{key}` (one row and what
+names it, `used_by`), `GET /change-sets/{id}/preview/files/{file}` (with the
+draft applied). Bulk kind `records` with `file` takes rows by their GTFS names,
+under the section 5 rules.
+
+### 18.6 Stops, routes, stop orders and trips carry every field
+
+- `stop/create` and `stop/update` take `tts_stop_name`, `zone_id`, `stop_url`,
+  `stop_timezone`, `wheelchair_boarding`, `level_id`, `stop_access`, and
+  `location_type` / `parent_station` under the reference's rules: an entrance
+  or node stands in a station, a boarding area on a platform
+  (`parent_wrong_type`), nothing is its own parent (`parent_is_itself`). A stop a
+  route calls at stays a stop (`stop_in_use`); a platform's station is still set
+  by a station change and a station still made by `station/create`
+  (`use_station_change`).
+- Only a stop (type 0) is a route stop, a station member or a merge side
+  (`not_a_stop`). `station/delete` refuses a station with entrances or nodes
+  (`station_has_entrances`); `station/update` detaches only its platforms.
+- `route/create` and `route/update` take `route_desc`, `route_url`,
+  `route_sort_order`, `continuous_*`, `network_id`, and an editable `agency_id`
+  (a finding when the feed has no such agency) and `route_type` (the basic types
+  and the extended 100-1702).
+- `route_stops` rows take `stop_sequence` (all or none of a stop order's served
+  rows, never decreasing), `continuous_*`, `shape_dist_traveled` and booking rule
+  ids; `route_trips` trips take `cars_allowed`, and in a feed that keeps its
+  shapes a trip's `shape_id` must be one (chennai_bus, whose shapes are drawn
+  elsewhere, is not checked).
+- Deleting what a record names is refused: a stop (`stop_in_use`), a route
+  (`route_in_use`), a service (`service_in_use`), a trip dropped from its route
+  (`trip_in_use`).
+- A stop merge and a station merge move the pathways, transfers, areas, location
+  group members and join rules naming the one that goes to the one kept (and a
+  stop merge its boarding areas), dropping a row that would then say what
+  another says.
+- Bulk `stops`, `routes`, `route_stops` and `route_trips` take the same columns.
+- The stop and route details, and the snapshot a change carries, have the fields
+  as `gtfs`, for the dashboard's forms and diffs.
+
+### 18.7 The GIMS loader (`src/services/gtfs_db_source.rs`)
+
+- A route is named by its own agency (`agency_id` looked up in `gtfs_agency`, as
+  the preprocessor looks it up), falling back to `gtfs_feed.agency_name`. Of the
+  shipped feeds only amsterdam has several.
+- `stops_scope = 'all'` serves every stop and station, not only those a route
+  calls at; never an entrance, node or boarding area. Stops are served in
+  `sort_key` order.
+- Split patterns - one stop order with different per-stop fields - are one
+  public pattern: the trips of both, in trip order, with the first trip's stops
+  and headsigns. A stored `stop_sequence` is served in the pattern and in
+  `/trip`.
+- chennai_bus is untouched: `stops_scope = 'served'`, its fare-stage headsigns,
+  and its trips from the preprocessed build until its `trips_source` flips.
+
+**Parity.** For the 14 feeds with a shipped zip and preprocessed output (amsterdam
+aside, for disk), GIMS serving the preprocessed build and GIMS serving the seeded
+tables (`data_source = trips_source = 'db'`) were compared endpoint by endpoint
+(`scripts/parity_gtfs_db.py --trips --all-routes`) and pattern by pattern
+(`examples/parity_gims.rs patterns`: 1,813 of 1,813 identical). Every difference
+is one the tables mean to make: the DB side serves what the preprocessed build
+leaves out - a route's colour (`color`), a stop's description (`description`,
+from `stop_desc`) and its platform label (`platform`, `platformCode`, from
+`platform_code`).
+
+### 18.8 A zip into a feed that has rows, through drafts (`src/editor/draft_import.rs`)
+
+The zip is read into the model a seed builds, with the feed's own default
+timing, and set beside the feed as its tables hold it. What differs becomes
+change sets, in two steps, because the second needs the first live:
+
+1. **Records and calendars**: every record file the zip has, as it has it (a
+   field it leaves out is cleared), its services, the splits its trips need (a
+   stop order the feed has, with other per-stop fields; a split's headsign is
+   never one the fare stage already gives), and the timing profiles. One set.
+2. **Trips**: once that set is committed, a `route_trips/replace` for every route
+   whose trips differ, at most 5,000 trips a set, a route never split.
+
+Stops, routes and the feed's own stop orders are compared and reported
+(`differences`), never written. A trip on the default timing carries only its
+start time, so a route whose one stop order in the zip the feed has otherwise
+gets its trips on the feed's first stop order (`moved`: a zip made before the
+stop order was edited says when the route runs, not where); any other route
+whose stop order the feed does not have keeps its trips, and is reported
+(`routes_left`), as is a route with trips the zip does not mention. A trip on
+the default timing keeps the explicit profile a seed gave that timing, so
+importing a seeded feed's own zip finds nothing to do. The changes are planned
+as uploads of the same rows are (`bulk::plan_into_set`) and each set is replayed
+as a review would; any error writes nothing.
+
+`gtfs_feed draft-import --db URL --zip Z --as EMAIL [--files F,F] [--write]`, or
+`POST /feeds/{g}/import?mode=drafts[&files=][&dry_run=false]` (admin; a dry run
+unless asked). Audited `gtfs_draft_import`.
+
+**chennai_bus, locally** (seeded from nandi's mapping, as master was, then the
+shipped zip): step 1 was 4 changes - the agency's URL, timezone and language,
+feed_info, the two services; step 2 was 11 sets of 52,606 trips. Committed, the
+feed exported again gives the zip's `agency`, `feed_info`, `calendar` and
+`trips` exactly, and the `stop_times` of the 3,811 routes whose stop order the
+editor has as the zip does; the 517 others differ only where the editor's stop
+order does. Run again, the import finds nothing to do.
+
+### 18.9 The feed report (`src/gtfs/validate.rs`)
+
+What a whole feed breaks of the reference, on the model a zip or the tables
+give, so one report reads a zip before it is imported and a feed as it stands:
+required files and fields; the row rules; every reference the spec names; a
+parent of the right type and a stop that is its own parent (a warning); pathways
+that end at a station; times and `shape_dist_traveled` that go backwards;
+services that never run, a feed none of whose services runs today or later, and
+feed_info's end date; several agencies sharing one timezone and named by every
+route; and, as warnings, what nothing uses - an agency, a route with no trips, a
+service, a shape, a level, a stop no stop order calls at. Counted by kind, with
+samples.
+
+`GET /feeds/{g}/validation` (viewer), `gtfs_feed validate (--zip Z | --db URL
+--gtfs-id G)`, and the seed's and the draft import's reports. On the shipped
+zips: kolkata_metro's 127 platforms whose parent is not a station (its 55
+self-parented stations) and one backward trip, chennai_suburban's 53 backward
+trips, and warnings for unused stops, routes, shapes and services and for
+feed_info dates past - chennai_metro (2025-07-17), kochi_metro, mumbai_suburban.
+
+### 18.10 Dashboard
+
+- **Files** (`#/files`): every file with its row count and whether the feed must
+  have it; a file's rows, paged and searched, live or with the draft applied;
+  one row as a form built from the spec (typed inputs, enums as choices,
+  references offered from the rows they may name) with what names it; add,
+  change and delete into the draft; a CSV of rows through the importer.
+- **Trips and timing** (`#/trips/{route}`, from the route panel): each stop
+  order's trips as a departure board by direction and service; add, remove and
+  shift departures, a run "every N minutes from ... until ...", headway windows;
+  beside the stops, the stop order's timing, whose minutes between stops make a
+  new timing or change one.
+- **Calendar** (`#/calendar`): services with their days, range, dates and trip
+  counts; add, change and delete.
+- **Feed** (`#/feed`): where the feed is served from, the GTFS zip the tables
+  give, the feed report, and for an admin a zip imported as a seed or as drafts,
+  previewed first.
+- The stop and route editors gain "More GTFS fields"; drafts show records, trip
+  lists (added, removed, changed), timings, services and stop orders as what
+  they change; Feed settings switch where trips come from; the importer takes
+  trips, timings, services and any record file.
+
+`dev/ui_e2e.mjs --only feed,files,gtfs_fields,trips,calendar` with
+`E2E_FEED=chennai_metro` runs one real flow per screen against a real GIMS and
+the local database, each drafted, approved and committed and checked in the
+database. `dev/mock_server.py` and `dev/ui_smoke.mjs` do not cover these screens
+yet: the smoke needs the master-copy sample, which the local database this was
+built on could not give.
+
+### 18.11 nandi: publishing from the tables
+
+On the nandi branch `feat/gtfs-exporter-release` (from `feat/editor-release-job`,
+local, not pushed), `scripts/chennai-bus/editor/release_from_db.sh` keeps its gate
+(the mapping, stop metadata and alias sidecar exported; nothing built when the
+feed version has not moved; `--mark-released` after) and builds with
+`editor/build_from_exporter.py` once the feed's `trips_source` is `db`, with the
+generator until then; `GTFS_RELEASE_BUILDER=exporter|generator` forces one. The
+builder runs `gtfs_feed export` (`GTFS_FEED_BIN`; the password reaches it through
+`PGPASSWORD`, never the command line), moves a service's or feed_info's start
+that is before today, and has not ended, to today - the rolling window the
+generator has always published - and packages and commits the files with the
+generator's own `package_and_commit_gtfs`. **The Jenkins image needs the
+`gtfs_feed` binary** (copied from the GIMS image) before chennai_bus's trips flip.
+
+### 18.12 Runbook: master, then prod
+
+1. `0023` on the database (after `0018`..`0022`), then the image. It does not
+   need `0022` (the release button's webhook columns), only to run after it
+   when both are applied, so the numbers stay in order.
+2. Each feed with no rows, one at a time: `gtfs_feed import --db URL --zip
+   nandi/assets/<feed>.gtfs.zip` (a dry run: the round trip must be empty and the
+   findings the expected ones), then again with `--seed`.
+3. chennai_bus: `gtfs_feed draft-import --db URL --zip ... --as <person>` - read
+   `differences` and `stop_orders` - then `--write`; approve and commit that set;
+   run it again with `--write` for the trip sets; approve and commit each. `gtfs_feed
+   export` then `gtfs_feed compare` against the shipped zip: differences only on
+   the routes the report called `moved`.
+4. Parity for each feed as 18.7, with its `data_source` and `trips_source`
+   pointed at the tables on a GIMS of its own.
+5. A `feed_config` draft per feed switches `data_source` to `db`, then another
+   `trips_source`, each approved and committed by a second person - never both at
+   once, and never for chennai_bus before its trip sets are committed and the
+   Jenkins image carries `gtfs_feed`.
+
+Going back is the same draft the other way.
+
+### 18.13 Known deviations, and what is not here
+
+- lat and lon stay NOT NULL for location types 3 and 4, which the reference lets
+  omit them: no shipped feed does, and every reader takes them as numbers.
+- A stop time with no time is refused at import (`untimed_stop_time`), and a
+  stop time calling at a Flex zone is a finding and not stored.
+- `stop_code` is not editable; a stop's code stays what it was seeded or created
+  with.
+- A draft import never writes stops, routes or the feed's own stop orders.
+- The MTC sync (16.8) is still to build.
+
+Settled while implementing:
+
+- Minted keys (`row_id`) are the column name for a file with no id of its own:
+  `translations.txt` has a field called `record_id`, so the column could not be.
+- JSON crosses sqlx as text (the `json` feature is off), and `serde_json`'s
+  `float_roundtrip` keeps a coordinate from moving one ulp on the way through.
+- A `location_type` left blank compares as 0, the reference's default and the
+  column's.
+- The seed and the draft import both set the feed's default timing before
+  building the model, so a trip on it stores no profile, or reuses the explicit
+  one a seed made.
+
+Tests: `src/gtfs/*` unit tests (the spec, reading, the model's patterns and
+warnings, byte-stable writing, the compare, the row rules, the feed report);
+`tests/gtfs_io_roundtrip.rs` (the fixture in `tests/support/gtfs_fixture.rs` -
+a row in every file of the reference and the awkward cases the shipped feeds
+have - round-trips; `#[ignore]`d, every `$NANDI_ASSETS/*.gtfs.zip`);
+`tests/editor_feed_io_flow.rs` (seed, refusals, audit, export);
+`tests/gtfs_db_full_spec_flow.rs` (the loader on a seeded feed);
+`tests/editor_records_flow.rs` (records through drafts, findings, conflicts,
+bulk, reads); `tests/editor_full_spec_flow.rs` (18.6, the details, the feed
+report); `tests/editor_draft_import_flow.rs` (both steps, splits, moved and left
+routes, a second run that does nothing, the endpoint) - all registered in
+`scripts/editor_flow_test.sh`.

@@ -124,6 +124,7 @@ fn clear_feed(feed: &str) -> Vec<String> {
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{feed}'"),
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{feed}' AND parent_station IS NOT NULL"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{feed}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{feed}'"),
     ]
 }
@@ -203,7 +204,7 @@ const VIEWER: &str = "viewer@editor-review-merge-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor review merge test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor review merge test feed', 'fare_stage')"
     ));
     // S and S2 sit 542 m east of the road their routes take between A and B,
     // where C - the same name - is; P and Q are back to back on R3
@@ -375,6 +376,14 @@ async fn review_merge_and_context() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }

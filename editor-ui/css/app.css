@@ -132,6 +132,10 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .chip.committed { background: var(--ok-tint); color: var(--ok); }
 .chip.rejected { background: var(--danger-tint); color: var(--danger); }
 .chip.discarded { background: #eceff0; color: var(--muted); }
+.chip.system-account { background: #eceff0; color: var(--muted); }
+/* People: one role picker per feed */
+table.people .feed-cell select { min-height: 30px; width: auto; font-size: var(--fs-s); }
+table.people .feed-col { white-space: nowrap; }
 
 .notice { padding: 10px 12px; border-left: 4px solid var(--rule-strong); background: var(--surface); font-size: var(--fs-s); }
 .notice.error { border-color: var(--danger); background: var(--danger-tint); }
@@ -151,16 +155,22 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .code-input { font-size: 26px !important; letter-spacing: .35em; text-align: center; max-width: 220px; }
 
 /* ------------------------------------------------------------ shell */
-.app { height: 100%; display: grid; grid-template-rows: var(--topbar-h) auto minmax(0, 1fr); }
+/* the top bar keeps one row while it fits and takes a second rather than
+   overflowing the window when it does not */
+.app { height: 100%; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
 .topbar {
-  display: flex; align-items: center; gap: 14px; padding: 0 14px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 14px;
+  min-height: var(--topbar-h);
   background: var(--surface); border-bottom: 1px solid var(--rule);
   /* above the map: Leaflet's controls are z-index 1000 inside .map-wrap */
   position: relative; z-index: 1100;
 }
 .brand { font-weight: 700; font-size: var(--fs-l); color: var(--ink); text-decoration: none; white-space: nowrap; }
-.feed-picker select { min-height: 34px; width: auto; }
-.search { position: relative; flex: 1 1 360px; max-width: 520px; }
+.feed-picker select { min-height: 34px; width: auto; max-width: 13rem; text-overflow: ellipsis; }
+/* the role this person holds on the feed chosen beside it (docs section 15) */
+.feed-picker { display: flex; align-items: center; gap: 6px; }
+.chip.feed-role { background: var(--action-tint); color: var(--action); }
+.search { position: relative; flex: 1 1 0; min-width: 150px; max-width: 520px; }
 .search-results {
   position: absolute; top: calc(100% + 4px); left: 0; right: 0; max-height: 70vh; overflow: auto;
   background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius);
@@ -178,11 +188,31 @@ code { font-size: .92em; background: var(--stage-tint); padding: 0 4px; border-r
 .nav a[aria-current="page"] { background: var(--stage-tint); }
 .nav a:hover { background: var(--action-tint); }
 .nav a { white-space: nowrap; }
+.nav { align-items: center; }
+/* a menu among the top bar's links (Feed data) */
+.nav-menu { position: relative; }
+.nav-menu summary {
+  list-style: none; cursor: pointer; padding: 6px 10px; border-radius: var(--radius);
+  font-weight: 700; font-size: var(--fs-s); white-space: nowrap;
+}
+.nav-menu summary::-webkit-details-marker { display: none; }
+.nav-menu summary::after { content: "▾"; margin-left: 3px; font-size: 11px; }
+.nav-menu summary:hover { background: var(--action-tint); }
+.nav-menu summary.current, .nav-menu[open] summary { background: var(--stage-tint); }
+.nav-menu-body {
+  position: absolute; left: 0; top: calc(100% + 6px); width: 280px; padding: 6px; display: grid; gap: 2px;
+  background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(20, 37, 42, .14);
+}
+.nav .nav-menu-body a { display: grid; gap: 1px; padding: 8px 10px; white-space: normal; }
+.nav .nav-menu-body a span { font-size: var(--fs-xs); color: var(--muted); font-weight: 400; }
 .nav-count {
   display: inline-block; min-width: 20px; margin-left: 4px; padding: 0 6px; border-radius: 999px;
   background: var(--draft-tint); color: var(--draft); font-size: var(--fs-xs); text-align: center;
 }
 .new-menu { position: relative; }
+/* New, the draft and the person keep to the right end of their row */
+.topbar .new-menu { margin-left: auto; }
 .new-menu summary { list-style: none; }
 .new-menu summary::-webkit-details-marker { display: none; }
 .new-menu summary::after { content: "▾"; margin-left: 2px; font-size: 11px; }
@@ -732,3 +762,28 @@ h1 .live-value, .title-block .live-value { display: block; font-weight: 400; whi
 .break { overflow-wrap: anywhere; word-break: break-word; }
 code.break { display: inline-block; max-width: 46ch; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ------------------------------------------------------------------ GTFS files, trips, calendar, feed (section 18) */
+.gtfs-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px 14px; }
+.gtfs-more { border: 1px solid var(--rule); border-radius: 8px; padding: 8px 12px; background: var(--surface); }
+.gtfs-more > summary { cursor: pointer; font-weight: 700; }
+.gtfs-more[open] > summary { margin-bottom: 8px; }
+.req { color: var(--danger); }
+.enum-other { display: flex; gap: 6px; }
+.files-group, .feed-section { margin-top: 20px; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 12px 0; }
+.file-table td, .board-table td, .report-table td, .timing-table td { vertical-align: top; }
+.file-table td { max-width: 18em; overflow-wrap: anywhere; }
+.record-form { display: grid; gap: 14px; margin-top: 12px; }
+.record-form textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+nav.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+button.tab { border: 1px solid var(--rule); background: var(--surface); border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; }
+button.tab[aria-pressed="true"] { background: var(--action); border-color: var(--action); color: #fff; }
+.board-group { margin: 12px 0; }
+.board-group h3 { margin: 0 0 6px; font-size: 15px; }
+.add-trips { display: grid; gap: 8px; margin-top: 16px; padding: 12px; border: 1px dashed var(--rule-strong); border-radius: 8px; }
+.timing { margin-top: 24px; }
+.timing-table input { width: 6em; }
+.report .samples { margin: 0; padding-left: 16px; font-size: 13px; color: var(--muted); }
+fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var(--rule); border-radius: 8px; padding: 8px 12px; }
+.calendar-table code { letter-spacing: 2px; }

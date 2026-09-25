@@ -55,5 +55,19 @@ export function leaveMessage() {
   }
 }
 
+// Roles are per feed (docs/gtfs-editor.md section 15): an admin is admin on
+// every feed; anyone else holds a feed only through a grant, listed by
+// /auth/me. Every badge and every disabled button asks about one feed - the
+// one chosen in the top bar, unless a page is about another (a draft opened
+// by its address).
 const RANK = { viewer: 0, editor: 1, approver: 2, admin: 3 };
-export const can = (role) => !!state.me && RANK[state.me.role] >= RANK[role];
+export const isAdmin = () => !!state.me && !!state.me.is_admin;
+export function feedRole(feedId = state.feedId) {
+  if (!state.me) return null;
+  if (state.me.is_admin) return "admin";
+  return (state.me.feeds || []).find((f) => f.gtfs_id === feedId)?.role || null;
+}
+export const can = (role, feedId = state.feedId) => {
+  const mine = feedRole(feedId);
+  return !!mine && RANK[mine] >= RANK[role];
+};
