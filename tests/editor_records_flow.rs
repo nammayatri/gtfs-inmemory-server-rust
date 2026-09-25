@@ -1,6 +1,6 @@
 //! Every GTFS file the editor keeps as records, edited through drafts
 //! (docs/gtfs-editor.md section 18), end to end against a real Postgres
-//! holding the editor schema (db/gtfs_editor/0001..0022):
+//! holding the editor schema (db/gtfs_editor/0001..0023):
 //!
 //! - a record is created, updated and deleted by a change; a file with no id
 //!   of its own gets a minted `r_` id; feed_info is the feed's one row; a

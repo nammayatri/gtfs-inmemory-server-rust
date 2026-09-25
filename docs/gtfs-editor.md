@@ -35,10 +35,10 @@ policy row that supersedes the dhall config (section 12.5), `0017` adds
 at all ("The headsign" below), `0018` adds per-feed access grants and system
 accounts (section 15), `0019` adds patterns, timing profiles, trips, frequencies
 and service calendars (section 16), `0020` the MTC sync's system account (section
-16.8), `0021` lets a map line come from GPS (section 17), `0022` holds every other
-file and field of the GTFS reference (section 18). All are safe to run twice.
-**`0012`, `0017` and `0022` go on a database before the build that reads
-them:** both the editor and the GIMS loader select those columns, so a DB feed
+16.8), `0021` lets a map line come from GPS (section 17), `0022` is the release
+button's (section 12.6), `0023` holds every other file and field of the GTFS
+reference (section 18). All are safe to run twice. **`0012`, `0017` and `0023`
+go on a database before the build that reads them:** both the editor and the GIMS loader select those columns, so a DB feed
 fails to load (and serves its preprocessed data) on a database without them.)
 
 ## 1. Data source per feed (GIMS loader)
@@ -3346,7 +3346,7 @@ keeps a time at every stop.
 shipped zips round-trip with 0 differences.** `gtfs_feed compare --a Z --b Z`
 compares any two.
 
-### 18.3 Schema - `0022_gtfs_full_spec.sql`
+### 18.3 Schema - `0023_gtfs_full_spec.sql`
 
 - `gtfs_stop` gains `tts_stop_name`, `zone_id`, `stop_url`, `stop_timezone`,
   `wheelchair_boarding`, `level_id`, `stop_access` and `sort_key` (the stop's line
@@ -3584,7 +3584,9 @@ generator's own `package_and_commit_gtfs`. **The Jenkins image needs the
 
 ### 18.12 Runbook: master, then prod
 
-1. `0022` on the database (after `0018`..`0021`), then the image.
+1. `0023` on the database (after `0018`..`0022`), then the image. It does not
+   need `0022` (the release button's webhook columns), only to run after it
+   when both are applied, so the numbers stay in order.
 2. Each feed with no rows, one at a time: `gtfs_feed import --db URL --zip
    nandi/assets/<feed>.gtfs.zip` (a dry run: the round trip must be empty and the
    findings the expected ones), then again with `--seed`.

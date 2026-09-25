@@ -54,7 +54,7 @@ pub struct StoredFrequency {
     pub start_s: i32,
     pub end_s: i32,
     pub headway_s: i32,
-    /// None: the feed left it blank (0022), which reads as 0. A stored 0 hashes
+    /// None: the feed left it blank (0023), which reads as 0. A stored 0 hashes
     /// exactly as it did before the column could be blank.
     pub exact_times: Option<i16>,
 }
@@ -79,7 +79,7 @@ pub struct StoredTrip {
     pub source: String,
     pub source_ref: Option<Value>,
     pub frequencies: Vec<StoredFrequency>,
-    /// GTFS `cars_allowed` (0022): left out of the hash when unset, so the
+    /// GTFS `cars_allowed` (0023): left out of the hash when unset, so the
     /// `base_trips_hash` of every draft made before it existed stays valid.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cars_allowed: Option<i16>,
