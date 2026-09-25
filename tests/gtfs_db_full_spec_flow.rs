@@ -1,7 +1,7 @@
 //! What GIMS serves from a feed imported whole into the editor's tables
 //! (docs/gtfs-editor.md section 18): the loader, on a feed seeded from a zip
 //! that uses every file of the reference, against a real Postgres holding the
-//! editor schema (db/gtfs_editor/0001..0022):
+//! editor schema (db/gtfs_editor/0001..0023):
 //!
 //! - a route is named by its own agency, as the preprocessor names it;
 //! - every stop and station is served (`stops_scope = 'all'`), in the order the

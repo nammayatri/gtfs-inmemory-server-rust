@@ -1,6 +1,6 @@
 //! A feed's whole GTFS into the editor's tables and back out
 //! (docs/gtfs-editor.md section 18), end to end against a real Postgres
-//! holding the editor schema (db/gtfs_editor/0001..0022):
+//! holding the editor schema (db/gtfs_editor/0001..0023):
 //!
 //! - every record table is the file the spec says it is: a column per field,
 //!   of the field's type;

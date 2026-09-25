@@ -1260,7 +1260,7 @@ pub async fn record_detail(
 
 // ---------------------------------------------------------------- the editor's own tables' GTFS fields
 
-/// Fields of stops.txt the stop changes set by their GTFS names since 0022:
+/// Fields of stops.txt the stop changes set by their GTFS names since 0023:
 /// each is a `gtfs_stop` column of the same name.
 pub const STOP_GTFS_FIELDS: &[&str] = &[
     "tts_stop_name",
@@ -1274,7 +1274,7 @@ pub const STOP_GTFS_FIELDS: &[&str] = &[
     "parent_station",
 ];
 
-/// Fields of routes.txt the route changes set by their GTFS names since 0022:
+/// Fields of routes.txt the route changes set by their GTFS names since 0023:
 /// each is a `gtfs_route` column of the same name.
 pub const ROUTE_GTFS_FIELDS: &[&str] = &[
     "route_desc",
@@ -1475,7 +1475,7 @@ pub(super) async fn route_findings(
         .map(|f| f.name)
         .filter(|f| after.get(f) != before.get(f))
         .collect();
-    // an agency_id is a reference only in a feed that keeps agencies (0022
+    // an agency_id is a reference only in a feed that keeps agencies (0023
     // gives every feed its one)
     let has_agencies: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM gtfs_agency WHERE gtfs_id = $1)")

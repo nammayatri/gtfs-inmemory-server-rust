@@ -1,6 +1,6 @@
 //! A GTFS zip brought into a feed that already has rows, through drafts
 //! (docs/gtfs-editor.md section 18), end to end against a real Postgres
-//! holding the editor schema (db/gtfs_editor/0001..0022):
+//! holding the editor schema (db/gtfs_editor/0001..0023):
 //!
 //! - the first step drafts what the trips need - the agency and feed_info as
 //!   the zip has them, a new service, and a split: a stop order the feed has,

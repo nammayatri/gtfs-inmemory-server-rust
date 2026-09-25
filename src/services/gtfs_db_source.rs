@@ -87,7 +87,7 @@ pub struct TripStop {
     pub lat: f64,
     pub lon: f64,
     /// The feed's own `stop_sequence` when it numbers its stops otherwise than
-    /// 1 to n (0022); None is the stop's position, from 1.
+    /// 1 to n (0023); None is the stop's position, from 1.
     pub sequence: Option<i32>,
 }
 
@@ -608,7 +608,7 @@ pub fn plan_feed_actions(
     out
 }
 
-/// The agency name a route is served with. A feed with agency rows (0022)
+/// The agency name a route is served with. A feed with agency rows (0023)
 /// names a route by its agency_id exactly as the preprocessor does - blank
 /// looks up the agency with no id, and an id with no agency names nothing; a
 /// feed without them keeps the one name `gtfs_feed.agency_name`.
@@ -639,7 +639,7 @@ struct ServedRow {
     /// 0 on a feed that has no fare stages (migration 0017).
     stage_no: i32,
     headsign: Option<String>,
-    /// The feed's own stop_sequence, when it is not the row's place (0022).
+    /// The feed's own stop_sequence, when it is not the row's place (0023).
     stop_sequence: Option<i32>,
 }
 
@@ -654,7 +654,7 @@ struct StopRow {
     platform_code: Option<String>,
     cluster_id: Option<String>,
     description: Option<String>,
-    /// The stop's line in the stops.txt it was imported from (0022).
+    /// The stop's line in the stops.txt it was imported from (0023).
     sort_key: Option<i32>,
 }
 
@@ -763,7 +763,7 @@ impl GtfsDbSource {
         let version: i64 = feed.try_get("version").map_err(db_err)?;
         let feed_agency: Option<String> = feed.try_get("agency_name").map_err(db_err)?;
         let all_stops = feed.try_get::<String, _>("stops_scope").map_err(db_err)? == "all";
-        // agency_id -> name (0022); a route is named by its own agency_id the
+        // agency_id -> name (0023); a route is named by its own agency_id the
         // way the preprocessor names it, and a feed with no agency rows keeps
         // the one name gtfs_feed has
         let mut agencies: HashMap<String, Option<String>> = HashMap::new();
@@ -1191,7 +1191,7 @@ impl GtfsDbSource {
             // patterns are the stop orders as the preprocessor groups them, by
             // their stops alone, so two stop orders that differ only in what a
             // stop time says besides its stop (a pickup, a headsign, a
-            // stop_sequence - 0022 keeps those apart) are one pattern. Its
+            // stop_sequence - 0023 keeps those apart) are one pattern. Its
             // stops and times are its first trip's, and its trips every trip of
             // either, in trip order, as the preprocessor meets them.
             let mut pattern_at: HashMap<i16, (u32, usize)> = HashMap::new();

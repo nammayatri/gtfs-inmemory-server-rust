@@ -571,11 +571,11 @@ async fn refuse_unless_empty(conn: &mut PgConnection, g: &str) -> EditorResult<(
     }
     for fspec in spec::FILES {
         let Some(table) = fspec.table() else { continue };
-        // the one agency 0022 gave every feed that existed is replaced by the
+        // the one agency 0023 gave every feed that existed is replaced by the
         // seed's, not a reason to refuse it
         let n: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM {table} WHERE gtfs_id = $1 \
-             AND ('{table}' <> 'gtfs_agency' OR updated_by IS DISTINCT FROM '0022_gtfs_full_spec')"
+             AND ('{table}' <> 'gtfs_agency' OR updated_by IS DISTINCT FROM '0023_gtfs_full_spec')"
         ))
         .bind(g)
         .fetch_one(&mut *conn)

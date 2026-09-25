@@ -576,7 +576,7 @@ SELECT f.gtfs_id,
                   WHERE r.gtfs_id = f.gtfs_id AND r.agency_id IS NOT NULL AND NOT r.deleted
                   GROUP BY r.agency_id ORDER BY count(*) DESC, r.agency_id LIMIT 1), ''),
        f.agency_name,
-       '0022_gtfs_full_spec'
+       '0023_gtfs_full_spec'
   FROM gtfs_feed f
  WHERE f.agency_name IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM gtfs_agency a WHERE a.gtfs_id = f.gtfs_id);

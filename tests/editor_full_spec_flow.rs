@@ -1,6 +1,6 @@
 //! The stops, routes, stop orders and trips the editor always kept, with the
 //! rest of their GTFS fields (docs/gtfs-editor.md section 18), end to end
-//! against a real Postgres holding the editor schema (db/gtfs_editor/0001..0022):
+//! against a real Postgres holding the editor schema (db/gtfs_editor/0001..0023):
 //!
 //! - a stop's zone, level, URL and accessibility, an entrance with its
 //!   station, a route's URL, order and agency, a stop order's own numbering
