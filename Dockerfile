@@ -63,6 +63,10 @@ WORKDIR /app
 
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/gtfs-routes-service /app/gtfs-routes-service
+# The GTFS editor's feed tool (docs/gtfs-editor.md section 18): import a feed's
+# zip into the editor tables, export one, compare or validate - run by hand from
+# a pod when feeds move to the tables; the server never calls it
+COPY --from=builder /app/target/release/gtfs_feed /app/gtfs_feed
 COPY --from=builder /app/assets /app/assets
 COPY --from=builder /app/dhall-configs /app/dhall-configs
 # GTFS editor dashboard: static files served at /internal/gtfs-editor/ui/
