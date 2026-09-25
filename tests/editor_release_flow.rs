@@ -169,6 +169,7 @@ async fn clear(pool: &PgPool) {
         format!("DELETE FROM gtfs_pod_feed_state WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_webhook_delivery WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_webhook WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
         format!(
             "DELETE FROM gtfs_editor_session WHERE user_id IN \
@@ -244,6 +245,18 @@ async fn user(pool: &PgPool, email: &str, role: &str) {
          ON CONFLICT (lower(email)) DO UPDATE SET role = $2, status = 'active'",
     )
     .bind(email)
+    .bind(role)
+    .execute(pool)
+    .await
+    .unwrap();
+    // since 0018 a member holds a feed through a grant on it, with this role
+    sqlx::query(
+        "INSERT INTO gtfs_editor_feed_access (user_id, gtfs_id, role) \
+         SELECT user_id, $2, $3 FROM gtfs_editor_user WHERE lower(email) = lower($1) \
+         ON CONFLICT (user_id, gtfs_id) DO UPDATE SET role = $3",
+    )
+    .bind(email)
+    .bind(FEED)
     .bind(role)
     .execute(pool)
     .await

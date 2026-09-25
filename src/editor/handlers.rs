@@ -1614,7 +1614,8 @@ pub async fn feed_release(
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
-    let ctx = auth::require(&req, &st, Role::Approver).await?;
+    // an approver on the feed, or an admin (section 15)
+    let ctx = auth::require_feed(&req, &st, &path, Role::Approver).await?;
     ok(webhooks::release(&st, &ctx, &path).await?)
 }
 

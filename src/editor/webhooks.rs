@@ -732,7 +732,7 @@ async fn release_state(
 /// The check and the insert share one transaction under the feed lock, so two
 /// clicks at once queue one release.
 pub async fn release(state: &EditorState, ctx: &Ctx, gtfs_id: &str) -> EditorResult<Value> {
-    ctx.require_role(Role::Approver)?;
+    ctx.require_feed_role(gtfs_id, super::auth::Role::Approver)?;
     let active = live_policy(state).await.policy.is_active();
     let mut tx = state.pool.begin().await?;
     super::feed_lock::lock_feed(&mut tx, gtfs_id).await?;
