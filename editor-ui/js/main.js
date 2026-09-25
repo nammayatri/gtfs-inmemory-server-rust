@@ -37,6 +37,9 @@ function applyMe(me) {
   set({ me, feeds, feedId: keep || feeds[0]?.gtfs_id || null });
   const select = document.getElementById("feed-select");
   select.replaceChildren(...feeds.map((f) => h("option", { value: f.gtfs_id, selected: f.gtfs_id === state.feedId }, f.display_name || f.gtfs_id)));
+  // the switcher is kept narrow; its whole name shows on hover
+  const chosen = feeds.find((f) => f.gtfs_id === state.feedId);
+  select.title = chosen ? `${chosen.display_name || chosen.gtfs_id} (${chosen.gtfs_id})` : "";
   renderAccess();
 }
 
@@ -108,15 +111,21 @@ async function boot() {
   route();
 }
 
-// The New menu: a small disclosure that closes on a choice, Escape or a click away.
+// The top bar's menus (New, Feed data): small disclosures that close on a
+// choice, Escape or a click away; opening one closes the others.
 function initNewMenu() {
-  const menu = document.getElementById("new-menu");
-  const close = () => { menu.open = false; };
-  menu.querySelectorAll("a").forEach((a) => a.addEventListener("click", close));
-  menu.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && menu.open) { close(); menu.querySelector("summary").focus(); }
-  });
-  document.addEventListener("click", (ev) => { if (menu.open && !menu.contains(ev.target)) close(); });
+  const menus = [document.getElementById("new-menu"), ...document.querySelectorAll(".nav-menu")];
+  for (const menu of menus) {
+    const close = () => { menu.open = false; };
+    menu.querySelectorAll("a").forEach((a) => a.addEventListener("click", close));
+    menu.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && menu.open) { close(); menu.querySelector("summary").focus(); }
+    });
+    menu.addEventListener("toggle", () => {
+      if (menu.open) menus.filter((m) => m !== menu).forEach((m) => { m.open = false; });
+    });
+    document.addEventListener("click", (ev) => { if (menu.open && !menu.contains(ev.target)) close(); });
+  }
 }
 
 async function chooseDraftAndGo() {
@@ -137,6 +146,10 @@ function markNav(name) {
   document.querySelectorAll("[data-nav]").forEach((a) => {
     if (a.dataset.nav === name) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
+  });
+  // a menu of the top bar reads as current when one of its pages is
+  document.querySelectorAll(".nav-menu").forEach((m) => {
+    m.querySelector("summary").classList.toggle("current", !!m.querySelector(`[data-nav="${name}"]`));
   });
 }
 
