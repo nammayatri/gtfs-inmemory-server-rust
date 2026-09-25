@@ -536,8 +536,8 @@ fn metres(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
-/// Every call a live (not deleted) route makes at `stop_id`, with the served
-/// stops either side. One statement; per call, key lookups only: the route, and
+/// Every call a live (not deleted) route makes at `stop_id` on its stop list
+/// (pattern 1, section 16), with the served stops either side. One statement; per call, key lookups only: the route, and
 /// one index range scan and one stop per side. The laterals keep it so on a
 /// feed the planner has no statistics for yet (a plain join there scanned the
 /// whole feed's stops for every call: 309 ms against 8 ms at 319 calls).
@@ -553,16 +553,18 @@ pub async fn calls(conn: &mut PgConnection, g: &str, stop_id: &str) -> EditorRes
          LEFT JOIN LATERAL ( \
              SELECT x.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop x \
              JOIN gtfs_stop s ON s.gtfs_id = x.gtfs_id AND s.stop_id = x.stop_id \
-             WHERE x.gtfs_id = t.gtfs_id AND x.route_id = t.route_id AND x.sequence < t.sequence \
+             WHERE x.gtfs_id = t.gtfs_id AND x.route_id = t.route_id AND x.pattern_key = t.pattern_key \
+               AND x.sequence < t.sequence \
                AND x.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
              ORDER BY x.sequence DESC LIMIT 1) p ON true \
          LEFT JOIN LATERAL ( \
              SELECT x.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop x \
              JOIN gtfs_stop s ON s.gtfs_id = x.gtfs_id AND s.stop_id = x.stop_id \
-             WHERE x.gtfs_id = t.gtfs_id AND x.route_id = t.route_id AND x.sequence > t.sequence \
+             WHERE x.gtfs_id = t.gtfs_id AND x.route_id = t.route_id AND x.pattern_key = t.pattern_key \
+               AND x.sequence > t.sequence \
                AND x.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
              ORDER BY x.sequence LIMIT 1) n ON true \
-         WHERE t.gtfs_id = $1 AND t.stop_id = $2 \
+         WHERE t.gtfs_id = $1 AND t.stop_id = $2 AND t.pattern_key = 1 \
          ORDER BY t.route_id, t.sequence",
     )
     .bind(g)
@@ -2283,6 +2285,11 @@ mod tests {
             marker_lon: stop.is_none().then_some(80.2),
             stop_name_override: stop.map(|s| format!("{s} ON THIS ROUTE")),
             provider_id: Some("7".into()),
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
+            stop_headsign: None,
+            ..Default::default()
         };
         let live = vec![
             row(Some("S"), "NEW STOP"),

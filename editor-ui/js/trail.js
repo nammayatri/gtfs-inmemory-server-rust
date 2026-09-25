@@ -35,14 +35,14 @@ function restore() {
 const ROOTS = [
   [/^#\/?$/, "Map"], [/^#\/coordinates$/, "Coordinates to review"], [/^#\/stations$/, "Stations to review"],
   [/^#\/drafts$/, "Drafts"], [/^#\/audit$/, "History"], [/^#\/admin$/, "People"], [/^#\/feed-settings$/, "Feed settings"],
-  [/^#\/import$/, "Import"],
+  [/^#\/import$/, "Import"], [/^#\/files$/, "GTFS files"], [/^#\/calendar$/, "Calendar"], [/^#\/feed$/, "Feed"],
 ];
 const rootLabel = (href) => (ROOTS.find(([re]) => re.test(place(href))) || [])[1] || null;
 
 // Words for a place before its page has loaded and named itself.
 function provisional(href) {
   const [, kind, id] = place(href).split("/").map(decodeURIComponent);
-  const word = { stop: "Stop", route: "Route", stations: "Suggested station", coordinates: "Coordinate review", drafts: "Draft", merge: "Merge", new: "New" }[kind];
+  const word = { stop: "Stop", route: "Route", stations: "Suggested station", coordinates: "Coordinate review", drafts: "Draft", merge: "Merge", new: "New", files: "File", trips: "Trips of" }[kind];
   return word ? `${word} ${id || ""}`.trim() : "Here";
 }
 

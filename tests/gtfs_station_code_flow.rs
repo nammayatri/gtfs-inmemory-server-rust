@@ -58,6 +58,7 @@ impl Caller<'_> {
         let r = match method {
             "GET" => test::TestRequest::get(),
             "POST" => test::TestRequest::post(),
+            "PUT" => test::TestRequest::put(),
             "PATCH" => test::TestRequest::patch(),
             _ => unreachable!(),
         }
@@ -180,6 +181,7 @@ fn clear_feed() -> Vec<String> {
              WHERE gtfs_id = '{FEED}' AND parent_station IS NOT NULL"
         ),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
     ]
 }
@@ -713,6 +715,14 @@ async fn a_station_code_answers_everywhere_a_stop_code_does() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &editor_app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }

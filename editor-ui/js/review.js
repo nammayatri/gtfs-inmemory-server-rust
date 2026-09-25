@@ -3,7 +3,7 @@
 // import), so its changes are filtered and paged, and maps are made only for
 // the changes on screen.
 import { get, post, del, enc, ApiError } from "./api.js";
-import { state, can } from "./state.js";
+import { state, can, isAdmin } from "./state.js";
 import {
   h, clear, toast, modal, confirmDialog, fmtDate, fmtCoord, fmtMetres, fmtCount, plural, haversine, decodePolyline,
   STATUS_LABEL, STOP_TYPE_LABEL, diffRows,
@@ -12,6 +12,8 @@ import * as map from "./map.js";
 import { useDraft, refreshDraft, chooseDraft } from "./drafts.js";
 import { pager } from "./importer.js";
 import { DATA_SOURCE_LABEL, OVERRIDE_CHIP_STYLE } from "./admin.js";
+import { loadSpec, cellText } from "./gtfs.js";
+import { daysText } from "./trips.js";
 
 const page = () => document.getElementById("page");
 const TABS = [
@@ -253,13 +255,25 @@ const KIND_LABEL = {
   "route:delete": ["route deleted", "routes deleted"], "route_stops:replace": ["stop list change", "stop list changes"],
   "station:create": ["new station", "new stations"], "station:update": ["station edit", "station edits"], "station:delete": ["station dissolved", "stations dissolved"],
   "station:merge": ["station merge", "station merges"],
-  "feed_config:update": ["feed data source switch", "feed data source switches"],
+  "feed_config:update": ["feed setting change", "feed setting changes"],
+  "route_trips:replace": ["trip list change", "trip list changes"],
+  "timing_profile:replace": ["timing change", "timing changes"], "timing_profile:delete": ["timing deleted", "timings deleted"],
+  "service:create": ["new service", "new services"], "service:update": ["service edit", "service edits"], "service:delete": ["service deleted", "services deleted"],
+  "pattern:update": ["stop order edit", "stop order edits"], "pattern:delete": ["stop order deleted", "stop orders deleted"],
 };
 const kindOf = (ch) => `${ch.entity}:${ch.op}`;
+// a GTFS file's rows (section 18) read as the file and what was done
+const recordWords = (key) => {
+  const [entity, op] = key.split(":");
+  const words = `${entity.replace(/_/g, " ")} row`;
+  return [`${words} ${OP_LABEL[op] || op}`, `${words}s ${OP_LABEL[op] || op}`];
+};
 const kindText = (key, n) => {
-  const [one, many] = KIND_LABEL[key] || [key, key];
+  const [one, many] = KIND_LABEL[key] || recordWords(key);
   return `${fmtCount(n)} ${n === 1 ? one : many}`;
 };
+// entity -> its file of the reference, for the files a draft's records are of
+let recordFiles = new Map();
 
 // what the page shows, kept while the same draft is open
 const pageState = { id: null, page: 1, filter: "all" };
@@ -286,6 +300,12 @@ export async function showDraft(id, { conflicts = null } = {}) {
     cs = await get(`change-sets/${enc(id)}`);
   } catch (e) {
     return clear(page(), h("div.page-inner", h("a", { href: "#/drafts" }, "All drafts"), h("p.notice.error", e.message)));
+  }
+  try {
+    const spec = await loadSpec();
+    recordFiles = new Map(spec.files.filter((f) => f.entity).map((f) => [f.entity, f]));
+  } catch {
+    /* without the spec a record reads by its entity's name */
   }
   if (state.draft && state.draft.change_set_id === cs.change_set_id && cs.status !== "draft") useDraft(null);
   const me = state.me;
@@ -350,7 +370,9 @@ export async function showDraft(id, { conflicts = null } = {}) {
     return h("button.btn", { type: "button", class: style, disabled: !!reason, "aria-describedby": reason ? bid : null, on: { click: onClick } }, label);
   };
   const actions = [];
-  const roleReason = (role) => (can(role) ? null : `Needs the ${role} role.`);
+  // the role on this draft's own feed: a draft opened by its address may be
+  // another feed's than the one in the top bar
+  const roleReason = (role) => (can(role, cs.gtfs_id) ? null : `Needs the ${role} role.`);
   const n = cs.changes.length;
   if (cs.status === "draft") {
     actions.push(button("Submit for review", {
@@ -361,7 +383,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
         }
       },
     }));
-    if (state.draft?.change_set_id !== cs.change_set_id && can("editor")) {
+    if (state.draft?.change_set_id !== cs.change_set_id && can("editor", cs.gtfs_id)) {
       actions.push(button("Edit in this draft", { style: "secondary", onClick: async () => { useDraft(cs); toast(`Edits now go into "${cs.title}".`); location.hash = "#/"; } }));
     }
   }
@@ -370,7 +392,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
     actions.push(button("Approve", { reason: reviewReason, onClick: () => withComment("Approve this draft", "Comment (optional)", false, "Approve", "approve", "Approved.") }));
     actions.push(button("Reject", { style: "danger", reason: reviewReason, onClick: () => withComment("Reject this draft", "What needs to change", true, "Reject", "reject", "Rejected. The author can reopen it.") }));
     // the admin override of maker-checker: never the main action, always confirmed
-    if (isSubmitter && me.role === "admin") {
+    if (isSubmitter && isAdmin()) {
       actions.push(h("button.btn.danger", { type: "button", id: "self-approve", on: { click: async () => {
         if (await confirmDialog("Approve your own draft?", "You submitted this draft. Approving it yourself skips the second reviewer. Continue?", { confirm: "Approve it myself", danger: true })) {
           act("approve", { self_approve: true }, "Approved by you, as an admin override. It is recorded in the history.");
@@ -380,7 +402,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
   }
   if (cs.status === "approved") {
     actions.push(button("Commit and go live", {
-      reason: roleReason("approver") || (isSubmitter && !(cs.self_approved && me.role === "admin") ? "You submitted this change, so someone else must commit it." : null),
+      reason: roleReason("approver") || (isSubmitter && !(cs.self_approved && isAdmin()) ? "You submitted this change, so someone else must commit it." : null),
       onClick: async () => {
         if (await confirmDialog("Commit this draft?", `The ${plural(n, "change")} go live for passengers within a minute. This is recorded in the history.`, { confirm: "Commit and go live" })) {
           act("commit", undefined, "Committed. The changes are live.");
@@ -389,11 +411,11 @@ export async function showDraft(id, { conflicts = null } = {}) {
     }));
   }
   if (["submitted", "rejected", "approved"].includes(cs.status)) {
-    actions.push(button("Reopen for editing", { style: "secondary", hideIfNot: true, reason: isAuthor || isSubmitter || me.role === "admin" ? null : "Only the person who started or submitted this draft, or an admin, can reopen it.",
+    actions.push(button("Reopen for editing", { style: "secondary", hideIfNot: true, reason: isAuthor || isSubmitter || isAdmin() ? null : "Only the person who started or submitted this draft, or an admin, can reopen it.",
       onClick: () => act("reopen", undefined, "Reopened as a draft.") }));
   }
   if (!["committed", "discarded"].includes(cs.status)) {
-    actions.push(button("Discard", { style: "danger", hideIfNot: true, reason: isAuthor || me.role === "admin" ? null : "Only the person who started this draft, or an admin, can discard it.",
+    actions.push(button("Discard", { style: "danger", hideIfNot: true, reason: isAuthor || isAdmin() ? null : "Only the person who started this draft, or an admin, can discard it.",
       onClick: async () => {
         const fromProposals = cs.changes.some((c) => c.entity === "station" && c.after && c.after.proposal_id);
         const fromReviews = cs.changes.some((c) => (c.after && c.after.position_review_id) || splitOf(cs, c));
@@ -420,7 +442,7 @@ export async function showDraft(id, { conflicts = null } = {}) {
     h("ul", list.slice(0, NOTICE_MAX).map((v) => h("li", v.message))),
     list.length > NOTICE_MAX ? h("p", `and ${fmtCount(list.length - NOTICE_MAX)} more. `, h("button.linklike", { type: "button", on: { click: showProblemChanges } }, "Show the changes with problems")) : null) : null);
 
-  const canRemove = cs.status === "draft" && can("editor");
+  const canRemove = cs.status === "draft" && can("editor", cs.gtfs_id);
   const changesBox = h("section.changes", { id: "draft-changes", "aria-label": "Changes" });
   const names = draftStopNames(cs);
 
@@ -479,7 +501,11 @@ function draftStopNames(cs) {
 }
 
 // ------------------------------------------------------------------ change views
-const ENTITY_LABEL = { stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station", feed_config: "Feed data source" };
+const ENTITY_LABEL = {
+  stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station", feed_config: "Feed settings",
+  route_trips: "Trips of route", timing_profile: "Timing of route", service: "Service", pattern: "Stop order of route",
+};
+const TIMETABLE = new Set(["route_trips", "timing_profile", "pattern"]);
 const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged" };
 
 // A stop the draft creates and puts on route stop lists in place of another stop,
@@ -509,13 +535,20 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   const reviewMerge = ch.entity === "stop" && ch.op === "merge" && a.position_review_id != null;
   const feedConfig = ch.entity === "feed_config";
   let title;
-  if (feedConfig) title = `Data source of feed ${ch.entity_key}`;
+  const record = !ENTITY_LABEL[ch.entity];
+  if (feedConfig) title = `Settings of feed ${ch.entity_key}`;
+  else if (record) title = `${(recordFiles.get(ch.entity) || {}).file || ch.entity} ${ch.entity_key || "(new row)"}`;
+  else if (TIMETABLE.has(ch.entity) || ch.entity === "service") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}`;
   else if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
   else if (ch.entity === "station" && ch.op === "merge") title = `Station ${(b.from && b.from.name) || ch.entity_key} merged`;
   else if (reviewMove) title = `Moved ${b.name || ch.entity_key} ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))}`;
   else if (ch.entity === "route_stops" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
   else title = `${ENTITY_LABEL[ch.entity]} ${a.name || b.name || ch.entity_key}`;
-  const link = feedConfig ? "#/feed-settings" : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
+  const link = feedConfig ? "#/feed-settings"
+    : record ? `#/files/${enc((recordFiles.get(ch.entity) || {}).file || ch.entity)}${ch.op === "create" ? "" : `/${enc(ch.entity_key)}`}`
+      : TIMETABLE.has(ch.entity) ? `#/trips/${enc(ch.entity_key)}`
+        : ch.entity === "service" ? "#/calendar"
+          : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
     : ch.op === "merge" ? `#/stop/${enc(a.into_station_id || a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
   const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
@@ -555,6 +588,11 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   else if (ch.entity === "route" && ch.op === "delete") body = h("p", `Route ${b.short_name || ch.entity_key} is deleted: it no longer appears in the feed.`);
   else if (ch.entity === "route") body = routeDiff(ch);
   else if (ch.entity === "route_stops") body = rowsDiff(ch, cs, names);
+  else if (ch.entity === "route_trips") body = tripsDiff(ch);
+  else if (ch.entity === "timing_profile") body = timingDiff(ch);
+  else if (ch.entity === "service") body = serviceDiff(ch);
+  else if (ch.entity === "pattern") body = h("p", ch.op === "delete" ? `Stop order ${(ch.after || {}).pattern_key} of route ${ch.entity_key} is deleted, with its timings.` : `Stop order ${(ch.after || {}).pattern_key} of route ${ch.entity_key}: ${JSON.stringify(ch.after)}`);
+  else if (record) body = recordDiff(ch);
   else body = stationDiff(ch);
   const showOpen = !(ch.op === "delete" && ch.entity === "stop") && !(ch.op === "create" && ch.entity === "station" && cs.status !== "committed");
   return h("article.change",
@@ -569,16 +607,31 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
       body));
 }
 
-// Which data GIMS serves the feed from. Nothing moves until the draft is committed.
+// Which data GIMS serves the feed from, and its other settings. Nothing moves
+// until the draft is committed.
+const SETTING_LABEL = {
+  data_source: "Served from", trips_source: "Trips served from", default_run_s: "Default time between stops (s)",
+  default_dwell_s: "Default time at a stop (s)", schedule_sync: "Schedule sync", sync_running_times: "Sync running times",
+};
 function feedConfigDiff(ch, cs) {
   const b = ch.before || {}, a = ch.after || {};
-  const label = (v) => DATA_SOURCE_LABEL[v] || v || "(unknown)";
+  const label = (k, v) => (k.endsWith("_source") ? DATA_SOURCE_LABEL[v] || v || "(unknown)" : v === undefined || v === null ? "(unknown)" : String(v));
   return h("div", { style: "display:grid;gap:10px" },
     h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))),
-      h("tbody", h("tr", h("th", "Served from"), h("td.before", label(b.data_source)), h("td.after", label(a.data_source))))),
+      h("tbody", Object.keys(a).map((k) => h("tr", h("th", SETTING_LABEL[k] || k), h("td.before", label(k, b[k])), h("td.after", label(k, a[k])))))),
     h("p.notice", cs.status === "committed"
       ? "Committed. Every GIMS server picked the new data source up within seconds."
       : "GIMS keeps serving this feed as it does now until this draft is submitted, approved by someone else and committed."));
+}
+
+// A stop's or route's GTFS fields a change sets (section 18); the before is the
+// `gtfs` the change's snapshot carries.
+const STOP_GTFS_DIFF = ["tts_stop_name", "zone_id", "stop_url", "stop_timezone", "wheelchair_boarding", "level_id", "stop_access", "location_type", "parent_station"];
+const ROUTE_GTFS_DIFF = ["route_desc", "route_url", "route_sort_order", "continuous_pickup", "continuous_drop_off", "network_id", "agency_id", "route_type"];
+function gtfsRows(before, after, fields) {
+  const was = (before && before.gtfs) || before || {};
+  return fields.filter((k) => after && k in after && cellText(after[k]) !== cellText(was[k])).map((k) =>
+    h("tr", h("th", h("code", k)), h("td.before", cellText(was[k]) || "(empty)"), h("td.after", cellText(after[k]) || "(empty)")));
 }
 
 function fieldRows(before, after, fields) {
@@ -627,7 +680,7 @@ function stopDiff(ch) {
   const movedPos = b && a.lat != null && (a.lat !== b.lat || a.lon !== b.lon);
   const rows = fieldRows(b, a, [
     ["name", "Name"], ["platform_code", "Platform"], ["description", "Description"], ["regional_name", "Tamil name"], ["cluster_id", "Cluster"],
-  ]);
+  ]).concat(gtfsRows(b, a, STOP_GTFS_DIFF));
   if (movedPos) {
     rows.push(h("tr", h("th", "Position"), h("td.before", `${fmtCoord(b.lat)}, ${fmtCoord(b.lon)}`),
       h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)} (moved ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))})`)));
@@ -724,7 +777,7 @@ function routeCreateDiff(ch, cs) {
 
 function routeDiff(ch) {
   const b = ch.before || {}, a = ch.after || {};
-  const rows = fieldRows(b, a, [["short_name", "Route number"], ["long_name", "Route name"], ["color", "Colour"]]);
+  const rows = fieldRows(b, a, [["short_name", "Route number"], ["long_name", "Route name"], ["color", "Colour"]]).concat(gtfsRows(b, a, ROUTE_GTFS_DIFF));
   const lineChanged = a.encoded_polyline && a.encoded_polyline !== b.encoded_polyline;
   if (lineChanged) rows.push(h("tr", h("th", "Map line"), h("td.before", b.encoded_polyline ? "saved line" : "none"), h("td.after", `new line (${a.polyline_source || "source unknown"})`)));
   const table = h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows));
@@ -801,6 +854,76 @@ function rowsDiff(ch, cs, draftNames) {
   return h("div", { style: "display:grid;gap:8px" },
     h("p", `${plural(before.length, "stop")} before, ${after.length} after: ${summary}.`),
     h("ol.rowdiff", items));
+}
+
+// A row of a GTFS file (section 18): its fields as added, or before and after.
+function recordDiff(ch) {
+  const a = ch.after || {}, b = ch.before || {};
+  const show = (v) => (cellText(v) === "" ? "(empty)" : cellText(v));
+  if (ch.op === "delete") return h("p", `The row is deleted${Object.keys(b).length ? `: ${Object.entries(b).filter(([k, v]) => v !== null && k !== "row_version").slice(0, 6).map(([k, v]) => `${k} ${cellText(v)}`).join(", ")}` : ""}.`);
+  const keys = Object.keys(a).filter((k) => k !== "points");
+  const rows = keys.map((k) => h("tr", h("th", h("code", k)), ch.op === "create" ? null : h("td.before", show(b[k])), h("td.after", show(a[k]))));
+  if (a.points) rows.push(h("tr", h("th", "points"), ch.op === "create" ? null : h("td.before", plural((b.points || []).length, "point")), h("td.after", plural(a.points.length, "point"))));
+  return h("table.diff-table",
+    h("thead", h("tr", h("th", ""), ch.op === "create" ? null : h("th", "Before"), h("th", ch.op === "create" ? "Value" : "After"))),
+    h("tbody", rows));
+}
+
+// A route's trip list: what the replace adds, removes and changes.
+function tripsDiff(ch) {
+  const before = Array.isArray(ch.before) ? ch.before : [];
+  const after = (ch.after && ch.after.trips) || [];
+  const byId = new Map(before.map((t) => [t.trip_id, t]));
+  const kept = new Set();
+  const same = (x, y) => ["start_time", "service_id", "pattern_key", "profile_key", "headsign", "direction_id"].every((k) => cellText(x[k]) === cellText(y[k]))
+    && JSON.stringify(x.frequencies || []) === JSON.stringify(y.frequencies || []);
+  const added = [], changed = [];
+  after.forEach((t) => {
+    const was = t.trip_id ? byId.get(t.trip_id) : null;
+    if (!was) added.push(t);
+    else {
+      kept.add(t.trip_id);
+      if (!same(was, t)) changed.push([was, t]);
+    }
+  });
+  const removed = before.filter((t) => !kept.has(t.trip_id));
+  const line = (t) => `${String(t.start_time || "").slice(0, 5)} ${t.service_id}${t.trip_id ? ` (${t.trip_id})` : ""}`;
+  const list = (items, fmt) => h("ul", items.slice(0, 20).map((x) => h("li", fmt(x))), items.length > 20 ? h("li.hint", `and ${fmtCount(items.length - 20)} more`) : null);
+  return h("div", { style: "display:grid;gap:8px" },
+    h("p", `${plural(before.length, "trip")} before, ${plural(after.length, "trip")} after.`),
+    added.length ? [h("h4", `Added (${fmtCount(added.length)})`), list(added, line)] : null,
+    removed.length ? [h("h4", `Removed (${fmtCount(removed.length)})`), list(removed, line)] : null,
+    changed.length ? [h("h4", `Changed (${fmtCount(changed.length)})`), list(changed, ([x, y]) => `${line(x)} → ${line(y)}`)] : null,
+    !added.length && !removed.length && !changed.length ? h("p.hint", "The trips are the same; their order or details the board does not show changed.") : null);
+}
+
+// A timing: the minutes between stops, before and after.
+function timingDiff(ch) {
+  const a = ch.after || {}, b = ch.before || {};
+  if (ch.op === "delete") return h("p", `Timing ${a.profile_key} of stop order ${a.pattern_key} is deleted.`);
+  const hops = (p) => (p && p.arrival_s ? p.arrival_s.map((x, i) => (i === 0 ? 0 : x - p.departure_s[i - 1])) : []);
+  const total = (p) => (p && p.arrival_s && p.arrival_s.length ? Math.round(p.arrival_s[p.arrival_s.length - 1] / 60) : null);
+  const ha = hops(a), hb = hops(b);
+  return h("div", { style: "display:grid;gap:8px" },
+    h("p", `${a.profile_key ? `Timing ${a.profile_key}` : "A new timing"} of stop order ${a.pattern_key || 1}${a.label ? `, "${a.label}"` : ""}: ${plural(ha.length, "stop")}, ${total(a)} minutes end to end${total(b) !== null ? ` (was ${total(b)})` : ""}.`),
+    h("table.diff-table", h("thead", h("tr", h("th", "Stop"), hb.length ? h("th", "Minutes before") : null, h("th", "Minutes after"))),
+      h("tbody", ha.map((x, i) => i === 0 ? null : h("tr", h("th", String(i + 1)), hb.length ? h("td.before", String(Math.round((hb[i] ?? 0) / 6) / 10)) : null, h("td.after", String(Math.round(x / 6) / 10)))))));
+}
+
+// A service: its days, range and dates.
+function serviceDiff(ch) {
+  const a = ch.after || {}, b = ch.before || {};
+  if (ch.op === "delete") return h("p", `Service ${ch.entity_key} is deleted.`);
+  const days = (x) => (x.days ? daysText(x.days) : "");
+  const rows = [
+    ["Days", days(b), a.days ? days({ days: { ...(b.days || {}), ...a.days } }) : undefined],
+    ["From", b.start_date, a.start_date],
+    ["To", b.end_date, a.end_date],
+    ["Label", b.label, a.label],
+    ["Dates", b.dates ? plural(b.dates.length, "date") : "", a.dates ? plural(a.dates.length, "date") : undefined],
+  ].filter(([, , after]) => after !== undefined);
+  return h("table.diff-table", h("thead", h("tr", h("th", ""), ch.op === "create" ? null : h("th", "Before"), h("th", "After"))),
+    h("tbody", rows.map(([k, x, y]) => h("tr", h("th", k), ch.op === "create" ? null : h("td.before", cellText(x) || "(none)"), h("td.after", cellText(y) || "(none)")))));
 }
 
 function stationDiff(ch) {

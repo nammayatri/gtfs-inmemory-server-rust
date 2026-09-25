@@ -82,6 +82,21 @@ macro_rules! call {
     }};
 }
 
+/// A feed's config in read shape carries its trips settings (section 16);
+/// this test's feed has the defaults.
+fn with_trip_settings(mut v: Value) -> Value {
+    for (k, d) in [
+        ("trips_source", json!("preprocessed")),
+        ("default_run_s", json!(120)),
+        ("default_dwell_s", json!(15)),
+        ("schedule_sync", json!("none")),
+        ("sync_running_times", json!(false)),
+    ] {
+        v[k] = d;
+    }
+    v
+}
+
 fn code_of(v: &Value) -> &str {
     v["error"]["code"].as_str().unwrap_or("")
 }
@@ -125,6 +140,7 @@ async fn clear(pool: &PgPool) {
     for stmt in [
         format!("DELETE FROM gtfs_change_set WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{FEED}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{FEED}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{FEED}'"),
         format!(
             "DELETE FROM gtfs_editor_session WHERE user_id IN \
@@ -277,13 +293,34 @@ async fn feed_config_goes_through_a_draft() {
     .execute(&pool)
     .await
     .unwrap();
+    // since 0018 a member works on a feed only through a grant on it
+    for (email, role) in others {
+        let id = users["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["email"] == email)
+            .unwrap()["user_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
+        );
+        assert_eq!(s, 200, "{b}");
+    }
     let before = audit_high_water(&pool).await;
     let config = |c: &Caller| c.req("GET", &format!("/feeds/{FEED}/config"));
     let (s, b, _) = call!(&app, config(&viewer));
     assert_eq!(s, 200, "{b}");
     assert_eq!(
         b,
-        json!({"gtfs_id": FEED, "data_source": "preprocessed", "version": 1, "pending": []})
+        with_trip_settings(
+            json!({"gtfs_id": FEED, "data_source": "preprocessed", "version": 1, "pending": []})
+        )
     );
 
     // Nothing writes the data source directly any more.
@@ -382,7 +419,7 @@ async fn feed_config_goes_through_a_draft() {
     );
     assert_eq!(
         change["before"],
-        json!({"gtfs_id": FEED, "data_source": "preprocessed", "version": 1})
+        with_trip_settings(json!({"gtfs_id": FEED, "data_source": "preprocessed", "version": 1}))
     );
     assert_eq!(change["after"], json!({"data_source": "db"}));
     assert!(change["base_row_version"].is_null(), "{change}");
@@ -390,7 +427,8 @@ async fn feed_config_goes_through_a_draft() {
     assert_eq!(
         b["pending"],
         json!([{"change_set_id": set, "change_set_title": "serve the feed from the database",
-                "status": "draft", "change_id": same, "data_source": "db"}])
+                "status": "draft", "change_id": same, "data_source": "db",
+                "after": {"data_source": "db"}}])
     );
     // a second switch in the same draft is judged after the first: back to
     // what is live is a switch, to 'db' again is not
@@ -458,7 +496,9 @@ async fn feed_config_goes_through_a_draft() {
     let (_, b, _) = call!(&app, config(&viewer));
     assert_eq!(
         b,
-        json!({"gtfs_id": FEED, "data_source": "db", "version": 2, "pending": []})
+        with_trip_settings(
+            json!({"gtfs_id": FEED, "data_source": "db", "version": 2, "pending": []})
+        )
     );
     let (_, feeds, _) = call!(&app, viewer.req("GET", "/feeds"));
     let listed = feeds["items"]

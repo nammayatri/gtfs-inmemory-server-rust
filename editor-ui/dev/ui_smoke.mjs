@@ -4,6 +4,7 @@
 //   python dev/mock_server.py &            # port 8765, fresh state for every run
 //   node dev/ui_smoke.mjs [--shots /tmp/gtfs-editor-shots]
 //   node dev/ui_smoke.mjs --station-merge    # only the merge-two-stations screen
+//   node dev/ui_smoke.mjs --feed-access      # only who may work on which feed
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -14,7 +15,8 @@
 // stops; coordinates to review (the list, a move by suggestion, raw point, map
 // click and drag, position is correct and reopen, splitting routes off a stop
 // with routes from three original stops and its draft conflict, a stop merged
-// away); importing CSV files into a draft of 1,200 changes; submit, approve and
+// away); importing CSV files into a draft of 1,200 changes, which the API answers
+// 200 at a time and the dashboard pages through; submit, approve and
 // commit by a second person, a commit conflict, people and history; a feed's
 // data source switched through a draft, approved by the admin who submitted it
 // (the override, its confirm, badge and history row); the "Stations to review"
@@ -22,11 +24,14 @@
 // (round4Flows below; `--round4` runs only those): what the map shows, stops
 // sharing a point, stations listed once, undo and redo, the trail, the cleanup
 // context, candidates and merge on a review, and pending changes shown on the
-// pages they change. Last the round 5 flows (round5Flows; `--round5`): the lines
+// pages they change. Then the round 5 flows (round5Flows; `--round5`): the lines
 // that tie a station to its platforms, a description and a platform label on
 // stops and stations, and importing stop details. Then the map line flows
 // (mapLineFlows; `--map-line`): a line through the stops and from GPS, and the
-// reason when either fails.
+// reason when either fails. Last, who may work on which feed (feedAccessFlows;
+// `--feed-access`): a system account at the gate, the no-feeds screen, the
+// switcher, badges and buttons by the role on the chosen feed, the People grid,
+// and a grant taken away while the page is open.
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1590,6 +1595,146 @@ if (process.argv.includes("--station-merge")) {
 }
 // ====================================================================== end of the station merge
 
+// ====================================================================== feed access
+// docs section 15: who may work on which feed. The mock's fixture
+// (seed_feed_access): a second, small feed; every member granted the first feed
+// at their role; a member who is a viewer on the first feed and an editor on
+// the second; one with no feed at all; and a system account.
+// `node dev/ui_smoke.mjs --feed-access` runs only these, on a fresh mock.
+async function feedAccessFlows() {
+  const fx = (await evaluate(`fetch("/__dev/state").then((r) => r.json())`)).feed_access;
+  if (!check(!!fx && !!fx.second_feed, "the mock has the feed-access fixture")) return;
+  const toastSays = (words) => waitFor(`[...document.querySelectorAll("#toasts .toast")].some((t) => t.textContent.includes(${JSON.stringify(words)}))`, `a toast saying "${words}"`);
+  const grant = (email, gtfsId, role) => evaluate(`fetch("/__dev/grant", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(${JSON.stringify({ email, gtfs_id: gtfsId, role })}) }).then((r) => r.json())`);
+  const role = () => evaluate(`document.getElementById("feed-role").hidden ? "" : document.getElementById("feed-role").textContent`);
+
+  // ---- a system account is refused at the gate
+  await actAs(fx.system);
+  await waitFor(`document.body.innerText.includes("Your editor access is turned off")`, "the gate refuses the system account");
+  check(await evaluate(`document.getElementById("app").hidden`), "a system account never reaches the dashboard");
+
+  // ---- no feed: a screen that says so, not an empty dashboard
+  await signIn(fx.no_feeds);
+  await waitFor(`!!document.getElementById("no-feeds")`, "the no-feeds screen");
+  check((await text("#page")).includes("You have no feeds yet — ask an admin"), "a member with no feeds is told to ask an admin");
+  check(await evaluate(`["feed-picker", "search", "nav"].every((c) => document.querySelector("." + c).hidden) && document.getElementById("new-menu").hidden`),
+    "no switcher, search, pages or New menu without a feed");
+  check((await evaluate(`document.getElementById("user-role").textContent`)).endsWith("no feeds yet"), "the account menu says there are no feeds yet");
+  await shot("fa-01-no-feeds");
+
+  // ---- the switcher lists the feeds granted, and badges and buttons read the chosen one
+  await signIn(fx.second_editor);
+  const options = await evaluate(`[...document.querySelectorAll("#feed-select option")].map((o) => o.value)`);
+  const first = options.find((o) => o !== fx.second_feed);
+  check(options.length === 2 && options.includes(fx.second_feed) && !!first, `the switcher lists the member's two feeds (${options.join(", ")})`);
+  if (await evaluate(`document.getElementById("feed-select").value`) !== first) await choose("#feed-select", first);
+  await waitFor(`document.getElementById("feed-role").textContent === "Viewer"`, "the badge reads viewer on the first feed");
+  check(await evaluate(`document.getElementById("new-menu").hidden`), "a viewer on this feed gets no New menu");
+  check((await evaluate(`document.getElementById("user-role").textContent`)).includes("viewer on"), "the account menu says viewer on this feed");
+  await go("#/drafts");
+  await waitFor(`document.getElementById("page").innerText.includes("Drafts")`, "drafts as a viewer");
+  check(!(await text("#page")).includes("Start or open a draft"), "a viewer on this feed cannot start a draft");
+  await choose("#feed-select", fx.second_feed);
+  await waitFor(`document.getElementById("feed-role").textContent === "Editor"`, "the badge reads editor on the second feed");
+  check(!(await evaluate(`document.getElementById("new-menu").hidden`)), "an editor on this feed gets the New menu");
+  await go("#/drafts");
+  await waitFor(`document.getElementById("page").innerText.includes("Start or open a draft")`, "an editor on this feed can start a draft");
+  check(await evaluate(`document.querySelector('[data-nav="admin"]').offsetParent === null`), "a member never sees People");
+  await shot("fa-02-second-feed");
+
+  // ---- admin: one row per person, one column per feed
+  await signIn("admin@nammayatri.in");
+  check(await role() === "Admin", "an admin's badge reads admin");
+  await go("#/admin");
+  await waitFor(`!!document.querySelector("table.people tbody tr")`, "the people grid");
+  const cols = await evaluate(`[...document.querySelectorAll("table.people th.feed-col")].map((th) => th.title)`);
+  check(cols.includes(first) && cols.includes(fx.second_feed), `one column per feed (${cols.join(", ")})`);
+  const row = (email) => `tr[data-email="${email}"]`;
+  check(await evaluate(`(() => { const tr = document.querySelector(${JSON.stringify(row(fx.system))});
+    return !!tr && tr.innerText.includes("System account") && tr.querySelector(".admin-switch").disabled; })()`),
+  "a system account is labelled as such, and can never be made an admin");
+  check(await evaluate(`document.querySelector(${JSON.stringify(`${row("admin@nammayatri.in")} .admin-switch`)}).disabled`), "an admin cannot switch off their own admin access");
+  check(await evaluate(`[...document.querySelectorAll(${JSON.stringify(`${row("admin@nammayatri.in")} td.feed-cell`)})].every((td) => td.innerText.includes("Every role") && !td.querySelector("select"))`),
+    "an admin's feed cells say they hold every role");
+  const picker = `${row(fx.no_feeds)} select[data-feed="${fx.second_feed}"]`;
+  check(await evaluate(`document.querySelector(${JSON.stringify(picker)}).value === ""`), "a member with no feed shows No access in every cell");
+  await choose(picker, "approver");
+  await toastSays("is now approver on");
+  let nf = (await api("users")).items.find((u) => u.email === fx.no_feeds);
+  check(nf.feeds.length === 1 && nf.feeds[0].gtfs_id === fx.second_feed && nf.feeds[0].role === "approver" && nf.feeds[0].granted_by_email === "admin@nammayatri.in",
+    "the cell's picker gives the grant");
+  await waitFor(`document.querySelector(${JSON.stringify(picker)})?.value === "approver"`, "the grid shows the grant");
+  await shot("fa-03-people-grid");
+  await choose(picker, "");
+  await toastSays("no longer has");
+  nf = (await api("users")).items.find((u) => u.email === fx.no_feeds);
+  check(nf.feeds.length === 0, "No access takes the grant away");
+
+  // the Admin switch, both ways, behind a confirm
+  await waitFor(`!!document.querySelector(${JSON.stringify(`${row(fx.no_feeds)} .admin-switch`)})`, "the admin switch");
+  await clickSel(`${row(fx.no_feeds)} .admin-switch`, "the Admin switch");
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("every feed at every role")`, "the confirm says what an admin can do");
+  await click("Make admin", "dialog");
+  await toastSays("is now an admin");
+  nf = (await api("users")).items.find((u) => u.email === fx.no_feeds);
+  check(nf.is_admin === true && nf.feeds.length === 0, "the switch makes an admin");
+  await waitFor(`[...document.querySelectorAll(${JSON.stringify(`${row(fx.no_feeds)} td.feed-cell`)})].every((td) => td.innerText.includes("Every role"))`, "the new admin's row holds every role");
+  await clickSel(`${row(fx.no_feeds)} .admin-switch`, "the Admin switch again");
+  await waitFor(`document.querySelector("dialog")?.innerText.includes("no feed at all until you give them some")`, "the confirm says a demoted admin keeps no feed");
+  await click("Remove admin access", "dialog");
+  await toastSays("is no longer an admin");
+  nf = (await api("users")).items.find((u) => u.email === fx.no_feeds);
+  check(nf.is_admin === false && nf.feeds.length === 0, "the switch takes admin away, and leaves no feed");
+
+  // the feed's history says who was let in and out
+  await choose("#feed-select", fx.second_feed);
+  await go("#/audit");
+  await waitFor(`document.body.innerText.includes("Let someone into this feed")`, "history of the second feed");
+  const history = await text("#page");
+  check(history.includes("Took someone's access to this feed away") && history.includes(`${fx.no_feeds}: approver → no access`),
+    "the feed's history names the grant and its revocation");
+
+  // ---- the only feed is preselected
+  await grant(fx.second_editor, first, null);
+  await signIn(fx.second_editor);
+  check(await evaluate(`document.querySelectorAll("#feed-select option").length === 1 && document.getElementById("feed-select").value === ${JSON.stringify(fx.second_feed)}`),
+    "a member with one feed has it chosen");
+  check(await role() === "Editor", "and the badge reads their role there");
+
+  // ---- a grant taken away while the page is open: the next call says so, and the page follows
+  await grant(fx.second_editor, fx.second_feed, null);
+  await go("#/drafts");
+  await waitFor(`!!document.getElementById("no-feeds")`, "the dashboard notices the feed is gone", 10000);
+  await toastSays("access to that feed was taken away");
+  check(await evaluate(`document.querySelector(".feed-picker").hidden`), "the switcher goes with the last feed");
+  await shot("fa-04-revoked");
+}
+
+// ---- only feed access
+if (process.argv.includes("--feed-access")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await feedAccessFlows();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+// ====================================================================== end of feed access
+
 // ------------------------------------------------------------------ flows
 try {
   await connect();
@@ -2451,6 +2596,14 @@ try {
   await choose(".pager select", "24");
   await waitFor(`document.querySelector(".pager select").value === "24"`, "last page");
   check(await evaluate(`document.querySelectorAll(".change").length === 50 && document.getElementById("page").innerText.includes("Showing 1,151 to 1,200")`), "the last page shows the last 50 changes");
+  // the API answers it 200 changes at a time (section 16.5), and the page above
+  // paged through all of them
+  const bigDraft = (await evaluate("location.hash")).split("/").pop();
+  const firstPage = await api(`change-sets/${bigDraft}`);
+  check(firstPage.changes.length === 200 && !!firstPage.next_cursor && firstPage.change_count === 1200
+    && firstPage.validation_summary && Array.isArray(firstPage.validation), "the API answers a big draft 200 changes at a time, with its count and the replay on the first page");
+  const lastPage = await api(`change-sets/${bigDraft}?limit=500&cursor=1000`);
+  check(lastPage.changes.length === 200 && lastPage.next_cursor === null && lastPage.validation === undefined, "a later page carries only its changes");
   await shot("17-big-draft");
 
   // ================================================================ approver
@@ -2637,6 +2790,8 @@ try {
   await deliveryFlows();
   // ================================================================ merging two stations: see stationMergeFlows above
   await stationMergeFlows();
+  // ================================================================ feed access: see feedAccessFlows above
+  await feedAccessFlows();
 
   // ================================================================ map lines through the stops and from GPS: see mapLineFlows above
   await mapLineFlows();

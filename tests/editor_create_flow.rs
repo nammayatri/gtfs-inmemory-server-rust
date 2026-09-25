@@ -118,6 +118,7 @@ fn clear_feed(feed: &str) -> Vec<String> {
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{feed}'"),
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{feed}' AND parent_station IS NOT NULL"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{feed}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{feed}'"),
     ]
 }
@@ -208,7 +209,7 @@ const APPROVER: &str = "approver@editor-create-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor create test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor create test feed', 'fare_stage')"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \
@@ -389,6 +390,14 @@ async fn create_merge_bulk_and_proposals() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }
@@ -646,7 +655,8 @@ async fn create_merge_bulk_and_proposals() {
         Some("#0A7E3C")
     );
     let order: Vec<String> = sqlx::query(&format!(
-        "SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'NR1' ORDER BY sequence"
+        "SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'NR1' AND pattern_key = 1 \
+         ORDER BY sequence"
     ))
     .fetch_all(&pool)
     .await
@@ -1251,7 +1261,7 @@ async fn create_merge_bulk_and_proposals() {
         );
         assert_eq!(s, 200, "{action}: {b}");
     }
-    let br1: Vec<String> = sqlx::query(&format!("SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'BR1' ORDER BY sequence"))
+    let br1: Vec<String> = sqlx::query(&format!("SELECT stop_id FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'BR1' AND pattern_key = 1 ORDER BY sequence"))
         .fetch_all(&pool).await.unwrap().iter().map(|r| r.get("stop_id")).collect();
     assert_eq!(
         br1,
@@ -1900,7 +1910,7 @@ async fn bulk_dry_run_timings() {
     }
     let mut setup = clear_feed(PERF_FEED);
     setup.extend([
-        format!("INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{PERF_FEED}', 'Bulk timing copy of chennai_bus')"),
+        format!("INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{PERF_FEED}', 'Bulk timing copy of chennai_bus', 'fare_stage')"),
         format!(
             "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted) \
              SELECT '{PERF_FEED}', stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted \
@@ -1914,7 +1924,8 @@ async fn bulk_dry_run_timings() {
             "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
                                           marker_lat, marker_lon, stop_name_override, provider_id) \
              SELECT '{PERF_FEED}', route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
-                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop WHERE gtfs_id = 'chennai_bus'"
+                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop \
+             WHERE gtfs_id = 'chennai_bus' AND pattern_key = 1"
         ),
     ]);
     setup.extend(reset_accounts(&[PERF_ADMIN]));
@@ -1962,7 +1973,8 @@ async fn bulk_dry_run_timings() {
     // 5,000 rows: whole stop lists of real routes, re-uploaded
     let rows = sqlx::query(&format!(
         "SELECT route_id, sequence, stop_id, stop_type, stage_no, stage_name FROM gtfs_route_stop \
-         WHERE gtfs_id = '{PERF_FEED}' AND stop_type <> 'ROUTE CORRECTION' ORDER BY route_id, sequence"
+         WHERE gtfs_id = '{PERF_FEED}' AND pattern_key = 1 AND stop_type <> 'ROUTE CORRECTION' \
+         ORDER BY route_id, sequence"
     ))
     .fetch_all(&pool)
     .await

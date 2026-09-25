@@ -122,6 +122,7 @@ fn clear_feed(feed: &str) -> Vec<String> {
         format!("DELETE FROM gtfs_route WHERE gtfs_id = '{feed}'"),
         format!("UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = '{feed}' AND parent_station IS NOT NULL"),
         format!("DELETE FROM gtfs_stop WHERE gtfs_id = '{feed}'"),
+        format!("DELETE FROM gtfs_editor_feed_access WHERE gtfs_id = '{feed}'"),
         format!("DELETE FROM gtfs_feed WHERE gtfs_id = '{feed}'"),
     ]
 }
@@ -212,7 +213,7 @@ const APPROVER: &str = "approver@editor-review-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor review test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{FEED}', 'Editor review test feed', 'fare_stage')"
     ));
     // S sits 542 m east of the road its routes take between A and B; T sits on
     // the east road, where R7 passes, while R5 and R6 take the west road
@@ -432,6 +433,14 @@ async fn review_move_split_confirm_and_release() {
             admin
                 .req("PATCH", &format!("/users/{id}"))
                 .set_json(json!({"role": role, "status": "active"}))
+        );
+        assert_eq!(s, 200, "{b}");
+        // since 0018 a member works on a feed only through a grant on it
+        let (s, b, _) = call!(
+            &app,
+            admin
+                .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                .set_json(json!({"role": role}))
         );
         assert_eq!(s, 200, "{b}");
     }
@@ -1638,7 +1647,7 @@ async fn position_review_timings() {
     }
     let mut setup = clear_feed(PERF_FEED);
     setup.extend([
-        format!("INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{PERF_FEED}', 'Review timing copy of chennai_bus')"),
+        format!("INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{PERF_FEED}', 'Review timing copy of chennai_bus', 'fare_stage')"),
         format!(
             "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted) \
              SELECT '{PERF_FEED}', stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted \
@@ -1652,7 +1661,8 @@ async fn position_review_timings() {
             "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
                                           marker_lat, marker_lon, stop_name_override, provider_id) \
              SELECT '{PERF_FEED}', route_id, sequence, stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
-                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop WHERE gtfs_id = 'chennai_bus'"
+                    marker_lat, marker_lon, stop_name_override, provider_id FROM gtfs_route_stop \
+             WHERE gtfs_id = 'chennai_bus' AND pattern_key = 1"
         ),
         // the three stops the most routes call at
         format!(

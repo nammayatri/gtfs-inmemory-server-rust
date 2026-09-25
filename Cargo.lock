@@ -2071,6 +2071,7 @@ dependencies = [
  "hmac",
  "libc",
  "macros",
+ "md-5",
  "num_cpus",
  "once_cell",
  "prometheus",
@@ -2096,6 +2097,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "zip",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@ use super::auth::{self, Ctx};
 use super::error::{EditorError, EditorResult};
 use super::feed_lock::{is_transient, lock_feed, lock_feed_of_set, retry_transient};
 use super::validation::{
-    check_payload, check_route_rows, create_id_field, grade_against_live, grade_repointed,
+    check_payload, check_route_rows_for, create_id_field, grade_against_live, grade_repointed,
     haversine_m, merge_effect, mint_stop_id, settle_create_key, station_members, Finding, Level,
     MemberSpec, RouteRow, SequencedStop, MERGE_FAR_METRES, MOVE_WARNING_METRES, ROUTE_RULE_CODES,
     STATION_MERGE_FAR_METRES,
@@ -69,8 +69,12 @@ impl Page {
     pub fn wrap(&self, mut items: Vec<Value>) -> Value {
         let more = items.len() as i64 > self.limit;
         items.truncate(self.limit as usize);
-        let next = more.then(|| URL_SAFE_NO_PAD.encode(format!("o:{}", self.offset + self.limit)));
-        json!({"items": items, "next_cursor": next})
+        json!({"items": items, "next_cursor": self.next_cursor(more)})
+    }
+
+    /// The cursor of the page after this one, when there is one.
+    pub fn next_cursor(&self, more: bool) -> Option<String> {
+        more.then(|| URL_SAFE_NO_PAD.encode(format!("o:{}", self.offset + self.limit)))
     }
 }
 
@@ -82,7 +86,7 @@ pub fn like_pattern(q: &str) -> String {
     format!("%{escaped}%")
 }
 
-fn json_col(r: &PgRow, col: &str) -> Result<Value, sqlx::Error> {
+pub(super) fn json_col(r: &PgRow, col: &str) -> Result<Value, sqlx::Error> {
     let raw: Option<String> = r.try_get(col)?;
     Ok(raw
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -100,11 +104,17 @@ pub async fn feed_version(conn: &mut PgConnection, gtfs_id: &str) -> EditorResul
     Ok(row.try_get("version")?)
 }
 
-pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
+/// The feeds the caller may see - every feed for an admin, else the ones they
+/// hold a grant on - each with `my_role`, the role they hold there.
+pub async fn feeds(state: &EditorState, ctx: &Ctx) -> EditorResult<Value> {
+    // a feed the caller holds no grant on does not exist for them
+    let granted: Vec<String> = ctx.user.grants.keys().cloned().collect();
     let rows = sqlx::query(
         "SELECT gtfs_id, display_name, version, data_source, released_version, released_at, updated_at \
-         FROM gtfs_feed ORDER BY gtfs_id",
+         FROM gtfs_feed WHERE $1 OR gtfs_id = ANY($2) ORDER BY gtfs_id",
     )
+    .bind(ctx.is_admin())
+    .bind(&granted)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -118,6 +128,7 @@ pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
                 "released_version": r.try_get::<Option<i64>, _>("released_version")?,
                 "released_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("released_at")?,
                 "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
+                "my_role": ctx.feed_role(&r.try_get::<String, _>("gtfs_id")?).map(auth::Role::as_str),
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -125,16 +136,15 @@ pub async fn feeds(state: &EditorState) -> EditorResult<Value> {
 }
 
 /// `GET /feeds/{g}/config` (docs/gtfs-editor.md "Feed data source"): which data
-/// source GIMS serves the feed from, and the open change sets that would change
-/// it. Nothing writes it here: a switch is a `feed_config` change in a draft.
+/// source GIMS serves the feed from, its trips settings (section 16), and the
+/// open change sets that would change them. Nothing writes it here: a switch is
+/// a `feed_config` change in a draft.
 pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> {
-    let row = sqlx::query("SELECT gtfs_id, data_source, version FROM gtfs_feed WHERE gtfs_id = $1")
-        .bind(gtfs_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
+    let mut conn = state.pool.acquire().await?;
+    let mut out = feed_config_row(&mut conn, gtfs_id).await?;
     let pending = sqlx::query(
-        "SELECT cs.change_set_id, cs.title, cs.status, c.change_id, c.after->>'data_source' AS data_source \
+        "SELECT cs.change_set_id, cs.title, cs.status, c.change_id, c.after->>'data_source' AS data_source, \
+                c.after::text AS after \
          FROM gtfs_change_set cs \
          JOIN gtfs_change c ON c.change_set_id = cs.change_set_id \
          WHERE cs.gtfs_id = $1 AND cs.status IN ('draft', 'submitted', 'approved') \
@@ -142,7 +152,7 @@ pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
          ORDER BY cs.updated_at DESC, cs.change_set_id, c.position",
     )
     .bind(gtfs_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *conn)
     .await?
     .iter()
     .map(|r| -> Result<Value, sqlx::Error> {
@@ -152,29 +162,35 @@ pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
             "status": r.try_get::<String, _>("status")?,
             "change_id": r.try_get::<i64, _>("change_id")?,
             "data_source": r.try_get::<Option<String>, _>("data_source")?,
+            "after": json_col(r, "after")?,
         }))
     })
     .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({
-        "gtfs_id": row.try_get::<String, _>("gtfs_id")?,
-        "data_source": row.try_get::<String, _>("data_source")?,
-        "version": row.try_get::<i64, _>("version")?,
-        "pending": pending,
-    }))
+    out["pending"] = json!(pending);
+    Ok(out)
 }
 
-/// The feed's row as a `feed_config` change snapshots it: `{gtfs_id,
-/// data_source, version}`, the read shape of `GET /feeds/{g}/config`.
+/// The feed's row as a `feed_config` change snapshots it, the read shape of
+/// `GET /feeds/{g}/config`: `{gtfs_id, data_source, version}` and, since
+/// section 16, the trips settings.
 async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<Value> {
-    let row = sqlx::query("SELECT gtfs_id, data_source, version FROM gtfs_feed WHERE gtfs_id = $1")
-        .bind(gtfs_id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
+    let row = sqlx::query(
+        "SELECT gtfs_id, data_source, version, trips_source, default_run_s, default_dwell_s, \
+                schedule_sync, sync_running_times FROM gtfs_feed WHERE gtfs_id = $1",
+    )
+    .bind(gtfs_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| EditorError::not_found("feed_not_found", format!("no feed {gtfs_id}")))?;
     Ok(json!({
         "gtfs_id": row.try_get::<String, _>("gtfs_id")?,
         "data_source": row.try_get::<String, _>("data_source")?,
         "version": row.try_get::<i64, _>("version")?,
+        "trips_source": row.try_get::<String, _>("trips_source")?,
+        "default_run_s": row.try_get::<i32, _>("default_run_s")?,
+        "default_dwell_s": row.try_get::<i32, _>("default_dwell_s")?,
+        "schedule_sync": row.try_get::<String, _>("schedule_sync")?,
+        "sync_running_times": row.try_get::<bool, _>("sync_running_times")?,
     }))
 }
 
@@ -356,11 +372,23 @@ pub async fn stop_detail(
     let mut stop = stop_row(conn, gtfs_id, stop_id)
         .await?
         .ok_or_else(|| EditorError::not_found("stop_not_found", format!("no stop {stop_id}")))?;
+    // the rest of its stops.txt fields, by their GTFS names (section 18)
+    stop["gtfs"] = super::records::gtfs_fields(
+        conn,
+        gtfs_id,
+        "stops.txt",
+        stop_id,
+        super::records::STOP_GTFS_FIELDS,
+    )
+    .await?;
+    // every call, on every stop order of the route (a pattern past the first
+    // is a metro short turn or express run, section 16): the stop is used there.
+    // A call on another stop order than the route's stop list says which.
     let routes = sqlx::query(
-        "SELECT rs.route_id, r.short_name, r.long_name, rs.sequence, rs.stop_type, rs.stage_no \
+        "SELECT rs.route_id, r.short_name, r.long_name, rs.pattern_key, rs.sequence, rs.stop_type, rs.stage_no \
          FROM gtfs_route_stop rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
-         WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.sequence",
+         WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(gtfs_id)
     .bind(stop_id)
@@ -368,14 +396,19 @@ pub async fn stop_detail(
     .await?
     .iter()
     .map(|r| -> Result<Value, sqlx::Error> {
-        Ok(json!({
+        let mut v = json!({
             "route_id": r.try_get::<String, _>("route_id")?,
             "short_name": r.try_get::<Option<String>, _>("short_name")?,
             "long_name": r.try_get::<Option<String>, _>("long_name")?,
             "sequence": r.try_get::<i32, _>("sequence")?,
             "stop_type": r.try_get::<String, _>("stop_type")?,
             "stage_no": r.try_get::<i32, _>("stage_no")?,
-        }))
+        });
+        let pattern: i16 = r.try_get("pattern_key")?;
+        if pattern != FIRST_PATTERN {
+            v["pattern_key"] = json!(pattern);
+        }
+        Ok(v)
     })
     .collect::<Result<Vec<_>, _>>()?;
     let children = sqlx::query(&format!(
@@ -446,7 +479,7 @@ pub async fn stop_detail(
 const ROUTE_COLS: &str =
     "route_id, short_name, long_name, route_type, agency_id, color, text_color, \
      encoded_polyline, polyline_source, service_type, provenance::text AS provenance, deleted, \
-     row_version, updated_at, updated_by";
+     row_version, updated_at, updated_by, schedule_source";
 
 fn route_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -465,6 +498,7 @@ fn route_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "row_version": r.try_get::<i32, _>("row_version")?,
         "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
         "updated_by": r.try_get::<Option<String>, _>("updated_by")?,
+        "schedule_source": r.try_get::<String, _>("schedule_source")?,
     }))
 }
 
@@ -493,7 +527,7 @@ pub async fn list_routes(
     let rows = sqlx::query(&format!(
         "SELECT {ROUTE_COLS}, \
             (SELECT count(*) FROM gtfs_route_stop rs WHERE rs.gtfs_id = r.gtfs_id \
-               AND rs.route_id = r.route_id \
+               AND rs.route_id = r.route_id AND rs.pattern_key = 1 \
                AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count \
          FROM gtfs_route r \
          WHERE r.gtfs_id = $1 AND NOT r.deleted \
@@ -527,8 +561,14 @@ pub async fn list_routes(
     Ok(page.wrap(items))
 }
 
+/// The stop order every route has (section 16): what everything that names no
+/// pattern means, so that code written before patterns keeps its meaning.
+pub const FIRST_PATTERN: i16 = 1;
+
 const ROUTE_ROW_COLS: &str = "stop_id, stop_type, stage_no, stage_name, marker_id, marker_name, \
-     marker_lat, marker_lon, stop_name_override, provider_id";
+     marker_lat, marker_lon, stop_name_override, provider_id, pickup_type, drop_off_type, timepoint, \
+     stop_headsign, stop_sequence, continuous_pickup, continuous_drop_off, shape_dist_traveled, \
+     pickup_booking_rule_id, drop_off_booking_rule_id";
 
 fn route_row_from(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
     Ok(RouteRow {
@@ -542,19 +582,43 @@ fn route_row_from(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
         marker_lon: r.try_get("marker_lon")?,
         stop_name_override: r.try_get("stop_name_override")?,
         provider_id: r.try_get("provider_id")?,
+        pickup_type: r.try_get("pickup_type")?,
+        drop_off_type: r.try_get("drop_off_type")?,
+        timepoint: r.try_get("timepoint")?,
+        stop_headsign: r.try_get("stop_headsign")?,
+        stop_sequence: r.try_get("stop_sequence")?,
+        continuous_pickup: r.try_get("continuous_pickup")?,
+        continuous_drop_off: r.try_get("continuous_drop_off")?,
+        shape_dist_traveled: r.try_get("shape_dist_traveled")?,
+        pickup_booking_rule_id: r.try_get("pickup_booking_rule_id")?,
+        drop_off_booking_rule_id: r.try_get("drop_off_booking_rule_id")?,
     })
 }
 
+/// A route's stop list: its rows of pattern 1, in sequence order.
 pub async fn load_route_rows(
     conn: &mut PgConnection,
     gtfs_id: &str,
     route_id: &str,
 ) -> EditorResult<Vec<RouteRow>> {
+    load_pattern_rows(conn, gtfs_id, route_id, FIRST_PATTERN).await
+}
+
+/// The rows of one of a route's stop orders, in sequence order. A pattern that
+/// does not exist has none.
+pub async fn load_pattern_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    route_id: &str,
+    pattern_key: i16,
+) -> EditorResult<Vec<RouteRow>> {
     let rows = sqlx::query(&format!(
-        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2 ORDER BY sequence"
+        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop \
+         WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 ORDER BY sequence"
     ))
     .bind(gtfs_id)
     .bind(route_id)
+    .bind(pattern_key)
     .fetch_all(&mut *conn)
     .await?;
     rows.iter()
@@ -570,17 +634,44 @@ pub async fn load_routes_rows(
     gtfs_id: &str,
     route_ids: &[String],
 ) -> EditorResult<HashMap<String, Vec<RouteRow>>> {
+    let keys: Vec<(String, i16)> = route_ids
+        .iter()
+        .map(|r| (r.clone(), FIRST_PATTERN))
+        .collect();
+    Ok(load_patterns_rows(conn, gtfs_id, &keys)
+        .await?
+        .into_iter()
+        .map(|((route, _), rows)| (route, rows))
+        .collect())
+}
+
+/// [`load_pattern_rows`] for many `(route, pattern)` in one query. Those without
+/// rows are absent.
+pub async fn load_patterns_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    keys: &[(String, i16)],
+) -> EditorResult<HashMap<(String, i16), Vec<RouteRow>>> {
+    let (routes, patterns): (Vec<String>, Vec<i16>) = keys.iter().cloned().unzip();
     let rows = sqlx::query(&format!(
-        "SELECT route_id, {ROUTE_ROW_COLS} FROM gtfs_route_stop \
-         WHERE gtfs_id = $1 AND route_id = ANY($2) ORDER BY route_id, sequence"
+        "SELECT rs.route_id, rs.pattern_key, {} FROM gtfs_route_stop rs \
+         JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
+           ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
+         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+        ROUTE_ROW_COLS
+            .split(", ")
+            .map(|c| format!("rs.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
     .bind(gtfs_id)
-    .bind(route_ids)
+    .bind(&routes)
+    .bind(&patterns)
     .fetch_all(&mut *conn)
     .await?;
-    let mut out: HashMap<String, Vec<RouteRow>> = HashMap::new();
+    let mut out: HashMap<(String, i16), Vec<RouteRow>> = HashMap::new();
     for r in &rows {
-        out.entry(r.try_get("route_id")?)
+        out.entry((r.try_get("route_id")?, r.try_get("pattern_key")?))
             .or_default()
             .push(route_row_from(r)?);
     }
@@ -594,22 +685,47 @@ pub async fn load_routes_read_rows(
     gtfs_id: &str,
     route_ids: &[String],
 ) -> EditorResult<HashMap<String, Vec<Value>>> {
+    let keys: Vec<(String, i16)> = route_ids
+        .iter()
+        .map(|r| (r.clone(), FIRST_PATTERN))
+        .collect();
+    Ok(load_patterns_read_rows(conn, gtfs_id, &keys)
+        .await?
+        .into_iter()
+        .map(|((route, _), rows)| (route, rows))
+        .collect())
+}
+
+/// [`load_routes_read_rows`] for `(route, pattern)` pairs.
+pub async fn load_patterns_read_rows(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    keys: &[(String, i16)],
+) -> EditorResult<HashMap<(String, i16), Vec<Value>>> {
+    let (routes, patterns): (Vec<String>, Vec<i16>) = keys.iter().cloned().unzip();
     let rows = sqlx::query(
-        "SELECT rs.route_id, rs.sequence, rs.stop_id, coalesce(rs.stop_name_override, s.name) AS stop_name, \
+        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, \
+                coalesce(rs.stop_name_override, s.name) AS stop_name, \
                 s.lat, s.lon, s.deleted AS stop_deleted, s.parent_station, \
                 rs.stop_type, rs.stage_no, rs.stage_name, rs.marker_id, rs.marker_name, rs.marker_lat, \
-                rs.marker_lon, rs.stop_name_override, rs.provider_id \
+                rs.marker_lon, rs.stop_name_override, rs.provider_id, \
+                rs.pickup_type, rs.drop_off_type, rs.timepoint, rs.stop_headsign, rs.stop_sequence, \
+                rs.continuous_pickup, rs.continuous_drop_off, rs.shape_dist_traveled, \
+                rs.pickup_booking_rule_id, rs.drop_off_booking_rule_id \
          FROM gtfs_route_stop rs \
+         JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
+           ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
          LEFT JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
-         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) ORDER BY rs.route_id, rs.sequence",
+         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(gtfs_id)
-    .bind(route_ids)
+    .bind(&routes)
+    .bind(&patterns)
     .fetch_all(&mut *conn)
     .await?;
-    let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut out: HashMap<(String, i16), Vec<Value>> = HashMap::new();
     for r in &rows {
-        out.entry(r.try_get("route_id")?).or_default().push(json!({
+        let mut row = json!({
             "sequence": r.try_get::<i32, _>("sequence")?,
             "stop_id": r.try_get::<Option<String>, _>("stop_id")?,
             "stop_name": r.try_get::<Option<String>, _>("stop_name")?,
@@ -626,7 +742,38 @@ pub async fn load_routes_read_rows(
             "marker_lon": r.try_get::<Option<f64>, _>("marker_lon")?,
             "stop_name_override": r.try_get::<Option<String>, _>("stop_name_override")?,
             "provider_id": r.try_get::<Option<String>, _>("provider_id")?,
-        }));
+        });
+        // the GTFS fields only where a row has them, so a stop list that has
+        // none reads exactly as it did before they were read
+        for k in [
+            "pickup_type",
+            "drop_off_type",
+            "timepoint",
+            "continuous_pickup",
+            "continuous_drop_off",
+        ] {
+            if let Some(v) = r.try_get::<Option<i16>, _>(k)? {
+                row[k] = json!(v);
+            }
+        }
+        for k in [
+            "stop_headsign",
+            "pickup_booking_rule_id",
+            "drop_off_booking_rule_id",
+        ] {
+            if let Some(v) = r.try_get::<Option<String>, _>(k)? {
+                row[k] = json!(v);
+            }
+        }
+        if let Some(v) = r.try_get::<Option<i32>, _>("stop_sequence")? {
+            row["stop_sequence"] = json!(v);
+        }
+        if let Some(v) = r.try_get::<Option<f64>, _>("shape_dist_traveled")? {
+            row["shape_dist_traveled"] = json!(v);
+        }
+        out.entry((r.try_get("route_id")?, r.try_get("pattern_key")?))
+            .or_default()
+            .push(row);
     }
     Ok(out)
 }
@@ -646,14 +793,27 @@ pub async fn route_detail(
     gtfs_id: &str,
     route_id: &str,
 ) -> EditorResult<Value> {
+    route_pattern_detail(conn, gtfs_id, route_id, FIRST_PATTERN).await
+}
+
+/// The route detail with the rows of one of its stop orders (section 16):
+/// `rows`, `rows_hash` and `stop_count` are that pattern's, and the route's
+/// timetable - its patterns, profiles and trips' hash - comes with it.
+pub async fn route_pattern_detail(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    route_id: &str,
+    pattern_key: i16,
+) -> EditorResult<Value> {
     let mut route = route_row(conn, gtfs_id, route_id)
         .await?
         .ok_or_else(|| EditorError::not_found("route_not_found", format!("no route {route_id}")))?;
-    let rows = load_routes_read_rows(conn, gtfs_id, &[route_id.to_string()])
+    let key = (route_id.to_string(), pattern_key);
+    let rows = load_patterns_read_rows(conn, gtfs_id, std::slice::from_ref(&key))
         .await?
-        .remove(route_id)
+        .remove(&key)
         .unwrap_or_default();
-    let hash = rows_hash(&load_route_rows(conn, gtfs_id, route_id).await?);
+    let hash = rows_hash(&load_pattern_rows(conn, gtfs_id, route_id, pattern_key).await?);
     let served = rows
         .iter()
         .filter(|r| {
@@ -663,8 +823,23 @@ pub async fn route_detail(
         })
         .count();
     route["stop_count"] = json!(served);
+    route["pattern_key"] = json!(pattern_key);
+    // the rest of its routes.txt fields, by their GTFS names (section 18)
+    let fields: Vec<&str> = super::records::ROUTE_GTFS_FIELDS
+        .iter()
+        .copied()
+        .chain(["agency_id", "route_type", "route_text_color"])
+        .collect();
+    route["gtfs"] =
+        super::records::gtfs_fields(conn, gtfs_id, "routes.txt", route_id, &fields).await?;
     route["rows"] = json!(rows);
     route["rows_hash"] = json!(hash);
+    if let (Some(r), Value::Object(t)) = (
+        route.as_object_mut(),
+        super::trips::route_timetable(conn, gtfs_id, route_id).await?,
+    ) {
+        r.extend(t);
+    }
     Ok(route)
 }
 
@@ -758,12 +933,51 @@ pub async fn load_changes(
     conn: &mut PgConnection,
     change_set_id: Uuid,
 ) -> EditorResult<Vec<ChangeRow>> {
+    select_changes(conn, change_set_id, Befores::All, None).await
+}
+
+/// A set's changes as [`evaluate`] needs them: without the `before` snapshots,
+/// which only a `feed_config` change's conflict check reads. A draft of
+/// thousands of stop lists or trip lists replays without carrying them.
+pub async fn load_changes_to_apply(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+) -> EditorResult<Vec<ChangeRow>> {
+    select_changes(conn, change_set_id, Befores::FeedConfigOnly, None).await
+}
+
+/// One page of a set's changes, in position order, with their snapshots.
+pub async fn load_changes_page(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    page: &Page,
+) -> EditorResult<Vec<ChangeRow>> {
+    select_changes(conn, change_set_id, Befores::All, Some(page)).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Befores {
+    All,
+    FeedConfigOnly,
+}
+
+async fn select_changes(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    befores: Befores,
+    page: Option<&Page>,
+) -> EditorResult<Vec<ChangeRow>> {
     let rows = sqlx::query(
         "SELECT change_id, position, entity, entity_key, op, base_row_version, \
-                before::text AS before, after::text AS after, created_by, created_at \
-         FROM gtfs_change WHERE change_set_id = $1 ORDER BY position",
+                CASE WHEN $2 OR entity = 'feed_config' THEN before::text END AS before, \
+                after::text AS after, created_by, created_at \
+         FROM gtfs_change WHERE change_set_id = $1 ORDER BY position \
+         LIMIT $3 OFFSET $4",
     )
     .bind(change_set_id)
+    .bind(befores == Befores::All)
+    .bind(page.map(|p| p.limit + 1))
+    .bind(page.map(|p| p.offset).unwrap_or(0))
     .fetch_all(&mut *conn)
     .await?;
     rows.iter()
@@ -1068,6 +1282,9 @@ pub struct Evaluation {
     /// One entry per `feed_config` change that switched the data source:
     /// `{gtfs_id, from, to, change_id}`; commit audits them.
     pub feed_configs: Vec<Value>,
+    /// One entry per other feed setting a `feed_config` change switched
+    /// (section 16): `{gtfs_id, setting, from, to, change_id}`; commit audits them.
+    pub feed_settings: Vec<Value>,
 }
 
 impl Evaluation {
@@ -1076,7 +1293,7 @@ impl Evaluation {
     }
 }
 
-enum ApplyError {
+pub(super) enum ApplyError {
     Findings(Vec<Finding>),
     Db(sqlx::Error),
 }
@@ -1093,7 +1310,7 @@ impl From<EditorError> for ApplyError {
     }
 }
 
-fn fail(code: &str, message: impl Into<String>) -> ApplyError {
+pub(super) fn fail(code: &str, message: impl Into<String>) -> ApplyError {
     ApplyError::Findings(vec![Finding::error(code, "", message)])
 }
 
@@ -1132,7 +1349,7 @@ fn db_finding(e: &sqlx::Error) -> Finding {
     }
 }
 
-fn field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
+pub(super) fn field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
     match m.get(key) {
         None => (false, None),
         Some(v) => (true, v.as_str()),
@@ -1141,7 +1358,7 @@ fn field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
 
 /// A text a passenger reads (platform label, description): trimmed, and blank
 /// clears it like `null` does.
-fn text_field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
+pub(super) fn text_field<'a>(m: &'a Map<String, Value>, key: &str) -> (bool, Option<&'a str>) {
     let (has, text) = field(m, key);
     (has, text.map(str::trim).filter(|t| !t.is_empty()))
 }
@@ -1150,17 +1367,40 @@ fn conflict(c: &ChangeRow, reason: &str, expected: Value, actual: Value) -> Valu
     conflict_on(c, &c.entity_key, reason, expected, actual)
 }
 
+/// The stop order a change names (section 16): its `pattern_key`, or pattern 1.
+pub fn pattern_of(after: &Value) -> i16 {
+    after["pattern_key"]
+        .as_i64()
+        .filter(|k| (1..=i16::MAX as i64).contains(k))
+        .map(|k| k as i16)
+        .unwrap_or(FIRST_PATTERN)
+}
+
 /// A conflict on `key`, which is the change's own row or - for a merge - the
 /// stop it merges into.
 fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: Value) -> Value {
+    let pattern = pattern_of(&c.after);
     let what = match c.entity.as_str() {
+        "route_stops" if pattern != FIRST_PATTERN => {
+            format!("The stop list of pattern {pattern} of route {key}")
+        }
         "route_stops" => format!("The stop list of route {key}"),
         "route" => format!("Route {key}"),
+        "pattern" => format!("Pattern {pattern} of route {key}"),
+        "timing_profile" => format!(
+            "Timing profile {} of pattern {pattern} of route {key}",
+            c.after["profile_key"]
+        ),
+        "route_trips" => format!("The trips of route {key}"),
+        "service" => format!("Service {key}"),
         "station" if key != c.entity_key => {
             format!("Station {key} (kept by the merge of {})", c.entity_key)
         }
         "station" => format!("Station {key}"),
         "feed_config" => format!("The data source of feed {key}"),
+        e if super::records::spec_for(e).is_some() => {
+            super::records::describe(super::records::spec_for(e).expect("a record file"), key)
+        }
         _ if key != c.entity_key => format!("Stop {key} (kept by the merge of {})", c.entity_key),
         _ => format!("Stop {key}"),
     };
@@ -1206,25 +1446,47 @@ fn version_conflict(
     }
 }
 
-/// Has the live data moved on since the change was made? `in_draft` says
-/// whether an earlier change in the same set creates a row (`true` = a route):
-/// such a row has no live version to be stale against.
+/// What an earlier change of a set creates, for [`conflict_for`]: `(kind, key)`
+/// with kind `stop` (a stop or station), `route`, `service` or `pattern`
+/// (`{route}#{pattern_key}`). Such a row has no live version to be stale
+/// against.
+fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
+    let key = c.entity_key.clone();
+    match (c.entity.as_str(), c.op.as_str()) {
+        ("stop" | "station", "create") => vec![("stop", key)],
+        ("route", "create") => vec![
+            ("pattern", format!("{key}#{FIRST_PATTERN}")),
+            ("route", key),
+        ],
+        ("service", "create") => vec![("service", key)],
+        (e, "create") if super::records::spec_for(e).is_some() => {
+            vec![("record", format!("{e}#{key}"))]
+        }
+        // replacing a stop order that does not exist creates it
+        ("route_stops", "replace") => vec![("pattern", format!("{key}#{}", pattern_of(&c.after)))],
+        _ => vec![],
+    }
+}
+
+/// Has the live data moved on since the change was made? `in_draft(kind, key)`
+/// says whether an earlier change in the same set creates a row
+/// ([`created_by`]): such a row has no live version to be stale against.
 async fn conflict_for(
     conn: &mut PgConnection,
     g: &str,
     c: &ChangeRow,
-    in_draft: &dyn Fn(bool, &str) -> bool,
+    in_draft: &dyn Fn(&str, &str) -> bool,
 ) -> EditorResult<Vec<Value>> {
     let key = c.entity_key.as_str();
     let mut out = Vec::new();
     match (c.entity.as_str(), c.op.as_str()) {
         ("stop", "update" | "delete") | ("station", "update" | "delete")
-            if !in_draft(false, key) =>
+            if !in_draft("stop", key) =>
         {
             let live = live_row_version(conn, "gtfs_stop", "stop_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
         }
-        ("route", "update" | "delete") if !in_draft(true, key) => {
+        ("route", "update" | "delete") if !in_draft("route", key) => {
             let live = live_row_version(conn, "gtfs_route", "route_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
         }
@@ -1236,54 +1498,143 @@ async fn conflict_for(
             } else {
                 "into_stop_id"
             };
-            if !in_draft(false, key) {
+            if !in_draft("stop", key) {
                 let live = live_row_version(conn, "gtfs_stop", "stop_id", g, key).await?;
                 out.extend(version_conflict(c, key, live, c.base_row_version));
             }
             if let Some(into) = c.after[into_field].as_str().map(str::trim) {
-                if !in_draft(false, into) {
+                if !in_draft("stop", into) {
                     let base = c.after["into_row_version"].as_i64().map(|v| v as i32);
                     let live = live_row_version(conn, "gtfs_stop", "stop_id", g, into).await?;
                     out.extend(version_conflict(c, into, live, base));
                 }
             }
         }
-        ("stop" | "station" | "route", "create") => {
-            let (table, id_col) = if c.entity == "route" {
-                ("gtfs_route", "route_id")
-            } else {
-                ("gtfs_stop", "stop_id")
+        ("stop" | "station" | "route" | "service", "create") => {
+            let (table, id_col) = match c.entity.as_str() {
+                "route" => ("gtfs_route", "route_id"),
+                "service" => ("gtfs_service", "service_id"),
+                _ => ("gtfs_stop", "stop_id"),
             };
             let exists = live_row_version(conn, table, id_col, g, key).await?;
             if exists.is_some() {
                 out.push(conflict(c, "exists", Value::Null, json!(key)));
             }
         }
+        ("service", "update" | "delete") if !in_draft("service", key) => {
+            let live = live_row_version(conn, "gtfs_service", "service_id", g, key).await?;
+            out.extend(version_conflict(c, key, live, c.base_row_version));
+        }
         ("feed_config", "update") => {
             // the feed's version moves with every commit, so the base is the
-            // value itself: the data source the change was made against
-            let expected = c.before["data_source"].as_str().unwrap_or("").to_string();
-            let actual: Option<String> =
-                sqlx::query("SELECT data_source FROM gtfs_feed WHERE gtfs_id = $1")
-                    .bind(g)
-                    .fetch_optional(&mut *conn)
-                    .await?
-                    .map(|r| r.try_get("data_source"))
-                    .transpose()?;
-            match actual {
-                None => out.push(conflict(c, "missing", json!(expected), Value::Null)),
-                Some(actual) if actual != expected => {
-                    out.push(conflict(c, "changed", json!(expected), json!(actual)))
+            // value itself: each setting the change sets, as it was when the
+            // change was made
+            let live = match feed_config_row(conn, g).await {
+                Ok(v) => Some(v),
+                Err(e) if e.code == "feed_not_found" => None,
+                Err(e) => return Err(e),
+            };
+            let fields: Vec<&str> = c
+                .after
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            for f in fields {
+                let expected = c.before[f].clone();
+                match &live {
+                    None => {
+                        out.push(conflict(c, "missing", expected, Value::Null));
+                        break;
+                    }
+                    Some(live) if live[f] != expected => {
+                        let mut found = conflict(c, "changed", expected, live[f].clone());
+                        if f != "data_source" {
+                            found["message"] = json!(format!(
+                                "The {f} of feed {key} was changed by another commit after this edit was made."
+                            ));
+                        }
+                        out.push(found);
+                    }
+                    Some(_) => {}
                 }
-                Some(_) => {}
             }
         }
         ("route_stops", "replace") => {
-            // a route created in the draft has no rows: its base is the hash of []
+            // a route or pattern created in the draft has no rows: its base is
+            // the hash of []
             let expected = c.after["base_rows_hash"].as_str().unwrap_or("").to_string();
-            let actual = rows_hash(&load_route_rows(conn, g, key).await?);
+            let pattern = pattern_of(&c.after);
+            let actual = rows_hash(&load_pattern_rows(conn, g, key, pattern).await?);
             if expected != actual {
                 out.push(conflict(c, "changed", json!(expected), json!(actual)));
+            }
+        }
+        ("route_trips", "replace") => {
+            let expected = c.after["base_trips_hash"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let actual =
+                super::trips::trips_hash(&super::trips::load_route_trips(conn, g, key).await?);
+            if expected != actual {
+                out.push(conflict(c, "changed", json!(expected), json!(actual)));
+            }
+        }
+        ("pattern", "update" | "delete") => {
+            let pattern = pattern_of(&c.after);
+            let live = super::trips::pattern_json(conn, g, key, pattern)
+                .await?
+                .map(|(_, v)| v);
+            if live.is_some() || !in_draft("pattern", &format!("{key}#{pattern}")) {
+                out.extend(version_conflict(c, key, live, c.base_row_version));
+            }
+        }
+        ("timing_profile", "replace") => {
+            // a profile the change creates is based on nothing
+            let expected = c.after["base_hash"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(super::trips::empty_hash);
+            let (pattern, profile) = (pattern_of(&c.after), c.after["profile_key"].as_i64());
+            let live = super::trips::load_profiles(conn, g, key, Some(pattern))
+                .await?
+                .into_iter()
+                .find(|p| Some(p.profile_key as i64) == profile);
+            let actual = super::trips::profile_hash(live.as_ref());
+            if expected != actual {
+                let reason = if expected == super::trips::empty_hash() {
+                    "exists"
+                } else if live.is_none() {
+                    "missing"
+                } else {
+                    "changed"
+                };
+                out.push(conflict(c, reason, json!(expected), json!(actual)));
+            }
+        }
+        ("timing_profile", "delete") => {
+            let (pattern, profile) = (pattern_of(&c.after), c.after["profile_key"].as_i64());
+            let live = super::trips::load_profiles(conn, g, key, Some(pattern))
+                .await?
+                .into_iter()
+                .find(|p| Some(p.profile_key as i64) == profile)
+                .map(|p| p.row_version);
+            if live.is_some() || c.base_row_version.is_some() {
+                out.extend(version_conflict(c, key, live, c.base_row_version));
+            }
+        }
+        (e, op) if super::records::spec_for(e).is_some() => {
+            let fspec = super::records::spec_for(e).expect("a record file");
+            if op == "create" {
+                if super::records::live_version(conn, g, fspec, key)
+                    .await?
+                    .is_some()
+                {
+                    out.push(conflict(c, "exists", Value::Null, json!(key)));
+                }
+            } else if !in_draft("record", &format!("{e}#{key}")) {
+                let live = super::records::live_version(conn, g, fspec, key).await?;
+                out.extend(version_conflict(c, key, live, c.base_row_version));
             }
         }
         _ => {}
@@ -1300,6 +1651,7 @@ struct ApplyState<'a> {
     merges: Vec<Value>,
     station_merges: Vec<Value>,
     feed_configs: Vec<Value>,
+    feed_settings: Vec<Value>,
 }
 
 /// Apply every change in order inside `conn`'s transaction; see the module doc.
@@ -1310,16 +1662,14 @@ pub async fn evaluate(
     actor: &str,
 ) -> EditorResult<Evaluation> {
     let mut ev = Evaluation::default();
-    let mut created: HashSet<(bool, String)> = HashSet::new();
+    let mut created: HashSet<(&'static str, String)> = HashSet::new();
     for c in changes {
-        let found = conflict_for(conn, g, c, &|routes, key| {
-            created.contains(&(routes, key.to_string()))
+        let found = conflict_for(conn, g, c, &|kind, key| {
+            created.iter().any(|(k, v)| *k == kind && v.as_str() == key)
         })
         .await?;
         ev.conflicts.extend(found);
-        if c.op == "create" {
-            created.insert((c.entity == "route", c.entity_key.clone()));
-        }
+        created.extend(created_by(c));
     }
     let mut state = ApplyState {
         changes,
@@ -1327,6 +1677,7 @@ pub async fn evaluate(
         merges: Vec::new(),
         station_merges: Vec::new(),
         feed_configs: Vec::new(),
+        feed_settings: Vec::new(),
     };
     for c in changes {
         sqlx::query("SAVEPOINT editor_change")
@@ -1359,6 +1710,7 @@ pub async fn evaluate(
     ev.merges = state.merges;
     ev.station_merges = state.station_merges;
     ev.feed_configs = state.feed_configs;
+    ev.feed_settings = state.feed_settings;
     // parent_station is DEFERRABLE: check it now rather than at COMMIT.
     sqlx::query("SAVEPOINT editor_constraints")
         .execute(&mut *conn)
@@ -1458,6 +1810,12 @@ fn referenced_stops(c: &ChangeRow) -> Vec<String> {
             }
             v
         }
+        (e, "create" | "update") if super::records::spec_for(e).is_some() => {
+            super::records::referenced_stops(
+                super::records::spec_for(e).expect("a record file"),
+                &c.after,
+            )
+        }
         ("route_stops", "replace") => c.after["rows"]
             .as_array()
             .map(|rows| {
@@ -1517,10 +1875,40 @@ async fn apply_change(
         ("station", "delete") => station_delete(conn, g, key, actor).await,
         ("station", "merge") => station_merge(conn, g, c, actor, state).await,
         ("feed_config", "update") => feed_config_update(conn, g, c, state).await,
+        ("pattern", "update") => super::trips::pattern_update(conn, g, key, &c.after, actor).await,
+        ("pattern", "delete") => super::trips::pattern_delete(conn, g, key, &c.after).await,
+        ("timing_profile", "replace") => {
+            super::trips::timing_profile_replace(conn, g, key, &c.after, actor).await
+        }
+        ("timing_profile", "delete") => {
+            super::trips::timing_profile_delete(conn, g, key, &c.after).await
+        }
+        ("route_trips", "replace") => {
+            super::trips::route_trips_replace(conn, g, key, &c.after, actor).await
+        }
+        ("service", "create") => super::trips::service_create(conn, g, &c.after, actor).await,
+        ("service", "update") => super::trips::service_update(conn, g, key, &c.after, actor).await,
+        ("service", "delete") => super::trips::service_delete(conn, g, key).await,
+        (e, _) if super::records::spec_for(e).is_some() => {
+            let fspec = super::records::spec_for(e).expect("a record file");
+            super::records::apply(conn, g, fspec, c, actor).await
+        }
         (e, o) => Err(fail(
             "invalid_change",
             format!("unsupported change {e}/{o}"),
         )),
+    }
+}
+
+/// What a person calls a location type.
+pub(super) fn stop_kind(location_type: i16) -> &'static str {
+    match location_type {
+        0 => "a stop",
+        1 => "a station",
+        2 => "an entrance or exit",
+        3 => "a generic node",
+        4 => "a boarding area",
+        _ => "a location",
     }
 }
 
@@ -1577,6 +1965,9 @@ async fn stop_update(
         ));
     }
     let m = after.as_object().expect("payload checked");
+    let before = super::records::gtfs_row(conn, g, "stops.txt", id)
+        .await?
+        .unwrap_or_default();
     let mut warnings = Vec::new();
     let moved = m.contains_key("lat");
     let (lat, lon) = (
@@ -1635,7 +2026,79 @@ async fn stop_update(
     .bind(description)
     .execute(&mut *conn)
     .await?;
+    warnings.extend(stop_gtfs_fields(conn, g, id, m, &before, live.location_type).await?);
     Ok(warnings)
+}
+
+/// The GTFS fields of stops.txt a stop change sets by name (section 18): what
+/// they are written as, and what the stop is then - graded against what it
+/// was, refused when the change breaks a rule of the reference. A stop that
+/// routes call at stays a stop, a station is made and unmade by station
+/// changes, and so is the station above a platform.
+async fn stop_gtfs_fields(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    m: &serde_json::Map<String, Value>,
+    before: &crate::gtfs::model::Row,
+    was_type: i16,
+) -> Result<Vec<Finding>, ApplyError> {
+    let sets = |f: &str| m.contains_key(f);
+    if !super::records::STOP_GTFS_FIELDS.iter().any(|f| sets(f)) {
+        return Ok(vec![]);
+    }
+    let new_type = match m.get("location_type") {
+        Some(v) => v.as_i64().unwrap_or(0) as i16,
+        None => was_type,
+    };
+    if new_type == 1 && was_type != 1 {
+        return Err(fail(
+            "use_station_change",
+            format!("{id} becomes a station through station/create, which groups its platforms"),
+        ));
+    }
+    if new_type != 0 && was_type == 0 {
+        let routes: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+             JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+             WHERE rs.gtfs_id = $1 AND rs.stop_id = $2",
+        )
+        .bind(g)
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if routes > 0 {
+            return Err(fail(
+                "stop_in_use",
+                format!("stop {id} is on {routes} route(s); a place a route calls at stays a stop (location_type 0)"),
+            ));
+        }
+    }
+    if sets("parent_station") && new_type == 0 {
+        return Err(fail(
+            "use_station_change",
+            format!("the station above platform {id} is set by a station change"),
+        ));
+    }
+    super::records::write_fields(
+        conn,
+        g,
+        "gtfs_stop",
+        "stop_id",
+        id,
+        "stops.txt",
+        m,
+        super::records::STOP_GTFS_FIELDS,
+    )
+    .await?;
+    let after = super::records::gtfs_row(conn, g, "stops.txt", id)
+        .await?
+        .unwrap_or_default();
+    let found = super::records::stop_findings(conn, g, id, before, &after).await?;
+    if found.iter().any(|f| f.level == Level::Error) {
+        return Err(ApplyError::Findings(found));
+    }
+    Ok(found)
 }
 
 async fn stop_create(
@@ -1675,7 +2138,8 @@ async fn stop_create(
             format!("stop {} already exists", s("stop_id").unwrap_or("")),
         ));
     }
-    Ok(vec![])
+    let id = s("stop_id").unwrap_or("");
+    stop_gtfs_fields(conn, g, id, m, &crate::gtfs::model::Row::new(), 0).await
 }
 
 async fn stop_delete(
@@ -1724,6 +2188,22 @@ async fn stop_delete(
             ),
         ));
     }
+    // what else names the stop (section 18): pathways, transfers, areas,
+    // location groups, fare join rules, and a boarding area standing on it
+    let users: Vec<_> = super::records::used_by(conn, g, "stops.txt", "stop_id", id)
+        .await?
+        .into_iter()
+        .filter(|(file, _, _)| file != "stop_times.txt")
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            "stop_in_use",
+            format!(
+                "stop {id} is named by {}; change or remove those first",
+                super::records::say_users(&users)
+            ),
+        ));
+    }
     sqlx::query(
         "UPDATE gtfs_stop SET deleted = true, parent_station = NULL, updated_by = $3 \
          WHERE gtfs_id = $1 AND stop_id = $2",
@@ -1756,14 +2236,19 @@ async fn route_update(
         return Err(fail("route_deleted", format!("route {id} is deleted")));
     }
     let m = after.as_object().expect("payload checked");
+    let before = super::records::gtfs_row(conn, g, "routes.txt", id)
+        .await?
+        .unwrap_or_default();
     let (has_short, short) = field(m, "short_name");
     let (has_long, long) = field(m, "long_name");
     let (has_color, color) = field(m, "color");
     let (has_text, text) = field(m, "text_color");
     let (has_poly, poly) = field(m, "encoded_polyline");
     let (has_src, src) = field(m, "polyline_source");
+    let (has_schedule, schedule) = field(m, "schedule_source");
     sqlx::query(
         "UPDATE gtfs_route SET \
+            schedule_source = CASE WHEN $16 THEN $17 ELSE schedule_source END, \
             short_name = CASE WHEN $3 THEN $4 ELSE short_name END, \
             long_name = CASE WHEN $5 THEN $6 ELSE long_name END, \
             color = CASE WHEN $7 THEN upper($8) ELSE color END, \
@@ -1790,9 +2275,45 @@ async fn route_update(
     .bind(has_src)
     .bind(src)
     .bind(actor)
+    .bind(has_schedule)
+    .bind(schedule)
     .execute(&mut *conn)
     .await?;
-    Ok(vec![])
+    route_gtfs_fields(conn, g, id, m, &before).await
+}
+
+/// The fields of routes.txt a route change sets by their GTFS names (section
+/// 18), and what the route is then: graded against what it was, refused when
+/// the change breaks a rule of the reference or names an agency the feed does
+/// not have.
+async fn route_gtfs_fields(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    m: &serde_json::Map<String, Value>,
+    before: &crate::gtfs::model::Row,
+) -> Result<Vec<Finding>, ApplyError> {
+    let mut fields: Vec<&str> = super::records::ROUTE_GTFS_FIELDS.to_vec();
+    fields.extend(["agency_id", "route_type"]);
+    super::records::write_fields(
+        conn,
+        g,
+        "gtfs_route",
+        "route_id",
+        id,
+        "routes.txt",
+        m,
+        &fields,
+    )
+    .await?;
+    let after = super::records::gtfs_row(conn, g, "routes.txt", id)
+        .await?
+        .unwrap_or_default();
+    let found = super::records::route_findings(conn, g, before, &after).await?;
+    if found.iter().any(|f| f.level == Level::Error) {
+        return Err(ApplyError::Findings(found));
+    }
+    Ok(found)
 }
 
 async fn route_create(
@@ -1830,7 +2351,17 @@ async fn route_create(
     if created.is_none() {
         return Err(fail("route_exists", format!("route {id} already exists")));
     }
-    Ok(vec![])
+    if let Some(text_color) = s("text_color") {
+        sqlx::query(
+            "UPDATE gtfs_route SET text_color = upper($3) WHERE gtfs_id = $1 AND route_id = $2",
+        )
+        .bind(g)
+        .bind(id)
+        .bind(text_color)
+        .execute(&mut *conn)
+        .await?;
+    }
+    route_gtfs_fields(conn, g, id, m, &crate::gtfs::model::Row::new()).await
 }
 
 /// Soft delete: the route and its rows stay, marked deleted, and GIMS stops
@@ -1872,6 +2403,22 @@ async fn route_delete(
             ),
         ));
     }
+    // what else names the route: transfers, fare rules, attributions, its
+    // network (its own trips go with it)
+    let users: Vec<_> = super::records::used_by(conn, g, "routes.txt", "route_id", id)
+        .await?
+        .into_iter()
+        .filter(|(file, _, _)| file != "trips.txt")
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            "route_in_use",
+            format!(
+                "route {id} is named by {}; change or remove those first",
+                super::records::say_users(&users)
+            ),
+        ));
+    }
     sqlx::query(
         "UPDATE gtfs_route SET deleted = true, updated_by = $3 WHERE gtfs_id = $1 AND route_id = $2",
     )
@@ -1883,13 +2430,18 @@ async fn route_delete(
     Ok(vec![])
 }
 
-/// Changes in a set, other than `except`, that create or edit a route or its
-/// stop list.
+/// Changes in a set, other than `except`, that create or edit a route, its stop
+/// lists, or its timetable (section 16).
 fn other_route_changes(changes: &[ChangeRow], route_id: &str, except: i64) -> Vec<i64> {
     changes
         .iter()
         .filter(|o| o.change_id != except && o.entity_key == route_id)
-        .filter(|o| matches!(o.entity.as_str(), "route" | "route_stops"))
+        .filter(|o| {
+            matches!(
+                o.entity.as_str(),
+                "route" | "route_stops" | "pattern" | "timing_profile" | "route_trips"
+            )
+        })
         .map(|o| o.change_id)
         .collect()
 }
@@ -1963,6 +2515,14 @@ async fn stop_merge(
                 id,
                 format!("{id} is a station; only stops are merged"),
             )),
+            Some(s) if s.location_type != 0 => errors.push(Finding::error(
+                "not_a_stop",
+                id,
+                format!(
+                    "{id} is {}; only stops are merged",
+                    stop_kind(s.location_type)
+                ),
+            )),
             _ => {}
         }
     }
@@ -1971,34 +2531,43 @@ async fn stop_merge(
     }
     let (f, i) = (&found[from], &found[into]);
 
-    // Every row of each live route that calls the stop going away, in order:
+    // Every row of each live route that calls the stop going away, in order -
+    // on each of its stop orders, which the merge switches alike (section 16):
     // switching the id must not make a route call one stop twice in a row.
-    let mut by_route: Vec<(String, Vec<SequencedStop>)> = Vec::new();
+    let mut by_route: Vec<((String, i16), Vec<SequencedStop>)> = Vec::new();
     for r in sqlx::query(
-        "SELECT rs.route_id, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop rs \
+        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 \
-           AND rs.route_id IN (SELECT route_id FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_id = $2) \
-         ORDER BY rs.route_id, rs.sequence",
+           AND (rs.route_id, rs.pattern_key) IN \
+               (SELECT route_id, pattern_key FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_id = $2) \
+         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(g)
     .bind(from)
     .fetch_all(&mut *conn)
     .await?
     {
-        let route: String = r.try_get("route_id")?;
+        let key: (String, i16) = (r.try_get("route_id")?, r.try_get("pattern_key")?);
         let row = (
             r.try_get("sequence")?,
             r.try_get("stop_id")?,
             r.try_get("stop_type")?,
         );
         match by_route.last_mut() {
-            Some((id, rows)) if *id == route => rows.push(row),
-            _ => by_route.push((route, vec![row])),
+            Some((k, rows)) if *k == key => rows.push(row),
+            _ => by_route.push((key, vec![row])),
         }
     }
     let mut warnings = Vec::new();
-    for (route, rows) in &by_route {
+    for ((route, pattern), rows) in &by_route {
+        // a stop order past the first names itself; pattern 1 is the route's
+        // stop list and reads exactly as it did before patterns existed
+        let route = if *pattern == FIRST_PATTERN {
+            route.clone()
+        } else {
+            format!("{route} (pattern {pattern})")
+        };
         let effect = merge_effect(rows, from, into);
         for (a, b) in &effect.repeats {
             errors.push(Finding::error(
@@ -2094,7 +2663,10 @@ async fn stop_merge(
         .execute(&mut *conn)
         .await?;
     }
-    // 4. the duplicate
+    // 4. what else names the duplicate names the kept stop (section 18):
+    // pathways, transfers, areas, location groups, and its boarding areas
+    let records = super::records::repoint_stop(conn, g, from, into, true).await?;
+    // 5. the duplicate
     sqlx::query(
         "UPDATE gtfs_stop SET deleted = true, parent_station = NULL, \
             provenance = coalesce(provenance, '{}'::jsonb) || jsonb_build_object('merged_into', $3::text), \
@@ -2114,6 +2686,7 @@ async fn stop_merge(
         .insert(from.to_string(), (into.to_string(), c.change_id, false));
     state.merges.push(json!({
         "change_id": c.change_id, "from": from, "into": into, "routes": routes, "rows": moved.len(),
+        "records": records,
         "keep_name": if keep_name_from { "from" } else { "into" },
         "keep_position": if keep_position_from { "from" } else { "into" },
     }));
@@ -2128,6 +2701,21 @@ struct RouteStopsPayload {
     position_review_id: Option<i64>,
 }
 
+/// Whether a feed has MTC's fare stages (`headsign_source = 'fare_stage'`): only
+/// then is a stop list held to the stage rules (section 16).
+pub async fn has_fare_stages(conn: &mut PgConnection, g: &str) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query("SELECT headsign_source FROM gtfs_feed WHERE gtfs_id = $1")
+            .bind(g)
+            .fetch_optional(&mut *conn)
+            .await?
+            .map(|r| r.try_get::<String, _>("headsign_source"))
+            .transpose()?
+            .as_deref()
+            == Some("fare_stage"),
+    )
+}
+
 async fn route_stops_replace(
     conn: &mut PgConnection,
     g: &str,
@@ -2137,6 +2725,7 @@ async fn route_stops_replace(
 ) -> Result<Vec<Finding>, ApplyError> {
     let payload: RouteStopsPayload = serde_json::from_value(after.clone())
         .map_err(|e| fail("invalid_payload", format!("rows are not valid: {e}")))?;
+    let pattern_key = pattern_of(after);
     let deleted: bool = sqlx::query(
         "SELECT deleted FROM gtfs_route WHERE gtfs_id = $1 AND route_id = $2 FOR UPDATE",
     )
@@ -2200,18 +2789,27 @@ async fn route_stops_replace(
                 id.as_str(),
                 format!("{id} is a station; a route calls at one of its platforms"),
             )),
+            Some((t, _)) if *t != 0 => findings.push(Finding::error(
+                "not_a_stop",
+                id.as_str(),
+                format!(
+                    "{id} is {} (location_type {t}); a route calls at a stop or platform",
+                    stop_kind(*t)
+                ),
+            )),
             _ => {}
         }
     }
-    let live = load_route_rows(conn, g, route_id).await?;
+    let live = load_pattern_rows(conn, g, route_id, pattern_key).await?;
+    let fare_stages = has_fare_stages(conn, g).await?;
     if payload.position_review_id.is_some() {
         // a split points the reviewed stop's rows at a new stop: what those rows
         // already had wrong under the old stop is not the split's doing
-        findings.extend(grade_repointed(&rows, &live));
+        findings.extend(grade_repointed(&rows, &live, fare_stages));
     } else {
         findings.extend(grade_against_live(
-            check_route_rows(&rows),
-            &check_route_rows(&live),
+            check_route_rows_for(&rows, fare_stages),
+            &check_route_rows_for(&live, fare_stages),
         ));
     }
     // A stop that cannot be used, or a row the table refuses, stops the change
@@ -2230,10 +2828,11 @@ async fn route_stops_replace(
     // position) and the provider id (a new row takes the route's usual one).
     let live_meta: HashMap<i32, (Option<String>, Option<String>, Option<String>)> = sqlx::query(
         "SELECT sequence, stop_id, marker_id, provenance::text AS provenance \
-         FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2",
+         FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3",
     )
     .bind(g)
     .bind(route_id)
+    .bind(pattern_key)
     .fetch_all(&mut *conn)
     .await?
     .iter()
@@ -2268,9 +2867,47 @@ async fn route_stops_replace(
     let (mut mid, mut mname, mut mlat, mut mlon, mut over, mut prov) =
         (vec![], vec![], vec![], vec![], vec![], vec![]);
     let mut provenance: Vec<Option<String>> = Vec::with_capacity(n);
+    let (mut pickup, mut dropoff, mut timepoint, mut headsign) = (vec![], vec![], vec![], vec![]);
+    let (
+        mut gtfs_seq,
+        mut cont_pickup,
+        mut cont_dropoff,
+        mut dist,
+        mut pickup_rule,
+        mut dropoff_rule,
+    ) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     for (i, r) in rows.iter().enumerate() {
         let s = i as i32 + 1;
         seq.push(s);
+        // a marker is not a place anyone boards
+        let served = |v: Option<i16>| if r.is_marker() { None } else { v };
+        pickup.push(served(r.pickup_type));
+        dropoff.push(served(r.drop_off_type));
+        timepoint.push(served(r.timepoint));
+        cont_pickup.push(served(r.continuous_pickup));
+        cont_dropoff.push(served(r.continuous_drop_off));
+        let marker = r.is_marker();
+        gtfs_seq.push(if marker { None } else { r.stop_sequence });
+        dist.push(if marker { None } else { r.shape_dist_traveled });
+        pickup_rule.push(if marker {
+            None
+        } else {
+            r.pickup_booking_rule_id.clone()
+        });
+        dropoff_rule.push(if marker {
+            None
+        } else {
+            r.drop_off_booking_rule_id.clone()
+        });
+        headsign.push(if r.is_marker() {
+            None
+        } else {
+            r.stop_headsign
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+        });
         stop.push(if r.is_marker() {
             None
         } else {
@@ -2314,20 +2951,41 @@ async fn route_stops_replace(
             }
         }));
     }
-    sqlx::query("DELETE FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2")
-        .bind(g)
-        .bind(route_id)
-        .execute(&mut *conn)
-        .await?;
+    // replacing a stop order the route does not have yet creates it (16.4)
     sqlx::query(
-        "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, \
-                                      marker_id, marker_name, marker_lat, marker_lon, stop_name_override, \
-                                      provider_id, provenance, updated_by) \
-         SELECT $1, $2, u.seq, u.stop, u.typ, u.no, u.name, u.mid, u.mname, u.mlat, u.mlon, u.over, u.prov, \
-                u.provenance::jsonb, $14 \
+        "INSERT INTO gtfs_pattern (gtfs_id, route_id, pattern_key, updated_by) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(g)
+    .bind(route_id)
+    .bind(pattern_key)
+    .bind(actor)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM gtfs_route_stop WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3",
+    )
+    .bind(g)
+    .bind(route_id)
+    .bind(pattern_key)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO gtfs_route_stop (gtfs_id, route_id, pattern_key, sequence, stop_id, stop_type, stage_no, \
+                                      stage_name, marker_id, marker_name, marker_lat, marker_lon, \
+                                      stop_name_override, provider_id, provenance, updated_by, \
+                                      pickup_type, drop_off_type, timepoint, stop_headsign, stop_sequence, \
+                                      continuous_pickup, continuous_drop_off, shape_dist_traveled, \
+                                      pickup_booking_rule_id, drop_off_booking_rule_id) \
+         SELECT $1, $2, $16, u.seq, u.stop, u.typ, u.no, u.name, u.mid, u.mname, u.mlat, u.mlon, u.over, \
+                u.prov, u.provenance::jsonb, $14, u.pickup, u.dropoff, u.timepoint, u.headsign, u.gseq, \
+                u.cpickup, u.cdropoff, u.dist, u.prule, u.drule \
          FROM UNNEST($3::int4[], $4::text[], $5::text[], $6::int4[], $7::text[], $8::text[], $9::text[], \
-                     $10::float8[], $11::float8[], $12::text[], $13::text[], $15::text[]) \
-              AS u(seq, stop, typ, no, name, mid, mname, mlat, mlon, over, prov, provenance)",
+                     $10::float8[], $11::float8[], $12::text[], $13::text[], $15::text[], \
+                     $17::int2[], $18::int2[], $19::int2[], $20::text[], $21::int4[], $22::int2[], \
+                     $23::int2[], $24::float8[], $25::text[], $26::text[]) \
+              AS u(seq, stop, typ, no, name, mid, mname, mlat, mlon, over, prov, provenance, \
+                   pickup, dropoff, timepoint, headsign, gseq, cpickup, cdropoff, dist, prule, drule)",
     )
     .bind(g)
     .bind(route_id)
@@ -2344,8 +3002,24 @@ async fn route_stops_replace(
     .bind(&prov)
     .bind(actor)
     .bind(&provenance)
+    .bind(pattern_key)
+    .bind(&pickup)
+    .bind(&dropoff)
+    .bind(&timepoint)
+    .bind(&headsign)
+    .bind(&gtfs_seq)
+    .bind(&cont_pickup)
+    .bind(&cont_dropoff)
+    .bind(&dist)
+    .bind(&pickup_rule)
+    .bind(&dropoff_rule)
     .execute(&mut *conn)
     .await?;
+    // the pattern's stored timings follow its new stops, in this same change
+    let old_ids = super::trips::served_ids(&live);
+    findings.extend(
+        super::trips::carry_over_profiles(conn, g, route_id, pattern_key, &old_ids, actor).await?,
+    );
     Ok(findings)
 }
 
@@ -2434,6 +3108,14 @@ async fn check_members(
                 "member_is_station",
                 id.as_str(),
                 format!("{id} is itself a station"),
+            )),
+            Some(s) if s.location_type != 0 => findings.push(Finding::error(
+                "not_a_stop",
+                id.as_str(),
+                format!(
+                    "{id} is {}; a station's members are its platforms",
+                    stop_kind(s.location_type)
+                ),
             )),
             Some(s) if s.parent_station.as_deref().is_some_and(|p| p != station_id) => findings
                 .push(Finding::error(
@@ -2543,7 +3225,8 @@ async fn station_update(
         check_members(conn, g, id, &members).await?;
         sqlx::query(
             "UPDATE gtfs_stop SET parent_station = NULL, updated_by = $4 \
-             WHERE gtfs_id = $1 AND parent_station = $2 AND NOT (stop_id = ANY($3))",
+             WHERE gtfs_id = $1 AND parent_station = $2 AND NOT (stop_id = ANY($3)) \
+               AND location_type = 0",
         )
         .bind(g)
         .bind(id)
@@ -2563,8 +3246,34 @@ async fn station_delete(
     actor: &str,
 ) -> Result<Vec<Finding>, ApplyError> {
     live_station(conn, g, id).await?;
+    let inside: Vec<(String, i16)> = sqlx::query_as(
+        "SELECT stop_id, location_type FROM gtfs_stop \
+         WHERE gtfs_id = $1 AND parent_station = $2 AND location_type IN (2, 3) AND NOT deleted \
+         ORDER BY stop_id",
+    )
+    .bind(g)
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !inside.is_empty() {
+        let list: Vec<String> = inside
+            .iter()
+            .take(5)
+            .map(|(s, t)| format!("{s} ({})", stop_kind(*t)))
+            .collect();
+        return Err(fail(
+            "station_has_entrances",
+            format!(
+                "station {id} has {} entrance(s) and node(s) ({}{}); delete them or move them to another station first",
+                inside.len(),
+                list.join(", "),
+                if inside.len() > 5 { ", ..." } else { "" }
+            ),
+        ));
+    }
     sqlx::query(
-        "UPDATE gtfs_stop SET parent_station = NULL, updated_by = $3 WHERE gtfs_id = $1 AND parent_station = $2",
+        "UPDATE gtfs_stop SET parent_station = NULL, updated_by = $3 \
+         WHERE gtfs_id = $1 AND parent_station = $2 AND location_type = 0",
     )
     .bind(g)
     .bind(id)
@@ -2802,6 +3511,9 @@ async fn station_merge(
         .execute(&mut *conn)
         .await?;
     }
+    // what names the station that goes names the one that stays (section 18);
+    // its platforms, entrances and nodes moved with the parent above
+    let records = super::records::repoint_stop(conn, g, from, into, false).await?;
     // 3. the station that goes: the same `merged_into` key a stop merge writes,
     // which is what the loader turns into an alias
     sqlx::query(
@@ -2822,6 +3534,7 @@ async fn station_merge(
         .insert(from.to_string(), (into.to_string(), c.change_id, true));
     state.station_merges.push(json!({
         "change_id": c.change_id, "from": from, "into": into, "platforms_moved": moved,
+        "records": records,
         "keep_name": if keep_name_from { "from" } else { "into" },
         "keep_position": if keep_position_from { "from" } else { "into" },
     }));
@@ -2833,10 +3546,12 @@ fn plural_count(n: usize, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
-/// Switch the data source GIMS serves the feed from. The feed's version is not
-/// touched here: the commit's own bump is what every pod's poll notices. A
-/// change to the value the feed already has - earlier changes of the set taken
-/// as applied - switches nothing and says so.
+/// Switch the data source GIMS serves the feed from, and - since section 16 -
+/// where it takes the feed's trips from and how it times them. The feed's
+/// version is not touched here: the commit's own bump is what every pod's poll
+/// notices. A setting the feed already has - earlier changes of the set taken as
+/// applied - switches nothing and says so. `trips_source = 'db'` needs
+/// `data_source = 'db'` once the change applies (`trips_need_db`).
 async fn feed_config_update(
     conn: &mut PgConnection,
     g: &str,
@@ -2852,53 +3567,141 @@ async fn feed_config_update(
             ),
         ));
     }
-    let to = c.after["data_source"].as_str().expect("payload checked");
-    let from: String =
-        sqlx::query("SELECT data_source FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
-            .bind(g)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| fail("feed_not_found", format!("no feed {g}")))?
-            .try_get("data_source")?;
-    if from == to {
-        return Ok(vec![Finding::warning(
-            "data_source_unchanged",
-            g,
-            format!("feed {g} is already served from '{to}'; this change switches nothing"),
-        )]);
-    }
-    sqlx::query("UPDATE gtfs_feed SET data_source = $2 WHERE gtfs_id = $1")
+    sqlx::query("SELECT 1 FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
         .bind(g)
-        .bind(to)
-        .execute(&mut *conn)
-        .await?;
-    state.feed_configs.push(json!({
-        "gtfs_id": g, "from": from, "to": to, "change_id": c.change_id,
-    }));
-    Ok(vec![])
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| fail("feed_not_found", format!("no feed {g}")))?;
+    let live = feed_config_row(conn, g).await?;
+    let m = c.after.as_object().expect("payload checked");
+    let after = |f: &str| m.get(f).unwrap_or(&live[f]).clone();
+    if after("trips_source") == "db" && after("data_source") != "db" {
+        return Err(fail(
+            "trips_need_db",
+            format!("feed {g}'s trips can be served from the database only while its data source is 'db'"),
+        ));
+    }
+    let mut warnings = Vec::new();
+    let mut switched = Vec::new();
+    for f in super::validation::FEED_CONFIG_FIELDS {
+        let Some(to) = m.get(f) else { continue };
+        if live[f] == *to {
+            warnings.push(if f == "data_source" {
+                Finding::warning(
+                    "data_source_unchanged",
+                    g,
+                    format!(
+                        "feed {g} is already served from '{}'; this change switches nothing",
+                        to.as_str().unwrap_or("")
+                    ),
+                )
+            } else {
+                Finding::warning(
+                    "feed_config_unchanged",
+                    format!("{g}|{f}"),
+                    format!("feed {g}'s {f} is already {to}; this sets nothing"),
+                )
+            });
+        } else {
+            switched.push((f, live[f].clone(), to.clone()));
+        }
+    }
+    if switched.is_empty() {
+        return Ok(warnings);
+    }
+    let set = |f: &str| {
+        switched
+            .iter()
+            .find(|(k, _, _)| *k == f)
+            .map(|(_, _, to)| to)
+    };
+    sqlx::query(
+        "UPDATE gtfs_feed SET data_source = coalesce($2, data_source), \
+            trips_source = coalesce($3, trips_source), default_run_s = coalesce($4, default_run_s), \
+            default_dwell_s = coalesce($5, default_dwell_s), schedule_sync = coalesce($6, schedule_sync), \
+            sync_running_times = coalesce($7, sync_running_times) \
+         WHERE gtfs_id = $1",
+    )
+    .bind(g)
+    .bind(set("data_source").and_then(Value::as_str))
+    .bind(set("trips_source").and_then(Value::as_str))
+    .bind(set("default_run_s").and_then(Value::as_i64).map(|n| n as i32))
+    .bind(set("default_dwell_s").and_then(Value::as_i64).map(|n| n as i32))
+    .bind(set("schedule_sync").and_then(Value::as_str))
+    .bind(set("sync_running_times").and_then(Value::as_bool))
+    .execute(&mut *conn)
+    .await?;
+    for (f, from, to) in switched {
+        if f == "data_source" {
+            state.feed_configs.push(json!({
+                "gtfs_id": g, "from": from, "to": to, "change_id": c.change_id,
+            }));
+        } else {
+            state.feed_settings.push(json!({
+                "gtfs_id": g, "setting": f, "from": from, "to": to, "change_id": c.change_id,
+            }));
+        }
+    }
+    Ok(warnings)
 }
 
 // ---------------------------------------------------------------- set detail
 
-/// The set, its changes, and - unless it is finished - what applying it now
-/// would find. Runs the changes in a transaction that is rolled back.
+/// How many changes a change set's detail carries at once unless asked
+/// (section 16.5, "Big drafts").
+pub const CHANGES_PAGE: i64 = 200;
+
+/// The set, the first page of its changes, and - unless it is finished - what
+/// applying it now would find. Runs the changes in a transaction that is rolled
+/// back.
 pub async fn set_detail(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
-    retry_transient(|| set_detail_once(state, ctx, id)).await
+    let first = Page {
+        limit: CHANGES_PAGE,
+        offset: 0,
+    };
+    set_detail_page(state, ctx, id, &first, true).await
 }
 
-async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<Value> {
+/// [`set_detail`] for one page of the changes (`limit`, `cursor`). Every page
+/// carries the set's fields, `change_count` and `next_cursor`. Only the first
+/// (`replay`) runs the draft: its `validation`, `validation_summary`,
+/// `conflicts` and `can_submit` are the whole set's, so paging through a draft
+/// of thousands of changes replays it once.
+pub async fn set_detail_page(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    page: &Page,
+    replay: bool,
+) -> EditorResult<Value> {
+    retry_transient(|| set_detail_once(state, ctx, id, page, replay)).await
+}
+
+async fn set_detail_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    page: &Page,
+    replay: bool,
+) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, false).await?;
-    let changes = load_changes(&mut tx, id).await?;
-    let ev = if matches!(set.status.as_str(), "committed" | "discarded") {
-        Evaluation::default()
+    let mut changes = load_changes_page(&mut tx, id, page).await?;
+    let more = changes.len() as i64 > page.limit;
+    changes.truncate(page.limit as usize);
+    let ev = if !replay {
+        None
+    } else if matches!(set.status.as_str(), "committed" | "discarded") {
+        Some(Evaluation::default())
     } else {
+        let all = load_changes_to_apply(&mut tx, id).await?;
         lock_feed(&mut tx, &set.gtfs_id).await?;
-        evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?
+        Some(evaluate(&mut tx, &set.gtfs_id, &all, &ctx.user.email).await?)
     };
     tx.rollback().await?;
     // Stop-order changes carry ids only; give the diff the names of every stop
-    // they reference (live names, so a stop added to a route reads as itself).
+    // the page's changes reference (live names, so a stop added to a route
+    // reads as itself).
     let referenced: Vec<String> = changes
         .iter()
         .filter(|c| c.entity == "route_stops")
@@ -2907,13 +3710,14 @@ async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResu
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let stop_names: Map<String, Value> = if referenced.is_empty() {
+    let mut conn = state.pool.acquire().await?;
+    let mut stop_names: Map<String, Value> = if referenced.is_empty() {
         Map::new()
     } else {
         sqlx::query("SELECT stop_id, name FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)")
             .bind(&set.gtfs_id)
             .bind(&referenced)
-            .fetch_all(&state.pool)
+            .fetch_all(&mut *conn)
             .await?
             .iter()
             .map(|r| -> Result<(String, Value), sqlx::Error> {
@@ -2925,26 +3729,32 @@ async fn set_detail_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResu
             .collect::<Result<_, _>>()?
     };
     // a stop created in this draft has no live name yet: use the one it is given
-    let mut stop_names = stop_names;
-    let wanted: HashSet<&String> = referenced.iter().collect();
-    for c in changes
+    let unnamed: Vec<String> = referenced
         .iter()
-        .filter(|c| c.entity == "stop" && c.op == "create")
-    {
-        if wanted.contains(&c.entity_key) && !stop_names.contains_key(&c.entity_key) {
-            if let Some(name) = c.after["name"].as_str() {
-                stop_names.insert(c.entity_key.clone(), json!(name.trim()));
-            }
+        .filter(|id| !stop_names.contains_key(*id))
+        .cloned()
+        .collect();
+    for (key, (entity, after)) in stops_created_in_set(&mut conn, id, &unnamed).await? {
+        if let (true, Some(name)) = (entity == "stop", after["name"].as_str()) {
+            stop_names.insert(key, json!(name.trim()));
         }
     }
     let mut out = set.json;
     out["stop_names"] = Value::Object(stop_names);
     out["changes"] = json!(changes.iter().map(ChangeRow::json).collect::<Vec<_>>());
-    out["validation"] = json!(ev.validation);
-    out["conflicts"] = json!(ev.conflicts);
-    out["can_submit"] = json!(
-        set.status == "draft" && !changes.is_empty() && !ev.has_errors() && ev.conflicts.is_empty()
-    );
+    out["next_cursor"] = json!(page.next_cursor(more));
+    if let Some(ev) = ev {
+        let count = |level: &str| ev.validation.iter().filter(|v| v["level"] == level).count();
+        out["validation_summary"] = json!({"errors": count("error"), "warnings": count("warning")});
+        out["can_submit"] = json!(
+            set.status == "draft"
+                && out["change_count"].as_i64().unwrap_or(0) > 0
+                && !ev.has_errors()
+                && ev.conflicts.is_empty()
+        );
+        out["validation"] = json!(ev.validation);
+        out["conflicts"] = json!(ev.conflicts);
+    }
     Ok(out)
 }
 
@@ -2963,18 +3773,86 @@ async fn preview_route_once(
     id: Uuid,
     route_id: &str,
 ) -> EditorResult<Value> {
+    preview_once(
+        state,
+        ctx,
+        id,
+        route_id,
+        RoutePreview::Pattern(FIRST_PATTERN),
+    )
+    .await
+}
+
+/// What a route preview shows (section 16): the route detail with the rows of
+/// one of its stop orders, or its trips.
+#[derive(Clone, Copy)]
+pub enum RoutePreview {
+    Pattern(i16),
+    Trips,
+}
+
+/// [`preview_route`] for another stop order of the route, or for its trips:
+/// the draft applied, then read, then rolled back.
+pub async fn preview_route_as(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    route_id: &str,
+    what: RoutePreview,
+) -> EditorResult<Value> {
+    retry_transient(|| preview_once(state, ctx, id, route_id, what)).await
+}
+
+async fn preview_once(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    route_id: &str,
+    what: RoutePreview,
+) -> EditorResult<Value> {
     let mut tx = state.pool.begin().await?;
     let set = load_set(&mut tx, id, false).await?;
-    let changes = load_changes(&mut tx, id).await?;
+    let changes = load_changes_to_apply(&mut tx, id).await?;
     lock_feed(&mut tx, &set.gtfs_id).await?;
     let ev = evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?;
-    let route = route_detail(&mut tx, &set.gtfs_id, route_id).await;
+    let route = match what {
+        RoutePreview::Pattern(k) => route_pattern_detail(&mut tx, &set.gtfs_id, route_id, k).await,
+        RoutePreview::Trips => {
+            super::trips::route_trips_detail(&mut tx, &set.gtfs_id, route_id).await
+        }
+    };
     tx.rollback().await?;
     // the route in read shape, with the draft applied, plus what applying found
     let mut route = route?;
     route["validation"] = json!(ev.validation);
     route["conflicts"] = json!(ev.conflicts);
     Ok(route)
+}
+
+/// A record file's rows (section 18) with a draft applied: applied, read,
+/// rolled back, like a route preview.
+pub async fn preview_records(
+    state: &EditorState,
+    ctx: &Ctx,
+    id: Uuid,
+    fspec: &'static crate::gtfs::spec::FileSpec,
+    q: Option<&str>,
+    page: &Page,
+) -> EditorResult<Value> {
+    retry_transient(|| async {
+        let mut tx = state.pool.begin().await?;
+        let set = load_set(&mut tx, id, false).await?;
+        let changes = load_changes_to_apply(&mut tx, id).await?;
+        lock_feed(&mut tx, &set.gtfs_id).await?;
+        let ev = evaluate(&mut tx, &set.gtfs_id, &changes, &ctx.user.email).await?;
+        let rows = super::records::list_records(&mut tx, &set.gtfs_id, fspec, q, page).await;
+        tx.rollback().await?;
+        let mut rows = rows?;
+        rows["validation"] = json!(ev.validation);
+        rows["conflicts"] = json!(ev.conflicts);
+        Ok(rows)
+    })
+    .await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3035,6 +3913,71 @@ async fn created_in_set(
         Some(r) => Some((r.try_get("entity")?, json_col(&r, "after")?)),
         None => None,
     })
+}
+
+/// The `after` of the create, earlier in the set, that makes service `key`.
+async fn service_created_in_set(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    key: &str,
+) -> EditorResult<Option<Value>> {
+    let row = sqlx::query(
+        "SELECT after::text AS after FROM gtfs_change \
+         WHERE change_set_id = $1 AND entity = 'service' AND op = 'create' AND entity_key = $2 \
+         ORDER BY position LIMIT 1",
+    )
+    .bind(change_set_id)
+    .bind(key)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|r| json_col(&r, "after")).transpose()?)
+}
+
+/// Whether an earlier change of the set makes pattern `pattern_key` of
+/// `route_id`: a stop list replace of a stop order the route does not have, or -
+/// for pattern 1 - the route's create.
+async fn pattern_created_in_set(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    route_id: &str,
+    pattern_key: i16,
+) -> EditorResult<bool> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM gtfs_change WHERE change_set_id = $1 AND entity_key = $2 \
+           AND ((entity = 'route_stops' AND op = 'replace' \
+                 AND coalesce((after->>'pattern_key')::int, 1) = $3) \
+                OR (entity = 'route' AND op = 'create' AND $3 = 1)) \
+         LIMIT 1",
+    )
+    .bind(change_set_id)
+    .bind(route_id)
+    .bind(pattern_key as i32)
+    .fetch_optional(&mut *conn)
+    .await?
+    .is_some())
+}
+
+/// A route that exists live or is created earlier in the set: `Some(true)` for
+/// a live one, `Some(false)` for one the set creates.
+async fn route_in_set(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    g: &str,
+    key: &str,
+) -> EditorResult<bool> {
+    if route_row(conn, g, key).await?.is_some() {
+        return Ok(true);
+    }
+    if created_in_set(conn, change_set_id, true, key)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Err(EditorError::not_found(
+        "entity_not_found",
+        format!("no route {key}"),
+    ))
 }
 
 /// The `after` of the creates in the set that make the stops or stations
@@ -3098,6 +4041,9 @@ async fn snapshot(
     key: &str,
     after: &mut Value,
 ) -> EditorResult<(Value, Option<i32>)> {
+    if let Some(fspec) = super::records::spec_for(entity) {
+        return super::records::snapshot(conn, change_set_id, g, fspec, op, key).await;
+    }
     let station_mismatch = |is_station: bool| {
         EditorError::bad_request(
             if is_station {
@@ -3132,6 +4078,18 @@ async fn snapshot(
                     .unwrap_or_default();
                 with_members(&mut row, &members);
             }
+            // the rest of its stops.txt fields, as the detail read carries them,
+            // so a review shows what a change to them was (section 18)
+            if !is_station && version.is_some() {
+                row["gtfs"] = super::records::gtfs_fields(
+                    conn,
+                    g,
+                    "stops.txt",
+                    key,
+                    super::records::STOP_GTFS_FIELDS,
+                )
+                .await?;
+            }
             Ok((row, version))
         }
         ("stop", "merge") => {
@@ -3161,8 +4119,15 @@ async fn snapshot(
                     m.insert("into_row_version".into(), json!(v));
                 }
             }
+            // one entry per route, whichever of its stop orders call the stop:
+            // `sequences` are its stop list's (pattern 1), and a route that also
+            // calls it on another stop order says which ones in `pattern_keys` -
+            // a route with only a stop list reads exactly as it always did
             let affected = sqlx::query(
-                "SELECT rs.route_id, r.short_name, array_agg(rs.sequence ORDER BY rs.sequence) AS sequences \
+                "SELECT rs.route_id, r.short_name, \
+                        coalesce(array_agg(rs.sequence ORDER BY rs.sequence) \
+                                 FILTER (WHERE rs.pattern_key = 1), '{}') AS sequences, \
+                        array_agg(DISTINCT rs.pattern_key) AS pattern_keys \
                  FROM gtfs_route_stop rs \
                  JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
                  WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 \
@@ -3174,11 +4139,16 @@ async fn snapshot(
             .await?
             .iter()
             .map(|r| -> Result<Value, sqlx::Error> {
-                Ok(json!({
+                let mut v = json!({
                     "route_id": r.try_get::<String, _>("route_id")?,
                     "short_name": r.try_get::<Option<String>, _>("short_name")?,
                     "sequences": r.try_get::<Vec<i32>, _>("sequences")?,
-                }))
+                });
+                let patterns: Vec<i16> = r.try_get("pattern_keys")?;
+                if patterns != [FIRST_PATTERN] {
+                    v["pattern_keys"] = json!(patterns);
+                }
+                Ok(v)
             })
             .collect::<Result<Vec<_>, _>>()?;
             Ok((
@@ -3220,8 +4190,15 @@ async fn snapshot(
             ))
         }
         ("route", "update" | "delete") => {
-            if let Some(row) = route_row(conn, g, key).await? {
+            if let Some(mut row) = route_row(conn, g, key).await? {
                 let v = row["row_version"].as_i64().map(|v| v as i32);
+                let fields: Vec<&str> = super::records::ROUTE_GTFS_FIELDS
+                    .iter()
+                    .copied()
+                    .chain(["agency_id", "route_type"])
+                    .collect();
+                row["gtfs"] =
+                    super::records::gtfs_fields(conn, g, "routes.txt", key, &fields).await?;
                 return Ok((row, v));
             }
             let (_, created) = created_in_set(conn, change_set_id, true, key)
@@ -3233,22 +4210,72 @@ async fn snapshot(
         }
         ("feed_config", "update") => Ok((feed_config_row(conn, g).await?, None)),
         ("route_stops", "replace") => {
-            if route_row(conn, g, key).await?.is_none() {
-                if created_in_set(conn, change_set_id, true, key)
-                    .await?
-                    .is_some()
-                {
-                    // a route this set creates starts with no rows
-                    return Ok((json!([]), None));
-                }
-                return Err(EditorError::not_found(
-                    "entity_not_found",
-                    format!("no route {key}"),
-                ));
+            if !route_in_set(conn, change_set_id, g, key).await? {
+                // a route this set creates starts with no rows
+                return Ok((json!([]), None));
             }
-            // the rows in read shape (names and positions), as the diff shows them
-            let detail = route_detail(conn, g, key).await?;
-            Ok((detail["rows"].clone(), None))
+            // the rows in read shape (names and positions), as the diff shows
+            // them; a stop order the route does not have yet has none
+            let key = (key.to_string(), pattern_of(after));
+            let rows = load_patterns_read_rows(conn, g, std::slice::from_ref(&key))
+                .await?
+                .remove(&key)
+                .unwrap_or_default();
+            Ok((json!(rows), None))
+        }
+        ("pattern", "update" | "delete") => {
+            let pattern = pattern_of(after);
+            if route_in_set(conn, change_set_id, g, key).await? {
+                if let Some((row, version)) =
+                    super::trips::pattern_json(conn, g, key, pattern).await?
+                {
+                    return Ok((row, Some(version)));
+                }
+            }
+            if pattern_created_in_set(conn, change_set_id, key, pattern).await? {
+                return Ok((json!({"pattern_key": pattern}), None));
+            }
+            Err(EditorError::not_found(
+                "entity_not_found",
+                format!("route {key} has no pattern {pattern}"),
+            ))
+        }
+        ("timing_profile", "replace" | "delete") => {
+            let (pattern, profile) = (pattern_of(after), after["profile_key"].as_i64());
+            if !route_in_set(conn, change_set_id, g, key).await? {
+                return Ok((Value::Null, None));
+            }
+            let live = match profile {
+                Some(p) => super::trips::profile_read(conn, g, key, pattern, p as i32).await?,
+                None => None,
+            };
+            match live {
+                Some((row, version)) if op == "delete" => Ok((row, Some(version))),
+                Some((row, _)) => Ok((row, None)),
+                // a profile the set creates earlier is deleted with no base
+                None => Ok((Value::Null, None)),
+            }
+        }
+        ("route_trips", "replace") => {
+            if !route_in_set(conn, change_set_id, g, key).await? {
+                return Ok((json!([]), None));
+            }
+            Ok((
+                json!(super::trips::route_trips_json(conn, g, key).await?),
+                None,
+            ))
+        }
+        ("service", "update" | "delete") => {
+            if let Some(row) = super::trips::service_json(conn, g, key).await? {
+                let version = row["row_version"].as_i64().map(|v| v as i32);
+                return Ok((row, version));
+            }
+            let created = service_created_in_set(conn, change_set_id, key)
+                .await?
+                .ok_or_else(|| {
+                    EditorError::not_found("entity_not_found", format!("no service {key}"))
+                })?;
+            Ok((created, None))
         }
         _ => Ok((Value::Null, None)),
     }
@@ -3299,10 +4326,30 @@ pub async fn add_change_to(
     } = change;
     // which data source a feed is served from is an admin's call
     if entity == "feed_config" {
-        ctx.require_role(auth::Role::Admin)?;
+        ctx.require_admin()?;
     }
     let mut key = entity_key.trim().to_string();
     settle_create_key(&entity, &op, &mut key, &mut after);
+    // a record file with no id of its own gets one; feed_info is the feed's
+    if let Some(fspec) = super::records::spec_for(&entity) {
+        match fspec.key() {
+            Some(crate::gtfs::spec::Key::Feed) if key.is_empty() => key = set.gtfs_id.clone(),
+            Some(crate::gtfs::spec::Key::Feed) if key != set.gtfs_id => {
+                return Err(EditorError::bad_request(
+                    "invalid_change",
+                    format!(
+                        "{entity}/{op}: entity_key must be the change set's feed, {}",
+                        set.gtfs_id
+                    ),
+                )
+                .with_details(json!({"code": "feed_mismatch"})));
+            }
+            Some(crate::gtfs::spec::Key::Minted { .. }) if op == "create" && key.is_empty() => {
+                key = super::records::mint_row_id();
+            }
+            _ => {}
+        }
+    }
     let mint = entity == "stop" && op == "create" && key.is_empty() && after.is_object();
     let invalid = |f: Finding| {
         EditorError::bad_request("invalid_change", f.message.clone())
@@ -3347,6 +4394,19 @@ pub async fn add_change_to(
                 after["agency_id"] = json!(agency);
             }
         }
+    }
+    // what a change leaves to the server is written into it, so a reviewer - and
+    // every later change of the draft - sees it: new trips' ids, a new profile's
+    // key (section 16.4)
+    if entity == "route_trips" && op == "replace" {
+        mint_missing_trip_ids(&mut *tx, &set.gtfs_id, &key, &mut after).await?;
+    }
+    if entity == "timing_profile" && op == "replace" && after["profile_key"].is_null() {
+        let next =
+            super::trips::next_profile_key(&mut *tx, id, &set.gtfs_id, &key, pattern_of(&after))
+                .await?;
+        after["profile_key"] = json!(next);
+        after["base_hash"] = json!(super::trips::empty_hash());
     }
     if entity == "route" && op == "delete" {
         let others = other_route_changes(&load_changes(&mut *tx, id).await?, &key, 0);
@@ -3401,6 +4461,37 @@ pub async fn add_change_to(
     Ok(change_id)
 }
 
+/// Give every trip of a `route_trips` change that has no `trip_id` a new one.
+pub(super) async fn mint_missing_trip_ids(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    after: &mut Value,
+) -> EditorResult<()> {
+    let Some(trips) = after["trips"].as_array_mut() else {
+        return Ok(());
+    };
+    let unnamed: Vec<usize> = trips
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t["trip_id"]
+                .as_str()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if unnamed.is_empty() {
+        return Ok(());
+    }
+    let ids = super::trips::mint_trip_ids(conn, g, route_id, unnamed.len()).await?;
+    for (i, id) in unnamed.into_iter().zip(ids) {
+        trips[i]["trip_id"] = json!(id);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeUpdate {
@@ -3445,7 +4536,7 @@ async fn update_change_once(
         row.try_get("entity_key")?,
     );
     if entity == "feed_config" {
-        ctx.require_role(auth::Role::Admin)?;
+        ctx.require_admin()?;
     }
     let mut update = update;
     // a create's id is fixed once the change exists; a merge keeps the kept
@@ -3475,6 +4566,19 @@ async fn update_change_once(
         };
         if let (Some(m), Some(v)) = (update.after.as_object_mut(), version) {
             m.insert("into_row_version".into(), json!(v));
+        }
+    }
+    // new trips get ids; a profile keeps the key it was added under
+    if entity == "route_trips" && op == "replace" {
+        mint_missing_trip_ids(&mut tx, &set.gtfs_id, &key, &mut update.after).await?;
+    }
+    if entity == "timing_profile" && op == "replace" && update.after["profile_key"].is_null() {
+        let old: Value = json_col(&row, "after")?;
+        if let Some(m) = update.after.as_object_mut() {
+            m.insert("profile_key".into(), old["profile_key"].clone());
+            if !m.contains_key("base_hash") {
+                m.insert("base_hash".into(), old["base_hash"].clone());
+            }
         }
     }
     // a change made for a coordinate review stays that review's
@@ -3587,7 +4691,7 @@ async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
     lock_feed_of_set(&mut tx, id).await?;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
-    let changes = load_changes(&mut tx, id).await?;
+    let changes = load_changes_to_apply(&mut tx, id).await?;
     if changes.is_empty() {
         return Err(EditorError::bad_request(
             "change_set_empty",
@@ -3677,7 +4781,7 @@ pub async fn review(
     // the override is an approval, by an admin, asked for in so many words; on
     // someone else's set the flag means nothing
     let own = set.submitted_by == Some(ctx.user.user_id);
-    let may_override = approve && ctx.user.role() >= auth::Role::Admin;
+    let may_override = approve && ctx.is_admin();
     if own && !(may_override && self_approve) {
         return Err(own_change_set(may_override));
     }
@@ -3730,7 +4834,7 @@ pub async fn reopen(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
     }
     let is_author =
         set.created_by == ctx.user.user_id || set.submitted_by == Some(ctx.user.user_id);
-    if !is_author && ctx.user.role() < auth::Role::Admin {
+    if !is_author && !ctx.is_admin() {
         return Err(EditorError::forbidden(
             "not_author",
             "only its author or an admin can reopen a change set",
@@ -3766,7 +4870,7 @@ pub async fn discard(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
             format!("a {} change set cannot be discarded", set.status),
         ));
     }
-    if set.created_by != ctx.user.user_id && ctx.user.role() < auth::Role::Admin {
+    if set.created_by != ctx.user.user_id && !ctx.is_admin() {
         return Err(EditorError::forbidden(
             "not_author",
             "only its author or an admin can discard a change set",
@@ -3829,12 +4933,10 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     }
     // maker-checker covers commit too: whoever submitted cannot put it live,
     // unless they are the admin who approved it themselves
-    if set.submitted_by == Some(ctx.user.user_id)
-        && !(set.self_approved && ctx.user.role() >= auth::Role::Admin)
-    {
+    if set.submitted_by == Some(ctx.user.user_id) && !(set.self_approved && ctx.is_admin()) {
         return Err(own_change_set(false));
     }
-    let changes = load_changes(&mut tx, id).await?;
+    let changes = load_changes_to_apply(&mut tx, id).await?;
     let ev = evaluate(&mut tx, &gtfs_id, &changes, &ctx.user.email).await?;
     if !ev.conflicts.is_empty() {
         tx.rollback().await?;
@@ -3925,6 +5027,25 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         &switched,
     )
     .await?;
+    let settings: Vec<Value> = ev
+        .feed_settings
+        .iter()
+        .cloned()
+        .map(|mut d| {
+            d["change_set_id"] = json!(id);
+            d
+        })
+        .collect();
+    auth::audit_many(
+        &mut *tx,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        "feed_config_changed",
+        Some(&gtfs_id),
+        Some(id),
+        &settings,
+    )
+    .await?;
     super::proposals::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
     super::position_reviews::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
     tx.commit().await?;
@@ -3970,29 +5091,179 @@ pub async fn audit_list(
 
 // ---------------------------------------------------------------- users
 
-pub async fn users(state: &EditorState) -> EditorResult<Value> {
-    let rows = sqlx::query(
-        "SELECT user_id, email, display_name, role, totp_enabled, totp_last_step, NULL::bytea AS totp_secret_enc, \
-                status, created_at, last_login_at FROM gtfs_editor_user ORDER BY lower(email)",
+/// Users as `GET /users` lists them (docs/gtfs-editor.md section 15): the
+/// account, its kind, and every grant it holds with who gave it and when.
+/// `only` narrows it to one user.
+async fn user_items(pool: &sqlx::PgPool, only: Option<Uuid>) -> EditorResult<Vec<Value>> {
+    let grants = sqlx::query(
+        "SELECT a.user_id, a.gtfs_id::text AS gtfs_id, a.role, g.email AS granted_by_email, a.granted_at \
+         FROM gtfs_editor_feed_access a LEFT JOIN gtfs_editor_user g ON g.user_id = a.granted_by \
+         WHERE $1::uuid IS NULL OR a.user_id = $1 ORDER BY a.gtfs_id",
     )
-    .fetch_all(&state.pool)
+    .bind(only)
+    .fetch_all(pool)
     .await?;
-    let items = rows
-        .iter()
-        .map(|r| -> Result<Value, sqlx::Error> {
+    let mut feeds: HashMap<Uuid, Vec<Value>> = HashMap::new();
+    for r in &grants {
+        feeds.entry(r.try_get("user_id")?).or_default().push(json!({
+            "gtfs_id": r.try_get::<String, _>("gtfs_id")?,
+            "role": r.try_get::<String, _>("role")?,
+            "granted_by_email": r.try_get::<Option<String>, _>("granted_by_email")?,
+            "granted_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("granted_at")?,
+        }));
+    }
+    let rows = sqlx::query(
+        "SELECT user_id, email, display_name, role, kind, status, totp_enabled, created_at, last_login_at \
+         FROM gtfs_editor_user WHERE $1::uuid IS NULL OR user_id = $1 ORDER BY lower(email)",
+    )
+    .bind(only)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| -> EditorResult<Value> {
+            let user_id: Uuid = r.try_get("user_id")?;
+            let role: String = r.try_get("role")?;
             Ok(json!({
-                "user_id": r.try_get::<Uuid, _>("user_id")?,
+                "user_id": user_id,
                 "email": r.try_get::<String, _>("email")?,
                 "display_name": r.try_get::<Option<String>, _>("display_name")?,
-                "role": r.try_get::<String, _>("role")?,
+                "is_admin": role == "admin",
+                "role": role,
+                "kind": r.try_get::<String, _>("kind")?,
                 "status": r.try_get::<String, _>("status")?,
                 "totp_enabled": r.try_get::<bool, _>("totp_enabled")?,
                 "created_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?,
                 "last_login_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_login_at")?,
+                "feeds": feeds.remove(&user_id).unwrap_or_default(),
             }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({"items": items, "next_cursor": null}))
+        .collect()
+}
+
+pub async fn users(state: &EditorState) -> EditorResult<Value> {
+    Ok(json!({"items": user_items(&state.pool, None).await?, "next_cursor": null}))
+}
+
+/// One user in the `GET /users` shape: what creating a user, changing one and
+/// granting or revoking a feed answer with.
+pub async fn user_item(state: &EditorState, user_id: Uuid) -> EditorResult<Value> {
+    user_items(&state.pool, Some(user_id))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(user_not_found)
+}
+
+fn user_not_found() -> EditorError {
+    EditorError::not_found("user_not_found", "no such user")
+}
+
+/// The feeds `GET /auth/me` lists, which the dashboard's feed switcher offers:
+/// every feed as `admin` for an admin, else each feed granted, at its role.
+pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Value> {
+    let rows = sqlx::query("SELECT gtfs_id, display_name FROM gtfs_feed ORDER BY gtfs_id")
+        .fetch_all(&state.pool)
+        .await?;
+    let mut out = Vec::new();
+    for r in &rows {
+        let gtfs_id: String = r.try_get("gtfs_id")?;
+        let role = if user.is_admin() {
+            auth::Role::Admin
+        } else {
+            match user.grants.get(&gtfs_id) {
+                Some(role) => *role,
+                None => continue,
+            }
+        };
+        out.push(json!({
+            "gtfs_id": gtfs_id,
+            "display_name": r.try_get::<String, _>("display_name")?,
+            "role": role.as_str(),
+        }));
+    }
+    Ok(json!(out))
+}
+
+/// `admin`, or the older `role` body it replaces: `role: "admin"` means an
+/// admin, any other role a member. Both may be sent, but must agree.
+fn admin_flag(admin: Option<bool>, role: Option<&str>) -> EditorResult<Option<bool>> {
+    let by_role = match role {
+        None => None,
+        Some(r) => Some(
+            auth::Role::parse(r).ok_or_else(|| {
+                EditorError::bad_request(
+                    "invalid_role",
+                    "role is viewer, editor, approver or admin",
+                )
+            })? == auth::Role::Admin,
+        ),
+    };
+    match (admin, by_role) {
+        (Some(a), Some(r)) if a != r => Err(EditorError::bad_request(
+            "invalid_role",
+            "admin and role disagree; send admin alone",
+        )),
+        (a, r) => Ok(a.or(r)),
+    }
+}
+
+/// A feed a user is let into when they are created.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewGrant {
+    pub gtfs_id: String,
+    pub role: String,
+}
+
+fn invalid_grant_role() -> EditorError {
+    EditorError::bad_request(
+        "invalid_role",
+        "a feed's role is viewer, editor or approver; an admin has every feed",
+    )
+}
+
+fn admin_has_all_feeds() -> EditorError {
+    EditorError::bad_request(
+        "admin_has_all_feeds",
+        "an admin has every feed at every role; there is nothing to grant",
+    )
+}
+
+async fn feed_exists(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<()> {
+    feed_version(conn, gtfs_id)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.with_details(json!({"gtfs_id": gtfs_id})))
+}
+
+/// `feed_access_granted` / `_changed` / `_revoked`: one row per feed, carrying
+/// the feed, so the feed's own history shows who was let in.
+async fn audit_access(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    user_id: Uuid,
+    email: &str,
+    gtfs_id: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> EditorResult<()> {
+    let action = match (before, after) {
+        (None, _) => "feed_access_granted",
+        (Some(_), Some(_)) => "feed_access_changed",
+        (Some(_), None) => "feed_access_revoked",
+    };
+    auth::audit(
+        &mut *conn,
+        Some(ctx.user.user_id),
+        Some(&ctx.user.email),
+        action,
+        Some(gtfs_id),
+        None,
+        json!({"user_id": user_id, "email": email, "gtfs_id": gtfs_id,
+               "role_before": before, "role_after": after}),
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn create_user(
@@ -4000,7 +5271,9 @@ pub async fn create_user(
     ctx: &Ctx,
     email: &str,
     display_name: Option<&str>,
-    role: &str,
+    admin: Option<bool>,
+    role: Option<&str>,
+    feeds: &[NewGrant],
 ) -> EditorResult<Value> {
     let email = email.trim().to_ascii_lowercase();
     if !email.contains('@') || email.len() > 254 {
@@ -4009,20 +5282,39 @@ pub async fn create_user(
             "email is not valid",
         ));
     }
-    if auth::Role::parse(role).is_none() {
-        return Err(EditorError::bad_request(
-            "invalid_role",
-            "role is viewer, editor, approver or admin",
-        ));
+    let admin = admin_flag(admin, role)?.unwrap_or(false);
+    if admin && !feeds.is_empty() {
+        return Err(admin_has_all_feeds());
     }
+    let mut seen = HashSet::new();
+    for f in feeds {
+        auth::Role::parse_grant(&f.role).ok_or_else(invalid_grant_role)?;
+        if !seen.insert(f.gtfs_id.as_str()) {
+            return Err(EditorError::bad_request(
+                "duplicate_feed",
+                format!("feed {} is listed twice", f.gtfs_id),
+            ));
+        }
+    }
+    // the column a member keeps is what an older image would read: the role the
+    // old body named, else the least of them
+    let stored = if admin {
+        "admin"
+    } else {
+        role.filter(|r| auth::Role::parse_grant(r).is_some())
+            .unwrap_or("viewer")
+    };
     let mut tx = state.pool.begin().await?;
+    for f in feeds {
+        feed_exists(&mut tx, &f.gtfs_id).await?;
+    }
     let row = sqlx::query(
         "INSERT INTO gtfs_editor_user (email, display_name, role) VALUES ($1, $2, $3) \
          ON CONFLICT DO NOTHING RETURNING user_id",
     )
     .bind(&email)
     .bind(display_name.map(str::trim).filter(|d| !d.is_empty()))
-    .bind(role)
+    .bind(stored)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| {
@@ -4036,35 +5328,48 @@ pub async fn create_user(
         "user_created",
         None,
         None,
-        json!({"user_id": user_id, "email": email, "role": role}),
+        json!({"user_id": user_id, "email": email, "role": stored, "admin": admin}),
     )
     .await?;
+    for f in feeds {
+        sqlx::query(
+            "INSERT INTO gtfs_editor_feed_access (user_id, gtfs_id, role, granted_by) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(user_id)
+        .bind(&f.gtfs_id)
+        .bind(&f.role)
+        .bind(ctx.user.user_id)
+        .execute(&mut *tx)
+        .await?;
+        audit_access(
+            &mut tx,
+            ctx,
+            user_id,
+            &email,
+            &f.gtfs_id,
+            None,
+            Some(&f.role),
+        )
+        .await?;
+    }
     tx.commit().await?;
-    Ok(
-        json!({"user_id": user_id, "email": email, "role": role, "status": "active", "totp_enabled": false}),
-    )
+    user_item(state, user_id).await
 }
 
 pub async fn update_user(
     state: &EditorState,
     ctx: &Ctx,
     user_id: Uuid,
+    admin: Option<bool>,
     role: Option<&str>,
     status: Option<&str>,
 ) -> EditorResult<()> {
-    if role.is_none() && status.is_none() {
+    let admin = admin_flag(admin, role)?;
+    if admin.is_none() && status.is_none() {
         return Err(EditorError::bad_request(
             "nothing_to_change",
-            "send role or status",
+            "send admin or status",
         ));
-    }
-    if let Some(r) = role {
-        if auth::Role::parse(r).is_none() {
-            return Err(EditorError::bad_request(
-                "invalid_role",
-                "role is viewer, editor, approver or admin",
-            ));
-        }
     }
     if let Some(s) = status {
         if !["active", "disabled"].contains(&s) {
@@ -4075,7 +5380,7 @@ pub async fn update_user(
         }
     }
     if user_id == ctx.user.user_id
-        && (role.is_some_and(|r| r != "admin") || status.is_some_and(|s| s != "active"))
+        && (admin == Some(false) || status.is_some_and(|s| s != "active"))
     {
         return Err(EditorError::bad_request(
             "cannot_change_self",
@@ -4083,34 +5388,178 @@ pub async fn update_user(
         ));
     }
     let mut tx = state.pool.begin().await?;
-    let n = sqlx::query(
+    // the user's row is the lock every change of their access takes, so a grant
+    // and a promotion of the same person never interleave
+    let row =
+        sqlx::query("SELECT email, role, kind FROM gtfs_editor_user WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(user_not_found)?;
+    let email: String = row.try_get("email")?;
+    let was_admin = row.try_get::<String, _>("role")? == "admin";
+    if admin == Some(true) && row.try_get::<String, _>("kind")? == "system" {
+        return Err(EditorError::bad_request(
+            "system_account",
+            "a system account cannot be an admin; grant it the feeds it works on",
+        ));
+    }
+    let flipped = admin.is_some_and(|a| a != was_admin);
+    // the column: admin, or for a member the role the old body named - else the
+    // least of them for a demoted admin, and what it was for anyone else
+    let column = match admin {
+        Some(true) => Some("admin"),
+        Some(false) => role
+            .filter(|r| auth::Role::parse_grant(r).is_some())
+            .or(was_admin.then_some("viewer")),
+        None => None,
+    };
+    sqlx::query(
         "UPDATE gtfs_editor_user SET role = coalesce($2, role), status = coalesce($3, status) WHERE user_id = $1",
     )
     .bind(user_id)
-    .bind(role)
+    .bind(column)
     .bind(status)
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if n == 0 {
-        return Err(EditorError::not_found("user_not_found", "no such user"));
-    }
+    .await?;
     if status == Some("disabled") {
         sqlx::query("DELETE FROM gtfs_editor_session WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
     }
-    auth::audit(
-        &mut *tx,
-        Some(ctx.user.user_id),
-        Some(&ctx.user.email),
-        "user_updated",
-        None,
-        None,
-        json!({"user_id": user_id, "role": role, "status": status}),
+    if flipped {
+        // an admin holds no grants: a new admin's are superseded, and a demoted
+        // admin has none until an admin gives some
+        let dropped = sqlx::query(
+            "DELETE FROM gtfs_editor_feed_access WHERE user_id = $1 RETURNING gtfs_id::text AS gtfs_id, role",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for r in &dropped {
+            let (g, before): (String, String) = (r.try_get("gtfs_id")?, r.try_get("role")?);
+            audit_access(&mut tx, ctx, user_id, &email, &g, Some(&before), None).await?;
+        }
+        auth::audit(
+            &mut *tx,
+            Some(ctx.user.user_id),
+            Some(&ctx.user.email),
+            "user_admin_changed",
+            None,
+            None,
+            json!({"user_id": user_id, "email": email, "admin_before": was_admin,
+                   "admin_after": admin}),
+        )
+        .await?;
+    }
+    if status.is_some() || (role.is_some() && !flipped) {
+        auth::audit(
+            &mut *tx,
+            Some(ctx.user.user_id),
+            Some(&ctx.user.email),
+            "user_updated",
+            None,
+            None,
+            json!({"user_id": user_id, "email": email,
+                   "role": if flipped { None } else { role }, "status": status}),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `PUT /users/{user_id}/feeds/{gtfs_id}`: create or change a member's grant on
+/// one feed. Setting the role a grant already has changes and audits nothing.
+pub async fn set_feed_access(
+    state: &EditorState,
+    ctx: &Ctx,
+    user_id: Uuid,
+    gtfs_id: &str,
+    role: &str,
+) -> EditorResult<()> {
+    auth::Role::parse_grant(role).ok_or_else(invalid_grant_role)?;
+    let mut tx = state.pool.begin().await?;
+    let user =
+        sqlx::query("SELECT email, role FROM gtfs_editor_user WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(user_not_found)?;
+    if user.try_get::<String, _>("role")? == "admin" {
+        return Err(admin_has_all_feeds());
+    }
+    let email: String = user.try_get("email")?;
+    feed_exists(&mut tx, gtfs_id).await?;
+    let before: Option<String> =
+        sqlx::query("SELECT role FROM gtfs_editor_feed_access WHERE user_id = $1 AND gtfs_id = $2")
+            .bind(user_id)
+            .bind(gtfs_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.try_get("role"))
+            .transpose()?;
+    if before.as_deref() == Some(role) {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO gtfs_editor_feed_access (user_id, gtfs_id, role, granted_by) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (user_id, gtfs_id) DO UPDATE SET role = EXCLUDED.role, \
+           granted_by = EXCLUDED.granted_by, granted_at = now()",
+    )
+    .bind(user_id)
+    .bind(gtfs_id)
+    .bind(role)
+    .bind(ctx.user.user_id)
+    .execute(&mut *tx)
+    .await?;
+    audit_access(
+        &mut tx,
+        ctx,
+        user_id,
+        &email,
+        gtfs_id,
+        before.as_deref(),
+        Some(role),
     )
     .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `DELETE /users/{user_id}/feeds/{gtfs_id}`. The user's open drafts on the
+/// feed stay, for others to finish or discard; their sessions are not ended -
+/// the next request simply has no grant.
+pub async fn revoke_feed_access(
+    state: &EditorState,
+    ctx: &Ctx,
+    user_id: Uuid,
+    gtfs_id: &str,
+) -> EditorResult<()> {
+    let mut tx = state.pool.begin().await?;
+    let email: String =
+        sqlx::query("SELECT email FROM gtfs_editor_user WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(user_not_found)?
+            .try_get("email")?;
+    let before: String = sqlx::query(
+        "DELETE FROM gtfs_editor_feed_access WHERE user_id = $1 AND gtfs_id = $2 RETURNING role",
+    )
+    .bind(user_id)
+    .bind(gtfs_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        EditorError::not_found(
+            "grant_not_found",
+            format!("{email} has no grant on feed {gtfs_id}"),
+        )
+    })?
+    .try_get("role")?;
+    audit_access(&mut tx, ctx, user_id, &email, gtfs_id, Some(&before), None).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -4278,6 +5727,11 @@ mod tests {
             marker_lon: None,
             stop_name_override: None,
             provider_id: None,
+            pickup_type: None,
+            drop_off_type: None,
+            timepoint: None,
+            stop_headsign: None,
+            ..Default::default()
         };
         let mut b = a.clone();
         b.stop_id = Some("B".into());

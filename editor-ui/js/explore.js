@@ -1,7 +1,7 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
+import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
@@ -448,7 +448,9 @@ export async function showRoute(routeId, { preview } = {}) {
              drafted && o.changed.has("encoded_polyline") ? h("span.live-value", " ", h("span.live-tag", "live: "), live.encoded_polyline ? `saved (${live.polyline_source || "source unknown"}), dashed grey on the map` : "none") : null]
           : "None yet. The map joins the stops with straight dashed lines."),
         r.color ? [h("dt", "Colour"), h("dd", h("span", { style: `display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin-right:6px;background:${r.color}` }), field("color"))] : null,
+        live ? [h("dt", "Trips"), h("dd", `${fmtCount(live.trip_count || 0)} live on ${plural((live.patterns || []).length || 1, "stop order")}`)] : null,
       ),
+      live ? h("div.btn-row", h("a.btn.secondary.small", { href: `#/trips/${enc(routeId)}` }, "Trips and timing")) : null,
       // the editors start from the live route and lay the draft's change over it themselves
       can("editor") && (live || created) ? h("div.btn-row",
         h("button.btn", { type: "button", on: { click: () => editRouteRows(created ? r : live, { created: !!created }) } }, created && !r.rows.length ? "Build the stop list" : "Edit stop list"),

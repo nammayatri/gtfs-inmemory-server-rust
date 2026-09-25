@@ -30,7 +30,8 @@ QUERIES = {
                  FROM gtfs_route""",
     "route_stops": """SELECT gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name,
                              marker_id, marker_lat, marker_lon, marker_name, stop_name_override, provider_id
-                      FROM gtfs_route_stop ORDER BY gtfs_id, route_id, sequence""",
+                      FROM gtfs_route_stop WHERE pattern_key = 1
+                      ORDER BY gtfs_id, route_id, sequence""",
     # station suggestions waiting for review (docs section 6)
     "station_proposals": """SELECT proposal_id, gtfs_id, batch, station_id, name, lat, lon, members, spread_m,
                                    status, review_note
