@@ -96,6 +96,7 @@ in {
   repeater_lookahead_days = 7,
   repeater_tick_interval_secs = 300,
   repeater_min_run_interval_secs = 3600,
+  repeater_stuck_lock_timeout_secs = 600,
 
   -- Outbound webhooks (docs/gtfs-editor.md section 12). Off here: each pod
   -- reports the feed version it is serving only when this is True, and a
