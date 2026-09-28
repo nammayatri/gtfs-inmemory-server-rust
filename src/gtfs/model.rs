@@ -177,6 +177,10 @@ pub struct FeedModel {
     pub dropped: BTreeSet<(String, String, String)>,
     /// `(run_s, dwell_s)`: the timing of a trip with no profile.
     pub default_timing: (i32, i32),
+    /// Stops out of use: their `stops.txt` rows are written as any other, and no
+    /// trip calls at them (docs/gtfs-editor.md section 21). Empty for a feed read
+    /// from a zip - GTFS has no such field - so a round trip is unaffected.
+    pub unserviceable: BTreeSet<String>,
 }
 
 /// The feed default timing a new feed row gets (`gtfs_feed.default_run_s`,

@@ -96,6 +96,11 @@ struct TripPattern {
     /// `{gtfs}:{route}`
     route_id: String,
     stops: Vec<TripStop>,
+    /// Per stop: it is out of use, so no trip calls there (section 21). The
+    /// stop stays in the pattern because a profile's offsets are positional
+    /// over it - dropping it would shift every later stop's time - and is left
+    /// out only where a trip's stops are served.
+    skip: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -138,12 +143,15 @@ impl DbTrips {
         Some(DbTrip {
             route_id: pattern.route_id.clone(),
             direction: t.direction.map(i32::from),
+            // a stop out of use is not called at, so it is not in the trip
             stops: pattern
                 .stops
                 .iter()
                 .cloned()
                 .zip(times)
-                .map(|(s, (a, d))| (s, a, d))
+                .zip(pattern.skip.iter().copied().chain(std::iter::repeat(false)))
+                .filter(|(_, skipped)| !skipped)
+                .map(|((s, (a, d)), _)| (s, a, d))
                 .collect(),
         })
     }
@@ -656,6 +664,9 @@ struct StopRow {
     description: Option<String>,
     /// The stop's line in the stops.txt it was imported from (0023).
     sort_key: Option<i32>,
+    /// Out of use for a while (0026): it stays on its routes and no trip calls
+    /// there. See docs/gtfs-editor.md section 21.
+    unserviceable: bool,
 }
 
 pub struct GtfsDbSource {
@@ -825,7 +836,7 @@ impl GtfsDbSource {
 
         let stop_rows = sqlx::query(
             "SELECT stop_id, stop_code, name, lat, lon, location_type, parent_station,
-                    platform_code, cluster_id, description, sort_key
+                    platform_code, cluster_id, description, sort_key, unserviceable
              FROM gtfs_stop WHERE gtfs_id = $1 AND NOT deleted",
         )
         .bind(gtfs_id)
@@ -852,6 +863,7 @@ impl GtfsDbSource {
         let mut stops: HashMap<String, StopRow> = HashMap::with_capacity(stop_rows.len());
         for r in &stop_rows {
             let s = StopRow {
+                unserviceable: r.try_get("unserviceable").map_err(db_err)?,
                 stop_id: r.try_get("stop_id").map_err(db_err)?,
                 stop_code: r.try_get("stop_code").map_err(db_err)?,
                 name: r.try_get("name").map_err(db_err)?,
@@ -1055,6 +1067,7 @@ impl GtfsDbSource {
                     ),
                     stage_number: stage.0,
                     is_stage_stop: stage.1,
+                    unserviceable: s.unserviceable.then_some(true),
                 });
             }
             let (Some(first), Some(end)) = (pattern_stops.first(), pattern_stops.last()) else {
@@ -1215,6 +1228,7 @@ impl GtfsDbSource {
                             ))
                         })?;
                     let mut trip_stops = Vec::with_capacity(rows.len());
+                    let mut skip = Vec::with_capacity(rows.len());
                     for row in rows {
                         let Some(s) = stops.get(&row.stop_id) else {
                             return Err(AppError::Internal(format!(
@@ -1230,10 +1244,12 @@ impl GtfsDbSource {
                             lon: s.lon,
                             sequence: row.stop_sequence,
                         });
+                        skip.push(s.unserviceable);
                     }
                     index.patterns.push(TripPattern {
                         route_id: prefixed(&route_id),
                         stops: trip_stops,
+                        skip,
                     });
                     slot.insert((index.patterns.len() as u32 - 1, rows.len()));
                 }
@@ -1326,6 +1342,7 @@ impl GtfsDbSource {
                         ),
                         stage_number: stage.0,
                         is_stage_stop: stage.1,
+                        unserviceable: s.unserviceable.then_some(true),
                     });
                 }
                 // the route's start and end are its longest stop order's, the
@@ -1725,6 +1742,7 @@ mod tests {
             headsign: None,
             stage_number: None,
             is_stage_stop: None,
+            unserviceable: None,
         };
         let pat = |id: &str, n: i32, trips: usize| NandiPatternDetails {
             id: id.into(),

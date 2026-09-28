@@ -260,6 +260,8 @@ const KIND_LABEL = {
   "timing_profile:replace": ["timing change", "timing changes"], "timing_profile:delete": ["timing deleted", "timings deleted"],
   "service:create": ["new service", "new services"], "service:update": ["service edit", "service edits"], "service:delete": ["service deleted", "services deleted"],
   "pattern:update": ["stop order edit", "stop order edits"], "pattern:delete": ["stop order deleted", "stop orders deleted"],
+  "stage:create": ["new stage", "new stages"], "stage:update": ["stage edit", "stage edits"], "stage:delete": ["stage deleted", "stages deleted"],
+  "route_stages:replace": ["route stages change", "route stages changes"],
 };
 const kindOf = (ch) => `${ch.entity}:${ch.op}`;
 // a GTFS file's rows (section 18) read as the file and what was done
@@ -504,6 +506,7 @@ function draftStopNames(cs) {
 const ENTITY_LABEL = {
   stop: "Stop", route: "Route", route_stops: "Route stop list", station: "Station", feed_config: "Feed settings",
   route_trips: "Trips of route", timing_profile: "Timing of route", service: "Service", pattern: "Stop order of route",
+  stage: "Stage", route_stages: "Stages of route", route_variant: "Temporary route",
 };
 const TIMETABLE = new Set(["route_trips", "timing_profile", "pattern"]);
 const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged" };
@@ -542,13 +545,14 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   else if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
   else if (ch.entity === "station" && ch.op === "merge") title = `Station ${(b.from && b.from.name) || ch.entity_key} merged`;
   else if (reviewMove) title = `Moved ${b.name || ch.entity_key} ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))}`;
-  else if (ch.entity === "route_stops" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
+  else if (ch.entity === "route_stops" || ch.entity === "route_stages" || ch.entity === "route") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}${ch.entity === "route" && a.short_name && a.short_name !== ch.entity_key ? ` (${a.short_name})` : ""}`;
   else title = `${ENTITY_LABEL[ch.entity]} ${a.name || b.name || ch.entity_key}`;
   const link = feedConfig ? "#/feed-settings"
     : record ? `#/files/${enc((recordFiles.get(ch.entity) || {}).file || ch.entity)}${ch.op === "create" ? "" : `/${enc(ch.entity_key)}`}`
       : TIMETABLE.has(ch.entity) ? `#/trips/${enc(ch.entity_key)}`
         : ch.entity === "service" ? "#/calendar"
-          : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
+          : ch.entity === "stage" ? `#/stage/${enc(ch.entity_key)}`
+            : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
     : ch.op === "merge" ? `#/stop/${enc(a.into_station_id || a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
   const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
@@ -593,6 +597,8 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   else if (ch.entity === "service") body = serviceDiff(ch);
   else if (ch.entity === "pattern") body = h("p", ch.op === "delete" ? `Stop order ${(ch.after || {}).pattern_key} of route ${ch.entity_key} is deleted, with its timings.` : `Stop order ${(ch.after || {}).pattern_key} of route ${ch.entity_key}: ${JSON.stringify(ch.after)}`);
   else if (record) body = recordDiff(ch);
+  else if (ch.entity === "stage") body = stageDiff(ch, cs, names);
+  else if (ch.entity === "route_stages") body = routeStagesDiff(ch, cs);
   else body = stationDiff(ch);
   const showOpen = !(ch.op === "delete" && ch.entity === "stop") && !(ch.op === "create" && ch.entity === "station" && cs.status !== "committed");
   return h("article.change",
@@ -678,6 +684,13 @@ function stopDiff(ch) {
       insetEl({ points: [{ lat: a.lat, lon: a.lon, kind: "after", label: "new" }] }));
   }
   const movedPos = b && a.lat != null && (a.lat !== b.lat || a.lon !== b.lon);
+  // out of use, or back in use (section 21): what it does is worth a sentence,
+  // not a true/false row
+  const outOfUse = a && "unserviceable" in a
+    ? h("p.notice.warning", a.unserviceable
+        ? `${b ? b.name : ch.entity_key} goes out of use: it stays in the feed and in the app, and no bus calls there, so journeys are routed around it.`
+        : `${b ? b.name : ch.entity_key} is in use again: buses call there from the next build, with the times they had before.`)
+    : null;
   const rows = fieldRows(b, a, [
     ["name", "Name"], ["platform_code", "Platform"], ["description", "Description"], ["regional_name", "Tamil name"], ["cluster_id", "Cluster"],
   ]).concat(gtfsRows(b, a, STOP_GTFS_DIFF));
@@ -685,12 +698,14 @@ function stopDiff(ch) {
     rows.push(h("tr", h("th", "Position"), h("td.before", `${fmtCoord(b.lat)}, ${fmtCoord(b.lon)}`),
       h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)} (moved ${fmtMetres(haversine(b.lat, b.lon, a.lat, a.lon))})`)));
   }
-  const table = h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows));
-  if (!movedPos) return table;
-  return h("div.change-grid", table, insetEl({
+  const table = rows.length
+    ? h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows))
+    : null;
+  if (!movedPos) return outOfUse ? h("div", outOfUse, table) : table;
+  return h("div", outOfUse, h("div.change-grid", table, insetEl({
     points: [{ lat: b.lat, lon: b.lon, kind: "before" }, { lat: a.lat, lon: a.lon, kind: "after" }],
     lines: [{ pts: [[b.lat, b.lon], [a.lat, a.lon]], color: "#0b6660", dashed: true, weight: 2 }],
-  }));
+  })));
 }
 
 const routeLabel = (r) => (r.short_name && r.short_name !== r.route_id ? `${r.short_name} (${r.route_id})` : r.route_id);
@@ -787,6 +802,43 @@ function routeDiff(ch) {
   try { if (b.encoded_polyline) lines.push({ pts: decodePolyline(b.encoded_polyline), color: "#9fb3b0", weight: 5 }); } catch { /* skip */ }
   try { lines.push({ pts: decodePolyline(a.encoded_polyline), color: "#0b6660", weight: 3 }); } catch { /* skip */ }
   return h("div.change-grid", table, insetEl({ lines }));
+}
+
+// A stage change: its stops before and after, side by side, and every route the
+// change reaches (the server lists them in `before.routes`).
+function stageDiff(ch, cs, draftNames) {
+  const b = ch.before || {}, a = ch.after || {};
+  if (ch.op === "delete") return h("p", `Stage ${b.name || ch.entity_key} is deleted. No route uses it.`);
+  const live = cs.stop_names || {};
+  const beforeNames = new Map((b.rows || []).map((r) => [r.stop_id, r.stop_name]));
+  const name = (r) => (r.stop_type === "ROUTE CORRECTION" ? `Map shaping point ${r.marker_name || r.marker_id || ""}`
+    : `${r.stop_name || r.stop_name_override || beforeNames.get(r.stop_id) || live[r.stop_id] || draftNames.get(r.stop_id) || r.stop_id} (${r.stop_id})`);
+  const col = (rows) => (rows && rows.length
+    ? h("ol", rows.map((r) => h("li", { class: r.stop_type === "NEW STOP" ? "head" : "" }, name(r), h("span.hint", ` ${STOP_TYPE_LABEL[r.stop_type] || r.stop_type}`))))
+    : h("p.empty", "none"));
+  const routes = [...new Map((b.routes || []).map((r) => [r.route_id, r])).values()];
+  const fields = fieldRows(b, a, [["name", "Stage name"], ["description", "Description"]]);
+  return h("div", { style: "display:grid;gap:10px" },
+    fields.length ? h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", fields)) : null,
+    ch.op === "create" || a.rows ? h("div.change-grid",
+      ch.op === "create" ? null : h("div", h("h4", "Stops before"), col(b.rows)),
+      h("div", h("h4", ch.op === "create" ? "Stops" : "Stops after"), col(a.rows))) : null,
+    ch.op === "update" ? (routes.length
+      ? h("p.notice.warning", `Changes the stop list of ${plural(routes.length, "route")}: ${routes.map((r) => r.short_name || r.route_id).join(", ")}.`)
+      : h("p.hint", "No route uses this stage yet.")) : null);
+}
+
+// A route's stage list, before and after.
+function routeStagesDiff(ch, cs) {
+  const b = Array.isArray(ch.before) ? ch.before : [];
+  const created = new Map(cs.changes.filter((c) => c.entity === "stage" && c.op === "create" && c.after).map((c) => [c.entity_key, c.after.name]));
+  const names = new Map(b.map((s) => [s.stage_id, s.name]));
+  const item = (s) => h("li", h("a", { href: `#/stage/${enc(s.stage_id)}` }, s.name || names.get(s.stage_id) || created.get(s.stage_id) || s.stage_id),
+    h("span.hint", ` fare stage ${s.stage_no ?? "next"}`));
+  const after = (ch.after && ch.after.stages) || [];
+  return h("div.change-grid",
+    h("div", h("h4", "Stages before"), b.length ? h("ol", b.map(item)) : h("p.empty", "none: not built from stages")),
+    h("div", h("h4", "Stages after"), after.length ? h("ol", after.map(item)) : h("p.empty", "none")));
 }
 
 function rowLabel(r) {

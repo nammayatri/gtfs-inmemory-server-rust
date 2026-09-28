@@ -39,6 +39,7 @@ fn write_preprocessed(dir: &Path) {
             headsign: Some(headsign.to_string()),
             stage_number: None,
             is_stage_stop: None,
+            unserviceable: None,
         }
     };
     let stop = |i: usize| {

@@ -536,6 +536,15 @@ pub struct NandiStop {
     pub stage_number: Option<i32>,
     #[serde(rename = "isStageStop", default)]
     pub is_stage_stop: Option<bool>,
+    /// The stop is out of use for a while (docs/gtfs-editor.md section 21): it
+    /// stays on the route so an app can show it greyed out, and no trip calls
+    /// there, so no journey is routed through it. Absent unless it is true.
+    #[serde(
+        rename = "unserviceable",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub unserviceable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

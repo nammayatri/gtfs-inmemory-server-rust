@@ -13,6 +13,7 @@ import { showStationsList, showProposal, refreshStationCount, leaveStations } fr
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
+import { showDiversions, showUnserviceableStops } from "./variants.js";
 import { showMerge } from "./merge.js";
 import { showStationMerge } from "./station_merge.js";
 import { showImport } from "./importer.js";
@@ -20,6 +21,7 @@ import { showFiles, showFile, showRecord } from "./files.js";
 import { showTrips } from "./trips.js";
 import { showCalendar } from "./calendar.js";
 import { showFeed, showNewFeed } from "./feed.js";
+import { showStage, showStagesList, editStage } from "./stages.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
 
@@ -224,6 +226,17 @@ function route() {
     markNav("map"); showWorkspace(true); // ?draft=1 asks for the draft applied; without it the route page decides (it
     // applies the draft whenever the draft touches the route)
     showRoute(parts[1], { preview: params.get("draft") === "1" ? true : undefined });
+  } else if (parts[0] === "stage" && parts[1]) {
+    markNav("stages"); showWorkspace(true); showStage(parts[1]);
+  } else if (parts[0] === "diversions") {
+    markNav("diversions"); showWorkspace(false); showDiversions();
+  } else if (parts[0] === "stops-out-of-use") {
+    markNav("stops-out-of-use"); showWorkspace(false); showUnserviceableStops();
+  } else if (parts[0] === "stages") {
+    markNav("stages"); showWorkspace(false); showStagesList();
+  } else if (parts[0] === "new" && parts[1] === "stage") {
+    markNav("stages"); showWorkspace(true);
+    editorsOnly("New stage", () => editStage(null, { mode: "create" }));
   } else if (parts[0] === "stations" && parts[1]) {
     markNav("stations"); showWorkspace(true); showProposal(parts[1]);
   } else if (parts[0] === "stations") {

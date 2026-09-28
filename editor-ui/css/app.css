@@ -117,6 +117,20 @@ input[aria-invalid="true"] { border-color: var(--danger); background: var(--dang
 .hint.ok { color: var(--ok); font-weight: 700; }
 .field-error { font-size: var(--fs-s); color: var(--danger); font-weight: 700; }
 .check { display: flex; gap: 8px; align-items: center; font-size: var(--fs-s); cursor: pointer; }
+/* which of a route's lists uses a stage: its normal one, or a temporary route */
+.chip.normal-route { background: #e8f0ef; color: var(--action); border: 1px solid #cfe0dd; }
+
+/* one of a route's temporary routes, where a stage says who uses it (section 20) */
+.chip.variant { background: #fdf3d8; color: #7a5000; border: 1px solid #e8d9a8; }
+
+/* a stop that stays where it is while no bus calls there (section 21) */
+.chip.out-of-use { background: #eceff0; color: var(--muted); border: 1px solid var(--rule); margin-left: 6px; }
+.sub.out-of-use-line { color: var(--muted); font-style: italic; }
+
+/* a flag with its own explanation, among a form's fields (section 21) */
+.field.inline { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; cursor: pointer; }
+.field.inline input { width: 18px; height: 18px; margin: 0; accent-color: var(--action); }
+.field.inline > .hint { grid-column: 2; margin: 0; }
 .check input { width: 18px; height: 18px; margin: 0; accent-color: var(--action); }
 fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
 fieldset legend { padding: 0; margin-bottom: 8px; font-size: var(--fs-s); color: var(--muted); }
@@ -558,6 +572,12 @@ tr.linkrow:hover td { background: #f5f9f8; }
 .timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: var(--fs-s); }
 .timeline li { padding-left: 16px; position: relative; }
 .timeline li::before { content: ""; position: absolute; left: 0; top: .55em; width: 7px; height: 7px; border-radius: 50%; background: var(--rule-strong); }
+/* a route's lists of stages: the picker, and + to add a temporary route */
+.list-picker { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.list-picker label { font-size: var(--fs-s); color: var(--muted); }
+.list-picker select { width: auto; min-width: 12rem; flex: 1 1 12rem; }
+.btn.add-variant { font-size: var(--fs-l); line-height: 1; padding: 0 12px; min-height: 36px; }
+
 /* several drafts put through together, from the drafts list */
 .batch-bar {
   position: sticky; bottom: 0; z-index: 5;
@@ -797,3 +817,18 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
 .gps-trips-table tbody tr:hover, .gps-trips-table tbody tr.selected { background: var(--action-tint); }
 .gps-trips-table tbody tr.selected td { font-weight: 600; }
 .trip-swatch { display: inline-block; width: 18px; height: 5px; border-radius: 3px; vertical-align: middle; }
+/* stages (docs section 18) */
+.stage-list { list-style: none; margin: 0; padding: 0; }
+.stage-list .key { min-width: 36px; }
+.stage-list.editing .list-item { grid-template-columns: 64px 1fr auto; }
+.stage-list input.stage-no-input { width: 56px; }
+.stage-stops { margin: 0; padding-left: 22px; display: grid; gap: 4px; }
+.stage-stops li.head { font-weight: 700; }
+.stage-stops.editing { list-style: none; padding-left: 0; }
+.stage-stops.editing .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-top: 1px solid #e4ebea; }
+.stage-stops.editing .row .what { display: grid; gap: 2px; }
+.stage-stops.editing .row .meta { color: var(--muted); font-size: var(--fs-xs); display: flex; gap: 6px; align-items: center; }
+.stage-stops.editing .row .item-end { display: flex; gap: 6px; }
+.filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+.change-grid ol { margin: 4px 0 0; padding-left: 22px; }
+.change-grid li.head { font-weight: 700; }

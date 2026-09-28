@@ -151,6 +151,30 @@ pub fn to_raw(m: &FeedModel) -> RawFeed {
             .filter(|(k, _)| TRIP_FIELDS.contains(k))
             .map(|(k, v)| (*k, v.clone()))
             .collect();
+        let Some(pattern) = m.pattern(&t.route_id, t.pattern_key) else {
+            trips_out.push_row(
+                &own,
+                &[
+                    ("route_id", t.route_id.clone()),
+                    ("service_id", t.service_id.clone()),
+                    ("trip_id", t.trip_id.clone()),
+                ],
+            );
+            continue;
+        };
+        // A trip left with fewer than two calls is not a trip a feed may carry,
+        // so while a stop is out of use (section 21) a trip that called at two
+        // stops and now calls at one is not published at all - neither its
+        // trips.txt row nor its frequencies. It comes back with the stop.
+        if pattern
+            .stops
+            .iter()
+            .filter(|s| !m.unserviceable.contains(&s.stop_id))
+            .count()
+            < 2
+        {
+            continue;
+        }
         trips_out.push_row(
             &own,
             &[
@@ -159,9 +183,6 @@ pub fn to_raw(m: &FeedModel) -> RawFeed {
                 ("trip_id", t.trip_id.clone()),
             ],
         );
-        let Some(pattern) = m.pattern(&t.route_id, t.pattern_key) else {
-            continue;
-        };
         let n = pattern.stops.len();
         let offsets = match t.profile_key {
             Some(k) => match m.profile(&t.route_id, t.pattern_key, k) {
@@ -178,13 +199,31 @@ pub fn to_raw(m: &FeedModel) -> RawFeed {
                 })
                 .clone(),
         };
+        // the headsign of a skipped row, for the next row that has none of its
+        // own: a fare stage whose first stop is out of use is still that stage
+        let mut carried: Option<Value> = None;
         for (i, s) in pattern.stops.iter().enumerate() {
-            let own: Row = s
+            // A stop out of use keeps its stops.txt row and loses its calls
+            // (section 21). The offsets are positional over the pattern, so the
+            // row is skipped here rather than taken out of the pattern: every
+            // other stop of the trip keeps the time it had, and stop_sequence
+            // need only increase, so the gap this leaves is legal GTFS.
+            if m.unserviceable.contains(&s.stop_id) {
+                if let Some(h) = s.values.get("stop_headsign") {
+                    carried = Some(h.clone());
+                }
+                continue;
+            }
+            let mut own: Row = s
                 .values
                 .iter()
                 .filter(|(k, _)| PATTERN_STOP_FIELDS.contains(k))
                 .map(|(k, v)| (*k, v.clone()))
                 .collect();
+            // the stage of a skipped first stop passes to this one
+            if let Some(h) = carried.take() {
+                own.entry("stop_headsign").or_insert(h);
+            }
             let seq = match s.values.get("stop_sequence") {
                 Some(v) => spec::to_text(
                     fspec.field("stop_sequence").expect("a field"),

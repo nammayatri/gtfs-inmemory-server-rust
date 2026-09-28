@@ -46,7 +46,7 @@ pub struct BulkRequest {
     #[serde(default)]
     pub file: Option<String>,
     /// `false`: a real run answers without the set's first page, which replays
-    /// the whole draft (section 19). The changes are stored exactly the same.
+    /// the whole draft (section 22). The changes are stored exactly the same.
     #[serde(default)]
     pub replay: Option<bool>,
 }
@@ -63,7 +63,7 @@ pub enum Kind {
     /// Rows of any file the editor keeps as records (section 18).
     Records,
     /// `{from_stop_id, into_stop_id}` rows: one `stop/merge` each, creating the
-    /// stop merged away first when the feed has no row for it (section 19).
+    /// stop merged away first when the feed has no row for it (section 22).
     StopMerges,
 }
 
@@ -2753,7 +2753,7 @@ async fn plan_stop_updates(
     Ok(plan)
 }
 
-// ---------------------------------------------------------------- stop merges (section 19)
+// ---------------------------------------------------------------- stop merges (section 22)
 
 /// A stop as a merge upload needs it: what is live, before the draft.
 struct LiveMergeStop {
@@ -2778,7 +2778,7 @@ struct MergeRow {
 /// `{from_stop_id, into_stop_id, name?, lat?, lon?, keep_name?, keep_position?}`
 /// rows: one `stop/merge` per row, preceded by a `stop/create` of the stop that
 /// goes when the feed has no row for it - an id retired before the editor was
-/// seeded, which riders and caches still hold (section 19). The upload is
+/// seeded, which riders and caches still hold (section 22). The upload is
 /// checked against one read of the stops it names and the draft as it stands;
 /// the real run then stores the changes through the single-change path
 /// ([`insert_as_changes`]), so each is exactly what
