@@ -162,10 +162,19 @@ export async function removeChange(changeId) {
 // Add (or merge into) a change. Returns {draft, problems} where problems are the
 // server's validation entries for this change. `quiet` leaves the toast to the
 // caller, for one that adds several changes as one step.
-export async function addChange(change, { merge = true, quiet = false } = {}) {
+// `sameAs` is for entities whose change is keyed by something inside the
+// payload: a route's temporary routes are all changes to the same route, so
+// which one a save is about is `after.variant_id`, not the entity key. Without
+// it a second save of the same thing adds a second change, and the draft then
+// creates a row it has already created.
+export async function addChange(change, { merge = true, quiet = false, sameAs = null } = {}) {
   const draft = await requireDraft();
   if (!draft) return null;
-  const prior = merge ? existingChange(change.entity, change.entity_key, patternOf(change)) : null;
+  const prior = sameAs
+    ? (state.draft.changes || []).find((c) =>
+        c.entity === change.entity && c.op === change.op
+        && c.entity_key === change.entity_key && sameAs(c)) || null
+    : merge ? existingChange(change.entity, change.entity_key, patternOf(change)) : null;
   let cs;
   try {
     if (prior && prior.op === change.op) {

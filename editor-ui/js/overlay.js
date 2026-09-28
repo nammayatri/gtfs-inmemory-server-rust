@@ -37,7 +37,9 @@ function build() {
   for (const c of (state.draft && state.draft.changes) || []) {
     push(index.byKey, `${c.entity}|${c.entity_key}`, c);
     const after = c.after || {};
-    if (c.entity === "route" || c.entity === "route_stops") index.routes.add(c.entity_key);
+    if (c.entity === "route" || c.entity === "route_stops" || c.entity === "route_stages") index.routes.add(c.entity_key);
+    // a stage change reaches every route that uses the stage
+    if (c.entity === "stage") ((c.before && c.before.routes) || []).forEach((r) => index.routes.add(r.route_id));
     if (c.entity === "stop" && c.op === "merge" && after.into_stop_id) {
       push(index.absorbs, after.into_stop_id, c);
       // the routes a merge switches to the stop that stays
@@ -84,7 +86,9 @@ export function routesTouched(routeId) {
 }
 
 // ------------------------------------------------------------------ actions
-const STOP_TEXT_FIELDS = ["platform_code", "description", "cluster_id", "regional_name", "hindi_name"];
+// the fields a stop edit carries into the panel's view of the draft; the last
+// is the out-of-use flag (section 21), which is not text but reads the same way
+const STOP_TEXT_FIELDS = ["platform_code", "description", "cluster_id", "regional_name", "hindi_name", "unserviceable"];
 
 // Everything the active draft does to one entity, in change order.
 export function pendingActions(entity, key) {
