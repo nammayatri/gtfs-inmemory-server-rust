@@ -1,4 +1,4 @@
-//! Scripted writes without a replay per change (docs/gtfs-editor.md section 19),
+//! Scripted writes without a replay per change (docs/gtfs-editor.md section 22),
 //! end to end against a real Postgres holding the editor schema: `replay=false`
 //! on adding, editing and removing one change, and the `stop_merges` bulk kind -
 //! its checks, a dry run, a real run that creates and merges retired ids in one

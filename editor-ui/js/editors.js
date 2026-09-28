@@ -93,13 +93,14 @@ const ROUTE_GTFS = ["route_desc", "route_url", "route_sort_order", "continuous_p
 export async function editStop(stop) {
   if (!(await requireDraft())) return;
   const prior = existingChange("stop", stop.stop_id);
-  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", ...(prior ? prior.after : {}) };
+  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", unserviceable: !!stop.unserviceable, ...(prior ? prior.after : {}) };
   const description = descriptionField("stop-description", start.description);
   const f = {
     name: h("input", { type: "text", id: "stop-name", value: start.name }),
     lat: h("input", { type: "number", id: "stop-lat", step: "any", value: String(start.lat) }),
     lon: h("input", { type: "number", id: "stop-lon", step: "any", value: String(start.lon) }),
     platform_code: h("input", { type: "text", id: "stop-platform", value: start.platform_code || "", maxlength: "120", placeholder: PLATFORM_PLACEHOLDER }),
+    unserviceable: h("input", { type: "checkbox", id: "stop-unserviceable", checked: !!start.unserviceable }),
     description: description.input,
     regional_name: h("input", { type: "text", id: "stop-regional", value: start.regional_name || "", lang: "ta" }),
   };
@@ -196,6 +197,10 @@ export async function editStop(stop) {
       const drafted = !!(prior && prior.after && k in prior.after);
       if (v !== (stop[k] || null) || (drafted && v !== (prior.after[k] ?? null))) after[k] = v;
     }
+    // out of use is a flag, so it is sent only when it turns over
+    const wasOut = prior && prior.after && "unserviceable" in prior.after
+      ? !!prior.after.unserviceable : !!stop.unserviceable;
+    if (f.unserviceable.checked !== wasOut) after.unserviceable = f.unserviceable.checked;
     const extra = more.read();
     if (extra.errors) { clear(problems, h("div.notice.error", h("ul", extra.errors.map((e) => h("li", e))))); return; }
     Object.assign(after, extra.after);
@@ -231,6 +236,10 @@ export async function editStop(stop) {
         h("label.field", { for: "stop-platform" }, h("span", "Platform label (optional)"), f.platform_code),
         h("label.field", { for: "stop-regional" }, h("span", "Tamil name (optional)"), f.regional_name)),
       h("p.hint", { id: "stop-platform-help" }, PLATFORM_HELP),
+      h("label.field.inline", { for: "stop-unserviceable" },
+        f.unserviceable,
+        h("span", "Out of use for now"),
+        h("span.hint", "The stop stays in the feed and in the app, and no bus calls there until this is cleared, so journeys are routed around it. Its times come back exactly as they were.")),
       description.el,
       more.el,
       problems),

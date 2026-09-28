@@ -171,6 +171,7 @@ function stopTooltip(s, stack = 1, station = null) {
   if (s.location_type === 1) bits.push("station");
   else if (s.draft) bits.push("new, in your draft");
   else if (s.route_count != null) bits.push(`${s.route_count} route${s.route_count === 1 ? "" : "s"}`);
+  if (s.unserviceable) bits.push("out of use: no bus calls here");
   if (s.pending) bits.push(s.pending.gone ? `goes away in draft “${draftTitle()}”, still live` : `${s.pending.moved ? "moved" : "renamed"} in draft “${draftTitle()}”, not live`);
   if (station) bits.push(station.parent_station ? `joins station ${station.parent_station} in draft “${draftTitle()}”, not live` : `leaves its station in draft “${draftTitle()}”, still live`);
   if (stack > 1) bits.push(`and ${plural(stack - 1, "other stop")} at this point: click to choose`);
@@ -310,14 +311,17 @@ function drawStops() {
     const isStation = s.location_type === 1;
     const amber = s.draft || (s.pending && !s.pending.gone);
     const going = s.pending && s.pending.gone;
+    // out of use: still on the map, in grey, since no bus calls there
+    const outOfUse = !!s.unserviceable && !amber && !going;
     const m = L.circleMarker([s.lat, s.lon], {
       renderer: dots,
       bubblingMouseEvents: false,
       radius: isStation || selected ? 8 : 6,
-      color: selected ? ACTION : isStation ? INK : amber ? DRAFT_RING : going ? MUTED : "#ffffff",
+      color: selected ? ACTION : isStation ? INK : amber ? DRAFT_RING : going ? MUTED : outOfUse ? MUTED : "#ffffff",
       weight: selected ? 4 : 2,
       dashArray: going ? "2 3" : null,
-      fillColor: amber ? DRAFT_FILL : going ? "#ffffff" : isStation ? "#ffffff" : selected ? ACTION : s.parent_station ? INK : ACTION,
+      fillColor: amber ? DRAFT_FILL : going ? "#ffffff" : isStation ? "#ffffff" : selected ? ACTION
+        : outOfUse ? MUTED : s.parent_station ? INK : ACTION,
       fillOpacity: 1,
       stopIds: stack.map((x) => x.stop_id),
     });

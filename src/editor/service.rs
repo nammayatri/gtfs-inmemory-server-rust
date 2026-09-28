@@ -215,7 +215,7 @@ fn stop_json_counted(r: &PgRow) -> Result<Value, sqlx::Error> {
 const STOP_COLS: &str = "stop_id, stop_code, name, lat, lon, location_type, parent_station, \
      platform_code, description, cluster_id, regional_name, hindi_name, \
      info_json::text AS info_json, position_source, provenance::text AS provenance, deleted, \
-     row_version, updated_at, updated_by";
+     unserviceable, row_version, updated_at, updated_by";
 
 fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -235,6 +235,8 @@ fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "position_source": r.try_get::<Option<String>, _>("position_source")?,
         "provenance": json_col(r, "provenance")?,
         "deleted": r.try_get::<bool, _>("deleted")?,
+        // out of use for a while: the row stays, no trip calls there (section 21)
+        "unserviceable": r.try_get::<bool, _>("unserviceable")?,
         "row_version": r.try_get::<i32, _>("row_version")?,
         "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
         "updated_by": r.try_get::<Option<String>, _>("updated_by")?,
@@ -362,6 +364,27 @@ pub async fn list_stops(
         .map(stop_json_counted)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(page.wrap(items))
+}
+
+/// Every stop out of use right now, with the routes that call at it (docs
+/// section 21). Nothing takes a stop back into use on its own, so this is the
+/// list somebody checks.
+pub async fn unserviceable_stops(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+) -> EditorResult<Vec<Value>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {STOP_COLS}, {ROUTE_COUNT}, {PLATFORM_COUNT} FROM gtfs_stop s \
+         WHERE s.gtfs_id = $1 AND s.unserviceable AND NOT s.deleted \
+         ORDER BY s.name, s.stop_id"
+    ))
+    .bind(gtfs_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(stop_json_counted)
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 pub async fn stop_detail(
@@ -1393,6 +1416,13 @@ fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: 
         ),
         "route_trips" => format!("The trips of route {key}"),
         "service" => format!("Service {key}"),
+        "stage" => format!("Stage {key}"),
+        "route_stages" => format!("The stages of route {key}"),
+        // the change is the route's; which of its lists is in the payload
+        "route_variant" => match c.after["variant_id"].as_str().map(str::trim) {
+            Some(v) if !v.is_empty() => format!("The stages of temporary route {v} on route {key}"),
+            _ => format!("The stages of the normal route {key}"),
+        },
         "station" if key != c.entity_key => {
             format!("Station {key} (kept by the merge of {})", c.entity_key)
         }
@@ -1447,7 +1477,7 @@ fn version_conflict(
 }
 
 /// What an earlier change of a set creates, for [`conflict_for`]: `(kind, key)`
-/// with kind `stop` (a stop or station), `route`, `service` or `pattern`
+/// with kind `stop` (a stop or station), `route`, `stage`, `service` or `pattern`
 /// (`{route}#{pattern_key}`). Such a row has no live version to be stale
 /// against.
 fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
@@ -1459,6 +1489,7 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
             ("route", key),
         ],
         ("service", "create") => vec![("service", key)],
+        ("stage", "create") => vec![("stage", key)],
         (e, "create") if super::records::spec_for(e).is_some() => {
             vec![("record", format!("{e}#{key}"))]
         }
@@ -1468,14 +1499,38 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
     }
 }
 
+/// The list of stages a change writes, as (route, variant), where the empty
+/// variant is the route's normal list. A later change based on a list this set
+/// has already written is based on the set, not on the live rows, so its hash
+/// is not compared against them.
+fn lists_written(c: &ChangeRow) -> Vec<(String, String)> {
+    let route = c.entity_key.clone();
+    let variant = || {
+        c.after["variant_id"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    match (c.entity.as_str(), c.op.as_str()) {
+        // a route's first temporary route turns its stops into stages, so the
+        // normal list is written too
+        ("route_variant", "create") => vec![(route.clone(), variant()), (route, String::new())],
+        ("route_variant", "update" | "delete") => vec![(route, variant())],
+        ("route_stages", "replace") => vec![(route, String::new())],
+        _ => Vec::new(),
+    }
+}
+
 /// Has the live data moved on since the change was made? `in_draft(kind, key)`
 /// says whether an earlier change in the same set creates a row
 /// ([`created_by`]): such a row has no live version to be stale against.
+/// `list_in_draft` says the same of a list of stages (see [`lists_written`]).
 async fn conflict_for(
     conn: &mut PgConnection,
     g: &str,
     c: &ChangeRow,
     in_draft: &dyn Fn(&str, &str) -> bool,
+    list_in_draft: &dyn Fn(&str, &str) -> bool,
 ) -> EditorResult<Vec<Value>> {
     let key = c.entity_key.as_str();
     let mut out = Vec::new();
@@ -1489,6 +1544,39 @@ async fn conflict_for(
         ("route", "update" | "delete") if !in_draft("route", key) => {
             let live = live_row_version(conn, "gtfs_route", "route_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
+        }
+        ("stage", "update" | "delete") if !in_draft("stage", key) => {
+            let live = live_row_version(conn, "gtfs_stage", "stage_id", g, key).await?;
+            out.extend(version_conflict(c, key, live, c.base_row_version));
+        }
+        // a temporary route's change is based on the list it names: the one it
+        // switches to, or the one it edits. A list this set has already written
+        // -- the temporary route it just added, or the normal list that adding
+        // it converted -- is the set's own work, not a stale read of live.
+        ("route_variant", "activate") | ("route_variant", "update") => {
+            let variant = c.after["variant_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if !list_in_draft(key, variant.unwrap_or("")) && !in_draft("route", key) {
+                if let Some(expected) = c.after["base_stages_hash"].as_str() {
+                    let actual = super::variants::live_variant_hash(conn, g, key, variant).await?;
+                    if expected != actual {
+                        out.push(conflict(c, "changed", json!(expected), json!(actual)));
+                    }
+                }
+            }
+        }
+        ("route_stages", "replace") if !list_in_draft(key, "") && !in_draft("route", key) => {
+            // a route without stages hashes like []
+            let expected = c.after["base_stages_hash"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let actual = super::stages::live_links_hash(conn, g, key, None).await?;
+            if expected != actual {
+                out.push(conflict(c, "changed", json!(expected), json!(actual)));
+            }
         }
         // a merge is two rows: the one that goes away and the one that stays,
         // and either moving on under the editor's feet is a conflict
@@ -1510,10 +1598,11 @@ async fn conflict_for(
                 }
             }
         }
-        ("stop" | "station" | "route" | "service", "create") => {
+        ("stop" | "station" | "route" | "service" | "stage", "create") => {
             let (table, id_col) = match c.entity.as_str() {
                 "route" => ("gtfs_route", "route_id"),
                 "service" => ("gtfs_service", "service_id"),
+                "stage" => ("gtfs_stage", "stage_id"),
                 _ => ("gtfs_stop", "stop_id"),
             };
             let exists = live_row_version(conn, table, id_col, g, key).await?;
@@ -1663,13 +1752,19 @@ pub async fn evaluate(
 ) -> EditorResult<Evaluation> {
     let mut ev = Evaluation::default();
     let mut created: HashSet<(&'static str, String)> = HashSet::new();
+    let mut lists: HashSet<(String, String)> = HashSet::new();
     for c in changes {
-        let found = conflict_for(conn, g, c, &|kind, key| {
-            created.iter().any(|(k, v)| *k == kind && v.as_str() == key)
-        })
+        let found = conflict_for(
+            conn,
+            g,
+            c,
+            &|kind, key| created.iter().any(|(k, v)| *k == kind && v.as_str() == key),
+            &|route, variant| lists.contains(&(route.to_string(), variant.to_string())),
+        )
         .await?;
         ev.conflicts.extend(found);
         created.extend(created_by(c));
+        lists.extend(lists_written(c));
     }
     let mut state = ApplyState {
         changes,
@@ -1816,7 +1911,7 @@ fn referenced_stops(c: &ChangeRow) -> Vec<String> {
                 &c.after,
             )
         }
-        ("route_stops", "replace") => c.after["rows"]
+        ("route_stops", "replace") | ("stage", "create" | "update") => c.after["rows"]
             .as_array()
             .map(|rows| {
                 rows.iter()
@@ -1870,6 +1965,24 @@ async fn apply_change(
         ("route", "update") => route_update(conn, g, key, &c.after, actor).await,
         ("route", "delete") => route_delete(conn, g, c, actor, state.changes).await,
         ("route_stops", "replace") => route_stops_replace(conn, g, key, &c.after, actor).await,
+        ("stage", "create") => super::stages::stage_create(conn, g, key, &c.after, actor).await,
+        ("stage", "update") => super::stages::stage_update(conn, g, key, &c.after, actor).await,
+        ("stage", "delete") => super::stages::stage_delete(conn, g, key, actor).await,
+        ("route_stages", "replace") => {
+            super::stages::route_stages_replace(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "create") => {
+            super::variants::variant_create(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "update") => {
+            super::variants::variant_update(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "activate") => {
+            super::variants::variant_activate(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "delete") => {
+            super::variants::variant_delete(conn, g, key, &c.after, actor).await
+        }
         ("station", "create") => station_create(conn, g, &c.after, actor).await,
         ("station", "update") => station_update(conn, g, key, &c.after, actor).await,
         ("station", "delete") => station_delete(conn, g, key, actor).await,
@@ -1918,6 +2031,8 @@ struct LiveStop {
     location_type: i16,
     deleted: bool,
     parent_station: Option<String>,
+    /// Out of use: its row stays, no trip calls there (section 21).
+    unserviceable: bool,
 }
 
 async fn live_stop(
@@ -1926,7 +2041,7 @@ async fn live_stop(
     id: &str,
 ) -> Result<Option<LiveStop>, sqlx::Error> {
     sqlx::query(
-        "SELECT lat, lon, location_type, deleted, parent_station FROM gtfs_stop \
+        "SELECT lat, lon, location_type, deleted, parent_station, unserviceable FROM gtfs_stop \
          WHERE gtfs_id = $1 AND stop_id = $2 FOR UPDATE",
     )
     .bind(g)
@@ -1940,6 +2055,7 @@ async fn live_stop(
             location_type: r.try_get("location_type")?,
             deleted: r.try_get("deleted")?,
             parent_station: r.try_get("parent_station")?,
+            unserviceable: r.try_get("unserviceable")?,
         })
     })
     .transpose()
@@ -1990,6 +2106,11 @@ async fn stop_update(
     let (has_cluster, cluster) = field(m, "cluster_id");
     let (has_regional, regional) = field(m, "regional_name");
     let (has_hindi, hindi) = field(m, "hindi_name");
+    // out of use, or back in use: the stops.txt row stays either way (section 21)
+    let unserviceable = m.get("unserviceable").and_then(Value::as_bool);
+    if let Some(flag) = unserviceable {
+        warnings.extend(unserviceable_findings(conn, g, id, flag, live.unserviceable).await?);
+    }
     sqlx::query(
         "UPDATE gtfs_stop SET \
             name = CASE WHEN $3 THEN $4 ELSE name END, \
@@ -2003,6 +2124,7 @@ async fn stop_update(
             regional_name = CASE WHEN $12 THEN $13 ELSE regional_name END, \
             hindi_name = CASE WHEN $14 THEN $15 ELSE hindi_name END, \
             description = CASE WHEN $17 THEN $18 ELSE description END, \
+            unserviceable = CASE WHEN $19 THEN $20 ELSE unserviceable END, \
             updated_by = $16 \
          WHERE gtfs_id = $1 AND stop_id = $2",
     )
@@ -2024,10 +2146,154 @@ async fn stop_update(
     .bind(actor)
     .bind(has_description)
     .bind(description)
+    .bind(unserviceable.is_some())
+    .bind(unserviceable.unwrap_or(false))
     .execute(&mut *conn)
     .await?;
     warnings.extend(stop_gtfs_fields(conn, g, id, m, &before, live.location_type).await?);
     Ok(warnings)
+}
+
+/// What making a stop unserviceable does to the routes that call at it (docs
+/// section 21). The rows stay and no time is recomputed - the stop is skipped
+/// where times are emitted - so what a reviewer needs to see is how much of the
+/// feed stops calling there, and whether any route is left with too little to
+/// publish.
+async fn unserviceable_findings(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    flag: bool,
+    was: bool,
+) -> Result<Vec<Finding>, ApplyError> {
+    if flag == was {
+        return Ok(vec![Finding::warning(
+            "unserviceable_unchanged",
+            id,
+            format!(
+                "stop {id} is already {}",
+                if flag { "out of use" } else { "in use" }
+            ),
+        )]);
+    }
+    if !flag {
+        return Ok(vec![Finding::warning(
+            "stop_serviceable_again",
+            id,
+            format!("stop {id} is served again from the next build, with the times it had before"),
+        )]);
+    }
+    // every stop order of every route that calls there - the ones that do not
+    // call at it too, since a route publishes nothing only when all of its stop
+    // orders are left with fewer than two calls
+    let rows = sqlx::query(
+        "SELECT rs.route_id, rs.pattern_key, \
+                count(*) FILTER (WHERE rs.stop_id <> $2) AS others, \
+                count(*) FILTER (WHERE rs.stop_id = $2) AS calls, \
+                count(*) FILTER (WHERE rs.stop_id = $2 AND rs.stop_type = 'NEW STOP') AS boundaries \
+         FROM gtfs_route_stop rs \
+         JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+         WHERE rs.gtfs_id = $1 AND rs.stop_type = ANY($3) \
+           AND rs.route_id IN ( \
+             SELECT route_id FROM gtfs_route_stop \
+              WHERE gtfs_id = $1 AND stop_id = $2 AND stop_type = ANY($3)) \
+         GROUP BY rs.route_id, rs.pattern_key ORDER BY rs.route_id, rs.pattern_key",
+    )
+    .bind(g)
+    .bind(id)
+    .bind(&super::validation::SERVED_STOP_TYPES[..])
+    .fetch_all(&mut *conn)
+    .await?;
+    if rows.is_empty() {
+        return Ok(vec![Finding::warning(
+            "stop_unserviceable",
+            id,
+            format!("stop {id} is out of use from the next build; no route calls there"),
+        )]);
+    }
+    // per route: its stop orders, and the ones left with too little to publish
+    let mut per_route: std::collections::BTreeMap<String, (usize, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    let mut calling: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut boundary_of = 0;
+    for r in &rows {
+        let route: String = r.try_get("route_id")?;
+        let pattern: i16 = r.try_get("pattern_key")?;
+        let calls = r.try_get::<i64, _>("calls")? > 0;
+        if calls {
+            calling.insert(route.clone());
+        }
+        if r.try_get::<i64, _>("boundaries")? > 0 {
+            boundary_of += 1;
+        }
+        let entry = per_route.entry(route.clone()).or_insert((0, Vec::new()));
+        entry.0 += 1;
+        if r.try_get::<i64, _>("others")? < 2 {
+            entry.1.push(if pattern == 1 {
+                format!("route {route}")
+            } else {
+                format!("route {route} stop order {pattern}")
+            });
+        }
+    }
+    let mut out = vec![Finding::warning(
+        "stop_unserviceable",
+        id,
+        format!(
+            "stop {id} is out of use from the next build: {} route(s) stop calling there, and \
+             their trips skip it until it is in use again",
+            calling.len()
+        ),
+    )];
+    if boundary_of > 0 {
+        out.push(Finding::warning(
+            "stage_boundary_moves",
+            id,
+            format!(
+                "stop {id} begins its fare stage on {boundary_of} stop order(s); while it is out \
+                 of use the stage's next stop carries the stage"
+            ),
+        ));
+    }
+    // a route whose every stop order is left too short would publish no trips at
+    // all: that is a mistake, not a stop out of use. One stop order of several
+    // going quiet is the operator's call, and is said.
+    let dead: Vec<&String> = per_route
+        .iter()
+        .filter(|(_, (total, short))| short.len() == *total)
+        .map(|(route, _)| route)
+        .collect();
+    let quiet: Vec<String> = per_route
+        .values()
+        .filter(|(total, short)| !short.is_empty() && short.len() < *total)
+        .flat_map(|(_, short)| short.clone())
+        .collect();
+    if !dead.is_empty() {
+        out.push(Finding::error(
+            "route_too_short",
+            id,
+            format!(
+                "route(s) {} would have no stop order left with two stops a passenger can board, \
+                 so they could publish no trips at all; take {id} out of those routes instead",
+                dead.iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    if !quiet.is_empty() {
+        out.push(Finding::warning(
+            "pattern_too_short",
+            id,
+            format!(
+                "{} would be left with fewer than two stops a passenger can board, so those \
+                 trips are not published while {id} is out of use",
+                quiet.join(", ")
+            ),
+        ));
+    }
+    Ok(out)
 }
 
 /// The GTFS fields of stops.txt a stop change sets by name (section 18): what
@@ -2201,6 +2467,24 @@ async fn stop_delete(
             format!(
                 "stop {id} is named by {}; change or remove those first",
                 super::records::say_users(&users)
+            ),
+        ));
+    }
+    // a stage no route uses yet is still one a route may be given
+    let stages = super::stages::stages_with_stop(conn, g, id).await?;
+    if !stages.is_empty() {
+        let sample: Vec<String> = stages
+            .iter()
+            .take(5)
+            .map(|(sid, name)| format!("{name} ({sid})"))
+            .collect();
+        return Err(fail(
+            "stop_in_stage",
+            format!(
+                "stop {id} is in {} stage(s) ({}{}); take it out of them first",
+                stages.len(),
+                sample.join(", "),
+                if stages.len() > 5 { ", ..." } else { "" }
             ),
         ));
     }
@@ -2439,7 +2723,13 @@ fn other_route_changes(changes: &[ChangeRow], route_id: &str, except: i64) -> Ve
         .filter(|o| {
             matches!(
                 o.entity.as_str(),
-                "route" | "route_stops" | "pattern" | "timing_profile" | "route_trips"
+                "route"
+                    | "route_stops"
+                    | "pattern"
+                    | "timing_profile"
+                    | "route_trips"
+                    | "route_stages"
+                    | "route_variant"
             )
         })
         .map(|o| o.change_id)
@@ -2635,6 +2925,15 @@ async fn stop_merge(
     .iter()
     .map(|r| r.try_get("route_id"))
     .collect::<Result<_, _>>()?;
+    super::stages::merge_stop_into(
+        conn,
+        g,
+        from,
+        into,
+        (!keep_name_from && f.name != i.name).then_some(f.name.as_str()),
+        actor,
+    )
+    .await?;
     // 2 and 3. the kept stop: name / position if asked, and the station the
     // duplicate was in when it has none
     let takes_station = i.parent_station.is_none() && f.parent_station.is_some();
@@ -2750,7 +3049,6 @@ async fn route_stops_replace(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
     }
-    let mut findings = Vec::new();
     let ids: Vec<String> = rows
         .iter()
         .filter(|r| !r.is_marker())
@@ -2758,11 +3056,62 @@ async fn route_stops_replace(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    if super::stages::has_stages(conn, g, route_id).await? {
+        return Err(fail(
+            "route_has_stages",
+            format!(
+                "route {route_id} is built from stages: change its stages, or the stage \
+                 itself, instead of its stop list"
+            ),
+        ));
+    }
+    let mut findings = check_stops_usable(conn, g, &ids).await?;
+    let live = load_pattern_rows(conn, g, route_id, pattern_key).await?;
+    let fare_stages = has_fare_stages(conn, g).await?;
+    if payload.position_review_id.is_some() {
+        // a split points the reviewed stop's rows at a new stop: what those rows
+        // already had wrong under the old stop is not the split's doing
+        findings.extend(grade_repointed(&rows, &live, fare_stages));
+    } else {
+        findings.extend(grade_against_live(
+            check_route_rows_for(&rows, fare_stages),
+            &check_route_rows_for(&live, fare_stages),
+        ));
+    }
+    // A stop that cannot be used, or a row the table refuses, stops the change
+    // here. A broken fare or stop-order rule does not: the rows are written, so
+    // the draft's preview (and every later change in it) sees the stop list as
+    // drafted, while the error still blocks submit and commit.
+    if blocks_apply(&findings) {
+        return Err(ApplyError::Findings(findings));
+    }
+
+    findings.extend(write_pattern_rows(conn, g, route_id, pattern_key, &rows, &live, actor).await?);
+    Ok(findings)
+}
+
+/// Whether findings stop a change from applying at all: an error that is not
+/// one of the fare and stop-order rules a draft may hold while it is fixed.
+pub(super) fn blocks_apply(findings: &[Finding]) -> bool {
+    findings
+        .iter()
+        .any(|f| f.level == Level::Error && !ROUTE_RULE_CODES.contains(&f.code.as_str()))
+}
+
+/// Errors for stop ids a route row cannot use: unknown, deleted, a station or
+/// some other kind of place. Stages check the same of a stage's stops (docs
+/// section 19).
+pub(super) async fn check_stops_usable(
+    conn: &mut PgConnection,
+    g: &str,
+    ids: &[String],
+) -> Result<Vec<Finding>, sqlx::Error> {
+    let mut findings = Vec::new();
     let known: HashMap<String, (i16, bool)> = sqlx::query(
         "SELECT stop_id, location_type, deleted FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
     )
     .bind(g)
-    .bind(&ids)
+    .bind(ids)
     .fetch_all(&mut *conn)
     .await?
     .iter()
@@ -2770,7 +3119,7 @@ async fn route_stops_replace(
         Ok((r.try_get("stop_id")?, (r.try_get("location_type")?, r.try_get("deleted")?)))
     })
     .collect::<Result<_, _>>()?;
-    let mut ids_sorted = ids.clone();
+    let mut ids_sorted = ids.to_vec();
     ids_sorted.sort();
     for id in &ids_sorted {
         match known.get(id) {
@@ -2800,29 +3149,21 @@ async fn route_stops_replace(
             _ => {}
         }
     }
-    let live = load_pattern_rows(conn, g, route_id, pattern_key).await?;
-    let fare_stages = has_fare_stages(conn, g).await?;
-    if payload.position_review_id.is_some() {
-        // a split points the reviewed stop's rows at a new stop: what those rows
-        // already had wrong under the old stop is not the split's doing
-        findings.extend(grade_repointed(&rows, &live, fare_stages));
-    } else {
-        findings.extend(grade_against_live(
-            check_route_rows_for(&rows, fare_stages),
-            &check_route_rows_for(&live, fare_stages),
-        ));
-    }
-    // A stop that cannot be used, or a row the table refuses, stops the change
-    // here. A broken fare or stop-order rule does not: the rows are written, so
-    // the draft's preview (and every later change in it) sees the stop list as
-    // drafted, while the error still blocks submit and commit.
-    if findings
-        .iter()
-        .any(|f| f.level == Level::Error && !ROUTE_RULE_CODES.contains(&f.code.as_str()))
-    {
-        return Err(ApplyError::Findings(findings));
-    }
+    Ok(findings)
+}
 
+/// Replace one pattern's `gtfs_route_stop` rows with `rows`, in order. `live` is
+/// what that pattern has now; its stored timings follow the new stops.
+pub(super) async fn write_pattern_rows(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    pattern_key: i16,
+    rows: &[RouteRow],
+    live: &[RouteRow],
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
+    let mut findings = Vec::new();
     // What the live rows carry that an edit does not send: the cleanup's
     // per-row provenance (kept where the same stop or marker stays at the same
     // position) and the provider id (a new row takes the route's usual one).
@@ -2851,7 +3192,7 @@ async fn route_stops_replace(
     .collect::<Result<_, _>>()?;
     let usual_provider = {
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for r in &live {
+        for r in live {
             if let Some(p) = r.provider_id.as_deref() {
                 *counts.entry(p).or_default() += 1;
             }
@@ -3016,11 +3357,24 @@ async fn route_stops_replace(
     .execute(&mut *conn)
     .await?;
     // the pattern's stored timings follow its new stops, in this same change
-    let old_ids = super::trips::served_ids(&live);
+    let old_ids = super::trips::served_ids(live);
     findings.extend(
         super::trips::carry_over_profiles(conn, g, route_id, pattern_key, &old_ids, actor).await?,
     );
     Ok(findings)
+}
+
+/// The rows of a route's first pattern: the stop list every screen that is not
+/// the timetable means. Stages and temporary routes write through this.
+pub(super) async fn write_route_rows(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    rows: &[RouteRow],
+    live: &[RouteRow],
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
+    write_pattern_rows(conn, g, route_id, FIRST_PATTERN, rows, live, actor).await
 }
 
 /// Put `members` under `station`, setting the platform label of each member
@@ -3087,6 +3441,9 @@ async fn check_members(
                 location_type: r.try_get("location_type")?,
                 deleted: r.try_get("deleted")?,
                 parent_station: r.try_get("parent_station")?,
+                // this read is a station's members; whether one is out of use
+                // does not bear on joining it to a station
+                unserviceable: false,
             },
         ))
     })
@@ -3704,7 +4061,7 @@ async fn set_detail_once(
     // reads as itself).
     let referenced: Vec<String> = changes
         .iter()
-        .filter(|c| c.entity == "route_stops")
+        .filter(|c| matches!(c.entity.as_str(), "route_stops" | "stage"))
         .flat_map(|c| c.after["rows"].as_array().cloned().unwrap_or_default())
         .filter_map(|r| r["stop_id"].as_str().map(str::to_string))
         .collect::<HashSet<_>>()
@@ -3891,13 +4248,13 @@ pub fn editable(set: &ChangeSet) -> EditorResult<()> {
 async fn created_in_set(
     conn: &mut PgConnection,
     change_set_id: Uuid,
-    routes: bool,
+    kind: &str,
     key: &str,
 ) -> EditorResult<Option<(String, Value)>> {
-    let entities: &[&str] = if routes {
-        &["route"]
-    } else {
-        &["stop", "station"]
+    let entities: &[&str] = match kind {
+        "route" => &["route"],
+        "stage" => &["stage"],
+        _ => &["stop", "station"],
     };
     let row = sqlx::query(
         "SELECT entity, after::text AS after FROM gtfs_change \
@@ -3968,7 +4325,7 @@ async fn route_in_set(
     if route_row(conn, g, key).await?.is_some() {
         return Ok(true);
     }
-    if created_in_set(conn, change_set_id, true, key)
+    if created_in_set(conn, change_set_id, "route", key)
         .await?
         .is_some()
     {
@@ -4023,7 +4380,7 @@ async fn stop_or_created(
         let version = row["row_version"].as_i64().map(|v| v as i32);
         return Ok(Some((row, station, version)));
     }
-    Ok(created_in_set(conn, change_set_id, false, key)
+    Ok(created_in_set(conn, change_set_id, "stop", key)
         .await?
         .map(|(entity, after)| (after, entity == "station", None)))
 }
@@ -4201,7 +4558,7 @@ async fn snapshot(
                     super::records::gtfs_fields(conn, g, "routes.txt", key, &fields).await?;
                 return Ok((row, v));
             }
-            let (_, created) = created_in_set(conn, change_set_id, true, key)
+            let (_, created) = created_in_set(conn, change_set_id, "route", key)
                 .await?
                 .ok_or_else(|| {
                     EditorError::not_found("entity_not_found", format!("no route {key}"))
@@ -4209,6 +4566,35 @@ async fn snapshot(
             Ok((created, None))
         }
         ("feed_config", "update") => Ok((feed_config_row(conn, g).await?, None)),
+        ("stage", "update" | "delete") => {
+            if let Some((row, version)) = super::stages::stage_snapshot(conn, g, key).await? {
+                return Ok((row, Some(version)));
+            }
+            let (_, created) = created_in_set(conn, change_set_id, "stage", key)
+                .await?
+                .ok_or_else(|| {
+                    EditorError::not_found("entity_not_found", format!("no stage {key}"))
+                })?;
+            Ok((created, None))
+        }
+        ("route_stages", "replace") => {
+            if route_row(conn, g, key).await?.is_none() {
+                if created_in_set(conn, change_set_id, "route", key)
+                    .await?
+                    .is_some()
+                {
+                    return Ok((json!([]), None));
+                }
+                return Err(EditorError::not_found(
+                    "entity_not_found",
+                    format!("no route {key}"),
+                ));
+            }
+            Ok((
+                super::stages::route_stages_snapshot(conn, g, key).await?,
+                None,
+            ))
+        }
         ("route_stops", "replace") => {
             if !route_in_set(conn, change_set_id, g, key).await? {
                 // a route this set creates starts with no rows
@@ -4350,7 +4736,10 @@ pub async fn add_change_to(
             _ => {}
         }
     }
-    let mint = entity == "stop" && op == "create" && key.is_empty() && after.is_object();
+    let mint = matches!(entity.as_str(), "stop" | "stage")
+        && op == "create"
+        && key.is_empty()
+        && after.is_object();
     let invalid = |f: Finding| {
         EditorError::bad_request("invalid_change", f.message.clone())
             .with_details(json!({"code": f.code}))
@@ -4379,7 +4768,11 @@ pub async fn add_change_to(
         )
         .with_details(json!({"code": "feed_mismatch"})));
     }
-    if mint {
+    if mint && entity == "stage" {
+        key = super::stages::mint_stage_id(&mut *tx, &set.gtfs_id).await?;
+        after["stage_id"] = json!(key);
+        check_payload(&entity, &op, &key, &after).map_err(invalid)?;
+    } else if mint {
         key = mint_stop_ids(&mut *tx, &set.gtfs_id, 1).await?.remove(0);
         after["stop_id"] = json!(key);
         check_payload(&entity, &op, &key, &after).map_err(invalid)?;

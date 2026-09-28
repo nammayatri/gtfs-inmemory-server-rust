@@ -165,6 +165,7 @@ fn write_preprocessed(dir: &Path) {
         headsign: None,
         stage_number: None,
         is_stage_stop: None,
+        unserviceable: None,
     };
     let gtfs_stop = |i: i32| GTFSStop {
         id: format!("{OTHER}:X{i}"),

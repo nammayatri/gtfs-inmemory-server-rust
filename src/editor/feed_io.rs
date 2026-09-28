@@ -215,6 +215,11 @@ pub async fn load_model(
             info.entry("clusterId").or_insert_with(|| json!(cluster));
             values.insert("info_json", Value::Object(info));
         }
+        // out of use: the row is written as any other, and no trip calls at it
+        // (section 21)
+        if s["unserviceable"].as_bool().unwrap_or(false) {
+            m.unserviceable.insert(stop_id.clone());
+        }
         m.stops.push(Stop {
             stop_id,
             values,

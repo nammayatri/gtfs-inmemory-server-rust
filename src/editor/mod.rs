@@ -25,9 +25,11 @@ pub mod position_reviews;
 pub mod proposals;
 pub mod records;
 pub mod service;
+pub mod stages;
 pub mod static_ui;
 pub mod trips;
 pub mod validation;
+pub mod variants;
 pub mod webhooks;
 
 use crate::environment::AppConfig;
@@ -281,6 +283,24 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::get().to(h::route_context),
             )
             .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/stages",
+                web::get().to(h::route_stages),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/variants",
+                web::get().to(h::route_variants),
+            )
+            .route("/feeds/{gtfs_id}/diversions", web::get().to(h::diversions))
+            .route(
+                "/feeds/{gtfs_id}/unserviceable-stops",
+                web::get().to(h::unserviceable_stops),
+            )
+            .route("/feeds/{gtfs_id}/stages", web::get().to(h::stages))
+            .route(
+                "/feeds/{gtfs_id}/stages/{stage_id}",
+                web::get().to(h::stage),
+            )
+            .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:osrm",
                 web::post().to(h::polyline_osrm),
             )
@@ -336,6 +356,18 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/change-sets/{id}/preview/routes/{route_id}/trips",
                 web::get().to(h::change_set_preview_trips),
+            )
+            .route(
+                "/change-sets/{id}/preview/routes/{route_id}/variants",
+                web::get().to(h::change_set_preview_route_variants),
+            )
+            .route(
+                "/change-sets/{id}/preview/routes/{route_id}/stages",
+                web::get().to(h::change_set_preview_route_stages),
+            )
+            .route(
+                "/change-sets/{id}/preview/stages/{stage_id}",
+                web::get().to(h::change_set_preview_stage),
             )
             .route("/change-sets/{id}/submit", web::post().to(h::submit))
             .route("/change-sets/{id}/reopen", web::post().to(h::reopen))

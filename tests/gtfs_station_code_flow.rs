@@ -286,6 +286,7 @@ fn write_preprocessed(dir: &Path) {
         headsign: None,
         stage_number: None,
         is_stage_stop: None,
+        unserviceable: None,
     };
     let routes: HashMap<&str, Vec<NandiRoutesRes>> = HashMap::from([(
         FEED,

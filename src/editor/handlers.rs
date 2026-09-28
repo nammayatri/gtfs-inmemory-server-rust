@@ -13,8 +13,10 @@ use super::position_reviews;
 use super::proposals;
 use super::records;
 use super::service::{self as svc, Page, StopQuery};
+use super::stages;
 use super::trips;
 use super::validation::valid_lat_lon;
+use super::variants;
 use super::webhooks;
 use super::EditorState;
 use crate::gtfs::write as gtfs_write;
@@ -753,6 +755,106 @@ pub async fn route(
     ok(svc::route_detail(&mut conn, &g, &id).await?)
 }
 
+#[derive(Deserialize)]
+pub struct StagesQuery {
+    q: Option<String>,
+    stop_id: Option<String>,
+    route_id: Option<String>,
+    /// "up" or "down" (section 19)
+    direction: Option<String>,
+    #[serde(default)]
+    unused: bool,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn stages(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<StagesQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    let query = stages::StageQuery {
+        q: q.q.clone(),
+        stop_id: q.stop_id.clone(),
+        route_id: q.route_id.clone(),
+        direction: q.direction.clone(),
+        unused: q.unused,
+    };
+    ok(stages::list_stages(&st, &path, &query, &page).await?)
+}
+
+pub async fn stage(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(stages::stage_detail(&mut conn, &g, &id).await?)
+}
+
+pub async fn route_stages(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(stages::route_stages_detail(&mut conn, &g, &id).await?)
+}
+
+/// A route's temporary routes, and which one it is running (docs section 19).
+pub async fn route_variants(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(variants::route_variants(&mut conn, &g, &id).await?)
+}
+
+/// Every route running a temporary route right now: the list that stops one
+/// quietly becoming permanent.
+/// GET /feeds/{gtfs_id}/unserviceable-stops
+pub async fn unserviceable_stops(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    let items = svc::unserviceable_stops(&mut conn, &path).await?;
+    ok(serde_json::json!({"items": items}))
+}
+
+pub async fn diversions(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    let items = variants::diverted_routes(&mut conn, &path).await?;
+    ok(serde_json::json!({"items": items}))
+}
+
+pub async fn change_set_preview_route_variants(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+) -> EditorResult<HttpResponse> {
+    let (id, route_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(stages::preview_route_variants(&st, &ctx, id, &route_id).await?)
+}
+
 /// What a person cleaning up a stop wants beside it (docs section 9).
 pub async fn stop_context(
     req: HttpRequest,
@@ -1122,7 +1224,7 @@ pub async fn change_set(
     ok(svc::set_detail_page(&st, &ctx, *path, &page, first).await?)
 }
 
-/// `replay=false` on a single-change write (section 19): answer with the ids
+/// `replay=false` on a single-change write (section 22): answer with the ids
 /// alone instead of the set's first page. That page replays the whole draft
 /// under the feed's lock, so a script adding changes one at a time paid for
 /// every change already in the draft on every call.
@@ -1195,6 +1297,26 @@ pub async fn change_set_preview_route(
     let (id, route_id) = path.into_inner();
     let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
     ok(svc::preview_route(&st, &ctx, id, &route_id).await?)
+}
+
+pub async fn change_set_preview_stage(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+) -> EditorResult<HttpResponse> {
+    let (id, stage_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(stages::preview_stage(&st, &ctx, id, &stage_id).await?)
+}
+
+pub async fn change_set_preview_route_stages(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+) -> EditorResult<HttpResponse> {
+    let (id, route_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(stages::preview_route_stages(&st, &ctx, id, &route_id).await?)
 }
 
 pub async fn submit(
