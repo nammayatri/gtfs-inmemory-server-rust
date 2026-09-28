@@ -3,7 +3,7 @@
 // and - for an admin - bringing a GTFS zip in: a seed for a feed with no rows,
 // or change sets for one that has them, always checked first without writing;
 // and a new feed made from its zip.
-import { get, postBytes, enc } from "./api.js";
+import { get, postBytes, enc, ApiError } from "./api.js";
 import { API_BASE } from "./config.js";
 import { state, isAdmin } from "./state.js";
 import { h, clear, fmtCount, plural, errorText, toast } from "./util.js";
@@ -99,9 +99,11 @@ function importForm(box) {
     } else if (write) {
       qs.set("seed", "true");
     }
-    clear(out, h("p.empty", write ? "Importing…" : `Checking ${name} without writing anything…`));
+    const doing = write ? "Importing" : `Checking ${name} without writing anything`;
+    clear(out, h("p.empty", `${doing}…`));
     try {
-      const res = await postBytes(`feeds/${enc(state.feedId)}/import?${qs}`, bytes);
+      const res = await runImport(`feeds/${enc(state.feedId)}/import?${qs}`, bytes,
+        (s) => clear(out, h("p.empty", `${doing}… ${s} s`)));
       clear(out, how === "drafts" ? draftsReport(res) : seedReport(res), !write && canWrite(how, res)
         ? h("div.btn-row", h("button.btn", { type: "button", id: "import-write", on: { click: () => run(true) } }, how === "drafts" ? "Draft these changes" : "Load the feed"))
         : null);
@@ -119,6 +121,25 @@ function importForm(box) {
     h("label.field", { for: "import-files" }, h("span", "Only these files (drafts)"), files),
     h("div.btn-row", h("button.btn.secondary", { type: "button", id: "import-check", on: { click: () => run(false) } }, "Check without writing")),
     out);
+}
+
+// An import in the background (docs section 18.15): the request is answered
+// at once with a job, and its report polled for, so an import may take longer
+// than the 30 s the load balancer and Pomerium in front of the editor wait.
+// `waiting(seconds)` hears how long it has been running.
+async function runImport(path, bytes, waiting) {
+  const { job_id } = await postBytes(`${path}${path.includes("?") ? "&" : "?"}background=true`, bytes);
+  const started = Date.now();
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const job = await get(`import-jobs/${enc(job_id)}`);
+    if (job.status === "done") return job.report;
+    if (job.status !== "running") {
+      const e = job.error || {};
+      throw new ApiError(e.status || 500, e.code || "import_failed", e.message || "The import failed.");
+    }
+    if (waiting) waiting(Math.round((Date.now() - started) / 1000));
+  }
 }
 
 // A new feed from its GTFS zip (docs section 18.14): the feed the zip's
@@ -147,9 +168,10 @@ export function showNewFeed() {
     const qs = new URLSearchParams();
     if (id.value.trim()) qs.set("gtfs_id", id.value.trim());
     if (write) qs.set("seed", "true");
-    clear(out, h("p.empty", write ? "Loading the feed…" : `Checking ${name} without writing anything…`));
+    const doing = write ? "Loading the feed" : `Checking ${name} without writing anything`;
+    clear(out, h("p.empty", `${doing}…`));
     try {
-      const res = await postBytes(`feeds?${qs}`, bytes);
+      const res = await runImport(`feeds?${qs}`, bytes, (s) => clear(out, h("p.empty", `${doing}… ${s} s`)));
       if (res.seeded) {
         toast(`Feed ${res.gtfs_id} is loaded.`);
         // main.js offers it in the switcher and opens it

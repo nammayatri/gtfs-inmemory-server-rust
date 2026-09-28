@@ -37,9 +37,11 @@ accounts (section 15), `0019` adds patterns, timing profiles, trips, frequencies
 and service calendars (section 16), `0020` the MTC sync's system account (section
 16.8), `0021` lets a map line come from GPS (section 17), `0022` is the release
 button's (section 12.6), `0023` holds every other file and field of the GTFS
-reference (section 18). All are safe to run twice. **`0012`, `0017` and `0023`
+reference (section 18), `0024` is where a background import's report waits
+(section 18.15). All are safe to run twice. **`0012`, `0017` and `0023`
 go on a database before the build that reads them:** both the editor and the GIMS loader select those columns, so a DB feed
-fails to load (and serves its preprocessed data) on a database without them.)
+fails to load (and serves its preprocessed data) on a database without them.
+`0024` too, or the dashboard's imports fail; GIMS itself serves without it.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -3717,3 +3719,41 @@ the feed and lists it named after its agency, a second one is refused, a zip
 that names no feed, a bad id, a viewer); `editor-ui/dev/ui_e2e.mjs --only newfeed`
 (nandi's mumbai_MMRCL zip renamed per run, through the page to the new feed's
 Feed page).
+
+### 18.15 Imports in the background (2026-09-28) - `0024_import_jobs.sql`
+
+The load balancer in front of the editor and Pomerium each give up on a request
+after 30 s, and answer 502. A chennai_bus drafts check takes longer than that
+(27 s locally on a debug build, more against master's database), and a big
+seed is close, so the dashboard's imports run in the background.
+
+Both imports (`POST /feeds/{g}/import`, `POST /feeds`) take `background=true`:
+the answer is `202 {job_id, status: "running"}` at once (7 ms for chennai_bus's
+11.6 MB zip, locally). The import runs on a thread of its own, with its own
+runtime and a pool of two connections of its own, so its CPU-heavy steps never
+hold up a web worker; its outcome goes to `gtfs_import_job`, one row a job:
+
+| column | |
+|---|---|
+| `job_id`, `gtfs_id`, `kind` (`seed`, `drafts`), `dry_run` | what was asked |
+| `status` | `running`, `done` or `failed` |
+| `report` | the import's report, as the request would have answered it |
+| `error` | `{status, code, message}`: the error the import answered |
+| `created_by`, `pod`, `created_at`, `finished_at` | who, where, when |
+
+`GET /import-jobs/{job_id}` (admin, as the imports are) is the row: `report`
+once done, `error` once failed, and `lost` - with `job_lost` - for a job still
+running 30 minutes on, whose pod went away. It is a table and not the pod's
+memory because prod runs four pods: the poll lands on any of them. The dashboard
+polls every 1.5 s and says how long it has been running. Without
+`background=true` the imports answer in the request, as before; the CLI and
+the tests use that.
+
+Settled while implementing: a pool's connections belong to the runtime that
+opened them, so the job's thread opens its own from the editor pool's options
+rather than borrowing its connections.
+
+Tests: `tests/editor_feed_io_flow.rs` (a seed job done with its report, a job
+that fails with the seed's `feed_not_empty`, a drafts job, a viewer, a job that
+does not exist); `editor-ui/dev/ui_e2e.mjs --only feed,newfeed`, both through
+jobs; the chennai_bus drafts check through the page as a 27 s job.

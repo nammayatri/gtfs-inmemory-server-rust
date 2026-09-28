@@ -64,7 +64,8 @@ SELECT m.migration, m.applied FROM (VALUES
   ('0019_trips',              to_regclass('gtfs_trip') IS NOT NULL),
   ('0021_polyline_source_gps',(SELECT pg_get_constraintdef(oid) LIKE '%gps%' FROM pg_constraint WHERE conname = 'gtfs_route_polyline_source_check')),
   ('0022_release_requested',  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'gtfs_webhook_delivery' AND column_name = 'target')),
-  ('0023_gtfs_full_spec',     to_regclass('gtfs_agency') IS NOT NULL)
+  ('0023_gtfs_full_spec',     to_regclass('gtfs_agency') IS NOT NULL),
+  ('0024_import_jobs',        to_regclass('gtfs_import_job') IS NOT NULL)
 ) AS m(migration, applied);
 ```
 
@@ -75,14 +76,16 @@ merged commit:
 psql "$EDITOR_DB" -v ON_ERROR_STOP=1 -f db/gtfs_editor/0017_stop_headsign.sql   # and so on, in order
 ```
 
-- New in this PR: `0017`, `0018`, `0019`, `0023`. `0022` came with #217.
+- New in #219: `0017`, `0018`, `0019`, `0023`. `0022` came with #217, `0024`
+  (where a background import's report waits, section 18.15) with #220.
 - Every migration is safe to run twice, but apply only the missing ones: an
   early one such as `0008` backfills settings that may have been changed since.
 - `0023` is additive: new columns, 25 new tables, and CHECKs relaxed, never
   tightened. The image running now keeps working on it.
 - **`0012`, `0017` and `0023` must be in before the new image starts**: the
   loader selects their columns, and a DB feed that fails to load falls back to
-  its preprocessed data.
+  its preprocessed data. **`0024` too** before the image with #220, or the
+  dashboard's imports fail (GIMS itself serves without it).
 
 ## 2. Deploy the image
 
@@ -114,10 +117,8 @@ below).
 settings, or the New menu, **New feed from a GTFS zip**. Choose the zip,
 **Check without writing**, and when it says the feed gives the zip back with
 0 errors, **Make feed {id}**. The new feed then opens on its Feed page. One zip
-at a time; the largest here, delhi_metro, took 16 s locally (a debug build).
-If the page reports a timeout from the proxy instead, reload before trying
-again: the seed may have committed after the proxy gave up, and then the feed
-is in the switcher (a second try is refused as `feed_not_empty`, harmlessly).
+at a time; each runs in the background (section 18.15) and the page counts the
+seconds - the largest here, delhi_metro, took 16 s locally (a debug build).
 
 **Or from the command line**, in a pod or on any machine that reaches the
 database (`cargo build --release --bin gtfs_feed`). The URL carries no password;
@@ -178,7 +179,9 @@ routes and stop orders are compared, never written.
 ```
 
 `--as` is an active editor account: the drafts are theirs, and a second person
-approves them.
+approves them. The same runs on the dashboard, as the admin doing it:
+chennai_bus's Feed page, **Import a GTFS zip**, **Bring into drafts** (with
+#220 it runs in the background, past the proxies' 30 s).
 
 1. The dry run reports `"step": "records"`, `"errors": 0`, and `stop_orders`:
    `same` (stop orders the editor has as the zip does), `moved` (a route whose
