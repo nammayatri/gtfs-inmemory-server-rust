@@ -8,7 +8,9 @@
 //!   same transaction, compares it with the zip and audits `seed`;
 //! - a feed that has rows, or open drafts, is not seeded again;
 //! - `GET /feeds/{g}/gtfs.zip` gives the zip back, to anyone who may see the
-//!   feed; `POST /feeds/{g}/import` is an admin's.
+//!   feed; `POST /feeds/{g}/import` is an admin's;
+//! - `POST /feeds` makes a new feed from a zip, the one its feed_info.txt
+//!   names, once; an admin's too.
 //!
 //! Runs only when `EDITOR_TEST_DATABASE_URL` is set, and refuses any host that
 //! is not local. Uses its own feeds and accounts and removes their rows
@@ -32,6 +34,7 @@ const AUD: &str = "gtfs.editor-feed-io-test.local";
 const BASE: &str = "/internal/gtfs-editor";
 const FEED: &str = "editor_feed_io_test_feed";
 const HTTP_FEED: &str = "editor_feed_io_http_test_feed";
+const NEW_FEED: &str = "editor_feed_io_new_test_feed";
 const ADMIN: &str = "admin@editor-feed-io-test.invalid";
 const VIEWER: &str = "viewer@editor-feed-io-test.invalid";
 
@@ -421,6 +424,7 @@ async fn an_admin_imports_a_zip_and_a_viewer_downloads_it() {
         return;
     };
     clear_feed(&pool, HTTP_FEED).await;
+    clear_feed(&pool, NEW_FEED).await;
     for email in [ADMIN, VIEWER] {
         sqlx::query(
             "UPDATE gtfs_editor_user SET totp_enabled = false, totp_secret_enc = NULL, \
@@ -541,7 +545,75 @@ async fn an_admin_imports_a_zip_and_a_viewer_downloads_it() {
     let (s, b, _, _, _) = call!(&app, viewer.req("GET", "/feeds/kochi_metro/gtfs.zip"));
     assert_eq!((s, code_of(&b)), (403, "no_feed_access"), "{b}");
 
+    // ---- a new feed from its zip: the feed its feed_info.txt names
+    let new_zip = fixture(NEW_FEED);
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin.req("POST", "/feeds").set_payload(new_zip.clone())
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        (&b["gtfs_id"], &b["new_feed"], &b["dry_run"], &b["seeded"]),
+        (&json!(NEW_FEED), &json!(true), &json!(true), &json!(false)),
+        "{b}"
+    );
+    assert_eq!(b["errors"], 0, "{b}");
+    assert_eq!(b["round_trip"], json!({}), "{b}");
+    assert_eq!(count(&pool, "gtfs_feed", NEW_FEED).await, 0, "a dry run");
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", "/feeds?seed=true")
+            .set_payload(new_zip.clone())
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        (&b["seeded"], &b["new_feed"]),
+        (&json!(true), &json!(true)),
+        "{b}"
+    );
+    // it is among the feeds, named after its agency
+    let (s, b, _, _, _) = call!(&app, admin.req("GET", "/feeds"));
+    assert_eq!(s, 200, "{b}");
+    let made = b["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["gtfs_id"] == NEW_FEED)
+        .cloned();
+    assert_eq!(
+        made.map(|f| f["display_name"].clone()),
+        Some(json!("Metro")),
+        "{b}"
+    );
+    // made once: now it has rows
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", "/feeds?seed=true")
+            .set_payload(new_zip.clone())
+    );
+    assert_eq!((s, code_of(&b)), (409, "feed_not_empty"), "{b}");
+    // a zip that names no feed needs its id, and the id must be one a URL carries
+    let bare = gtfs_fixture::zip_of(&[(
+        "stops.txt",
+        "stop_id,stop_name,stop_lat,stop_lon\nS1,A,13.0,80.0\n",
+    )]);
+    let (s, b, _, _, _) = call!(&app, admin.req("POST", "/feeds").set_payload(bare.clone()));
+    assert_eq!((s, code_of(&b)), (400, "gtfs_id_required"), "{b}");
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", "/feeds?gtfs_id=two%20words")
+            .set_payload(bare)
+    );
+    assert_eq!((s, code_of(&b)), (400, "invalid_gtfs_id"), "{b}");
+    // and it is an admin's
+    let (s, b, _, _, _) = call!(&app, viewer.req("POST", "/feeds").set_payload(new_zip));
+    assert_eq!(s, 403, "{b}");
+
     // (the zip that named another feed wrote nothing to FEED, which the seed
     // test above works on at the same time)
     clear_feed(&pool, HTTP_FEED).await;
+    clear_feed(&pool, NEW_FEED).await;
 }

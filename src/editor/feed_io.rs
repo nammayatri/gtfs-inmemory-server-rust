@@ -1089,6 +1089,8 @@ pub struct Importer {
 #[derive(Debug, serde::Serialize)]
 pub struct ImportReport {
     pub gtfs_id: String,
+    /// No feed of that id existed: seeding it makes a new feed.
+    pub new_feed: bool,
     pub dry_run: bool,
     pub zip_sha256: String,
     pub counts: BTreeMap<String, usize>,
@@ -1111,6 +1113,26 @@ pub fn feed_id_of(raw: &crate::gtfs::read::RawFeed) -> Option<String> {
     let t = raw.table("feed_info.txt")?;
     let row = t.rows.first()?;
     Some(t.cell(row, "feed_id").trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// A gtfs_id GIMS, nandi and a URL path all carry as it is: 1 to 64 letters,
+/// digits, `_` or `-`, starting with a letter or a digit (`chennai_bus`,
+/// `mumbai_MMRCL_metro`). Checked before a feed is made from a zip.
+pub fn check_gtfs_id(g: &str) -> EditorResult<()> {
+    let ok = (1..=64).contains(&g.len())
+        && g.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && g.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(EditorError::bad_request(
+            "invalid_gtfs_id",
+            format!(
+                "{g:?} is not a feed id: 1 to 64 letters, digits, _ or -, starting with a letter or a digit"
+            ),
+        ))
+    }
 }
 
 /// Read a feed's zip and seed feed `gtfs_id` (or the feed_id the zip names)
@@ -1137,10 +1159,17 @@ pub async fn import_zip(
             ))
         }
     };
+    check_gtfs_id(&g)?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM gtfs_feed WHERE gtfs_id = $1)")
+            .bind(&g)
+            .fetch_one(pool)
+            .await?;
     let (m, more) = model::FeedModel::from_raw(&raw, &g, model::BuildOptions::default());
     findings.extend(more);
     let mut report = ImportReport {
         gtfs_id: g.clone(),
+        new_feed: !exists,
         dry_run,
         zip_sha256: super::crypto::sha256_hex(bytes),
         counts: m.counts(),
@@ -1201,4 +1230,37 @@ pub async fn import_zip(
     report.seeded = true;
     report.feed_version = Some(seeded.feed_version);
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_gtfs_id;
+
+    #[test]
+    fn a_feed_id_is_what_gims_and_a_url_carry_as_it_is() {
+        for ok in [
+            "chennai_bus",
+            "mumbai_MMRCL_metro",
+            "delhi_bus_nammayatri_application_mock",
+            "amsterdam",
+            "7-city",
+        ] {
+            assert!(check_gtfs_id(ok).is_ok(), "{ok}");
+        }
+        let long = "a".repeat(65);
+        for bad in [
+            "",
+            "_x",
+            "-x",
+            "a b",
+            "a/b",
+            "a.b",
+            "IYP|0420",
+            "ü",
+            long.as_str(),
+        ] {
+            let e = check_gtfs_id(bad).unwrap_err();
+            assert_eq!(e.code, "invalid_gtfs_id", "{bad}");
+        }
+    }
 }

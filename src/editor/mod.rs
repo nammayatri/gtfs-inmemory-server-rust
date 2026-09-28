@@ -238,7 +238,13 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route("/auth/session", web::delete().to(h::session_delete))
             // live data
             .route("/gtfs-spec", web::get().to(h::gtfs_spec))
-            .route("/feeds", web::get().to(h::feeds))
+            // POST: a new feed from its zip, the body - up to 64 MB, as an import
+            .service(
+                web::resource("/feeds")
+                    .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+                    .route(web::get().to(h::feeds))
+                    .route(web::post().to(h::feed_create)),
+            )
             .route("/feeds/{gtfs_id}/gtfs.zip", web::get().to(h::feed_gtfs_zip))
             .route("/feeds/{gtfs_id}/files", web::get().to(h::files))
             .route(

@@ -109,6 +109,7 @@ async fn import(args: &[String]) -> ExitCode {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "gtfs_id": report.gtfs_id,
+                    "new_feed": report.new_feed,
                     "dry_run": report.dry_run,
                     "seeded": report.seeded,
                     "feed_version": report.feed_version,

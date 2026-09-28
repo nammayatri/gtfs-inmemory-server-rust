@@ -194,7 +194,9 @@ export async function showFeedSettings() {
   };
 
   clear(page(), h("div.page-inner",
-    h("div.title-block", h("h1", "Feed settings"), h("p.hint", "Which feeds GIMS serves from the live editor tables instead of the nightly preprocessed build.")),
+    h("div.page-head",
+      h("div.title-block", h("h1", "Feed settings"), h("p.hint", "Which feeds GIMS serves from the live editor tables instead of the nightly preprocessed build.")),
+      h("a.btn.small", { href: "#/new-feed", id: "new-feed-link" }, "New feed from a GTFS zip")),
     h("p.notice", "Switching a feed adds a change to your current draft. It takes effect only after the draft is submitted, approved by someone else and committed - like every other edit."),
     tableBox,
   ));

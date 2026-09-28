@@ -46,6 +46,9 @@
 //               preview of the feed's own shipped zip (nothing to do on a feed
 //               as seeded; the flows below tag what they write, so they can
 //               run again)
+//   newfeed     a new feed from a GTFS zip (nandi's mumbai_MMRCL, renamed per
+//               run): the New menu offers it only to an admin, who checks it
+//               from Feed settings, makes it, and lands on its Feed page
 //   files       a new level and a pathway's sign, from the GTFS files page
 //   gtfs_fields a stop's zone and step-free boarding, a route's web page
 //   trips       four late departures added as a run, and a slower timing
@@ -1230,6 +1233,64 @@ async function feedFlow() {
   }
 }
 
+// A copy of the zip at `src` whose feed_info.txt names `feedId`: a shipped
+// feed, as one the database does not have yet.
+function renamedZip(src, feedId) {
+  const py = [
+    "import csv, io, sys, zipfile",
+    "src, fid = sys.argv[1], sys.argv[2]",
+    "out = io.BytesIO()",
+    "with zipfile.ZipFile(src) as z, zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as w:",
+    "    for n in z.namelist():",
+    "        b = z.read(n)",
+    "        if n.rsplit('/', 1)[-1] == 'feed_info.txt':",
+    "            rows = list(csv.reader(io.StringIO(b.decode('utf-8-sig'))))",
+    "            i = rows[0].index('feed_id')",
+    "            for r in rows[1:]: r[i] = fid",
+    "            s = io.StringIO(); csv.writer(s, lineterminator='\\n').writerows(rows); b = s.getvalue().encode()",
+    "        w.writestr(n, b)",
+    "sys.stdout.buffer.write(out.getvalue())",
+  ].join("\n");
+  const r = spawnSync("python3", ["-c", py, src, feedId], { maxBuffer: 64e6 });
+  if (r.error || r.status !== 0) throw new Error(`python3: ${r.error ? r.error.message : r.stderr}`);
+  return r.stdout;
+}
+
+async function newFeedFlow() {
+  const made = `e2e_new_feed_${TAG.toLowerCase()}`;
+  const src = join(NANDI_ASSETS, "mumbai_MMRCL.metro.gtfs.zip");
+  let bytes;
+  try { bytes = renamedZip(src, made); } catch (e) { console.log(`     (no ${src}: ${e.message}; skipped)`); return; }
+  const newFeedLink = `document.querySelector('a[href="#/new-feed"][data-admin-only]')`;
+  // an editor is told a feed is an admin's to make
+  await freshStart(EDITOR);
+  check(await evaluate(`${newFeedLink}.hidden`), "the New menu offers a new feed only to an admin");
+  await go("#/new-feed");
+  await must(waitFor(`document.body.innerText.includes("Only an admin makes a feed")`, "the new feed page, for an editor"));
+  // the admin, from Feed settings
+  await freshStart(ADMIN);
+  check(!(await evaluate(`${newFeedLink}.hidden`)), "the New menu offers the admin a new feed");
+  await go("#/feed-settings");
+  await must(waitFor(`!!document.getElementById("new-feed-link")`, "New feed on Feed settings"));
+  await clickSel("#new-feed-link", "New feed from a GTFS zip");
+  await must(waitFor(`!!document.getElementById("new-feed-zip")`, "the new feed page"));
+  await evaluate(`(() => { const b = Uint8Array.from(atob(${JSON.stringify(bytes.toString("base64"))}), (c) => c.charCodeAt(0));
+    const input = document.getElementById("new-feed-zip"); const dt = new DataTransfer();
+    dt.items.add(new File([b], "new.gtfs.zip", { type: "application/zip" }));
+    input.files = dt.files; input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  await sleep(800);
+  await clickSel("#new-feed-check", "Check without writing");
+  await must(waitFor(`!!document.getElementById("new-feed-create")`, `the check of ${made}`, 60000));
+  check((await text("#page")).includes(`This makes a new feed, ${made}.`), "the check names the new feed");
+  check(db(`SELECT count(*) FROM gtfs_feed WHERE gtfs_id = ${sqlText(made)}`)[0][0] === "0", "the check writes nothing");
+  await shot("35-new-feed-check");
+  await clickSel("#new-feed-create", `Make feed ${made}`);
+  await must(waitFor(`location.hash === "#/feed" && document.getElementById("feed-select").value === ${JSON.stringify(made)} && !!document.getElementById("check-feed")`, "the new feed's page, chosen in the top bar", 60000));
+  const trips = Number(db(`SELECT count(*) FROM gtfs_trip WHERE gtfs_id = ${sqlText(made)}`)[0][0]);
+  check(trips > 0, `${made} is in the tables (${trips} trips) and open on its Feed page`);
+  await shot("36-new-feed-made");
+}
+
 async function filesFlow() {
   await freshStart(EDITOR);
   await go("#/files");
@@ -1375,6 +1436,7 @@ try {
   await flow("coordinates", coordinatesFlow);
   await flow("history", historyFlow);
   await flow("feed", feedFlow);
+  await flow("newfeed", newFeedFlow);
   await flow("files", filesFlow);
   await flow("gtfs_fields", gtfsFieldsFlow);
   await flow("trips", tripsFlow);

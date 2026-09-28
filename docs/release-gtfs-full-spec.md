@@ -1,6 +1,7 @@
 # Release: the whole GTFS reference in the editor, and every feed in the tables
 
-PR #219 (`feat/gtfs-full-spec`). The design and the reasons are
+PR #219 (`feat/gtfs-full-spec`), and the dashboard's **New feed from a GTFS
+zip** that followed it (section 18.14). The design and the reasons are
 `docs/gtfs-editor.md` sections 15, 16 and 18; this is what to do, in order, to
 ship it to master and then prod, and to move the feeds into the editor's
 tables.
@@ -14,7 +15,8 @@ tables.
   feed's trips from the tables once its `trips_source` is `db`.
 - **The whole GTFS reference (section 18).** Every file and field of the GTFS
   Schedule reference, GTFS-Flex included, stored, edited through drafts and
-  exported; a feed loaded from its zip (`gtfs_feed import --seed`), a feed that
+  exported; a feed loaded from its zip (the dashboard's **New feed from a GTFS
+  zip**, or `gtfs_feed import --seed`), a feed that
   has rows brought up to a zip through drafts (`gtfs_feed draft-import`), the
   feed report (`GET /feeds/{g}/validation`), and the dashboard's Feed data menu
   (Feed, GTFS files, Calendar) and Trips and timing page.
@@ -22,14 +24,16 @@ tables.
 
 ## Read this first
 
-1. **Master and prod share one editor database.** A migration, a seed or a
-   feed setting applied once applies to both. Seeding a feed changes nothing
-   either serves; switching a feed's `data_source` or `trips_source` changes
-   what **both** serve within seconds.
-2. **Switch no feed to the tables until prod runs this image too.** Prod's
-   current loader does not know what a feed loaded from its zip needs (a route
-   named by its own agency, every stop served, split stop orders, the feed's own
-   stop numbering), so it would serve such a feed wrongly.
+1. **Master and prod each have their own editor database** (master's is
+   `mtc_internal_master`). Steps 1 to 6 are done once per environment: all of
+   them on master first, then on prod. Nothing done on master's database
+   changes what prod serves. Seeding a feed changes nothing the environment
+   serves; switching a feed's `data_source` or `trips_source` changes what that
+   environment serves within seconds.
+2. **Switch a feed to the tables only where this image runs.** The loader
+   before it does not know what a feed loaded from its zip needs (a route named
+   by its own agency, every stop served, split stop orders, the feed's own stop
+   numbering), so it would serve such a feed wrongly.
 3. **Feed access narrows who can edit.** `0018` gives every non-admin a grant on
    `chennai_bus` at the role they hold today, and nothing else. After the
    release an admin grants the other feeds on the People page.
@@ -42,9 +46,10 @@ tables.
    feeds reaches GIMS but not Nandi** until its release is switched the same
    way. Decide per feed whether that is acceptable before people edit it.
 
-## 1. Migrations - the shared editor database, before any image
+## 1. Migrations - the environment's editor database, before its image
 
-Find what the database already has (read-only):
+Find what the database already has with this read-only migration check; it
+prints `t` for each migration that is in and `f` for each that is not:
 
 ```sql
 SELECT m.migration, m.applied FROM (VALUES
@@ -81,15 +86,19 @@ psql "$EDITOR_DB" -v ON_ERROR_STOP=1 -f db/gtfs_editor/0017_stop_headsign.sql   
 
 ## 2. Deploy the image
 
-1. **Master.** Its dhall needs `is_master = True` (from #217); the editor
-   settings are unchanged. Check:
+1. **Master.** Its dhall needs `is_master = True` (from #217), so its Release
+   to Nandi goes to master Nandi; the editor settings are unchanged. Apply that
+   config map before the service release. Check:
    - the pods report ready, and `/routes/chennai_bus` and a few other feeds answer as before;
    - the dashboard opens; the top bar has **Feed data** (Feed, GTFS files, Calendar);
    - `chennai_bus`'s Feed page: "Check the feed" returns a report, and "Download the GTFS zip" gives a zip.
-2. **Prod.** The same image with `is_master = False`. Check the same.
+
+   Then steps 3 to 6 on master.
+2. **Prod.** Step 1 on prod's database, then the same image with `is_master`
+   `False` (or left out). Check the same, then steps 3 to 6 on prod.
 
 Going back: the previous image runs on the migrated database; do it before any
-feed has been switched to the tables (step 5), or switch those back first.
+feed has been switched to the tables (step 6), or switch those back first.
 
 ## 3. Grants
 
@@ -98,9 +107,20 @@ on each of them (approver for those who commit). Admins need none.
 
 ## 4. Load the feeds into the tables - nothing served changes
 
-From a master pod (the zips copied in with `kubectl cp` from `nandi/assets/` at
-the commit prod ships), or any machine that reaches the database with
-`cargo build --release --bin gtfs_feed`. The URL carries no password;
+The zips are the ones in `nandi/assets/` at the commit prod ships (the table
+below).
+
+**On the dashboard** (an admin; needs the image with section 18.14): Feed
+settings, or the New menu, **New feed from a GTFS zip**. Choose the zip,
+**Check without writing**, and when it says the feed gives the zip back with
+0 errors, **Make feed {id}**. The new feed then opens on its Feed page. One zip
+at a time; the largest here, delhi_metro, took 16 s locally (a debug build).
+If the page reports a timeout from the proxy instead, reload before trying
+again: the seed may have committed after the proxy gave up, and then the feed
+is in the switcher (a second try is refused as `feed_not_empty`, harmlessly).
+
+**Or from the command line**, in a pod or on any machine that reaches the
+database (`cargo build --release --bin gtfs_feed`). The URL carries no password;
 `gtfs_feed` reads it from `PGPASSWORD`.
 
 ```bash
@@ -180,15 +200,15 @@ The trips sit in the tables unused while `trips_source` is `preprocessed`. Each
 commit moves the feed's version, so nandi's release (`--if-changed`) builds
 chennai_bus again - with its generator, as today.
 
-## 6. Switch the feeds to the tables - one at a time, after prod runs the image
+## 6. Switch the feeds to the tables - one at a time, where the image runs
 
 For each feed, as an admin, with the feed chosen in the top bar, on **Feed
 settings** (the admin menu):
 
 1. In the feed's row, **Add to draft: switch to database (live edits)**
-   (`data_source = db`). A second person approves and commits the draft. Both
-   master and prod reload the feed within `gtfs_version_poll_seconds`.
-2. Check the feed on master and prod: `/routes/{g}`, `/stops/{g}`, a few
+   (`data_source = db`). A second person approves and commits the draft. The
+   environment's GIMS reloads the feed within `gtfs_version_poll_seconds`.
+2. Check the feed: `/routes/{g}`, `/stops/{g}`, a few
    `/route/{g}/{r}` and `/route-stop-mapping/{g}/route/{r}`. Locally, parity
    between the preprocessed load and the tables was identical for all 14 feeds
    except three things the tables serve and the preprocessed build leaves out:
@@ -218,10 +238,12 @@ build date as the generator does.
 
 ## Go / no-go
 
-- [ ] Every migration the probe listed as missing is applied; the probe now says `t` for all.
+Master first, then prod, each on its own database:
+
+- [ ] The migration check (step 1) says `t` for every row.
 - [ ] Master on the new image with `is_master = True`; prod on it with `False`.
 - [ ] Reviewers granted on the feeds they review.
-- [ ] Each feed seeded with a dry run that showed `"round_trip": {}`; its sha256 matches the table.
+- [ ] Each feed seeded after a check that gave the zip back with 0 errors; its sha256 matches the table.
 - [ ] chennai_bus set 1 and every trip set committed; `compare` as step 5.
-- [ ] Per feed switched: its checks passed on master and prod.
+- [ ] Per feed switched: its checks passed in that environment.
 - [ ] For chennai_bus `trips_source`: the nandi branch merged and `gtfs_feed` in nandi's image.
