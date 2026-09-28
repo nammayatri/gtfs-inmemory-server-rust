@@ -19,7 +19,7 @@ import { showImport } from "./importer.js";
 import { showFiles, showFile, showRecord } from "./files.js";
 import { showTrips } from "./trips.js";
 import { showCalendar } from "./calendar.js";
-import { showFeed } from "./feed.js";
+import { showFeed, showNewFeed } from "./feed.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
 
@@ -59,10 +59,11 @@ function renderAccess() {
   for (const sel of [".feed-picker", ".search", ".nav"]) document.querySelector(sel).hidden = noFeed;
   document.querySelector('[data-nav="admin"]').hidden = !isAdmin();
   document.querySelector('[data-nav="feed-settings"]').hidden = !isAdmin();
+  document.querySelectorAll("[data-admin-only]").forEach((el) => { el.hidden = !isAdmin(); });
   document.getElementById("new-menu").hidden = noFeed || !can("editor");
 }
 
-async function switchFeed(feedId) {
+async function switchFeed(feedId, hash = "#/") {
   setPref("feed", feedId);
   set({ feedId });
   renderAccess();
@@ -72,7 +73,7 @@ async function switchFeed(feedId) {
   refreshCoordinateCount();
   setLeaveGuard(null);
   resetTrail();
-  location.hash = "#/";
+  location.hash = hash;
   route();
 }
 
@@ -195,10 +196,16 @@ function route() {
   // what could be undone belonged to the screen being left
   resetUndo();
   arrive(currentHash);
+  // a new feed needs none chosen: an admin makes the first one here
+  if (/^#\/new-feed\/?$/.test(currentHash)) {
+    markNav("feed-settings"); showWorkspace(false); showNewFeed();
+    return;
+  }
   if (!state.feedId) {
     showWorkspace(false);
     document.getElementById("page").replaceChildren(isAdmin()
-      ? h("div.page-inner", h("h1", "No feeds"), h("p.notice", "The editor has no feeds to show. Ask an engineer to load one."))
+      ? h("div.page-inner", h("h1", "No feeds"), h("p.notice", "The editor has no feeds yet. Make the first one from its GTFS zip."),
+        h("div.btn-row", h("a.btn", { href: "#/new-feed" }, "New feed from a GTFS zip")))
       : h("div.page-inner#no-feeds", h("h1", "You have no feeds yet — ask an admin"),
         h("p.notice", "You are signed in, but nobody has given you a feed to work on yet. Ask a GTFS editor admin to add you to the feeds you need, then reload this page.")));
     return;
@@ -299,6 +306,21 @@ window.addEventListener("access:changed", async () => {
   } finally {
     refreshingAccess = false;
   }
+});
+
+// A feed made from its zip (feed.js): the switcher offers it, and it opens on
+// its Feed page.
+window.addEventListener("feeds:changed", async (ev) => {
+  const made = ev.detail?.select;
+  // chosen first, so the rebuilt switcher shows it
+  if (made) set({ feedId: made });
+  try {
+    applyMe(await get("auth/me"));
+  } catch {
+    return; /* the call has said what went wrong */
+  }
+  if (made && state.feedId === made) await switchFeed(made, "#/feed");
+  else route();
 });
 
 boot();

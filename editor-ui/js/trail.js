@@ -36,6 +36,7 @@ const ROOTS = [
   [/^#\/?$/, "Map"], [/^#\/coordinates$/, "Coordinates to review"], [/^#\/stations$/, "Stations to review"],
   [/^#\/drafts$/, "Drafts"], [/^#\/audit$/, "History"], [/^#\/admin$/, "People"], [/^#\/feed-settings$/, "Feed settings"],
   [/^#\/import$/, "Import"], [/^#\/files$/, "GTFS files"], [/^#\/calendar$/, "Calendar"], [/^#\/feed$/, "Feed"],
+  [/^#\/new-feed$/, "New feed"],
 ];
 const rootLabel = (href) => (ROOTS.find(([re]) => re.test(place(href))) || [])[1] || null;
 

@@ -519,11 +519,7 @@ pub async fn feed_import(
 ) -> EditorResult<HttpResponse> {
     let g = path.into_inner();
     let ctx = auth::require_admin(&req, &st).await?;
-    let who = feed_io::Importer {
-        user_id: Some(ctx.user.user_id),
-        email: Some(ctx.user.email.clone()),
-        label: ctx.user.email.clone(),
-    };
+    let who = importer(&ctx);
     match q.mode.as_deref() {
         None | Some("seed") => {}
         Some("drafts") => {
@@ -549,6 +545,43 @@ pub async fn feed_import(
     }
     let dry_run = !q.seed.unwrap_or(false);
     let report = feed_io::import_zip(&st.pool, &body, Some(&g), dry_run, &who).await?;
+    ok(json!(report))
+}
+
+fn importer(ctx: &auth::Ctx) -> feed_io::Importer {
+    feed_io::Importer {
+        user_id: Some(ctx.user.user_id),
+        email: Some(ctx.user.email.clone()),
+        label: ctx.user.email.clone(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct FeedCreateQuery {
+    /// For a zip whose feed_info.txt names no feed_id.
+    pub gtfs_id: Option<String>,
+    /// `true` makes the feed; anything else is a dry run.
+    pub seed: Option<bool>,
+}
+
+/// A new feed from its GTFS zip, the request's body (section 18.14): the feed
+/// the zip's feed_info.txt names (`gtfs_id` for one that names none), made and
+/// seeded as `POST /feeds/{g}/import` seeds. Admin only; a feed that already
+/// has rows is refused, as the seed refuses it.
+pub async fn feed_create(
+    req: HttpRequest,
+    st: Data,
+    q: web::Query<FeedCreateQuery>,
+    body: web::Bytes,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_admin(&req, &st).await?;
+    let g = q
+        .gtfs_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty());
+    let dry_run = !q.seed.unwrap_or(false);
+    let report = feed_io::import_zip(&st.pool, &body, g, dry_run, &importer(&ctx)).await?;
     ok(json!(report))
 }
 

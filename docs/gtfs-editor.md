@@ -3442,7 +3442,8 @@ feeds - CUMTA publishes Chennai's bus and metro).
 
 `gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]` (a dry run without
 `--seed`), or `POST /feeds/{g}/import?seed=true` with the zip as the body (admin,
-64 MB). The report carries the feed report of the zip (18.9).
+64 MB), or `POST /feeds` for a feed the editor does not have yet (18.14). The
+report carries the feed report of the zip (18.9).
 
 ### 18.5 Every record file through drafts (`src/editor/records.rs`)
 
@@ -3688,3 +3689,31 @@ bulk, reads); `tests/editor_full_spec_flow.rs` (18.6, the details, the feed
 report); `tests/editor_draft_import_flow.rs` (both steps, splits, moved and left
 routes, a second run that does nothing, the endpoint) - all registered in
 `scripts/editor_flow_test.sh`.
+
+### 18.14 A new feed from its zip (2026-09-28)
+
+The Feed page's import (18.10) works on the feed chosen in the top bar, so it
+could not make a feed the editor does not have yet: a zip of another feed is a
+`feed_id_mismatch`, and the chosen feed has rows anyway (`feed_not_empty`).
+`POST /feeds` (admin, the zip as the body, 64 MB) is the seed of 18.4 for the
+feed the zip's feed_info.txt names, or `?gtfs_id=` for a zip that names none;
+`?seed=true` writes, anything else is a dry run. It makes the `gtfs_feed` row
+(`data_source` and `trips_source` `preprocessed`, so nothing served changes),
+or loads a feed whose row exists but holds nothing; a feed with rows is refused
+as the seed refuses it. The report says `new_feed`: whether a feed of that id
+existed before.
+
+A feed id is 1 to 64 letters, digits, `_` or `-`, starting with a letter or a
+digit (`invalid_gtfs_id`, checked by every seed): what GIMS, nandi and a URL
+path carry as it is.
+
+Dashboard: **New feed from a GTFS zip** (`#/new-feed`) - from the New menu (admin
+only), Feed settings, and the page an admin sees while the editor has no feeds,
+since it needs no feed chosen. Check without writing, then **Make feed {id}**;
+the switcher then offers the feed and opens it on its Feed page.
+
+Tests: `tests/editor_feed_io_flow.rs` (a dry run writes nothing, the seed makes
+the feed and lists it named after its agency, a second one is refused, a zip
+that names no feed, a bad id, a viewer); `editor-ui/dev/ui_e2e.mjs --only newfeed`
+(nandi's mumbai_MMRCL zip renamed per run, through the page to the new feed's
+Feed page).

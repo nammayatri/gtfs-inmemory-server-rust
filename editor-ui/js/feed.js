@@ -1,11 +1,12 @@
 // The feed as a whole (docs section 18): what it serves from, its GTFS zip as
 // the tables give it, the feed report (what it breaks of the GTFS reference),
 // and - for an admin - bringing a GTFS zip in: a seed for a feed with no rows,
-// or change sets for one that has them, always checked first without writing.
+// or change sets for one that has them, always checked first without writing;
+// and a new feed made from its zip.
 import { get, postBytes, enc } from "./api.js";
 import { API_BASE } from "./config.js";
 import { state, isAdmin } from "./state.js";
-import { h, clear, fmtCount, plural, errorText } from "./util.js";
+import { h, clear, fmtCount, plural, errorText, toast } from "./util.js";
 import { nameHere } from "./trail.js";
 
 const page = () => document.getElementById("page");
@@ -109,7 +110,8 @@ function importForm(box) {
     }
   };
   clear(box,
-    h("p.hint", "Only an admin imports. Nothing is written until you have seen what the import would do."),
+    h("p.hint", "Only an admin imports. Nothing is written until you have seen what the import would do. This imports into ",
+      h("strong", state.feedId), "; a zip of another feed goes in as ", h("a", { href: "#/new-feed" }, "a new feed"), "."),
     h("label.field", { for: "import-zip" }, h("span", "GTFS zip"), file),
     h("div.radio-cards", { role: "radiogroup", "aria-label": "How" },
       mode("seed", "Load an empty feed", "For a feed with no rows yet: the whole zip in one go, checked by exporting it again.", true),
@@ -117,6 +119,64 @@ function importForm(box) {
     h("label.field", { for: "import-files" }, h("span", "Only these files (drafts)"), files),
     h("div.btn-row", h("button.btn.secondary", { type: "button", id: "import-check", on: { click: () => run(false) } }, "Check without writing")),
     out);
+}
+
+// A new feed from its GTFS zip (docs section 18.14): the feed the zip's
+// feed_info.txt names, checked without writing, then made and loaded in one
+// go. An admin's, like every import; it needs no feed chosen, so an admin can
+// make the first one.
+export function showNewFeed() {
+  nameHere("New feed");
+  if (!isAdmin()) {
+    return clear(page(), h("div.page-inner", h("h1", "New feed from a GTFS zip"),
+      h("p.notice", "Only an admin makes a feed. Ask an admin if a feed you need is missing.")));
+  }
+  const file = h("input", { type: "file", id: "new-feed-zip", accept: ".zip,application/zip" });
+  const id = h("input", { type: "text", id: "new-feed-id", autocomplete: "off", spellcheck: false, placeholder: "from the zip's feed_info.txt" });
+  const out = h("div", { "aria-live": "polite" });
+  let bytes = null, name = null;
+  file.addEventListener("change", async () => {
+    const f = file.files && file.files[0];
+    bytes = f ? await f.arrayBuffer() : null;
+    name = f ? f.name : null;
+    clear(out);
+  });
+  id.addEventListener("input", () => clear(out));
+  const run = async (write) => {
+    if (!bytes) return clear(out, h("p.notice.error", "Choose a GTFS zip first."));
+    const qs = new URLSearchParams();
+    if (id.value.trim()) qs.set("gtfs_id", id.value.trim());
+    if (write) qs.set("seed", "true");
+    clear(out, h("p.empty", write ? "Loading the feed…" : `Checking ${name} without writing anything…`));
+    try {
+      const res = await postBytes(`feeds?${qs}`, bytes);
+      if (res.seeded) {
+        toast(`Feed ${res.gtfs_id} is loaded.`);
+        // main.js offers it in the switcher and opens it
+        window.dispatchEvent(new CustomEvent("feeds:changed", { detail: { select: res.gtfs_id } }));
+        return;
+      }
+      const verb = res.new_feed ? "Make" : "Load";
+      clear(out,
+        h("p", h("strong", res.new_feed
+          ? `This makes a new feed, ${res.gtfs_id}.`
+          : `Feed ${res.gtfs_id} exists but has no rows yet: this loads it.`)),
+        seedReport(res),
+        !write && canWrite("seed", res)
+          ? h("div.btn-row", h("button.btn", { type: "button", id: "new-feed-create", on: { click: () => run(true) } }, `${verb} feed ${res.gtfs_id}`))
+          : null);
+    } catch (e) {
+      clear(out, h("p.notice.error", errorText(e)));
+    }
+  };
+  clear(page(), h("div.page-inner.feed",
+    h("div.title-block", h("h1", "New feed from a GTFS zip"),
+      h("p.hint", "The whole feed from its zip: stops, stations, routes, trips, calendars and every other file. It is checked first without writing anything, and loaded only if exporting it again gives the zip back.")),
+    h("p.notice", "GIMS serves the new feed from these tables only once it is switched to the database on Feed settings. After it is loaded it changes through drafts, like any other feed."),
+    h("label.field", { for: "new-feed-zip" }, h("span", "GTFS zip"), file),
+    h("label.field", { for: "new-feed-id" }, h("span", "Feed id - only for a zip whose feed_info.txt names none"), id),
+    h("div.btn-row", h("button.btn.secondary", { type: "button", id: "new-feed-check", on: { click: () => run(false) } }, "Check without writing")),
+    out));
 }
 
 const canWrite = (how, res) => (how === "drafts" ? res.errors === 0 && res.change_sets.length > 0 : res.errors === 0 && !Object.keys(res.round_trip || {}).length);
