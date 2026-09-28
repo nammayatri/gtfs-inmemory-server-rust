@@ -74,13 +74,8 @@ pub async fn run_repeater_reconciler_tick(
     lookahead_days: i64,
     tick_interval_secs: u64,
     min_run_interval_secs: i64,
+    stuck_lock_timeout_secs: i64,
 ) {
-    // Reserved lock key -- advisory lock keys are a single global namespace per DB, so a new
-    // lock added elsewhere must pick a different value. Not config: nothing should ever have a
-    // legitimate reason to want a different value here.
-    const RECONCILER_LOCK_KEY: i64 = 891_234_567_890_123;
-    let min_run_interval = chrono::Duration::seconds(min_run_interval_secs);
-
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
     interval.tick().await; // discard the immediate first tick, matching the OSRTC cache pattern
     loop {
@@ -88,62 +83,40 @@ pub async fn run_repeater_reconciler_tick(
         if REPEATER_AUTOMATION_ENABLED_GTFS_IDS.is_empty() {
             continue;
         }
-        // Transaction-scoped lock (pg_advisory_xact_lock), not session-scoped: a session-scoped
-        // lock only releases when its connection actually closes, but if this task panics while
-        // the pod itself keeps running, the connection just gets Drop-returned to the pool still
-        // open -- the lock would stay held, stuck on some now-unrelated future borrower of that
-        // connection, until the pool eventually recycles it (db_max_lifetime). A transaction
-        // releases its xact lock the instant the transaction ends, and sqlx::Transaction's Drop
-        // sends an implicit ROLLBACK if it's dropped without an explicit commit -- including
-        // during a panic-unwind -- so a panic anywhere in this tick releases the lock almost
-        // immediately instead of leaving it stuck for up to an hour.
         let Some(pool) = operator_service.pool() else {
             continue; // mock/no-DB mode: nothing to reconcile
         };
-        let mut txn = match pool.begin().await {
-            Ok(t) => t,
-            Err(e) => {
-                error!(
-                    "repeater reconciler: could not open a transaction for the lock: {}",
-                    e
-                );
-                continue;
-            }
-        };
-        let acquired: bool = match sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-            .bind(RECONCILER_LOCK_KEY)
-            .fetch_one(&mut *txn)
-            .await
+
+        // Lease claim: a single auto-committed UPDATE, not a held transaction or advisory lock.
+        // The WHERE clause is a compare-and-swap enforced by Postgres's own row lock on this
+        // single-row table -- two pods racing here can't both match, so this alone is the entire
+        // mutual-exclusion mechanism. It succeeds only when a run is actually due (last_run_at
+        // unset or stale) AND nobody else currently holds a live claim (never claimed, the last
+        // claim already finished, or the last claim is old enough to count as abandoned --
+        // a crashed pod or panicked task that never got to write last_run_at).
+        let claimed_at: Option<DateTime<Utc>> = match sqlx::query_scalar(
+            "UPDATE public.repeater_reconciler_state
+             SET lock_acquired_at = now()
+             WHERE (last_run_at IS NULL OR now() - last_run_at >= $1 * INTERVAL '1 second')
+               AND (lock_acquired_at IS NULL
+                    OR last_run_at > lock_acquired_at
+                    OR now() - lock_acquired_at > $2 * INTERVAL '1 second')
+             RETURNING lock_acquired_at",
+        )
+        .bind(min_run_interval_secs)
+        .bind(stuck_lock_timeout_secs)
+        .fetch_optional(pool)
+        .await
         {
             Ok(v) => v,
             Err(e) => {
-                error!("repeater reconciler: advisory lock check failed: {}", e);
-                continue; // txn drops here -> implicit rollback; the lock was never acquired
+                error!("repeater reconciler: could not claim the lease: {}", e);
+                continue;
             }
         };
-        if !acquired {
-            continue; // another replica already holds the lock for this tick; txn rolls back, harmless
-        }
-
-        // Checked (and later updated) inside the same transaction as the lock, so a panic before
-        // reaching the commit below rolls back the timestamp write too -- a tick that crashed
-        // partway through never gets to fool the next tick into thinking it's already been run.
-        let last_run_at: Option<DateTime<Utc>> =
-            match sqlx::query_scalar("SELECT last_run_at FROM public.repeater_reconciler_state")
-                .fetch_optional(&mut *txn)
-                .await
-            {
-                Ok(v) => v.flatten(),
-                Err(e) => {
-                    error!("repeater reconciler: could not read last_run_at: {}", e);
-                    continue;
-                }
-            };
-        if let Some(last_run_at) = last_run_at {
-            if Utc::now() - last_run_at < min_run_interval {
-                continue; // not due yet -- some replica already ran this within the last hour
-            }
-        }
+        let Some(claimed_at) = claimed_at else {
+            continue; // not due yet, or another replica already holds a live claim
+        };
 
         let today = crate::services::service_hopper::today_ist();
         let to = today + chrono::Duration::days(lookahead_days);
@@ -170,17 +143,18 @@ pub async fn run_repeater_reconciler_tick(
             }
         }
 
-        if let Err(e) =
-            sqlx::query("UPDATE public.repeater_reconciler_state SET last_run_at = now()")
-                .execute(&mut *txn)
-                .await
+        // Fenced on the exact claim made above: if this run's lease expired and got reclaimed by
+        // another replica while this one was still (slowly) working, lock_acquired_at no longer
+        // equals `claimed_at` and this matches zero rows -- it can't stomp on the new claimant.
+        if let Err(e) = sqlx::query(
+            "UPDATE public.repeater_reconciler_state SET last_run_at = now()
+             WHERE lock_acquired_at = $1",
+        )
+        .bind(claimed_at)
+        .execute(pool)
+        .await
         {
             error!("repeater reconciler: could not record last_run_at: {}", e);
-        }
-
-        // Releases the xact lock and durably commits last_run_at together, in one step.
-        if let Err(e) = txn.commit().await {
-            error!("repeater reconciler: could not commit: {}", e);
         }
     }
 }

@@ -127,6 +127,13 @@ pub struct AppConfig {
     /// replica's clock.
     #[serde(default = "default_repeater_min_run_interval_secs")]
     pub repeater_min_run_interval_secs: i64,
+    /// How long a claimed-but-unfinished reconciler run (repeater_reconciler_state.
+    /// lock_acquired_at) is treated as abandoned -- a crashed pod or panicked task -- and so
+    /// eligible for another replica to reclaim. Must comfortably exceed the worst-case real
+    /// generation duration (lookahead_days x enabled operators), or a still-healthy, just-slow
+    /// run risks getting its claim stolen mid-flight.
+    #[serde(default = "default_repeater_stuck_lock_timeout_secs")]
+    pub repeater_stuck_lock_timeout_secs: i64,
     /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
     /// existing dhall configs still parse; the editor stays off unless enabled.
     #[serde(default)]
@@ -266,6 +273,10 @@ fn default_repeater_tick_interval_secs() -> u64 {
 
 fn default_repeater_min_run_interval_secs() -> i64 {
     3600
+}
+
+fn default_repeater_stuck_lock_timeout_secs() -> i64 {
+    600
 }
 
 impl OtpConfig {

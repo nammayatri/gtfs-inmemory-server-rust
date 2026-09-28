@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let repeater_lookahead_days = app_config.repeater_lookahead_days;
     let repeater_tick_interval_secs = app_config.repeater_tick_interval_secs;
     let repeater_min_run_interval_secs = app_config.repeater_min_run_interval_secs;
+    let repeater_stuck_lock_timeout_secs = app_config.repeater_stuck_lock_timeout_secs;
     let editor_state = gtfs_routes_service::editor::EditorState::init(&app_config).await;
     let app_state = environment::AppState::new(app_config).await?;
 
@@ -81,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
             repeater_lookahead_days,
             repeater_tick_interval_secs,
             repeater_min_run_interval_secs,
+            repeater_stuck_lock_timeout_secs,
         )
         .await;
     });

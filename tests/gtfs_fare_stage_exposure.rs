@@ -229,6 +229,7 @@ fn app_config(dir: &Path) -> AppConfig {
         repeater_lookahead_days: 7,
         repeater_tick_interval_secs: 300,
         repeater_min_run_interval_secs: 3600,
+        repeater_stuck_lock_timeout_secs: 600,
         gtfs_editor_enabled: false,
         gtfs_editor_pomerium_jwks_url: None,
         gtfs_editor_audience: None,
