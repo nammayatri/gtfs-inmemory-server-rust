@@ -19,6 +19,7 @@ pub mod feed_io;
 pub mod feed_lock;
 pub mod gps_line;
 pub mod handlers;
+pub mod import_jobs;
 pub mod jwt;
 pub mod position_reviews;
 pub mod proposals;
@@ -262,6 +263,7 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                     .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
                     .route(web::post().to(h::feed_import)),
             )
+            .route("/import-jobs/{job_id}", web::get().to(h::import_job))
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))
             .route("/feeds/{gtfs_id}/stops/{stop_id}", web::get().to(h::stop))

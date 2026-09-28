@@ -8,6 +8,7 @@ use super::error::{EditorError, EditorResult};
 use super::feed_io;
 use super::feed_lock;
 use super::gps_line::{self, GpsFailure};
+use super::import_jobs;
 use super::position_reviews;
 use super::proposals;
 use super::records;
@@ -503,6 +504,8 @@ pub struct ImportQuery {
     pub dry_run: Option<bool>,
     /// mode `drafts`: the files it may write, comma separated.
     pub files: Option<String>,
+    /// `true`: answer at once with a job to poll (section 18.15).
+    pub background: Option<bool>,
 }
 
 /// Load a feed that has no rows yet from its GTFS zip, the request's body
@@ -519,7 +522,7 @@ pub async fn feed_import(
 ) -> EditorResult<HttpResponse> {
     let g = path.into_inner();
     let ctx = auth::require_admin(&req, &st).await?;
-    let who = importer(&ctx);
+    let background = q.background.unwrap_or(false);
     match q.mode.as_deref() {
         None | Some("seed") => {}
         Some("drafts") => {
@@ -532,9 +535,31 @@ pub async fn feed_import(
                 user_id: ctx.user.user_id,
                 email: ctx.user.email.clone(),
             };
-            let report =
-                super::draft_import::draft_import(&st.pool, &body, Some(&g), &opts).await?;
-            return ok(json!(report));
+            if !background {
+                let report =
+                    super::draft_import::draft_import(&st.pool, &body, Some(&g), &opts).await?;
+                return ok(json!(report));
+            }
+            let dry_run = opts.dry_run;
+            let job_g = g.clone();
+            let work: import_jobs::Work = Box::new(move |pool| {
+                Box::pin(async move {
+                    let report =
+                        super::draft_import::draft_import(&pool, &body, Some(&job_g), &opts)
+                            .await?;
+                    Ok(json!(report))
+                })
+            });
+            let job_id = import_jobs::start(
+                &st.pool,
+                Some(&g),
+                "drafts",
+                dry_run,
+                ctx.user.user_id,
+                work,
+            )
+            .await?;
+            return accepted(job_id);
         }
         Some(other) => {
             return Err(EditorError::bad_request(
@@ -544,8 +569,7 @@ pub async fn feed_import(
         }
     }
     let dry_run = !q.seed.unwrap_or(false);
-    let report = feed_io::import_zip(&st.pool, &body, Some(&g), dry_run, &who).await?;
-    ok(json!(report))
+    seed_import(&st, &ctx, body, Some(g), dry_run, background).await
 }
 
 fn importer(ctx: &auth::Ctx) -> feed_io::Importer {
@@ -556,12 +580,65 @@ fn importer(ctx: &auth::Ctx) -> feed_io::Importer {
     }
 }
 
+/// A seed of feed `g` (the feed the zip names when `None`): its report, or with
+/// `background` a job that will have it (section 18.15).
+async fn seed_import(
+    st: &Data,
+    ctx: &auth::Ctx,
+    body: web::Bytes,
+    g: Option<String>,
+    dry_run: bool,
+    background: bool,
+) -> EditorResult<HttpResponse> {
+    let who = importer(ctx);
+    if !background {
+        let report = feed_io::import_zip(&st.pool, &body, g.as_deref(), dry_run, &who).await?;
+        return ok(json!(report));
+    }
+    let job_g = g.clone();
+    let work: import_jobs::Work = Box::new(move |pool| {
+        Box::pin(async move {
+            let report = feed_io::import_zip(&pool, &body, job_g.as_deref(), dry_run, &who).await?;
+            Ok(json!(report))
+        })
+    });
+    let job_id = import_jobs::start(
+        &st.pool,
+        g.as_deref(),
+        "seed",
+        dry_run,
+        ctx.user.user_id,
+        work,
+    )
+    .await?;
+    accepted(job_id)
+}
+
+/// `202`: the import runs in the background as job `job_id`.
+fn accepted(job_id: Uuid) -> EditorResult<HttpResponse> {
+    Ok(HttpResponse::Accepted().json(json!({"job_id": job_id, "status": "running"})))
+}
+
+/// An import running in the background (section 18.15): whether it is still
+/// running, and its report once done or its error once failed. Admin only, as
+/// the imports are.
+pub async fn import_job(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<Uuid>,
+) -> EditorResult<HttpResponse> {
+    auth::require_admin(&req, &st).await?;
+    ok(import_jobs::get(&st.pool, path.into_inner()).await?)
+}
+
 #[derive(Deserialize)]
 pub struct FeedCreateQuery {
     /// For a zip whose feed_info.txt names no feed_id.
     pub gtfs_id: Option<String>,
     /// `true` makes the feed; anything else is a dry run.
     pub seed: Option<bool>,
+    /// `true`: answer at once with a job to poll (section 18.15).
+    pub background: Option<bool>,
 }
 
 /// A new feed from its GTFS zip, the request's body (section 18.14): the feed
@@ -579,10 +656,10 @@ pub async fn feed_create(
         .gtfs_id
         .as_deref()
         .map(str::trim)
-        .filter(|g| !g.is_empty());
+        .filter(|g| !g.is_empty())
+        .map(str::to_string);
     let dry_run = !q.seed.unwrap_or(false);
-    let report = feed_io::import_zip(&st.pool, &body, g, dry_run, &importer(&ctx)).await?;
-    ok(json!(report))
+    seed_import(&st, &ctx, body, g, dry_run, q.background.unwrap_or(false)).await
 }
 
 pub async fn feed_config(

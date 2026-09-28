@@ -1,6 +1,6 @@
 //! A feed's whole GTFS into the editor's tables and back out
 //! (docs/gtfs-editor.md section 18), end to end against a real Postgres
-//! holding the editor schema (db/gtfs_editor/0001..0023):
+//! holding the editor schema (db/gtfs_editor/0001..0024):
 //!
 //! - every record table is the file the spec says it is: a column per field,
 //!   of the field's type;
@@ -10,7 +10,9 @@
 //! - `GET /feeds/{g}/gtfs.zip` gives the zip back, to anyone who may see the
 //!   feed; `POST /feeds/{g}/import` is an admin's;
 //! - `POST /feeds` makes a new feed from a zip, the one its feed_info.txt
-//!   names, once; an admin's too.
+//!   names, once; an admin's too;
+//! - with `background=true` either import answers at once with a job, and
+//!   `GET /import-jobs/{id}` gives its report, or the error it failed with.
 //!
 //! Runs only when `EDITOR_TEST_DATABASE_URL` is set, and refuses any host that
 //! is not local. Uses its own feeds and accounts and removes their rows
@@ -35,6 +37,7 @@ const BASE: &str = "/internal/gtfs-editor";
 const FEED: &str = "editor_feed_io_test_feed";
 const HTTP_FEED: &str = "editor_feed_io_http_test_feed";
 const NEW_FEED: &str = "editor_feed_io_new_test_feed";
+const BG_FEED: &str = "editor_feed_io_background_test_feed";
 const ADMIN: &str = "admin@editor-feed-io-test.invalid";
 const VIEWER: &str = "viewer@editor-feed-io-test.invalid";
 
@@ -425,6 +428,7 @@ async fn an_admin_imports_a_zip_and_a_viewer_downloads_it() {
     };
     clear_feed(&pool, HTTP_FEED).await;
     clear_feed(&pool, NEW_FEED).await;
+    clear_feed(&pool, BG_FEED).await;
     for email in [ADMIN, VIEWER] {
         sqlx::query(
             "UPDATE gtfs_editor_user SET totp_enabled = false, totp_secret_enc = NULL, \
@@ -612,8 +616,94 @@ async fn an_admin_imports_a_zip_and_a_viewer_downloads_it() {
     let (s, b, _, _, _) = call!(&app, viewer.req("POST", "/feeds").set_payload(new_zip));
     assert_eq!(s, 403, "{b}");
 
+    // ---- in the background: a job at once, its report when it is done
+    // (the job runs on a thread of its own, so this runtime only waits)
+    macro_rules! job_outcome {
+        ($job_id:expr) => {{
+            let mut last = Value::Null;
+            for _ in 0..300 {
+                let (s, b, _, _, _) =
+                    call!(&app, admin.req("GET", &format!("/import-jobs/{}", $job_id)));
+                assert_eq!(s, 200, "{b}");
+                last = b;
+                if last["status"] != "running" {
+                    break;
+                }
+                actix_web::rt::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            last
+        }};
+    }
+    let bg_zip = fixture(BG_FEED);
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", "/feeds?seed=true&background=true")
+            .set_payload(bg_zip.clone())
+    );
+    assert_eq!((s, &b["status"]), (202, &json!("running")), "{b}");
+    let job = b["job_id"].as_str().unwrap().to_string();
+    let done = job_outcome!(job);
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(
+        (&done["kind"], &done["dry_run"]),
+        (&json!("seed"), &json!(false)),
+        "{done}"
+    );
+    assert_eq!(
+        (&done["report"]["gtfs_id"], &done["report"]["seeded"]),
+        (&json!(BG_FEED), &json!(true)),
+        "{done}"
+    );
+    assert!(count(&pool, "gtfs_trip", BG_FEED).await > 0);
+    // a job's failure is the error the import answered
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", "/feeds?seed=true&background=true")
+            .set_payload(bg_zip.clone())
+    );
+    assert_eq!(s, 202, "{b}");
+    let failed = job_outcome!(b["job_id"].as_str().unwrap());
+    assert_eq!(
+        (
+            &failed["status"],
+            &failed["error"]["code"],
+            &failed["error"]["status"]
+        ),
+        (&json!("failed"), &json!("feed_not_empty"), &json!(409)),
+        "{failed}"
+    );
+    // a drafts import too: the feed as seeded holds what its zip says
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req(
+                "POST",
+                &format!("/feeds/{BG_FEED}/import?mode=drafts&background=true")
+            )
+            .set_payload(bg_zip)
+    );
+    assert_eq!(s, 202, "{b}");
+    let drafted = job_outcome!(b["job_id"].as_str().unwrap());
+    assert_eq!(
+        (&drafted["status"], &drafted["kind"], &drafted["gtfs_id"]),
+        (&json!("done"), &json!("drafts"), &json!(BG_FEED)),
+        "{drafted}"
+    );
+    assert_eq!(drafted["report"]["change_sets"], json!([]), "{drafted}");
+    // a job is an admin's to read, and one that does not exist says so
+    let (s, b, _, _, _) = call!(&app, viewer.req("GET", &format!("/import-jobs/{job}")));
+    assert_eq!(s, 403, "{b}");
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin.req("GET", &format!("/import-jobs/{}", uuid::Uuid::new_v4()))
+    );
+    assert_eq!((s, code_of(&b)), (404, "job_not_found"), "{b}");
+
     // (the zip that named another feed wrote nothing to FEED, which the seed
     // test above works on at the same time)
     clear_feed(&pool, HTTP_FEED).await;
     clear_feed(&pool, NEW_FEED).await;
+    clear_feed(&pool, BG_FEED).await;
 }
