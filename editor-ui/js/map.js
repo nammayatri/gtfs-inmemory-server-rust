@@ -70,7 +70,7 @@ export function initMap() {
   lines = L.canvas({ pane: "lines", padding: 0.3 });
   dots = L.canvas({ pane: "dots", padding: 0.3 });
   L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
-  for (const name of ["links", "route", "proposal", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "labels"]) {
+  for (const name of ["links", "route", "proposal", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "labels"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
   initLayerControl();
@@ -645,6 +645,30 @@ export function showRoute(route, { fit = true, layer = "route", dashed = false, 
 
 export function clearRoute(layer = "route") {
   layers[layer].clearLayers();
+  updateLayerNote();
+}
+
+// A day's trips from the buses' GPS (docs section 17.8), each in its own
+// colour; the chosen one (an index into `trips`) thicker and on top, the rest
+// faded. Cleared with clearRoute("gpsTrips").
+export const TRIP_COLORS = ["#1f5fbf", "#b42318", "#0b6660", "#a15c00", "#6b3fa0", "#c2410c", "#0e7490", "#be185d", "#4d7c0f", "#374151"];
+export function showGpsTrips(trips, { selected = null, fit = false } = {}) {
+  const group = layers.gpsTrips;
+  group.clearLayers();
+  const all = [];
+  const order = trips.map((_, i) => i).sort((a, b) => (a === selected) - (b === selected));
+  for (const i of order) {
+    let pts = null;
+    try { pts = decodePolyline(trips[i].encoded_polyline); } catch { pts = null; }
+    if (!pts || pts.length < 2) continue;
+    const on = selected === i;
+    L.polyline(pts, {
+      renderer: lines, color: TRIP_COLORS[i % TRIP_COLORS.length], weight: on ? 6 : 3,
+      opacity: selected == null || on ? 0.85 : 0.2, interactive: false, gpsTrip: i,
+    }).addTo(group);
+    all.push(...pts);
+  }
+  if (fit && all.length) map.fitBounds(L.latLngBounds(all).pad(0.08), { maxZoom: 16 });
   updateLayerNote();
 }
 

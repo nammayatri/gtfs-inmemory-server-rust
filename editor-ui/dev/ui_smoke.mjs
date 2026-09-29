@@ -5,6 +5,7 @@
 //   node dev/ui_smoke.mjs [--shots /tmp/gtfs-editor-shots]
 //   node dev/ui_smoke.mjs --station-merge    # only the merge-two-stations screen
 //   node dev/ui_smoke.mjs --feed-access      # only who may work on which feed
+//   node dev/ui_smoke.mjs --gps-trips        # only a route's trips from GPS on a day
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -1465,7 +1466,7 @@ async function mapLineFlows() {
   await sleep(300);
   if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Map line from GPS");
   const buttons = () => evaluate(`[...document.querySelectorAll("#panel button")].map((b) => b.textContent)`);
-  await waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Suggest from GPS (last 14 days)")`, "the GPS suggestion");
+  await waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Suggest from GPS (last 7 days)")`, "the GPS suggestion");
   check((await buttons()).includes("Route through stops"), "the suggestion through the stops sits beside it");
 
   // ---- the road router: why it failed, and where
@@ -1482,28 +1483,28 @@ async function mapLineFlows() {
 
   // ---- GPS: not enough evidence, and not set up
   await setMode({ osrm: "ok", gps: "not_enough_runs" });
-  await click("Suggest from GPS (last 14 days)");
+  await click("Suggest from GPS (last 7 days)");
   await waitFor(`!!document.querySelector('#panel [data-failure-reason="gps_not_enough_runs"]')`, "the not-enough-runs reason");
   const why = await text("#panel");
   check(why.includes("Of 9 bus runs seen") && why.includes("1 passed this route's stops in order; at least 3 are needed"), "says how many runs there were and how many passed");
   // cut short to answer in time: says so, and that asking again reads further
   await setMode({ gps: "budget" });
-  await click("Suggest from GPS (last 14 days)");
+  await click("Suggest from GPS (last 7 days)");
   await waitFor(`!!document.querySelector('#panel [data-stopped="budget"]')`, "the reading-stopped-early hint");
   check((await text("#panel")).includes("Reading stopped after 6 days to answer in time"), "says reading stopped early, and after how many days");
   await setMode({ gps: "unavailable" });
-  await click("Suggest from GPS (last 14 days)");
+  await click("Suggest from GPS (last 7 days)");
   await waitFor(`!!document.querySelector('#panel [data-failure-reason="gps_unavailable"]')`, "the unavailable reason");
 
   // ---- GPS: partly snapped, then snapped all through
   await setMode({ gps: "partial" });
-  await click("Suggest from GPS (last 14 days)");
+  await click("Suggest from GPS (last 7 days)");
   await waitFor(`document.getElementById("panel").innerText.includes("New map line ready")`, "a partly snapped line");
   const partial = await text("[data-gps-evidence]");
   check(partial.includes("partly snapped by OSRM (82% of the line"), `the evidence says it is partly snapped: ${partial}`);
   check((await text("#panel")).includes("OSRM said:"), "and what OSRM said");
   await setMode({ gps: "ok" });
-  await click("Suggest from GPS (last 14 days)");
+  await click("Suggest from GPS (last 7 days)");
   await waitFor(`(document.querySelector("[data-gps-evidence]")?.innerText || "").includes("snapped by OSRM.")`, "a snapped line");
   const ev = await text("[data-gps-evidence]");
   check(/^31 runs by 12 buses, \d+(–| \w+ – )\d+ \w+, 94% of stops on the line, snapped by OSRM\.$/.test(ev.trim()), `the evidence reads as a sentence: ${ev}`);
@@ -1518,6 +1519,54 @@ async function mapLineFlows() {
   check(!!change && change.after.polyline_source === "gps" && !!change.after.encoded_polyline, "the draft holds the line with polyline_source gps");
   check(!!change && !("evidence" in change.after), "and not the evidence shown beside it");
   await setMode({ osrm: "ok", gps: "ok" });
+}
+
+// A route's trips from GPS on a day (docs section 17.8), on the first feed
+// this person holds that has GPS.
+async function gpsTripsFlow() {
+  const me = await api("auth/me");
+  const feed = (me.feeds || []).find((f) => f.gps);
+  if (!check(!!feed, "a feed with GPS")) return;
+  const routes = (await api(`feeds/${encodeURIComponent(feed.gtfs_id)}/routes?limit=50`)).items
+    .filter((r) => r.stop_count >= 3 && !r.deleted && (r.short_name || "").trim());
+  if (!check(routes.length > 0, "a route with stops and a number")) return;
+  await go(`#/route/${encodeURIComponent(routes[0].route_id)}`);
+  await waitFor(`!!document.getElementById("gps-trips-show")`, "the trips from GPS");
+  const day = await evaluate(`document.getElementById("gps-trips-date").value`);
+  check(/^\d{4}-\d{2}-\d{2}$/.test(day), `the day starts as today: ${day}`);
+  check(await evaluate(`document.getElementById("gps-trips-date").max === ${JSON.stringify(day)}`), "and no later day can be chosen");
+  await click("Show trips");
+  await waitFor(`document.querySelectorAll(".gps-trips-table tbody tr").length === 3`, "the day's trips listed");
+  check((await text(".gps-trips")).includes(`3 trips on ${day} by 3 buses`), "says how many trips, and by how many buses");
+  await evaluate(`document.querySelector('.gps-trips-table tbody tr[data-trip="1"]').click()`);
+  await waitFor(`document.querySelector('.gps-trips-table tbody tr[data-trip="1"]').classList.contains("selected")`, "a trip picked out");
+  await shot("gt-01-gps-trips");
+  await click("Hide trips");
+  await waitFor(`!document.querySelector(".gps-trips-table")`, "the trips hidden");
+}
+
+// ---- only a route's trips from GPS
+if (process.argv.includes("--gps-trips")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await gpsTripsFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
 }
 
 // ---- only the map lines

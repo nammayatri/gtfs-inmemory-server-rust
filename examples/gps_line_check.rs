@@ -22,7 +22,8 @@
 
 use gtfs_routes_service::editor::{gps_line, service as svc};
 use gtfs_routes_service::services::clickhouse_reader::{
-    ClickHouseError, ClickHouseReader, ClickHouseSettings, RowSource, DEFAULT_MIN_GAP,
+    ClickHouseError, ClickHouseReader, ClickHouseSettings, RowSource, DEFAULT_MAX_CONCURRENT,
+    DEFAULT_MIN_GAP,
 };
 use gtfs_routes_service::services::osrm;
 use serde_json::{json, Value};
@@ -133,6 +134,7 @@ fn clickhouse_settings() -> ClickHouseSettings {
         password: Some(env("CLICKHOUSE_PASSWORD")).filter(|p| !p.is_empty()),
         query_timeout: Duration::from_secs(60),
         min_gap: DEFAULT_MIN_GAP,
+        max_concurrent: DEFAULT_MAX_CONCURRENT,
     }
 }
 

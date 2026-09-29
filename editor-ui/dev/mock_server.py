@@ -1473,6 +1473,31 @@ class Handler(BaseHTTPRequestHandler):
                 if (g, rest[1]) not in s.routes:
                     raise ApiError(404, "unknown_route", f"Route {rest[1]} does not exist.")
                 return 200, route_detail(Projection(s, g, []), rest[1])
+            if len(rest) == 3 and rest[0] == "routes" and rest[2] == "gps-trips" and method == "GET":
+                # a day's trips from GPS (docs section 17.8): three along the
+                # route's stops, in the morning of the day asked for
+                if (g, rest[1]) not in s.routes:
+                    raise ApiError(404, "unknown_route", f"Route {rest[1]} does not exist.")
+                d = route_detail(Projection(s, g, []), rest[1])
+                served = [r for r in d["rows"] if r["stop_type"] not in SERVED_EXCLUDE and r["lat"] is not None]
+                day = q.get("date", [datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()])[0]
+                try:
+                    start = datetime.fromisoformat(day).replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+                except ValueError:
+                    raise ApiError(400, "invalid_date", f"{day!r} is not a date (YYYY-MM-DD)")
+                trips = []
+                for k, (hour, minute) in enumerate([(6, 10), (7, 40), (9, 5)]):
+                    t0 = int((start + timedelta(hours=hour, minutes=minute)).timestamp())
+                    pts = [(r["lat"] + 0.0001 * k, r["lon"] + 0.0001 * k) for r in served]
+                    trips.append({"device": f"mock-bus-{k + 1}", "start": t0, "end": t0 + 60 * max(len(pts), 2),
+                                  "stops_matched": max(len(pts) - k, 2),
+                                  "first_stop_id": served[0]["stop_id"] if served else None,
+                                  "last_stop_id": served[-1]["stop_id"] if served else None,
+                                  "encoded_polyline": polyline_encode(pts)})
+                return 200, {"route_id": rest[1], "route_number": d.get("short_name"), "date": day,
+                             "stops": len(served), "trips": trips if len(served) >= 2 else [],
+                             "evidence": {"buses": 3, "buses_read": 3, "runs_seen": 5, "runs_used": 3,
+                                          "stopped": "complete", "cached": False}}
             if len(rest) == 3 and rest[0] == "routes" and rest[2] in ("polyline:osrm", "polyline:gps") and method == "POST":
                 self.require_role(u, "editor")
                 cs = s.change_sets.get(q.get("change_set", [""])[0])
@@ -4099,7 +4124,10 @@ class FeedAccessHandler(WebhookHandler):
         return found["gtfs_id"] if found else None
 
     def my_feeds(self, u):
-        return [{"gtfs_id": g, "display_name": f.get("display_name"), "role": self.feed_role(u, g)}
+        # GPS (docs section 17) is set up for the sample's feeds, not the
+        # second feed made here
+        return [{"gtfs_id": g, "display_name": f.get("display_name"), "role": self.feed_role(u, g),
+                 "gps": {"days": 7, "trips_days": 30} if g != SECOND_FEED else None}
                 for g, f in self.store.feeds.items() if self.feed_role(u, g)]
 
     def _api(self, method, path, q):

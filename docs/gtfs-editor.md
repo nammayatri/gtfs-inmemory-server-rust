@@ -480,7 +480,8 @@ below). Every list is
 | GET | `/feeds/{g}/routes?q=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows) |
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change. Asked of OSRM in chunks of at most 25 waypoints; a failure is 502 `osrm_failed` saying why and where (section 17.5) |
-| POST | `/feeds/{g}/routes/{route_id}/polyline:gps?change_set=` | `{route_id, encoded_polyline, polyline_source: "gps", saved: false, evidence}` — the path this route's buses drove over the last 14 days, snapped to roads (section 17); not saved, add it as a `route` change |
+| POST | `/feeds/{g}/routes/{route_id}/polyline:gps?change_set=` | `{route_id, encoded_polyline, polyline_source: "gps", saved: false, evidence}` — the path this route's buses drove over the last 7 days, snapped to roads (section 17); not saved, add it as a `route` change |
+| GET | `/feeds/{g}/routes/{route_id}/gps-trips?date=` | `{route_id, route_number, date, stops, trips: [{device, start, end, stops_matched, first_stop_id, last_stop_id, encoded_polyline}], evidence}` — the trips the buses made along the route on one day, from their GPS (section 17.8); viewer |
 | GET | `/feeds/{g}/stops/{stop_id}/context`, `/feeds/{g}/routes/{route_id}/context` | what is known about a stop or a route for cleanup: detours, coordinate reviews, same-named stops, its audit rows, the open drafts touching it — section 9 |
 | GET | `/feeds/{g}/audit?change_set=&limit=&cursor=` | newest first: `{audit_id, at, actor, actor_email, action, gtfs_id, change_set_id, detail}` |
 
@@ -3009,8 +3010,8 @@ and it goes live when someone else approves and commits the draft.
   "polyline_source": "gps",
   "saved": false,
   "evidence": {
-    "from": "2026-09-20", "to": "2026-09-22", "days": 14, "days_read": 3,
-    "stopped": "enough", "read_seconds": 6.5,
+    "from": "2026-09-16", "to": "2026-09-22", "days": 7, "days_read": 7,
+    "days_unread": 0, "stopped": "enough", "read_seconds": 6.5,
     "route_number": "12G", "stops": 46,
     "bus_days": 12, "bus_days_read": 12, "pings": 71075, "points_read": 30625,
     "truncated": false, "queries": 6,
@@ -3027,8 +3028,8 @@ and it goes live when someone else approves and commits the draft.
 | field | meaning |
 | --- | --- |
 | `from`, `to` | the service days (Indian time) read: today back to the oldest day read |
-| `days`, `days_read` | how far back it may look (the configured lookback), and how many days it read, today first |
-| `stopped` | why it stopped going back: `enough` - it had `enough_bus_days`; `lookback` - it read all `days`; `budget` - the time for reading ran out (17.4) |
+| `days`, `days_read`, `days_unread` | how far back it looks (the configured lookback), how many of those days it read, and how many the time ran out for |
+| `stopped` | `enough` - every day read, and `enough_bus_days` among them; `lookback` - every day read, fewer bus-days than that; `budget` - the time for reading ran out before every day, or every track, was read (17.4) |
 | `read_seconds` | wall time spent reading ClickHouse |
 | `route_number` | the route's `short_name`, which is how the pings name the route |
 | `bus_days`, `bus_days_read`, `pings`, `points_read` | bus-days found, those whose tracks were read, the raw pings behind them, the averaged points they became |
@@ -3046,8 +3047,8 @@ gps_no_route_number` (the route has no `short_name` to find its buses by), `422
 gps_not_enough_stops` (fewer than two served stops with a position), `422
 gps_not_enough_runs` (fewer than 3 runs passed the stops in order; `details` holds
 the evidence counts above plus `min_runs` - with `stopped: "budget"` the reading
-was cut short to answer in time, and asking again reads further), `504
-gps_timeout` (the backstop: the whole suggestion ran past its limit, 45 s by
+was cut short to answer in time, and asking again reads the days not yet read), `504
+gps_timeout` (the backstop: the whole suggestion ran past its limit, 25 s by
 default - only when ClickHouse does not stop a query at its
 `max_execution_time`, or another suggestion held the pod's turn too long), `502
 gps_query_failed` (ClickHouse answered with an error, or could not be reached).
@@ -3141,8 +3142,9 @@ as nandi's `ch_client.py` does:
   readonly=2 still allows) are refused before anything is sent;
 - a statement holding a `;` anywhere is refused.
 
-It is unhurried: one query at a time per pod, 350 ms between queries,
-`max_execution_time` 30 s, `max_threads=2`, low `priority`; one suggestion at a
+It is unhurried: at most three queries at once per pod (one at a time until
+2026-09-29), 350 ms between two starting, `max_execution_time` 30 s,
+`max_threads=2` each, low `priority`; one suggestion (or day's trips, 17.8) at a
 time per pod (a second waits for the first, and then finds its answer in the
 cache when it was for the same route). Answers come back as `TabSeparated` (JSON
 formats stall on this cluster), and the password goes as HTTP basic auth: it is
@@ -3154,13 +3156,16 @@ The table's sort key is the timestamp alone, so a route filter prunes nothing:
 <= now()` (device clocks emit far-future timestamps), then by the route label, a
 box around the route's stops (+1 km), and a `LIMIT`. Raw pings are never pulled:
 
-1. **Bus-days** - one query per day, **today first**: which `deviceId`s carried
-   the route number with at least 120 pings in the box that day, the busiest 4,
-   with the first and last ping that carried it. It stops going back as soon as
-   `enough_bus_days` (12) are found, after `days` (14) days, or once 15 s have
-   gone (`stopped` says which). A busy route has enough in three days; only a
-   quiet one reads further back.
-2. **Tracks** - for each day read, newest first, that day's buses' pings, only
+1. **Bus-days** - one query per day, every day of the `days` (7) read, three at
+   a time, **today first**: which `deviceId`s carried the route number with at
+   least 120 pings in the box that day, the busiest 4, with the first and last
+   ping that carried it. Step 1 gets at most 12 s. `enough_bus_days` (12) are
+   then taken across the days read - the busiest bus of each day, newest day
+   first, then each day's second busiest, and so on - so the line draws on the
+   whole week, not only its first days. A past day's answer cannot change: it
+   is kept in the pod (4,096 route-days, the oldest dropped first) and never
+   asked for again, by a suggestion or a day's trips.
+2. **Tracks** - for each day chosen, three days at a time, that day's buses' pings, only
    from 45 minutes before the first ping that carried the number to 45 minutes
    after the last: in the box, labelled with this route number or with none (a
    quarter carry no label), averaged in ClickHouse to one point per 20 s, and
@@ -3180,17 +3185,26 @@ spellings; ` 51AXCT` and `57Fct` are real ones). Tracks add `isNull(routeNumber)
 OR routeNumber IN ('', …)` for the unlabelled pings. Rarer spellings (two spaces,
 a stray dot) are missed: they were 0.16% of labelled pings in a day.
 
-**The time budget.** A proxy (Pomerium) gives an editor request 60 s, so the
-whole suggestion answers within `timeout` (45 s, at most 50): reading stops 8 s
-before it, leaving OSRM and the build their time; step 1 gets the first 15 s.
+**The time budget.** The Google load balancer in front of the editor gives up
+on a request after 30 s and answers 502 (Pomerium, behind it, the same), so the
+whole suggestion answers within `timeout` (25 s, at most 27): reading stops 5 s
+before it, leaving OSRM and the build their time; step 1 gets the first 12 s.
 Each query is sent with `max_execution_time` = the time left (never more than
 30 s), and a query is not started with less than 2 s left. When ClickHouse
 stops a query at its limit (`TIMEOUT_EXCEEDED`, HTTP 408), or the time runs out
 between queries, reading stops: the line is built from what was read, or the
 answer is 422 `gps_not_enough_runs` with the counts - in both cases with
-`stopped: "budget"`, and neither is cached, so the next click reads again (and
-the cluster has those days warm by then). 504 `gps_timeout` is left only as the
-backstop.
+`stopped: "budget"`, and neither is cached, so the next click reads again - only
+the days not yet read, the ones read being kept. 504 `gps_timeout` is left only
+as the backstop.
+
+**Why a week, three at a time (2026-09-29).** On master a suggestion read one
+day: step 1 went a day at a time, one query at a time, and gave up going back
+after 15 s, so a cold cluster answered today and nothing more. The whole
+suggestion also counted on the 60 s once thought the proxy's, while the load
+balancer's 30 s cut it off first (a dashboard import showed it: 30.2 s, then the
+balancer's own 502 page). So the lookback is a week, every day of it read three
+queries at a time, and the answer comes inside 25 s.
 
 **Why.** On master the first version failed for route 2288 (12G) with `502
 gps_query_failed`: "ClickHouse answered HTTP 408: Code: 159 TIMEOUT_EXCEEDED:
@@ -3203,7 +3217,8 @@ by converting every row of a LowCardinality(Nullable(String)) column: one
 bus-day track query took 3.6 s with it and 2.2 s with an `IN` list. The fix
 does not raise `max_threads` or the 30 s ceiling - it reads less.
 
-Measured on real data from a laptop after the fix, 14-day lookback, the defaults:
+Measured on real data from a laptop after the fix, 14-day lookback, the
+defaults of the time (one query at a time, stopping once there was enough):
 
 | route | days read | stopped | bus-days | queries | read | runs used | stop coverage |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -3261,12 +3276,12 @@ gtfs_gps = Some
   { url = "https://clickhouse.internal:8443"   -- the HTTP interface, not 9000/9440
   , user = "gims_reader"
   , table = Some "atlas_kafka.amnex_direct_data"
-  , days = Some 14                     -- how far back it may look
-  , enough_bus_days = None Natural      -- 12: stop going back once found
+  , days = None Natural                -- 7: how far back it looks
+  , enough_bus_days = None Natural      -- 12: the bus-days a line is built from
   , feeds = Some [ "chennai_bus" ]
   , max_bus_days = None Natural         -- 30
   , page_rows = None Natural            -- 100
-  , timeout_seconds = None Natural      -- 45, at most 50: a proxy allows 60
+  , timeout_seconds = None Natural      -- 25, at most 27: the load balancer allows 30
   },
 gtfs_gps_clickhouse_password = secrets.clickhouse_password,
 ```
@@ -3275,8 +3290,10 @@ Only `url` and `user` are required. Absent (the default, as in the dev dhall),
 the endpoint is `503 gps_unavailable` and nothing else changes; so is a feed not
 in `feeds`. An invalid block (a table name that is not `db.table`, `days` outside
 1-60, a non-http URL) is logged at boot and leaves the feature off.
-`timeout_seconds` is held to 10-50 s; the step-1 share (15 s) and the time kept
-back for OSRM (8 s) shrink with a shorter timeout.
+`timeout_seconds` is held to 10-27 s; the step-1 share (12 s, at most half) and
+the time kept back for OSRM (5 s, at most a quarter) shrink with a shorter
+timeout. The reader's three queries at once is `DEFAULT_MAX_CONCURRENT`, not
+configured.
 
 ### 17.7 Schema, dashboard and tests
 
@@ -3287,7 +3304,7 @@ image with this endpoint serves drafts**: without it, committing a draft that
 holds a `gps` line fails on the CHECK.
 
 The dashboard's route editor offers **Route through stops** and **Suggest from
-GPS (last 14 days)** side by side. A GPS line shows its evidence under it - "31
+GPS (last 7 days)** side by side (the days as `/auth/me` gives the feed's `gps`). A GPS line shows its evidence under it - "31
 runs by 12 buses, 8–21 Sep, 94% of stops on the line, snapped by OSRM" - with a
 warning when under 80% of the stops are on it; either failure shows the server's
 reason and what to do about it. The line goes into the draft with `polyline_source:
@@ -3299,9 +3316,11 @@ stitching, the detour guard, the encoder against Google's example),
 `src/editor/gps_line.rs` (run selection by direction and variant, cutting, gap
 and dwell splits, the synthetic fleet, a loop route, the queries passing the
 guard, the label spellings, and - against a fake cluster with a latency per
-query - today first and stopping once there is enough, reading back to the
-lookback on a quiet route, the budget stopping the read on time, and a day's
-tracks never read twice); `tests/editor_gps_line_flow.rs`, registered in
+query - every day of the week read and the bus-days drawn from all of it, three
+queries out at once and never more, a past day asked for once, reading back to
+the lookback on a quiet route, the budget stopping the read on time, a day's
+tracks never read twice, and a day's trips); `src/services/clickhouse_reader.rs`
+also checks three slow queries overlap and their starts are spaced; `tests/editor_gps_line_flow.rs`, registered in
 `scripts/editor_flow_test.sh`, against a fake ClickHouse and a fake OSRM on
 localhost (every statement checked for readonly=2, a SELECT, a LIMIT and no
 OFFSET, a time bound, a `max_execution_time` within the budget; one day per
@@ -3310,6 +3329,61 @@ its limit (422 `stopped: budget`, on time, not cached) and one that does not
 (504), commit of a `gps` line, and each OSRM reason); `dev/ui_smoke.mjs --map-line` against the mock's `/__dev/map-line`
 switch. `examples/gps_line_check.rs` runs the real pipeline read-only against the
 real cluster for a few routes and writes GeoJSON to look at.
+
+### 17.8 A day's trips from GPS (2026-09-29)
+
+```
+GET /feeds/{g}/routes/{route_id}/gps-trips?date=YYYY-MM-DD
+```
+
+Viewer role; reads only. For one Indian service day - today when `date` is left
+out, at most 29 days back (`TRIPS_LOOKBACK_DAYS` 30, today included), never a
+day to come (`400 invalid_date`) - steps 1 to 3 for that day alone: the busiest
+20 buses carrying the route number in the box (at least 120 pings), their tracks
+around the hours they carried it, and every run that passed the route's **live**
+stops in order by the 17.1 rule. Those runs are the day's trips:
+
+```json
+{
+  "route_id": "2288", "route_number": "12G", "date": "2026-09-28", "stops": 46,
+  "trips": [
+    {"device": "861…", "start": 1790563800, "end": 1790568900, "stops_matched": 44,
+     "first_stop_id": "…", "last_stop_id": "…", "encoded_polyline": "…"}
+  ],
+  "evidence": {"buses": 9, "buses_read": 9, "runs_seen": 31, "runs_used": 22,
+               "stop_share": 0.7, "pings": 90210, "stopped": "complete",
+               "queries": 3, "read_seconds": 4.1, "cached": false}
+}
+```
+
+`start` and `end` are when the run passed its first and its last matched stop
+(unix seconds), `stops_matched` of the route's `stops`; the line runs from its
+first matched stop to its last, as the bus drove it (not snapped). Trips come in
+the order they started. A run the other way, a variant, or a bus under this
+number on another road is not a trip of this route - it may well be one of
+another. `stopped: "budget"` when the time ran out before every bus's track was
+read: some trips may be missing, and asking again reads them. A past day's answer
+is kept in the pod's cache, as a past day's bus-days are (17.4): it cannot change.
+Errors as the line's: 503 `gps_unavailable`, 422 `gps_no_route_number` or
+`gps_not_enough_stops`, 504 `gps_timeout`, 502 `gps_query_failed`; a day no bus
+passed is 200 with no trips.
+
+`/auth/me` says which feeds have GPS: each feed carries `gps: {days,
+trips_days}` (the line's lookback and the trips' days), or `null`.
+
+The dashboard's route page has **Trips from GPS** for a live route with a number
+on such a feed: a day (today, back 29 days), **Show trips**, then the trips in a
+table - from, to, bus, stops matched - and each on the map in its own colour.
+Choosing one draws it thick and on top and fades the rest; **Hide trips** clears
+them, as does leaving the page.
+
+Tests: `src/editor/gps_line.rs` (`a_days_trips_are_the_runs_that_passed_the_stops_in_order`:
+the synthetic fleet's nine forward runs of a day, in order, and none of its runs
+back, variant or parallel road; a past day's trips kept; a day no bus ran);
+`tests/editor_gps_line_flow.rs` (yesterday's four trips of `R_FWD` over HTTP, a
+day to come, one past the lookback and not a date refused, the feed's `gps` in
+`/auth/me`); `dev/ui_smoke.mjs --gps-trips` against the mock (the day defaults to
+today and goes no later, three trips listed, one picked out, hidden again).
 
 ## 18. The whole GTFS reference, and every feed in the tables (2026-09-24)
 

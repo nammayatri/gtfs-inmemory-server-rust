@@ -192,6 +192,8 @@ function route() {
   leaveStations();
   leaveCoordinates();
   leaveWebhooks();
+  // a route's trips from GPS belong to its page
+  map.clearRoute("gpsTrips");
   setLeaveGuard(null);
   // what could be undone belonged to the screen being left
   resetUndo();
