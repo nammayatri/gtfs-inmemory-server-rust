@@ -1808,12 +1808,13 @@ async fn fetch_vehicle_service_type(
         .is_vehicle_in_internal(vehicle_no, gtfs_id)
         .await
     {
-        let vehicle_data = app_state
+        // Service type only — no trip/schedule queries (those serve /service-type).
+        let service_type = app_state
             .db_vehicle_reader_internal
-            .get_vehicle_data(vehicle_no, gtfs_id, None)
+            .get_vehicle_service_type(vehicle_no, gtfs_id)
             .await?;
-        if vehicle_data.service_type.is_some() {
-            return Ok(vehicle_data.service_type);
+        if service_type.is_some() {
+            return Ok(service_type);
         }
         return Ok(app_state
             .gtfs_service
@@ -1822,12 +1823,12 @@ async fn fetch_vehicle_service_type(
     }
 
     // Standard DB path
-    let vehicle_data = app_state
+    let service_type = app_state
         .db_vehicle_reader
-        .get_vehicle_data(vehicle_no, None)
+        .get_vehicle_service_type(vehicle_no)
         .await?;
-    if vehicle_data.service_type.is_some() {
-        return Ok(vehicle_data.service_type);
+    if service_type.is_some() {
+        return Ok(service_type);
     }
     Ok(app_state
         .gtfs_service

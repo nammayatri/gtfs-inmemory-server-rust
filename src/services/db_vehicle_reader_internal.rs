@@ -56,6 +56,13 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         fleet_no: &str,
         gtfs_id: &str,
     ) -> AppResult<Option<String>>;
+
+    /// Service type only: same waybill priority as `get_vehicle_data`, without the trip/schedule queries.
+    async fn get_vehicle_service_type(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>>;
 }
 
 // Mock implementation for local testing without a database
@@ -138,6 +145,16 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         _gtfs_id: &str,
     ) -> AppResult<Option<String>> {
         Ok(None)
+    }
+
+    async fn get_vehicle_service_type(
+        &self,
+        _vehicle_no: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
     }
 }
 
@@ -594,6 +611,45 @@ impl DBVehicleReaderInternal {
             return Ok((Some(w), status));
         }
         Ok((None, WaybillStatus::NotFound))
+    }
+
+    async fn get_vehicle_service_type_impl(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        let query = r#"
+            SELECT w.service_type
+            FROM waybills_internal w
+            WHERE w.vehicle_no = $1
+              AND w.gtfs_id    = $2
+              AND w.service_type IS NOT NULL
+            ORDER BY
+                CASE
+                    WHEN w.deleted = false AND w.status = 'online'  THEN 0
+                    WHEN w.deleted = false AND w.status = 'closed'  THEN 1
+                    WHEN w.deleted = false AND w.status = 'audited' THEN 2
+                    ELSE 3
+                END,
+                w.updated_at DESC
+            LIMIT 1
+        "#;
+
+        match sqlx::query_scalar::<_, String>(query)
+            .bind(vehicle_no)
+            .bind(gtfs_id)
+            .fetch_optional(self.pool()?)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                error!(
+                    "Service type waybill_internal query failed for vehicle_no={} gtfs_id={}: {}",
+                    vehicle_no, gtfs_id, e
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn resolve_trip_data(
@@ -1363,6 +1419,15 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             eta_in_seconds,
         )
         .await
+    }
+
+    async fn get_vehicle_service_type(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<String>> {
+        self.get_vehicle_service_type_impl(vehicle_no, gtfs_id)
+            .await
     }
 
     async fn get_waybill_metadata(
