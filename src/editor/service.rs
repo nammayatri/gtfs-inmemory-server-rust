@@ -5175,10 +5175,23 @@ pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Va
                 None => continue,
             }
         };
+        // what the feed's GPS offers (section 17): the days a suggested line
+        // looks back over, and how far back a day's trips go; null without
+        let gps = state
+            .gps_line
+            .as_ref()
+            .filter(|gps| gps.serves(&gtfs_id))
+            .map(|gps| {
+                json!({
+                    "days": gps.settings.days,
+                    "trips_days": super::gps_line::TRIPS_LOOKBACK_DAYS,
+                })
+            });
         out.push(json!({
             "gtfs_id": gtfs_id,
             "display_name": r.try_get::<String, _>("display_name")?,
             "role": role.as_str(),
+            "gps": gps,
         }));
     }
     Ok(json!(out))

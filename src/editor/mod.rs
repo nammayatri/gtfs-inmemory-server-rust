@@ -289,6 +289,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::post().to(h::polyline_gps),
             )
             .route(
+                "/feeds/{gtfs_id}/routes/{route_id}/gps-trips",
+                web::get().to(h::route_gps_trips),
+            )
+            .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/patterns/{pattern_key}",
                 web::get().to(h::route_pattern),
             )
@@ -514,19 +518,21 @@ mod tests {
         let s =
             super::gps_line::settings_from_config(&gps, cfg.gtfs_gps_clickhouse_password.clone());
         assert_eq!(s.table, super::gps_line::DEFAULT_TABLE);
-        assert_eq!(s.days, 14);
+        assert_eq!(s.days, 7);
         assert_eq!(s.feeds, vec!["chennai_bus".to_string()]);
         assert_eq!(s.page_rows, 100);
         assert_eq!(s.enough_bus_days, 12);
-        assert_eq!(s.timeout, std::time::Duration::from_secs(45));
-        assert_eq!(s.bus_days_budget, std::time::Duration::from_secs(15));
-        assert_eq!(s.osrm_reserve, std::time::Duration::from_secs(8));
-        // a timeout past what the proxy in front allows is held under it
+        // inside the 30 s the load balancer in front of the editor waits
+        assert_eq!(s.timeout, std::time::Duration::from_secs(25));
+        assert_eq!(s.bus_days_budget, std::time::Duration::from_secs(12));
+        assert_eq!(s.osrm_reserve, std::time::Duration::from_secs(5));
+        assert_eq!(s.clickhouse.max_concurrent, 3);
+        // a timeout past what the load balancer in front allows is held under it
         let mut long = gps.clone();
         long.timeout_seconds = Some(300);
         long.enough_bus_days = Some(500);
         let l = super::gps_line::settings_from_config(&long, None);
-        assert_eq!(l.timeout, std::time::Duration::from_secs(50));
+        assert_eq!(l.timeout, std::time::Duration::from_secs(27));
         assert_eq!(l.enough_bus_days, l.max_bus_days);
         assert!(super::gps_line::GpsLine::new(s).is_ok());
         std::fs::remove_dir_all(dir).ok();

@@ -27,7 +27,9 @@
 //!   - the line goes into a draft as `polyline_source: "gps"` and commits
 //!     (the CHECK of 0021);
 //!   - the road route through the stops is asked for in chunks of at most 25
-//!     waypoints, and when it fails it says why and where.
+//!     waypoints, and when it fails it says why and where;
+//!   - a day's trips (section 17.8) are the runs that passed the stops in
+//!     order, and only a day of the lookback may be asked for.
 //!
 //! Runs only when `EDITOR_TEST_DATABASE_URL` is set, and refuses any host that
 //! is not local. Uses its own feeds and accounts; never touches chennai_bus.
@@ -741,6 +743,7 @@ async fn a_map_line_from_gps_end_to_end() {
             password: Some(CH_PASSWORD.into()),
             query_timeout: Duration::from_secs(10),
             min_gap: Duration::from_millis(20),
+            max_concurrent: 3,
         },
         table: gps_line::DEFAULT_TABLE.into(),
         days: 3,
@@ -848,6 +851,53 @@ async fn a_map_line_from_gps_end_to_end() {
     assert_eq!(b["evidence"]["cached"], true);
     assert_eq!(b["encoded_polyline"], fwd_line.as_str());
     assert_eq!(ch_count(), queries);
+
+    // ---- the trips of a day (section 17.8): yesterday's runs of R_FWD
+    let today = gps_line::service_today();
+    let trips_of = |date: &str| {
+        editor_c.req(
+            "GET",
+            &format!("/feeds/{GPS_FEED}/routes/R_FWD/gps-trips?date={date}"),
+        )
+    };
+    let yesterday = (today - chrono::Duration::days(1)).to_string();
+    let (s, b, _, _) = call!(&app, trips_of(&yesterday));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["date"], yesterday.as_str());
+    let trips = b["trips"].as_array().unwrap();
+    // dev-1 and dev-2 drive it forward twice a day each; dev-v leaves the
+    // corridor, and the legs back meet the stops backwards
+    assert_eq!(trips.len(), 4, "{b}");
+    for t in trips {
+        assert!(
+            ["dev-1", "dev-2"].contains(&t["device"].as_str().unwrap()),
+            "{t}"
+        );
+        assert!(
+            t["start"].as_i64().unwrap() < t["end"].as_i64().unwrap(),
+            "{t}"
+        );
+    }
+    // a day to come, one past the lookback, or not a date
+    for bad in [
+        (today + chrono::Duration::days(1)).to_string(),
+        (today - chrono::Duration::days(gps_line::TRIPS_LOOKBACK_DAYS)).to_string(),
+        "yesterday".to_string(),
+    ] {
+        let (s, b, _, _) = call!(&app, trips_of(&bad));
+        assert_eq!((s, code_of(&b)), (400, "invalid_date"), "{bad}: {b}");
+    }
+    // the feed says it has GPS, and how far back a line looks
+    let (s, me, _, _) = call!(&app, editor_c.req("GET", "/auth/me"));
+    assert_eq!(s, 200, "{me}");
+    let feed = me["feeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["gtfs_id"] == GPS_FEED)
+        .cloned()
+        .unwrap();
+    assert_eq!(feed["gps"]["days"], 3, "{feed}");
 
     // ---- the other direction of the same route number, with OSRM down
     osrm_state.mode.store(1, Ordering::SeqCst);

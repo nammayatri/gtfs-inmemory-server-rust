@@ -359,6 +359,7 @@ export async function showStop(stopId) {
 // left out, the draft is applied whenever it touches the route.
 export async function showRoute(routeId, { preview } = {}) {
   map.endModes();
+  map.clearRoute("gpsTrips");
   clear(panel(), h("section.section", h("p.empty", "Loading route…")));
   const created = createdChange("route", routeId);
   let live = null;
@@ -456,11 +457,95 @@ export async function showRoute(routeId, { preview } = {}) {
         h("button.btn", { type: "button", on: { click: () => editRouteRows(created ? r : live, { created: !!created }) } }, created && !r.rows.length ? "Build the stop list" : "Edit stop list"),
         h("button.btn.secondary", { type: "button", on: { click: () => editRouteDetails(created ? r : live, { created: !!created }) } }, "Edit name, colour and map line")) : null,
     ),
+    live ? gpsTripsSection(live) : null,
     h("section.section", h("h2", "Stops by fare stage"), ladderBox,
       removed.length ? h("p.pending-removed.notice.draft", `Taken off the route in the draft: ${removed.map((d) => d.before.stop_name || d.before.marker_name || d.before.stop_id).join(", ")}.`) : null),
     live ? routeContext(live, { onReviews: (m) => { reviews = m; drawLadder(); } }) : null,
   );
   drawLadder();
+}
+
+// An Indian service day as YYYY-MM-DD, `daysAgo` days before today.
+const serviceDay = (daysAgo = 0) => new Date(Date.now() - daysAgo * 86400000).toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+const clock = (t) => new Date(t * 1000).toLocaleTimeString("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" });
+
+// The trips the buses made along this route on a chosen day, from their GPS
+// (docs section 17.8): every run that passed its live stops in order, drawn on
+// the map each in its own colour and listed with its times. Reading only.
+function gpsTripsSection(route) {
+  const gps = (state.feeds.find((f) => f.gtfs_id === state.feedId) || {}).gps;
+  if (!gps || !(route.short_name || "").trim()) return null;
+  const date = h("input", { type: "date", id: "gps-trips-date", value: serviceDay(), min: serviceDay(gps.trips_days - 1), max: serviceDay() });
+  const out = h("div", { "aria-live": "polite" });
+  const names = new Map(route.rows.filter((r) => r.stop_id).map((r) => [r.stop_id, r.stop_name || r.stop_id]));
+  let trips = [];
+  let selected = null;
+  let answer = null;
+  let asking = false;
+  const pick = (i) => {
+    selected = selected === i ? null : i;
+    map.showGpsTrips(trips, { selected });
+    render();
+  };
+  const hide = () => {
+    trips = []; selected = null; answer = null;
+    map.clearRoute("gpsTrips");
+    clear(out);
+  };
+  const render = () => {
+    const ev = answer.evidence || {};
+    const partial = ev.stopped === "budget"
+      ? h("p.notice.warning", "Reading stopped to answer in time, so some buses may be missing. Show the trips again to read the rest.") : null;
+    if (!trips.length) {
+      return clear(out, h("p.empty", { "data-gps-trips": "0" }, ev.buses
+        ? `${plural(ev.buses, "bus", "buses")} carried route number ${answer.route_number} near these stops on ${answer.date}, but none passed them in order.`
+        : `No bus carrying route number ${answer.route_number} was seen near these stops on ${answer.date}.`), partial);
+    }
+    clear(out,
+      h("p", { "data-gps-trips": String(trips.length) }, h("strong", `${plural(trips.length, "trip")} on ${answer.date}`),
+        ` by ${plural(new Set(trips.map((t) => t.device)).size, "bus", "buses")}. Choose one to pick it out on the map.`),
+      partial,
+      h("div.table-wrap", h("table.gps-trips-table",
+        h("thead", h("tr", h("th", ""), h("th", "From"), h("th", "To"), h("th", "Bus"), h("th.num", "Stops"))),
+        h("tbody", trips.map((t, i) => h("tr", {
+          class: selected === i ? "selected" : "", tabindex: "0", dataset: { trip: String(i) },
+          title: `${names.get(t.first_stop_id) || t.first_stop_id} to ${names.get(t.last_stop_id) || t.last_stop_id}`,
+          on: { click: () => pick(i), keydown: (ev2) => { if (ev2.key === "Enter") pick(i); } },
+        },
+          h("td", h("span.trip-swatch", { style: `background:${map.TRIP_COLORS[i % map.TRIP_COLORS.length]}` })),
+          h("td", clock(t.start)), h("td", clock(t.end)),
+          h("td", h("code", t.device)),
+          h("td.num", `${t.stops_matched}/${answer.stops}`)))))),
+      h("div.btn-row", h("button.btn.quiet.small", { type: "button", on: { click: hide } }, "Hide trips")));
+  };
+  const show = async () => {
+    if (asking) return;
+    asking = true;
+    button.disabled = true;
+    clear(out, h("p.hint", `Reading where the buses of route ${route.short_name} drove on ${date.value}… this can take up to 25 seconds.`));
+    try {
+      answer = await get(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/gps-trips?date=${enc(date.value)}`);
+      trips = answer.trips || [];
+      selected = null;
+      map.showGpsTrips(trips, { fit: trips.length > 0 });
+      render();
+    } catch (e) {
+      trips = [];
+      map.clearRoute("gpsTrips");
+      clear(out, h("p.notice.error", e.message));
+    } finally {
+      asking = false;
+      button.disabled = false;
+    }
+  };
+  const button = h("button.btn.secondary.small", { type: "button", id: "gps-trips-show", on: { click: show } }, "Show trips");
+  return h("section.section.gps-trips",
+    h("h2", "Trips from GPS"),
+    h("p.hint", `Where the buses carrying route number ${route.short_name} drove on a day: each run that passed this route's stops in order. The last ${gps.trips_days} days can be read.`),
+    h("div.field-row",
+      h("label.field", { for: "gps-trips-date" }, h("span", "Day"), date),
+      h("div.btn-row", button)),
+    out);
 }
 
 // The read-only stage ladder. `rowInfo(row, index)` may give a row a class and

@@ -19,14 +19,17 @@
 //!
 //! The pipeline:
 //!
-//!  1. **Bus-days** (one query per day, today first): which devices carried
-//!     this route number that day, with enough pings inside a box around the
-//!     route's stops - the busiest few a day. It stops going back as soon as
-//!     `enough_bus_days` are found, after `days` days, or when its share of the
-//!     time is spent. The table's sort key is the timestamp alone, so a day's
-//!     bound is what makes a query cheap: one query over 14 cold days took
-//!     40 s and hit the 30 s ceiling; a day takes a second or three.
-//!  2. **Tracks** (one query per day, or per few hours of one): those devices'
+//!  1. **Bus-days** (one query per day, the `days` days read three at a time,
+//!     today first): which devices carried this route number that day, with
+//!     enough pings inside a box around the route's stops - the busiest few a
+//!     day. `enough_bus_days` are then taken across the days, the busiest bus
+//!     of each day first, so the line draws on the whole week rather than its
+//!     first few days. A past day's answer cannot change, so it is kept and
+//!     never asked again. The table's sort key is the timestamp alone, so a
+//!     day's bound is what makes a query cheap: one query over 14 cold days
+//!     took 40 s and hit the 30 s ceiling; a day takes a second or three.
+//!  2. **Tracks** (one query per day, or per few hours of one; the days three
+//!     at a time): those devices'
 //!     pings around the hours they carried the number, still inside the box,
 //!     averaged to one point per `bucket_s` seconds, and packed one device-hour
 //!     per row - ClickHouse does the thinning, each answer is at most
@@ -34,10 +37,12 @@
 //!     of time is ever read twice (no `OFFSET` paging, which re-runs the scan).
 //!
 //!  Reading has a deadline: the whole suggestion answers within `timeout`
-//!  (45 s), well inside the 60 s a proxy allows a request. Each query is given
+//!  (25 s), inside the 30 s the Google load balancer in front of the editor
+//!  (and Pomerium behind it) waits for a request. Each query is given
 //!  only the time left as its `max_execution_time`; when time runs out, the
 //!  line is built from what was read, or the answer is "not enough runs" with
-//!  the counts - and neither is cached, so the next click reads further.
+//!  the counts - and neither is cached, so the next click reads further (the
+//!  days already read are kept, so it asks only for the rest).
 //!  3. **Runs**: clean (impossible jumps), split at feed gaps and terminal
 //!     dwells, match the stops, keep the runs that pass enough of them in
 //!     order, cut each from its first to its last matched stop.
@@ -50,11 +55,17 @@
 //!
 //! Nothing here writes anything: the answer is a proposal the dashboard puts
 //! into a draft, like the OSRM one.
+//!
+//! The same reading answers a second question (section 17.8): the trips the
+//! buses made along a route on one day ([`GpsLine::trips_on`]) - steps 1 to 3
+//! for that day, every run that passed the stops in order, with when it did,
+//! which bus, and its line.
 
 use crate::services::clickhouse_reader::{
     quote, ClickHouseError, ClickHouseReader, ClickHouseSettings, RowSource,
 };
 use crate::services::osrm::{self, dist, seg_dist, MatchOptions, MatchQuality, Planar};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -62,22 +73,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 pub const DEFAULT_TABLE: &str = "atlas_kafka.amnex_direct_data";
-/// How far back a suggestion may look, at most.
-pub const DEFAULT_DAYS: u32 = 14;
-/// Reading stops once this many bus-days are found. 6 bus-days of 21G gave
-/// 13-20 usable runs; twice that is plenty and leaves room for a quiet day.
+/// How far back a suggestion looks: a week, every day of it read.
+pub const DEFAULT_DAYS: u32 = 7;
+/// A line is built from this many bus-days, taken across the days read. 6
+/// bus-days of 21G gave 13-20 usable runs; twice that is plenty and leaves
+/// room for a quiet day.
 pub const DEFAULT_ENOUGH_BUS_DAYS: usize = 12;
 pub const DEFAULT_MAX_BUS_DAYS: usize = 30;
 pub const DEFAULT_PAGE_ROWS: usize = 100;
-/// The whole suggestion, OSRM included: well inside the 60 s a proxy in front
-/// of the editor (Pomerium) allows a request.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
-/// No configured timeout may leave less room than this under 60 s.
-pub const MAX_TIMEOUT: Duration = Duration::from_secs(50);
-/// Step 1 (finding bus-days) stops looking further back after this long.
-pub const DEFAULT_BUS_DAYS_BUDGET: Duration = Duration::from_secs(15);
+/// The whole suggestion, OSRM included: inside the 30 s the Google load
+/// balancer in front of the editor waits (it answers 502 after that).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25);
+/// No configured timeout may leave less room than this under 30 s.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(27);
+/// Step 1 (finding bus-days) is given at most this long.
+pub const DEFAULT_BUS_DAYS_BUDGET: Duration = Duration::from_secs(12);
 /// Left for OSRM and building the line once reading stops.
-pub const DEFAULT_OSRM_RESERVE: Duration = Duration::from_secs(8);
+pub const DEFAULT_OSRM_RESERVE: Duration = Duration::from_secs(5);
+/// How far back the trips of a day may be asked for.
+pub const TRIPS_LOOKBACK_DAYS: i64 = 30;
+/// The buses read for a day's trips: the busiest this many.
+const TRIP_BUSES: usize = 20;
 /// Bus-days taken from one day: the busiest few, so a busy route's answer
 /// still spans a few days rather than one.
 const BUS_DAYS_PER_DAY: usize = 4;
@@ -497,7 +513,11 @@ pub struct KeptRun {
     pub device: String,
     pub xy: Vec<(f64, f64)>,
     pub first_stop: usize,
+    pub last_stop: usize,
     pub stops_matched: usize,
+    /// When it passed its first and its last matched stop, unix seconds.
+    pub t_start: i64,
+    pub t_end: i64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -546,11 +566,17 @@ pub fn select_runs(
                 if cut.len() < 2 {
                     continue;
                 }
+                let (t_start, t_end) = chain
+                    .iter()
+                    .fold((f64::MAX, f64::MIN), |(a, b), e| (a.min(e.t), b.max(e.t)));
                 kept.push(KeptRun {
                     device: track.device.clone(),
                     xy: cut,
                     first_stop: chain[0].stop,
+                    last_stop: chain[chain.len() - 1].stop,
                     stops_matched: chain.len(),
+                    t_start: t_start.round() as i64,
+                    t_end: t_end.round() as i64,
                 });
             }
         }
@@ -1032,6 +1058,53 @@ pub fn build_line(tracks: &[Track], stops: &[Stop], p: &Params) -> Result<Built,
     })
 }
 
+/// One bus run that passed a route's stops in order: a trip, as its GPS saw it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpsTrip {
+    pub device: String,
+    /// When it passed its first and its last matched stop, unix seconds.
+    pub start: i64,
+    pub end: i64,
+    /// Indexes into the stops.
+    pub first_stop: usize,
+    pub last_stop: usize,
+    pub stops_matched: usize,
+    /// (lat, lon), from its first matched stop to its last.
+    pub line: Vec<(f64, f64)>,
+}
+
+/// Step 3 over tracks already read, for a day's trips: every run that passes
+/// enough of the stops in order, in the order they started. No database, no
+/// network.
+pub fn gps_trips(tracks: &[Track], stops: &[Stop], p: &Params) -> (Vec<GpsTrip>, RunCounts) {
+    let Some(first) = stops.first() else {
+        return (vec![], RunCounts::default());
+    };
+    let pl = Planar::around(first.lat, first.lon);
+    let (runs, counts) = select_runs(tracks, stops, &pl, p);
+    let mut trips: Vec<GpsTrip> = runs
+        .into_iter()
+        .map(|r| GpsTrip {
+            line: r
+                .xy
+                .iter()
+                .map(|&q| {
+                    let (lat, lon) = pl.ll(q);
+                    ((lat * 1e6).round() / 1e6, (lon * 1e6).round() / 1e6)
+                })
+                .collect(),
+            device: r.device,
+            start: r.t_start,
+            end: r.t_end,
+            first_stop: r.first_stop,
+            last_stop: r.last_stop,
+            stops_matched: r.stops_matched,
+        })
+        .collect();
+    trips.sort_by(|a, b| a.start.cmp(&b.start).then(a.device.cmp(&b.device)));
+    (trips, counts)
+}
+
 // ---------------------------------------------------------------- queries
 
 /// The route number, trimmed. None when it cannot be one (empty, too long, or
@@ -1179,6 +1252,29 @@ pub fn bus_days_sql(
     )
 }
 
+/// A [`bus_days_sql`] answer, row by row.
+type BusDayRows = Vec<Vec<String>>;
+/// A bus-day: the device, and its first and last ping carrying the number.
+type BusDay = (String, i64, i64);
+
+/// A [`bus_days_sql`] answer as (device, first, last), at most `limit`, rows
+/// that cannot be a bus-day left out.
+fn bus_days_of(rows: &[Vec<String>], limit: usize) -> Vec<BusDay> {
+    rows.iter()
+        .filter_map(|r| {
+            let (Some(device), Some(first), Some(last)) = (
+                r.first(),
+                r.get(2).and_then(|v| v.parse::<i64>().ok()),
+                r.get(3).and_then(|v| v.parse::<i64>().ok()),
+            ) else {
+                return None;
+            };
+            (!device.is_empty() && !device.contains(';')).then(|| (device.clone(), first, last))
+        })
+        .take(limit)
+        .collect()
+}
+
 /// Step 2: some devices' pings over one stretch of time, averaged to one point
 /// per `bucket_s`, packed one device-hour per row as `t,lat,lon|t,lat,lon|...`.
 /// Pings labelled with another route are left out; unlabelled ones stay (a
@@ -1276,6 +1372,11 @@ fn today(now: i64) -> chrono::NaiveDate {
         .date_naive()
 }
 
+/// Today, as the service days count (Indian days).
+pub fn service_today() -> chrono::NaiveDate {
+    today(chrono::Utc::now().timestamp())
+}
+
 // ---------------------------------------------------------------- service
 
 #[derive(Debug, Clone)]
@@ -1326,6 +1427,7 @@ pub fn settings_from_config(
             password,
             query_timeout: Duration::from_secs(30).min(timeout),
             min_gap: crate::services::clickhouse_reader::DEFAULT_MIN_GAP,
+            max_concurrent: crate::services::clickhouse_reader::DEFAULT_MAX_CONCURRENT,
         },
         table: c
             .table
@@ -1349,8 +1451,8 @@ pub fn settings_from_config(
             .unwrap_or(DEFAULT_PAGE_ROWS)
             .clamp(10, 10_000),
         timeout,
-        // a third of the time for finding bus-days, whatever the timeout
-        bus_days_budget: DEFAULT_BUS_DAYS_BUDGET.min(timeout / 3),
+        // at most half the time for finding bus-days, whatever the timeout
+        bus_days_budget: DEFAULT_BUS_DAYS_BUDGET.min(timeout / 2),
         osrm_reserve: DEFAULT_OSRM_RESERVE.min(timeout / 4),
         min_query_time: MIN_QUERY_TIME,
         params: Params::default(),
@@ -1398,14 +1500,29 @@ struct CacheEntry {
 }
 
 const CACHE_ENTRIES: usize = 256;
+/// Past days' bus-days kept: a week of a few hundred routes.
+const DAY_CACHE_ENTRIES: usize = 4096;
 
 pub struct GpsLine {
     pub settings: GpsLineSettings,
     reader: std::sync::Arc<dyn RowSource>,
     http: reqwest::Client,
-    /// One suggestion at a time per pod: the cluster is shared.
+    /// One suggestion (or day's trips) at a time per pod: the cluster is
+    /// shared. Within one, at most `clickhouse.max_concurrent` queries.
     permit: Semaphore,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// A past day's bus-days for a route, which cannot change: asked once.
+    day_cache: Mutex<HashMap<String, (Instant, BusDayRows)>>,
+}
+
+/// One day's tracks, as step 2 read them.
+#[derive(Debug, Default)]
+struct DayTracks {
+    tracks: BTreeMap<String, Vec<Ping>>,
+    points: usize,
+    pings: u64,
+    /// Reading stopped on the clock before the day was read.
+    budget: bool,
 }
 
 impl std::fmt::Debug for GpsLine {
@@ -1463,6 +1580,7 @@ impl GpsLine {
             http,
             permit: Semaphore::new(1),
             cache: Mutex::new(HashMap::new()),
+            day_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1672,6 +1790,232 @@ impl GpsLine {
         })
     }
 
+    /// Step 1 for one day: its bus-days, busiest first, at most `limit`, as
+    /// [`bus_days_sql`] answers them. A past day's answer cannot change, so it
+    /// is kept and never asked for again. `None` when there was no time left to
+    /// ask, or the cluster ran out of it.
+    #[allow(clippy::too_many_arguments)]
+    async fn day_bus_days(
+        &self,
+        q: &RouteQuery<'_>,
+        spellings: &[String],
+        bbox: &Bbox,
+        date: chrono::NaiveDate,
+        now: i64,
+        limit: usize,
+        until: Instant,
+    ) -> Result<Option<BusDayRows>, GpsFailure> {
+        let s = &self.settings;
+        let past = date < today(now);
+        let key = format!("{}|bus-days|{limit}", Self::cache_key(q, date));
+        if past {
+            if let Some((_, rows)) = self.day_cache.lock().expect("day cache").get(&key) {
+                return Ok(Some(rows.clone()));
+            }
+        }
+        let time = until.saturating_duration_since(Instant::now());
+        if time < s.min_query_time {
+            return Ok(None);
+        }
+        let (a, b) = (day_start(date), (day_start(date) + 86_400).min(now));
+        let sql = bus_days_sql(
+            &s.table,
+            a,
+            b,
+            spellings,
+            bbox,
+            s.params.min_bus_day_pings,
+            limit,
+        );
+        match self.reader.rows(&sql, time).await {
+            Ok(rows) => {
+                if past {
+                    let mut cache = self.day_cache.lock().expect("day cache");
+                    if !cache.contains_key(&key) && cache.len() >= DAY_CACHE_ENTRIES {
+                        if let Some(old) = cache
+                            .iter()
+                            .min_by_key(|(_, (at, _))| *at)
+                            .map(|(k, _)| k.clone())
+                        {
+                            cache.remove(&old);
+                        }
+                    }
+                    cache.insert(key, (Instant::now(), rows.clone()));
+                }
+                Ok(Some(rows))
+            }
+            Err(ClickHouseError::Timeout(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Step 2 for one day: these devices' pings over `span` (their first and
+    /// last labelled ping), with a margin each side, never before
+    /// `bounds.0` nor after `bounds.1`, in stretches of at most `page_rows`
+    /// rows, each read once. Stops at `until`.
+    #[allow(clippy::too_many_arguments)]
+    async fn day_tracks(
+        &self,
+        spellings: &[String],
+        bbox: &Bbox,
+        date: chrono::NaiveDate,
+        devices: &[String],
+        span: (i64, i64),
+        bounds: (i64, i64),
+        until: Instant,
+    ) -> Result<DayTracks, GpsFailure> {
+        let s = &self.settings;
+        let a = day_start(date).max(bounds.0).max(span.0 - SPAN_MARGIN_S);
+        let b = (day_start(date) + 86_400)
+            .min(bounds.1)
+            .min(span.1 + SPAN_MARGIN_S + 1);
+        let mut out = DayTracks::default();
+        for (wa, wb, group, limit) in track_windows(a, b, devices, s.page_rows) {
+            let time = until.saturating_duration_since(Instant::now());
+            if time < s.min_query_time {
+                out.budget = true;
+                break;
+            }
+            let sql = tracks_sql(
+                &s.table,
+                wa,
+                wb,
+                &group,
+                spellings,
+                bbox,
+                s.params.bucket_s,
+                limit,
+            );
+            let rows = match self.reader.rows(&sql, time).await {
+                Ok(rows) => rows,
+                Err(ClickHouseError::Timeout(_)) => {
+                    out.budget = true;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            for r in rows {
+                let (Some(device), Some(n), Some(track)) = (r.first(), r.get(3), r.get(4)) else {
+                    continue;
+                };
+                let parsed = parse_packed(track);
+                out.points += parsed.len();
+                out.pings += n.parse::<u64>().unwrap_or(0);
+                out.tracks.entry(device.clone()).or_default().extend(parsed);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The trips the buses made along a route on `date` (docs section 17.8):
+    /// every run that passed its stops in order, with when it did, which bus
+    /// and its line - steps 1 to 3 for that one day, the busiest
+    /// [`TRIP_BUSES`] buses carrying its number. A past day's answer is kept:
+    /// it cannot change.
+    pub async fn trips_on(
+        &self,
+        q: RouteQuery<'_>,
+        date: chrono::NaiveDate,
+    ) -> Result<Value, GpsFailure> {
+        let spellings = label_spellings(q.short_name);
+        if spellings.is_empty() {
+            return Err(GpsFailure::NoRouteNumber);
+        }
+        if q.stops.len() < 2 {
+            return Err(GpsFailure::NotEnoughStops(q.stops.len()));
+        }
+        let now = chrono::Utc::now().timestamp();
+        let past = date < today(now);
+        let key = format!("{}|trips", Self::cache_key(&q, date));
+        if past {
+            if let (Some(mut answer), _) = self.cached(&key) {
+                answer["evidence"]["cached"] = json!(true);
+                return Ok(answer);
+            }
+        }
+        let s = &self.settings;
+        let deadline = Instant::now() + s.timeout;
+        let until = deadline - Duration::from_secs(1).min(s.timeout / 4);
+        let work = async {
+            let wait = until.saturating_duration_since(Instant::now());
+            let _one_at_a_time = tokio::time::timeout(wait, self.permit.acquire())
+                .await
+                .map_err(|_| GpsFailure::Timeout)?
+                .map_err(|_| GpsFailure::Internal("the GPS permit is closed".into()))?;
+            let bbox = Bbox::around(q.stops, s.params.bbox_margin_m)
+                .ok_or(GpsFailure::NotEnoughStops(q.stops.len()))?;
+            let started = Instant::now();
+            let queries_before = self.reader.sent();
+            let Some(rows) = self
+                .day_bus_days(&q, &spellings, &bbox, date, now, TRIP_BUSES, until)
+                .await?
+            else {
+                return Err(GpsFailure::Timeout);
+            };
+            let buses = bus_days_of(&rows, TRIP_BUSES);
+            let read = match (
+                buses.iter().map(|b| b.1).min(),
+                buses.iter().map(|b| b.2).max(),
+            ) {
+                (Some(first), Some(last)) => {
+                    let devices: Vec<String> = buses.iter().map(|b| b.0.clone()).collect();
+                    self.day_tracks(
+                        &spellings,
+                        &bbox,
+                        date,
+                        &devices,
+                        (first, last),
+                        (i64::MIN, now),
+                        until,
+                    )
+                    .await?
+                }
+                _ => DayTracks::default(),
+            };
+            let tracks: Vec<Track> = read
+                .tracks
+                .into_iter()
+                .map(|(device, pings)| Track { device, pings })
+                .collect();
+            let (trips, counts) = gps_trips(&tracks, q.stops, &s.params);
+            let answer = json!({
+                "route_id": q.route_id,
+                "route_number": q.short_name.trim(),
+                "date": date.to_string(),
+                "stops": q.stops.len(),
+                "trips": trips.iter().map(|t| json!({
+                    "device": t.device,
+                    "start": t.start,
+                    "end": t.end,
+                    "stops_matched": t.stops_matched,
+                    "first_stop_id": q.stops[t.first_stop].stop_id,
+                    "last_stop_id": q.stops[t.last_stop].stop_id,
+                    "encoded_polyline": osrm::encode_polyline(&t.line),
+                })).collect::<Vec<_>>(),
+                "evidence": {
+                    "buses": buses.len(),
+                    "buses_read": tracks.len(),
+                    "runs_seen": counts.runs_seen,
+                    "runs_used": counts.runs_used,
+                    "stop_share": s.params.stop_share,
+                    "pings": read.pings,
+                    "stopped": if read.budget { "budget" } else { "complete" },
+                    "queries": self.reader.sent() - queries_before,
+                    "read_seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+                    "cached": false,
+                },
+            });
+            if past && !read.budget {
+                self.remember(&key, None, Some(answer.clone()));
+            }
+            Ok(answer)
+        };
+        match tokio::time::timeout_at(deadline.into(), work).await {
+            Ok(r) => r,
+            Err(_) => Err(GpsFailure::Timeout),
+        }
+    }
+
     /// Steps 1 to 4, reading until `read_until` at the latest. The flag is
     /// whether reading finished on its own (enough found, or the whole
     /// lookback read) rather than on the clock.
@@ -1690,60 +2034,62 @@ impl GpsLine {
         let queries_before = self.reader.sent();
         let last_day = today(now);
         let lookback_start = day_start(last_day - chrono::Duration::days(i64::from(s.days) - 1));
-        // time left before `until`, or None when too little to start a query
-        let left = |until: Instant| {
-            let d = until.saturating_duration_since(Instant::now());
-            (d >= s.min_query_time).then_some(d)
-        };
+        let at_once = s.clickhouse.max_concurrent.max(1);
 
-        // 1. bus-days, a day at a time, today first: a busy route has enough
-        // in two or three days, and only a quiet one reads further back
+        // 1. bus-days: every day of the lookback, a few at a time, today first
         let step1_until = read_until.min(started + s.bus_days_budget);
-        let mut chosen: Vec<(String, chrono::NaiveDate, i64, i64)> = Vec::new();
-        let mut days_read = 0u32;
-        let mut stopped = "lookback";
-        for k in 0..s.days {
-            if chosen.len() >= s.enough_bus_days.min(s.max_bus_days) {
-                stopped = "enough";
-                break;
+        let per_day = BUS_DAYS_PER_DAY.min(s.max_bus_days);
+        let dates: Vec<chrono::NaiveDate> = (0..s.days)
+            .map(|k| last_day - chrono::Duration::days(i64::from(k)))
+            .collect();
+        let answers: Vec<(chrono::NaiveDate, Result<Option<BusDayRows>, GpsFailure>)> =
+            futures::stream::iter(dates)
+                .map(|date| async move {
+                    let rows = self
+                        .day_bus_days(q, spellings, &bbox, date, now, per_day, step1_until)
+                        .await;
+                    (date, rows)
+                })
+                .buffered(at_once)
+                .collect()
+                .await;
+        let mut read: Vec<(chrono::NaiveDate, Vec<BusDay>)> = Vec::new();
+        let mut unread = 0u32;
+        for (date, rows) in answers {
+            match rows? {
+                Some(rows) => read.push((date, bus_days_of(&rows, per_day))),
+                None => unread += 1,
             }
-            let Some(time) = left(step1_until) else {
-                stopped = "budget";
-                break;
-            };
-            let date = last_day - chrono::Duration::days(i64::from(k));
-            let (a, b) = (day_start(date), (day_start(date) + 86_400).min(now));
-            let want = BUS_DAYS_PER_DAY.min(s.max_bus_days - chosen.len());
-            let sql = bus_days_sql(&s.table, a, b, spellings, &bbox, p.min_bus_day_pings, want);
-            let rows = match self.reader.rows(&sql, time).await {
-                Ok(rows) => rows,
-                Err(ClickHouseError::Timeout(_)) => {
-                    stopped = "budget";
-                    break;
+        }
+        let days_read = read.len() as u32;
+        let first_read = read.iter().map(|(d, _)| *d).min().unwrap_or(last_day);
+        // the bus-days to read: the busiest of each day first, newest day
+        // first, so the line draws on the whole lookback
+        let want = s.enough_bus_days.min(s.max_bus_days);
+        let mut chosen: Vec<(String, chrono::NaiveDate, i64, i64)> = Vec::new();
+        'pick: for rank in 0..per_day {
+            for (date, buses) in &read {
+                if chosen.len() >= want {
+                    break 'pick;
                 }
-                Err(e) => return Err(e.into()),
-            };
-            days_read += 1;
-            for r in rows.iter().take(want) {
-                let (Some(device), Some(first), Some(last)) = (
-                    r.first(),
-                    r.get(2).and_then(|v| v.parse::<i64>().ok()),
-                    r.get(3).and_then(|v| v.parse::<i64>().ok()),
-                ) else {
-                    continue;
-                };
-                if !device.is_empty() && !device.contains(';') {
-                    chosen.push((device.clone(), date, first, last));
+                if let Some((device, first, last)) = buses.get(rank) {
+                    chosen.push((device.clone(), *date, *first, *last));
                 }
             }
         }
-        let first_read = last_day - chrono::Duration::days(i64::from(days_read.max(1)) - 1);
+        let mut stopped = if unread > 0 {
+            "budget"
+        } else if chosen.len() >= want {
+            "enough"
+        } else {
+            "lookback"
+        };
 
-        // 2. their tracks, a day at a time: only around the hours the chosen
-        // buses carried the route number (the sort key is the timestamp, so a
-        // narrower span is fewer rows read), with room for a run that began
-        // before its first labelled ping or ended after its last; each stretch
-        // read once, in answers of at most `page_rows` rows
+        // 2. their tracks, a few days at a time: only around the hours the
+        // chosen buses carried the route number (the sort key is the
+        // timestamp, so a narrower span is fewer rows read), with room for a
+        // run that began before its first labelled ping or ended after its
+        // last; each stretch read once, in answers of at most `page_rows` rows
         let mut by_day: BTreeMap<chrono::NaiveDate, (Vec<String>, i64, i64)> = BTreeMap::new();
         for (device, date, first, last) in &chosen {
             let e = by_day.entry(*date).or_insert((vec![], i64::MAX, i64::MIN));
@@ -1751,57 +2097,52 @@ impl GpsLine {
             e.1 = e.1.min(*first);
             e.2 = e.2.max(*last);
         }
+        let days: Vec<(chrono::NaiveDate, Vec<String>, i64, i64)> = by_day
+            .into_iter()
+            .rev()
+            .map(|(date, (devices, first, last))| (date, devices, first, last))
+            .collect();
+        let day_reads: Vec<Result<DayTracks, GpsFailure>> = futures::stream::iter(&days)
+            .map(|(date, devices, first, last)| {
+                self.day_tracks(
+                    spellings,
+                    &bbox,
+                    *date,
+                    devices,
+                    (*first, *last),
+                    (lookback_start, now),
+                    read_until,
+                )
+            })
+            .buffered(at_once)
+            .collect()
+            .await;
         let mut tracks: BTreeMap<(String, chrono::NaiveDate), Vec<Ping>> = BTreeMap::new();
         let (mut points, mut pings, mut truncated) = (0usize, 0u64, false);
         let mut bus_days_read = 0usize;
-        'days: for (date, (devices, first, last)) in by_day.iter().rev() {
+        for ((date, devices, _, _), day) in days.iter().zip(day_reads) {
+            let day = day?;
             if points >= p.max_points {
                 truncated = true;
                 break;
             }
-            let a = day_start(*date)
-                .max(lookback_start)
-                .max(first - SPAN_MARGIN_S);
-            let b = (day_start(*date) + 86_400)
-                .min(now)
-                .min(last + SPAN_MARGIN_S + 1);
-            for (wa, wb, group, limit) in track_windows(a, b, devices, s.page_rows) {
-                let Some(time) = left(read_until) else {
-                    stopped = "budget";
-                    break 'days;
-                };
-                let sql = tracks_sql(
-                    &s.table, wa, wb, &group, spellings, &bbox, p.bucket_s, limit,
-                );
-                let rows = match self.reader.rows(&sql, time).await {
-                    Ok(rows) => rows,
-                    Err(ClickHouseError::Timeout(_)) => {
-                        stopped = "budget";
-                        break 'days;
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                for r in rows {
-                    let (Some(device), Some(n), Some(track)) = (r.first(), r.get(3), r.get(4))
-                    else {
-                        continue;
-                    };
-                    let parsed = parse_packed(track);
-                    points += parsed.len();
-                    pings += n.parse::<u64>().unwrap_or(0);
-                    tracks
-                        .entry((device.clone(), *date))
-                        .or_default()
-                        .extend(parsed);
-                }
+            if day.budget {
+                stopped = "budget";
+            } else {
+                bus_days_read += devices.len();
             }
-            bus_days_read += devices.len();
+            points += day.points;
+            pings += day.pings;
+            for (device, found) in day.tracks {
+                tracks.insert((device, *date), found);
+            }
         }
         let mut evidence = json!({
             "from": first_read.to_string(),
             "to": last_day.to_string(),
             "days": s.days,
             "days_read": days_read,
+            "days_unread": unread,
             "stopped": stopped,
             "route_number": q.short_name.trim(),
             "stops": q.stops.len(),
@@ -2545,6 +2886,9 @@ pub mod tests {
         log: Mutex<Vec<(String, Duration)>>,
         overflow: std::sync::atomic::AtomicBool,
         sent: std::sync::atomic::AtomicU64,
+        /// Queries being answered now, and the most there were at once.
+        out: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
     }
 
     fn numbers(sql: &str, pattern: &str) -> Vec<i64> {
@@ -2562,14 +2906,19 @@ pub mod tests {
             sql: &str,
             limit: Duration,
         ) -> Result<Vec<Vec<String>>, ClickHouseError> {
+            use std::sync::atomic::Ordering::SeqCst;
             crate::services::clickhouse_reader::assert_read_only(sql).unwrap();
-            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.sent.fetch_add(1, SeqCst);
             self.log.lock().unwrap().push((sql.to_string(), limit));
+            let now_out = self.out.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(now_out, SeqCst);
             if self.latency > limit {
                 tokio::time::sleep(limit).await;
+                self.out.fetch_sub(1, SeqCst);
                 return Err(ClickHouseError::Timeout(limit.as_secs()));
             }
             tokio::time::sleep(self.latency).await;
+            self.out.fetch_sub(1, SeqCst);
             let t = numbers(sql, r"toDateTime\((\d+)\)");
             let (a, b) = (t[0], t[1]);
             let rows_limit = *numbers(sql, r"LIMIT (\d+)").last().unwrap() as usize;
@@ -2667,6 +3016,8 @@ pub mod tests {
             log: Mutex::new(vec![]),
             overflow: Default::default(),
             sent: Default::default(),
+            out: Default::default(),
+            most: Default::default(),
         }
     }
 
@@ -2678,6 +3029,7 @@ pub mod tests {
                 password: None,
                 query_timeout: Duration::from_secs(30),
                 min_gap: Duration::ZERO,
+                max_concurrent: 3,
             },
             table: DEFAULT_TABLE.into(),
             days: 14,
@@ -2724,35 +3076,161 @@ pub mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn a_busy_route_stops_going_back_once_it_has_enough() {
+    async fn a_busy_route_draws_on_every_day_of_the_week() {
         let now = chrono::Utc::now().timestamp();
-        let rows = Arc::new(fake(now, &(0..14).collect::<Vec<_>>(), 5, Duration::ZERO));
-        let (stage, complete, _) =
-            read_with(rows.clone(), settings_for_tests(), Duration::from_secs(30)).await;
+        let rows = Arc::new(fake(now, &(0..7).collect::<Vec<_>>(), 5, Duration::ZERO));
+        let mut settings = settings_for_tests();
+        settings.days = 7;
+        let (stage, complete, _) = read_with(rows.clone(), settings, Duration::from_secs(30)).await;
         let ev = evidence(&stage);
         assert!(matches!(stage, Stage::Line { .. }), "{ev}");
         assert!(complete);
-        // 4 a day: three days make 12 - today's may be short if it is early
+        // every day read, and twelve bus-days taken across them
+        assert_eq!(ev["days_read"], 7, "{ev}");
         assert_eq!(ev["stopped"], "enough", "{ev}");
-        assert!((3..=4).contains(&ev["days_read"].as_u64().unwrap()), "{ev}");
-        assert!(ev["bus_days"].as_u64().unwrap() >= 12, "{ev}");
+        assert_eq!(ev["bus_days"], 12, "{ev}");
         let log = rows.log.lock().unwrap();
-        let bus_days: Vec<&String> = log
+        // each day asked for once, one day each
+        let mut starts: Vec<i64> = log
             .iter()
             .map(|(q, _)| q)
             .filter(|q| !q.contains("arrayStringConcat"))
-            .collect();
-        assert_eq!(bus_days.len() as u64, ev["days_read"].as_u64().unwrap());
-        // newest first, one day each
-        let starts: Vec<i64> = bus_days
-            .iter()
             .map(|q| numbers(q, r"toDateTime\((\d+)\)")[0])
             .collect();
-        assert_eq!(starts[0], day_start(today(now)));
-        for pair in starts.windows(2) {
-            assert_eq!(pair[0] - pair[1], 86_400);
-        }
+        starts.sort();
+        let week: Vec<i64> = (0..7)
+            .rev()
+            .map(|k| day_start(today(now) - chrono::Duration::days(k)))
+            .collect();
+        assert_eq!(starts, week);
+        // the busiest bus of each day first: tracks from the whole week, not
+        // its first three days (today's buses may not have run yet)
+        let track_days: BTreeSet<i64> = log
+            .iter()
+            .filter(|(q, _)| q.contains("arrayStringConcat"))
+            .map(|(q, _)| {
+                let a = numbers(q, r"toDateTime\((\d+)\)")[0];
+                a - (a + DAY_OFFSET_S).rem_euclid(86_400)
+            })
+            .collect();
+        assert!(track_days.len() >= 6, "{track_days:?}");
         assert!(!rows.overflow.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_week_is_read_three_days_at_a_time() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = Arc::new(fake(
+            now,
+            &(0..7).collect::<Vec<_>>(),
+            5,
+            Duration::from_millis(200),
+        ));
+        let mut settings = settings_for_tests();
+        settings.days = 7;
+        let (stage, complete, _) = read_with(rows.clone(), settings, Duration::from_secs(30)).await;
+        let ev = evidence(&stage);
+        assert!(complete, "{ev}");
+        assert_eq!(ev["days_read"], 7, "{ev}");
+        assert_eq!(
+            rows.most.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "three queries out at once, never more"
+        );
+        // 7 day queries and a track query per day, 200 ms each: one at a
+        // time would be 2.8 s or more
+        let queries = ev["queries"].as_u64().unwrap();
+        assert!(queries >= 13, "{ev}");
+        assert!(ev["read_seconds"].as_f64().unwrap() < 2.0, "{ev}");
+    }
+
+    #[tokio::test]
+    async fn a_past_day_is_asked_for_once() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = Arc::new(fake(now, &(0..7).collect::<Vec<_>>(), 5, Duration::ZERO));
+        let mut settings = settings_for_tests();
+        settings.days = 7;
+        let gps = GpsLine::with_source(settings, rows.clone()).unwrap();
+        let stops = stops_along(&corridor(), "S");
+        let q = RouteQuery {
+            gtfs_id: "f",
+            route_id: "r",
+            short_name: "21G",
+            stops: &stops,
+        };
+        let spellings = label_spellings("21G");
+        let asked = || {
+            rows.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(q, _)| !q.contains("arrayStringConcat"))
+                .count()
+        };
+        let until = || Instant::now() + Duration::from_secs(30);
+        gps.read_and_build(&q, &spellings, now, until())
+            .await
+            .unwrap();
+        assert_eq!(asked(), 7);
+        let (stage, complete) = gps
+            .read_and_build(&q, &spellings, now, until())
+            .await
+            .unwrap();
+        assert!(complete);
+        assert_eq!(evidence(&stage)["days_read"], 7);
+        // only today is asked for again: it can still change
+        assert_eq!(asked(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_days_trips_are_the_runs_that_passed_the_stops_in_order() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = Arc::new(fake(now, &[1], 5, Duration::ZERO));
+        let gps = GpsLine::with_source(settings_for_tests(), rows.clone()).unwrap();
+        let stops = stops_along(&corridor(), "S");
+        let q = || RouteQuery {
+            gtfs_id: "f",
+            route_id: "r",
+            short_name: "21G",
+            stops: &stops,
+        };
+        let yesterday = today(now) - chrono::Duration::days(1);
+        let answer = gps.trips_on(q(), yesterday).await.unwrap();
+        assert_eq!(answer["date"], yesterday.to_string());
+        assert_eq!(answer["evidence"]["stopped"], "complete", "{answer}");
+        let trips = answer["trips"].as_array().unwrap();
+        // the forward runs of the corridor: a, b, c and d twice, e once; the
+        // runs back, the variant and the parallel road are not this route
+        assert_eq!(trips.len(), 9, "{answer}");
+        let need = (stops.len() as f64 * Params::default().stop_share).ceil() as u64;
+        let mut last_start = i64::MIN;
+        for t in trips {
+            let (start, end) = (t["start"].as_i64().unwrap(), t["end"].as_i64().unwrap());
+            assert!(
+                start < end && start >= last_start,
+                "in the order they started: {t}"
+            );
+            last_start = start;
+            assert!(start >= day_start(yesterday), "{t}");
+            assert!(t["stops_matched"].as_u64().unwrap() >= need, "{t}");
+            assert!(["dev-a", "dev-b", "dev-c", "dev-d", "dev-e"]
+                .contains(&t["device"].as_str().unwrap()));
+            let line = osrm::decode_polyline(t["encoded_polyline"].as_str().unwrap()).unwrap();
+            assert!(line.len() >= 2, "{t}");
+        }
+        // a past day's trips are kept: asked again, nothing is read
+        let sent = rows.sent();
+        let again = gps.trips_on(q(), yesterday).await.unwrap();
+        assert_eq!(again["evidence"]["cached"], true);
+        assert_eq!(again["trips"], answer["trips"]);
+        assert_eq!(rows.sent(), sent);
+        // a day no bus ran: no trips, and no error
+        let quiet = gps
+            .trips_on(q(), today(now) - chrono::Duration::days(3))
+            .await
+            .unwrap();
+        assert_eq!(quiet["trips"], json!([]));
+        assert_eq!(quiet["evidence"]["buses"], 0);
     }
 
     #[tokio::test]
@@ -2789,8 +3267,10 @@ pub mod tests {
         let ev = evidence(&stage);
         assert!(!complete, "a read cut short is not complete: {ev}");
         assert_eq!(ev["stopped"], "budget", "{ev}");
+        // three at a time: about three rounds of 250 ms in 900 ms
         let read = ev["days_read"].as_u64().unwrap();
-        assert!((2..=5).contains(&read), "{ev}");
+        assert!((6..=12).contains(&read), "{ev}");
+        assert_eq!(read + ev["days_unread"].as_u64().unwrap(), 14, "{ev}");
         assert!(took <= budget + Duration::from_millis(300), "{took:?}");
         // each query was allowed no more than the time that was left
         for (q, limit) in rows.log.lock().unwrap().iter() {

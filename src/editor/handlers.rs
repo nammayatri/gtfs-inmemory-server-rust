@@ -903,16 +903,7 @@ pub async fn polyline_gps(
 ) -> EditorResult<HttpResponse> {
     let (g, route_id) = path.into_inner();
     let ctx = auth::require_feed(&req, &st, &g, Role::Editor).await?;
-    let unavailable =
-        |why: String| EditorError::new(StatusCode::SERVICE_UNAVAILABLE, "gps_unavailable", why);
-    let Some(gps) = st.gps_line.clone() else {
-        return Err(unavailable(
-            "map lines from GPS are not set up on this server".into(),
-        ));
-    };
-    if !gps.serves(&g) {
-        return Err(unavailable(format!("there are no GPS pings for feed {g}")));
-    }
+    let gps = gps_for(&st, &g)?;
     let detail = route_for_line(&st, &ctx, &g, &route_id, q.change_set).await?;
     let stops = gps_line::served_stops(&detail);
     let short_name = detail["short_name"].as_str().unwrap_or("").to_string();
@@ -924,18 +915,87 @@ pub async fn polyline_gps(
     };
     match gps.suggest(st.osrm_url.as_deref(), asked).await {
         Ok(v) => ok(v),
-        Err(GpsFailure::NoRouteNumber) => Err(EditorError::new(
+        Err(f) => Err(gps_error(f, &short_name)),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GpsTripsQuery {
+    /// `YYYY-MM-DD`, an Indian service day; today when left out.
+    date: Option<String>,
+}
+
+/// The trips the buses made along a route on one day, from their GPS (docs
+/// section 17.8): every run that passed its live stops in order, with when,
+/// which bus and its line. Reads only; nothing is saved.
+pub async fn route_gps_trips(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+    q: web::Query<GpsTripsQuery>,
+) -> EditorResult<HttpResponse> {
+    let (g, route_id) = path.into_inner();
+    let ctx = auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let gps = gps_for(&st, &g)?;
+    let today = gps_line::service_today();
+    let earliest = today - chrono::Duration::days(gps_line::TRIPS_LOOKBACK_DAYS - 1);
+    let date = match q.date.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        None => today,
+        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| {
+            EditorError::bad_request("invalid_date", format!("{d:?} is not a date (YYYY-MM-DD)"))
+        })?,
+    };
+    if date > today || date < earliest {
+        return Err(EditorError::bad_request(
+            "invalid_date",
+            format!("the trips of a day from {earliest} to {today} can be read"),
+        ));
+    }
+    let detail = route_for_line(&st, &ctx, &g, &route_id, None).await?;
+    let stops = gps_line::served_stops(&detail);
+    let short_name = detail["short_name"].as_str().unwrap_or("").to_string();
+    let asked = gps_line::RouteQuery {
+        gtfs_id: &g,
+        route_id: &route_id,
+        short_name: &short_name,
+        stops: &stops,
+    };
+    match gps.trips_on(asked, date).await {
+        Ok(v) => ok(v),
+        Err(f) => Err(gps_error(f, &short_name)),
+    }
+}
+
+/// The feed's GPS reader, or why there is none.
+fn gps_for(st: &Data, g: &str) -> EditorResult<std::sync::Arc<gps_line::GpsLine>> {
+    let unavailable =
+        |why: String| EditorError::new(StatusCode::SERVICE_UNAVAILABLE, "gps_unavailable", why);
+    let Some(gps) = st.gps_line.clone() else {
+        return Err(unavailable(
+            "map lines from GPS are not set up on this server".into(),
+        ));
+    };
+    if !gps.serves(g) {
+        return Err(unavailable(format!("there are no GPS pings for feed {g}")));
+    }
+    Ok(gps)
+}
+
+/// What a reading of the GPS that gave nothing answers.
+fn gps_error(failure: GpsFailure, short_name: &str) -> EditorError {
+    match failure {
+        GpsFailure::NoRouteNumber => EditorError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "gps_no_route_number",
             "this route has no route number to find its buses by",
-        )),
-        Err(GpsFailure::NotEnoughStops(n)) => Err(EditorError::new(
+        ),
+        GpsFailure::NotEnoughStops(n) => EditorError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "gps_not_enough_stops",
             format!("the route has {n} stop(s) with a position; a line from GPS needs two"),
         )
-        .with_details(json!({"stops": n}))),
-        Err(GpsFailure::NotEnoughRuns(counts)) => {
+        .with_details(json!({"stops": n})),
+        GpsFailure::NotEnoughRuns(counts) => {
             let used = counts["runs_used"].as_u64().unwrap_or(0);
             let seen = counts["runs_seen"].as_u64().unwrap_or(0);
             let need = counts["min_runs"].as_u64().unwrap_or(0);
@@ -947,32 +1007,32 @@ pub async fn polyline_gps(
             );
             if counts["stopped"] == "budget" {
                 message.push_str(
-                    ". Reading stopped early to answer in time; asking again usually reads further",
+                    ". Reading stopped early to answer in time; asking again reads the days not yet read",
                 );
             }
-            Err(EditorError::new(
+            EditorError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "gps_not_enough_runs",
                 message,
             )
-            .with_details(counts))
+            .with_details(counts)
         }
-        Err(GpsFailure::Timeout) => Err(EditorError::new(
+        GpsFailure::Timeout => EditorError::new(
             StatusCode::GATEWAY_TIMEOUT,
             "gps_timeout",
             "reading the GPS pings took too long; try again in a minute",
-        )),
-        Err(GpsFailure::Query(why)) => {
+        ),
+        GpsFailure::Query(why) => {
             tracing::error!(tag = "[GTFS EDITOR GPS]", error = %why);
-            Err(EditorError::new(
+            EditorError::new(
                 StatusCode::BAD_GATEWAY,
                 "gps_query_failed",
                 format!("the GPS pings could not be read: {why}"),
-            ))
+            )
         }
-        Err(GpsFailure::Internal(why)) => {
+        GpsFailure::Internal(why) => {
             tracing::error!(tag = "[GTFS EDITOR GPS]", error = %why);
-            Err(EditorError::internal("the GPS query was refused"))
+            EditorError::internal("the GPS query was refused")
         }
     }
 }

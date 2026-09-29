@@ -19,11 +19,13 @@
 //!  3. A statement holding a `;` anywhere is refused, so nothing can be
 //!     smuggled in behind one.
 //!
-//! It is also a shared cluster, so the client is unhurried on purpose: one
-//! query at a time per reader (a pod has one), a minimum gap between queries,
-//! a server-side time ceiling on each (`max_execution_time`, so a runaway
-//! query is killed at the server rather than merely abandoned by us), two
-//! threads and a low priority.
+//! It is also a shared cluster, so the client is unhurried on purpose: at most
+//! [`DEFAULT_MAX_CONCURRENT`] queries at a time per reader (a pod has one), a
+//! minimum gap between two queries starting, a server-side time ceiling on
+//! each (`max_execution_time`, so a runaway query is killed at the server
+//! rather than merely abandoned by us), two threads each and a low priority.
+//! (It was one query at a time; three, so a week of days can be read inside
+//! the 30 s the load balancer in front of the editor waits - section 17.)
 //!
 //! Transport notes learned against this deployment and encoded here: JSON
 //! output formats stall and never return, so answers come back as
@@ -47,10 +49,13 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
-/// The politeness floor between two queries against the shared cluster.
+/// The politeness floor between two queries starting against the shared
+/// cluster.
 pub const DEFAULT_MIN_GAP: Duration = Duration::from_millis(350);
+/// Queries one reader has out at once.
+pub const DEFAULT_MAX_CONCURRENT: usize = 3;
 
 #[derive(Clone)]
 pub struct ClickHouseSettings {
@@ -63,6 +68,8 @@ pub struct ClickHouseSettings {
     /// request itself gives up a few seconds after it.
     pub query_timeout: Duration,
     pub min_gap: Duration,
+    /// Queries out at once; at least one.
+    pub max_concurrent: usize,
 }
 
 impl std::fmt::Debug for ClickHouseSettings {
@@ -73,6 +80,7 @@ impl std::fmt::Debug for ClickHouseSettings {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("query_timeout", &self.query_timeout)
             .field("min_gap", &self.min_gap)
+            .field("max_concurrent", &self.max_concurrent)
             .finish()
     }
 }
@@ -212,8 +220,10 @@ fn unescape(cell: &str) -> String {
 pub struct ClickHouseReader {
     settings: ClickHouseSettings,
     http: reqwest::Client,
-    /// Held for the whole of a query: one at a time, and the time the last
-    /// one finished, for the gap.
+    /// One per query out: at most `max_concurrent`.
+    slots: Semaphore,
+    /// When the last query started, for the gap; held only while a query
+    /// waits its turn to start.
     gate: Mutex<Option<Instant>>,
     queries: std::sync::atomic::AtomicU64,
 }
@@ -239,12 +249,15 @@ impl ClickHouseReader {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("cannot build the ClickHouse client: {}", e.without_url()))?;
+        let max_concurrent = settings.max_concurrent.max(1);
         Ok(Self {
             settings: ClickHouseSettings {
                 url: url.trim_end_matches('/').to_string() + "/",
+                max_concurrent,
                 ..settings
             },
             http,
+            slots: Semaphore::new(max_concurrent),
             gate: Mutex::new(None),
             queries: Default::default(),
         })
@@ -268,12 +281,20 @@ impl ClickHouseReader {
         limit: Duration,
     ) -> Result<Vec<Vec<String>>, ClickHouseError> {
         let body = assert_read_only(sql)?;
-        let mut last = self.gate.lock().await;
-        if let Some(at) = *last {
-            let wait = self.settings.min_gap.saturating_sub(at.elapsed());
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| ClickHouseError::ReadOnly("the reader is closed".into()))?;
+        {
+            let mut last = self.gate.lock().await;
+            if let Some(at) = *last {
+                let wait = self.settings.min_gap.saturating_sub(at.elapsed());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
             }
+            *last = Some(Instant::now());
         }
         let ceiling = self.settings.query_timeout.min(limit).as_secs().max(1);
         let sent = self
@@ -317,7 +338,6 @@ impl ClickHouseReader {
                 }
             }
         };
-        *last = Some(Instant::now());
         result
     }
 
@@ -456,6 +476,7 @@ mod tests {
             password: Some("hunter2-very-secret".into()),
             query_timeout: Duration::from_secs(5),
             min_gap: DEFAULT_MIN_GAP,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
         };
         let reader = ClickHouseReader::new(s.clone()).unwrap();
         for text in [format!("{s:?}"), format!("{reader:?}")] {
@@ -520,6 +541,7 @@ mod tests {
             password: Some("pw".into()),
             query_timeout: Duration::from_secs(30),
             min_gap: Duration::ZERO,
+            max_concurrent: 1,
         };
         // less than the ceiling: that is what the server is told
         let (url, server) = one_shot("1\n").await;
@@ -576,6 +598,7 @@ mod tests {
             password: Some("pw".into()),
             query_timeout: Duration::from_secs(7),
             min_gap: DEFAULT_MIN_GAP,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
         })
         .unwrap();
         let rows = reader.query("SELECT 7, 'x' LIMIT 1").await.unwrap();
@@ -619,6 +642,7 @@ mod tests {
             password: Some("pw".into()),
             query_timeout: Duration::from_secs(2),
             min_gap: Duration::ZERO,
+            max_concurrent: 1,
         })
         .unwrap();
         match reader.query("SELECT 1 LIMIT 1").await {
@@ -626,6 +650,93 @@ mod tests {
                 assert!(!why.contains(&port.to_string()), "{why}");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// A server answering every request after `delay`: how many were being
+    /// answered at once, at most, and when each arrived.
+    async fn slow_server(
+        delay: Duration,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<Instant>>>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let arrived = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (most2, arrived2) = (most.clone(), arrived.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                arrived2.lock().unwrap().push(Instant::now());
+                let (now, most) = (now.clone(), most2.clone());
+                tokio::spawn(async move {
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(n, Ordering::SeqCst);
+                    let mut chunk = [0u8; 4096];
+                    let mut buf = Vec::new();
+                    while !String::from_utf8_lossy(&buf).contains("TabSeparated") {
+                        let k = sock.read(&mut chunk).await.unwrap();
+                        if k == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..k]);
+                    }
+                    tokio::time::sleep(delay).await;
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n1\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}"), most, arrived)
+    }
+
+    #[tokio::test]
+    async fn at_most_max_concurrent_queries_are_out_and_their_starts_are_spaced() {
+        for (limit, gap) in [(3usize, Duration::from_millis(60)), (1, Duration::ZERO)] {
+            let (url, most, arrived) = slow_server(Duration::from_millis(400)).await;
+            let reader = std::sync::Arc::new(
+                ClickHouseReader::new(ClickHouseSettings {
+                    url,
+                    user: "reader".into(),
+                    password: None,
+                    query_timeout: Duration::from_secs(5),
+                    min_gap: gap,
+                    max_concurrent: limit,
+                })
+                .unwrap(),
+            );
+            let started = Instant::now();
+            let asked = (0..5).map(|_| {
+                let reader = reader.clone();
+                async move { reader.query("SELECT 1 LIMIT 1").await.unwrap() }
+            });
+            futures::future::join_all(asked).await;
+            let took = started.elapsed();
+            assert_eq!(
+                most.load(std::sync::atomic::Ordering::SeqCst),
+                limit,
+                "limit {limit}"
+            );
+            if limit == 3 {
+                // five queries of 400 ms, three at a time: two rounds, not five
+                assert!(took < Duration::from_millis(1_400), "{took:?}");
+                let mut at = arrived.lock().unwrap().clone();
+                at.sort();
+                for pair in at.windows(2) {
+                    assert!(pair[1] - pair[0] >= gap - Duration::from_millis(5));
+                }
+            } else {
+                assert!(took >= Duration::from_millis(2_000), "{took:?}");
+            }
         }
     }
 }

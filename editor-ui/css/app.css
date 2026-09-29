@@ -787,3 +787,13 @@ button.tab[aria-pressed="true"] { background: var(--action); border-color: var(-
 .report .samples { margin: 0; padding-left: 16px; font-size: 13px; color: var(--muted); }
 fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var(--rule); border-radius: 8px; padding: 8px 12px; }
 .calendar-table code { letter-spacing: 2px; }
+
+/* a route's trips from GPS (docs section 17.7) */
+.gps-trips .field-row { align-items: end; }
+.gps-trips-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.gps-trips-table th, .gps-trips-table td { padding: 5px 8px; text-align: left; border-bottom: 1px solid var(--rule); }
+.gps-trips-table th.num, .gps-trips-table td.num { text-align: right; }
+.gps-trips-table tbody tr { cursor: pointer; }
+.gps-trips-table tbody tr:hover, .gps-trips-table tbody tr.selected { background: var(--action-tint); }
+.gps-trips-table tbody tr.selected td { font-weight: 600; }
+.trip-swatch { display: inline-block; width: 18px; height: 5px; border-radius: 3px; vertical-align: middle; }
