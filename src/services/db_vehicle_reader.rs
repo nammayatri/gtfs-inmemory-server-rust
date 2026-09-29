@@ -83,6 +83,9 @@ pub trait VehicleDataReader: Send + Sync {
         trip_number: i32,
     ) -> AppResult<Vec<VehicleData>>;
     async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>>;
+
+    /// Service type only: same waybill priority as `get_vehicle_data`, without the trip/schedule queries.
+    async fn get_vehicle_service_type(&self, vehicle_no: &str) -> AppResult<Option<String>>;
 }
 
 // Mock implementation for local testing without a database
@@ -107,6 +110,12 @@ impl VehicleDataReader for MockDBVehicleReader {
         _vehicle_no: &str,
         _trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn get_vehicle_service_type(&self, _vehicle_no: &str) -> AppResult<Option<String>> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
         ))
@@ -1056,6 +1065,41 @@ impl DBVehicleReader {
         Ok((None, WaybillStatus::NotFound))
     }
 
+    async fn get_vehicle_service_type_impl(&self, vehicle_no: &str) -> AppResult<Option<String>> {
+        let query = r#"
+            SELECT w.service_type
+            FROM waybills w
+            WHERE w.vehicle_no = $1
+              AND w.service_type IS NOT NULL
+            ORDER BY
+                CASE
+                    WHEN w.deleted = false AND w.status = 'Online'    THEN 0
+                    WHEN w.deleted = false AND w.status = 'Processed' THEN 1
+                    WHEN w.deleted = false AND w.status = 'New'       THEN 2
+                    WHEN w.deleted = false AND w.status = 'Closed'    THEN 3
+                    WHEN w.deleted = false AND w.status = 'Audited'   THEN 4
+                    ELSE 5
+                END,
+                w.updated_at DESC
+            LIMIT 1
+        "#;
+
+        match sqlx::query_scalar::<_, String>(query)
+            .bind(vehicle_no)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                error!(
+                    "Service type waybill query failed for {}: {}",
+                    vehicle_no, e
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Handle flexi trips using waybill_id binding
     async fn handle_flexi_trips(
         &self,
@@ -1437,6 +1481,10 @@ impl DBVehicleReader {
 
 #[async_trait]
 impl VehicleDataReader for DBVehicleReader {
+    async fn get_vehicle_service_type(&self, vehicle_no: &str) -> AppResult<Option<String>> {
+        self.get_vehicle_service_type_impl(vehicle_no).await
+    }
+
     async fn get_vehicle_data(
         &self,
         vehicle_no: &str,
