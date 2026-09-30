@@ -600,6 +600,9 @@ Settled while implementing:
 | POST | `/change-sets/{id}/reject` | `{comment}` (required) submitted → rejected; approver+, 403 `own_change_set` for the submitter, no override |
 | POST | `/change-sets/{id}/commit` | approved → committed; approver+, 403 `own_change_set` for the submitter — unless the set is `self_approved` and they are (still) an admin; see below |
 | POST | `/change-sets/{id}/discard` | not committed/discarded → discarded; its creator or an admin |
+| POST | `/feeds/{g}/change-sets/submit` | `{change_set_ids: [..]}` — several drafts of feed `g` submitted in one call and one transaction; editor+ on the feed. Each follows `/submit`'s rules. → `{submitted: [id], failed: [{change_set_id, stage: "submit", approved: false, error: {code, message, details}}]}`: a draft that cannot be submitted is rolled back to its own savepoint and reported, and the rest are submitted. At most 100 ids, duplicates dropped; none is 400 `no_change_sets`; a set of another feed fails as `change_set_not_found` |
+| POST | `/feeds/{g}/change-sets/approve` | `{change_set_ids: [..], comment?, self_approve?: bool}` — several submitted sets of feed `g` approved in one call and one transaction; approver+ on the feed. Each follows `/approve`'s rules (`self_approve` covers only the sets the caller submitted). → `{approved: [id], failed: [{change_set_id, stage: "approve", approved: false, error: {code, message, details}}]}`: a set that cannot be approved is reported and the rest are. At most 100 ids, duplicates dropped; none is 400 `no_change_sets`; a set of another feed fails as `change_set_not_found` |
+| POST | `/feeds/{g}/change-sets/commit` | `{change_set_ids: [..], approve?: bool, self_approve?: bool}` — several sets committed in **one transaction as one feed version**: pods reload once and every webhook (`feed_committed`, `feed_in_sync`: the Jenkins build) fires once, however many sets go live. Applied in the order given, each on top of the ones before, with `/commit`'s checks; with `approve` submitted sets are approved first in the same transaction. → `{committed: [id], failed: [{change_set_id, stage: "approve"\|"commit", approved, error}], feed_version}`: a failed set is rolled back alone and the rest go live; one approved but then not committed (`approved: true`) stays approved. `feed_version` is null, and the version does not move, when nothing committed. A serialization failure retries the whole batch |
 
 Editing a set that is not a draft is 409 `change_set_not_draft`.
 
@@ -4243,6 +4246,173 @@ edit blocking submit; two drafts editing one stage, the second conflicting;
 `stage_in_use`, `stop_in_use`, `stop_in_stage`; a stop merge moving the stage rows
 and bumping the stage; and a route edited outside its stages refusing a stage
 edit until its stages are set again.
+
+### 19.0 Where a route's stops come from
+
+Every reader takes a route's stops from **`gtfs_route_stop`**: the GTFS export
+(`feed_io::load_model`), the in-memory loader (`gtfs_db_source`), nandi's build,
+merges, reviews and the public APIs. None of them reads the stage tables, and
+`stage_no`/`stage_name` are never exported to GTFS.
+
+That table is not a second source of truth. It is the stages, flattened:
+
+```sql
+CREATE VIEW gtfs_route_stop_from_stages AS ...   -- db/gtfs_editor/0025
+-- the route's stages in order, each stage's stops in order, for the list the
+-- route is wearing (its normal one, or the temporary route it is running)
+```
+
+The two are kept identical: a stage edit rewrites the route's rows, and refuses
+a route where they have come apart (`route_out_of_sync`); the backfill rewrites
+every route it changes in the same transaction. On chennai_bus the view and the
+table are **88,422 rows with 0 differing either way**, and
+`tests/editor_stage_review_flow.rs` asserts it.
+
+**Why the readers do not simply read the stages.** `stop_times.txt` carries ten
+per-stop fields - `pickup_type`, `drop_off_type`, `timepoint`,
+`continuous_pickup`, `continuous_drop_off`, `shape_dist_traveled`,
+`stop_headsign`, `stop_sequence` and the two booking rules - and a stage has
+nowhere to put any of them; a route not built from stages has no stage rows at
+all; and `gtfs_route_stop` also carries `pattern_key` for feeds whose trips are
+in the tables, which stages do not model. Deriving the mapping at read time
+would drop all of that. Moving those fields onto `gtfs_stage_stop` is what it
+would take to make the stages the only source, and nothing needs it yet: on
+chennai_bus all ten are empty.
+
+### 19.1 Stages to review: the routes do not agree about a name (2026-09-29)
+
+The backfill (`scripts/backfill_stages.py`, docs/stage-backfill.md) makes **one
+stage per fare-stage name and direction**. Its stops are the list **the most
+routes give it**, because `gtfs_route_stop` was filled route by route and the
+routes do not always agree - one lists 10 stops for a stage, the next 9, a third
+only the fare boundary.
+
+That is a guess, and it is treated as one. Every name the routes disagree about
+is raised in `gtfs_stage_review` carrying **every list they give**, and a person
+settles it: they build the stage's real stop list in the dashboard, which goes
+into a draft like any other edit. **Committing that draft is what updates the
+stop mapping**, for every route using the stage.
+
+| `reason` | what the routes do | what settles it |
+|---|---|---|
+| `head_differs` | begin it at stops with *different names* | the name covers more than one place: build the right list, or name them apart |
+| `head_duplicate_stops` | begin it at different stop records that all carry *one* name | merge the stops (section 8.2); the stage comes right on its own |
+| `stretch_differs` | agree where it begins, differ on the stops after | decide which stops it really has |
+
+A name the routes spell two ways but agree the stops of is **not** raised: the
+backfill writes one spelling everywhere, so nothing is left to decide.
+
+**`impact`**: how many stop calls the guess gets wrong here - for every route
+that does not have the chosen list, the stops it gains plus the stops it loses.
+It is what makes the queue finishable, because the damage is very unevenly
+spread: on chennai_bus 776 of 2,037 rows change 20 calls or more and hold 91% of
+the whole difference. The list is ordered by it, the summary's `worth_a_look`
+counts it, and `?min_impact=N` filters by it. The dashboard opens on those and
+keeps the rest a click away.
+
+Two places record it, kept in step:
+
+- **`gtfs_stage.review`** — the reason, or NULL when nobody need look. It rides
+  on the stage, so the chip shows wherever the stage does, and
+  `GET /feeds/{g}/stages?review=any|none|<reason>` filters by it.
+- **`gtfs_stage_review`** — the queue, one row per **stage name and direction**.
+  Its `evidence` holds `candidates`: each list the routes give, with the stops,
+  their names, which routes give it, and which one the backfill chose. That is
+  what the dashboard puts in front of the reviewer.
+
+Closing a row clears the flag on the stage in the same transaction; reopening
+puts it back.
+
+```
+GET  /feeds/{g}/stage-reviews?status=&reason=&q=&min_impact=   the queue
+GET  /feeds/{g}/stage-reviews/summary              how much is left, and of what
+GET  /stage-reviews/{id}                           it, and the stage in full
+POST /stage-reviews/{id}/close                     {decision, note?, change_set?}
+POST /stage-reviews/{id}/reopen
+```
+
+`decision` is `fixed` (the change is in a draft, which `change_set` may name) or
+`confirmed` (nothing should change - a note is required, so the next person knows
+how it was decided). Statuses: `pending`, `fixed`, `confirmed`, `superseded`; a
+later backfill supersedes the rows nobody has closed and leaves the closed ones,
+which are the record of a decision. Both actions take the editor role and are
+audited (`stage_review_closed`, `stage_review_reopened`).
+
+**Dashboard.** *Stages to review* in the nav, with a count; the list filters by
+status and reason. Opening one gives the reviewer the stage's stops as a list
+they build:
+
+- the stops in order, each with move up, move down and remove;
+- **every list the routes give**, commonest first, with which routes give it and
+  a *Use this list* button that takes it whole;
+- **Add a stop** — the same stop search the rest of the editor uses, for a stop
+  no route recorded;
+- the stage's name, editable beside it.
+
+*Save these stops to a draft* puts one `stage/update` in the open draft. Nothing
+reaches passengers until somebody else approves that draft and it is committed,
+as with every other change - there is deliberately no way to change the feed from
+this screen. Then *Mark fixed* (naming the draft) or *Leave it alone* (with a
+note). For `head_duplicate_stops` the screen links straight to the stop merge
+with the duplicate head stops preselected, since renaming would be the wrong fix.
+
+Tests: `tests/editor_stage_review_flow.rs`, registered in
+`scripts/editor_flow_test.sh`; and `scripts/backfill_stages.py --self-test`
+covers which list is chosen and why a name is raised.
+
+**Splitting a list off** (`stage/split`). The other way out of a disagreement:
+these routes are not wrong, they are a different stage. The reviewer picks one of
+the lists and gives it a stage of its own — a name, a direction (the one they are
+looking at, by default) and that list's stops — and the routes that gave it come
+off the stage they were on, which keeps every other route.
+
+It is **one change and one request**, however many routes move. The server mints
+the stage id (`stg_` + 10 hex), creates the stage, repoints exactly the routes
+named, and rewrites each of their stop lists from their new stages, all in the
+apply of that one row. An earlier version of this did a `stage/create` followed by
+a `route_stages/replace` per route — 95 requests for a stage 47 routes run, and a
+half-finished split was a real outcome. A route named in the payload that does not
+run the stage is `route_not_on_stage`; one whose stop list was changed outside its
+stages is `route_out_of_sync`, as for a merge; at most 500 routes in one split.
+
+### 19.2 Routes to review: our route is not MTC's route (2026-09-29)
+
+A stage is named by MTC's `bus_stop_id` for its head, which the backfill gets by
+lining our fare stages up against the replica's **by position**, and only when
+the two lists are the same length. On chennai_bus 76 routes are not: MTC lists
+route 1324 as beginning ROYAPURAM B.T → PARRYS CORNER where our feed begins it at
+BROADWAY alone, 20 fare stages against 19. Rather than guess - a guess slides the
+shorter list against the longer one and hands every stage after the divergence
+the wrong id, silently and for good - the backfill pairs nothing for that route.
+Its stages then fall back to being named after themselves, which is where a stage
+id like `nm_SAIDAPET` comes from, and why the same real fare stage can exist
+twice: `159` for the 343 routes that paired, `nm_SAIDAPET` for the four that did
+not. 1,243 of chennai_bus's 58,768 stage links are name-keyed this way.
+
+Nothing is missing from a table. Both sides are complete and they differ, nearly
+always because MTC has changed the route since our feed was built. Only somebody
+who knows the route can say which side is right, so the 76 are marked in
+`gtfs_route_stage_issue` with both lists, and worked through at **Routes to
+review** exactly as section 19.1's queue is.
+
+The screen puts the two lists beside each other and lines them up with a longest
+common subsequence, so what shows as a difference is a fare stage one side has
+and the other does not. Names that differ only in spelling - THYAGARAYA NAGAR
+against THYAGARAYA NAGAR B.T, GURUNANAK against GURU NANAK - are matched loosely
+and marked rather than shown as a difference, because they pair correctly and
+cost nothing; 1,594 routes differ that way and none of them is a problem. Below
+the lists, the stages this route left name-keyed, each saying whether a stage of
+the same name already exists with MTC's id - those are the duplicates.
+
+Two ways out, and which one depends on who is behind. If MTC has changed the
+route and we have not, change the route's stages to match (section 18, in a
+draft) and **Mark it fixed**. If our feed is right and MTC's table is the one out
+of date, **Leave it alone** with a note saying so. Nothing on the screen edits
+anything itself.
+
+`order_differs` exists in the table's vocabulary and nothing raises it: a route
+whose lists are the same length pairs by position and the names differing down
+it is, on the evidence, spelling.
 
 ## 20. Temporary routes: a route runs somewhere else for a while (2026-09-27)
 

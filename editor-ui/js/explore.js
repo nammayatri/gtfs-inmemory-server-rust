@@ -10,6 +10,7 @@ import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, route
 import { stationNames, foldedList, platformsNote, stopContext, routeContext } from "./context.js";
 import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 import { routeListsSection } from "./variants.js";
+import { idKind } from "./stage_reviews.js";
 
 const panel = () => document.getElementById("panel");
 
@@ -43,7 +44,7 @@ export function initSearch() {
             : null,
           s.route_count ? `used by ${plural(s.route_count, "route")}` : "used by no route",
         ].filter(Boolean).join(" · "),
-        href: `#/stage/${enc(s.stage_id)}`,
+        href: `#/stage/${enc(s.stage_key || s.stage_id)}`,
       }),
     },
     Stops: {
@@ -318,7 +319,9 @@ export async function showStop(stopId) {
     h("section.section",
       backLink(),
       h("div.title-block",
-        h("h1", s.name, o.changed.has("name") ? h("span.live-value", h("span.live-tag", "live: "), h("s", live.name)) : null),
+        h("h1", s.name, o.changed.has("name") ? h("span.live-value", h("span.live-tag", "live: "), h("s", live.name)) : null,
+          // an id the editor made up says so, rather than passing for MTC's
+          idKind(s.stop_id)),
         h("p.ids", `${isStation ? "Station" : "Stop"} ${s.stop_id}${s.stop_code && s.stop_code !== s.stop_id ? `, code ${s.stop_code}` : ""}`),
         // what passengers read beside the name: the platform label and the description
         s.platform_code || o.changed.has("platform_code") ? h("p.platform-line", h("span.label-tag", "Platform label: "), shown("platform_code")) : null,

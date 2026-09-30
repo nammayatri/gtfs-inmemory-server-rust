@@ -11,6 +11,8 @@ import { showPeople, showHistory, showFeedSettings } from "./admin.js";
 import { showDelivery, leaveWebhooks } from "./webhooks.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
+import { showStageReviewsList, showStageReview, refreshStageReviewCount, leaveStageReviews } from "./stage_reviews.js";
+import { showRouteIssuesList, showRouteIssue, refreshRouteIssueCount } from "./route_issues.js";
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
 import { showDiversions, showUnserviceableStops } from "./variants.js";
@@ -58,7 +60,7 @@ function renderAccess() {
   badge.textContent = role ? ROLE_LABEL[role] : "";
   badge.title = role ? `Your role on ${where}` : "";
   const noFeed = !state.feedId;
-  for (const sel of [".feed-picker", ".search", ".nav"]) document.querySelector(sel).hidden = noFeed;
+  for (const sel of [".feed-picker", ".search", ".nav-drawer"]) document.querySelector(sel).hidden = noFeed;
   document.querySelector('[data-nav="admin"]').hidden = !isAdmin();
   document.querySelector('[data-nav="feed-settings"]').hidden = !isAdmin();
   document.querySelectorAll("[data-admin-only]").forEach((el) => { el.hidden = !isAdmin(); });
@@ -73,6 +75,8 @@ async function switchFeed(feedId, hash = "#/") {
   map.refreshStops();
   refreshStationCount();
   refreshCoordinateCount();
+  refreshStageReviewCount();
+  refreshRouteIssueCount();
   setLeaveGuard(null);
   resetTrail();
   location.hash = hash;
@@ -107,6 +111,8 @@ async function boot() {
   initSearch();
   refreshStationCount();
   refreshCoordinateCount();
+  refreshStageReviewCount();
+  refreshRouteIssueCount();
   window.addEventListener("hashchange", onHashChange);
   window.addEventListener("beforeunload", (ev) => {
     if (leaveMessage()) { ev.preventDefault(); ev.returnValue = ""; }
@@ -125,7 +131,9 @@ function initNewMenu() {
       if (ev.key === "Escape" && menu.open) { close(); menu.querySelector("summary").focus(); }
     });
     menu.addEventListener("toggle", () => {
-      if (menu.open) menus.filter((m) => m !== menu).forEach((m) => { m.open = false; });
+      if (menu.open) {
+        menus.filter((m) => m !== menu && !m.contains(menu)).forEach((m) => { m.open = false; });
+      }
     });
     document.addEventListener("click", (ev) => { if (menu.open && !menu.contains(ev.target)) close(); });
   }
@@ -151,9 +159,13 @@ function markNav(name) {
     else a.removeAttribute("aria-current");
   });
   // a menu of the top bar reads as current when one of its pages is
-  document.querySelectorAll(".nav-menu").forEach((m) => {
+  document.querySelectorAll(".nav-menu:not(.nav-drawer)").forEach((m) => {
     m.querySelector("summary").classList.toggle("current", !!m.querySelector(`[data-nav="${name}"]`));
   });
+  // the drawer's button says where you are, since its links are put away
+  const here = document.querySelector(`.nav [data-nav="${name}"]`);
+  const label = document.querySelector("#main-menu > summary");
+  if (label) label.dataset.here = here ? here.childNodes[0].textContent.trim() : "";
 }
 
 // Leaving a screen with unsaved edits asks first; staying puts the address back.
@@ -193,6 +205,7 @@ function route() {
   currentHash = location.hash || "#/";
   leaveStations();
   leaveCoordinates();
+  leaveStageReviews();
   leaveWebhooks();
   // a route's trips from GPS belong to its page
   map.clearRoute("gpsTrips");
@@ -241,6 +254,14 @@ function route() {
     markNav("stations"); showWorkspace(true); showProposal(parts[1]);
   } else if (parts[0] === "stations") {
     markNav("stations"); showWorkspace(true); showStationsList();
+  } else if (parts[0] === "route-issues" && parts[1]) {
+    markNav("route-issues"); showWorkspace(true); showRouteIssue(parts[1]);
+  } else if (parts[0] === "route-issues") {
+    markNav("route-issues"); showWorkspace(true); showRouteIssuesList();
+  } else if (parts[0] === "stage-reviews" && parts[1]) {
+    markNav("stage-reviews"); showWorkspace(true); showStageReview(parts[1]);
+  } else if (parts[0] === "stage-reviews") {
+    markNav("stage-reviews"); showWorkspace(true); showStageReviewsList();
   } else if (parts[0] === "coordinates" && parts[1]) {
     markNav("coordinates"); showWorkspace(true); showCoordinateReview(parts[1]);
   } else if (parts[0] === "coordinates") {

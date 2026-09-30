@@ -87,16 +87,27 @@ async fn rows_of(
     let numbers = stage_numbers(links);
     let mut stages = Vec::with_capacity(links.len());
     for (link, number) in links.iter().zip(&numbers) {
-        let id = link.stage_id.trim();
-        match super::stages::load_stage(conn, g, id, false).await? {
+        let sk = match super::stages::resolve_link(conn, g, link).await {
+            Ok(sk) => sk,
+            Err(e) => {
+                findings.push(Finding::error(
+                    "stage_not_found",
+                    link.stage_id.trim(),
+                    e.to_string(),
+                ));
+                continue;
+            }
+        };
+        let id = sk.label();
+        match super::stages::load_stage(conn, g, &sk, false).await? {
             None => findings.push(Finding::error(
                 "stage_not_found",
-                id,
+                &id,
                 format!("no stage {id}"),
             )),
             Some(s) if s.deleted => findings.push(Finding::error(
                 "stage_deleted",
-                id,
+                &id,
                 format!("stage {id} is deleted"),
             )),
             Some(s) => stages.push((s.name, *number, s.rows)),
@@ -155,7 +166,7 @@ pub(super) async fn ensure_normal_list(
             .2
             .push(row.clone());
     }
-    let mut links: Vec<(String, i32)> = Vec::with_capacity(runs.len());
+    let mut links: Vec<(super::stages::StageKey, i32)> = Vec::with_capacity(runs.len());
     for (stage_no, stage_name, rows) in runs {
         let stage_id = mint_stage_id(conn, g).await?;
         let stored: Vec<StageRow> = stored_stage_rows(
@@ -185,8 +196,9 @@ pub(super) async fn ensure_normal_list(
         .bind(actor)
         .execute(&mut *conn)
         .await?;
-        super::stages::write_stage_rows(conn, g, &stage_id, &stored).await?;
-        links.push((stage_id, stage_no));
+        let sk = super::stages::StageKey::new(&stage_id, None);
+        super::stages::write_stage_rows(conn, g, &sk, &stored).await?;
+        links.push((sk, stage_no));
     }
     let made = links.len();
     write_links(conn, g, route_id, None, &links, actor).await?;
@@ -433,11 +445,11 @@ pub(super) async fn variant_delete(
 }
 
 /// The links of a list, each with the fare stage number it carries.
-fn numbered(links: &[StageLink]) -> Vec<(String, i32)> {
+fn numbered(links: &[StageLink]) -> Vec<(super::stages::StageKey, i32)> {
     links
         .iter()
         .zip(stage_numbers(links))
-        .map(|(l, n)| (l.stage_id.trim().to_string(), n))
+        .map(|(l, n)| (super::stages::link_key(l), n))
         .collect()
 }
 

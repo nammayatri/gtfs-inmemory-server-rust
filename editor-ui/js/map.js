@@ -599,8 +599,16 @@ export function showFaint(stops) {
 }
 
 // ------------------------------------------------------------------ routes
+/// The layer group of that name, made the first time it is asked for. Most are
+/// made at startup; a page that draws several lines at once (stages beside each
+/// other on a review) names one per line and gets them this way.
+function groupFor(name) {
+  if (!layers[name]) layers[name] = L.layerGroup().addTo(map);
+  return layers[name];
+}
+
 export function showRoute(route, { fit = true, layer = "route", dashed = false, color, weight = 5, markers = true } = {}) {
-  const group = layers[layer];
+  const group = groupFor(layer);
   group.clearLayers();
   const served = route.rows.filter((r) => r.stop_type !== "ROUTE CORRECTION" && r.lat != null);
   let line = null;
@@ -648,7 +656,7 @@ export function showRoute(route, { fit = true, layer = "route", dashed = false, 
 }
 
 export function clearRoute(layer = "route") {
-  layers[layer].clearLayers();
+  if (layers[layer]) layers[layer].clearLayers();
   updateLayerNote();
 }
 
@@ -833,7 +841,21 @@ export function showCandidates(stops, onPick) {
       .addTo(layers.candidates);
     rings.set(s.stop_id, ring);
   });
-  return (stopId) => rings.forEach((r, id) => r.setStyle({ color: id === stopId ? "#1f5fbf" : ACTION, weight: id === stopId ? 5 : 3 }));
+  // Hovering a result rings it AND brings it into view. Recolouring alone says
+  // nothing when the stop is off the screen, which is the usual case: the list
+  // is ranked by name, not by what the map happens to be showing.
+  return (stopId) => {
+    rings.forEach((r, id) => r.setStyle({
+      color: id === stopId ? "#1f5fbf" : ACTION,
+      weight: id === stopId ? 5 : 3,
+    }));
+    const at = stops.find((s) => s.stop_id === stopId && s.lat != null);
+    if (!at) return;
+    const point = L.latLng(at.lat, at.lon);
+    if (!map.getBounds().pad(-0.2).contains(point) || map.getZoom() < STOPS_MIN_ZOOM) {
+      map.setView(point, Math.max(map.getZoom(), 16));
+    }
+  };
 }
 
 export function clearCandidates() {

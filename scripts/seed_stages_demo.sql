@@ -26,11 +26,16 @@ DELETE FROM gtfs_station_proposal WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_release          WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_route_stage      WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_stage_stop       WHERE gtfs_id = 'stages_demo';
+DELETE FROM gtfs_stage_review     WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_stage            WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_route_stop       WHERE gtfs_id = 'stages_demo';
+DELETE FROM gtfs_pattern          WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_route            WHERE gtfs_id = 'stages_demo';
 UPDATE gtfs_stop SET parent_station = NULL WHERE gtfs_id = 'stages_demo' AND parent_station IS NOT NULL;
 DELETE FROM gtfs_stop             WHERE gtfs_id = 'stages_demo';
+-- the editor writes these two as the demo feed is used; without them the feed
+-- cannot be deleted and a re-seed fails on gtfs_agency's foreign key
+DELETE FROM gtfs_agency           WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_feed             WHERE gtfs_id = 'stages_demo';
 
 INSERT INTO gtfs_feed (gtfs_id, display_name, data_source, agency_name)
@@ -127,9 +132,31 @@ JOIN gtfs_stage st ON st.gtfs_id = rs.gtfs_id AND st.stage_id = rs.stage_id
 JOIN gtfs_stage_stop ss ON ss.gtfs_id = rs.gtfs_id AND ss.stage_id = rs.stage_id
 WHERE rs.gtfs_id = 'stages_demo';
 
+-- One stage name its routes do not agree about, so the "Stages to review" queue
+-- (section 19.1) has something in it to work through. CHROMEPET MIT GATE is two
+-- stages here: corridor 2 runs on to Kadaperi, corridor 3 turns into Chromepet.
+UPDATE gtfs_stage SET review = 'head_differs'
+ WHERE gtfs_id = 'stages_demo' AND upper(btrim(name)) = 'CHROMEPET MIT GATE';
+
+INSERT INTO gtfs_stage_review (gtfs_id, batch, name, name_key, direction, reason, evidence)
+SELECT 'stages_demo', 'seed_stages_demo', 'CHROMEPET MIT GATE', 'CHROMEPET MIT GATE',
+       s.direction, 'head_differs',
+       jsonb_build_object(
+         'lists', count(*),
+         'stages', jsonb_agg(s.stage_id ORDER BY s.stage_id),
+         'head_names', jsonb_build_array('CHROMEPET MIT GATE', 'CHROMEPET'),
+         'routes', (SELECT jsonb_agg(DISTINCT rs.route_id) FROM gtfs_route_stage rs
+                     WHERE rs.gtfs_id = 'stages_demo' AND rs.stage_id IN (
+                       SELECT stage_id FROM gtfs_stage
+                        WHERE gtfs_id = 'stages_demo' AND upper(btrim(name)) = 'CHROMEPET MIT GATE')))
+FROM gtfs_stage s
+WHERE s.gtfs_id = 'stages_demo' AND upper(btrim(s.name)) = 'CHROMEPET MIT GATE'
+GROUP BY s.direction;
+
 SELECT (SELECT count(*) FROM gtfs_stop WHERE gtfs_id = 'stages_demo') AS stops,
        (SELECT count(*) FROM gtfs_stage WHERE gtfs_id = 'stages_demo') AS stages,
        (SELECT count(*) FROM gtfs_route WHERE gtfs_id = 'stages_demo') AS routes,
-       (SELECT count(*) FROM gtfs_route_stop WHERE gtfs_id = 'stages_demo') AS route_rows;
+       (SELECT count(*) FROM gtfs_route_stop WHERE gtfs_id = 'stages_demo') AS route_rows,
+       (SELECT count(*) FROM gtfs_stage_review WHERE gtfs_id = 'stages_demo') AS to_review;
 
 COMMIT;
