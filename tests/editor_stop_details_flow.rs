@@ -987,13 +987,17 @@ async fn stop_updates_at_5000_rows() {
         eprintln!("chennai_bus has {source} stops; skipping the stop_updates timings");
         return;
     }
+    // Every stop, not only the ones outside a station: the test needs 7,000 and
+    // chennai_bus has 7,889 of which just 2,475 are parentless, so filtering on
+    // that made the seeding depend on how much station merging had been done.
+    // `parent_station` is not copied, so the platforms land here as plain stops.
     let mut setup = clear_feed(PERF_FEED);
     setup.extend([
         format!("INSERT INTO gtfs_feed (gtfs_id, display_name, headsign_source) VALUES ('{PERF_FEED}', 'Stop details timing copy of chennai_bus', 'fare_stage')"),
         format!(
             "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted) \
              SELECT '{PERF_FEED}', stop_id, stop_code, name, lat, lon, location_type, platform_code, cluster_id, deleted \
-             FROM gtfs_stop WHERE gtfs_id = 'chennai_bus' AND parent_station IS NULL"
+             FROM gtfs_stop WHERE gtfs_id = 'chennai_bus' AND NOT deleted"
         ),
     ]);
     setup.extend(reset_accounts(&[PERF_ADMIN]));

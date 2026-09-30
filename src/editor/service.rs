@@ -1463,6 +1463,25 @@ async fn live_row_version(
     .transpose()?)
 }
 
+/// A stage's live `row_version`, by the pair that names it.
+async fn live_stage_version(
+    conn: &mut PgConnection,
+    g: &str,
+    key: &super::stages::StageKey,
+) -> EditorResult<Option<i32>> {
+    Ok(sqlx::query(
+        "SELECT row_version FROM gtfs_stage \
+          WHERE gtfs_id = $1 AND stage_id = $2 AND direction = $3",
+    )
+    .bind(g)
+    .bind(&key.stage_id)
+    .bind(&key.direction)
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(|r| r.try_get("row_version"))
+    .transpose()?)
+}
+
 fn version_conflict(
     c: &ChangeRow,
     key: &str,
@@ -1489,7 +1508,7 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
             ("route", key),
         ],
         ("service", "create") => vec![("service", key)],
-        ("stage", "create") => vec![("stage", key)],
+        ("stage", "create" | "split") => vec![("stage", key)],
         (e, "create") if super::records::spec_for(e).is_some() => {
             vec![("record", format!("{e}#{key}"))]
         }
@@ -1545,8 +1564,13 @@ async fn conflict_for(
             let live = live_row_version(conn, "gtfs_route", "route_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
         }
-        ("stage", "update" | "delete") if !in_draft("stage", key) => {
-            let live = live_row_version(conn, "gtfs_stage", "stage_id", g, key).await?;
+        ("stage", "update" | "delete" | "merge") if !in_draft("stage", key) => {
+            // A stage is keyed by its id AND its direction, and the change
+            // writes the pair as `159|down`. Looking that up as a bare stage id
+            // matches no row, and every stage change then reports a conflict
+            // that is not there, so the key is read back before it is used.
+            let sk = super::stages::key_of_change(conn, g, key).await;
+            let live = live_stage_version(conn, g, &sk).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
         }
         // a temporary route's change is based on the list it names: the one it
@@ -1595,6 +1619,18 @@ async fn conflict_for(
                     let base = c.after["into_row_version"].as_i64().map(|v| v as i32);
                     let live = live_row_version(conn, "gtfs_stop", "stop_id", g, into).await?;
                     out.extend(version_conflict(c, into, live, base));
+                }
+            }
+        }
+        ("stage", "split") => {
+            // the stage it makes is new; the one it takes routes off is the row
+            // that can have moved under it
+            let from = c.after["from_stage_id"].as_str().unwrap_or("").trim();
+            if !from.is_empty() && !in_draft("stage", from) {
+                let sk = super::stages::key_of_change(conn, g, from).await;
+                let live = live_stage_version(conn, g, &sk).await?;
+                if live.is_none() {
+                    out.push(conflict_on(c, from, "missing", Value::Null, Value::Null));
                 }
             }
         }
@@ -1911,7 +1947,7 @@ fn referenced_stops(c: &ChangeRow) -> Vec<String> {
                 &c.after,
             )
         }
-        ("route_stops", "replace") | ("stage", "create" | "update") => c.after["rows"]
+        ("route_stops", "replace") | ("stage", "create" | "update" | "split") => c.after["rows"]
             .as_array()
             .map(|rows| {
                 rows.iter()
@@ -1968,6 +2004,8 @@ async fn apply_change(
         ("stage", "create") => super::stages::stage_create(conn, g, key, &c.after, actor).await,
         ("stage", "update") => super::stages::stage_update(conn, g, key, &c.after, actor).await,
         ("stage", "delete") => super::stages::stage_delete(conn, g, key, actor).await,
+        ("stage", "merge") => super::stages::stage_merge(conn, g, key, &c.after, actor).await,
+        ("stage", "split") => super::stages::stage_split(conn, g, key, &c.after, actor).await,
         ("route_stages", "replace") => {
             super::stages::route_stages_replace(conn, g, key, &c.after, actor).await
         }
@@ -4566,8 +4604,9 @@ async fn snapshot(
             Ok((created, None))
         }
         ("feed_config", "update") => Ok((feed_config_row(conn, g).await?, None)),
-        ("stage", "update" | "delete") => {
-            if let Some((row, version)) = super::stages::stage_snapshot(conn, g, key).await? {
+        ("stage", "update" | "delete" | "merge") => {
+            let sk = super::stages::key_of_change(conn, g, key).await;
+            if let Some((row, version)) = super::stages::stage_snapshot(conn, g, &sk).await? {
                 return Ok((row, Some(version)));
             }
             let (_, created) = created_in_set(conn, change_set_id, "stage", key)
@@ -4736,10 +4775,11 @@ pub async fn add_change_to(
             _ => {}
         }
     }
-    let mint = matches!(entity.as_str(), "stop" | "stage")
-        && op == "create"
-        && key.is_empty()
-        && after.is_object();
+    // `&&` binds tighter than `||`: the two kinds of minting change go in their
+    // own parentheses, or an id given by the caller stops being checked
+    let mints = (matches!(entity.as_str(), "stop" | "stage") && op == "create")
+        || (entity == "stage" && op == "split");
+    let mint = mints && key.is_empty() && after.is_object();
     let invalid = |f: Finding| {
         EditorError::bad_request("invalid_change", f.message.clone())
             .with_details(json!({"code": f.code}))
@@ -5082,6 +5122,15 @@ pub async fn submit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
 async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
     lock_feed_of_set(&mut tx, id).await?;
+    submit_in(&mut tx, ctx, id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Submit one set inside a transaction the caller owns: the whole of a submit
+/// but the locking and the commit, so [`submit_many`] can do several in one.
+async fn submit_in(tx: &mut PgConnection, ctx: &Ctx, id: Uuid) -> EditorResult<()> {
+    let mut tx = tx;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
     let changes = load_changes_to_apply(&mut tx, id).await?;
@@ -5131,8 +5180,57 @@ async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
         json!({"changes": changes.len(), "warnings": ev.validation.len()}),
     )
     .await?;
-    tx.commit().await?;
     Ok(())
+}
+
+/// Submit several drafts of feed `g` in one transaction and one request. The
+/// same rules as [`submit`] for each; one that cannot be submitted is reported
+/// in `failed`, rolled back to its own savepoint, and the rest are submitted.
+///
+/// A batch is one call rather than one per draft because the dashboard submits
+/// the drafts somebody has ticked, and half of them going through on a dropped
+/// connection is worse than none.
+pub async fn submit_many(
+    state: &EditorState,
+    ctx: &Ctx,
+    g: &str,
+    ids: &[Uuid],
+) -> EditorResult<Value> {
+    let ids = batch_ids(ids)?;
+    retry_transient(|| async {
+        let ids = ids.clone();
+        let mut tx = state.pool.begin().await?;
+        // the same lock order as a single submit, taken once for the feed
+        lock_feed(&mut tx, g).await?;
+        let (mut submitted, mut failed) = (Vec::new(), Vec::new());
+        for &id in &ids {
+            begin_set(&mut tx).await?;
+            let out = async {
+                let found = sqlx::query(
+                    "SELECT 1 FROM gtfs_change_set WHERE change_set_id = $1 AND gtfs_id = $2",
+                )
+                .bind(id)
+                .bind(g)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if found.is_none() {
+                    return Err(EditorError::not_found(
+                        "change_set_not_found",
+                        format!("no change set {id} on feed {g}"),
+                    ));
+                }
+                submit_in(&mut tx, ctx, id).await
+            }
+            .await;
+            match settle_set(&mut tx, out).await? {
+                None => submitted.push(id),
+                Some(e) => failed.push(batch_failure(id, "submit", false, &e)),
+            }
+        }
+        tx.commit().await?;
+        Ok(json!({"submitted": submitted, "failed": failed}))
+    })
+    .await
 }
 
 /// Maker-checker, enforced here as well as by the table's CHECK: nobody reviews
@@ -5164,7 +5262,21 @@ pub async fn review(
         ));
     }
     let mut tx = state.pool.begin().await?;
-    let set = load_set(&mut tx, id, true).await?;
+    review_in(&mut tx, ctx, id, approve, comment, self_approve).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`review`] inside the caller's transaction; `comment` is already trimmed.
+async fn review_in(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    id: Uuid,
+    approve: bool,
+    comment: Option<&str>,
+    self_approve: bool,
+) -> EditorResult<()> {
+    let set = load_set(conn, id, true).await?;
     if set.status != "submitted" {
         return Err(EditorError::conflict(
             "change_set_not_submitted",
@@ -5188,7 +5300,7 @@ pub async fn review(
     .bind(ctx.user.user_id)
     .bind(comment)
     .bind(own)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     let (action, detail) = match (approve, own) {
         (true, true) => (
@@ -5203,7 +5315,7 @@ pub async fn review(
         (false, _) => ("change_set_rejected", json!({"comment": comment})),
     };
     auth::audit(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         action,
@@ -5212,7 +5324,6 @@ pub async fn review(
         detail,
     )
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -5310,11 +5421,57 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     // the feed's advisory lock first (every replay of the feed queues on it),
     // then its row, then the set: every commit on a feed takes locks in this order
     let gtfs_id = lock_feed_of_set(&mut tx, id).await?;
-    sqlx::query("SELECT version FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
-        .bind(&gtfs_id)
-        .fetch_one(&mut *tx)
+    let version = next_feed_version(&mut tx, &gtfs_id).await?;
+    commit_in(&mut tx, ctx, &gtfs_id, id, version).await?;
+    set_feed_version(&mut tx, &gtfs_id, version).await?;
+    tx.commit().await?;
+    Ok(json!({"change_set_id": id, "status": "committed", "feed_version": version}))
+}
+
+/// Lock the feed's row and say which version the next commit goes live as. The
+/// caller holds the feed's advisory lock, and moves the version with
+/// [`set_feed_version`] only once something is committed.
+async fn next_feed_version(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<i64> {
+    let current: i64 = sqlx::query("SELECT version FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
+        .bind(gtfs_id)
+        .fetch_one(&mut *conn)
+        .await?
+        .try_get("version")?;
+    Ok(current + 1)
+}
+
+/// The feed's one version bump: every pod reloads on it, and every webhook
+/// (the Jenkins build among them) fires once for it.
+async fn set_feed_version(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    version: i64,
+) -> EditorResult<()> {
+    sqlx::query("UPDATE gtfs_feed SET version = $2 WHERE gtfs_id = $1")
+        .bind(gtfs_id)
+        .bind(version)
+        .execute(&mut *conn)
         .await?;
-    let set = load_set(&mut tx, id, true).await?;
+    Ok(())
+}
+
+/// Apply one approved set of feed `gtfs_id` inside the caller's transaction,
+/// which holds the feed's lock and row; the set goes live as `version`. A
+/// conflict or error leaves the changes applied: the caller rolls back.
+async fn commit_in(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    gtfs_id: &str,
+    id: Uuid,
+    version: i64,
+) -> EditorResult<()> {
+    let set = load_set(conn, id, true).await?;
+    if set.gtfs_id != gtfs_id {
+        return Err(EditorError::not_found(
+            "change_set_not_found",
+            "no such change set",
+        ));
+    }
     if set.status != "approved" {
         return Err(EditorError::conflict(
             "change_set_not_approved",
@@ -5329,10 +5486,9 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     if set.submitted_by == Some(ctx.user.user_id) && !(set.self_approved && ctx.is_admin()) {
         return Err(own_change_set(false));
     }
-    let changes = load_changes_to_apply(&mut tx, id).await?;
-    let ev = evaluate(&mut tx, &gtfs_id, &changes, &ctx.user.email).await?;
+    let changes = load_changes_to_apply(conn, id).await?;
+    let ev = evaluate(conn, gtfs_id, &changes, &ctx.user.email).await?;
     if !ev.conflicts.is_empty() {
-        tx.rollback().await?;
         return Err(EditorError::conflict(
             "change_set_conflicts",
             "the live data changed since this set was made; reopen it and rebase the edits",
@@ -5340,20 +5496,12 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         .with_details(json!({"conflicts": ev.conflicts})));
     }
     if ev.has_errors() {
-        tx.rollback().await?;
         return Err(EditorError::bad_request(
             "validation_failed",
             "the change set no longer applies cleanly",
         )
         .with_details(json!({"validation": ev.validation})));
     }
-    let version: i64 = sqlx::query(
-        "UPDATE gtfs_feed SET version = version + 1 WHERE gtfs_id = $1 RETURNING version",
-    )
-    .bind(&gtfs_id)
-    .fetch_one(&mut *tx)
-    .await?
-    .try_get("version")?;
     sqlx::query(
         "UPDATE gtfs_change_set SET status = 'committed', committed_by = $2, committed_at = now(), \
             committed_version = $3 WHERE change_set_id = $1",
@@ -5361,7 +5509,7 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     .bind(id)
     .bind(ctx.user.user_id)
     .bind(version)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     let summary: Vec<Value> = changes
         .iter()
@@ -5369,11 +5517,11 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         .map(|c| json!([c.entity, c.op, c.entity_key]))
         .collect();
     auth::audit(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "change_set_committed",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         json!({
             "feed_version": version, "changes": changes.len(), "applied": summary,
@@ -5382,21 +5530,21 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     )
     .await?;
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "stop_merged",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &ev.merges,
     )
     .await?;
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "station_merged",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &ev.station_merges,
     )
@@ -5411,11 +5559,11 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         })
         .collect();
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "feed_data_source_changed",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &switched,
     )
@@ -5430,19 +5578,197 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         })
         .collect();
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "feed_config_changed",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &settings,
     )
     .await?;
-    super::proposals::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
-    super::position_reviews::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
-    tx.commit().await?;
-    Ok(json!({"change_set_id": id, "status": "committed", "feed_version": version}))
+    super::proposals::mark_committed(conn, ctx, gtfs_id, id, version).await?;
+    super::position_reviews::mark_committed(conn, ctx, gtfs_id, id, version).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- several sets at once
+
+/// The most sets one batch call takes: a page of the drafts list.
+const BATCH_MAX: usize = 100;
+
+/// Several sets of feed `g`, as a batch call names them: in order, each once.
+fn batch_ids(ids: &[Uuid]) -> EditorResult<Vec<Uuid>> {
+    let mut seen = HashSet::new();
+    let ids: Vec<Uuid> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    if ids.is_empty() {
+        return Err(EditorError::bad_request(
+            "no_change_sets",
+            "name at least one change set",
+        ));
+    }
+    if ids.len() > BATCH_MAX {
+        return Err(EditorError::bad_request(
+            "too_many_change_sets",
+            format!("at most {BATCH_MAX} change sets at once"),
+        ));
+    }
+    Ok(ids)
+}
+
+/// Each set's step in a batch runs in a savepoint of the batch's transaction,
+/// opened here and closed by [`settle_set`].
+async fn begin_set(conn: &mut PgConnection) -> EditorResult<()> {
+    sqlx::query("SAVEPOINT batch_set")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Close [`begin_set`]'s savepoint on how the step went: a set that failed is
+/// rolled back alone and handed back to report, and the rest carry on. A
+/// serialization failure is not the set's fault and fails the whole batch, so
+/// [`retry_transient`] runs it again from nothing.
+async fn settle_set(
+    conn: &mut PgConnection,
+    out: EditorResult<()>,
+) -> EditorResult<Option<EditorError>> {
+    match out {
+        Ok(()) => {
+            sqlx::query("RELEASE SAVEPOINT batch_set")
+                .execute(&mut *conn)
+                .await?;
+            Ok(None)
+        }
+        Err(e) if e.code == super::feed_lock::TRY_AGAIN => Err(e),
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT batch_set")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT batch_set")
+                .execute(&mut *conn)
+                .await?;
+            Ok(Some(e))
+        }
+    }
+}
+
+fn batch_failure(id: Uuid, stage: &str, approved: bool, e: &EditorError) -> Value {
+    json!({
+        "change_set_id": id, "stage": stage, "approved": approved,
+        "error": {"code": e.code, "message": e.message, "details": e.details},
+    })
+}
+
+/// Approve several submitted sets of feed `g` in one transaction. The same
+/// rules as [`review`] for each; `self_approve` is an admin's override for the
+/// ones they submitted and means nothing on the others. A set that cannot be
+/// approved is reported in `failed` and the rest are approved.
+pub async fn approve_many(
+    state: &EditorState,
+    ctx: &Ctx,
+    g: &str,
+    ids: &[Uuid],
+    comment: Option<&str>,
+    self_approve: bool,
+) -> EditorResult<Value> {
+    let ids = batch_ids(ids)?;
+    let comment = comment.map(str::trim).filter(|c| !c.is_empty());
+    retry_transient(|| async {
+        let mut tx = state.pool.begin().await?;
+        let (mut approved, mut failed) = (Vec::new(), Vec::new());
+        for &id in &ids {
+            begin_set(&mut tx).await?;
+            let out = approve_in(&mut tx, ctx, g, id, comment, self_approve).await;
+            let err = settle_set(&mut tx, out).await?;
+            match err {
+                None => approved.push(id),
+                Some(e) => failed.push(batch_failure(id, "approve", false, &e)),
+            }
+        }
+        tx.commit().await?;
+        Ok(json!({"approved": approved, "failed": failed}))
+    })
+    .await
+}
+
+/// Commit several sets of feed `g` in one transaction, as **one** feed version:
+/// pods reload once and every webhook fires once, however many sets go live.
+/// Each is applied on top of the ones before it, in the order given, and checked
+/// against the live rows just as [`commit`] does. With `approve`, submitted sets
+/// are approved first ([`review`]'s rules, `self_approve` as in
+/// [`approve_many`]); one that is approved but then cannot be committed stays
+/// approved. A set that fails is reported in `failed` and the rest go live.
+/// `feed_version` is null when none did.
+pub async fn commit_many(
+    state: &EditorState,
+    ctx: &Ctx,
+    g: &str,
+    ids: &[Uuid],
+    approve: bool,
+    self_approve: bool,
+) -> EditorResult<Value> {
+    let ids = batch_ids(ids)?;
+    retry_transient(|| async {
+        let mut tx = state.pool.begin().await?;
+        // the same lock order as a single commit: the feed's advisory lock, its
+        // row, then each set
+        lock_feed(&mut tx, g).await?;
+        let version = next_feed_version(&mut tx, g).await?;
+        let (mut committed, mut failed) = (Vec::new(), Vec::new());
+        for &id in &ids {
+            if approve {
+                begin_set(&mut tx).await?;
+                let out = approve_in(&mut tx, ctx, g, id, None, self_approve).await;
+                let err = settle_set(&mut tx, out).await?;
+                if let Some(e) = err {
+                    failed.push(batch_failure(id, "approve", false, &e));
+                    continue;
+                }
+            }
+            begin_set(&mut tx).await?;
+            let out = commit_in(&mut tx, ctx, g, id, version).await;
+            let err = settle_set(&mut tx, out).await?;
+            match err {
+                None => committed.push(id),
+                Some(e) => failed.push(batch_failure(id, "commit", approve, &e)),
+            }
+        }
+        if !committed.is_empty() {
+            set_feed_version(&mut tx, g, version).await?;
+        }
+        tx.commit().await?;
+        Ok(json!({
+            "committed": committed, "failed": failed,
+            "feed_version": if committed.is_empty() { Value::Null } else { json!(version) },
+        }))
+    })
+    .await
+}
+
+/// Approve set `id` of feed `g`, one of a batch authorised on the feed: a set
+/// of another feed is 404, as if it did not exist.
+async fn approve_in(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    g: &str,
+    id: Uuid,
+    comment: Option<&str>,
+    self_approve: bool,
+) -> EditorResult<()> {
+    let found =
+        sqlx::query("SELECT 1 FROM gtfs_change_set WHERE change_set_id = $1 AND gtfs_id = $2")
+            .bind(id)
+            .bind(g)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if found.is_none() {
+        return Err(EditorError::not_found(
+            "change_set_not_found",
+            "no such change set",
+        ));
+    }
+    review_in(conn, ctx, id, true, comment, self_approve).await
 }
 
 // ---------------------------------------------------------------- audit

@@ -66,6 +66,13 @@ function batchState(cs, action) {
     : { ok: false, why: "you submitted it, so someone else must commit it" };
 }
 
+// Why a draft in a batch did not go through, in the list's words.
+const failureWhy = (code, message) => (code === "change_set_conflicts"
+  ? "some of its changes were overtaken by another commit"
+  : code === "validation_failed"
+    ? "it has problems to fix first"
+    : message);
+
 export async function showDraftList(status = "draft") {
   const body = h("div");
   const tabs = h("div.tabs", { role: "tablist" }, TABS.map(([key, label]) => h("button", {
@@ -128,9 +135,11 @@ export async function showDraftList(status = "draft") {
     };
     const toggle = (id, on) => { if (on) chosen.add(id); else chosen.delete(id); drawBar(); };
 
-    // Each draft goes through on its own, in the order shown: a commit is one
-    // transaction per draft, and a later one can still be overtaken by an
-    // earlier one, so the run reports each draft rather than stopping.
+    // Approving and committing is one call for the whole selection: the drafts
+    // commit together as one feed version, so the pods reload once and the
+    // webhooks (the Jenkins build) fire once. Oldest first, each on top of the
+    // ones before it; one that fails is reported and the rest carry on.
+    // Submitting creates no version, so it still goes one draft at a time.
     const runBatch = async (step) => {
       const picked = res.items.filter((cs) => chosen.has(cs.change_set_id));
       const own = picked.filter((cs) => mine.get(cs.change_set_id).override);
@@ -146,36 +155,37 @@ export async function showDraftList(status = "draft") {
             + (others.length ? `The other ${plural(others.length, "draft")} ${others.length === 1 ? "is" : "are"} reviewed normally. ` : "")
           : "")
         + (step.action === "submit"
-          ? "They can no longer be edited unless they are reopened, and someone other than the person who submitted each must approve it. One that cannot be submitted is reported and the rest carry on."
+          ? "They go in one go. They can no longer be edited unless they are reopened, and someone other than the person who submitted each must approve it. One that cannot be submitted is reported and the rest carry on."
           : step.then || step.action === "commit"
-            ? "Each is committed on its own, oldest first, and goes live as it commits. One that fails is reported and the rest carry on."
-            : "Each is approved on its own; approving does not make anything live."),
+            ? "They are committed together, oldest first, and go live as one feed version. One that fails is reported and the rest carry on."
+            : "They are approved together; approving does not make anything live."),
         { confirm: step.label, danger: own.length > 0 });
       if (!ok) return;
       bar.querySelectorAll("button").forEach((b) => { b.disabled = true; });
       const done = [], failed = [];
-      for (const [i, cs] of picked.entries()) {
-        clear(bar, h("span", `${step.label}: ${fmtCount(i + 1)} of ${fmtCount(picked.length)}…`));
+      {
+        clear(bar, h("span", `${step.label}: ${plural(picked.length, "draft")}…`));
         bar.hidden = false;
-        // which step it reached matters: approved-but-not-committed is a state
-        // the person has to know about, since the draft is waiting to commit
-        let stage = step.action;
+        // the list is newest first; they apply oldest first
+        const ids = picked.map((cs) => cs.change_set_id).reverse();
+        const byId = new Map(picked.map((cs) => [cs.change_set_id, cs]));
+        const self_approve = own.length > 0;
         try {
-          const isOwn = mine.get(cs.change_set_id).override;
-          await post(`change-sets/${enc(cs.change_set_id)}/${step.action}`,
-            step.action === "approve" ? { comment: "", ...(isOwn ? { self_approve: true } : {}) } : undefined);
-          if (step.then) {
-            stage = step.then;
-            await post(`change-sets/${enc(cs.change_set_id)}/${step.then}`, undefined);
-          }
-          done.push(cs);
+          // one call, whatever the step and however many drafts: the server
+          // does them in one transaction, so a dropped connection cannot leave
+          // half of them through
+          const out = step.action === "submit"
+            ? await post(`feeds/${enc(state.feedId)}/change-sets/submit`, { change_set_ids: ids })
+            : step.action === "approve" && !step.then
+              ? await post(`feeds/${enc(state.feedId)}/change-sets/approve`, { change_set_ids: ids, comment: "", self_approve })
+              : await post(`feeds/${enc(state.feedId)}/change-sets/commit`, { change_set_ids: ids, approve: step.action === "approve", self_approve });
+          (out.submitted || out.approved || out.committed).forEach((id) => done.push(byId.get(id)));
+          out.failed.forEach((f) => failed.push({
+            cs: byId.get(f.change_set_id), why: failureWhy(f.error.code, f.error.message), stage: f.stage, approved: f.approved,
+          }));
         } catch (e) {
-          const why = e instanceof ApiError && e.code === "change_set_conflicts"
-            ? "some of its changes were overtaken by another commit"
-            : e instanceof ApiError && e.code === "validation_failed"
-              ? "it has problems to fix first"
-              : e.message;
-          failed.push({ cs, why, stage, approved: stage === "commit" && step.then });
+          // the whole call failed: nothing went through
+          picked.forEach((cs) => failed.push({ cs, why: e.message, stage: step.action, approved: false }));
         }
       }
       if (done.length && (step.then || step.action === "commit")) map.refreshStops();

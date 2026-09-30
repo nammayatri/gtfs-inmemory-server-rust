@@ -9,6 +9,7 @@ import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERV
 import * as map from "./map.js";
 import { addChange, existingChange, createdChange, requireDraft } from "./drafts.js";
 import { stopPicker } from "./picker.js";
+import { idKind } from "./stage_reviews.js";
 
 const panel = () => document.getElementById("panel");
 // sha256 of "[]": the stage list of a route that has none
@@ -51,6 +52,17 @@ function createdStages() {
 }
 
 const directionWord = (d) => (d ? `direction: ${d}` : null);
+// Why somebody still has to look at this stage: the routes that share its name
+// do not agree about it (section 19.1). Cleared when the review is closed.
+const REVIEW_TEXT = {
+  head_differs: "routes start it at different stops",
+  head_duplicate_stops: "routes start it at duplicate stops",
+  stretch_differs: "routes disagree about its stops",
+  spelled_differently: "spelled more than one way",
+};
+const reviewChip = (s) => (s.review
+  ? h("span.chip.warn", { title: `${REVIEW_TEXT[s.review] || s.review}. Open “Stages to review” to settle it.` }, "to review")
+  : null);
 const stageLine = (s) => [
   plural(s.stop_count ?? 0, "stop"),
   directionWord(s.direction),
@@ -58,6 +70,7 @@ const stageLine = (s) => [
   `used by ${plural(s.route_count ?? 0, "route")}`,
   // a stage keeps a stop nobody can board at; the list says so (section 21)
   s.out_of_use ? `${plural(s.out_of_use, "stop")} out of use` : null,
+  s.review ? REVIEW_TEXT[s.review] || s.review : null,
 ].filter(Boolean).join(" · ");
 
 const rowName = (r) => (r.stop_type === "ROUTE CORRECTION" ? `Map shaping point: ${r.marker_name || r.marker_id}` : r.stop_name || r.stop_id);
@@ -88,7 +101,7 @@ export function stageListView(stages) {
     .filter((c) => c.entity === "stage").map((c) => [c.entity_key, c.op]));
   return h("ol.stage-list", (stages || []).map((s) => h("li.list-item",
     h("span.key", { "aria-label": `Fare stage ${s.stage_no}` }, String(s.stage_no)),
-    h("a", { href: `#/stage/${enc(s.stage_id)}` }, s.name),
+    h("a", { href: `#/stage/${enc(s.stage_key || s.stage_id)}` }, s.name),
     h("span.item-end", inDraft.has(s.stage_id) ? h("span.chip.draft", inDraft.get(s.stage_id) === "create" ? "new in draft" : "changed in draft") : null,
       h("span.hint", s.route_count > 1 ? `shared by ${plural(s.route_count, "route")}` : "only this route")),
     h("span.sub", `${plural(s.stop_count, "stop")}: ${(s.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`),
@@ -175,7 +188,7 @@ export async function editRouteStages(route, { created = false, variant = null }
       h("label.visually-hidden", { for: `stage-no-${i}` }, `Fare stage number of ${l.name}`),
       h("input.stage-no-input", { type: "number", min: "0", id: `stage-no-${i}`, value: String(l.stage_no ?? ""),
         on: { change: (ev) => { l.stage_no = ev.target.value === "" ? null : Number(ev.target.value); edited(); } } }),
-      h("a", { href: `#/stage/${enc(l.stage_id)}` }, l.name),
+      h("a", { href: `#/stage/${enc(l.stage_key || l.stage_id)}` }, l.name),
       h("span.item-end",
         h("button.btn.quiet.small", { type: "button", disabled: i === 0, "aria-label": `Move ${l.name} up`, on: { click: () => { [links[i - 1], links[i]] = [links[i], links[i - 1]]; edited(); } } }, "↑"),
         h("button.btn.quiet.small", { type: "button", disabled: i === links.length - 1, "aria-label": `Move ${l.name} down`, on: { click: () => { [links[i + 1], links[i]] = [links[i], links[i + 1]]; edited(); } } }, "↓"),
@@ -194,8 +207,8 @@ export async function editRouteStages(route, { created = false, variant = null }
     let detail;
     try {
       detail = s.draft
-        ? await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(s.stage_id)}`)
-        : await get(`feeds/${enc(state.feedId)}/stages/${enc(s.stage_id)}`);
+        ? await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(s.stage_key || s.stage_id)}`)
+        : await get(`feeds/${enc(state.feedId)}/stages/${enc(s.stage_key || s.stage_id)}`);
     } catch (e) {
       toast(e.message, "error");
       return;
@@ -400,8 +413,8 @@ export async function showStage(stageId) {
   const remove = async () => {
     if (!(await confirmDialog("Delete this stage?", `${s.name} (${s.stage_id}) is used by no route. Deleting it takes it out of the stage list once the draft is committed.`, { confirm: "Delete stage", danger: true }))) return;
     try {
-      const res = await addChange({ entity: "stage", op: "delete", entity_key: s.stage_id, after: null }, { merge: false });
-      if (res) showStage(s.stage_id);
+      const res = await addChange({ entity: "stage", op: "delete", entity_key: s.stage_key || s.stage_id, after: null }, { merge: false });
+      if (res) showStage(s.stage_key || s.stage_id);
     } catch (e) {
       toast(e.message, "error");
     }
@@ -410,10 +423,26 @@ export async function showStage(stageId) {
     h("section.section",
       h("a.crumb", { href: "#/stages" }, "All stages"),
       h("div.title-block",
-        h("h1", s.name),
+        h("h1", s.name, reviewChip(s), idKind(s.stage_id)),
         s.description ? h("p", s.description) : null,
         h("p.ids", `Stage id ${s.stage_id}, ${plural(s.stop_count, "stop")}${s.direction ? `, direction: ${s.direction}` : ""}, used by ${plural(s.route_count, "route")}`)),
+      // a stand-in id is said here, not left for somebody to notice
+      s.stage_id.startsWith("nm_") ? h("div.notice.warning",
+        h("p", h("strong", "This stage is named after itself, not by MTC's stop id."),
+          " The backfill could not line up the routes that run it with MTC's own route, "
+          + "so it had no fare-stage id to use. A stage for the same place may also exist "
+          + "under MTC's id, carrying every other route."),
+        h("p", h("a", { href: "#/route-issues" }, "See the routes this came from"))) : null,
+      (s.rows || []).some((r) => r.stop_type === "ROUTE CORRECTION") ? h("div.notice",
+        h("p", h("strong", "This stage holds a map point."),
+          " A map point is not a stop: it is a position the line is drawn through so it "
+          + "follows the road. No passenger boards there and it is in no GTFS file.")) : null,
       s.deleted ? h("p.notice.error", "This stage is deleted.") : null,
+      s.review ? h("div.notice",
+        h("p", h("strong", "The routes using this name do not agree about it: "),
+          `${REVIEW_TEXT[s.review] || s.review}.`),
+        h("p", h("a", { href: `#/stage-reviews?q=${encodeURIComponent(s.name)}` },
+          "See it beside the other stages of this name"))) : null,
       drafted ? h("div.notice.draft.pending",
         h("p", h("strong", created ? `New in your draft “${state.draft.title}”.` : `Pending in draft “${state.draft.title}”, not live.`), " ",
           h("a", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft")),
@@ -557,7 +586,7 @@ export async function editStage(stage, { mode = "update" } = {}) {
     try {
       const res = creating
         ? await addChange({ entity: "stage", op: "create", entity_key: "", after: payload }, { merge: false })
-        : await addChange({ entity: "stage", op: "update", entity_key: stage.stage_id, after: payload });
+        : await addChange({ entity: "stage", op: "update", entity_key: stage.stage_key || stage.stage_id, after: payload });
       if (!res) return;
       const id = creating ? res.draft.changes.find((c) => c.change_id === res.changeId).entity_key : stage.stage_id;
       serverProblems = res.problems;
@@ -613,7 +642,7 @@ export async function showStagesList() {
   const status = h("p.hint", { "aria-live": "polite" });
   let cursor = null;
   const item = (s) => h("li.list-item",
-    h("a", { href: `#/stage/${enc(s.stage_id)}` }, s.name),
+    h("a", { href: `#/stage/${enc(s.stage_key || s.stage_id)}` }, s.name),
     h("span.item-end", s.route_count === 0 ? h("span.chip", "unused") : h("span.hint", plural(s.route_count, "route"))),
     h("span.sub", `${s.stage_id} · ${s.draft ? `${plural(s.stop_count, "stop")}, new in your draft` : stageLine(s)}${s.description ? ` · ${s.description}` : ""}`));
   const load = async (append = false) => {

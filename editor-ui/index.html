@@ -27,11 +27,16 @@
                aria-controls="search-results" aria-expanded="false">
         <div id="search-results" class="search-results" role="listbox" hidden></div>
       </div>
+      <details class="nav-menu nav-drawer" id="main-menu">
+        <summary title="Everything in the editor">Menu</summary>
+        <div class="nav-menu-body">
       <nav class="nav" aria-label="Main">
         <a href="#/" data-nav="map">Map</a>
         <a href="#/stages" data-nav="stages">Stages</a>
         <a href="#/diversions" data-nav="diversions">Diversions</a>
         <a href="#/stops-out-of-use" data-nav="stops-out-of-use">Stops out of use</a>
+        <a href="#/stage-reviews" data-nav="stage-reviews">Stages to review <span id="stage-reviews-count" class="nav-count" hidden></span></a>
+        <a href="#/route-issues" data-nav="route-issues">Routes to review <span id="route-issues-count" class="nav-count" hidden></span></a>
         <a href="#/coordinates" data-nav="coordinates">Coordinates to review <span id="coordinates-count" class="nav-count" hidden></span></a>
         <a href="#/stations" data-nav="stations" hidden>Stations to review <span id="stations-count" class="nav-count" hidden></span></a>
         <details class="nav-menu" id="feed-menu">
@@ -48,6 +53,8 @@
         <a href="#/feed-settings" data-nav="feed-settings" hidden>Feed settings</a>
         <a href="#/delivery" data-nav="delivery">Delivery</a>
       </nav>
+        </div>
+      </details>
       <details class="new-menu" id="new-menu" hidden>
         <summary class="btn small">New</summary>
         <div class="new-menu-body">

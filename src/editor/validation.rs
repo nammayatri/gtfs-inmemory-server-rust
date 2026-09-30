@@ -567,6 +567,10 @@ pub fn mint_stop_id() -> String {
     )
 }
 
+/// At most this many routes move in one `stage/split`. A stage 47 routes run is
+/// ordinary; a payload naming thousands is a mistake, not a review decision.
+pub const MAX_SPLIT_ROUTES: usize = 500;
+
 /// Stage ids the server mints: `stg_` + 10 lower-case hex digits.
 pub const MINTED_STAGE_PREFIX: &str = "stg_";
 
@@ -610,7 +614,14 @@ impl StageRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StageLink {
+    /// The stage's id. A stage is named by its id AND its direction, so this
+    /// may carry both as `<stage_id>|<direction>`, which is how a draft's
+    /// `entity_key` writes the pair; `direction` below says it separately.
     pub stage_id: String,
+    /// "up", "down", or none for a stage that runs the same either way. Left
+    /// out when `stage_id` already carries it.
+    #[serde(default)]
+    pub direction: Option<String>,
     #[serde(default)]
     pub stage_no: Option<i32>,
 }
@@ -1381,6 +1392,144 @@ pub fn check_payload(
                 ))
             }
         }
+        ("stage", "split") => {
+            // A new stage, and the routes that come off `from_stage_id` onto
+            // it. One change, however many routes: see stages::stage_split.
+            let m = obj(after, what)?;
+            allow_only(
+                m,
+                &[
+                    "stage_id",
+                    "name",
+                    "direction",
+                    "description",
+                    "rows",
+                    "from_stage_id",
+                    "routes",
+                ],
+                what,
+            )?;
+            let id = req_string(m, "stage_id", what)?;
+            check_entity_id("stage_id", id)?;
+            if id != entity_key {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    id,
+                    format!("{what}: entity_key must equal stage_id"),
+                ));
+            }
+            req_string(m, "name", what)?;
+            let from = req_string(m, "from_stage_id", what)?;
+            if from == entity_key.trim() {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    from,
+                    format!("{what}: a stage cannot be split off itself"),
+                ));
+            }
+            match m.get("direction") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(d))
+                    if matches!(d.trim().to_lowercase().as_str(), "up" | "down") => {}
+                Some(_) => {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "direction",
+                        format!("{what}: direction is \"up\", \"down\", or null"),
+                    ))
+                }
+            }
+            let routes = m.get("routes").and_then(Value::as_array).ok_or_else(|| {
+                Finding::error(
+                    "invalid_payload",
+                    "routes",
+                    format!("{what}: routes names the routes to move"),
+                )
+            })?;
+            if routes.is_empty() || routes.len() > MAX_SPLIT_ROUTES {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "routes",
+                    format!("{what}: routes is 1 to {MAX_SPLIT_ROUTES} route ids"),
+                ));
+            }
+            if routes
+                .iter()
+                .any(|r| r.as_str().is_none_or(|s| s.trim().is_empty()))
+            {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "routes",
+                    format!("{what}: every route is a non-empty id"),
+                ));
+            }
+            opt_string(m, "description", what)?;
+            let rows = m.get("rows").ok_or_else(|| {
+                Finding::error(
+                    "invalid_payload",
+                    "rows",
+                    format!("{what}: rows is required"),
+                )
+            })?;
+            serde_json::from_value::<Vec<StageRow>>(rows.clone())
+                .map(|_| ())
+                .map_err(|e| {
+                    Finding::error(
+                        "invalid_payload",
+                        "rows",
+                        format!("{what}: rows are not valid: {e}"),
+                    )
+                })
+        }
+        ("stage", "merge") => {
+            // The stage named by entity_key goes away; the routes using it are
+            // pointed at `into_stage_id`. Both name a stage as
+            // `<stage_id>|<direction>`.
+            let m = obj(after, what)?;
+            allow_only(m, &["into_stage_id", "into_row_version"], what)?;
+            let into = req_string(m, "into_stage_id", what)?;
+            if into == entity_key.trim() {
+                return Err(Finding::error(
+                    "merge_same_stage",
+                    into,
+                    format!("{what}: a stage cannot be merged into itself"),
+                ));
+            }
+            // Direction is half a stage's key, and the two directions of a
+            // corridor hold different stops: merging across them would give a
+            // route the other way's stops. The apply checks it against the
+            // stored rows too; this catches it before anything is read.
+            let (_, a) = entity_key
+                .trim()
+                .split_once('|')
+                .unwrap_or((entity_key.trim(), ""));
+            let (_, b) = into.split_once('|').unwrap_or((into, ""));
+            if a != b {
+                return Err(Finding::error(
+                    "merge_across_directions",
+                    format!("{entity_key}->{into}"),
+                    format!(
+                        "{what}: {} runs {} and {into} runs {}; a stage is only merged \
+                         into one going the same way",
+                        entity_key.trim(),
+                        if a.is_empty() { "either way" } else { a },
+                        if b.is_empty() { "either way" } else { b }
+                    ),
+                ));
+            }
+            match m.get("into_row_version") {
+                None | Some(Value::Null) => {}
+                Some(v) if v.is_i64() => {}
+                Some(_) => {
+                    return Err(Finding::error(
+                        "invalid_row_version",
+                        into,
+                        format!("{what}: into_row_version is a number"),
+                    ))
+                }
+            }
+            Ok(())
+        }
         ("stop", "merge") => {
             let m = obj(after, what)?;
             allow_only(
@@ -2020,6 +2169,7 @@ mod tests {
     fn stage_numbers_count_on_from_the_last_one_given() {
         let l = |id: &str, no: Option<i32>| StageLink {
             stage_id: id.into(),
+            direction: None,
             stage_no: no,
         };
         assert_eq!(stage_numbers(&[]), Vec::<i32>::new());
