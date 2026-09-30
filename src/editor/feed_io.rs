@@ -215,6 +215,11 @@ pub async fn load_model(
             info.entry("clusterId").or_insert_with(|| json!(cluster));
             values.insert("info_json", Value::Object(info));
         }
+        // out of use: the row is written as any other, and no trip calls at it
+        // (section 21)
+        if s["unserviceable"].as_bool().unwrap_or(false) {
+            m.unserviceable.insert(stop_id.clone());
+        }
         m.stops.push(Stop {
             stop_id,
             values,
@@ -246,7 +251,7 @@ pub async fn load_model(
     let mut patterns: BTreeMap<(String, i16), Pattern> = BTreeMap::new();
     for r in rows(
         conn,
-        "SELECT to_jsonb(rs)::text FROM gtfs_route_stop rs \
+        "SELECT to_jsonb(rs)::text FROM gtfs_route_stop_effective_all rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 AND rs.stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
          ORDER BY rs.route_id, rs.pattern_key, rs.sequence",

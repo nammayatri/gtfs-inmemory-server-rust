@@ -150,6 +150,7 @@ fn write_preprocessed(dir: &Path) {
         headsign: None,
         stage_number: None,
         is_stage_stop: None,
+        unserviceable: None,
     };
     let route = |feed: &str| NandiRoutesRes {
         id: format!("{feed}:{ROUTE}"),
@@ -396,10 +397,17 @@ async fn chennai_bus_is_served_exactly_as_it_was() {
     let Some(pool) = local_pool().await else {
         return;
     };
+    // The rows the loader itself is given: the view, not the table. This test
+    // is about the headsign RULE - that the loader derives a fare-stage headsign
+    // exactly as the pre-0017 loader did - so the reference has to start from
+    // the same stops. On a feed served from its stages (migration 0027) those
+    // are what the stages say, which for chennai_bus is no longer what
+    // gtfs_route_stop holds: read from the table, this compared the rule
+    // against a different list of stops and failed on the list, not the rule.
     let rows = sqlx::query(
         "SELECT rs.route_id, rs.sequence, rs.stop_type, rs.stage_no, rs.stop_headsign,
                 coalesce(s.stop_code, s.stop_id) AS code
-           FROM gtfs_route_stop rs
+           FROM gtfs_route_stop_effective_all rs
            JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
            JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id AND NOT s.deleted
           WHERE rs.gtfs_id = 'chennai_bus' AND rs.pattern_key = 1

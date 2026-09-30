@@ -110,7 +110,8 @@ pub async fn feeds(state: &EditorState, ctx: &Ctx) -> EditorResult<Value> {
     // a feed the caller holds no grant on does not exist for them
     let granted: Vec<String> = ctx.user.grants.keys().cloned().collect();
     let rows = sqlx::query(
-        "SELECT gtfs_id, display_name, version, data_source, released_version, released_at, updated_at \
+        "SELECT gtfs_id, display_name, version, data_source, released_version, released_at, updated_at, \
+                use_stages \
          FROM gtfs_feed WHERE $1 OR gtfs_id = ANY($2) ORDER BY gtfs_id",
     )
     .bind(ctx.is_admin())
@@ -129,6 +130,9 @@ pub async fn feeds(state: &EditorState, ctx: &Ctx) -> EditorResult<Value> {
                 "released_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("released_at")?,
                 "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
                 "my_role": ctx.feed_role(&r.try_get::<String, _>("gtfs_id")?).map(auth::Role::as_str),
+                // whether this feed is served from its stages: the dashboard
+                // offers nothing about stages on a feed where it is off
+                "use_stages": r.try_get::<bool, _>("use_stages")?,
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -176,7 +180,7 @@ pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
 async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<Value> {
     let row = sqlx::query(
         "SELECT gtfs_id, data_source, version, trips_source, default_run_s, default_dwell_s, \
-                schedule_sync, sync_running_times FROM gtfs_feed WHERE gtfs_id = $1",
+                schedule_sync, sync_running_times, use_stages FROM gtfs_feed WHERE gtfs_id = $1",
     )
     .bind(gtfs_id)
     .fetch_optional(&mut *conn)
@@ -191,13 +195,15 @@ async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult
         "default_dwell_s": row.try_get::<i32, _>("default_dwell_s")?,
         "schedule_sync": row.try_get::<String, _>("schedule_sync")?,
         "sync_running_times": row.try_get::<bool, _>("sync_running_times")?,
+        // whether the feed is served from its stages (migration 0027)
+        "use_stages": row.try_get::<bool, _>("use_stages")?,
     }))
 }
 
 // ---------------------------------------------------------------- stops
 
 /// Distinct routes calling at a stop, for a query aliasing gtfs_stop as `s`.
-const ROUTE_COUNT: &str = "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+const ROUTE_COUNT: &str = "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
      WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count";
 
 /// A station's live platforms, for the same query: the map ties a station to
@@ -215,7 +221,7 @@ fn stop_json_counted(r: &PgRow) -> Result<Value, sqlx::Error> {
 const STOP_COLS: &str = "stop_id, stop_code, name, lat, lon, location_type, parent_station, \
      platform_code, description, cluster_id, regional_name, hindi_name, \
      info_json::text AS info_json, position_source, provenance::text AS provenance, deleted, \
-     row_version, updated_at, updated_by";
+     unserviceable, row_version, updated_at, updated_by";
 
 fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -235,6 +241,8 @@ fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "position_source": r.try_get::<Option<String>, _>("position_source")?,
         "provenance": json_col(r, "provenance")?,
         "deleted": r.try_get::<bool, _>("deleted")?,
+        // out of use for a while: the row stays, no trip calls there (section 21)
+        "unserviceable": r.try_get::<bool, _>("unserviceable")?,
         "row_version": r.try_get::<i32, _>("row_version")?,
         "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
         "updated_by": r.try_get::<Option<String>, _>("updated_by")?,
@@ -364,6 +372,27 @@ pub async fn list_stops(
     Ok(page.wrap(items))
 }
 
+/// Every stop out of use right now, with the routes that call at it (docs
+/// section 21). Nothing takes a stop back into use on its own, so this is the
+/// list somebody checks.
+pub async fn unserviceable_stops(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+) -> EditorResult<Vec<Value>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {STOP_COLS}, {ROUTE_COUNT}, {PLATFORM_COUNT} FROM gtfs_stop s \
+         WHERE s.gtfs_id = $1 AND s.unserviceable AND NOT s.deleted \
+         ORDER BY s.name, s.stop_id"
+    ))
+    .bind(gtfs_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(stop_json_counted)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
 pub async fn stop_detail(
     conn: &mut PgConnection,
     gtfs_id: &str,
@@ -386,7 +415,7 @@ pub async fn stop_detail(
     // A call on another stop order than the route's stop list says which.
     let routes = sqlx::query(
         "SELECT rs.route_id, r.short_name, r.long_name, rs.pattern_key, rs.sequence, rs.stop_type, rs.stage_no \
-         FROM gtfs_route_stop rs \
+         FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
          WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
@@ -526,7 +555,7 @@ pub async fn list_routes(
     let q = q.map(str::trim).filter(|s| !s.is_empty());
     let rows = sqlx::query(&format!(
         "SELECT {ROUTE_COLS}, \
-            (SELECT count(*) FROM gtfs_route_stop rs WHERE rs.gtfs_id = r.gtfs_id \
+            (SELECT count(*) FROM gtfs_route_stop_effective rs WHERE rs.gtfs_id = r.gtfs_id \
                AND rs.route_id = r.route_id AND rs.pattern_key = 1 \
                AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count \
          FROM gtfs_route r \
@@ -612,8 +641,12 @@ pub async fn load_pattern_rows(
     route_id: &str,
     pattern_key: i16,
 ) -> EditorResult<Vec<RouteRow>> {
+    // The view, not the table: on a feed served from its stages a route's
+    // rows ARE what its stages say (migration 0027), so "the live rows" and "the
+    // stages flattened" are the same thing by construction and no stage edit can
+    // find a route out of step with its stages.
     let rows = sqlx::query(&format!(
-        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop \
+        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop_effective \
          WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 ORDER BY sequence"
     ))
     .bind(gtfs_id)
@@ -653,11 +686,15 @@ pub async fn load_patterns_rows(
     keys: &[(String, i16)],
 ) -> EditorResult<HashMap<(String, i16), Vec<RouteRow>>> {
     let (routes, patterns): (Vec<String>, Vec<i16>) = keys.iter().cloned().unzip();
+    // `route_id = ANY($2)` says again what the join says, and is not redundant:
+    // a join is not pushed into the view, so without it every route of the feed
+    // is flattened from its stages (1.6 s on chennai_bus) to keep a handful
     let rows = sqlx::query(&format!(
-        "SELECT rs.route_id, rs.pattern_key, {} FROM gtfs_route_stop rs \
+        "SELECT rs.route_id, rs.pattern_key, {} FROM gtfs_route_stop_effective rs \
          JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
            ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
-         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) \
+         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
         ROUTE_ROW_COLS
             .split(", ")
             .map(|c| format!("rs.{}", c.trim()))
@@ -712,11 +749,12 @@ pub async fn load_patterns_read_rows(
                 rs.pickup_type, rs.drop_off_type, rs.timepoint, rs.stop_headsign, rs.stop_sequence, \
                 rs.continuous_pickup, rs.continuous_drop_off, rs.shape_dist_traveled, \
                 rs.pickup_booking_rule_id, rs.drop_off_booking_rule_id \
-         FROM gtfs_route_stop rs \
+         FROM gtfs_route_stop_effective rs \
          JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
            ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
          LEFT JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
-         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) \
+         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(gtfs_id)
     .bind(&routes)
@@ -1393,6 +1431,13 @@ fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: 
         ),
         "route_trips" => format!("The trips of route {key}"),
         "service" => format!("Service {key}"),
+        "stage" => format!("Stage {key}"),
+        "route_stages" => format!("The stages of route {key}"),
+        // the change is the route's; which of its lists is in the payload
+        "route_variant" => match c.after["variant_id"].as_str().map(str::trim) {
+            Some(v) if !v.is_empty() => format!("The stages of temporary route {v} on route {key}"),
+            _ => format!("The stages of the normal route {key}"),
+        },
         "station" if key != c.entity_key => {
             format!("Station {key} (kept by the merge of {})", c.entity_key)
         }
@@ -1433,6 +1478,25 @@ async fn live_row_version(
     .transpose()?)
 }
 
+/// A stage's live `row_version`, by the pair that names it.
+async fn live_stage_version(
+    conn: &mut PgConnection,
+    g: &str,
+    key: &super::stages::StageKey,
+) -> EditorResult<Option<i32>> {
+    Ok(sqlx::query(
+        "SELECT row_version FROM gtfs_stage \
+          WHERE gtfs_id = $1 AND stage_id = $2 AND direction = $3",
+    )
+    .bind(g)
+    .bind(&key.stage_id)
+    .bind(&key.direction)
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(|r| r.try_get("row_version"))
+    .transpose()?)
+}
+
 fn version_conflict(
     c: &ChangeRow,
     key: &str,
@@ -1447,7 +1511,7 @@ fn version_conflict(
 }
 
 /// What an earlier change of a set creates, for [`conflict_for`]: `(kind, key)`
-/// with kind `stop` (a stop or station), `route`, `service` or `pattern`
+/// with kind `stop` (a stop or station), `route`, `stage`, `service` or `pattern`
 /// (`{route}#{pattern_key}`). Such a row has no live version to be stale
 /// against.
 fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
@@ -1459,6 +1523,7 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
             ("route", key),
         ],
         ("service", "create") => vec![("service", key)],
+        ("stage", "create" | "split") => vec![("stage", key)],
         (e, "create") if super::records::spec_for(e).is_some() => {
             vec![("record", format!("{e}#{key}"))]
         }
@@ -1468,14 +1533,38 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
     }
 }
 
+/// The list of stages a change writes, as (route, variant), where the empty
+/// variant is the route's normal list. A later change based on a list this set
+/// has already written is based on the set, not on the live rows, so its hash
+/// is not compared against them.
+fn lists_written(c: &ChangeRow) -> Vec<(String, String)> {
+    let route = c.entity_key.clone();
+    let variant = || {
+        c.after["variant_id"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    match (c.entity.as_str(), c.op.as_str()) {
+        // a route's first temporary route turns its stops into stages, so the
+        // normal list is written too
+        ("route_variant", "create") => vec![(route.clone(), variant()), (route, String::new())],
+        ("route_variant", "update" | "delete") => vec![(route, variant())],
+        ("route_stages", "replace") => vec![(route, String::new())],
+        _ => Vec::new(),
+    }
+}
+
 /// Has the live data moved on since the change was made? `in_draft(kind, key)`
 /// says whether an earlier change in the same set creates a row
 /// ([`created_by`]): such a row has no live version to be stale against.
+/// `list_in_draft` says the same of a list of stages (see [`lists_written`]).
 async fn conflict_for(
     conn: &mut PgConnection,
     g: &str,
     c: &ChangeRow,
     in_draft: &dyn Fn(&str, &str) -> bool,
+    list_in_draft: &dyn Fn(&str, &str) -> bool,
 ) -> EditorResult<Vec<Value>> {
     let key = c.entity_key.as_str();
     let mut out = Vec::new();
@@ -1489,6 +1578,44 @@ async fn conflict_for(
         ("route", "update" | "delete") if !in_draft("route", key) => {
             let live = live_row_version(conn, "gtfs_route", "route_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
+        }
+        ("stage", "update" | "delete" | "merge") if !in_draft("stage", key) => {
+            // A stage is keyed by its id AND its direction, and the change
+            // writes the pair as `159|down`. Looking that up as a bare stage id
+            // matches no row, and every stage change then reports a conflict
+            // that is not there, so the key is read back before it is used.
+            let sk = super::stages::key_of_change(conn, g, key).await;
+            let live = live_stage_version(conn, g, &sk).await?;
+            out.extend(version_conflict(c, key, live, c.base_row_version));
+        }
+        // a temporary route's change is based on the list it names: the one it
+        // switches to, or the one it edits. A list this set has already written
+        // -- the temporary route it just added, or the normal list that adding
+        // it converted -- is the set's own work, not a stale read of live.
+        ("route_variant", "activate") | ("route_variant", "update") => {
+            let variant = c.after["variant_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if !list_in_draft(key, variant.unwrap_or("")) && !in_draft("route", key) {
+                if let Some(expected) = c.after["base_stages_hash"].as_str() {
+                    let actual = super::variants::live_variant_hash(conn, g, key, variant).await?;
+                    if expected != actual {
+                        out.push(conflict(c, "changed", json!(expected), json!(actual)));
+                    }
+                }
+            }
+        }
+        ("route_stages", "replace") if !list_in_draft(key, "") && !in_draft("route", key) => {
+            // a route without stages hashes like []
+            let expected = c.after["base_stages_hash"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let actual = super::stages::live_links_hash(conn, g, key, None).await?;
+            if expected != actual {
+                out.push(conflict(c, "changed", json!(expected), json!(actual)));
+            }
         }
         // a merge is two rows: the one that goes away and the one that stays,
         // and either moving on under the editor's feet is a conflict
@@ -1510,10 +1637,23 @@ async fn conflict_for(
                 }
             }
         }
-        ("stop" | "station" | "route" | "service", "create") => {
+        ("stage", "split") => {
+            // the stage it makes is new; the one it takes routes off is the row
+            // that can have moved under it
+            let from = c.after["from_stage_id"].as_str().unwrap_or("").trim();
+            if !from.is_empty() && !in_draft("stage", from) {
+                let sk = super::stages::key_of_change(conn, g, from).await;
+                let live = live_stage_version(conn, g, &sk).await?;
+                if live.is_none() {
+                    out.push(conflict_on(c, from, "missing", Value::Null, Value::Null));
+                }
+            }
+        }
+        ("stop" | "station" | "route" | "service" | "stage", "create") => {
             let (table, id_col) = match c.entity.as_str() {
                 "route" => ("gtfs_route", "route_id"),
                 "service" => ("gtfs_service", "service_id"),
+                "stage" => ("gtfs_stage", "stage_id"),
                 _ => ("gtfs_stop", "stop_id"),
             };
             let exists = live_row_version(conn, table, id_col, g, key).await?;
@@ -1663,13 +1803,19 @@ pub async fn evaluate(
 ) -> EditorResult<Evaluation> {
     let mut ev = Evaluation::default();
     let mut created: HashSet<(&'static str, String)> = HashSet::new();
+    let mut lists: HashSet<(String, String)> = HashSet::new();
     for c in changes {
-        let found = conflict_for(conn, g, c, &|kind, key| {
-            created.iter().any(|(k, v)| *k == kind && v.as_str() == key)
-        })
+        let found = conflict_for(
+            conn,
+            g,
+            c,
+            &|kind, key| created.iter().any(|(k, v)| *k == kind && v.as_str() == key),
+            &|route, variant| lists.contains(&(route.to_string(), variant.to_string())),
+        )
         .await?;
         ev.conflicts.extend(found);
         created.extend(created_by(c));
+        lists.extend(lists_written(c));
     }
     let mut state = ApplyState {
         changes,
@@ -1816,7 +1962,7 @@ fn referenced_stops(c: &ChangeRow) -> Vec<String> {
                 &c.after,
             )
         }
-        ("route_stops", "replace") => c.after["rows"]
+        ("route_stops", "replace") | ("stage", "create" | "update" | "split") => c.after["rows"]
             .as_array()
             .map(|rows| {
                 rows.iter()
@@ -1861,6 +2007,15 @@ async fn apply_change(
         return Err(ApplyError::Findings(gone));
     }
     let key = c.entity_key.as_str();
+    // Stages, and the temporary routes built out of them, exist only on a feed
+    // that uses them. Anywhere else a change to one is refused here, in one
+    // place, so no stage can come to be on a feed whose routes are stop lists.
+    if matches!(
+        c.entity.as_str(),
+        "stage" | "route_stages" | "route_variant"
+    ) {
+        super::stages::require_stages(conn, g).await?;
+    }
     match (c.entity.as_str(), c.op.as_str()) {
         ("stop", "update") => stop_update(conn, g, key, &c.after, actor).await,
         ("stop", "create") => stop_create(conn, g, &c.after, actor).await,
@@ -1870,6 +2025,26 @@ async fn apply_change(
         ("route", "update") => route_update(conn, g, key, &c.after, actor).await,
         ("route", "delete") => route_delete(conn, g, c, actor, state.changes).await,
         ("route_stops", "replace") => route_stops_replace(conn, g, key, &c.after, actor).await,
+        ("stage", "create") => super::stages::stage_create(conn, g, key, &c.after, actor).await,
+        ("stage", "update") => super::stages::stage_update(conn, g, key, &c.after, actor).await,
+        ("stage", "delete") => super::stages::stage_delete(conn, g, key, actor).await,
+        ("stage", "merge") => super::stages::stage_merge(conn, g, key, &c.after, actor).await,
+        ("stage", "split") => super::stages::stage_split(conn, g, key, &c.after, actor).await,
+        ("route_stages", "replace") => {
+            super::stages::route_stages_replace(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "create") => {
+            super::variants::variant_create(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "update") => {
+            super::variants::variant_update(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "activate") => {
+            super::variants::variant_activate(conn, g, key, &c.after, actor).await
+        }
+        ("route_variant", "delete") => {
+            super::variants::variant_delete(conn, g, key, &c.after, actor).await
+        }
         ("station", "create") => station_create(conn, g, &c.after, actor).await,
         ("station", "update") => station_update(conn, g, key, &c.after, actor).await,
         ("station", "delete") => station_delete(conn, g, key, actor).await,
@@ -1918,6 +2093,8 @@ struct LiveStop {
     location_type: i16,
     deleted: bool,
     parent_station: Option<String>,
+    /// Out of use: its row stays, no trip calls there (section 21).
+    unserviceable: bool,
 }
 
 async fn live_stop(
@@ -1926,7 +2103,7 @@ async fn live_stop(
     id: &str,
 ) -> Result<Option<LiveStop>, sqlx::Error> {
     sqlx::query(
-        "SELECT lat, lon, location_type, deleted, parent_station FROM gtfs_stop \
+        "SELECT lat, lon, location_type, deleted, parent_station, unserviceable FROM gtfs_stop \
          WHERE gtfs_id = $1 AND stop_id = $2 FOR UPDATE",
     )
     .bind(g)
@@ -1940,6 +2117,7 @@ async fn live_stop(
             location_type: r.try_get("location_type")?,
             deleted: r.try_get("deleted")?,
             parent_station: r.try_get("parent_station")?,
+            unserviceable: r.try_get("unserviceable")?,
         })
     })
     .transpose()
@@ -1990,6 +2168,11 @@ async fn stop_update(
     let (has_cluster, cluster) = field(m, "cluster_id");
     let (has_regional, regional) = field(m, "regional_name");
     let (has_hindi, hindi) = field(m, "hindi_name");
+    // out of use, or back in use: the stops.txt row stays either way (section 21)
+    let unserviceable = m.get("unserviceable").and_then(Value::as_bool);
+    if let Some(flag) = unserviceable {
+        warnings.extend(unserviceable_findings(conn, g, id, flag, live.unserviceable).await?);
+    }
     sqlx::query(
         "UPDATE gtfs_stop SET \
             name = CASE WHEN $3 THEN $4 ELSE name END, \
@@ -2003,6 +2186,7 @@ async fn stop_update(
             regional_name = CASE WHEN $12 THEN $13 ELSE regional_name END, \
             hindi_name = CASE WHEN $14 THEN $15 ELSE hindi_name END, \
             description = CASE WHEN $17 THEN $18 ELSE description END, \
+            unserviceable = CASE WHEN $19 THEN $20 ELSE unserviceable END, \
             updated_by = $16 \
          WHERE gtfs_id = $1 AND stop_id = $2",
     )
@@ -2024,10 +2208,154 @@ async fn stop_update(
     .bind(actor)
     .bind(has_description)
     .bind(description)
+    .bind(unserviceable.is_some())
+    .bind(unserviceable.unwrap_or(false))
     .execute(&mut *conn)
     .await?;
     warnings.extend(stop_gtfs_fields(conn, g, id, m, &before, live.location_type).await?);
     Ok(warnings)
+}
+
+/// What making a stop unserviceable does to the routes that call at it (docs
+/// section 21). The rows stay and no time is recomputed - the stop is skipped
+/// where times are emitted - so what a reviewer needs to see is how much of the
+/// feed stops calling there, and whether any route is left with too little to
+/// publish.
+async fn unserviceable_findings(
+    conn: &mut PgConnection,
+    g: &str,
+    id: &str,
+    flag: bool,
+    was: bool,
+) -> Result<Vec<Finding>, ApplyError> {
+    if flag == was {
+        return Ok(vec![Finding::warning(
+            "unserviceable_unchanged",
+            id,
+            format!(
+                "stop {id} is already {}",
+                if flag { "out of use" } else { "in use" }
+            ),
+        )]);
+    }
+    if !flag {
+        return Ok(vec![Finding::warning(
+            "stop_serviceable_again",
+            id,
+            format!("stop {id} is served again from the next build, with the times it had before"),
+        )]);
+    }
+    // every stop order of every route that calls there - the ones that do not
+    // call at it too, since a route publishes nothing only when all of its stop
+    // orders are left with fewer than two calls
+    let rows = sqlx::query(
+        "SELECT rs.route_id, rs.pattern_key, \
+                count(*) FILTER (WHERE rs.stop_id <> $2) AS others, \
+                count(*) FILTER (WHERE rs.stop_id = $2) AS calls, \
+                count(*) FILTER (WHERE rs.stop_id = $2 AND rs.stop_type = 'NEW STOP') AS boundaries \
+         FROM gtfs_route_stop_effective rs \
+         JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+         WHERE rs.gtfs_id = $1 AND rs.stop_type = ANY($3) \
+           AND rs.route_id = ANY(ARRAY( \
+             SELECT route_id FROM gtfs_route_stop_effective \
+              WHERE gtfs_id = $1 AND stop_id = $2 AND stop_type = ANY($3))) \
+         GROUP BY rs.route_id, rs.pattern_key ORDER BY rs.route_id, rs.pattern_key",
+    )
+    .bind(g)
+    .bind(id)
+    .bind(&super::validation::SERVED_STOP_TYPES[..])
+    .fetch_all(&mut *conn)
+    .await?;
+    if rows.is_empty() {
+        return Ok(vec![Finding::warning(
+            "stop_unserviceable",
+            id,
+            format!("stop {id} is out of use from the next build; no route calls there"),
+        )]);
+    }
+    // per route: its stop orders, and the ones left with too little to publish
+    let mut per_route: std::collections::BTreeMap<String, (usize, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    let mut calling: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut boundary_of = 0;
+    for r in &rows {
+        let route: String = r.try_get("route_id")?;
+        let pattern: i16 = r.try_get("pattern_key")?;
+        let calls = r.try_get::<i64, _>("calls")? > 0;
+        if calls {
+            calling.insert(route.clone());
+        }
+        if r.try_get::<i64, _>("boundaries")? > 0 {
+            boundary_of += 1;
+        }
+        let entry = per_route.entry(route.clone()).or_insert((0, Vec::new()));
+        entry.0 += 1;
+        if r.try_get::<i64, _>("others")? < 2 {
+            entry.1.push(if pattern == 1 {
+                format!("route {route}")
+            } else {
+                format!("route {route} stop order {pattern}")
+            });
+        }
+    }
+    let mut out = vec![Finding::warning(
+        "stop_unserviceable",
+        id,
+        format!(
+            "stop {id} is out of use from the next build: {} route(s) stop calling there, and \
+             their trips skip it until it is in use again",
+            calling.len()
+        ),
+    )];
+    if boundary_of > 0 {
+        out.push(Finding::warning(
+            "stage_boundary_moves",
+            id,
+            format!(
+                "stop {id} begins its fare stage on {boundary_of} stop order(s); while it is out \
+                 of use the stage's next stop carries the stage"
+            ),
+        ));
+    }
+    // a route whose every stop order is left too short would publish no trips at
+    // all: that is a mistake, not a stop out of use. One stop order of several
+    // going quiet is the operator's call, and is said.
+    let dead: Vec<&String> = per_route
+        .iter()
+        .filter(|(_, (total, short))| short.len() == *total)
+        .map(|(route, _)| route)
+        .collect();
+    let quiet: Vec<String> = per_route
+        .values()
+        .filter(|(total, short)| !short.is_empty() && short.len() < *total)
+        .flat_map(|(_, short)| short.clone())
+        .collect();
+    if !dead.is_empty() {
+        out.push(Finding::error(
+            "route_too_short",
+            id,
+            format!(
+                "route(s) {} would have no stop order left with two stops a passenger can board, \
+                 so they could publish no trips at all; take {id} out of those routes instead",
+                dead.iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    if !quiet.is_empty() {
+        out.push(Finding::warning(
+            "pattern_too_short",
+            id,
+            format!(
+                "{} would be left with fewer than two stops a passenger can board, so those \
+                 trips are not published while {id} is out of use",
+                quiet.join(", ")
+            ),
+        ));
+    }
+    Ok(out)
 }
 
 /// The GTFS fields of stops.txt a stop change sets by name (section 18): what
@@ -2059,7 +2387,7 @@ async fn stop_gtfs_fields(
     }
     if new_type != 0 && was_type == 0 {
         let routes: i64 = sqlx::query_scalar(
-            "SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+            "SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
              WHERE rs.gtfs_id = $1 AND rs.stop_id = $2",
         )
@@ -2165,7 +2493,7 @@ async fn stop_delete(
     }
     let used: Vec<String> = sqlx::query(
         // a deleted route's rows stay, but nothing serves them
-        "SELECT DISTINCT rs.route_id FROM gtfs_route_stop rs \
+        "SELECT DISTINCT rs.route_id FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id",
     )
@@ -2201,6 +2529,24 @@ async fn stop_delete(
             format!(
                 "stop {id} is named by {}; change or remove those first",
                 super::records::say_users(&users)
+            ),
+        ));
+    }
+    // a stage no route uses yet is still one a route may be given
+    let stages = super::stages::stages_with_stop(conn, g, id).await?;
+    if !stages.is_empty() {
+        let sample: Vec<String> = stages
+            .iter()
+            .take(5)
+            .map(|(sid, name)| format!("{name} ({sid})"))
+            .collect();
+        return Err(fail(
+            "stop_in_stage",
+            format!(
+                "stop {id} is in {} stage(s) ({}{}); take it out of them first",
+                stages.len(),
+                sample.join(", "),
+                if stages.len() > 5 { ", ..." } else { "" }
             ),
         ));
     }
@@ -2439,7 +2785,13 @@ fn other_route_changes(changes: &[ChangeRow], route_id: &str, except: i64) -> Ve
         .filter(|o| {
             matches!(
                 o.entity.as_str(),
-                "route" | "route_stops" | "pattern" | "timing_profile" | "route_trips"
+                "route"
+                    | "route_stops"
+                    | "pattern"
+                    | "timing_profile"
+                    | "route_trips"
+                    | "route_stages"
+                    | "route_variant"
             )
         })
         .map(|o| o.change_id)
@@ -2535,12 +2887,17 @@ async fn stop_merge(
     // on each of its stop orders, which the merge switches alike (section 16):
     // switching the id must not make a route call one stop twice in a row.
     let mut by_route: Vec<((String, i16), Vec<SequencedStop>)> = Vec::new();
+    // the routes are named as an array as well as by the IN below: an array is
+    // a filter the view can apply before it flattens anything, where a
+    // sub-select alone makes it flatten every route of the feed first
     for r in sqlx::query(
-        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop rs \
+        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 \
+           AND rs.route_id = ANY(ARRAY( \
+               SELECT route_id FROM gtfs_route_stop_effective WHERE gtfs_id = $1 AND stop_id = $2)) \
            AND (rs.route_id, rs.pattern_key) IN \
-               (SELECT route_id, pattern_key FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_id = $2) \
+               (SELECT route_id, pattern_key FROM gtfs_route_stop_effective WHERE gtfs_id = $1 AND stop_id = $2) \
          ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(g)
@@ -2635,6 +2992,15 @@ async fn stop_merge(
     .iter()
     .map(|r| r.try_get("route_id"))
     .collect::<Result<_, _>>()?;
+    super::stages::merge_stop_into(
+        conn,
+        g,
+        from,
+        into,
+        (!keep_name_from && f.name != i.name).then_some(f.name.as_str()),
+        actor,
+    )
+    .await?;
     // 2 and 3. the kept stop: name / position if asked, and the station the
     // duplicate was in when it has none
     let takes_station = i.parent_station.is_none() && f.parent_station.is_some();
@@ -2750,7 +3116,6 @@ async fn route_stops_replace(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
     }
-    let mut findings = Vec::new();
     let ids: Vec<String> = rows
         .iter()
         .filter(|r| !r.is_marker())
@@ -2758,11 +3123,75 @@ async fn route_stops_replace(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    if super::stages::has_stages(conn, g, route_id).await? {
+        return Err(fail(
+            "route_has_stages",
+            format!(
+                "route {route_id} is built from stages: change its stages, or the stage \
+                 itself, instead of its stop list"
+            ),
+        ));
+    }
+    // A feed served from its stages reads nothing else (migration 0027), so a
+    // stop list written for a route without stages would be written and never
+    // seen. The route gets its stops by being given stages.
+    if super::stages::feed_uses_stages(conn, g).await? {
+        return Err(fail(
+            "route_needs_stages",
+            format!(
+                "feed {g} builds its routes from stages, so route {route_id} has no stop \
+                 list to set: give it stages (Build from stages on the route, or the \
+                 Route stages upload)"
+            ),
+        ));
+    }
+    let mut findings = check_stops_usable(conn, g, &ids).await?;
+    let live = load_pattern_rows(conn, g, route_id, pattern_key).await?;
+    let fare_stages = has_fare_stages(conn, g).await?;
+    if payload.position_review_id.is_some() {
+        // a split points the reviewed stop's rows at a new stop: what those rows
+        // already had wrong under the old stop is not the split's doing
+        findings.extend(grade_repointed(&rows, &live, fare_stages));
+    } else {
+        findings.extend(grade_against_live(
+            check_route_rows_for(&rows, fare_stages),
+            &check_route_rows_for(&live, fare_stages),
+        ));
+    }
+    // A stop that cannot be used, or a row the table refuses, stops the change
+    // here. A broken fare or stop-order rule does not: the rows are written, so
+    // the draft's preview (and every later change in it) sees the stop list as
+    // drafted, while the error still blocks submit and commit.
+    if blocks_apply(&findings) {
+        return Err(ApplyError::Findings(findings));
+    }
+
+    findings.extend(write_pattern_rows(conn, g, route_id, pattern_key, &rows, &live, actor).await?);
+    Ok(findings)
+}
+
+/// Whether findings stop a change from applying at all: an error that is not
+/// one of the fare and stop-order rules a draft may hold while it is fixed.
+pub(super) fn blocks_apply(findings: &[Finding]) -> bool {
+    findings
+        .iter()
+        .any(|f| f.level == Level::Error && !ROUTE_RULE_CODES.contains(&f.code.as_str()))
+}
+
+/// Errors for stop ids a route row cannot use: unknown, deleted, a station or
+/// some other kind of place. Stages check the same of a stage's stops (docs
+/// section 19).
+pub(super) async fn check_stops_usable(
+    conn: &mut PgConnection,
+    g: &str,
+    ids: &[String],
+) -> Result<Vec<Finding>, sqlx::Error> {
+    let mut findings = Vec::new();
     let known: HashMap<String, (i16, bool)> = sqlx::query(
         "SELECT stop_id, location_type, deleted FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
     )
     .bind(g)
-    .bind(&ids)
+    .bind(ids)
     .fetch_all(&mut *conn)
     .await?
     .iter()
@@ -2770,7 +3199,7 @@ async fn route_stops_replace(
         Ok((r.try_get("stop_id")?, (r.try_get("location_type")?, r.try_get("deleted")?)))
     })
     .collect::<Result<_, _>>()?;
-    let mut ids_sorted = ids.clone();
+    let mut ids_sorted = ids.to_vec();
     ids_sorted.sort();
     for id in &ids_sorted {
         match known.get(id) {
@@ -2800,29 +3229,21 @@ async fn route_stops_replace(
             _ => {}
         }
     }
-    let live = load_pattern_rows(conn, g, route_id, pattern_key).await?;
-    let fare_stages = has_fare_stages(conn, g).await?;
-    if payload.position_review_id.is_some() {
-        // a split points the reviewed stop's rows at a new stop: what those rows
-        // already had wrong under the old stop is not the split's doing
-        findings.extend(grade_repointed(&rows, &live, fare_stages));
-    } else {
-        findings.extend(grade_against_live(
-            check_route_rows_for(&rows, fare_stages),
-            &check_route_rows_for(&live, fare_stages),
-        ));
-    }
-    // A stop that cannot be used, or a row the table refuses, stops the change
-    // here. A broken fare or stop-order rule does not: the rows are written, so
-    // the draft's preview (and every later change in it) sees the stop list as
-    // drafted, while the error still blocks submit and commit.
-    if findings
-        .iter()
-        .any(|f| f.level == Level::Error && !ROUTE_RULE_CODES.contains(&f.code.as_str()))
-    {
-        return Err(ApplyError::Findings(findings));
-    }
+    Ok(findings)
+}
 
+/// Replace one pattern's `gtfs_route_stop` rows with `rows`, in order. `live` is
+/// what that pattern has now; its stored timings follow the new stops.
+pub(super) async fn write_pattern_rows(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    pattern_key: i16,
+    rows: &[RouteRow],
+    live: &[RouteRow],
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
+    let mut findings = Vec::new();
     // What the live rows carry that an edit does not send: the cleanup's
     // per-row provenance (kept where the same stop or marker stays at the same
     // position) and the provider id (a new row takes the route's usual one).
@@ -2851,7 +3272,7 @@ async fn route_stops_replace(
     .collect::<Result<_, _>>()?;
     let usual_provider = {
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for r in &live {
+        for r in live {
             if let Some(p) = r.provider_id.as_deref() {
                 *counts.entry(p).or_default() += 1;
             }
@@ -3016,11 +3437,43 @@ async fn route_stops_replace(
     .execute(&mut *conn)
     .await?;
     // the pattern's stored timings follow its new stops, in this same change
-    let old_ids = super::trips::served_ids(&live);
+    let old_ids = super::trips::served_ids(live);
     findings.extend(
         super::trips::carry_over_profiles(conn, g, route_id, pattern_key, &old_ids, actor).await?,
     );
     Ok(findings)
+}
+
+/// The rows of a route's first pattern: the stop list every screen that is not
+/// the timetable means. Stages and temporary routes write through this.
+pub(super) async fn write_route_rows(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    rows: &[RouteRow],
+    live: &[RouteRow],
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
+    // On a feed served from its stages there is nothing to write: the route's
+    // stops are read from its stages (gtfs_route_stop_effective), so the stage
+    // change that brought us here has already changed the route. Writing a copy
+    // into gtfs_route_stop is what made the two able to disagree, and for
+    // chennai_bus that table is MTC's own data and is not ours to overwrite.
+    // The stored timings still follow the route's new stops.
+    if super::stages::feed_uses_stages(conn, g).await? {
+        let _ = rows;
+        let old_ids = super::trips::served_ids(live);
+        return super::trips::carry_over_profiles(
+            conn,
+            g,
+            route_id,
+            FIRST_PATTERN,
+            &old_ids,
+            actor,
+        )
+        .await;
+    }
+    write_pattern_rows(conn, g, route_id, FIRST_PATTERN, rows, live, actor).await
 }
 
 /// Put `members` under `station`, setting the platform label of each member
@@ -3087,6 +3540,9 @@ async fn check_members(
                 location_type: r.try_get("location_type")?,
                 deleted: r.try_get("deleted")?,
                 parent_station: r.try_get("parent_station")?,
+                // this read is a station's members; whether one is out of use
+                // does not bear on joining it to a station
+                unserviceable: false,
             },
         ))
     })
@@ -3300,7 +3756,7 @@ async fn moving_platforms(
 ) -> Result<Vec<Value>, sqlx::Error> {
     sqlx::query(
         "SELECT s.stop_id, s.name, s.platform_code, \
-            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
               JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
                                 AND NOT r.deleted \
               WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count \
@@ -3619,7 +4075,8 @@ async fn feed_config_update(
         "UPDATE gtfs_feed SET data_source = coalesce($2, data_source), \
             trips_source = coalesce($3, trips_source), default_run_s = coalesce($4, default_run_s), \
             default_dwell_s = coalesce($5, default_dwell_s), schedule_sync = coalesce($6, schedule_sync), \
-            sync_running_times = coalesce($7, sync_running_times) \
+            sync_running_times = coalesce($7, sync_running_times), \
+            use_stages = coalesce($8, use_stages) \
          WHERE gtfs_id = $1",
     )
     .bind(g)
@@ -3629,6 +4086,7 @@ async fn feed_config_update(
     .bind(set("default_dwell_s").and_then(Value::as_i64).map(|n| n as i32))
     .bind(set("schedule_sync").and_then(Value::as_str))
     .bind(set("sync_running_times").and_then(Value::as_bool))
+    .bind(set("use_stages").and_then(Value::as_bool))
     .execute(&mut *conn)
     .await?;
     for (f, from, to) in switched {
@@ -3704,7 +4162,7 @@ async fn set_detail_once(
     // reads as itself).
     let referenced: Vec<String> = changes
         .iter()
-        .filter(|c| c.entity == "route_stops")
+        .filter(|c| matches!(c.entity.as_str(), "route_stops" | "stage"))
         .flat_map(|c| c.after["rows"].as_array().cloned().unwrap_or_default())
         .filter_map(|r| r["stop_id"].as_str().map(str::to_string))
         .collect::<HashSet<_>>()
@@ -3891,13 +4349,13 @@ pub fn editable(set: &ChangeSet) -> EditorResult<()> {
 async fn created_in_set(
     conn: &mut PgConnection,
     change_set_id: Uuid,
-    routes: bool,
+    kind: &str,
     key: &str,
 ) -> EditorResult<Option<(String, Value)>> {
-    let entities: &[&str] = if routes {
-        &["route"]
-    } else {
-        &["stop", "station"]
+    let entities: &[&str] = match kind {
+        "route" => &["route"],
+        "stage" => &["stage"],
+        _ => &["stop", "station"],
     };
     let row = sqlx::query(
         "SELECT entity, after::text AS after FROM gtfs_change \
@@ -3968,7 +4426,7 @@ async fn route_in_set(
     if route_row(conn, g, key).await?.is_some() {
         return Ok(true);
     }
-    if created_in_set(conn, change_set_id, true, key)
+    if created_in_set(conn, change_set_id, "route", key)
         .await?
         .is_some()
     {
@@ -4023,7 +4481,7 @@ async fn stop_or_created(
         let version = row["row_version"].as_i64().map(|v| v as i32);
         return Ok(Some((row, station, version)));
     }
-    Ok(created_in_set(conn, change_set_id, false, key)
+    Ok(created_in_set(conn, change_set_id, "stop", key)
         .await?
         .map(|(entity, after)| (after, entity == "station", None)))
 }
@@ -4128,7 +4586,7 @@ async fn snapshot(
                         coalesce(array_agg(rs.sequence ORDER BY rs.sequence) \
                                  FILTER (WHERE rs.pattern_key = 1), '{}') AS sequences, \
                         array_agg(DISTINCT rs.pattern_key) AS pattern_keys \
-                 FROM gtfs_route_stop rs \
+                 FROM gtfs_route_stop_effective rs \
                  JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
                  WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 \
                  GROUP BY rs.route_id, r.short_name ORDER BY rs.route_id",
@@ -4201,7 +4659,7 @@ async fn snapshot(
                     super::records::gtfs_fields(conn, g, "routes.txt", key, &fields).await?;
                 return Ok((row, v));
             }
-            let (_, created) = created_in_set(conn, change_set_id, true, key)
+            let (_, created) = created_in_set(conn, change_set_id, "route", key)
                 .await?
                 .ok_or_else(|| {
                     EditorError::not_found("entity_not_found", format!("no route {key}"))
@@ -4209,6 +4667,36 @@ async fn snapshot(
             Ok((created, None))
         }
         ("feed_config", "update") => Ok((feed_config_row(conn, g).await?, None)),
+        ("stage", "update" | "delete" | "merge") => {
+            let sk = super::stages::key_of_change(conn, g, key).await;
+            if let Some((row, version)) = super::stages::stage_snapshot(conn, g, &sk).await? {
+                return Ok((row, Some(version)));
+            }
+            let (_, created) = created_in_set(conn, change_set_id, "stage", key)
+                .await?
+                .ok_or_else(|| {
+                    EditorError::not_found("entity_not_found", format!("no stage {key}"))
+                })?;
+            Ok((created, None))
+        }
+        ("route_stages", "replace") => {
+            if route_row(conn, g, key).await?.is_none() {
+                if created_in_set(conn, change_set_id, "route", key)
+                    .await?
+                    .is_some()
+                {
+                    return Ok((json!([]), None));
+                }
+                return Err(EditorError::not_found(
+                    "entity_not_found",
+                    format!("no route {key}"),
+                ));
+            }
+            Ok((
+                super::stages::route_stages_snapshot(conn, g, key).await?,
+                None,
+            ))
+        }
         ("route_stops", "replace") => {
             if !route_in_set(conn, change_set_id, g, key).await? {
                 // a route this set creates starts with no rows
@@ -4350,7 +4838,11 @@ pub async fn add_change_to(
             _ => {}
         }
     }
-    let mint = entity == "stop" && op == "create" && key.is_empty() && after.is_object();
+    // `&&` binds tighter than `||`: the two kinds of minting change go in their
+    // own parentheses, or an id given by the caller stops being checked
+    let mints = (matches!(entity.as_str(), "stop" | "stage") && op == "create")
+        || (entity == "stage" && op == "split");
+    let mint = mints && key.is_empty() && after.is_object();
     let invalid = |f: Finding| {
         EditorError::bad_request("invalid_change", f.message.clone())
             .with_details(json!({"code": f.code}))
@@ -4379,7 +4871,11 @@ pub async fn add_change_to(
         )
         .with_details(json!({"code": "feed_mismatch"})));
     }
-    if mint {
+    if mint && entity == "stage" {
+        key = super::stages::mint_stage_id(&mut *tx, &set.gtfs_id).await?;
+        after["stage_id"] = json!(key);
+        check_payload(&entity, &op, &key, &after).map_err(invalid)?;
+    } else if mint {
         key = mint_stop_ids(&mut *tx, &set.gtfs_id, 1).await?.remove(0);
         after["stop_id"] = json!(key);
         check_payload(&entity, &op, &key, &after).map_err(invalid)?;
@@ -4689,6 +5185,15 @@ pub async fn submit(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()
 async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<()> {
     let mut tx = state.pool.begin().await?;
     lock_feed_of_set(&mut tx, id).await?;
+    submit_in(&mut tx, ctx, id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Submit one set inside a transaction the caller owns: the whole of a submit
+/// but the locking and the commit, so [`submit_many`] can do several in one.
+async fn submit_in(tx: &mut PgConnection, ctx: &Ctx, id: Uuid) -> EditorResult<()> {
+    let mut tx = tx;
     let set = load_set(&mut tx, id, true).await?;
     editable(&set)?;
     let changes = load_changes_to_apply(&mut tx, id).await?;
@@ -4738,8 +5243,57 @@ async fn submit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<(
         json!({"changes": changes.len(), "warnings": ev.validation.len()}),
     )
     .await?;
-    tx.commit().await?;
     Ok(())
+}
+
+/// Submit several drafts of feed `g` in one transaction and one request. The
+/// same rules as [`submit`] for each; one that cannot be submitted is reported
+/// in `failed`, rolled back to its own savepoint, and the rest are submitted.
+///
+/// A batch is one call rather than one per draft because the dashboard submits
+/// the drafts somebody has ticked, and half of them going through on a dropped
+/// connection is worse than none.
+pub async fn submit_many(
+    state: &EditorState,
+    ctx: &Ctx,
+    g: &str,
+    ids: &[Uuid],
+) -> EditorResult<Value> {
+    let ids = batch_ids(ids)?;
+    retry_transient(|| async {
+        let ids = ids.clone();
+        let mut tx = state.pool.begin().await?;
+        // the same lock order as a single submit, taken once for the feed
+        lock_feed(&mut tx, g).await?;
+        let (mut submitted, mut failed) = (Vec::new(), Vec::new());
+        for &id in &ids {
+            begin_set(&mut tx).await?;
+            let out = async {
+                let found = sqlx::query(
+                    "SELECT 1 FROM gtfs_change_set WHERE change_set_id = $1 AND gtfs_id = $2",
+                )
+                .bind(id)
+                .bind(g)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if found.is_none() {
+                    return Err(EditorError::not_found(
+                        "change_set_not_found",
+                        format!("no change set {id} on feed {g}"),
+                    ));
+                }
+                submit_in(&mut tx, ctx, id).await
+            }
+            .await;
+            match settle_set(&mut tx, out).await? {
+                None => submitted.push(id),
+                Some(e) => failed.push(batch_failure(id, "submit", false, &e)),
+            }
+        }
+        tx.commit().await?;
+        Ok(json!({"submitted": submitted, "failed": failed}))
+    })
+    .await
 }
 
 /// Maker-checker, enforced here as well as by the table's CHECK: nobody reviews
@@ -4771,7 +5325,21 @@ pub async fn review(
         ));
     }
     let mut tx = state.pool.begin().await?;
-    let set = load_set(&mut tx, id, true).await?;
+    review_in(&mut tx, ctx, id, approve, comment, self_approve).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`review`] inside the caller's transaction; `comment` is already trimmed.
+async fn review_in(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    id: Uuid,
+    approve: bool,
+    comment: Option<&str>,
+    self_approve: bool,
+) -> EditorResult<()> {
+    let set = load_set(conn, id, true).await?;
     if set.status != "submitted" {
         return Err(EditorError::conflict(
             "change_set_not_submitted",
@@ -4795,7 +5363,7 @@ pub async fn review(
     .bind(ctx.user.user_id)
     .bind(comment)
     .bind(own)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     let (action, detail) = match (approve, own) {
         (true, true) => (
@@ -4810,7 +5378,7 @@ pub async fn review(
         (false, _) => ("change_set_rejected", json!({"comment": comment})),
     };
     auth::audit(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         action,
@@ -4819,7 +5387,6 @@ pub async fn review(
         detail,
     )
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -4917,11 +5484,57 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     // the feed's advisory lock first (every replay of the feed queues on it),
     // then its row, then the set: every commit on a feed takes locks in this order
     let gtfs_id = lock_feed_of_set(&mut tx, id).await?;
-    sqlx::query("SELECT version FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
-        .bind(&gtfs_id)
-        .fetch_one(&mut *tx)
+    let version = next_feed_version(&mut tx, &gtfs_id).await?;
+    commit_in(&mut tx, ctx, &gtfs_id, id, version).await?;
+    set_feed_version(&mut tx, &gtfs_id, version).await?;
+    tx.commit().await?;
+    Ok(json!({"change_set_id": id, "status": "committed", "feed_version": version}))
+}
+
+/// Lock the feed's row and say which version the next commit goes live as. The
+/// caller holds the feed's advisory lock, and moves the version with
+/// [`set_feed_version`] only once something is committed.
+async fn next_feed_version(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<i64> {
+    let current: i64 = sqlx::query("SELECT version FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
+        .bind(gtfs_id)
+        .fetch_one(&mut *conn)
+        .await?
+        .try_get("version")?;
+    Ok(current + 1)
+}
+
+/// The feed's one version bump: every pod reloads on it, and every webhook
+/// (the Jenkins build among them) fires once for it.
+async fn set_feed_version(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    version: i64,
+) -> EditorResult<()> {
+    sqlx::query("UPDATE gtfs_feed SET version = $2 WHERE gtfs_id = $1")
+        .bind(gtfs_id)
+        .bind(version)
+        .execute(&mut *conn)
         .await?;
-    let set = load_set(&mut tx, id, true).await?;
+    Ok(())
+}
+
+/// Apply one approved set of feed `gtfs_id` inside the caller's transaction,
+/// which holds the feed's lock and row; the set goes live as `version`. A
+/// conflict or error leaves the changes applied: the caller rolls back.
+async fn commit_in(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    gtfs_id: &str,
+    id: Uuid,
+    version: i64,
+) -> EditorResult<()> {
+    let set = load_set(conn, id, true).await?;
+    if set.gtfs_id != gtfs_id {
+        return Err(EditorError::not_found(
+            "change_set_not_found",
+            "no such change set",
+        ));
+    }
     if set.status != "approved" {
         return Err(EditorError::conflict(
             "change_set_not_approved",
@@ -4936,10 +5549,9 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     if set.submitted_by == Some(ctx.user.user_id) && !(set.self_approved && ctx.is_admin()) {
         return Err(own_change_set(false));
     }
-    let changes = load_changes_to_apply(&mut tx, id).await?;
-    let ev = evaluate(&mut tx, &gtfs_id, &changes, &ctx.user.email).await?;
+    let changes = load_changes_to_apply(conn, id).await?;
+    let ev = evaluate(conn, gtfs_id, &changes, &ctx.user.email).await?;
     if !ev.conflicts.is_empty() {
-        tx.rollback().await?;
         return Err(EditorError::conflict(
             "change_set_conflicts",
             "the live data changed since this set was made; reopen it and rebase the edits",
@@ -4947,20 +5559,12 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         .with_details(json!({"conflicts": ev.conflicts})));
     }
     if ev.has_errors() {
-        tx.rollback().await?;
         return Err(EditorError::bad_request(
             "validation_failed",
             "the change set no longer applies cleanly",
         )
         .with_details(json!({"validation": ev.validation})));
     }
-    let version: i64 = sqlx::query(
-        "UPDATE gtfs_feed SET version = version + 1 WHERE gtfs_id = $1 RETURNING version",
-    )
-    .bind(&gtfs_id)
-    .fetch_one(&mut *tx)
-    .await?
-    .try_get("version")?;
     sqlx::query(
         "UPDATE gtfs_change_set SET status = 'committed', committed_by = $2, committed_at = now(), \
             committed_version = $3 WHERE change_set_id = $1",
@@ -4968,7 +5572,7 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     .bind(id)
     .bind(ctx.user.user_id)
     .bind(version)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     let summary: Vec<Value> = changes
         .iter()
@@ -4976,11 +5580,11 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         .map(|c| json!([c.entity, c.op, c.entity_key]))
         .collect();
     auth::audit(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "change_set_committed",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         json!({
             "feed_version": version, "changes": changes.len(), "applied": summary,
@@ -4989,21 +5593,21 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
     )
     .await?;
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "stop_merged",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &ev.merges,
     )
     .await?;
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "station_merged",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &ev.station_merges,
     )
@@ -5018,11 +5622,11 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         })
         .collect();
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "feed_data_source_changed",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &switched,
     )
@@ -5037,19 +5641,197 @@ async fn commit_once(state: &EditorState, ctx: &Ctx, id: Uuid) -> EditorResult<V
         })
         .collect();
     auth::audit_many(
-        &mut *tx,
+        &mut *conn,
         Some(ctx.user.user_id),
         Some(&ctx.user.email),
         "feed_config_changed",
-        Some(&gtfs_id),
+        Some(gtfs_id),
         Some(id),
         &settings,
     )
     .await?;
-    super::proposals::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
-    super::position_reviews::mark_committed(&mut tx, ctx, &gtfs_id, id, version).await?;
-    tx.commit().await?;
-    Ok(json!({"change_set_id": id, "status": "committed", "feed_version": version}))
+    super::proposals::mark_committed(conn, ctx, gtfs_id, id, version).await?;
+    super::position_reviews::mark_committed(conn, ctx, gtfs_id, id, version).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- several sets at once
+
+/// The most sets one batch call takes: a page of the drafts list.
+const BATCH_MAX: usize = 100;
+
+/// Several sets of feed `g`, as a batch call names them: in order, each once.
+fn batch_ids(ids: &[Uuid]) -> EditorResult<Vec<Uuid>> {
+    let mut seen = HashSet::new();
+    let ids: Vec<Uuid> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    if ids.is_empty() {
+        return Err(EditorError::bad_request(
+            "no_change_sets",
+            "name at least one change set",
+        ));
+    }
+    if ids.len() > BATCH_MAX {
+        return Err(EditorError::bad_request(
+            "too_many_change_sets",
+            format!("at most {BATCH_MAX} change sets at once"),
+        ));
+    }
+    Ok(ids)
+}
+
+/// Each set's step in a batch runs in a savepoint of the batch's transaction,
+/// opened here and closed by [`settle_set`].
+async fn begin_set(conn: &mut PgConnection) -> EditorResult<()> {
+    sqlx::query("SAVEPOINT batch_set")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Close [`begin_set`]'s savepoint on how the step went: a set that failed is
+/// rolled back alone and handed back to report, and the rest carry on. A
+/// serialization failure is not the set's fault and fails the whole batch, so
+/// [`retry_transient`] runs it again from nothing.
+async fn settle_set(
+    conn: &mut PgConnection,
+    out: EditorResult<()>,
+) -> EditorResult<Option<EditorError>> {
+    match out {
+        Ok(()) => {
+            sqlx::query("RELEASE SAVEPOINT batch_set")
+                .execute(&mut *conn)
+                .await?;
+            Ok(None)
+        }
+        Err(e) if e.code == super::feed_lock::TRY_AGAIN => Err(e),
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT batch_set")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT batch_set")
+                .execute(&mut *conn)
+                .await?;
+            Ok(Some(e))
+        }
+    }
+}
+
+fn batch_failure(id: Uuid, stage: &str, approved: bool, e: &EditorError) -> Value {
+    json!({
+        "change_set_id": id, "stage": stage, "approved": approved,
+        "error": {"code": e.code, "message": e.message, "details": e.details},
+    })
+}
+
+/// Approve several submitted sets of feed `g` in one transaction. The same
+/// rules as [`review`] for each; `self_approve` is an admin's override for the
+/// ones they submitted and means nothing on the others. A set that cannot be
+/// approved is reported in `failed` and the rest are approved.
+pub async fn approve_many(
+    state: &EditorState,
+    ctx: &Ctx,
+    g: &str,
+    ids: &[Uuid],
+    comment: Option<&str>,
+    self_approve: bool,
+) -> EditorResult<Value> {
+    let ids = batch_ids(ids)?;
+    let comment = comment.map(str::trim).filter(|c| !c.is_empty());
+    retry_transient(|| async {
+        let mut tx = state.pool.begin().await?;
+        let (mut approved, mut failed) = (Vec::new(), Vec::new());
+        for &id in &ids {
+            begin_set(&mut tx).await?;
+            let out = approve_in(&mut tx, ctx, g, id, comment, self_approve).await;
+            let err = settle_set(&mut tx, out).await?;
+            match err {
+                None => approved.push(id),
+                Some(e) => failed.push(batch_failure(id, "approve", false, &e)),
+            }
+        }
+        tx.commit().await?;
+        Ok(json!({"approved": approved, "failed": failed}))
+    })
+    .await
+}
+
+/// Commit several sets of feed `g` in one transaction, as **one** feed version:
+/// pods reload once and every webhook fires once, however many sets go live.
+/// Each is applied on top of the ones before it, in the order given, and checked
+/// against the live rows just as [`commit`] does. With `approve`, submitted sets
+/// are approved first ([`review`]'s rules, `self_approve` as in
+/// [`approve_many`]); one that is approved but then cannot be committed stays
+/// approved. A set that fails is reported in `failed` and the rest go live.
+/// `feed_version` is null when none did.
+pub async fn commit_many(
+    state: &EditorState,
+    ctx: &Ctx,
+    g: &str,
+    ids: &[Uuid],
+    approve: bool,
+    self_approve: bool,
+) -> EditorResult<Value> {
+    let ids = batch_ids(ids)?;
+    retry_transient(|| async {
+        let mut tx = state.pool.begin().await?;
+        // the same lock order as a single commit: the feed's advisory lock, its
+        // row, then each set
+        lock_feed(&mut tx, g).await?;
+        let version = next_feed_version(&mut tx, g).await?;
+        let (mut committed, mut failed) = (Vec::new(), Vec::new());
+        for &id in &ids {
+            if approve {
+                begin_set(&mut tx).await?;
+                let out = approve_in(&mut tx, ctx, g, id, None, self_approve).await;
+                let err = settle_set(&mut tx, out).await?;
+                if let Some(e) = err {
+                    failed.push(batch_failure(id, "approve", false, &e));
+                    continue;
+                }
+            }
+            begin_set(&mut tx).await?;
+            let out = commit_in(&mut tx, ctx, g, id, version).await;
+            let err = settle_set(&mut tx, out).await?;
+            match err {
+                None => committed.push(id),
+                Some(e) => failed.push(batch_failure(id, "commit", approve, &e)),
+            }
+        }
+        if !committed.is_empty() {
+            set_feed_version(&mut tx, g, version).await?;
+        }
+        tx.commit().await?;
+        Ok(json!({
+            "committed": committed, "failed": failed,
+            "feed_version": if committed.is_empty() { Value::Null } else { json!(version) },
+        }))
+    })
+    .await
+}
+
+/// Approve set `id` of feed `g`, one of a batch authorised on the feed: a set
+/// of another feed is 404, as if it did not exist.
+async fn approve_in(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    g: &str,
+    id: Uuid,
+    comment: Option<&str>,
+    self_approve: bool,
+) -> EditorResult<()> {
+    let found =
+        sqlx::query("SELECT 1 FROM gtfs_change_set WHERE change_set_id = $1 AND gtfs_id = $2")
+            .bind(id)
+            .bind(g)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if found.is_none() {
+        return Err(EditorError::not_found(
+            "change_set_not_found",
+            "no such change set",
+        ));
+    }
+    review_in(conn, ctx, id, true, comment, self_approve).await
 }
 
 // ---------------------------------------------------------------- audit
@@ -5161,9 +5943,10 @@ fn user_not_found() -> EditorError {
 /// The feeds `GET /auth/me` lists, which the dashboard's feed switcher offers:
 /// every feed as `admin` for an admin, else each feed granted, at its role.
 pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Value> {
-    let rows = sqlx::query("SELECT gtfs_id, display_name FROM gtfs_feed ORDER BY gtfs_id")
-        .fetch_all(&state.pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT gtfs_id, display_name, use_stages FROM gtfs_feed ORDER BY gtfs_id")
+            .fetch_all(&state.pool)
+            .await?;
     let mut out = Vec::new();
     for r in &rows {
         let gtfs_id: String = r.try_get("gtfs_id")?;
@@ -5192,6 +5975,9 @@ pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Va
             "display_name": r.try_get::<String, _>("display_name")?,
             "role": role.as_str(),
             "gps": gps,
+            // whether the feed is served from its stages: this is the list
+            // the dashboard keeps, so it is what decides which pages it offers
+            "use_stages": r.try_get::<bool, _>("use_stages")?,
         }));
     }
     Ok(json!(out))

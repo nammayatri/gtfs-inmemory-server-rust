@@ -1,7 +1,7 @@
 // Edit screens. Each builds a change and hands it to drafts.addChange(); none
 // of them writes live data.
 import { get, post, enc } from "./api.js";
-import { state, setLeaveGuard } from "./state.js";
+import { state, setLeaveGuard, usesStages } from "./state.js";
 import {
   h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, STOP_TYPE_LABEL, SERVED_EXCLUDE,
   validateRows, renumberStages, decodePolyline, plural, ID_RE, ID_RULE,
@@ -93,13 +93,14 @@ const ROUTE_GTFS = ["route_desc", "route_url", "route_sort_order", "continuous_p
 export async function editStop(stop) {
   if (!(await requireDraft())) return;
   const prior = existingChange("stop", stop.stop_id);
-  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", ...(prior ? prior.after : {}) };
+  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", unserviceable: !!stop.unserviceable, ...(prior ? prior.after : {}) };
   const description = descriptionField("stop-description", start.description);
   const f = {
     name: h("input", { type: "text", id: "stop-name", value: start.name }),
     lat: h("input", { type: "number", id: "stop-lat", step: "any", value: String(start.lat) }),
     lon: h("input", { type: "number", id: "stop-lon", step: "any", value: String(start.lon) }),
     platform_code: h("input", { type: "text", id: "stop-platform", value: start.platform_code || "", maxlength: "120", placeholder: PLATFORM_PLACEHOLDER }),
+    unserviceable: h("input", { type: "checkbox", id: "stop-unserviceable", checked: !!start.unserviceable }),
     description: description.input,
     regional_name: h("input", { type: "text", id: "stop-regional", value: start.regional_name || "", lang: "ta" }),
   };
@@ -196,6 +197,10 @@ export async function editStop(stop) {
       const drafted = !!(prior && prior.after && k in prior.after);
       if (v !== (stop[k] || null) || (drafted && v !== (prior.after[k] ?? null))) after[k] = v;
     }
+    // out of use is a flag, so it is sent only when it turns over
+    const wasOut = prior && prior.after && "unserviceable" in prior.after
+      ? !!prior.after.unserviceable : !!stop.unserviceable;
+    if (f.unserviceable.checked !== wasOut) after.unserviceable = f.unserviceable.checked;
     const extra = more.read();
     if (extra.errors) { clear(problems, h("div.notice.error", h("ul", extra.errors.map((e) => h("li", e))))); return; }
     Object.assign(after, extra.after);
@@ -231,6 +236,10 @@ export async function editStop(stop) {
         h("label.field", { for: "stop-platform" }, h("span", "Platform label (optional)"), f.platform_code),
         h("label.field", { for: "stop-regional" }, h("span", "Tamil name (optional)"), f.regional_name)),
       h("p.hint", { id: "stop-platform-help" }, PLATFORM_HELP),
+      h("label.field.inline", { for: "stop-unserviceable" },
+        f.unserviceable,
+        h("span", "Out of use for now"),
+        h("span.hint", "The stop stays in the feed and in the app, and no bus calls there until this is cleared, so journeys are routed around it. Its times come back exactly as they were.")),
       description.el,
       more.el,
       problems),
@@ -617,6 +626,113 @@ export async function editRouteRows(route, { created = false } = {}) {
     map.endModes();
     showRoute(route.route_id, { preview: created });
   };
+  // The edit as changes to the route's stages. Returns true when it was handled
+  // here (saved, refused or cancelled), false when the route has no stages and
+  // the ordinary stop-list change applies.
+  const saveThroughStages = async (payload) => {
+    // only a feed served from its stages has any; everywhere else the route is
+    // its stop list and the ordinary change applies
+    if (created || !usesStages()) return false;
+    let info;
+    try {
+      info = await get(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/stages`);
+    } catch {
+      return false;
+    }
+    if (!info.has_stages) return false;
+    if (!info.in_sync) {
+      toast("This route's stop list was changed outside its stages. Choose its stages again first (Change stages), then edit its stops.", "error");
+      return true;
+    }
+
+    // the edited list, cut into fare stages the way the stages themselves are
+    const runs = [];
+    for (const r of payload) {
+      const last = runs[runs.length - 1];
+      if (last && last.stage_no === r.stage_no) last.rows.push(r);
+      else runs.push({ stage_no: r.stage_no, stage_name: r.stage_name, rows: [r] });
+    }
+    const stages = info.stages || [];
+    // Adding or taking away a whole fare stage is a change to WHICH stages the
+    // route runs, which is what Change stages is for; here the stages stay and
+    // only the stops inside them move.
+    if (runs.length !== stages.length || runs.some((run, i) => run.stage_no !== stages[i].stage_no)) {
+      toast(`Route ${label} runs ${plural(stages.length, "fare stage")} and this list has ${runs.length}. To add, remove or reorder a fare stage use Change stages; here you change the stops inside one.`, "error");
+      return true;
+    }
+
+    const asStage = (r) => ({
+      stop_id: r.stop_id, stop_type: r.stop_type,
+      marker_id: r.marker_id ?? null, marker_name: r.marker_name ?? null,
+      marker_lat: r.marker_lat ?? null, marker_lon: r.marker_lon ?? null,
+      stop_name_override: r.stop_name_override ?? null,
+    });
+    const sig = (list) => JSON.stringify(list.map((r) => [r.stop_id || null, r.stop_type, r.marker_id || null, r.stop_name_override || null]));
+    const changed = [];
+    runs.forEach((run, i) => {
+      const next = run.rows.map(asStage);
+      if (sig(next) !== sig(stages[i].rows || [])) changed.push({ stage: stages[i], rows: next });
+    });
+    if (!changed.length) {
+      toast("Nothing in the stop list changed.");
+      return true;
+    }
+
+    // A stage is shared. Editing it from one route's page would quietly change
+    // every other route that runs it, so which is meant is asked, not assumed.
+    const shared = changed.filter((c) => (c.stage.route_count || 0) > 1);
+    let everyRoute = false;
+    if (shared.length) {
+      const others = shared.map((c) => `${c.stage.name} (${plural(c.stage.route_count, "route")})`).join(", ");
+      const choice = await modal(`Change ${plural(changed.length, "stage")} of route ${label}?`, () => h("div",
+        h("p", `${plural(changed.length, "fare stage")} of this route ${changed.length === 1 ? "has" : "have"} different stops now: `,
+          h("strong", changed.map((c) => c.stage.name).join(", ")), "."),
+        h("p", h("strong", `${shared.length === 1 ? "It is" : `${shared.length} of them are`} shared with other routes: `), others, "."),
+        h("p.hint", "\u201cOnly this route\u201d gives route ", label, " a stage of its own with these stops and leaves every other route as it is. \u201cEvery route\u201d changes the shared stage itself, so all of them get these stops.")), {
+        actions: [
+          (close) => h("button.btn.secondary", { type: "button", on: { click: () => close(undefined) } }, "Cancel"),
+          (close) => h("button.btn.secondary", { type: "button", on: { click: () => close("all") } }, "Every route using it"),
+          (close) => h("button.btn", { type: "button", on: { click: () => close("one") } }, "Only this route"),
+        ],
+      });
+      if (!choice) return true;
+      everyRoute = choice === "all";
+    }
+
+    let done = 0;
+    for (const c of changed) {
+      const key = c.stage.stage_key || c.stage.stage_id;
+      const alone = (c.stage.route_count || 0) <= 1;
+      const res = alone || everyRoute
+        // the stage itself changes, for every route running it
+        ? await addChange({ entity: "stage", op: "update", entity_key: key, after: { rows: c.rows } })
+        // this route alone moves onto a stage of its own carrying these stops
+        : await addChange({
+          entity: "stage", op: "split", entity_key: "",
+          after: {
+            name: c.stage.name, direction: c.stage.direction || null, description: null,
+            from_stage_id: key, routes: [route.route_id], rows: c.rows,
+          },
+        }, { merge: false });
+      if (!res) return true;
+      const bad = (res.problems || []).find((pb) => pb.level === "error");
+      if (bad) {
+        serverProblems = res.problems;
+        redraw();
+        summary.scrollIntoView({ block: "nearest" });
+        toast(`${c.stage.name}: ${bad.message}`, "error");
+        return true;
+      }
+      done += 1;
+    }
+    unsaved.done();
+    history.clear();
+    map.endModes();
+    toast(`${plural(done, "stage")} of route ${label} ${done === 1 ? "is" : "are"} changed in your draft.`, "ok");
+    showRoute(route.route_id, { preview: true });
+    return true;
+  };
+
   const save = async () => {
     const marker = (r) => r.stop_type === "ROUTE CORRECTION";
     const payload = rows.map((r) => ({
@@ -629,6 +745,11 @@ export async function editRouteRows(route, { created = false } = {}) {
       ...(marker(r) ? {} : gtfsFields(r)),
     }));
     try {
+      // A route built from stages does not own its stop list: the list is what
+      // its stages say. So an edit made here is an edit to those stages, and is
+      // written as one - a route_stops change would be refused, and rightly,
+      // since it would leave the route saying one thing and its stages another.
+      if (await saveThroughStages(payload)) return;
       const res = await addChange({ entity: "route_stops", op: "replace", entity_key: route.route_id, after: { rows: payload, base_rows_hash: baseHash } });
       if (!res) return;
       unsaved.done();

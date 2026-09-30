@@ -1,6 +1,6 @@
 // Boot, the top bar and the hash router.
 import { get, enc } from "./api.js";
-import { state, set, subscribe, pref, setPref, can, isAdmin, feedRole, leaveMessage, setLeaveGuard } from "./state.js";
+import { state, set, subscribe, pref, setPref, can, isAdmin, feedRole, usesStages, leaveMessage, setLeaveGuard } from "./state.js";
 import { ensureSignedIn, signOut } from "./auth.js";
 import { h, toast, confirmDialog, ROLE_LABEL } from "./util.js";
 import * as map from "./map.js";
@@ -11,8 +11,11 @@ import { showPeople, showHistory, showFeedSettings } from "./admin.js";
 import { showDelivery, leaveWebhooks } from "./webhooks.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
+import { showStageReviewsList, showStageReview, refreshStageReviewCount, leaveStageReviews } from "./stage_reviews.js";
+import { showRouteIssuesList, showRouteIssue, refreshRouteIssueCount } from "./route_issues.js";
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
+import { showDiversions, showUnserviceableStops } from "./variants.js";
 import { showMerge } from "./merge.js";
 import { showStationMerge } from "./station_merge.js";
 import { showImport } from "./importer.js";
@@ -20,6 +23,7 @@ import { showFiles, showFile, showRecord } from "./files.js";
 import { showTrips } from "./trips.js";
 import { showCalendar } from "./calendar.js";
 import { showFeed, showNewFeed } from "./feed.js";
+import { showStage, showStagesList, editStage } from "./stages.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
 
@@ -43,6 +47,10 @@ function applyMe(me) {
   renderAccess();
 }
 
+// Pages that exist only on a feed served from its stages. Off, they are not in
+// the menu and their addresses lead back to the map.
+const STAGE_PAGES = ["stages", "diversions", "stage-reviews", "route-issues"];
+
 // What this person may do on the chosen feed: the role badge, the admin pages,
 // the New menu. Everything else asks can() when it draws.
 function renderAccess() {
@@ -56,10 +64,17 @@ function renderAccess() {
   badge.textContent = role ? ROLE_LABEL[role] : "";
   badge.title = role ? `Your role on ${where}` : "";
   const noFeed = !state.feedId;
-  for (const sel of [".feed-picker", ".search", ".nav"]) document.querySelector(sel).hidden = noFeed;
+  for (const sel of [".feed-picker", ".search", ".nav-drawer"]) document.querySelector(sel).hidden = noFeed;
   document.querySelector('[data-nav="admin"]').hidden = !isAdmin();
   document.querySelector('[data-nav="feed-settings"]').hidden = !isAdmin();
   document.querySelectorAll("[data-admin-only]").forEach((el) => { el.hidden = !isAdmin(); });
+  // pages that exist only on a feed served from its stages
+  const stages = usesStages();
+  for (const name of STAGE_PAGES) {
+    const link = document.querySelector(`[data-nav="${name}"]`);
+    if (link) link.hidden = !stages;
+  }
+  document.querySelectorAll("[data-stages-only]").forEach((el) => { el.hidden = !stages; });
   document.getElementById("new-menu").hidden = noFeed || !can("editor");
 }
 
@@ -71,6 +86,8 @@ async function switchFeed(feedId, hash = "#/") {
   map.refreshStops();
   refreshStationCount();
   refreshCoordinateCount();
+  refreshStageReviewCount();
+  refreshRouteIssueCount();
   setLeaveGuard(null);
   resetTrail();
   location.hash = hash;
@@ -105,6 +122,8 @@ async function boot() {
   initSearch();
   refreshStationCount();
   refreshCoordinateCount();
+  refreshStageReviewCount();
+  refreshRouteIssueCount();
   window.addEventListener("hashchange", onHashChange);
   window.addEventListener("beforeunload", (ev) => {
     if (leaveMessage()) { ev.preventDefault(); ev.returnValue = ""; }
@@ -123,7 +142,9 @@ function initNewMenu() {
       if (ev.key === "Escape" && menu.open) { close(); menu.querySelector("summary").focus(); }
     });
     menu.addEventListener("toggle", () => {
-      if (menu.open) menus.filter((m) => m !== menu).forEach((m) => { m.open = false; });
+      if (menu.open) {
+        menus.filter((m) => m !== menu && !m.contains(menu)).forEach((m) => { m.open = false; });
+      }
     });
     document.addEventListener("click", (ev) => { if (menu.open && !menu.contains(ev.target)) close(); });
   }
@@ -149,9 +170,13 @@ function markNav(name) {
     else a.removeAttribute("aria-current");
   });
   // a menu of the top bar reads as current when one of its pages is
-  document.querySelectorAll(".nav-menu").forEach((m) => {
+  document.querySelectorAll(".nav-menu:not(.nav-drawer)").forEach((m) => {
     m.querySelector("summary").classList.toggle("current", !!m.querySelector(`[data-nav="${name}"]`));
   });
+  // the drawer's button says where you are, since its links are put away
+  const here = document.querySelector(`.nav [data-nav="${name}"]`);
+  const label = document.querySelector("#main-menu > summary");
+  if (label) label.dataset.here = here ? here.childNodes[0].textContent.trim() : "";
 }
 
 // Leaving a screen with unsaved edits asks first; staying puts the address back.
@@ -191,6 +216,7 @@ function route() {
   currentHash = location.hash || "#/";
   leaveStations();
   leaveCoordinates();
+  leaveStageReviews();
   leaveWebhooks();
   // a route's trips from GPS belong to its page
   map.clearRoute("gpsTrips");
@@ -218,16 +244,48 @@ function route() {
   const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
   window.scrollTo(0, 0);
 
+  // A feed that does not use stages has no stage pages: an address that names
+  // one (a bookmark, a link from another feed) goes to the map and says why,
+  // rather than drawing a page about something this feed does not have.
+  const stagePage = STAGE_PAGES.includes(parts[0]) || parts[0] === "stage"
+    || (parts[0] === "new" && parts[1] === "stage");
+  if (stagePage && !usesStages()) {
+    toast("This feed does not use stages, so its routes are edited as stop lists.");
+    history.replaceState(null, "", "#/");
+    currentHash = "#/";
+    markNav("map"); showWorkspace(true); showHome();
+    return;
+  }
+
   if (parts[0] === "stop" && parts[1]) {
     markNav("map"); showWorkspace(true); showStop(parts[1]);
   } else if (parts[0] === "route" && parts[1]) {
     markNav("map"); showWorkspace(true); // ?draft=1 asks for the draft applied; without it the route page decides (it
     // applies the draft whenever the draft touches the route)
     showRoute(parts[1], { preview: params.get("draft") === "1" ? true : undefined });
+  } else if (parts[0] === "stage" && parts[1]) {
+    markNav("stages"); showWorkspace(true); showStage(parts[1]);
+  } else if (parts[0] === "diversions") {
+    markNav("diversions"); showWorkspace(false); showDiversions();
+  } else if (parts[0] === "stops-out-of-use") {
+    markNav("stops-out-of-use"); showWorkspace(false); showUnserviceableStops();
+  } else if (parts[0] === "stages") {
+    markNav("stages"); showWorkspace(false); showStagesList();
+  } else if (parts[0] === "new" && parts[1] === "stage") {
+    markNav("stages"); showWorkspace(true);
+    editorsOnly("New stage", () => editStage(null, { mode: "create" }));
   } else if (parts[0] === "stations" && parts[1]) {
     markNav("stations"); showWorkspace(true); showProposal(parts[1]);
   } else if (parts[0] === "stations") {
     markNav("stations"); showWorkspace(true); showStationsList();
+  } else if (parts[0] === "route-issues" && parts[1]) {
+    markNav("route-issues"); showWorkspace(true); showRouteIssue(parts[1]);
+  } else if (parts[0] === "route-issues") {
+    markNav("route-issues"); showWorkspace(true); showRouteIssuesList();
+  } else if (parts[0] === "stage-reviews" && parts[1]) {
+    markNav("stage-reviews"); showWorkspace(true); showStageReview(parts[1]);
+  } else if (parts[0] === "stage-reviews") {
+    markNav("stage-reviews"); showWorkspace(true); showStageReviewsList();
   } else if (parts[0] === "coordinates" && parts[1]) {
     markNav("coordinates"); showWorkspace(true); showCoordinateReview(parts[1]);
   } else if (parts[0] === "coordinates") {

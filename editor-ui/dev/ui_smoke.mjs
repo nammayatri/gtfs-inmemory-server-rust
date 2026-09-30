@@ -127,6 +127,21 @@ async function click(text, scope = "body") {
   await sleep(400);
   return ok;
 }
+// Every page lives behind the top bar's Menu button, so a nav link's visibility
+// is read, and a nav link clicked, with the drawer open. It closes itself on a
+// choice, as it does for a person.
+async function navOpen(open = true) {
+  await evaluate(`(() => { const d = document.getElementById("main-menu"); if (d) d.open = ${open}; })()`);
+}
+
+async function navShown(selector) {
+  await navOpen(true);
+  const shown = await evaluate(`(() => { const a = document.querySelector(${JSON.stringify(selector)}); return !!a && a.offsetParent !== null; })()`);
+  // closed again: the open panel covers the page the next check looks at
+  await navOpen(false);
+  return shown;
+}
+
 async function clickSel(selector, what = selector) {
   const ok = await evaluate(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.click(); return true; })()`);
   check(ok, `click ${what}`);
@@ -506,6 +521,7 @@ async function round4Flows() {
   await shot("31-route-context");
 
   // ================================================================ 4. the trail
+  await navOpen(true);
   await clickSel('[data-nav="map"]', "Map in the top bar");
   await waitFor(`location.hash === "#/"`, "the map page");
   check(await evaluate(`document.getElementById("trail").classList.contains("is-empty")`), "a top-level page has no trail to show");
@@ -1689,7 +1705,7 @@ async function feedAccessFlows() {
   check(!(await evaluate(`document.getElementById("new-menu").hidden`)), "an editor on this feed gets the New menu");
   await go("#/drafts");
   await waitFor(`document.getElementById("page").innerText.includes("Start or open a draft")`, "an editor on this feed can start a draft");
-  check(await evaluate(`document.querySelector('[data-nav="admin"]').offsetParent === null`), "a member never sees People");
+  check(!(await navShown('[data-nav="admin"]')), "a member never sees People");
   await shot("fa-02-second-feed");
 
   // ---- admin: one row per person, one column per feed
@@ -1815,8 +1831,11 @@ try {
   // the top bar: coordinates to review with the pending count; stations to review while any is open
   const coordSummary = await api("feeds/chennai_bus/position-reviews/summary");
   await waitFor(`document.getElementById("coordinates-count").textContent === ${JSON.stringify(coordSummary.pending.toLocaleString("en-IN"))}`, "the coordinates count in the top bar");
+  await navOpen(true);
   check(await evaluate(`(() => { const a = document.querySelector('[data-nav="coordinates"]'); return a.offsetParent !== null && a.innerText.startsWith("Coordinates to review"); })()`), `the top bar links to "Coordinates to review" with ${coordSummary.pending} pending`);
-  await waitFor(`document.querySelector('[data-nav="stations"]').offsetParent !== null`, "the stations link while suggestions are open");
+  // the drawer is reopened on every poll: a click away closes it
+  await waitFor(`(() => { const d = document.getElementById("main-menu"); if (d) d.open = true; const a = document.querySelector('[data-nav="stations"]'); return !!a && a.offsetParent !== null; })()`, "the stations link while suggestions are open");
+  await navOpen(false);
   check(true, "the top bar links to \"Stations to review\" while suggestions are waiting");
   check((await panelText()).includes("Coordinates to review"), "the home panel points to the coordinates to review");
 
@@ -2729,7 +2748,7 @@ try {
   await shot("20-history");
 
   // ================================================================ feed settings (admin only)
-  check(await evaluate(`document.querySelector('[data-nav="feed-settings"]').offsetParent !== null`), "an admin sees the Feed settings nav entry");
+  check(await navShown('[data-nav="feed-settings"]'), "an admin sees the Feed settings nav entry");
   await go("#/feed-settings");
   await waitFor(`document.body.innerText.includes("Feed settings")`, "feed settings page");
   await waitFor(`document.querySelectorAll("#page table tbody tr").length >= 1`, "feed settings table");
@@ -2810,7 +2829,7 @@ try {
 
   // a non-admin never sees the nav entry, or the page's controls by address
   await signIn("editor1@nammayatri.in");
-  check(await evaluate(`document.querySelector('[data-nav="feed-settings"]').offsetParent === null`), "a non-admin never sees the Feed settings nav entry");
+  check(!(await navShown('[data-nav="feed-settings"]')), "a non-admin never sees the Feed settings nav entry");
   await go("#/feed-settings");
   await waitFor(`document.body.innerText.includes("Feed settings")`, "feed settings page reachable by address for a non-admin");
   check(!(await has("#page table")), "a non-admin sees no feed settings table or switch controls");
@@ -2823,11 +2842,11 @@ try {
   await load(UI);
   await waitFor(`!document.getElementById("app").hidden && performance.getEntriesByType("resource").some((e) => e.name.includes("/station-proposals/summary"))`, "the top bar after reloading");
   await sleep(500);
-  check(await evaluate(`document.querySelector('[data-nav="stations"]').offsetParent === null`), "with nothing to review or in a draft, the top bar hides Stations to review");
-  check(await evaluate(`document.querySelector('[data-nav="coordinates"]').offsetParent !== null`), "Coordinates to review stays in the top bar");
+  check(!(await navShown('[data-nav="stations"]')), "with nothing to review or in a draft, the top bar hides Stations to review");
+  check(await navShown('[data-nav="coordinates"]'), "Coordinates to review stays in the top bar");
   await go("#/stations");
   await waitFor(`document.getElementById("panel").innerText.includes("Nothing is waiting for review")`, "the stations page by its address");
-  check(await evaluate(`document.querySelector('[data-nav="stations"]').offsetParent === null`), "#/stations still opens while its link is hidden");
+  check(!(await navShown('[data-nav="stations"]')), "#/stations still opens while its link is hidden");
 
   // ================================================================ round 4 (UX): see round4Flows above
   await round4Flows();

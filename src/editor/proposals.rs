@@ -142,7 +142,7 @@ async fn stops_now(
                 s.deleted, s.row_version, {} AS route_count \
          FROM gtfs_stop s WHERE s.gtfs_id = $1 AND s.stop_id = ANY($2)",
         if with_routes {
-            "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+            "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
               WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id)"
         } else {
             "NULL::int8"

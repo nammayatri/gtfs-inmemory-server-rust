@@ -4,7 +4,7 @@
 // without changing anything (dry run), and only then added to the draft in one
 // go. The draft is reviewed and committed like any other.
 import { get, post, enc, ApiError } from "./api.js";
-import { state, can } from "./state.js";
+import { state, can, usesStages } from "./state.js";
 import { h, clear, toast, confirmDialog, fmtCount, plural, STOP_TYPE_LABEL } from "./util.js";
 import { parseCsv, toCsv, CsvError } from "./csv.js";
 import * as map from "./map.js";
@@ -45,6 +45,18 @@ function action(allowed, why) {
     if (!allowed.includes(s)) throw new Error(`action ${s}: ${why[s]}`);
     return s;
   };
+}
+function direction(v) {
+  const s = v.trim().toLowerCase();
+  if (s === "") return undefined;
+  if (s !== "up" && s !== "down") throw new Error(`direction must be up or down, not “${v.trim()}”.`);
+  return s;
+}
+function optionalStopType(v) {
+  return v.trim() === "" ? undefined : stopType(v);
+}
+function optionalWhole(name) {
+  return (v) => (v.trim() === "" ? undefined : whole(name)(v));
 }
 function stopType(v) {
   const s = v.trim().toUpperCase().replace(/\s+/g, " ");
@@ -111,6 +123,7 @@ const KINDS = {
     },
   },
   routes: {
+    lists: true,
     label: "Routes",
     what: "Routes to add, change or remove. Each row says which in its action column; import stop lists separately.",
     columns: [
@@ -134,7 +147,55 @@ const KINDS = {
       return problems;
     },
   },
+  // A feed keeps its routes one way or the other (Feed settings, "Routes built
+  // from"): as stop lists, or as the fare stages they run through. `lists`
+  // (Routes, Route stop lists) is offered on the first kind of feed only,
+  // `stages` (Route stages, Stages) on the second only.
+  route_stages: {
+    stages: true,
+    label: "Route stages",
+    short: "route stages",
+    what: "Which fare stages each route runs through. All rows of one route_id are that route's stages, in position order: action add for a route that has none yet, update to replace the ones it has. The stops come from the stages, so the file names no stops.",
+    columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add or update.", read: action(["add", "update"], { delete: "a route's stages are uploaded whole. Upload them with update, leaving out the stages it should not run through." }), help: "add for a route with no stages yet, update to replace the ones it has. The rows of one route all say the same." },
+      { name: "route_id", required: true, read: text, help: "An existing route, or one new in your draft." },
+      { name: "position", required: true, read: whole("position"), help: "The stage's place on the route: 1, 2, 3…" },
+      { name: "stage_id", required: true, read: text, help: "An existing stage, or one new in your draft. Find it on the Stages page." },
+      { name: "direction", required: false, read: direction, help: "up or down. Needed only when the stage id runs both ways." },
+      { name: "stage_no", required: false, read: optionalWhole("stage_no"), help: "Fare stage number. Empty: one more than the stage before (1 for the first)." },
+    ],
+    show: ["action", "route_id", "position", "stage_id", "direction", "stage_no"],
+    example: [
+      ["update", "4100", "1", "159", "up", "1"],
+      ["update", "4100", "2", "1204", "up", "2"],
+      ["update", "4100", "3", "stg_3fa91c20be", "up", "3"],
+    ],
+  },
+  stages: {
+    stages: true,
+    label: "Stages",
+    short: "stages",
+    what: "The stops of fare stages. All rows of one stage_id and direction are that stage's stops, in position order: add makes a new stage, update sets the stops of one that exists (on every route that runs through it), delete removes one no route uses.",
+    columns: [
+      { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(["add", "update", "delete"], {}), help: "add a new stage, update one that exists, or delete one no route uses. The rows of one stage all say the same." },
+      { name: "stage_id", required: false, read: optional, help: "The stage. For a new stage leave it empty and a short id is made." },
+      { name: "direction", required: false, read: direction, help: "up or down. For update and delete, needed only when the stage id runs both ways." },
+      { name: "name", required: false, read: optional, help: "The stage's name. Required for a new stage; on update, a new name or empty to keep it." },
+      { name: "position", required: false, read: optionalWhole("position"), help: "The stop's place in the stage: 1, 2, 3… Not needed for delete." },
+      { name: "stop_id", required: false, read: optional, help: "An existing stop, or one new in your draft. Not needed for delete." },
+      { name: "stop_type", required: false, read: optionalStopType, help: `${STOP_TYPES.join(", ")}. Empty: NEW STOP for the first stop of the stage, INTERMEDIATE STOP for the rest.` },
+    ],
+    show: ["action", "stage_id", "direction", "name", "position", "stop_id", "stop_type"],
+    example: [
+      ["add", "", "up", "Saidapet", "1", "1001", "NEW STOP"],
+      ["add", "", "up", "Saidapet", "2", "1002", "INTERMEDIATE STOP"],
+      ["update", "159", "down", "", "1", "2040", ""],
+      ["update", "159", "down", "", "2", "2041", ""],
+      ["delete", "stg_0a1b2c3d4e", "up", "", "", "", ""],
+    ],
+  },
   route_stops: {
+    lists: true,
     label: "Route stop lists",
     what: "Whole stop lists. All rows of one route_id are that route's stop list, in sequence order: action add for a route that has none yet, update to replace the list it has.",
     columns: [
@@ -312,6 +373,20 @@ function recordsKind(fspec) {
 }
 
 const templates = {};
+// Which kinds this feed takes: a feed built from stages has its routes' stages
+// uploaded, not their stop lists, and a feed of stop lists has no stages.
+const offered = (k) => (k.stages ? usesStages() : k.lists ? !usesStages() : true);
+
+function exampleHref(kind) {
+  const id = `example:${kind}`;
+  if (!templates[id]) {
+    const spec = KINDS[kind];
+    const blob = new Blob(["\ufeff" + toCsv([spec.columns.map((c) => c.name), ...spec.example])], { type: "text/csv;charset=utf-8" });
+    templates[id] = URL.createObjectURL(blob);
+  }
+  return templates[id];
+}
+
 function templateHref(kind) {
   const id = `${kind}:${KINDS[kind].file || ""}`;
   if (!templates[id]) {
@@ -340,6 +415,12 @@ export async function showImport(kind, file) {
     /* without the reference, the kinds the editor always had */
   }
   if (kind && KINDS[kind]) view.kind = kind;
+  if (!offered(KINDS[view.kind])) {
+    // route stop lists on a stages feed is its stages, and the other way round
+    const other = { route_stops: "route_stages", routes: "route_stages", route_stages: "routes" }[view.kind];
+    view.kind = other && offered(KINDS[other]) ? other : "stops";
+    view.file = null; view.read = null; view.result = null;
+  }
   if (!can("editor")) {
     return clear(page(), h("div.page-inner", h("h1", "Import from a CSV file"), h("p.notice", "Importing needs the editor role. Ask an admin.")));
   }
@@ -351,7 +432,7 @@ export async function showImport(kind, file) {
     if (insetMap) { insetMap.remove(); insetMap = null; }
     const spec = KINDS[view.kind];
     const kinds = h("div.radio-cards.kind-cards", { role: "radiogroup", "aria-label": "What the file holds" },
-      Object.entries(KINDS).map(([key, k]) => h("label.radio-card", { for: `kind-${key}` },
+      Object.entries(KINDS).filter(([, k]) => offered(k)).map(([key, k]) => h("label.radio-card", { for: `kind-${key}` },
         h("input", { type: "radio", name: "import-kind", id: `kind-${key}`, value: key, checked: key === view.kind,
           on: { change: () => { view.kind = key; resetFile(); render(); } } }),
         h("span.radio-card-body", h("span.radio-card-title", k.label), h("span.hint", k.what)))));
@@ -395,7 +476,8 @@ export async function showImport(kind, file) {
         h("details.columns",
           h("summary", `Columns for ${spec.short || spec.label.toLowerCase()}`),
           h("table.column-table", h("tbody", spec.columns.map((c) => h("tr", h("th", { scope: "row" }, h("code", c.name)), h("td", c.required ? "Required" : "Optional"), h("td", c.help)))))),
-        h("div.btn-row", h("a.btn.secondary.small", { href: templateHref(view.kind), download: `${view.kind}-template.csv` }, `Download the ${spec.short || spec.label.toLowerCase()} template`))),
+        h("div.btn-row", h("a.btn.secondary.small", { href: templateHref(view.kind), download: `${view.kind}-template.csv` }, `Download the ${spec.short || spec.label.toLowerCase()} template`),
+          spec.example ? h("a.btn.secondary.small", { href: exampleHref(view.kind), download: `${view.kind}-example.csv` }, "Download a filled-in example") : null)),
       h("section.import-step",
         h("h2", "2. Choose the file"),
         fileInput, drop,
@@ -521,7 +603,7 @@ export async function showImport(kind, file) {
       s.errors
         ? h("div.notice.error", h("p", h("strong", `${plural(s.errors, "row")} ${s.errors === 1 ? "has" : "have"} errors.`), " Nothing can be added until they are fixed. Fix the file, then choose it again above."))
         : !s.changes
-          ? h("div.notice", h("p", h("strong", "Nothing to add."), " Every row already says what its stop has, counting what is in your draft."))
+          ? h("div.notice", h("p", h("strong", "Nothing to add."), " Every row already says what is there, counting what is in your draft."))
           : h("div.notice.ok", h("p", h("strong", "The file can be added."), s.warnings ? ` Please look at the ${plural(s.warnings, "warning")} first.` : "")),
       view.kind === "stops" || spec.now ? h("div.import-map.inset", { role: "img", "aria-label": "Map of the stops in the file, coloured by result" }) : null,
       resultTable(rows, view.resultFor.read),

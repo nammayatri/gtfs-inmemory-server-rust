@@ -1,12 +1,13 @@
 // Creating things from the New menu: a stop placed on the map, and a route
-// whose stop list is then built with the stop pickers. Also the panel for a stop
+// whose stages are then chosen (docs section 18). Also the panel for a stop
 // that so far exists only in the draft. (New station is the station editor.)
 import { get, enc, ApiError } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
 import { h, clear, toast, confirmDialog, debounce, fmtCoord, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, ID_RE, ID_RULE, PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField } from "./util.js";
 import * as map from "./map.js";
 import { addChange, requireDraft, createdChange, createdStops, updateChange, removeChange } from "./drafts.js";
-import { editRouteRows, problemList } from "./editors.js";
+import { problemList } from "./editors.js";
+import { editRouteStages } from "./stages.js";
 import { pendingNotice, pendingActions, draftedPoints } from "./overlay.js";
 import { nameHere } from "./trail.js";
 import { undoScope } from "./undo.js";
@@ -425,7 +426,8 @@ export async function newRoute() {
       } catch {
         route = { route_id: id, short_name: short, long_name: long || null, color: color || null, rows: [], rows_hash: await emptyListHash() };
       }
-      editRouteRows(route, { created: true });
+      // a new route is built from stages: its stops come from the stages chosen
+      editRouteStages(route, { created: true });
     } catch (e) {
       clear(problems, h("p.notice.error", e.message));
     }
@@ -442,10 +444,10 @@ export async function newRoute() {
       h("label.field", { for: "new-route-short" }, h("span", "Route number passengers see"), f.short),
       h("label.field", { for: "new-route-long" }, h("span", "Route name (optional)"), f.long),
       h("label.field", { for: "new-route-color" }, h("span", "Colour on maps (optional)"), h("div.btn-row", swatch, h("div", { style: "flex:1" }, f.color))),
-      h("p.hint", "Next you build its stop list: add the stops in order and mark the fare stages."),
+      h("p.hint", "Next you choose its fare stages in order. Its stops come from the stages; a stage that does not exist yet can be made with New stage."),
       problems),
     h("div.sticky-actions", h("div.btn-row",
-      h("button.btn", { type: "submit" }, "Add route, then add its stops"),
+      h("button.btn", { type: "submit" }, "Add route, then choose its stages"),
       h("button.btn.secondary", { type: "button", on: { click: cancel } }, "Cancel"))),
   ));
   f.id.focus();

@@ -171,6 +171,7 @@ function stopTooltip(s, stack = 1, station = null) {
   if (s.location_type === 1) bits.push("station");
   else if (s.draft) bits.push("new, in your draft");
   else if (s.route_count != null) bits.push(`${s.route_count} route${s.route_count === 1 ? "" : "s"}`);
+  if (s.unserviceable) bits.push("out of use: no bus calls here");
   if (s.pending) bits.push(s.pending.gone ? `goes away in draft “${draftTitle()}”, still live` : `${s.pending.moved ? "moved" : "renamed"} in draft “${draftTitle()}”, not live`);
   if (station) bits.push(station.parent_station ? `joins station ${station.parent_station} in draft “${draftTitle()}”, not live` : `leaves its station in draft “${draftTitle()}”, still live`);
   if (stack > 1) bits.push(`and ${plural(stack - 1, "other stop")} at this point: click to choose`);
@@ -310,14 +311,17 @@ function drawStops() {
     const isStation = s.location_type === 1;
     const amber = s.draft || (s.pending && !s.pending.gone);
     const going = s.pending && s.pending.gone;
+    // out of use: still on the map, in grey, since no bus calls there
+    const outOfUse = !!s.unserviceable && !amber && !going;
     const m = L.circleMarker([s.lat, s.lon], {
       renderer: dots,
       bubblingMouseEvents: false,
       radius: isStation || selected ? 8 : 6,
-      color: selected ? ACTION : isStation ? INK : amber ? DRAFT_RING : going ? MUTED : "#ffffff",
+      color: selected ? ACTION : isStation ? INK : amber ? DRAFT_RING : going ? MUTED : outOfUse ? MUTED : "#ffffff",
       weight: selected ? 4 : 2,
       dashArray: going ? "2 3" : null,
-      fillColor: amber ? DRAFT_FILL : going ? "#ffffff" : isStation ? "#ffffff" : selected ? ACTION : s.parent_station ? INK : ACTION,
+      fillColor: amber ? DRAFT_FILL : going ? "#ffffff" : isStation ? "#ffffff" : selected ? ACTION
+        : outOfUse ? MUTED : s.parent_station ? INK : ACTION,
       fillOpacity: 1,
       stopIds: stack.map((x) => x.stop_id),
     });
@@ -595,8 +599,16 @@ export function showFaint(stops) {
 }
 
 // ------------------------------------------------------------------ routes
+/// The layer group of that name, made the first time it is asked for. Most are
+/// made at startup; a page that draws several lines at once (stages beside each
+/// other on a review) names one per line and gets them this way.
+function groupFor(name) {
+  if (!layers[name]) layers[name] = L.layerGroup().addTo(map);
+  return layers[name];
+}
+
 export function showRoute(route, { fit = true, layer = "route", dashed = false, color, weight = 5, markers = true } = {}) {
-  const group = layers[layer];
+  const group = groupFor(layer);
   group.clearLayers();
   const served = route.rows.filter((r) => r.stop_type !== "ROUTE CORRECTION" && r.lat != null);
   let line = null;
@@ -644,7 +656,7 @@ export function showRoute(route, { fit = true, layer = "route", dashed = false, 
 }
 
 export function clearRoute(layer = "route") {
-  layers[layer].clearLayers();
+  if (layers[layer]) layers[layer].clearLayers();
   updateLayerNote();
 }
 
@@ -829,7 +841,21 @@ export function showCandidates(stops, onPick) {
       .addTo(layers.candidates);
     rings.set(s.stop_id, ring);
   });
-  return (stopId) => rings.forEach((r, id) => r.setStyle({ color: id === stopId ? "#1f5fbf" : ACTION, weight: id === stopId ? 5 : 3 }));
+  // Hovering a result rings it AND brings it into view. Recolouring alone says
+  // nothing when the stop is off the screen, which is the usual case: the list
+  // is ranked by name, not by what the map happens to be showing.
+  return (stopId) => {
+    rings.forEach((r, id) => r.setStyle({
+      color: id === stopId ? "#1f5fbf" : ACTION,
+      weight: id === stopId ? 5 : 3,
+    }));
+    const at = stops.find((s) => s.stop_id === stopId && s.lat != null);
+    if (!at) return;
+    const point = L.latLng(at.lat, at.lon);
+    if (!map.getBounds().pad(-0.2).contains(point) || map.getZoom() < STOPS_MIN_ZOOM) {
+      map.setView(point, Math.max(map.getZoom(), 16));
+    }
+  };
 }
 
 export function clearCandidates() {

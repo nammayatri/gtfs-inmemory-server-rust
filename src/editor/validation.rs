@@ -75,13 +75,15 @@ pub const STATION_MIN_MEMBERS: usize = 2;
 /// Stop ids the server mints: `ed_` + 10 lower-case hex digits.
 pub const MINTED_STOP_PREFIX: &str = "ed_";
 /// What a `feed_config` change may set (sections 3 and 16.4).
-pub const FEED_CONFIG_FIELDS: [&str; 6] = [
+pub const FEED_CONFIG_FIELDS: [&str; 7] = [
     "data_source",
     "trips_source",
     "default_run_s",
     "default_dwell_s",
     "schedule_sync",
     "sync_running_times",
+    // whether the feed is served from its stages (migration 0027)
+    "use_stages",
 ];
 /// The two `gtfs_feed.data_source` values a `feed_config` change may set.
 pub const DATA_SOURCES: [&str; 2] = ["db", "preprocessed"];
@@ -567,6 +569,198 @@ pub fn mint_stop_id() -> String {
     )
 }
 
+/// At most this many routes move in one `stage/split`. A stage 47 routes run is
+/// ordinary; a payload naming thousands is a mistake, not a review decision.
+pub const MAX_SPLIT_ROUTES: usize = 500;
+
+/// Stage ids the server mints: `stg_` + 10 lower-case hex digits.
+pub const MINTED_STAGE_PREFIX: &str = "stg_";
+
+/// A fresh stage id; the caller checks it is unused.
+pub fn mint_stage_id() -> String {
+    format!(
+        "{MINTED_STAGE_PREFIX}{}",
+        hex::encode(super::crypto::random_bytes(5))
+    )
+}
+
+/// One row of a stage's stop order, as sent in a `stage` change and as stored
+/// in `gtfs_stage_stop`: a route row without what belongs to the route (its
+/// fare stage number, the stage's name and the provider id).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageRow {
+    #[serde(default)]
+    pub stop_id: Option<String>,
+    pub stop_type: String,
+    #[serde(default)]
+    pub marker_id: Option<String>,
+    #[serde(default)]
+    pub marker_name: Option<String>,
+    #[serde(default)]
+    pub marker_lat: Option<f64>,
+    #[serde(default)]
+    pub marker_lon: Option<f64>,
+    #[serde(default)]
+    pub stop_name_override: Option<String>,
+}
+
+impl StageRow {
+    pub fn is_marker(&self) -> bool {
+        self.stop_type == "ROUTE CORRECTION"
+    }
+}
+
+/// One stage of a route, as sent in a `route_stages` replace. A missing
+/// `stage_no` is the previous stage's plus one (1 for the first).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageLink {
+    /// The stage's id. A stage is named by its id AND its direction, so this
+    /// may carry both as `<stage_id>|<direction>`, which is how a draft's
+    /// `entity_key` writes the pair; `direction` below says it separately.
+    pub stage_id: String,
+    /// "up", "down", or none for a stage that runs the same either way. Left
+    /// out when `stage_id` already carries it.
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub stage_no: Option<i32>,
+}
+
+/// The fare stage number of each link: its own, or one more than the one before.
+pub fn stage_numbers(links: &[StageLink]) -> Vec<i32> {
+    let mut out = Vec::with_capacity(links.len());
+    for l in links {
+        let n = l
+            .stage_no
+            .unwrap_or_else(|| out.last().map_or(1, |p: &i32| p + 1));
+        out.push(n);
+    }
+    out
+}
+
+/// A stage's rows as the apply stores them: trimmed stop ids, markers without
+/// a stop and with an id, stops without marker fields.
+pub fn stored_stage_rows(stage_id: &str, rows: &[StageRow]) -> Vec<StageRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut r = r.clone();
+            r.stop_id = r
+                .stop_id
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if r.is_marker() {
+                r.stop_id = None;
+                r.stop_name_override = None;
+                if r.marker_id.is_none() {
+                    r.marker_id = Some(format!("rc_{stage_id}_{}", i + 1));
+                }
+            } else {
+                r.marker_id = None;
+                r.marker_name = None;
+                r.marker_lat = None;
+                r.marker_lon = None;
+            }
+            r
+        })
+        .collect()
+}
+
+/// A route's rows from its stages, in order: every row of each stage, carrying
+/// the route's number for that stage and the stage's name. The provider id is
+/// the route's, filled in when the rows are written.
+pub fn flatten_stages<'a>(
+    stages: impl IntoIterator<Item = (i32, &'a str, &'a [StageRow])>,
+) -> Vec<RouteRow> {
+    let mut out = Vec::new();
+    for (stage_no, name, rows) in stages {
+        for r in rows {
+            out.push(RouteRow {
+                stop_id: r.stop_id.clone(),
+                stop_type: r.stop_type.clone(),
+                stage_no,
+                stage_name: name.to_string(),
+                marker_id: r.marker_id.clone(),
+                marker_name: r.marker_name.clone(),
+                marker_lat: r.marker_lat,
+                marker_lon: r.marker_lon,
+                stop_name_override: r.stop_name_override.clone(),
+                provider_id: None,
+                // the per-row GTFS fields (section 18) are not a stage's to give
+                ..Default::default()
+            });
+        }
+    }
+    out
+}
+
+/// Shape of one stage's rows. A stage's fare rules only mean something on a
+/// route, so they are checked on every route the stage is part of; what is
+/// checked here is what no route could make right: an empty stage, a row the
+/// table refuses, and two stage stops in one stage.
+pub fn check_stage_rows(rows: &[StageRow]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if rows.is_empty() {
+        out.push(Finding::error(
+            "stage_empty",
+            "",
+            "a stage needs at least one stop",
+        ));
+        return out;
+    }
+    for (i, r) in rows.iter().enumerate() {
+        let pos = format!("stop {}", i + 1);
+        if !STOP_TYPES.contains(&r.stop_type.as_str()) {
+            out.push(Finding::error(
+                "unknown_stop_type",
+                format!("{}|{}", r.stop_type, i + 1),
+                format!("{pos}: unknown stop type {:?}", r.stop_type),
+            ));
+        } else if r.is_marker() {
+            if r.stop_id.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                out.push(Finding::error(
+                    "marker_has_stop",
+                    format!("{:?}", r.marker_id),
+                    format!("{pos}: a ROUTE CORRECTION row is a shaping point and cannot carry a stop id"),
+                ));
+            }
+            match (r.marker_lat, r.marker_lon) {
+                (Some(lat), Some(lon)) if valid_lat_lon(lat, lon) => {}
+                _ => out.push(Finding::error(
+                    "marker_position",
+                    format!("{:?}", r.marker_id),
+                    format!("{pos}: a ROUTE CORRECTION row needs a valid marker position"),
+                )),
+            }
+            if r.stop_name_override.is_some() {
+                out.push(Finding::error(
+                    "marker_name_override",
+                    format!("{:?}", r.marker_id),
+                    format!("{pos}: use marker_name on a ROUTE CORRECTION row"),
+                ));
+            }
+        } else if r.stop_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            out.push(Finding::error(
+                "stop_missing",
+                format!("{}", i + 1),
+                format!("{pos}: {} needs a stop id", r.stop_type),
+            ));
+        }
+    }
+    let heads = rows.iter().filter(|r| r.stop_type == "NEW STOP").count();
+    if heads > 1 {
+        out.push(Finding::error(
+            "stage_two_heads",
+            "",
+            format!("a stage starts with one NEW STOP, and this one has {heads}; split it into two stages"),
+        ));
+    }
+    out
+}
+
 /// GTFS route_type: the basic types and Google's extended range.
 pub fn valid_route_type(t: i64) -> bool {
     matches!(t, 0..=7 | 11 | 12 | 100..=1702)
@@ -835,6 +1029,7 @@ pub fn create_id_field(entity: &str, op: &str) -> Option<&'static str> {
         ("route", "create") => Some("route_id"),
         ("station", "create") => Some("station_id"),
         ("service", "create") => Some("service_id"),
+        ("stage", "create") => Some("stage_id"),
         // a record file keyed by an id field of its own (section 18)
         _ => super::records::create_key_field(entity, op),
     }
@@ -899,6 +1094,8 @@ pub fn check_payload(
                 "regional_name",
                 "hindi_name",
                 "position_review_id",
+                // out of use for a while, the stops.txt row staying (section 21)
+                "unserviceable",
             ];
             // the rest of stops.txt, by its GTFS names (section 18)
             allowed.extend(super::records::STOP_GTFS_FIELDS);
@@ -913,6 +1110,13 @@ pub fn check_payload(
             }
             if m.contains_key("name") {
                 req_string(m, "name", what)?;
+            }
+            if m.get("unserviceable").is_some_and(|v| !v.is_boolean()) {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "unserviceable",
+                    format!("{what}: unserviceable is true or false"),
+                ));
             }
             if m.contains_key("lat") != m.contains_key("lon") {
                 return Err(Finding::error(
@@ -979,7 +1183,207 @@ pub fn check_payload(
             }
             Ok(())
         }
-        ("stop", "delete") | ("station", "delete") | ("route", "delete") => {
+        ("stage", "create") | ("stage", "update") => {
+            let m = obj(after, what)?;
+            let create = op == "create";
+            let allowed: &[&str] = if create {
+                &["stage_id", "name", "direction", "description", "rows"]
+            } else {
+                &["name", "direction", "description", "rows"]
+            };
+            allow_only(m, allowed, what)?;
+            // two stages of one corridor share a name and differ by direction
+            match m.get("direction") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(d))
+                    if matches!(d.trim().to_lowercase().as_str(), "up" | "down") => {}
+                Some(_) => {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "direction",
+                        format!("{what}: direction is \"up\", \"down\", or null"),
+                    ))
+                }
+            }
+            if create {
+                let id = req_string(m, "stage_id", what)?;
+                check_entity_id("stage_id", id)?;
+                if id != entity_key {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        id,
+                        format!("{what}: entity_key must equal stage_id"),
+                    ));
+                }
+            } else if m.is_empty() {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "",
+                    format!("{what}: nothing to change"),
+                ));
+            }
+            if create || m.contains_key("name") {
+                req_string(m, "name", what)?;
+            }
+            opt_string(m, "description", what)?;
+            if let Some(d) = m.get("description").and_then(Value::as_str) {
+                if d.trim().chars().count() > DESCRIPTION_MAX_CHARS {
+                    return Err(Finding::error(
+                        "description_too_long",
+                        entity_key,
+                        format!("{what}: the description is longer than {DESCRIPTION_MAX_CHARS} characters"),
+                    ));
+                }
+            }
+            match m.get("rows") {
+                None if create => Err(Finding::error(
+                    "invalid_payload",
+                    "rows",
+                    format!("{what}: rows is required"),
+                )),
+                None => Ok(()),
+                Some(rows) => serde_json::from_value::<Vec<StageRow>>(rows.clone())
+                    .map(|_| ())
+                    .map_err(|e| {
+                        Finding::error(
+                            "invalid_payload",
+                            "rows",
+                            format!("{what}: rows are not valid: {e}"),
+                        )
+                    }),
+            }
+        }
+        ("route_stages", "replace") => {
+            let m = obj(after, what)?;
+            allow_only(m, &["stages", "base_stages_hash"], what)?;
+            req_string(m, "base_stages_hash", what)?;
+            let stages = m.get("stages").ok_or_else(|| {
+                Finding::error(
+                    "invalid_payload",
+                    "stages",
+                    format!("{what}: stages is required"),
+                )
+            })?;
+            let links = serde_json::from_value::<Vec<StageLink>>(stages.clone()).map_err(|e| {
+                Finding::error(
+                    "invalid_payload",
+                    "stages",
+                    format!("{what}: stages are not valid: {e}"),
+                )
+            })?;
+            if let Some(l) = links.iter().find(|l| l.stage_id.trim().is_empty()) {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    l.stage_id.as_str(),
+                    format!("{what}: every stage needs a stage_id"),
+                ));
+            }
+            // a route runs through a stage once
+            let mut seen = HashSet::new();
+            if let Some((i, l)) = links
+                .iter()
+                .enumerate()
+                .find(|(_, l)| !seen.insert(l.stage_id.trim()))
+            {
+                let id = l.stage_id.trim();
+                return Err(Finding::error(
+                    "stage_repeated",
+                    id,
+                    format!(
+                        "{what}: stage {id} is on the route twice (stage {} of the list is its second time); a route uses a stage once",
+                        i + 1
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        // a temporary route (section 19): the change is the route's, and the
+        // list it names lives in the payload
+        // a temporary route (section 20): the change is the route's, and the
+        // list it names lives in the payload. Its id is all it has besides its
+        // stages, so those two are the whole payload.
+        ("route_variant", "create") | ("route_variant", "update") => {
+            let m = obj(after, what)?;
+            allow_only(m, &["variant_id", "stages"], what)?;
+            let id = req_string(m, "variant_id", what)?;
+            check_entity_id("variant_id", id)?;
+            let Some(stages) = m.get("stages") else {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "stages",
+                    format!("{what}: stages is required"),
+                ));
+            };
+            let links = serde_json::from_value::<Vec<StageLink>>(stages.clone()).map_err(|e| {
+                Finding::error(
+                    "invalid_payload",
+                    "stages",
+                    format!("{what}: stages are not valid: {e}"),
+                )
+            })?;
+            if links.is_empty() {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "stages",
+                    format!("{what}: a temporary route needs at least one stage"),
+                ));
+            }
+            if let Some(l) = links.iter().find(|l| l.stage_id.trim().is_empty()) {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    l.stage_id.as_str(),
+                    format!("{what}: every stage needs a stage_id"),
+                ));
+            }
+            let mut seen = HashSet::new();
+            if let Some(l) = links.iter().find(|l| !seen.insert(l.stage_id.trim())) {
+                let id = l.stage_id.trim();
+                return Err(Finding::error(
+                    "stage_repeated",
+                    id,
+                    format!("{what}: stage {id} is on the temporary route twice; a route uses a stage once"),
+                ));
+            }
+            Ok(())
+        }
+        ("route_variant", "activate") => {
+            let m = obj(after, what)?;
+            allow_only(m, &["variant_id", "base_stages_hash"], what)?;
+            req_string(m, "base_stages_hash", what)?;
+            // no variant_id (or null) is the route's normal list: how a
+            // diversion ends
+            match m.get("variant_id") {
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(id)) if check_entity_id("variant_id", id.trim()).is_ok() => Ok(()),
+                Some(_) => Err(Finding::error(
+                    "invalid_payload",
+                    "variant_id",
+                    format!("{what}: variant_id must be a temporary route's id, or null to go back to normal"),
+                )),
+            }
+        }
+        ("route_variant", "delete") => {
+            let m = obj(after, what)?;
+            allow_only(m, &["variant_id"], what)?;
+            // no id means the route's normal list, which is not a thing that can
+            // be deleted: a route always has one to go back to
+            let id = match m.get("variant_id").and_then(Value::as_str).map(str::trim) {
+                Some(id) if !id.is_empty() => id,
+                _ => {
+                    return Err(Finding::error(
+                        "variant_is_main",
+                        "variant_id",
+                        format!(
+                            "{what}: a route's normal stop list cannot be deleted; name the \
+                             temporary route to delete by its own id"
+                        ),
+                    ))
+                }
+            };
+            check_entity_id("variant_id", id)?;
+            Ok(())
+        }
+        ("stop", "delete") | ("station", "delete") | ("route", "delete") | ("stage", "delete") => {
             if after.is_null() {
                 Ok(())
             } else {
@@ -989,6 +1393,144 @@ pub fn check_payload(
                     format!("{what}: `after` must be null"),
                 ))
             }
+        }
+        ("stage", "split") => {
+            // A new stage, and the routes that come off `from_stage_id` onto
+            // it. One change, however many routes: see stages::stage_split.
+            let m = obj(after, what)?;
+            allow_only(
+                m,
+                &[
+                    "stage_id",
+                    "name",
+                    "direction",
+                    "description",
+                    "rows",
+                    "from_stage_id",
+                    "routes",
+                ],
+                what,
+            )?;
+            let id = req_string(m, "stage_id", what)?;
+            check_entity_id("stage_id", id)?;
+            if id != entity_key {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    id,
+                    format!("{what}: entity_key must equal stage_id"),
+                ));
+            }
+            req_string(m, "name", what)?;
+            let from = req_string(m, "from_stage_id", what)?;
+            if from == entity_key.trim() {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    from,
+                    format!("{what}: a stage cannot be split off itself"),
+                ));
+            }
+            match m.get("direction") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(d))
+                    if matches!(d.trim().to_lowercase().as_str(), "up" | "down") => {}
+                Some(_) => {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "direction",
+                        format!("{what}: direction is \"up\", \"down\", or null"),
+                    ))
+                }
+            }
+            let routes = m.get("routes").and_then(Value::as_array).ok_or_else(|| {
+                Finding::error(
+                    "invalid_payload",
+                    "routes",
+                    format!("{what}: routes names the routes to move"),
+                )
+            })?;
+            if routes.is_empty() || routes.len() > MAX_SPLIT_ROUTES {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "routes",
+                    format!("{what}: routes is 1 to {MAX_SPLIT_ROUTES} route ids"),
+                ));
+            }
+            if routes
+                .iter()
+                .any(|r| r.as_str().is_none_or(|s| s.trim().is_empty()))
+            {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "routes",
+                    format!("{what}: every route is a non-empty id"),
+                ));
+            }
+            opt_string(m, "description", what)?;
+            let rows = m.get("rows").ok_or_else(|| {
+                Finding::error(
+                    "invalid_payload",
+                    "rows",
+                    format!("{what}: rows is required"),
+                )
+            })?;
+            serde_json::from_value::<Vec<StageRow>>(rows.clone())
+                .map(|_| ())
+                .map_err(|e| {
+                    Finding::error(
+                        "invalid_payload",
+                        "rows",
+                        format!("{what}: rows are not valid: {e}"),
+                    )
+                })
+        }
+        ("stage", "merge") => {
+            // The stage named by entity_key goes away; the routes using it are
+            // pointed at `into_stage_id`. Both name a stage as
+            // `<stage_id>|<direction>`.
+            let m = obj(after, what)?;
+            allow_only(m, &["into_stage_id", "into_row_version"], what)?;
+            let into = req_string(m, "into_stage_id", what)?;
+            if into == entity_key.trim() {
+                return Err(Finding::error(
+                    "merge_same_stage",
+                    into,
+                    format!("{what}: a stage cannot be merged into itself"),
+                ));
+            }
+            // Direction is half a stage's key, and the two directions of a
+            // corridor hold different stops: merging across them would give a
+            // route the other way's stops. The apply checks it against the
+            // stored rows too; this catches it before anything is read.
+            let (_, a) = entity_key
+                .trim()
+                .split_once('|')
+                .unwrap_or((entity_key.trim(), ""));
+            let (_, b) = into.split_once('|').unwrap_or((into, ""));
+            if a != b {
+                return Err(Finding::error(
+                    "merge_across_directions",
+                    format!("{entity_key}->{into}"),
+                    format!(
+                        "{what}: {} runs {} and {into} runs {}; a stage is only merged \
+                         into one going the same way",
+                        entity_key.trim(),
+                        if a.is_empty() { "either way" } else { a },
+                        if b.is_empty() { "either way" } else { b }
+                    ),
+                ));
+            }
+            match m.get("into_row_version") {
+                None | Some(Value::Null) => {}
+                Some(v) if v.is_i64() => {}
+                Some(_) => {
+                    return Err(Finding::error(
+                        "invalid_row_version",
+                        into,
+                        format!("{what}: into_row_version is a number"),
+                    ))
+                }
+            }
+            Ok(())
         }
         ("stop", "merge") => {
             let m = obj(after, what)?;
@@ -1568,6 +2110,13 @@ pub fn check_payload(
                     format!("{what}: sync_running_times is true or false"),
                 ));
             }
+            if m.get("use_stages").is_some_and(|v| !v.is_boolean()) {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "use_stages",
+                    format!("{what}: use_stages is true or false"),
+                ));
+            }
             Ok(())
         }
         _ => Err(Finding::error(
@@ -1582,6 +2131,146 @@ pub fn check_payload(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn stage_row(stop: Option<&str>, typ: &str) -> StageRow {
+        StageRow {
+            stop_id: stop.map(str::to_string),
+            stop_type: typ.into(),
+            marker_id: None,
+            marker_name: None,
+            marker_lat: None,
+            marker_lon: None,
+            stop_name_override: None,
+        }
+    }
+
+    #[test]
+    fn stage_rows_are_checked_for_what_no_route_can_fix() {
+        assert_eq!(check_stage_rows(&[])[0].code, "stage_empty");
+        let ok = [
+            stage_row(Some("A"), "NEW STOP"),
+            stage_row(Some("B"), "INTERMEDIATE STOP"),
+        ];
+        assert!(check_stage_rows(&ok).is_empty());
+        let two = [
+            stage_row(Some("A"), "NEW STOP"),
+            stage_row(Some("B"), "NEW STOP"),
+        ];
+        assert_eq!(check_stage_rows(&two)[0].code, "stage_two_heads");
+        let codes = |rows: &[StageRow]| {
+            check_stage_rows(rows)
+                .into_iter()
+                .map(|f| f.code)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(codes(&[stage_row(None, "NEW STOP")]), ["stop_missing"]);
+        assert_eq!(
+            codes(&[stage_row(Some("A"), "BUS STOP")]),
+            ["unknown_stop_type"]
+        );
+        assert_eq!(
+            codes(&[stage_row(Some("A"), "ROUTE CORRECTION")]),
+            ["marker_has_stop", "marker_position"]
+        );
+    }
+
+    #[test]
+    fn stage_numbers_count_on_from_the_last_one_given() {
+        let l = |id: &str, no: Option<i32>| StageLink {
+            stage_id: id.into(),
+            direction: None,
+            stage_no: no,
+        };
+        assert_eq!(stage_numbers(&[]), Vec::<i32>::new());
+        assert_eq!(
+            stage_numbers(&[l("a", None), l("b", None), l("c", None)]),
+            [1, 2, 3]
+        );
+        // a fare chart that skips a number keeps counting from it
+        assert_eq!(
+            stage_numbers(&[l("a", None), l("b", Some(5)), l("c", None)]),
+            [1, 5, 6]
+        );
+    }
+
+    #[test]
+    fn a_route_flattens_from_its_stages() {
+        let s1 = stored_stage_rows(
+            "stg_a",
+            &[
+                stage_row(Some("A "), "NEW STOP"),
+                StageRow {
+                    marker_lat: Some(13.0),
+                    marker_lon: Some(80.2),
+                    ..stage_row(None, "ROUTE CORRECTION")
+                },
+                stage_row(Some("B"), "INTERMEDIATE STOP"),
+            ],
+        );
+        assert_eq!(s1[0].stop_id.as_deref(), Some("A"));
+        assert_eq!(s1[1].marker_id.as_deref(), Some("rc_stg_a_2"));
+        let s2 = [stage_row(Some("C"), "NEW STOP")];
+        let rows = flatten_stages([(1, "ONE", s1.as_slice()), (2, "TWO", &s2[..])]);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.stage_no, r.stage_name.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "ONE"), (1, "ONE"), (1, "ONE"), (2, "TWO")]
+        );
+        // what a stage makes is a route the route rules accept
+        assert!(check_route_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn stage_payloads() {
+        let rows = json!([{"stop_id": "A", "stop_type": "NEW STOP"}]);
+        let create = |key: &str, after: Value| check_payload("stage", "create", key, &after);
+        assert!(create(
+            "stg_1",
+            json!({"stage_id": "stg_1", "name": "X", "rows": rows})
+        )
+        .is_ok());
+        assert_eq!(
+            create(
+                "stg_1",
+                json!({"stage_id": "stg_2", "name": "X", "rows": rows})
+            )
+            .unwrap_err()
+            .code,
+            "invalid_payload"
+        );
+        assert!(create("stg_1", json!({"stage_id": "stg_1", "name": "X"})).is_err());
+        assert!(create(
+            "stg_1",
+            json!({"stage_id": "stg_1", "name": " ", "rows": rows})
+        )
+        .is_err());
+        assert!(create(
+            "stg_1",
+            json!({"stage_id": "stg_1", "name": "X", "rows": [{"stop_id": "A", "stop_type": "NEW STOP", "stage_no": 1}]})
+        )
+        .is_err());
+        let update = |after: Value| check_payload("stage", "update", "stg_1", &after);
+        assert!(update(json!({"name": "Y"})).is_ok());
+        assert!(update(json!({"description": null})).is_ok());
+        assert!(update(json!({})).is_err());
+        assert!(update(json!({"stage_id": "stg_2"})).is_err());
+        assert!(check_payload("stage", "delete", "stg_1", &Value::Null).is_ok());
+
+        let replace = |after: Value| check_payload("route_stages", "replace", "R1", &after);
+        assert!(replace(json!({"stages": [{"stage_id": "a"}, {"stage_id": "b", "stage_no": 3}], "base_stages_hash": "h"})).is_ok());
+        assert!(replace(json!({"stages": [], "base_stages_hash": "h"})).is_ok());
+        assert!(replace(json!({"stages": [{"stage_id": "a"}]})).is_err());
+        assert!(replace(json!({"stages": [{"stage_id": " "}], "base_stages_hash": "h"})).is_err());
+        assert!(replace(json!({"stages": [{"id": "a"}], "base_stages_hash": "h"})).is_err());
+        assert_eq!(
+            replace(json!({"stages": [{"stage_id": "a"}, {"stage_id": "b"}, {"stage_id": " a"}], "base_stages_hash": "h"}))
+                .unwrap_err()
+                .code,
+            "stage_repeated"
+        );
+    }
 
     #[test]
     fn feed_config_payloads() {

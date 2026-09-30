@@ -425,6 +425,8 @@ pub enum Object {
     ChangeSet(Uuid),
     StationProposal(i64),
     PositionReview(i64),
+    StageReview(i64),
+    RouteIssue(i64),
     Webhook(Uuid),
 }
 
@@ -450,6 +452,18 @@ pub async fn feed_of(pool: &PgPool, object: Object) -> EditorResult<String> {
                 .fetch_optional(pool)
                 .await?
         }
+        Object::StageReview(id) => {
+            sqlx::query("SELECT gtfs_id FROM gtfs_stage_review WHERE review_id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+        }
+        Object::RouteIssue(id) => {
+            sqlx::query("SELECT gtfs_id FROM gtfs_route_stage_issue WHERE issue_id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+        }
         Object::Webhook(id) => {
             sqlx::query("SELECT gtfs_id FROM gtfs_webhook WHERE webhook_id = $1")
                 .bind(id)
@@ -469,6 +483,12 @@ pub async fn feed_of(pool: &PgPool, object: Object) -> EditorResult<String> {
             }
             Object::PositionReview(id) => {
                 EditorError::not_found("review_not_found", format!("no position review {id}"))
+            }
+            Object::StageReview(id) => {
+                EditorError::not_found("review_not_found", format!("no stage review {id}"))
+            }
+            Object::RouteIssue(id) => {
+                EditorError::not_found("route_issue_not_found", format!("no route issue {id}"))
             }
             Object::Webhook(_) => EditorError::not_found("webhook_not_found", "no such webhook"),
         }),

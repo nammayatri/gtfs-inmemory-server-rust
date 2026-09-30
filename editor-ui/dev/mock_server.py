@@ -1540,6 +1540,8 @@ class Handler(BaseHTTPRequestHandler):
                 s.change_sets[cs_id] = cs
                 s.add_audit(u, "change_set_created", g, cs_id, {"title": cs["title"]})
                 return 201, self.set_full(cs)
+            if rest in (["change-sets", "approve"], ["change-sets", "commit"]) and method == "POST":
+                return 200, self.transition_many(u, g, rest[1], self._body())
             if rest == ["station-proposals"] and method == "GET":
                 return 200, self.list_proposals(g, q)
             if rest == ["station-proposals", "summary"] and method == "GET":
@@ -2086,6 +2088,44 @@ class Handler(BaseHTTPRequestHandler):
             detail.update(feed_version=cs["committed_version"], changes=len(cs["changes"]), applied=len(cs["changes"]))
         s.add_audit(u, f"change_set_{past}", cs["gtfs_id"], cs["change_set_id"], detail)
         return self.set_full(cs)
+
+    def transition_many(self, u, g, action, b):
+        """POST /feeds/{g}/change-sets/approve|commit: several drafts in one call.
+        A commit batch goes live as one feed version, as the server's does."""
+        s = self.store
+        self.require_role(u, "approver")
+        ids = list(dict.fromkeys(b.get("change_set_ids") or []))
+        if not ids:
+            raise ApiError(400, "no_change_sets", "name at least one change set")
+        before = s.feeds[g]["version"]
+        done, failed = [], []
+        for cs_id in ids:
+            cs = s.change_sets.get(cs_id)
+            stage = "approve" if action == "approve" or b.get("approve") else "commit"
+            try:
+                if cs is None or cs["gtfs_id"] != g:
+                    raise ApiError(404, "change_set_not_found", "no such change set")
+                if stage == "approve":
+                    self.transition(u, cs, "approve", {"comment": b.get("comment")})
+                if action == "commit":
+                    stage = "commit"
+                    self.transition(u, cs, "commit", {})
+                done.append(cs_id)
+            except ApiError as e:
+                failed.append({"change_set_id": cs_id, "stage": stage,
+                               "approved": stage == "commit" and bool(b.get("approve")),
+                               "error": {"code": e.code, "message": e.message, "details": e.details}})
+        if action == "approve":
+            return {"approved": done, "failed": failed}
+        # one version for the whole batch
+        if done:
+            s.feeds[g]["version"] = before + 1
+            for cs_id in done:
+                s.change_sets[cs_id]["committed_version"] = before + 1
+            for pod in getattr(s, "pods", {}).get(g, []):
+                if pod.get("loaded_version", 0) > before + 1:
+                    pod["loaded_version"] = before + 1
+        return {"committed": done, "failed": failed, "feed_version": before + 1 if done else None}
 
     def apply_commit(self, cs):
         s, g = self.store, cs["gtfs_id"]
@@ -4125,9 +4165,12 @@ class FeedAccessHandler(WebhookHandler):
 
     def my_feeds(self, u):
         # GPS (docs section 17) is set up for the sample's feeds, not the
-        # second feed made here
+        # second feed made here.
+        # use_stages: the mock's feeds are all served from stages unless a feed
+        # says otherwise, so the stage screens it exercises stay reachable
         return [{"gtfs_id": g, "display_name": f.get("display_name"), "role": self.feed_role(u, g),
-                 "gps": {"days": 7, "trips_days": 30} if g != SECOND_FEED else None}
+                 "gps": {"days": 7, "trips_days": 30} if g != SECOND_FEED else None,
+                 "use_stages": f.get("use_stages", True)}
                 for g, f in self.store.feeds.items() if self.feed_role(u, g)]
 
     def _api(self, method, path, q):
