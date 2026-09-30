@@ -1122,14 +1122,35 @@ pub async fn change_set(
     ok(svc::set_detail_page(&st, &ctx, *path, &page, first).await?)
 }
 
+/// `replay=false` on a single-change write (section 19): answer with the ids
+/// alone instead of the set's first page. That page replays the whole draft
+/// under the feed's lock, so a script adding changes one at a time paid for
+/// every change already in the draft on every call.
+#[derive(Deserialize)]
+pub struct ChangeWriteQuery {
+    replay: Option<bool>,
+}
+
+impl ChangeWriteQuery {
+    fn replay(&self) -> bool {
+        self.replay.unwrap_or(true)
+    }
+}
+
 pub async fn change_add(
     req: HttpRequest,
     st: Data,
     path: web::Path<Uuid>,
+    q: web::Query<ChangeWriteQuery>,
     body: web::Json<svc::NewChange>,
 ) -> EditorResult<HttpResponse> {
     let ctx = auth::require_object(&req, &st, Object::ChangeSet(*path), Role::Editor).await?;
     let change_id = svc::add_change(&st, &ctx, *path, body.into_inner()).await?;
+    if !q.replay() {
+        return Ok(
+            HttpResponse::Created().json(json!({"change_set_id": *path, "change_id": change_id}))
+        );
+    }
     let mut detail = svc::set_detail(&st, &ctx, *path).await?;
     detail["change_id"] = json!(change_id);
     Ok(HttpResponse::Created().json(detail))
@@ -1139,11 +1160,15 @@ pub async fn change_update(
     req: HttpRequest,
     st: Data,
     path: web::Path<(Uuid, i64)>,
+    q: web::Query<ChangeWriteQuery>,
     body: web::Json<svc::ChangeUpdate>,
 ) -> EditorResult<HttpResponse> {
     let (id, change_id) = path.into_inner();
     let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Editor).await?;
     svc::update_change(&st, &ctx, id, change_id, body.into_inner()).await?;
+    if !q.replay() {
+        return ok(json!({"change_set_id": id, "change_id": change_id}));
+    }
     ok(svc::set_detail(&st, &ctx, id).await?)
 }
 
@@ -1151,10 +1176,14 @@ pub async fn change_delete(
     req: HttpRequest,
     st: Data,
     path: web::Path<(Uuid, i64)>,
+    q: web::Query<ChangeWriteQuery>,
 ) -> EditorResult<HttpResponse> {
     let (id, change_id) = path.into_inner();
     let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Editor).await?;
     svc::delete_change(&st, &ctx, id, change_id).await?;
+    if !q.replay() {
+        return ok(json!({"change_set_id": id, "removed_change_id": change_id}));
+    }
     ok(svc::set_detail(&st, &ctx, id).await?)
 }
 

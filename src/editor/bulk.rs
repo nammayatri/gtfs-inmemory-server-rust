@@ -45,6 +45,10 @@ pub struct BulkRequest {
     /// kind `records`: the file the rows are of (`pathways.txt`, section 18).
     #[serde(default)]
     pub file: Option<String>,
+    /// `false`: a real run answers without the set's first page, which replays
+    /// the whole draft (section 19). The changes are stored exactly the same.
+    #[serde(default)]
+    pub replay: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,6 +62,9 @@ pub enum Kind {
     Services,
     /// Rows of any file the editor keeps as records (section 18).
     Records,
+    /// `{from_stop_id, into_stop_id}` rows: one `stop/merge` each, creating the
+    /// stop merged away first when the feed has no row for it (section 19).
+    StopMerges,
 }
 
 impl Kind {
@@ -71,6 +78,7 @@ impl Kind {
             "timing_profiles" => Some(Kind::TimingProfiles),
             "services" => Some(Kind::Services),
             "records" => Some(Kind::Records),
+            "stop_merges" => Some(Kind::StopMerges),
             _ => None,
         }
     }
@@ -85,11 +93,22 @@ impl Kind {
             Kind::TimingProfiles => "timing_profiles",
             Kind::Services => "services",
             Kind::Records => "records",
+            Kind::StopMerges => "stop_merges",
         }
     }
 
     pub fn columns(self) -> &'static [&'static str] {
         match self {
+            // no `action`: the kind is the action - every row merges one stop
+            Kind::StopMerges => &[
+                "from_stop_id",
+                "into_stop_id",
+                "name",
+                "lat",
+                "lon",
+                "keep_name",
+                "keep_position",
+            ],
             // then records::STOP_GTFS_FIELDS, by their stops.txt names
             Kind::Stops => &[
                 "action",
@@ -2689,6 +2708,344 @@ async fn plan_stop_updates(
     Ok(plan)
 }
 
+// ---------------------------------------------------------------- stop merges (section 19)
+
+/// A stop as a merge upload needs it: what is live, before the draft.
+struct LiveMergeStop {
+    deleted: bool,
+    location_type: i16,
+    merged_into: Option<String>,
+}
+
+/// One parsed `stop_merges` row.
+struct MergeRow {
+    upload: usize,
+    from: String,
+    into: String,
+    /// `stop/create`'s `after`, when the row gives name, lat and lon.
+    create: Option<Value>,
+    /// `stop/merge`'s `after`.
+    merge: Value,
+    /// Any of name, lat or lon was given, all three or not.
+    cells_given: bool,
+}
+
+/// `{from_stop_id, into_stop_id, name?, lat?, lon?, keep_name?, keep_position?}`
+/// rows: one `stop/merge` per row, preceded by a `stop/create` of the stop that
+/// goes when the feed has no row for it - an id retired before the editor was
+/// seeded, which riders and caches still hold (section 19). The upload is
+/// checked against one read of the stops it names and the draft as it stands;
+/// the real run then stores the changes through the single-change path
+/// ([`insert_as_changes`]), so each is exactly what
+/// `POST /change-sets/{id}/changes` would have stored.
+async fn plan_stop_merges(
+    conn: &mut PgConnection,
+    g: &str,
+    rows: &[Value],
+    draft: &DraftView,
+) -> EditorResult<Plan> {
+    let mut plan = Plan::new(rows.len());
+    let mut by_from: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut parsed: Vec<MergeRow> = Vec::new();
+    for (i, v) in rows.iter().enumerate() {
+        let m = match row_object(v, Kind::StopMerges) {
+            Ok(m) => m,
+            Err(f) => {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let texts = [
+            "from_stop_id",
+            "into_stop_id",
+            "name",
+            "keep_name",
+            "keep_position",
+        ]
+        .map(|k| cell_text(m, k));
+        let nums = ["lat", "lon"].map(|k| cell_f64(m, k));
+        let bad: Vec<String> = texts
+            .iter()
+            .filter_map(|c| c.as_ref().err())
+            .chain(nums.iter().filter_map(|c| c.as_ref().err()))
+            .cloned()
+            .collect();
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
+        let [from, into, name, keep_name, keep_position] = texts.map(|c| c.unwrap_or_default());
+        let [lat, lon] = nums.map(|c| c.unwrap_or_default());
+        let (Some(from), Some(into)) = (from, into) else {
+            plan.rows[i]
+                .findings
+                .push(invalid_row("from_stop_id and into_stop_id are required"));
+            continue;
+        };
+        let mut merge = json!({"into_stop_id": into});
+        if let Some(k) = keep_name {
+            merge["keep_name"] = json!(k);
+        }
+        if let Some(k) = keep_position {
+            merge["keep_position"] = json!(k);
+        }
+        // exactly the single change's shape check: itself, prm_, keep_*
+        if let Err(f) = check_payload("stop", "merge", &from, &merge) {
+            plan.rows[i].findings.push(f);
+            continue;
+        }
+        let cells_given = name.is_some() || lat.is_some() || lon.is_some();
+        let create = match (name, lat, lon) {
+            (Some(name), Some(lat), Some(lon)) => {
+                Some(json!({"stop_id": from, "name": name, "lat": lat, "lon": lon}))
+            }
+            _ => None,
+        };
+        by_from.entry(from.clone()).or_default().push(i);
+        parsed.push(MergeRow {
+            upload: i,
+            from,
+            into,
+            create,
+            merge,
+            cells_given,
+        });
+    }
+    mark_duplicates(&mut plan, by_from, |id| format!("from_stop_id {id}"));
+
+    // every stop the upload names, in one query
+    let mut wanted: Vec<String> = parsed
+        .iter()
+        .flat_map(|r| [r.from.clone(), r.into.clone()])
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut live: HashMap<String, LiveMergeStop> = HashMap::with_capacity(wanted.len());
+    if !wanted.is_empty() {
+        for r in sqlx::query(
+            "SELECT stop_id, deleted, location_type, provenance->>'merged_into' AS merged_into \
+             FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
+        )
+        .bind(g)
+        .bind(&wanted)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            live.insert(
+                r.try_get("stop_id")?,
+                LiveMergeStop {
+                    deleted: r.try_get("deleted")?,
+                    location_type: r.try_get("location_type")?,
+                    merged_into: r.try_get("merged_into")?,
+                },
+            );
+        }
+    }
+    // a stop this upload merges away cannot also be what another of its rows keeps
+    let merged_here: HashSet<String> = parsed.iter().map(|r| r.from.clone()).collect();
+
+    for r in &parsed {
+        let i = r.upload;
+        if !plan.rows[i].findings.is_empty() {
+            continue; // a duplicate
+        }
+        let (from, into) = (r.from.as_str(), r.into.as_str());
+        if let Some(f) = kept_stop_problem(into, &live, draft, &merged_here) {
+            plan.rows[i].findings.push(f);
+            continue;
+        }
+
+        // the stop that goes
+        if let Some((to, by)) = draft.merged_into(from) {
+            plan.rows[i].findings.push(if to == into {
+                Finding::warning(
+                    "unchanged",
+                    from,
+                    format!("change {by} in this draft already merges {from} into {into}; this row adds nothing"),
+                )
+            } else {
+                Finding::error(
+                    "stop_merged_away",
+                    from,
+                    format!("change {by} in this draft merges {from} into {to}"),
+                )
+            });
+            continue;
+        }
+        let create = match (live.get(from), draft.created_stop(from)) {
+            (Some(s), _) if s.deleted => {
+                plan.rows[i].findings.push(match s.merged_into.as_deref() {
+                    Some(m) if m == into => Finding::warning(
+                        "unchanged",
+                        from,
+                        format!("stop {from} is already merged into {into}; this row adds nothing"),
+                    ),
+                    Some(m) => Finding::error(
+                        "stop_merged_away",
+                        from,
+                        format!("stop {from} is already merged into {m}"),
+                    ),
+                    None => Finding::error("stop_deleted", from, format!("stop {from} is deleted")),
+                });
+                continue;
+            }
+            (Some(s), _) if s.location_type == 1 => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_is_station",
+                    from,
+                    format!("{from} is a station; only stops are merged"),
+                ));
+                continue;
+            }
+            (None, Some(c)) if c.location_type == 1 => {
+                plan.rows[i].findings.push(Finding::error(
+                    "stop_is_station",
+                    from,
+                    format!("{from} is a station; only stops are merged"),
+                ));
+                continue;
+            }
+            (Some(_), _) | (None, Some(_)) => {
+                if r.cells_given {
+                    plan.rows[i].findings.push(Finding::warning(
+                        "cells_not_used",
+                        from,
+                        format!("stop {from} exists; name, lat and lon are only for creating one"),
+                    ));
+                }
+                None
+            }
+            (None, None) => match &r.create {
+                Some(after) => {
+                    if let Err(f) = check_payload("stop", "create", from, after) {
+                        plan.rows[i].findings.push(f);
+                        continue;
+                    }
+                    Some(after.clone())
+                }
+                None => {
+                    plan.rows[i].findings.push(Finding::error(
+                        "stop_not_found",
+                        from,
+                        format!("no stop {from}: give name, lat and lon to create it and merge it in one go"),
+                    ));
+                    continue;
+                }
+            },
+        };
+        if draft.stop_deleted(from) {
+            plan.rows[i].findings.push(Finding::error(
+                "stop_deleted",
+                from,
+                format!("stop {from} is deleted in this draft"),
+            ));
+            continue;
+        }
+        if let Some(after) = create {
+            plan.changes.push(Planned {
+                entity: "stop",
+                op: "create",
+                key: Some(from.to_string()),
+                after,
+                before: Value::Null,
+                base: None,
+            });
+        }
+        plan.changes.push(Planned {
+            entity: "stop",
+            op: "merge",
+            key: Some(from.to_string()),
+            after: r.merge.clone(),
+            before: Value::Null,
+            base: None,
+        });
+        plan.rows[i].change = Some(plan.changes.len() - 1);
+    }
+    Ok(plan)
+}
+
+/// Why `into` cannot be the stop a merge keeps, if it cannot.
+fn kept_stop_problem(
+    into: &str,
+    live: &HashMap<String, LiveMergeStop>,
+    draft: &DraftView,
+    merged_here: &HashSet<String>,
+) -> Option<Finding> {
+    if merged_here.contains(into) {
+        return Some(Finding::error(
+            "into_merged_in_upload",
+            into,
+            format!("stop {into} is merged away by another row of this upload; merge into what it becomes"),
+        ));
+    }
+    if let Some((to, by)) = draft.merged_into(into) {
+        return Some(Finding::error(
+            "stop_merged_away",
+            into,
+            format!(
+                "stop {into} is merged into {to} by change {by} earlier in this draft; use {to}"
+            ),
+        ));
+    }
+    if draft.stop_deleted(into) {
+        return Some(Finding::error(
+            "stop_deleted",
+            into,
+            format!("stop {into} is deleted in this draft"),
+        ));
+    }
+    let station = |id: &str| {
+        Finding::error(
+            "stop_is_station",
+            id,
+            format!("{id} is a station; only stops are merged"),
+        )
+    };
+    match (live.get(into), draft.created_stop(into)) {
+        (Some(s), _) if s.deleted => Some(Finding::error(
+            "stop_deleted",
+            into,
+            match &s.merged_into {
+                Some(m) => format!("stop {into} was merged into {m}; use {m}"),
+                None => format!("stop {into} is deleted"),
+            },
+        )),
+        (Some(s), _) if s.location_type == 1 => Some(station(into)),
+        (None, Some(c)) if c.location_type == 1 => Some(station(into)),
+        (Some(_), _) | (None, Some(_)) => None,
+        (None, None) => Some(Finding::error(
+            "stop_not_found",
+            into,
+            format!("no stop {into}"),
+        )),
+    }
+}
+
+/// Store a plan through the single-change path, inside the upload's one
+/// transaction: each change gets the snapshot, versions, checks and audit
+/// `POST /change-sets/{id}/changes` gives it, and nothing replays per change.
+async fn insert_as_changes(
+    conn: &mut PgConnection,
+    ctx: &Ctx,
+    set: &service::ChangeSet,
+    plan: &Plan,
+) -> EditorResult<Vec<i64>> {
+    let mut ids = Vec::with_capacity(plan.changes.len());
+    for c in &plan.changes {
+        let change = service::NewChange {
+            entity: c.entity.into(),
+            op: c.op.into(),
+            entity_key: c.key.clone().unwrap_or_default(),
+            after: c.after.clone(),
+            base_row_version: c.base,
+        };
+        ids.push(service::add_change_to(&mut *conn, ctx, set, change).await?);
+    }
+    Ok(ids)
+}
+
 // ---------------------------------------------------------------- run
 
 // ---------------------------------------------------------------- records (section 18)
@@ -2990,7 +3347,7 @@ pub async fn run(
     let kind = Kind::parse(&req.kind).ok_or_else(|| {
         EditorError::bad_request(
             "invalid_kind",
-            "kind is stops, routes, route_stops, stop_updates, route_trips, timing_profiles, services, or records with a file",
+            "kind is stops, routes, route_stops, stop_updates, route_trips, timing_profiles, services, stop_merges, or records with a file",
         )
     })?;
     if req.rows.is_empty() {
@@ -3011,7 +3368,7 @@ pub async fn run(
     }
     let (mut out, with_detail) =
         retry_transient(|| run_once(state, ctx, change_set_id, kind, &req)).await?;
-    if with_detail {
+    if with_detail && req.replay != Some(false) {
         out["change_set"] = service::set_detail(state, ctx, change_set_id).await?;
     }
     Ok(out)
@@ -3043,6 +3400,7 @@ async fn plan_kind(
         Kind::RouteTrips => plan_route_trips(conn, g, rows, draft, with_before).await?,
         Kind::TimingProfiles => plan_timing_profiles(conn, g, rows, draft, with_before).await?,
         Kind::Services => plan_services(conn, g, rows, draft, with_before).await?,
+        Kind::StopMerges => plan_stop_merges(conn, g, rows, draft).await?,
         Kind::Records => {
             let fspec = records_file(req.file.as_deref())?;
             plan_records(conn, g, change_set_id, fspec, rows, actor).await?
@@ -3108,11 +3466,19 @@ pub(super) async fn plan_into_set(
     kind: Kind,
     rows: Vec<Value>,
 ) -> EditorResult<(Vec<Vec<Finding>>, Vec<i64>)> {
+    if kind == Kind::StopMerges {
+        // stored through the single-change path, which needs the caller's
+        // context: only an upload (run_once) takes this kind
+        return Err(EditorError::internal(
+            "stop_merges is stored by run_once, not plan_into_set",
+        ));
+    }
     let req = BulkRequest {
         kind: kind.name().to_string(),
         rows,
         dry_run: false,
         file: None,
+        replay: None,
     };
     let draft = DraftView::load(conn, change_set_id).await?;
     let mut plan = plan_kind(conn, g, change_set_id, kind, &req, &draft, actor).await?;
@@ -3169,7 +3535,11 @@ async fn run_once(
         tx.rollback().await?;
         return Ok((respond(false, kind, &plan, &[]), true));
     }
-    let change_ids = insert_plan(&mut tx, &g, change_set_id, ctx.user.user_id, &mut plan).await?;
+    let change_ids = if kind == Kind::StopMerges {
+        insert_as_changes(&mut tx, ctx, &set, &plan).await?
+    } else {
+        insert_plan(&mut tx, &g, change_set_id, ctx.user.user_id, &mut plan).await?
+    };
     sqlx::query("UPDATE gtfs_change_set SET updated_at = now() WHERE change_set_id = $1")
         .bind(change_set_id)
         .execute(&mut *tx)
@@ -3301,6 +3671,20 @@ mod tests {
         )
         .is_ok());
         assert!(row_object(&json!({"stop_id": "S", "lat": 13.0}), Kind::StopUpdates).is_err());
+        // stop_merges: the kind is the action, so it has no action column
+        assert_eq!(Kind::parse("stop_merges"), Some(Kind::StopMerges));
+        assert_eq!(Kind::StopMerges.name(), "stop_merges");
+        assert!(row_object(
+            &json!({"from_stop_id": "OLD", "into_stop_id": "NEW", "name": "n", "lat": 13.0, "lon": 80.2,
+                    "keep_name": "into", "keep_position": "into"}),
+            Kind::StopMerges
+        )
+        .is_ok());
+        assert!(row_object(
+            &json!({"action": "add", "from_stop_id": "OLD", "into_stop_id": "NEW"}),
+            Kind::StopMerges
+        )
+        .is_err());
     }
 
     #[test]
