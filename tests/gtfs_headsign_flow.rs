@@ -307,6 +307,7 @@ fn app_config(dir: &Path, db_url: &str) -> AppConfig {
         gtfs_gps: None,
         is_master: false,
         gtfs_gps_clickhouse_password: None,
+        max_eta_override_seconds: None,
     }
 }
 

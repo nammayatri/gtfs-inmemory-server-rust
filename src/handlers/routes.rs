@@ -1,3 +1,4 @@
+use crate::services::field_generator;
 use crate::services::fleet_operator::{
     EmployeeLoginRequest, EmployeeLoginResponse, EmployeeRegisterRequest, EmployeeRegisterResponse,
     TripAction, WaybillAnchor,
@@ -5,7 +6,7 @@ use crate::services::fleet_operator::{
 use crate::services::operator::{
     break_types, day_types, shift_types, trip_types, waybill_statuses, FleetRow, QueryBody,
     VehicleUpsertRequest, EXTERNAL_ONLY_GTFS_IDS, INTERNAL_ONLY_GTFS_IDS, MAX_QUERY_LIMIT,
-    SUPPORTED_OPERATOR_GTFS_IDS,
+    MAX_UPSERT_BATCH_SIZE, SUPPORTED_OPERATOR_GTFS_IDS,
 };
 use actix_web::{
     web::{self, Data, Json, Path, Query},
@@ -45,6 +46,12 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
     limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StationEtaQuery {
+    #[serde(rename = "variantId")]
+    variant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,12 +113,57 @@ pub struct GetAllVehiclesByIdsRequest {
 
 #[derive(Deserialize, Debug, ToSchema)]
 pub struct StationEtaUpsertRequest {
-    #[serde(rename = "sourceStationCode")]
-    pub source_station_code: String,
-    #[serde(rename = "destinationStationCode")]
-    pub destination_station_code: String,
-    #[serde(rename = "etaInSeconds")]
-    pub eta_in_seconds: i32,
+    /// Omitted means the feed's default variant, which is what a caller writing baseline
+    /// times wants.
+    #[serde(rename = "variantId", default)]
+    pub variant_id: Option<String>,
+    pub entries: Vec<crate::models::StationEtaEntry>,
+}
+
+#[derive(Deserialize, Debug, ToSchema)]
+pub struct EtaVariantUpsertRequest {
+    pub code: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "isDefault", default)]
+    pub is_default: bool,
+}
+
+#[derive(Deserialize, Debug, ToSchema)]
+pub struct ScheduleDefaultVariantRequest {
+    #[serde(rename = "scheduleTripId")]
+    pub schedule_trip_id: String,
+    /// Omitted pins every trip of the schedule, which is how a whole service is moved to a
+    /// variant in one call.
+    #[serde(rename = "tripNumber", default)]
+    pub trip_number: Option<i32>,
+    /// Null clears the pin, putting the trip back on the feed's default variant.
+    #[serde(rename = "variantId", default)]
+    pub variant_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug, ToSchema)]
+pub struct TripEtaOverrideRequest {
+    #[serde(rename = "waybillNo")]
+    pub waybill_no: String,
+    #[serde(rename = "tripNumber")]
+    pub trip_number: i32,
+    #[serde(rename = "variantId")]
+    pub variant_id: String,
+    /// Window bounds, epoch seconds. Matched against the trip's own clock, not `now()`, so one
+    /// window can deliberately cover the same schedule trip across several duty dates.
+    #[serde(rename = "effectiveFrom")]
+    pub effective_from: i64,
+    #[serde(rename = "effectiveUntill")]
+    pub effective_untill: i64,
+}
+
+#[derive(Deserialize, Debug, ToSchema)]
+pub struct TripEtaOverrideClearRequest {
+    #[serde(rename = "waybillNo")]
+    pub waybill_no: String,
+    #[serde(rename = "tripNumber")]
+    pub trip_number: i32,
 }
 
 pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
@@ -163,7 +215,27 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                         web::post().to(generate_waybill_repeats),
                     )
                     .route("/waybills", web::get().to(get_waybills))
+                    .route("/station-eta", web::get().to(get_station_etas))
                     .route("/station-eta/upsert", web::post().to(upsert_station_eta))
+                    .route("/eta-variants", web::get().to(get_eta_variants))
+                    .route("/eta-variants", web::post().to(upsert_eta_variant))
+                    .route(
+                        "/eta-variants/{variant_id}",
+                        web::delete().to(delete_eta_variant),
+                    )
+                    .route(
+                        "/schedule-default-variant",
+                        web::post().to(set_schedule_default_variant),
+                    )
+                    .route("/trip-eta-override", web::post().to(set_trip_eta_override))
+                    .route(
+                        "/trip-eta-override/clear",
+                        web::post().to(clear_trip_eta_override),
+                    )
+                    .route(
+                        "/trip-eta-override/active",
+                        web::get().to(list_active_trip_eta_overrides),
+                    )
                     .route("/vehicles/upsert", web::post().to(upsert_vehicles))
                     .route("/vehicles/query", web::get().to(query_vehicles))
                     .route("/vehicles/{vehicle_id}", web::delete().to(delete_vehicle))
@@ -2939,10 +3011,33 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_KM * c
 }
 
+/// Segment time for one consecutive pair, preferring the trip's own variant and falling back
+/// through the feed default before giving up on the table. A variant that covers only part of
+/// a route therefore degrades to the baseline for the rest, not straight to haversine.
+fn lookup_pair_seconds(
+    etas: &crate::models::StationEtaMap,
+    variant_id: Option<&str>,
+    default_variant_id: Option<&str>,
+    pair: &(String, String),
+) -> Option<i32> {
+    variant_id
+        .and_then(|v| etas.get(v))
+        .and_then(|m| m.get(pair))
+        .or_else(|| {
+            default_variant_id
+                .filter(|d| Some(*d) != variant_id)
+                .and_then(|d| etas.get(d))
+                .and_then(|m| m.get(pair))
+        })
+        .copied()
+}
+
 fn calculate_eta_from_db(
     route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
     trip_start_time: Option<i64>,
-    db_etas: &HashMap<(String, String), i32>,
+    db_etas: &crate::models::StationEtaMap,
+    variant_id: Option<&str>,
+    default_variant_id: Option<&str>,
 ) -> Vec<crate::models::BusStopETA> {
     let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
     let now = chrono::Utc::now();
@@ -2958,7 +3053,9 @@ fn calculate_eta_from_db(
                 mapping.stop_code.to_string(),
             );
 
-            let time_seconds = if let Some(&eta_secs) = db_etas.get(&pair) {
+            let time_seconds = if let Some(eta_secs) =
+                lookup_pair_seconds(db_etas, variant_id, default_variant_id, &pair)
+            {
                 // Get ETA for this consecutive pair from DB (value is already in seconds)
                 let prev_eta = eta_secs as f64;
                 info!(
@@ -3148,6 +3245,15 @@ pub async fn get_bus_trip_schedule(
         .chain(internal_rows.into_iter())
         .collect();
 
+    // Hoisted out of the row loop: both are per-feed reference data, and the loop asked for
+    // them once per row.
+    let db_etas = app_state
+        .db_vehicle_reader_internal
+        .get_station_etas(&gtfs_id)
+        .await
+        .unwrap_or_default();
+    let default_variant_id = resolve_default_variant_id(&app_state, &gtfs_id).await;
+
     let mut schedule_details: BusScheduleDetails = Vec::new();
     for row in all {
         let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
@@ -3177,15 +3283,16 @@ pub async fn get_bus_trip_schedule(
 
         // Calculate ETAs
 
-        let bus_stop_etas = match app_state
-            .db_vehicle_reader_internal
-            .get_station_etas(&gtfs_id)
-            .await
-        {
-            Ok(db_etas) if !db_etas.is_empty() => {
-                calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
-            }
-            _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
+        let bus_stop_etas = if db_etas.is_empty() {
+            calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time)
+        } else {
+            calculate_eta_from_db(
+                &route_stop_mappings,
+                trip_start_time,
+                &db_etas,
+                row.effective_variant_id.as_deref(),
+                default_variant_id.as_deref(),
+            )
         };
 
         schedule_details.push(crate::models::BusScheduleDetail {
@@ -3196,10 +3303,39 @@ pub async fn get_bus_trip_schedule(
             is_active_trip: row.is_active_trip,
             waybill_no: Some(row.waybill_no),
             is_completed: row.is_completed,
+            eta_variant_id: row
+                .effective_variant_id
+                .clone()
+                .or_else(|| default_variant_id.clone()),
+            override_effective_untill: row.override_effective_untill.map(|t| t.timestamp()),
         });
     }
 
     Ok(HttpResponse::Ok().json(schedule_details))
+}
+
+/// The feed's fallback variant. Read through the trait so it stays available behind the
+/// mock reader, and cached upstream so this is not a query per call.
+async fn resolve_default_variant_id(app_state: &Data<AppState>, gtfs_id: &str) -> Option<String> {
+    match app_state
+        .db_vehicle_reader_internal
+        .get_eta_variants(gtfs_id)
+        .await
+    {
+        Ok(variants) => variants
+            .into_iter()
+            .find(|v| v.is_default)
+            .map(|v| v.variant_id),
+        // Losing the default silently drops the whole feed to haversine even with segment
+        // times loaded, so the cause has to be visible rather than inferred from the ETAs.
+        Err(e) => {
+            error!(
+                "resolve_default_variant_id failed for gtfs_id={}: {} - segment times will be skipped",
+                gtfs_id, e
+            );
+            None
+        }
+    }
 }
 
 #[utoipa::path(
@@ -3268,6 +3404,15 @@ pub async fn get_bus_route_schedule(
             all_rows.append(&mut int_rows);
         }
 
+        // Hoisted out of the row loop: both are per-feed reference data, and the loop asked
+        // for them once per row.
+        let db_etas = app_state
+            .db_vehicle_reader_internal
+            .get_station_etas(&gtfs_id)
+            .await
+            .unwrap_or_default();
+        let default_variant_id = resolve_default_variant_id(&app_state, &gtfs_id).await;
+
         let mut schedule_details: BusScheduleDetails = Vec::new();
         for row in all_rows {
             // Resolve trip start time from (db_start_time HH:MM + duty_date) or
@@ -3297,15 +3442,16 @@ pub async fn get_bus_route_schedule(
                     .and_then(|s| s.parse::<i64>().ok())
             };
 
-            let bus_stop_etas = match app_state
-                .db_vehicle_reader_internal
-                .get_station_etas(&gtfs_id)
-                .await
-            {
-                Ok(db_etas) if !db_etas.is_empty() => {
-                    calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
-                }
-                _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
+            let bus_stop_etas = if db_etas.is_empty() {
+                calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time)
+            } else {
+                calculate_eta_from_db(
+                    &route_stop_mappings,
+                    trip_start_time,
+                    &db_etas,
+                    row.effective_variant_id.as_deref(),
+                    default_variant_id.as_deref(),
+                )
             };
 
             let is_upcoming = row
@@ -3325,6 +3471,11 @@ pub async fn get_bus_route_schedule(
                 },
                 waybill_no: Some(row.waybill_no),
                 is_completed: row.is_completed,
+                eta_variant_id: row
+                    .effective_variant_id
+                    .clone()
+                    .or_else(|| default_variant_id.clone()),
+                override_effective_untill: row.override_effective_untill.map(|t| t.timestamp()),
             });
         }
 
@@ -3367,6 +3518,10 @@ pub async fn get_bus_route_schedule(
                     trip_number: None,
                     is_active_trip: None,
                     is_completed: None,
+                    // Chalo feeds carry no schedule rows, so there is nothing to name a
+                    // variant; the feed default applies.
+                    effective_variant_id: None,
+                    override_effective_untill: None,
                 })
                 .collect()
         } else {
@@ -3463,6 +3618,9 @@ pub async fn get_bus_route_schedule(
             is_active_trip: None,
             waybill_no: None,
             is_completed: None,
+            // This branch computes ETAs from haversine only, so no variant informed them.
+            eta_variant_id: None,
+            override_effective_untill: None,
         });
     }
 
@@ -4906,22 +5064,340 @@ pub async fn upsert_station_eta(
     req: web::Json<StationEtaUpsertRequest>,
 ) -> AppResult<HttpResponse> {
     let gtfs_id = path.into_inner();
+    let StationEtaUpsertRequest {
+        variant_id,
+        mut entries,
+    } = req.into_inner();
+
+    if entries.is_empty() {
+        return Err(AppError::BadRequest(
+            "entries must not be empty".to_string(),
+        ));
+    }
+    if entries.len() > MAX_UPSERT_BATCH_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "At most {} entries per batch (got {})",
+            MAX_UPSERT_BATCH_SIZE,
+            entries.len()
+        )));
+    }
+    validate_station_eta_entries(&mut entries)?;
+
+    let rows = app_state
+        .db_vehicle_reader_internal
+        .upsert_station_etas(&gtfs_id, variant_id.as_deref(), &entries)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "success",
+        "rows_affected": rows,
+    })))
+}
+
+/// A single implausible pair is not a local error: `calculate_eta_from_db` accumulates
+/// segment times, so it shifts every stop after it on that route.
+const MAX_SEGMENT_ETA_SECONDS: i32 = 3600;
+
+/// Mirrors `eta_variant_code_check`, so a malformed code is rejected here with a message a
+/// form can show rather than surfacing as a constraint violation.
+fn is_variant_code(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Normalises in place: a stop code stored with surrounding whitespace matches no route stop,
+/// so trimming has to reach the stored value rather than only the blank check.
+fn validate_station_eta_entries(entries: &mut [crate::models::StationEtaEntry]) -> AppResult<()> {
+    for e in entries.iter_mut() {
+        e.source_station_code = e.source_station_code.trim().to_string();
+        e.destination_station_code = e.destination_station_code.trim().to_string();
+        if e.source_station_code.is_empty() || e.destination_station_code.is_empty() {
+            return Err(AppError::BadRequest(
+                "sourceStationCode and destinationStationCode must not be blank".to_string(),
+            ));
+        }
+        if e.source_station_code == e.destination_station_code {
+            return Err(AppError::BadRequest(format!(
+                "A stop pair must span two stops (got '{}' twice)",
+                e.source_station_code
+            )));
+        }
+        if e.eta_in_seconds <= 0 || e.eta_in_seconds > MAX_SEGMENT_ETA_SECONDS {
+            return Err(AppError::BadRequest(format!(
+                "etaInSeconds for {} -> {} must be between 1 and {} (got {})",
+                e.source_station_code,
+                e.destination_station_code,
+                MAX_SEGMENT_ETA_SECONDS,
+                e.eta_in_seconds
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ─── ETA variants ──────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/eta-variants",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "Variant catalogue", body = Vec<crate::models::EtaVariant>))
+)]
+pub async fn get_eta_variants(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let variants = app_state
+        .db_vehicle_reader_internal
+        .get_eta_variants(&gtfs_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(variants))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/station-eta",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("variantId" = Option<String>, Query, description = "Restrict to one variant"),
+    ),
+    responses((status = 200, description = "Stored segment times", body = Vec<crate::models::StationEtaRow>))
+)]
+pub async fn get_station_etas(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: web::Query<StationEtaQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let variant_id = query
+        .variant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let rows = app_state
+        .db_vehicle_reader_internal
+        .list_station_etas(&gtfs_id, variant_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/eta-variants",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = EtaVariantUpsertRequest,
+    responses((status = 200, description = "Variant saved", body = crate::models::EtaVariant))
+)]
+pub async fn upsert_eta_variant(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    req: web::Json<EtaVariantUpsertRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
     let body = req.into_inner();
+
+    if body.code.trim().is_empty() || body.display_name.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "code and displayName must not be blank".to_string(),
+        ));
+    }
+    if !is_variant_code(body.code.trim()) {
+        return Err(AppError::BadRequest(format!(
+            "code must be lowercase letters, digits and underscores, starting with a letter (got '{}')",
+            body.code.trim()
+        )));
+    }
+
+    let saved = app_state
+        .db_vehicle_reader_internal
+        .upsert_eta_variant(&crate::models::EtaVariant {
+            // Ignored when the (gtfs_id, code) row already exists; the stored id wins.
+            variant_id: field_generator::gen_random_id(),
+            gtfs_id: gtfs_id.clone(),
+            code: body.code.trim().to_string(),
+            display_name: body.display_name.trim().to_string(),
+            is_default: body.is_default,
+        })
+        .await?;
+
+    Ok(HttpResponse::Ok().json(saved))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/internal/operator/{gtfs_id}/eta-variants/{variant_id}",
+    tag = "Internal Operator",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("variant_id" = String, Path, description = "Variant to retire"),
+    ),
+    responses((status = 200, description = "Variant retired"))
+)]
+pub async fn delete_eta_variant(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, variant_id) = path.into_inner();
+    let rows = app_state
+        .db_vehicle_reader_internal
+        .delete_eta_variant(&gtfs_id, &variant_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "success",
+        "rows_affected": rows,
+    })))
+}
+
+// ─── Trip ETA overrides ────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/trip-eta-override",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = TripEtaOverrideRequest,
+    responses((status = 200, description = "Override applied"))
+)]
+pub async fn set_trip_eta_override(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    req: web::Json<TripEtaOverrideRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let body = req.into_inner();
+
+    let effective_from =
+        chrono::DateTime::from_timestamp(body.effective_from, 0).ok_or_else(|| {
+            AppError::BadRequest("effectiveFrom is not a valid epoch second".to_string())
+        })?;
+    let effective_untill =
+        chrono::DateTime::from_timestamp(body.effective_untill, 0).ok_or_else(|| {
+            AppError::BadRequest("effectiveUntill is not a valid epoch second".to_string())
+        })?;
+
+    if effective_untill <= effective_from {
+        return Err(AppError::BadRequest(
+            "effectiveUntill must be after effectiveFrom".to_string(),
+        ));
+    }
+
+    // Bounds the override nobody comes back to clear; on span, not on distance from now().
+    let max = app_state.config.max_eta_override_seconds() as i64;
+    if (effective_untill - effective_from).num_seconds() > max {
+        return Err(AppError::BadRequest(format!(
+            "An override window may span at most {} seconds ({} hours)",
+            max,
+            max / 3600
+        )));
+    }
 
     app_state
         .db_vehicle_reader_internal
-        .upsert_station_eta(
+        .set_trip_eta_override(
             &gtfs_id,
-            &body.source_station_code,
-            &body.destination_station_code,
-            body.eta_in_seconds,
+            &body.waybill_no,
+            body.trip_number,
+            &body.variant_id,
+            effective_from,
+            effective_untill,
         )
         .await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "success",
-        "message": "Station ETA successfully upserted.",
+        "effective_from": effective_from.timestamp(),
+        "effective_untill": effective_untill.timestamp(),
     })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/trip-eta-override/clear",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = TripEtaOverrideClearRequest,
+    responses((status = 200, description = "Override cleared"))
+)]
+pub async fn clear_trip_eta_override(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    req: web::Json<TripEtaOverrideClearRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let body = req.into_inner();
+
+    let rows = app_state
+        .db_vehicle_reader_internal
+        .clear_trip_eta_override(&gtfs_id, &body.waybill_no, body.trip_number)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "success",
+        "rows_affected": rows,
+    })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/schedule-default-variant",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    request_body = ScheduleDefaultVariantRequest,
+    responses((status = 200, description = "Schedule default variant set"))
+)]
+pub async fn set_schedule_default_variant(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    req: web::Json<ScheduleDefaultVariantRequest>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let body = req.into_inner();
+
+    let schedule_trip_id = body.schedule_trip_id.trim();
+    if schedule_trip_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "scheduleTripId must not be blank".to_string(),
+        ));
+    }
+
+    let rows = app_state
+        .db_vehicle_reader_internal
+        .set_schedule_default_variant(
+            &gtfs_id,
+            schedule_trip_id,
+            body.trip_number,
+            body.variant_id.as_deref(),
+        )
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "success",
+        "rows_affected": rows,
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/trip-eta-override/active",
+    tag = "Internal Operator",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "Overrides currently in force", body = Vec<crate::models::ActiveTripEtaOverride>))
+)]
+pub async fn list_active_trip_eta_overrides(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    let overrides = app_state
+        .db_vehicle_reader_internal
+        .list_active_trip_eta_overrides(&gtfs_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(overrides))
 }
 
 // ─── Fleet operator ────────────────────────────────────────────────────────────
@@ -5411,4 +5887,142 @@ async fn metro_graph_info(
         "routes": route_info,
         "availableStops": graph.nodes.len(),
     })))
+}
+
+#[cfg(test)]
+mod eta_variant_tests {
+    use super::*;
+    use crate::models::{StationEtaEntry, StationEtaMap};
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    fn etas() -> StationEtaMap {
+        let mut m = StationEtaMap::new();
+        m.entry("default".into())
+            .or_default()
+            .insert(pair("A", "B"), 600);
+        m.entry("default".into())
+            .or_default()
+            .insert(pair("B", "C"), 300);
+        // Peak knows only the first hop; the second has to come from the default.
+        m.entry("am_peak".into())
+            .or_default()
+            .insert(pair("A", "B"), 1200);
+        m
+    }
+
+    #[test]
+    fn variant_value_wins_over_default() {
+        assert_eq!(
+            lookup_pair_seconds(&etas(), Some("am_peak"), Some("default"), &pair("A", "B")),
+            Some(1200)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_for_a_pair_the_variant_omits() {
+        assert_eq!(
+            lookup_pair_seconds(&etas(), Some("am_peak"), Some("default"), &pair("B", "C")),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn unknown_variant_still_resolves_through_the_default() {
+        assert_eq!(
+            lookup_pair_seconds(&etas(), Some("monsoon"), Some("default"), &pair("A", "B")),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn trip_naming_no_variant_uses_the_default() {
+        assert_eq!(
+            lookup_pair_seconds(&etas(), None, Some("default"), &pair("A", "B")),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn pair_absent_everywhere_yields_none_so_the_caller_falls_to_haversine() {
+        assert_eq!(
+            lookup_pair_seconds(&etas(), Some("am_peak"), Some("default"), &pair("C", "D")),
+            None
+        );
+    }
+
+    #[test]
+    fn upsert_body_is_camel_case_like_every_other_request() {
+        let body: StationEtaUpsertRequest = serde_json::from_str(
+            r#"{"variantId":"v1","entries":[{"sourceStationCode":"A","destinationStationCode":"B","etaInSeconds":90}]}"#,
+        )
+        .expect("camelCase body must parse");
+        assert_eq!(body.variant_id.as_deref(), Some("v1"));
+        assert_eq!(body.entries[0].source_station_code, "A");
+        assert_eq!(body.entries[0].eta_in_seconds, 90);
+    }
+
+    #[test]
+    fn variant_code_matches_the_database_constraint() {
+        for good in ["default", "am_peak", "monsoon", "x1"] {
+            assert!(is_variant_code(good), "{good} should be accepted");
+        }
+        for bad in ["AM Peak", "am-peak", "1st", "_x", "", "am peak", "AmPeak"] {
+            assert!(!is_variant_code(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn no_default_configured_is_not_a_panic() {
+        assert_eq!(
+            lookup_pair_seconds(&etas(), Some("am_peak"), None, &pair("B", "C")),
+            None
+        );
+    }
+
+    #[test]
+    fn segment_times_must_be_plausible() {
+        let entry = |secs| StationEtaEntry {
+            source_station_code: "A".into(),
+            destination_station_code: "B".into(),
+            eta_in_seconds: secs,
+        };
+        assert!(validate_station_eta_entries(&mut [entry(600)]).is_ok());
+        assert!(validate_station_eta_entries(&mut [entry(0)]).is_err());
+        assert!(validate_station_eta_entries(&mut [entry(-1)]).is_err());
+        // Accumulated downstream, so one absurd hop shifts every stop after it.
+        assert!(validate_station_eta_entries(&mut [entry(MAX_SEGMENT_ETA_SECONDS + 1)]).is_err());
+    }
+
+    #[test]
+    fn stop_codes_are_trimmed_before_they_are_stored() {
+        let mut entries = [StationEtaEntry {
+            source_station_code: "  A ".into(),
+            destination_station_code: "B  ".into(),
+            eta_in_seconds: 60,
+        }];
+        assert!(validate_station_eta_entries(&mut entries).is_ok());
+        assert_eq!(entries[0].source_station_code, "A");
+        assert_eq!(entries[0].destination_station_code, "B");
+
+        // Same stop with padding is still the same stop.
+        let mut same = [StationEtaEntry {
+            source_station_code: " A".into(),
+            destination_station_code: "A ".into(),
+            eta_in_seconds: 60,
+        }];
+        assert!(validate_station_eta_entries(&mut same).is_err());
+    }
+
+    #[test]
+    fn a_pair_must_span_two_different_stops() {
+        assert!(validate_station_eta_entries(&mut [StationEtaEntry {
+            source_station_code: "A".into(),
+            destination_station_code: "A".into(),
+            eta_in_seconds: 60,
+        }])
+        .is_err());
+    }
 }
