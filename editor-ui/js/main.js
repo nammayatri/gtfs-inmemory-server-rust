@@ -1,6 +1,6 @@
 // Boot, the top bar and the hash router.
 import { get, enc } from "./api.js";
-import { state, set, subscribe, pref, setPref, can, isAdmin, feedRole, leaveMessage, setLeaveGuard } from "./state.js";
+import { state, set, subscribe, pref, setPref, can, isAdmin, feedRole, usesStages, leaveMessage, setLeaveGuard } from "./state.js";
 import { ensureSignedIn, signOut } from "./auth.js";
 import { h, toast, confirmDialog, ROLE_LABEL } from "./util.js";
 import * as map from "./map.js";
@@ -47,6 +47,10 @@ function applyMe(me) {
   renderAccess();
 }
 
+// Pages that exist only on a feed served from its stages. Off, they are not in
+// the menu and their addresses lead back to the map.
+const STAGE_PAGES = ["stages", "diversions", "stage-reviews", "route-issues"];
+
 // What this person may do on the chosen feed: the role badge, the admin pages,
 // the New menu. Everything else asks can() when it draws.
 function renderAccess() {
@@ -64,6 +68,13 @@ function renderAccess() {
   document.querySelector('[data-nav="admin"]').hidden = !isAdmin();
   document.querySelector('[data-nav="feed-settings"]').hidden = !isAdmin();
   document.querySelectorAll("[data-admin-only]").forEach((el) => { el.hidden = !isAdmin(); });
+  // pages that exist only on a feed served from its stages
+  const stages = usesStages();
+  for (const name of STAGE_PAGES) {
+    const link = document.querySelector(`[data-nav="${name}"]`);
+    if (link) link.hidden = !stages;
+  }
+  document.querySelectorAll("[data-stages-only]").forEach((el) => { el.hidden = !stages; });
   document.getElementById("new-menu").hidden = noFeed || !can("editor");
 }
 
@@ -232,6 +243,19 @@ function route() {
   const params = new URLSearchParams(query);
   const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
   window.scrollTo(0, 0);
+
+  // A feed that does not use stages has no stage pages: an address that names
+  // one (a bookmark, a link from another feed) goes to the map and says why,
+  // rather than drawing a page about something this feed does not have.
+  const stagePage = STAGE_PAGES.includes(parts[0]) || parts[0] === "stage"
+    || (parts[0] === "new" && parts[1] === "stage");
+  if (stagePage && !usesStages()) {
+    toast("This feed does not use stages, so its routes are edited as stop lists.");
+    history.replaceState(null, "", "#/");
+    currentHash = "#/";
+    markNav("map"); showWorkspace(true); showHome();
+    return;
+  }
 
   if (parts[0] === "stop" && parts[1]) {
     markNav("map"); showWorkspace(true); showStop(parts[1]);

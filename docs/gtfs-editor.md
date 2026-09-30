@@ -3996,6 +3996,87 @@ edit blocking submit; two drafts editing one stage, the second conflicting;
 and bumping the stage; and a route edited outside its stages refusing a stage
 edit until its stages are set again.
 
+### 19.00 Whether a feed uses stages at all (`gtfs_feed.use_stages`)
+
+Stages are a property of the feed and they are opt-in (migration 0027):
+
+| `use_stages` | what a route is | what is offered |
+|---|---|---|
+| `false` (every feed by default) | its rows in `gtfs_route_stop` | the stop-list editor, and nothing about stages: no Stages, Diversions, Stages to review or Routes to review in the menu, no Stages section on a route, no stages in search. A `stage`, `route_stages` or `route_variant` change is refused `stages_off` |
+| `true` | what its stages say, and nothing else | everything in this section. A route with no stages has **no stops** until it is given some: its rows in `gtfs_route_stop`, if it has any, are not read. A `route_stops` change is refused (`route_has_stages` for a route with stages, `route_needs_stages` for one without) |
+
+On a feed that uses stages there is **no copy**. A route built from stages used
+to be kept twice — in its stages, and in `gtfs_route_stop`, rewritten on every
+stage edit so the two never differed — and every stage write refused
+`route_out_of_sync` when they did. Now the route's stops are *read* from its
+stages, so they cannot differ, and `gtfs_route_stop` is neither read nor
+written for the feed's routes at all (the one thing still looked up there is the
+route's provider id, which a stage cannot hold). For chennai_bus that table is MTC's own data, read by the stage
+mapper and never overwritten.
+
+Every reader goes through one of two views with `gtfs_route_stop`'s columns:
+
+- **`gtfs_route_stop_effective`** — for a read that names a stop or a route.
+  A row's `sequence` is counted, so a filter on `stop_id` reaches an index.
+- **`gtfs_route_stop_effective_all`** — for a read of the whole feed (the
+  loader, the export). Rows are numbered in one pass.
+
+They hold the same rows. The split is speed only: numbering the rows costs
+127 ms to answer "which routes call at this stop" on chennai_bus, against 6 ms
+counted; counting costs 1.4 s to read the whole feed, against 250 ms numbered.
+
+The setting is changed in **Feed settings** and goes through a draft like any
+other `feed_config` change, because it changes what passengers are served. Off
+again, every route is its own stop list once more; the stages are kept, not
+deleted.
+
+**Editing a route's stop list on a feed that uses stages.** The stop-list editor
+and the *Route stop lists* upload both still work, and both write *stages*: the
+list is cut into fare stages on `stage_no` and set against the route's stages,
+and each one whose stops differ is changed. A stage is shared, so which is meant
+is never assumed —
+
+- the editor asks: *only this route* (a `stage/split`, which gives the route a
+  stage of its own and leaves every other route alone) or *every route using it*
+  (a `stage/update`);
+- an upload always means only the route it names, so a shared stage is split
+  and one the route runs alone is updated. An upload never changes a route it
+  does not name.
+
+Adding or removing a whole fare stage is not something a stop list can say and is
+refused `route_stage_count`: that is which stages the route runs, and is what
+*Change stages* is for.
+
+**Uploads on a feed that uses stages.** The import page offers two files there
+that a stop-list feed never sees, and does not offer *Route stop lists* (the
+bulk kind `route_stops` is still accepted, and translated as above, because a
+GTFS zip imported into a draft arrives that way):
+
+| kind | one group of rows is | columns | becomes |
+|---|---|---|---|
+| `route_stages` | a route: the fare stages it runs through, in `position` order | `action` (add, update), `route_id`, `position`, `stage_id`, `direction`?, `stage_no`? | one `route_stages/replace` per route |
+| `stages` | a stage: its stops, in `position` order | `action` (add, update, delete), `stage_id`?, `direction`?, `name`?, `position`, `stop_id`, `stop_type`? | one `stage/create`, `stage/update` or `stage/delete` per stage |
+
+A route's file names **stages and no stops**; the route's stops are whatever
+those stages hold. It never makes a stage: a `stage_id` that does not exist
+(live, or made earlier in the same draft) is an error on that row
+(`stage_not_found`), as is a stage on the route twice (`stage_repeated`).
+`direction` is needed only when the id runs both ways
+(`stage_direction_needed`). A list the route already runs is
+`route_stages_unchanged` and adds nothing.
+
+A stages file is where a stage is made or changed. `add` with a blank
+`stage_id` gets a short minted id (`stg_` + 10 hex), grouped by name and
+direction; with an id given, the id must be unused in either direction
+(`stage_exists`). `update` replaces the stage's stops (and its name, when one is
+given) for **every route that runs through it**, and says how many
+(`stage_changes_routes`); a file cannot carry map points, so an update of a
+stage that has them warns that they go (`stage_map_points_dropped`). A blank
+`stop_type` is NEW STOP for the first stop and INTERMEDIATE STOP for the rest.
+`delete` is refused while a route uses the stage (`stage_in_use`).
+
+On a feed with `use_stages` off both kinds are refused `stages_off`.
+
 ### 19.0 Where a route's stops come from
 
 Every reader takes a route's stops from **`gtfs_route_stop`**: the GTFS export

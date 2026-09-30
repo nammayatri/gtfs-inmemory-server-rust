@@ -1533,7 +1533,7 @@ async fn served_stops(
     pattern_key: i16,
 ) -> Result<Vec<(String, (f64, f64))>, sqlx::Error> {
     sqlx::query(
-        "SELECT rs.stop_id, s.lat, s.lon FROM gtfs_route_stop rs \
+        "SELECT rs.stop_id, s.lat, s.lon FROM gtfs_route_stop_effective rs \
          JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
          WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.pattern_key = $3 \
            AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \

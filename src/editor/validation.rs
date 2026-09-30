@@ -75,13 +75,15 @@ pub const STATION_MIN_MEMBERS: usize = 2;
 /// Stop ids the server mints: `ed_` + 10 lower-case hex digits.
 pub const MINTED_STOP_PREFIX: &str = "ed_";
 /// What a `feed_config` change may set (sections 3 and 16.4).
-pub const FEED_CONFIG_FIELDS: [&str; 6] = [
+pub const FEED_CONFIG_FIELDS: [&str; 7] = [
     "data_source",
     "trips_source",
     "default_run_s",
     "default_dwell_s",
     "schedule_sync",
     "sync_running_times",
+    // whether the feed is served from its stages (migration 0027)
+    "use_stages",
 ];
 /// The two `gtfs_feed.data_source` values a `feed_config` change may set.
 pub const DATA_SOURCES: [&str; 2] = ["db", "preprocessed"];
@@ -2106,6 +2108,13 @@ pub fn check_payload(
                     "invalid_payload",
                     "sync_running_times",
                     format!("{what}: sync_running_times is true or false"),
+                ));
+            }
+            if m.get("use_stages").is_some_and(|v| !v.is_boolean()) {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "use_stages",
+                    format!("{what}: use_stages is true or false"),
                 ));
             }
             Ok(())

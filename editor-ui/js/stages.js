@@ -10,6 +10,7 @@ import * as map from "./map.js";
 import { addChange, existingChange, createdChange, requireDraft } from "./drafts.js";
 import { stopPicker } from "./picker.js";
 import { idKind } from "./stage_reviews.js";
+import { showRoute } from "./explore.js";
 
 const panel = () => document.getElementById("panel");
 // sha256 of "[]": the stage list of a route that has none
@@ -279,11 +280,14 @@ export async function editRouteStages(route, { created = false, variant = null }
     picker.focus();
   };
 
+  // The route is drawn again directly, as the stop-list editor's Cancel does.
+  // Setting the address is not enough: this screen opens without changing it,
+  // so the address is already the route's and the router, which only acts on a
+  // change, does nothing - Cancel and "Back to the route" both looked dead.
   const cancel = () => {
     unsaved.done();
     map.endModes();
-    location.hash = `#/route/${enc(route.route_id)}${created ? "?draft=1" : ""}`;
-    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    showRoute(route.route_id, { preview: created });
   };
   const renumber = () => {
     links.forEach((l, i) => { l.stage_no = i + 1; });

@@ -819,7 +819,7 @@ impl GtfsDbSource {
         let served = sqlx::query(
             "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no,
                     rs.stop_headsign, rs.stop_sequence
-             FROM gtfs_route_stop rs
+             FROM gtfs_route_stop_effective_all rs
              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
              WHERE rs.gtfs_id = $1 AND (rs.pattern_key = 1 OR $3) AND rs.stop_type = ANY($2)
              ORDER BY rs.route_id, rs.pattern_key, rs.sequence",

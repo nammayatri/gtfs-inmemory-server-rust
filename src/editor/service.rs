@@ -110,7 +110,8 @@ pub async fn feeds(state: &EditorState, ctx: &Ctx) -> EditorResult<Value> {
     // a feed the caller holds no grant on does not exist for them
     let granted: Vec<String> = ctx.user.grants.keys().cloned().collect();
     let rows = sqlx::query(
-        "SELECT gtfs_id, display_name, version, data_source, released_version, released_at, updated_at \
+        "SELECT gtfs_id, display_name, version, data_source, released_version, released_at, updated_at, \
+                use_stages \
          FROM gtfs_feed WHERE $1 OR gtfs_id = ANY($2) ORDER BY gtfs_id",
     )
     .bind(ctx.is_admin())
@@ -129,6 +130,9 @@ pub async fn feeds(state: &EditorState, ctx: &Ctx) -> EditorResult<Value> {
                 "released_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("released_at")?,
                 "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
                 "my_role": ctx.feed_role(&r.try_get::<String, _>("gtfs_id")?).map(auth::Role::as_str),
+                // whether this feed is served from its stages: the dashboard
+                // offers nothing about stages on a feed where it is off
+                "use_stages": r.try_get::<bool, _>("use_stages")?,
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -176,7 +180,7 @@ pub async fn feed_config(state: &EditorState, gtfs_id: &str) -> EditorResult<Val
 async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult<Value> {
     let row = sqlx::query(
         "SELECT gtfs_id, data_source, version, trips_source, default_run_s, default_dwell_s, \
-                schedule_sync, sync_running_times FROM gtfs_feed WHERE gtfs_id = $1",
+                schedule_sync, sync_running_times, use_stages FROM gtfs_feed WHERE gtfs_id = $1",
     )
     .bind(gtfs_id)
     .fetch_optional(&mut *conn)
@@ -191,13 +195,15 @@ async fn feed_config_row(conn: &mut PgConnection, gtfs_id: &str) -> EditorResult
         "default_dwell_s": row.try_get::<i32, _>("default_dwell_s")?,
         "schedule_sync": row.try_get::<String, _>("schedule_sync")?,
         "sync_running_times": row.try_get::<bool, _>("sync_running_times")?,
+        // whether the feed is served from its stages (migration 0027)
+        "use_stages": row.try_get::<bool, _>("use_stages")?,
     }))
 }
 
 // ---------------------------------------------------------------- stops
 
 /// Distinct routes calling at a stop, for a query aliasing gtfs_stop as `s`.
-const ROUTE_COUNT: &str = "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+const ROUTE_COUNT: &str = "(SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
      WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count";
 
 /// A station's live platforms, for the same query: the map ties a station to
@@ -409,7 +415,7 @@ pub async fn stop_detail(
     // A call on another stop order than the route's stop list says which.
     let routes = sqlx::query(
         "SELECT rs.route_id, r.short_name, r.long_name, rs.pattern_key, rs.sequence, rs.stop_type, rs.stage_no \
-         FROM gtfs_route_stop rs \
+         FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
          WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
@@ -549,7 +555,7 @@ pub async fn list_routes(
     let q = q.map(str::trim).filter(|s| !s.is_empty());
     let rows = sqlx::query(&format!(
         "SELECT {ROUTE_COLS}, \
-            (SELECT count(*) FROM gtfs_route_stop rs WHERE rs.gtfs_id = r.gtfs_id \
+            (SELECT count(*) FROM gtfs_route_stop_effective rs WHERE rs.gtfs_id = r.gtfs_id \
                AND rs.route_id = r.route_id AND rs.pattern_key = 1 \
                AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count \
          FROM gtfs_route r \
@@ -635,8 +641,12 @@ pub async fn load_pattern_rows(
     route_id: &str,
     pattern_key: i16,
 ) -> EditorResult<Vec<RouteRow>> {
+    // The view, not the table: on a feed served from its stages a route's
+    // rows ARE what its stages say (migration 0027), so "the live rows" and "the
+    // stages flattened" are the same thing by construction and no stage edit can
+    // find a route out of step with its stages.
     let rows = sqlx::query(&format!(
-        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop \
+        "SELECT {ROUTE_ROW_COLS} FROM gtfs_route_stop_effective \
          WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 ORDER BY sequence"
     ))
     .bind(gtfs_id)
@@ -676,11 +686,15 @@ pub async fn load_patterns_rows(
     keys: &[(String, i16)],
 ) -> EditorResult<HashMap<(String, i16), Vec<RouteRow>>> {
     let (routes, patterns): (Vec<String>, Vec<i16>) = keys.iter().cloned().unzip();
+    // `route_id = ANY($2)` says again what the join says, and is not redundant:
+    // a join is not pushed into the view, so without it every route of the feed
+    // is flattened from its stages (1.6 s on chennai_bus) to keep a handful
     let rows = sqlx::query(&format!(
-        "SELECT rs.route_id, rs.pattern_key, {} FROM gtfs_route_stop rs \
+        "SELECT rs.route_id, rs.pattern_key, {} FROM gtfs_route_stop_effective rs \
          JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
            ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
-         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) \
+         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
         ROUTE_ROW_COLS
             .split(", ")
             .map(|c| format!("rs.{}", c.trim()))
@@ -735,11 +749,12 @@ pub async fn load_patterns_read_rows(
                 rs.pickup_type, rs.drop_off_type, rs.timepoint, rs.stop_headsign, rs.stop_sequence, \
                 rs.continuous_pickup, rs.continuous_drop_off, rs.shape_dist_traveled, \
                 rs.pickup_booking_rule_id, rs.drop_off_booking_rule_id \
-         FROM gtfs_route_stop rs \
+         FROM gtfs_route_stop_effective rs \
          JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::int2[])) AS k(route_id, pattern_key) \
            ON k.route_id = rs.route_id AND k.pattern_key = rs.pattern_key \
          LEFT JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
-         WHERE rs.gtfs_id = $1 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) \
+         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(gtfs_id)
     .bind(&routes)
@@ -1992,6 +2007,15 @@ async fn apply_change(
         return Err(ApplyError::Findings(gone));
     }
     let key = c.entity_key.as_str();
+    // Stages, and the temporary routes built out of them, exist only on a feed
+    // that uses them. Anywhere else a change to one is refused here, in one
+    // place, so no stage can come to be on a feed whose routes are stop lists.
+    if matches!(
+        c.entity.as_str(),
+        "stage" | "route_stages" | "route_variant"
+    ) {
+        super::stages::require_stages(conn, g).await?;
+    }
     match (c.entity.as_str(), c.op.as_str()) {
         ("stop", "update") => stop_update(conn, g, key, &c.after, actor).await,
         ("stop", "create") => stop_create(conn, g, &c.after, actor).await,
@@ -2229,12 +2253,12 @@ async fn unserviceable_findings(
                 count(*) FILTER (WHERE rs.stop_id <> $2) AS others, \
                 count(*) FILTER (WHERE rs.stop_id = $2) AS calls, \
                 count(*) FILTER (WHERE rs.stop_id = $2 AND rs.stop_type = 'NEW STOP') AS boundaries \
-         FROM gtfs_route_stop rs \
+         FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 AND rs.stop_type = ANY($3) \
-           AND rs.route_id IN ( \
-             SELECT route_id FROM gtfs_route_stop \
-              WHERE gtfs_id = $1 AND stop_id = $2 AND stop_type = ANY($3)) \
+           AND rs.route_id = ANY(ARRAY( \
+             SELECT route_id FROM gtfs_route_stop_effective \
+              WHERE gtfs_id = $1 AND stop_id = $2 AND stop_type = ANY($3))) \
          GROUP BY rs.route_id, rs.pattern_key ORDER BY rs.route_id, rs.pattern_key",
     )
     .bind(g)
@@ -2363,7 +2387,7 @@ async fn stop_gtfs_fields(
     }
     if new_type != 0 && was_type == 0 {
         let routes: i64 = sqlx::query_scalar(
-            "SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+            "SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
              JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
              WHERE rs.gtfs_id = $1 AND rs.stop_id = $2",
         )
@@ -2469,7 +2493,7 @@ async fn stop_delete(
     }
     let used: Vec<String> = sqlx::query(
         // a deleted route's rows stay, but nothing serves them
-        "SELECT DISTINCT rs.route_id FROM gtfs_route_stop rs \
+        "SELECT DISTINCT rs.route_id FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id",
     )
@@ -2863,12 +2887,17 @@ async fn stop_merge(
     // on each of its stop orders, which the merge switches alike (section 16):
     // switching the id must not make a route call one stop twice in a row.
     let mut by_route: Vec<((String, i16), Vec<SequencedStop>)> = Vec::new();
+    // the routes are named as an array as well as by the IN below: an array is
+    // a filter the view can apply before it flattens anything, where a
+    // sub-select alone makes it flatten every route of the feed first
     for r in sqlx::query(
-        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop rs \
+        "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type FROM gtfs_route_stop_effective rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
          WHERE rs.gtfs_id = $1 \
+           AND rs.route_id = ANY(ARRAY( \
+               SELECT route_id FROM gtfs_route_stop_effective WHERE gtfs_id = $1 AND stop_id = $2)) \
            AND (rs.route_id, rs.pattern_key) IN \
-               (SELECT route_id, pattern_key FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_id = $2) \
+               (SELECT route_id, pattern_key FROM gtfs_route_stop_effective WHERE gtfs_id = $1 AND stop_id = $2) \
          ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
     )
     .bind(g)
@@ -3100,6 +3129,19 @@ async fn route_stops_replace(
             format!(
                 "route {route_id} is built from stages: change its stages, or the stage \
                  itself, instead of its stop list"
+            ),
+        ));
+    }
+    // A feed served from its stages reads nothing else (migration 0027), so a
+    // stop list written for a route without stages would be written and never
+    // seen. The route gets its stops by being given stages.
+    if super::stages::feed_uses_stages(conn, g).await? {
+        return Err(fail(
+            "route_needs_stages",
+            format!(
+                "feed {g} builds its routes from stages, so route {route_id} has no stop \
+                 list to set: give it stages (Build from stages on the route, or the \
+                 Route stages upload)"
             ),
         ));
     }
@@ -3412,6 +3454,25 @@ pub(super) async fn write_route_rows(
     live: &[RouteRow],
     actor: &str,
 ) -> Result<Vec<Finding>, ApplyError> {
+    // On a feed served from its stages there is nothing to write: the route's
+    // stops are read from its stages (gtfs_route_stop_effective), so the stage
+    // change that brought us here has already changed the route. Writing a copy
+    // into gtfs_route_stop is what made the two able to disagree, and for
+    // chennai_bus that table is MTC's own data and is not ours to overwrite.
+    // The stored timings still follow the route's new stops.
+    if super::stages::feed_uses_stages(conn, g).await? {
+        let _ = rows;
+        let old_ids = super::trips::served_ids(live);
+        return super::trips::carry_over_profiles(
+            conn,
+            g,
+            route_id,
+            FIRST_PATTERN,
+            &old_ids,
+            actor,
+        )
+        .await;
+    }
     write_pattern_rows(conn, g, route_id, FIRST_PATTERN, rows, live, actor).await
 }
 
@@ -3695,7 +3756,7 @@ async fn moving_platforms(
 ) -> Result<Vec<Value>, sqlx::Error> {
     sqlx::query(
         "SELECT s.stop_id, s.name, s.platform_code, \
-            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
               JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
                                 AND NOT r.deleted \
               WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count \
@@ -4014,7 +4075,8 @@ async fn feed_config_update(
         "UPDATE gtfs_feed SET data_source = coalesce($2, data_source), \
             trips_source = coalesce($3, trips_source), default_run_s = coalesce($4, default_run_s), \
             default_dwell_s = coalesce($5, default_dwell_s), schedule_sync = coalesce($6, schedule_sync), \
-            sync_running_times = coalesce($7, sync_running_times) \
+            sync_running_times = coalesce($7, sync_running_times), \
+            use_stages = coalesce($8, use_stages) \
          WHERE gtfs_id = $1",
     )
     .bind(g)
@@ -4024,6 +4086,7 @@ async fn feed_config_update(
     .bind(set("default_dwell_s").and_then(Value::as_i64).map(|n| n as i32))
     .bind(set("schedule_sync").and_then(Value::as_str))
     .bind(set("sync_running_times").and_then(Value::as_bool))
+    .bind(set("use_stages").and_then(Value::as_bool))
     .execute(&mut *conn)
     .await?;
     for (f, from, to) in switched {
@@ -4523,7 +4586,7 @@ async fn snapshot(
                         coalesce(array_agg(rs.sequence ORDER BY rs.sequence) \
                                  FILTER (WHERE rs.pattern_key = 1), '{}') AS sequences, \
                         array_agg(DISTINCT rs.pattern_key) AS pattern_keys \
-                 FROM gtfs_route_stop rs \
+                 FROM gtfs_route_stop_effective rs \
                  JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
                  WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 \
                  GROUP BY rs.route_id, r.short_name ORDER BY rs.route_id",
@@ -5880,9 +5943,10 @@ fn user_not_found() -> EditorError {
 /// The feeds `GET /auth/me` lists, which the dashboard's feed switcher offers:
 /// every feed as `admin` for an admin, else each feed granted, at its role.
 pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Value> {
-    let rows = sqlx::query("SELECT gtfs_id, display_name FROM gtfs_feed ORDER BY gtfs_id")
-        .fetch_all(&state.pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT gtfs_id, display_name, use_stages FROM gtfs_feed ORDER BY gtfs_id")
+            .fetch_all(&state.pool)
+            .await?;
     let mut out = Vec::new();
     for r in &rows {
         let gtfs_id: String = r.try_get("gtfs_id")?;
@@ -5911,6 +5975,9 @@ pub async fn my_feeds(state: &EditorState, user: &auth::User) -> EditorResult<Va
             "display_name": r.try_get::<String, _>("display_name")?,
             "role": role.as_str(),
             "gps": gps,
+            // whether the feed is served from its stages: this is the list
+            // the dashboard keeps, so it is what decides which pages it offers
+            "use_stages": r.try_get::<bool, _>("use_stages")?,
         }));
     }
     Ok(json!(out))

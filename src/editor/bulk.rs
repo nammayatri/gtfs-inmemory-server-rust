@@ -17,10 +17,12 @@ use super::error::{EditorError, EditorResult};
 use super::feed_lock::{lock_feed_of_set, retry_transient};
 use super::records::{ROUTE_GTFS_FIELDS, STOP_GTFS_FIELDS};
 use super::service::{self, rows_hash, ChangeInsert, FIRST_PATTERN};
+use super::stages::StageKey;
 use super::trips::{self, check_trips, TripRules, TripSpec};
 use super::validation::{
-    check_payload, check_route_rows_for, check_route_rows_labelled, grade_against_live, Finding,
-    Level, RouteRow,
+    check_payload, check_route_rows_for, check_route_rows_labelled, check_stage_rows,
+    grade_against_live, Finding, Level, RouteRow, StageLink, StageRow, INTERMEDIATE_STOP, NEW_STOP,
+    ROUTE_CORRECTION,
 };
 use super::EditorState;
 use crate::gtfs::spec;
@@ -60,6 +62,10 @@ pub enum Kind {
     RouteTrips,
     TimingProfiles,
     Services,
+    /// The fare stages each route runs through (section 19): stages feeds only.
+    RouteStages,
+    /// The stops of each stage (section 19): stages feeds only.
+    Stages,
     /// Rows of any file the editor keeps as records (section 18).
     Records,
     /// `{from_stop_id, into_stop_id}` rows: one `stop/merge` each, creating the
@@ -77,6 +83,8 @@ impl Kind {
             "route_trips" => Some(Kind::RouteTrips),
             "timing_profiles" => Some(Kind::TimingProfiles),
             "services" => Some(Kind::Services),
+            "route_stages" => Some(Kind::RouteStages),
+            "stages" => Some(Kind::Stages),
             "records" => Some(Kind::Records),
             "stop_merges" => Some(Kind::StopMerges),
             _ => None,
@@ -92,6 +100,8 @@ impl Kind {
             Kind::RouteTrips => "route_trips",
             Kind::TimingProfiles => "timing_profiles",
             Kind::Services => "services",
+            Kind::RouteStages => "route_stages",
+            Kind::Stages => "stages",
             Kind::Records => "records",
             Kind::StopMerges => "stop_merges",
         }
@@ -210,6 +220,23 @@ impl Kind {
                 "label",
             ],
             // the file's own fields, checked by plan_records
+            Kind::RouteStages => &[
+                "action",
+                "route_id",
+                "position",
+                "stage_id",
+                "direction",
+                "stage_no",
+            ],
+            Kind::Stages => &[
+                "action",
+                "stage_id",
+                "direction",
+                "name",
+                "position",
+                "stop_id",
+                "stop_type",
+            ],
             Kind::Records => &[],
         }
     }
@@ -233,6 +260,10 @@ impl Kind {
             ),
             (Kind::Services, Action::Delete) => Some(
                 "a service is uploaded whole; delete one with a service/delete change".into(),
+            ),
+            (Kind::RouteStages, Action::Delete) => Some(
+                "a route's stages are uploaded whole: upload them with action update, leaving out the stages it should not run through"
+                    .into(),
             ),
             (Kind::RouteStops, Action::Delete) => Some(
                 "a route's stop list is uploaded whole: upload it with action update, leaving out the stops it should not have"
@@ -1375,6 +1406,74 @@ async fn plan_route_stops(
                 o
             })
             .collect();
+        // A route built from stages does not own its stop list: the list is what
+        // its stages say (migration 0027). An uploaded list for one is therefore
+        // written as changes to those stages - a route_stops change would be
+        // refused, and rightly. On a feed that does not use stages this never
+        // applies and the list replaces the route's rows as it always has.
+        if pattern == FIRST_PATTERN && super::stages::has_stages(conn, g, &route_id).await? {
+            match through_stages(conn, g, &route_id, &after_rows).await? {
+                Err(f) => findings.push((None, f)),
+                Ok(changes) if changes.is_empty() => findings.push((
+                    None,
+                    Finding::warning(
+                        "route_stops_unchanged",
+                        route_id.as_str(),
+                        format!("route {route_id} already calls at these stops; nothing changes"),
+                    ),
+                )),
+                Ok(changes) => {
+                    let n = changes.len();
+                    for (k, c) in changes.into_iter().enumerate() {
+                        plan.changes.push(c);
+                        let at = plan.changes.len() - 1;
+                        // the route's findings go on its first change; the rest
+                        // are the same upload rows, said once
+                        spread(
+                            &mut plan,
+                            &uploads,
+                            at,
+                            if k == 0 {
+                                std::mem::take(&mut findings)
+                            } else {
+                                Vec::new()
+                            },
+                        );
+                    }
+                    let _ = n;
+                    continue;
+                }
+            }
+            // an error or nothing to do: said on the rows, with no change made
+            for (at, f) in findings {
+                match at {
+                    Some(k) => plan.rows[uploads[k]].findings.push(f),
+                    None => {
+                        for i in &uploads {
+                            plan.rows[*i].findings.push(f.clone());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // A feed served from its stages reads nothing else, so a stop list for
+        // a route that has no stages (or for another stop order of one that
+        // has) would be stored and never seen.
+        if super::stages::feed_uses_stages(conn, g).await? {
+            let f = Finding::error(
+                "route_needs_stages",
+                route_id.as_str(),
+                format!(
+                    "feed {g} builds its routes from stages, so route {route_id} takes no stop \
+                     list: give it stages with the Route stages upload"
+                ),
+            );
+            for i in &uploads {
+                plan.rows[*i].findings.push(f.clone());
+            }
+            continue;
+        }
         let mut after = json!({"base_rows_hash": rows_hash(&live), "rows": after_rows});
         if pattern != FIRST_PATTERN {
             after["pattern_key"] = json!(pattern);
@@ -1392,6 +1491,1034 @@ async fn plan_route_stops(
         });
         let change = plan.changes.len() - 1;
         spread(&mut plan, &uploads, change, findings);
+    }
+    Ok(plan)
+}
+
+/// An uploaded stop list for a route built from stages, as the changes to those
+/// stages that make the route call at it.
+///
+/// The list is cut into fare stages on `stage_no`, the way a route's stages are,
+/// and each is set against the stage the route runs at that place. A stage whose
+/// stops differ is changed; one that is the same is left alone.
+///
+/// A stage is shared, and an upload says what **one** route should call at. So
+/// where the stage is run by other routes too, this route is moved onto a stage
+/// of its own with the uploaded stops (`stage/split`) and the others are left
+/// exactly as they were. Where this route is the only one on it, the stage
+/// itself is changed (`stage/update`). An upload never changes a route it does
+/// not name.
+///
+/// Adding or taking away a whole fare stage is not something a stop list can
+/// say - that is which stages the route runs, not what is in them - and is
+/// refused with the way to do it.
+async fn through_stages(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    rows: &[Value],
+) -> EditorResult<Result<Vec<Planned>, Finding>> {
+    let info = super::stages::route_stages_of(conn, g, route_id, None).await?;
+    let stages = info["stages"].as_array().cloned().unwrap_or_default();
+
+    let mut runs: Vec<(i64, Vec<&Value>)> = Vec::new();
+    for r in rows {
+        let no = r["stage_no"].as_i64().unwrap_or(0);
+        match runs.last_mut() {
+            Some((n, list)) if *n == no => list.push(r),
+            _ => runs.push((no, vec![r])),
+        }
+    }
+    let lines_up = runs.len() == stages.len()
+        && runs
+            .iter()
+            .zip(&stages)
+            .all(|((no, _), st)| st["stage_no"].as_i64() == Some(*no));
+    if !lines_up {
+        return Ok(Err(Finding::error(
+            "route_stage_count",
+            route_id,
+            format!(
+                "route {route_id} runs {} fare stage(s) ({}) and this list has {} ({}). A stop \
+                 list changes the stops inside a route's stages; to add, remove or reorder a \
+                 fare stage, change the route's stages in the dashboard",
+                stages.len(),
+                stages
+                    .iter()
+                    .map(|s| s["stage_no"].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                runs.len(),
+                runs.iter()
+                    .map(|(n, _)| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        )));
+    }
+
+    // only what a stage holds: the rest of an uploaded row belongs to the route
+    let as_stage = |r: &Value| {
+        json!({
+            "stop_id": r["stop_id"],
+            "stop_type": r["stop_type"],
+            "stop_name_override": r.get("stop_name_override").cloned().unwrap_or(Value::Null),
+        })
+    };
+    let shape = |list: &[Value]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|r| {
+                (
+                    r["stop_id"]
+                        .as_str()
+                        .or(r["marker_id"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    r["stop_type"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let mut out = Vec::new();
+    for ((_, run), stage) in runs.iter().zip(&stages) {
+        let next: Vec<Value> = run.iter().map(|r| as_stage(r)).collect();
+        let was = stage["rows"].as_array().cloned().unwrap_or_default();
+        if shape(&next) == shape(&was) {
+            continue;
+        }
+        let key = stage["stage_key"].as_str().unwrap_or("").to_string();
+        let shared = stage["route_count"].as_i64().unwrap_or(0) > 1;
+        if shared {
+            let id = super::stages::mint_stage_id(conn, g).await?;
+            out.push(Planned {
+                entity: "stage",
+                op: "split",
+                key: Some(id.clone()),
+                after: json!({
+                    "stage_id": id,
+                    "name": stage["name"],
+                    "direction": stage["direction"],
+                    "description": Value::Null,
+                    "from_stage_id": key,
+                    "routes": [route_id],
+                    "rows": next,
+                }),
+                before: Value::Null,
+                base: None,
+            });
+        } else {
+            out.push(Planned {
+                entity: "stage",
+                op: "update",
+                key: Some(key),
+                after: json!({"rows": next}),
+                before: stage.clone(),
+                base: stage["row_version"].as_i64().map(|v| v as i32),
+            });
+        }
+    }
+    Ok(Ok(out))
+}
+
+// ---------------------------------------------------------------- stages (section 19)
+
+/// Stand-in id for checking the shape of a stage row whose id the server mints.
+const PROVISIONAL_STAGE_ID: &str = "stg_0000000000";
+
+/// The `direction` cell: up, down, or blank for "not said".
+fn cell_direction(m: &Map<String, Value>, bad: &mut Vec<String>) -> Option<String> {
+    match cell_text(m, "direction") {
+        Ok(None) => None,
+        Ok(Some(d)) => {
+            let d = d.to_ascii_lowercase();
+            if matches!(d.as_str(), "up" | "down") {
+                Some(d)
+            } else {
+                bad.push(format!("direction {d:?} is not up or down"));
+                None
+            }
+        }
+        Err(e) => {
+            bad.push(e);
+            None
+        }
+    }
+}
+
+/// The stages an upload may name: the live ones with the ids it uses, and the
+/// ones the draft itself makes, which exist by the time the upload's changes
+/// apply.
+struct KnownStages {
+    /// stage id -> each direction it runs, and whether that stage is deleted
+    live: HashMap<String, Vec<(String, bool)>>,
+    drafted: HashSet<StageKey>,
+}
+
+impl KnownStages {
+    async fn load(
+        conn: &mut PgConnection,
+        g: &str,
+        change_set_id: Uuid,
+        ids: &[String],
+    ) -> EditorResult<KnownStages> {
+        let mut live: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+        for r in sqlx::query(
+            "SELECT stage_id, direction, deleted FROM gtfs_stage \
+             WHERE gtfs_id = $1 AND stage_id = ANY($2) ORDER BY stage_id, direction",
+        )
+        .bind(g)
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            live.entry(r.try_get("stage_id")?)
+                .or_default()
+                .push((r.try_get("direction")?, r.try_get("deleted")?));
+        }
+        let drafted = sqlx::query(
+            "SELECT entity_key, COALESCE(after->>'direction', '') AS direction FROM gtfs_change \
+             WHERE change_set_id = $1 AND entity = 'stage' AND op IN ('create', 'split')",
+        )
+        .bind(change_set_id)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|r| -> Result<StageKey, sqlx::Error> {
+            let direction: String = r.try_get("direction")?;
+            Ok(StageKey::new(
+                StageKey::parse(r.try_get("entity_key")?).stage_id.as_str(),
+                Some(direction.trim().to_lowercase().as_str()),
+            ))
+        })
+        .collect::<Result<_, _>>()?;
+        Ok(KnownStages { live, drafted })
+    }
+
+    /// Whether any stage, live or deleted or made in the draft, has this id.
+    fn id_taken(&self, id: &str) -> bool {
+        self.live.contains_key(id) || self.drafted.iter().any(|k| k.stage_id == id)
+    }
+
+    fn in_draft(&self, key: &StageKey) -> bool {
+        self.drafted.contains(key)
+    }
+
+    /// The stage a row names. A row that states its direction says which; a
+    /// bare id is the only stage with that id, as it is everywhere else.
+    fn resolve(
+        &self,
+        id: &str,
+        direction: Option<&str>,
+    ) -> Result<StageKey, (&'static str, String)> {
+        let live = self.live.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        let mut ways: Vec<&str> = live
+            .iter()
+            .filter(|(_, deleted)| !deleted)
+            .map(|(d, _)| d.as_str())
+            .chain(
+                self.drafted
+                    .iter()
+                    .filter(|k| k.stage_id == id)
+                    .map(|k| k.direction.as_str()),
+            )
+            .collect();
+        ways.sort_unstable();
+        ways.dedup();
+        let said = |d: &str| if d.is_empty() { "either way" } else { d }.to_string();
+        let deleted = |d: Option<&str>| {
+            live.iter()
+                .any(|(w, gone)| *gone && d.is_none_or(|d| d == w))
+        };
+        match direction {
+            Some(d) if ways.contains(&d) => Ok(StageKey::new(id, Some(d))),
+            Some(d) if deleted(Some(d)) => {
+                Err(("stage_deleted", format!("stage {id} ({d}) is deleted")))
+            }
+            Some(d) if ways.is_empty() => Err(("stage_not_found", format!("no stage {id} ({d})"))),
+            Some(d) => Err((
+                "stage_not_found",
+                format!(
+                    "stage {id} does not run {d}; it runs {}",
+                    ways.iter()
+                        .map(|w| said(w))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ),
+            )),
+            None => match ways.as_slice() {
+                [one] => Ok(StageKey::new(id, Some(one))),
+                [] if deleted(None) => Err(("stage_deleted", format!("stage {id} is deleted"))),
+                [] => Err(("stage_not_found", format!("no stage {id}"))),
+                _ => Err((
+                    "stage_direction_needed",
+                    format!("stage {id} runs both ways; say which in the direction column"),
+                )),
+            },
+        }
+    }
+}
+
+/// Refuse a stage upload on a feed that keeps its routes as stop lists.
+async fn stages_feed(conn: &mut PgConnection, g: &str, kind: Kind) -> EditorResult<()> {
+    if super::stages::feed_uses_stages(conn, g).await? {
+        return Ok(());
+    }
+    Err(EditorError::bad_request(
+        "stages_off",
+        format!(
+            "feed {g} keeps its routes as stop lists, not stages, so it takes no {} upload; \
+             upload the route's stop list instead",
+            kind.name()
+        ),
+    ))
+}
+
+struct LinkRow {
+    upload: usize,
+    position: i32,
+    stage_id: String,
+    direction: Option<String>,
+    stage_no: Option<i32>,
+}
+
+/// `{route_id, position, stage_id, direction?, stage_no?}` rows: the fare
+/// stages each route runs through, in order. A route's stages are uploaded
+/// whole, as its stop list is, and become one `route_stages/replace`. The
+/// stages themselves are not touched: a row names one that exists (or that an
+/// earlier change of the draft makes), and the route takes whatever stops that
+/// stage holds.
+async fn plan_route_stages(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    rows: &[Value],
+    draft: &DraftView,
+    with_before: bool,
+) -> EditorResult<Plan> {
+    stages_feed(conn, g, Kind::RouteStages).await?;
+    let mut plan = Plan::new(rows.len());
+    let mut routes: Vec<(String, Vec<LinkRow>)> = Vec::new();
+    let mut route_at: HashMap<String, usize> = HashMap::new();
+    let mut by_pos: HashMap<(String, i32), Vec<usize>> = HashMap::new();
+    let mut route_action: HashMap<String, Vec<(usize, Action)>> = HashMap::new();
+    for (i, v) in rows.iter().enumerate() {
+        let m = match row_object(v, Kind::RouteStages) {
+            Ok(m) => m,
+            Err(f) => {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let action = match cell_action(m, Kind::RouteStages) {
+            Ok(a) => a,
+            Err(e) => {
+                plan.rows[i].findings.push(invalid_row(e));
+                continue;
+            }
+        };
+        let mut bad = Vec::new();
+        let mut text = |k: &str| match cell_text(m, k) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                bad.push(format!("{k} is required"));
+                None
+            }
+            Err(e) => {
+                bad.push(e);
+                None
+            }
+        };
+        let (route_id, stage_id) = (text("route_id"), text("stage_id"));
+        let position = match cell_i32(m, "position") {
+            Ok(Some(p)) if p >= 1 => Some(p),
+            Ok(Some(_)) => {
+                bad.push("position must be 1 or more".into());
+                None
+            }
+            Ok(None) => {
+                bad.push("position is required".into());
+                None
+            }
+            Err(e) => {
+                bad.push(e);
+                None
+            }
+        };
+        let stage_no = match cell_i32(m, "stage_no") {
+            Ok(Some(n)) if n < 0 => {
+                bad.push("stage_no must be 0 or more".into());
+                None
+            }
+            Ok(n) => n,
+            Err(e) => {
+                bad.push(e);
+                None
+            }
+        };
+        let direction = cell_direction(m, &mut bad);
+        let (Some(route_id), Some(stage_id), Some(position)) = (route_id, stage_id, position)
+        else {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        };
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
+        by_pos
+            .entry((route_id.clone(), position))
+            .or_default()
+            .push(i);
+        route_action
+            .entry(route_id.clone())
+            .or_default()
+            .push((i, action));
+        let at = *route_at.entry(route_id.clone()).or_insert_with(|| {
+            routes.push((route_id.clone(), Vec::new()));
+            routes.len() - 1
+        });
+        routes[at].1.push(LinkRow {
+            upload: i,
+            position,
+            stage_id,
+            direction,
+            stage_no,
+        });
+    }
+    mark_duplicates(&mut plan, by_pos, |(route, pos)| {
+        format!("position {pos} of route {route}")
+    });
+    for (_, list) in routes.iter_mut() {
+        list.sort_by_key(|r| (r.position, r.upload));
+    }
+
+    let route_ids: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let stage_ids: Vec<String> = routes
+        .iter()
+        .flat_map(|(_, list)| list.iter().map(|r| r.stage_id.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let live_routes = live_route_states(conn, g, &route_ids).await?;
+    let known = KnownStages::load(conn, g, change_set_id, &stage_ids).await?;
+
+    for (route_id, list) in routes {
+        let uploads: Vec<usize> = list.iter().map(|r| r.upload).collect();
+        let mut findings: Vec<(Option<usize>, Finding)> = Vec::new();
+        let live = if live_routes.contains_key(&route_id) {
+            super::stages::route_links(conn, g, &route_id, None).await?
+        } else {
+            Vec::new()
+        };
+        let said = route_action.get(&route_id).cloned().unwrap_or_default();
+        let what = format!("route {route_id}");
+        let route_state = route_problem(&route_id, &live_routes, draft).or_else(|| {
+            group_action_problem(&said, !live.is_empty(), &what, "stage list").map(
+                |(code, message)| {
+                    let code = match code {
+                        GroupProblem::Mixed => "mixed_action",
+                        GroupProblem::Exists => "route_stages_exist",
+                        GroupProblem::Missing => "route_stages_missing",
+                    };
+                    (code, message)
+                },
+            )
+        });
+        if let Some((code, message)) = route_state {
+            findings.push((None, Finding::error(code, route_id.as_str(), message)));
+            let at = plan.changes.len();
+            spread(&mut plan, &uploads, at, findings);
+            for i in &uploads {
+                plan.rows[*i].change = None;
+            }
+            continue;
+        }
+
+        let mut links: Vec<StageLink> = Vec::with_capacity(list.len());
+        let mut seen: HashMap<String, i32> = HashMap::new();
+        for (k, r) in list.iter().enumerate() {
+            match known.resolve(&r.stage_id, r.direction.as_deref()) {
+                Err((code, message)) => {
+                    findings.push((Some(k), Finding::error(code, r.stage_id.as_str(), message)));
+                }
+                Ok(key) => {
+                    // a route runs through a stage once
+                    if let Some(first) = seen.insert(key.stage_id.clone(), r.position) {
+                        findings.push((
+                            Some(k),
+                            Finding::error(
+                                "stage_repeated",
+                                key.stage_id.as_str(),
+                                format!(
+                                    "stage {} is already at position {first} of route {route_id}; a route uses a stage once",
+                                    key.stage_id
+                                ),
+                            ),
+                        ));
+                    }
+                    links.push(StageLink {
+                        stage_id: key.stage_id.clone(),
+                        direction: Some(key.direction.clone()),
+                        stage_no: r.stage_no,
+                    });
+                }
+            }
+        }
+        let broken = findings.iter().any(|(_, f)| f.level == Level::Error);
+        if !broken && super::stages::links_hash(&links) == super::stages::links_hash(&live) {
+            findings.push((
+                None,
+                Finding::warning(
+                    "route_stages_unchanged",
+                    route_id.as_str(),
+                    format!("route {route_id} already runs through exactly these stages; nothing to change"),
+                ),
+            ));
+        }
+        let unchanged = findings
+            .iter()
+            .any(|(_, f)| f.code == "route_stages_unchanged");
+        if broken || unchanged {
+            let at = plan.changes.len();
+            spread(&mut plan, &uploads, at, findings);
+            for i in &uploads {
+                plan.rows[*i].change = None;
+            }
+            continue;
+        }
+        let after = json!({
+            "stages": links,
+            "base_stages_hash": super::stages::links_hash(&live),
+        });
+        if let Err(f) = check_payload("route_stages", "replace", &route_id, &after) {
+            findings.push((None, f));
+            let at = plan.changes.len();
+            spread(&mut plan, &uploads, at, findings);
+            for i in &uploads {
+                plan.rows[*i].change = None;
+            }
+            continue;
+        }
+        let before = if with_before && live_routes.contains_key(&route_id) {
+            super::stages::route_stages_snapshot(conn, g, &route_id).await?
+        } else {
+            Value::Null
+        };
+        let at = plan.changes.len();
+        plan.changes.push(Planned {
+            entity: "route_stages",
+            op: "replace",
+            key: Some(route_id.clone()),
+            after,
+            before,
+            base: None,
+        });
+        spread(&mut plan, &uploads, at, findings);
+    }
+    Ok(plan)
+}
+
+/// A stage's rows as a change carries them: only what each row says, as the
+/// dashboard sends them.
+fn stage_rows_json(rows: &[StageRow]) -> Value {
+    let mut out = json!(rows);
+    for r in out.as_array_mut().into_iter().flatten() {
+        if let Some(m) = r.as_object_mut() {
+            m.retain(|_, v| !v.is_null());
+        }
+    }
+    out
+}
+
+struct StageStopRow {
+    upload: usize,
+    position: i32,
+    stop_id: Option<String>,
+    stop_type: Option<String>,
+    name: Option<String>,
+}
+
+/// What groups a stages upload's rows into stages: the id and direction as the
+/// rows spell them, or - for a new stage whose id the server makes - its name.
+type StageGroup = (Option<String>, Option<String>, Option<String>);
+
+/// `{stage_id, direction, name, position, stop_id, stop_type?}` rows: the stops
+/// of each stage, in order. A stage is uploaded whole: `add` makes one (with
+/// the id given, or a new short one when `stage_id` is blank), `update` sets an
+/// existing stage's stops and name - which reaches every route that runs
+/// through it - and `delete` takes away one no route uses.
+async fn plan_stages(
+    conn: &mut PgConnection,
+    g: &str,
+    change_set_id: Uuid,
+    rows: &[Value],
+    draft: &DraftView,
+    with_before: bool,
+) -> EditorResult<Plan> {
+    stages_feed(conn, g, Kind::Stages).await?;
+    let mut plan = Plan::new(rows.len());
+    let mut groups: Vec<(StageGroup, Vec<StageStopRow>)> = Vec::new();
+    let mut group_at: HashMap<StageGroup, usize> = HashMap::new();
+    let mut group_action: HashMap<StageGroup, Vec<(usize, Action)>> = HashMap::new();
+    for (i, v) in rows.iter().enumerate() {
+        let m = match row_object(v, Kind::Stages) {
+            Ok(m) => m,
+            Err(f) => {
+                plan.rows[i].findings.push(f);
+                continue;
+            }
+        };
+        let action = match cell_action(m, Kind::Stages) {
+            Ok(a) => a,
+            Err(e) => {
+                plan.rows[i].findings.push(invalid_row(e));
+                continue;
+            }
+        };
+        let mut bad = Vec::new();
+        let mut text = |k: &str| {
+            cell_text(m, k).unwrap_or_else(|e| {
+                bad.push(e);
+                None
+            })
+        };
+        let (stage_id, name, stop_id, stop_type) = (
+            text("stage_id"),
+            text("name"),
+            text("stop_id"),
+            text("stop_type"),
+        );
+        let position = cell_i32(m, "position").unwrap_or_else(|e| {
+            bad.push(e);
+            None
+        });
+        let direction = cell_direction(m, &mut bad);
+        if action != Action::Delete {
+            if stop_id.is_none() {
+                bad.push("stop_id is required".into());
+            }
+            match position {
+                None => bad.push("position is required".into()),
+                Some(p) if p < 1 => bad.push("position must be 1 or more".into()),
+                _ => {}
+            }
+        }
+        if stage_id.is_none() {
+            match action {
+                Action::Add if name.is_none() => bad.push(
+                    "a new stage needs a name (its stage_id may be left blank; one is made for it)"
+                        .into(),
+                ),
+                Action::Add => {}
+                _ => bad.push("stage_id is required".into()),
+            }
+        }
+        if !bad.is_empty() {
+            plan.rows[i]
+                .findings
+                .extend(bad.into_iter().map(invalid_row));
+            continue;
+        }
+        let group: StageGroup = match &stage_id {
+            Some(id) => (Some(id.clone()), None, direction.clone()),
+            None => (None, name.clone(), direction.clone()),
+        };
+        group_action
+            .entry(group.clone())
+            .or_default()
+            .push((i, action));
+        let at = *group_at.entry(group.clone()).or_insert_with(|| {
+            groups.push((group, Vec::new()));
+            groups.len() - 1
+        });
+        groups[at].1.push(StageStopRow {
+            upload: i,
+            position: position.unwrap_or(0),
+            stop_id,
+            stop_type,
+            name,
+        });
+    }
+    for (_, list) in groups.iter_mut() {
+        list.sort_by_key(|r| (r.position, r.upload));
+    }
+
+    let stage_ids: Vec<String> = groups
+        .iter()
+        .filter_map(|((id, _, _), _)| id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let stop_ids: Vec<String> = groups
+        .iter()
+        .flat_map(|(_, list)| list.iter().filter_map(|r| r.stop_id.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let known = KnownStages::load(conn, g, change_set_id, &stage_ids).await?;
+    let live_stops: HashMap<String, (i16, bool)> = sqlx::query(
+        "SELECT stop_id, location_type, deleted FROM gtfs_stop WHERE gtfs_id = $1 AND stop_id = ANY($2)",
+    )
+    .bind(g)
+    .bind(&stop_ids)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<(String, (i16, bool)), sqlx::Error> {
+        Ok((
+            r.try_get("stop_id")?,
+            (r.try_get("location_type")?, r.try_get("deleted")?),
+        ))
+    })
+    .collect::<Result<_, _>>()?;
+    // once the draft applies, a stop exists, is live and is a place a bus calls
+    let stop_problem = |id: &str| -> Option<(&'static str, String)> {
+        if let Some((into, by)) = draft.merged_into(id) {
+            return Some((
+                "stop_merged_away",
+                format!("stop {id} is merged into {into} by change {by} earlier in this draft; use {into}"),
+            ));
+        }
+        let created = draft.created_stop(id).map(|c| (c.location_type, false));
+        match live_stops.get(id).copied().or(created) {
+            None => Some(("unknown_stop", format!("stop {id} does not exist"))),
+            Some((_, deleted)) if deleted || draft.stop_deleted(id) => {
+                Some(("stop_deleted", format!("stop {id} is deleted")))
+            }
+            Some((1, _)) => Some((
+                "stop_is_station",
+                format!("{id} is a station; a stage holds one of its platforms"),
+            )),
+            Some((t, _)) if t != 0 => Some((
+                "not_a_stop",
+                format!(
+                    "{id} is {} (location_type {t}); a stage holds a stop or platform",
+                    service::stop_kind(t)
+                ),
+            )),
+            _ => None,
+        }
+    };
+
+    // a stage named twice, once with its direction and once without
+    let mut taken: HashMap<StageKey, usize> = HashMap::new();
+    // an id two new stages of this upload both ask for
+    let mut new_ids: HashSet<String> = HashSet::new();
+    for (group, list) in groups {
+        let (given_id, _, direction) = &group;
+        let uploads: Vec<usize> = list.iter().map(|r| r.upload).collect();
+        let mut findings: Vec<(Option<usize>, Finding)> = Vec::new();
+        let said = group_action.get(&group).cloned().unwrap_or_default();
+        let action = said.first().map(|(_, a)| *a).unwrap_or(Action::Update);
+        let label = match given_id {
+            Some(id) => StageKey::new(id, direction.as_deref()).label(),
+            None => format!("{:?}", group.1.clone().unwrap_or_default()),
+        };
+        let error =
+            |code: &str, message: String| (None, Finding::error(code, label.as_str(), message));
+        if said.iter().any(|(_, a)| *a != action) {
+            findings.push(error(
+                "mixed_action",
+                format!(
+                    "stage {label} has rows saying {} and rows saying something else; a stage is one action",
+                    action.name()
+                ),
+            ));
+        }
+        let mut names: Vec<&str> = list.iter().filter_map(|r| r.name.as_deref()).collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() > 1 {
+            findings.push(error(
+                "stage_name_differs",
+                format!(
+                    "the rows of stage {label} give it different names ({}); a stage has one",
+                    names.join(", ")
+                ),
+            ));
+        }
+        let name = names.first().map(|n| n.to_string());
+
+        // which stage, and whether the action fits what is there
+        let key = match (action, given_id) {
+            (Action::Add, Some(id)) => {
+                if known.id_taken(id) || !new_ids.insert(id.clone()) {
+                    findings.push(error(
+                        "stage_exists",
+                        format!(
+                            "there is already a stage {id}; a new stage takes a new id (leave stage_id blank and one is made), and action update changes the one that is there"
+                        ),
+                    ));
+                }
+                if name.is_none() {
+                    findings.push(error("invalid_row", format!("new stage {id} needs a name")));
+                }
+                Some(StageKey::new(id, direction.as_deref()))
+            }
+            (Action::Add, None) => None,
+            (_, Some(id)) => match known.resolve(id, direction.as_deref()) {
+                Ok(key) if known.in_draft(&key) => {
+                    findings.push(error(
+                        "stage_in_draft",
+                        format!(
+                            "stage {} is made earlier in this draft and is not live yet; change it there",
+                            key.label()
+                        ),
+                    ));
+                    None
+                }
+                Ok(key) => Some(key),
+                Err((code, message)) => {
+                    findings.push(error(code, message));
+                    None
+                }
+            },
+            (_, None) => None,
+        };
+        if let Some(key) = &key {
+            if let Some(first) = taken.insert(key.clone(), uploads[0]) {
+                findings.push(error(
+                    "duplicate_in_upload",
+                    format!(
+                        "stage {} is in this upload twice (from row {}), once with its direction and once without",
+                        key.label(),
+                        first + 1
+                    ),
+                ));
+            }
+        }
+
+        // its stops
+        let mut rows: Vec<StageRow> = Vec::with_capacity(list.len());
+        if action != Action::Delete {
+            let mut at: HashMap<i32, usize> = HashMap::new();
+            for (k, r) in list.iter().enumerate() {
+                if let Some(first) = at.insert(r.position, k) {
+                    findings.push((
+                        Some(k),
+                        Finding::error(
+                            "duplicate_in_upload",
+                            "",
+                            format!(
+                                "position {} of stage {label} is on rows {} and {} of this upload",
+                                r.position,
+                                list[first].upload + 1,
+                                r.upload + 1
+                            ),
+                        ),
+                    ));
+                }
+                let stop_id = r.stop_id.clone().unwrap_or_default();
+                if let Some((code, message)) = stop_problem(&stop_id) {
+                    findings.push((Some(k), Finding::error(code, stop_id.as_str(), message)));
+                }
+                // the first stop is where the fare stage begins
+                let stop_type = r.stop_type.clone().unwrap_or_else(|| {
+                    if k == 0 { NEW_STOP } else { INTERMEDIATE_STOP }.to_string()
+                });
+                if stop_type == ROUTE_CORRECTION {
+                    findings.push((
+                        Some(k),
+                        Finding::error(
+                            "marker_in_upload",
+                            stop_id.as_str(),
+                            "a ROUTE CORRECTION row is a point on the map, not a stop; add it on the stage's page".to_string(),
+                        ),
+                    ));
+                }
+                rows.push(StageRow {
+                    stop_id: Some(stop_id),
+                    stop_type,
+                    marker_id: None,
+                    marker_name: None,
+                    marker_lat: None,
+                    marker_lon: None,
+                    stop_name_override: None,
+                });
+            }
+            for f in check_stage_rows(&rows) {
+                findings.push((None, f));
+            }
+        }
+
+        let mut planned: Option<Planned> = None;
+        if !findings.iter().any(|(_, f)| f.level == Level::Error) {
+            match (action, &key) {
+                (Action::Add, _) => {
+                    let mut after = json!({
+                        "name": name,
+                        "direction": direction,
+                        "rows": stage_rows_json(&rows),
+                    });
+                    let id = key.as_ref().map(|k| k.stage_id.clone());
+                    let checked = id.as_deref().unwrap_or(PROVISIONAL_STAGE_ID);
+                    after["stage_id"] = json!(checked);
+                    match check_payload("stage", "create", checked, &after) {
+                        Err(f) => findings.push((None, f)),
+                        Ok(()) => {
+                            if id.is_none() {
+                                after.as_object_mut().map(|m| m.remove("stage_id"));
+                            }
+                            planned = Some(Planned {
+                                entity: "stage",
+                                op: "create",
+                                key: id,
+                                after,
+                                before: Value::Null,
+                                base: None,
+                            });
+                        }
+                    }
+                }
+                (Action::Update, Some(key)) => {
+                    let live = super::stages::load_stage(conn, g, key, false).await?;
+                    if let Some(live) = live {
+                        // what a stop is called on this stage stays with the stop
+                        for r in rows.iter_mut() {
+                            r.stop_name_override = live
+                                .rows
+                                .iter()
+                                .find(|l| l.stop_id == r.stop_id)
+                                .and_then(|l| l.stop_name_override.clone());
+                        }
+                        let shape = |list: &[StageRow]| -> Vec<(Option<String>, String)> {
+                            list.iter()
+                                .map(|r| {
+                                    (
+                                        r.stop_id.clone().or(r.marker_id.clone()),
+                                        r.stop_type.clone(),
+                                    )
+                                })
+                                .collect()
+                        };
+                        let renamed = name.as_deref().is_some_and(|n| n != live.name);
+                        let moved = shape(&rows) != shape(&live.rows);
+                        if !renamed && !moved {
+                            findings.push((
+                                None,
+                                Finding::warning(
+                                    "stage_unchanged",
+                                    label.as_str(),
+                                    format!("stage {label} already holds exactly these stops; nothing to change"),
+                                ),
+                            ));
+                        } else {
+                            let markers = live.rows.iter().filter(|r| r.is_marker()).count();
+                            if moved && markers > 0 {
+                                findings.push((
+                                    None,
+                                    Finding::warning(
+                                        "stage_map_points_dropped",
+                                        label.as_str(),
+                                        format!(
+                                            "stage {label} has {markers} map point(s) (ROUTE CORRECTION) that a file cannot carry; this upload takes them out. Add them again on the stage's page"
+                                        ),
+                                    ),
+                                ));
+                            }
+                            let routes = super::stages::routes_using(conn, g, key).await?;
+                            if !routes.is_empty() {
+                                findings.push((
+                                    None,
+                                    Finding::warning(
+                                        "stage_changes_routes",
+                                        label.as_str(),
+                                        format!(
+                                            "changing stage {label} changes every route that runs through it: {} route(s)",
+                                            routes.len()
+                                        ),
+                                    ),
+                                ));
+                            }
+                            let mut after = json!({});
+                            if renamed {
+                                after["name"] = json!(name);
+                            }
+                            if moved {
+                                after["rows"] = stage_rows_json(&rows);
+                            }
+                            let entity_key = key.entity_key();
+                            match check_payload("stage", "update", &entity_key, &after) {
+                                Err(f) => findings.push((None, f)),
+                                Ok(()) => {
+                                    let before = if with_before {
+                                        super::stages::stage_snapshot(conn, g, key)
+                                            .await?
+                                            .map(|(row, _)| row)
+                                            .unwrap_or(Value::Null)
+                                    } else {
+                                        Value::Null
+                                    };
+                                    planned = Some(Planned {
+                                        entity: "stage",
+                                        op: "update",
+                                        key: Some(entity_key),
+                                        after,
+                                        before,
+                                        base: Some(live.row_version),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                (Action::Delete, Some(key)) => {
+                    let routes = super::stages::routes_using(conn, g, key).await?;
+                    if !routes.is_empty() {
+                        findings.push(error(
+                            "stage_in_use",
+                            format!(
+                                "stage {label} is used by {} route(s) ({}{}); take it off those routes first",
+                                routes.len(),
+                                routes
+                                    .iter()
+                                    .take(5)
+                                    .map(|(id, _)| id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                if routes.len() > 5 { ", ..." } else { "" },
+                            ),
+                        ));
+                    } else if let Some(live) =
+                        super::stages::load_stage(conn, g, key, false).await?
+                    {
+                        let before = if with_before {
+                            super::stages::stage_snapshot(conn, g, key)
+                                .await?
+                                .map(|(row, _)| row)
+                                .unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        };
+                        planned = Some(Planned {
+                            entity: "stage",
+                            op: "delete",
+                            key: Some(key.entity_key()),
+                            after: Value::Null,
+                            before,
+                            base: Some(live.row_version),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        let at = plan.changes.len();
+        let made = planned.is_some();
+        if let Some(p) = planned {
+            plan.changes.push(p);
+        }
+        spread(&mut plan, &uploads, at, findings);
+        if !made {
+            for i in &uploads {
+                plan.rows[*i].change = None;
+            }
+        }
     }
     Ok(plan)
 }
@@ -3347,7 +4474,7 @@ pub async fn run(
     let kind = Kind::parse(&req.kind).ok_or_else(|| {
         EditorError::bad_request(
             "invalid_kind",
-            "kind is stops, routes, route_stops, stop_updates, route_trips, timing_profiles, services, stop_merges, or records with a file",
+            "kind is stops, routes, route_stops, route_stages, stages, stop_updates, route_trips, timing_profiles, services, stop_merges, or records with a file",
         )
     })?;
     if req.rows.is_empty() {
@@ -3401,6 +4528,10 @@ async fn plan_kind(
         Kind::TimingProfiles => plan_timing_profiles(conn, g, rows, draft, with_before).await?,
         Kind::Services => plan_services(conn, g, rows, draft, with_before).await?,
         Kind::StopMerges => plan_stop_merges(conn, g, rows, draft).await?,
+        Kind::RouteStages => {
+            plan_route_stages(conn, g, change_set_id, rows, draft, with_before).await?
+        }
+        Kind::Stages => plan_stages(conn, g, change_set_id, rows, draft, with_before).await?,
         Kind::Records => {
             let fspec = records_file(req.file.as_deref())?;
             plan_records(conn, g, change_set_id, fspec, rows, actor).await?
@@ -3421,13 +4552,24 @@ async fn insert_plan(
         .changes
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.key.is_none())
+        .filter(|(_, c)| c.key.is_none() && c.entity != "stage")
         .map(|(k, _)| k)
         .collect();
     let minted = service::mint_stop_ids(conn, g, unnamed.len()).await?;
     for (k, id) in unnamed.into_iter().zip(minted) {
         let c = &mut plan.changes[k];
         c.after["stop_id"] = json!(id);
+        c.key = Some(id);
+    }
+    // a new stage uploaded without an id gets a short one, as one made in the
+    // dashboard does
+    for c in plan
+        .changes
+        .iter_mut()
+        .filter(|c| c.entity == "stage" && c.key.is_none())
+    {
+        let id = super::stages::mint_stage_id(conn, g).await?;
+        c.after["stage_id"] = json!(id);
         c.key = Some(id);
     }
     // a trip uploaded without an id gets one, as a single change's would

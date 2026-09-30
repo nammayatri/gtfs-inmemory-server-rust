@@ -197,7 +197,7 @@ const VIEWER: &str = "viewer@editor-stage-review-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Stage review test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, use_stages) VALUES ('{FEED}', 'Stage review test feed', true)"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \
@@ -665,7 +665,7 @@ async fn the_team_works_through_the_stage_review_queue() {
                    EXCEPT ALL \
                    SELECT route_id, sequence, stop_id, stop_type, stage_no, stage_name, \
                           stop_name_override, marker_id, marker_name, marker_lat, marker_lon \
-                     FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND pattern_key = 1) d"
+                     FROM gtfs_route_stop_effective WHERE gtfs_id = '{FEED}' AND pattern_key = 1) d"
             )
         )
         .await,
