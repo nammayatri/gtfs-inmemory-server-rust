@@ -91,6 +91,8 @@ fn with_trip_settings(mut v: Value) -> Value {
         ("default_dwell_s", json!(15)),
         ("schedule_sync", json!("none")),
         ("sync_running_times", json!(false)),
+        // a feed is served from its stop lists until somebody turns stages on
+        ("use_stages", json!(false)),
     ] {
         v[k] = d;
     }

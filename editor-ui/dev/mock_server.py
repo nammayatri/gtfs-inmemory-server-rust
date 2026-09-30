@@ -4233,9 +4233,12 @@ class FeedAccessHandler(WebhookHandler):
 
     def my_feeds(self, u):
         # GPS (docs section 17) is set up for the sample's feeds, not the
-        # second feed made here
+        # second feed made here.
+        # use_stages: the mock's feeds are all served from stages unless a feed
+        # says otherwise, so the stage screens it exercises stay reachable
         return [{"gtfs_id": g, "display_name": f.get("display_name"), "role": self.feed_role(u, g),
-                 "gps": {"days": 7, "trips_days": 30} if g != SECOND_FEED else None}
+                 "gps": {"days": 7, "trips_days": 30} if g != SECOND_FEED else None,
+                 "use_stages": f.get("use_stages", True)}
                 for g, f in self.store.feeds.items() if self.feed_role(u, g)]
 
     def _api(self, method, path, q):

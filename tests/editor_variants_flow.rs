@@ -178,7 +178,7 @@ async fn scalar_i64(pool: &PgPool, sql: impl AsRef<str>) -> i64 {
 async fn route_rows(pool: &PgPool, route: &str) -> Vec<String> {
     sqlx::query(&format!(
         "SELECT coalesce(stop_id, marker_id) || '/' || stop_type || '/' || stage_no || '/' || stage_name AS r \
-         FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = '{route}' ORDER BY sequence"
+         FROM gtfs_route_stop_effective WHERE gtfs_id = '{FEED}' AND route_id = '{route}' ORDER BY sequence"
     ))
     .fetch_all(pool)
     .await
@@ -209,7 +209,7 @@ const APPROVER: &str = "approver@editor-variants-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor variants test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, use_stages) VALUES ('{FEED}', 'Editor variants test feed', true)"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \
@@ -220,8 +220,23 @@ fn seed() -> Vec<String> {
         "INSERT INTO gtfs_route (gtfs_id, route_id, short_name, long_name, agency_id) VALUES \
          ('{FEED}', 'R1', '21G', 'A To D', 'AG')"
     ));
-    // R1 is edited stop by stop, like every route today: A B | C D, two fare
-    // stages, carrying a provider id the rows must keep
+    // R1 runs A B | C D, two fare stages. On a feed served from its stages
+    // that is what its stages say and nothing else (migration 0027); the rows
+    // in gtfs_route_stop are not read as stops, only for the provider id the
+    // route's rows must keep.
+    s.push(format!(
+        "INSERT INTO gtfs_stage (gtfs_id, stage_id, direction, name) VALUES \
+         ('{FEED}', 'stg_a', '', 'A STAGE'), ('{FEED}', 'stg_c', '', 'C STAGE')"
+    ));
+    s.push(format!(
+        "INSERT INTO gtfs_stage_stop (gtfs_id, stage_id, direction, position, stop_id, stop_type) VALUES \
+         ('{FEED}', 'stg_a', '', 1, 'A', 'NEW STOP'), ('{FEED}', 'stg_a', '', 2, 'B', 'INTERMEDIATE STOP'), \
+         ('{FEED}', 'stg_c', '', 1, 'C', 'NEW STOP'), ('{FEED}', 'stg_c', '', 2, 'D', 'INTERMEDIATE STOP')"
+    ));
+    s.push(format!(
+        "INSERT INTO gtfs_route_stage (gtfs_id, route_id, position, stage_id, direction, stage_no) VALUES \
+         ('{FEED}', 'R1', 1, 'stg_a', '', 1), ('{FEED}', 'R1', 2, 'stg_c', '', 2)"
+    ));
     s.push(format!(
         "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, provider_id) VALUES \
          ('{FEED}', 'R1', 1, 'A', 'NEW STOP', 1, 'A STAGE', '21'), \
@@ -384,7 +399,7 @@ async fn a_route_is_diverted_and_put_back() {
         async move {
             sqlx::query(&format!(
                 "SELECT sequence, stop_id, stop_type, stage_no, stage_name, provider_id \
-                 FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = '{route}' ORDER BY sequence"
+                 FROM gtfs_route_stop_effective WHERE gtfs_id = '{FEED}' AND route_id = '{route}' ORDER BY sequence"
             ))
             .fetch_all(&pool)
             .await
@@ -412,10 +427,10 @@ async fn a_route_is_diverted_and_put_back() {
             "3:C:NEW STOP:2:21",
             "4:D:INTERMEDIATE STOP:2:21"
         ],
-        "the fixture is a route edited stop by stop"
+        "the fixture is a route of two stages"
     );
 
-    // ======================================================== a diversion, on a route with no stages
+    // ======================================================== a diversion
     let d1 = draft!("divert 21G around the bridge");
     // the stage the diversion runs through instead of C and D
     let b = added!(
@@ -427,9 +442,7 @@ async fn a_route_is_diverted_and_put_back() {
         .as_str()
         .unwrap()
         .to_string();
-    // the route keeps its first stage and runs through E instead: the stages of
-    // its normal list are not known until it is converted, so the diversion
-    // names the new stage alone
+    // the diversion runs through E alone
     let b = added!(
         d1,
         json!({"entity": "route_variant", "op": "create", "entity_key": "R1", "after": {
@@ -442,8 +455,8 @@ async fn a_route_is_diverted_and_put_back() {
         .map(|v| v["code"].as_str().unwrap_or("").to_string())
         .collect();
     assert!(
-        findings.iter().any(|c| c == "route_built_from_stages"),
-        "the route's own stops became stages it can go back to: {b}"
+        !findings.iter().any(|c| c == "route_built_from_stages"),
+        "its normal list is already stages; nothing is converted: {b}"
     );
     // creating a diversion does not change what the route serves
     let (s, b) = ship!(d1);
@@ -454,7 +467,7 @@ async fn a_route_is_diverted_and_put_back() {
         format!("SELECT count(*) FROM gtfs_route_stage WHERE gtfs_id = '{FEED}' AND route_id = 'R1' AND variant_id IS NULL"),
     )
     .await;
-    assert_eq!(stage_count, 2, "its normal list is now two stages");
+    assert_eq!(stage_count, 2, "its normal list is its two stages still");
 
     // ======================================================== wearing it
     let hash_of = |variant: Option<&str>| {

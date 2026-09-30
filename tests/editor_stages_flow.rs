@@ -175,10 +175,28 @@ async fn scalar_i64(pool: &PgPool, sql: impl AsRef<str>) -> i64 {
 }
 
 /// A route's served stop list as `stop_id/stop_type/stage_no/stage_name`.
-async fn route_rows(pool: &PgPool, route: &str) -> Vec<String> {
+// What gtfs_route_stop itself holds for a route: only what the stop-list editor
+// wrote there. Distinct from what the route is served as on a stages feed.
+async fn table_rows(pool: &PgPool, route: &str) -> Vec<String> {
     sqlx::query(&format!(
         "SELECT coalesce(stop_id, marker_id) || '/' || stop_type || '/' || stage_no || '/' || stage_name AS r \
          FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = '{route}' ORDER BY sequence"
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| r.get::<String, _>("r"))
+    .collect()
+}
+
+// What the route is served as. On a feed served from its stages that is what the
+// stages say, read through the view every reader uses; gtfs_route_stop itself is
+// no longer written for such a route (migration 0027).
+async fn route_rows(pool: &PgPool, route: &str) -> Vec<String> {
+    sqlx::query(&format!(
+        "SELECT coalesce(stop_id, marker_id) || '/' || stop_type || '/' || stage_no || '/' || stage_name AS r \
+         FROM gtfs_route_stop_effective WHERE gtfs_id = '{FEED}' AND route_id = '{route}' ORDER BY sequence"
     ))
     .fetch_all(pool)
     .await
@@ -209,7 +227,7 @@ const APPROVER: &str = "approver@editor-stages-test.invalid";
 fn seed() -> Vec<String> {
     let mut s = clear_feed(FEED);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name) VALUES ('{FEED}', 'Editor stages test feed')"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, use_stages) VALUES ('{FEED}', 'Editor stages test feed', true)"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \
@@ -221,7 +239,8 @@ fn seed() -> Vec<String> {
          ('{FEED}', 'R1', '1', 'A To E', 'AG'), ('{FEED}', 'R2', '2', 'A To E short', 'AG'), \
          ('{FEED}', 'R3', '3', 'legacy', 'AG')"
     ));
-    // R3 is not built from stages: its rows are edited directly, as before
+    // R3 has no stages. Its rows here are what the feed held before it was
+    // served from stages; they are not read while it is
     s.push(format!(
         "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, provider_id) VALUES \
          ('{FEED}', 'R3', 1, 'G', 'NEW STOP', 1, 'G STAGE', '33'), ('{FEED}', 'R3', 2, 'H', 'NEW STOP', 2, 'H STAGE', '33'), \
@@ -515,7 +534,7 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
     assert_eq!(
         scalar_i64(
             &pool,
-            format!("SELECT count(*) FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'R1' AND provider_id = '11'")
+            format!("SELECT count(*) FROM gtfs_route_stop_effective WHERE gtfs_id = '{FEED}' AND route_id = 'R1' AND provider_id = '11'")
         )
         .await,
         5
@@ -638,7 +657,8 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
             "base_rows_hash": detail["rows_hash"]}})
     );
     assert!(has_code(&findings(&b, "error"), "route_has_stages"), "{b}");
-    // a route without stages is still edited as before
+    // and a route without stages has no stop list to set either: the feed is
+    // served from stages and from nothing else, so it is given stages instead
     let (_, detail, _) = call!(&app, ed.req("GET", &format!("/feeds/{FEED}/routes/R3")));
     let b = added!(
         d2,
@@ -648,8 +668,14 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
                      {"stop_id": "H", "stop_type": "NEW STOP", "stage_no": 2, "stage_name": "H STAGE"}],
             "base_rows_hash": detail["rows_hash"]}})
     );
-    let errs = findings(&b, "error");
-    assert_eq!(errs.len(), 1, "{b}");
+    assert!(
+        has_code(&findings(&b, "error"), "route_needs_stages"),
+        "{b}"
+    );
+    assert!(
+        detail["rows"].as_array().unwrap().is_empty(),
+        "its rows in gtfs_route_stop are not its stops on a stages feed: {detail}"
+    );
     let (s, _, _) = call!(&app, ed.req("POST", &format!("/change-sets/{d2}/discard")));
     assert_eq!(s, 200);
 
@@ -750,16 +776,11 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
         d8,
         json!({"entity": "stop", "op": "delete", "entity_key": "H", "after": null})
     );
-    // H is still on the legacy route R3 as well
-    assert!(has_code(&findings(&b, "error"), "stop_in_use"), "{b}");
+    // R3's old rows in gtfs_route_stop name H too, but they are not R3's stops
+    // on a feed served from stages, so they hold nothing: the stage does
+    assert!(has_code(&findings(&b, "error"), "stop_in_stage"), "{b}");
+    assert!(!has_code(&findings(&b, "error"), "stop_in_use"), "{b}");
     call!(&app, ed.req("POST", &format!("/change-sets/{d8}/discard")));
-    exec(
-        &pool,
-        &[format!(
-            "DELETE FROM gtfs_route_stop WHERE gtfs_id = '{FEED}' AND route_id = 'R3' AND stop_id = 'H'"
-        )],
-    )
-    .await;
     let d9 = draft!("delete H again");
     let b = added!(
         d9,
@@ -838,42 +859,435 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
         assert_eq!(rs["in_sync"], true, "{r}: {rs}");
     }
 
-    // ======================================================== a route changed outside its stages is not overwritten
-    exec(
-        &pool,
-        &[format!(
-            "UPDATE gtfs_route_stop SET stage_name = 'HAND EDIT' WHERE gtfs_id = '{FEED}' AND route_id = 'R2' AND stop_id = 'E'"
-        )],
-    )
-    .await;
+    // ======================================================== a route built from stages IS its stages
+    // On a feed served from its stages a route's stops are READ from them
+    // (migration 0027). gtfs_route_stop still holds the rows R1 had before it
+    // was given stages, and through every stage commit above nothing has
+    // written them: they are not what the route is, so they block no stage
+    // edit and no stage edit overwrites them.
+    let original = ["G/NEW STOP/1/OLD", "H/NEW STOP/2/OLD 2"];
+    assert_eq!(
+        table_rows(&pool, "R1").await,
+        original,
+        "gtfs_route_stop is not written for a route served from stages"
+    );
+    assert_ne!(
+        route_rows(&pool, "R1").await,
+        original,
+        "what R1 serves comes from its stages, not from those rows"
+    );
     let (_, rs, _) = call!(
         &app,
-        ed.req("GET", &format!("/feeds/{FEED}/routes/R2/stages"))
+        ed.req("GET", &format!("/feeds/{FEED}/routes/R1/stages"))
     );
-    assert_eq!(rs["in_sync"], false);
+    assert_eq!(
+        rs["in_sync"], true,
+        "a staged route is always in step: {rs}"
+    );
+    // so its stages can be edited, where a route whose rows differed from its
+    // stages used to refuse every edit to a stage it ran
     let d11 = draft!("rename GAMMA");
     let b = added!(
         d11,
         json!({"entity": "stage", "op": "update", "entity_key": "stg_gamma", "after": {"name": "GAMMA 2"}})
     );
-    let errs = findings(&b, "error");
     assert!(
-        has_code(&errs, "route_out_of_sync")
-            && errs[0]["message"].as_str().unwrap().contains("2 (R2)"),
-        "{b}"
+        !has_code(&findings(&b, "error"), "route_out_of_sync"),
+        "a stage edit is not refused over rows nobody reads: {b}"
     );
-    // giving the route its stages again puts it back, with a warning that it replaces the hand edit
+    let (s, b) = ship!(d11);
+    assert_eq!(s, 200, "commit: {b}");
+    // the rename reached the route by being read...
+    assert!(
+        route_rows(&pool, "R1")
+            .await
+            .iter()
+            .any(|r| r.ends_with("/GAMMA 2")),
+        "{:?}",
+        route_rows(&pool, "R1").await
+    );
+    // ...and the table was not touched to get it there
+    assert_eq!(table_rows(&pool, "R1").await, original);
+
+    // ======================================================== an uploaded stop list follows the feed's setting
+    // The same upload, the same rows. On a feed served from its stages it
+    // becomes changes to the stages; on one that is not, it replaces the
+    // route's rows. Which one is the feed's setting, never the upload's.
+    let (_, live, _) = call!(&app, ed.req("GET", &format!("/feeds/{FEED}/routes/R1")));
+    let served: Vec<Value> = live["rows"].as_array().unwrap().clone();
+    let as_upload = |rows: &[Value]| -> Vec<Value> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                json!({"action": "update", "route_id": "R1", "sequence": i + 1,
+                       "stop_id": r["stop_id"], "stop_type": r["stop_type"],
+                       "stage_no": r["stage_no"], "stage_name": r["stage_name"]})
+            })
+            .collect()
+    };
+    let upload = |rows: Vec<Value>, set: &str| {
+        ed.req("POST", &format!("/change-sets/{set}/bulk"))
+            .set_json(json!({"kind": "route_stops", "rows": rows, "dry_run": true}))
+    };
+    let d_up = draft!("upload a stop list");
+    // the list it already has: nothing to do, and said so
+    let (s, out, _) = call!(&app, upload(as_upload(&served), &d_up));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["summary"]["changes"], 0, "{out}");
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "route_stops_unchanged",
+        "{out}"
+    );
+    // One stop taken out of a fare stage is a change to that STAGE, never a
+    // route_stops change. How it is written depends on who else runs the stage.
+    let (_, info, _) = call!(
+        &app,
+        ed.req("GET", &format!("/feeds/{FEED}/routes/R1/stages"))
+    );
+    let mut seen = (false, false);
+    for stage in info["stages"].as_array().unwrap() {
+        let no = stage["stage_no"].clone();
+        let mine: Vec<&Value> = served.iter().filter(|r| r["stage_no"] == no).collect();
+        if mine.len() < 2 {
+            continue; // a stage of one stop has nothing to take out
+        }
+        let drop = served.iter().rposition(|r| r["stage_no"] == no).unwrap();
+        let mut fewer = served.clone();
+        fewer.remove(drop);
+        let (s, out, _) = call!(&app, upload(as_upload(&fewer), &d_up));
+        assert_eq!(s, 200, "{out}");
+        assert_eq!(out["summary"]["errors"], 0, "{out}");
+        let changes = out["changes_preview"].as_array().unwrap();
+        assert_eq!(
+            changes.len(),
+            1,
+            "only the stage that differs is changed: {out}"
+        );
+        assert_eq!(changes[0]["entity"], "stage", "{out}");
+        assert_eq!(
+            changes[0]["after"]["rows"].as_array().unwrap().len(),
+            mine.len() - 1,
+            "{out}"
+        );
+        if stage["route_count"].as_i64().unwrap() > 1 {
+            // shared: R1 alone moves onto a stage of its own and every other
+            // route keeps the original - an upload never changes a route it
+            // does not name
+            assert_eq!(changes[0]["op"], "split", "{out}");
+            assert_eq!(changes[0]["after"]["routes"], json!(["R1"]), "{out}");
+            assert_eq!(
+                changes[0]["after"]["from_stage_id"], stage["stage_key"],
+                "{out}"
+            );
+            seen.0 = true;
+        } else {
+            // R1 is the only route on it: the stage itself is changed
+            assert_eq!(changes[0]["op"], "update", "{out}");
+            assert_eq!(changes[0]["entity_key"], stage["stage_key"], "{out}");
+            seen.1 = true;
+        }
+    }
+    assert!(
+        seen.0 && seen.1,
+        "both a shared and an unshared stage were exercised: {seen:?}"
+    );
+    // a whole fare stage fewer is not something a stop list can say
+    let last_stage = served.last().unwrap()["stage_no"].clone();
+    let shorter: Vec<Value> = served
+        .iter()
+        .filter(|r| r["stage_no"] != last_stage)
+        .cloned()
+        .collect();
+    let (s, out, _) = call!(&app, upload(as_upload(&shorter), &d_up));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "route_stage_count",
+        "{out}"
+    );
+    assert_eq!(out["summary"]["changes"], 0, "{out}");
+    call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{d_up}/discard"))
+    );
+
+    // ======================================================== stages and a route's stages from a file
+    // A stages feed takes two uploads a stop-list feed does not: the stops of
+    // stages, and which stages each route runs through. Neither names the
+    // other's columns: a route's file has no stops in it, only stages.
+    let bulk = |kind: &str, rows: Value, set: &str, dry: bool| {
+        ed.req("POST", &format!("/change-sets/{set}/bulk"))
+            .set_json(json!({"kind": kind, "rows": rows, "dry_run": dry}))
+    };
+    let r3_table = table_rows(&pool, "R3").await;
+    let d_st = draft!("stages from a file");
+    // two new stages: one whose id the server makes, one that brings its own
+    let new_stages = json!([
+        {"action": "add", "direction": "up", "name": "UPLOADED", "position": 1, "stop_id": "X"},
+        {"action": "add", "direction": "up", "name": "UPLOADED", "position": 2, "stop_id": "F"},
+        {"action": "add", "stage_id": "stg_up1", "direction": "up", "name": "UPLOADED 2",
+         "position": 1, "stop_id": "G", "stop_type": "NEW STOP"},
+    ]);
+    let (s, out, _) = call!(&app, bulk("stages", new_stages.clone(), &d_st, true));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["summary"]["errors"], 0, "{out}");
+    assert_eq!(
+        out["summary"]["changes"], 2,
+        "one change per stage, not per row: {out}"
+    );
+    let (s, out, _) = call!(&app, bulk("stages", new_stages, &d_st, false));
+    assert_eq!(s, 200, "{out}");
+    let made = out["changes_preview"].as_array().unwrap();
+    assert_eq!(made[0]["op"], "create", "{out}");
+    let minted = made[0]["entity_key"].as_str().unwrap().to_string();
+    assert!(
+        minted.starts_with("stg_") && minted.len() == 14,
+        "a short id is made: {minted}"
+    );
+    // a blank stop_type is the head of the stage, then the stops after it
+    assert_eq!(
+        made[0]["after"]["rows"],
+        stops(&[("X", "NEW STOP"), ("F", "INTERMEDIATE STOP")]),
+        "{out}"
+    );
+    assert_eq!(made[1]["entity_key"], "stg_up1", "{out}");
+    // R3 has no stages yet; its file names the two just made, in the same draft
+    let r3_stages = |action: &str| {
+        json!([
+            {"action": action, "route_id": "R3", "position": 1, "stage_id": minted, "direction": "up"},
+            {"action": action, "route_id": "R3", "position": 2, "stage_id": "stg_up1"},
+        ])
+    };
+    let (s, out, _) = call!(&app, bulk("route_stages", r3_stages("update"), &d_st, true));
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "route_stages_missing",
+        "{out}"
+    );
+    let (s, out, _) = call!(&app, bulk("route_stages", r3_stages("add"), &d_st, false));
+    assert_eq!(s, 200, "{out}");
+    let made = out["changes_preview"].as_array().unwrap();
+    assert_eq!(made.len(), 1, "a route's stages are one change: {out}");
+    assert_eq!(made[0]["entity"], "route_stages", "{out}");
+    assert_eq!(made[0]["op"], "replace", "{out}");
+    assert_eq!(
+        made[0]["after"]["stages"].as_array().unwrap().len(),
+        2,
+        "{out}"
+    );
+    let (s, b) = ship!(d_st);
+    assert_eq!(s, 200, "commit: {b}");
+    // the route is now what those stages hold, and its old rows were not rewritten
+    let (_, live, _) = call!(&app, ed.req("GET", &format!("/feeds/{FEED}/routes/R3")));
+    let calls: Vec<&str> = live["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["stop_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(calls, ["X", "F", "G"], "{live}");
+    assert_eq!(
+        table_rows(&pool, "R3").await,
+        r3_table,
+        "gtfs_route_stop is not written for a staged route"
+    );
+
+    let d_st2 = draft!("the same files again");
+    // what it already runs: nothing to do
+    let (_, out, _) = call!(
+        &app,
+        bulk("route_stages", r3_stages("update"), &d_st2, true)
+    );
+    assert_eq!(out["summary"]["changes"], 0, "{out}");
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "route_stages_unchanged",
+        "{out}"
+    );
+    // add is for a route with none
+    let (_, out, _) = call!(&app, bulk("route_stages", r3_stages("add"), &d_st2, true));
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "route_stages_exist",
+        "{out}"
+    );
+    // a stage nobody made is not made by naming it: the upload never creates one
+    let (_, out, _) = call!(
+        &app,
+        bulk(
+            "route_stages",
+            json!([{"action": "update", "route_id": "R3", "position": 1, "stage_id": "stg_nope"}]),
+            &d_st2,
+            true
+        )
+    );
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "stage_not_found",
+        "{out}"
+    );
+    assert_eq!(out["summary"]["changes"], 0, "{out}");
+    // a route runs through a stage once
+    let (_, out, _) = call!(
+        &app,
+        bulk(
+            "route_stages",
+            json!([
+                {"action": "update", "route_id": "R3", "position": 1, "stage_id": "stg_up1"},
+                {"action": "update", "route_id": "R3", "position": 2, "stage_id": "stg_up1"},
+            ]),
+            &d_st2,
+            true
+        )
+    );
+    assert_eq!(
+        out["rows"][1]["messages"][0]["code"], "stage_repeated",
+        "{out}"
+    );
+    // a stop column is not a column of this file
+    let (_, out, _) = call!(
+        &app,
+        bulk(
+            "route_stages",
+            json!([{"action": "update", "route_id": "R3", "position": 1, "stage_id": "stg_up1", "stop_id": "G"}]),
+            &d_st2,
+            true
+        )
+    );
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "invalid_row",
+        "{out}"
+    );
+
+    // a stage's stops, uploaded again
+    let same = json!([{"action": "update", "stage_id": "stg_up1", "position": 1, "stop_id": "G"}]);
+    let (_, out, _) = call!(&app, bulk("stages", same, &d_st2, true));
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "stage_unchanged",
+        "{out}"
+    );
+    assert_eq!(out["summary"]["changes"], 0, "{out}");
+    let more = json!([
+        {"action": "update", "stage_id": "stg_up1", "position": 1, "stop_id": "G"},
+        {"action": "update", "stage_id": "stg_up1", "position": 2, "stop_id": "A"},
+    ]);
+    let (_, out, _) = call!(&app, bulk("stages", more, &d_st2, true));
+    assert_eq!(out["summary"]["errors"], 0, "{out}");
+    let changes = out["changes_preview"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{out}");
+    assert_eq!(changes[0]["op"], "update", "{out}");
+    assert_eq!(changes[0]["entity_key"], "stg_up1|up", "{out}");
+    assert!(
+        has_code(
+            out["rows"][0]["messages"].as_array().unwrap(),
+            "stage_changes_routes"
+        ),
+        "it says the routes it reaches: {out}"
+    );
+    // add is for a stage that is not there, delete for one no route runs
+    let again = json!([{"action": "add", "stage_id": "stg_up1", "direction": "down", "name": "N", "position": 1, "stop_id": "G"}]);
+    let (_, out, _) = call!(&app, bulk("stages", again, &d_st2, true));
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "stage_exists",
+        "{out}"
+    );
+    let gone = json!([{"action": "delete", "stage_id": "stg_up1"}]);
+    let (_, out, _) = call!(&app, bulk("stages", gone, &d_st2, true));
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "stage_in_use",
+        "{out}"
+    );
+    let unknown =
+        json!([{"action": "update", "stage_id": "stg_up1", "position": 1, "stop_id": "NOPE"}]);
+    let (_, out, _) = call!(&app, bulk("stages", unknown, &d_st2, true));
+    assert_eq!(
+        out["rows"][0]["messages"][0]["code"], "unknown_stop",
+        "{out}"
+    );
+    call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{d_st2}/discard"))
+    );
+
+    // ======================================================== and a feed that does not use stages has none
+    exec(
+        &pool,
+        &[format!(
+            "UPDATE gtfs_feed SET use_stages = false WHERE gtfs_id = '{FEED}'"
+        )],
+    )
+    .await;
+    // the route is its own rows again
+    assert_eq!(
+        route_rows(&pool, "R1").await,
+        original,
+        "off, a route is its rows in gtfs_route_stop"
+    );
+    let (_, rs, _) = call!(
+        &app,
+        ed.req("GET", &format!("/feeds/{FEED}/routes/R1/stages"))
+    );
+    assert_eq!(rs["has_stages"], false, "{rs}");
+    assert_eq!(rs["stages"].as_array().unwrap().len(), 0, "{rs}");
+    // a stage change is refused outright...
+    let d12 = draft!("a stage on a feed without stages");
     let b = added!(
-        d11,
-        json!({"entity": "route_stages", "op": "replace", "entity_key": "R2", "after": {
-            "stages": [{"stage_id": alpha}, {"stage_id": "stg_gamma", "stage_no": 5}],
-            "base_stages_hash": rs["stages_hash"]}})
+        d12,
+        json!({"entity": "stage", "op": "update", "entity_key": "stg_gamma", "after": {"name": "NOPE"}})
+    );
+    assert!(has_code(&findings(&b, "error"), "stages_off"), "{b}");
+    call!(&app, ed.req("POST", &format!("/change-sets/{d12}/discard")));
+    // ...and the stop list is editable again, where a staged route refused it
+    let d13 = draft!("edit the stop list directly");
+    let (_, live, _) = call!(&app, ed.req("GET", &format!("/feeds/{FEED}/routes/R1")));
+    let b = added!(
+        d13,
+        json!({"entity": "route_stops", "op": "replace", "entity_key": "R1", "after": {
+            "rows": [{"stop_id": "G", "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "OLD"}],
+            "base_rows_hash": live["rows_hash"]}})
     );
     assert!(
-        has_code(&findings(&b, "warning"), "route_out_of_sync"),
-        "{b}"
+        !has_code(&findings(&b, "error"), "route_has_stages"),
+        "off, a route is edited as a stop list: {b}"
     );
-    call!(&app, ed.req("POST", &format!("/change-sets/{d11}/discard")));
+    call!(&app, ed.req("POST", &format!("/change-sets/{d13}/discard")));
+    // the same kind of upload now replaces the route's rows, as it always did
+    let d14 = draft!("upload with stages off");
+    let (s, out, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{d14}/bulk"))
+            .set_json(json!({
+            "kind": "route_stops", "dry_run": true,
+            "rows": [{"action": "update", "route_id": "R1", "sequence": 1, "stop_id": "G",
+                      "stop_type": "NEW STOP", "stage_no": 1, "stage_name": "OLD"}]}))
+    );
+    assert_eq!(s, 200, "{out}");
+    let changes = out["changes_preview"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{out}");
+    assert_eq!(
+        changes[0]["entity"], "route_stops",
+        "off, an upload replaces the route's rows: {out}"
+    );
+    assert_eq!(changes[0]["op"], "replace", "{out}");
+    call!(&app, ed.req("POST", &format!("/change-sets/{d14}/discard")));
+
+    // and the two stage files are not taken at all
+    let d15 = draft!("stage files with stages off");
+    for (kind, rows) in [
+        (
+            "route_stages",
+            json!([{"action": "update", "route_id": "R3", "position": 1, "stage_id": "stg_up1"}]),
+        ),
+        (
+            "stages",
+            json!([{"action": "update", "stage_id": "stg_up1", "position": 1, "stop_id": "G"}]),
+        ),
+    ] {
+        let (s, out, _) = call!(
+            &app,
+            ed.req("POST", &format!("/change-sets/{d15}/bulk"))
+                .set_json(json!({"kind": kind, "rows": rows, "dry_run": true}))
+        );
+        assert_eq!(s, 400, "{out}");
+        assert_eq!(code_of(&out), "stages_off", "{out}");
+    }
+    call!(&app, ed.req("POST", &format!("/change-sets/{d15}/discard")));
 
     exec(&pool, &clear_feed(FEED)).await;
     std::fs::remove_dir_all(dir).ok();

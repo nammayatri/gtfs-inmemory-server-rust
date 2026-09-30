@@ -38,8 +38,10 @@ DELETE FROM gtfs_stop             WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_agency           WHERE gtfs_id = 'stages_demo';
 DELETE FROM gtfs_feed             WHERE gtfs_id = 'stages_demo';
 
-INSERT INTO gtfs_feed (gtfs_id, display_name, data_source, agency_name)
-VALUES ('stages_demo', 'Stages demo (dummy data)', 'preprocessed', 'MTC');
+-- use_stages: this feed exists to show stages, so it is served from them
+-- (migration 0027). Without it the dashboard offers nothing about stages here.
+INSERT INTO gtfs_feed (gtfs_id, display_name, data_source, agency_name, use_stages)
+VALUES ('stages_demo', 'Stages demo (dummy data)', 'preprocessed', 'MTC', true);
 
 -- ---------------------------------------------------------------- corridors
 -- 40 distinct stops from each of five long routes, in route order, never a

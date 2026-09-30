@@ -452,7 +452,8 @@ async fn members_work_only_on_the_feeds_they_are_granted() {
     assert_eq!(me["is_admin"], false, "{me}");
     assert_eq!(
         me["feeds"],
-        json!([{"gtfs_id": FEED_A, "display_name": format!("Feed access test {FEED_A}"), "role": "viewer", "gps": null}]),
+        json!([{"gtfs_id": FEED_A, "display_name": format!("Feed access test {FEED_A}"), "role": "viewer",
+                "gps": null, "use_stages": false}]),
         "{me}"
     );
     let (s, b, _) = call!(&app, approver_a.req("GET", "/feeds"));

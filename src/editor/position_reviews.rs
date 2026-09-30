@@ -546,19 +546,19 @@ pub async fn calls(conn: &mut PgConnection, g: &str, stop_id: &str) -> EditorRes
         "SELECT t.route_id, r.short_name, t.sequence, t.stop_type, \
                 p.stop_id AS prev_id, p.name AS prev_name, p.lat AS prev_lat, p.lon AS prev_lon, \
                 n.stop_id AS next_id, n.name AS next_name, n.lat AS next_lat, n.lon AS next_lon \
-         FROM gtfs_route_stop t \
+         FROM gtfs_route_stop_effective t \
          CROSS JOIN LATERAL ( \
              SELECT r.short_name FROM gtfs_route r \
              WHERE r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted LIMIT 1) r \
          LEFT JOIN LATERAL ( \
-             SELECT x.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop x \
+             SELECT x.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop_effective x \
              JOIN gtfs_stop s ON s.gtfs_id = x.gtfs_id AND s.stop_id = x.stop_id \
              WHERE x.gtfs_id = t.gtfs_id AND x.route_id = t.route_id AND x.pattern_key = t.pattern_key \
                AND x.sequence < t.sequence \
                AND x.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
              ORDER BY x.sequence DESC LIMIT 1) p ON true \
          LEFT JOIN LATERAL ( \
-             SELECT x.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop x \
+             SELECT x.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop_effective x \
              JOIN gtfs_stop s ON s.gtfs_id = x.gtfs_id AND s.stop_id = x.stop_id \
              WHERE x.gtfs_id = t.gtfs_id AND x.route_id = t.route_id AND x.pattern_key = t.pattern_key \
                AND x.sequence > t.sequence \

@@ -168,7 +168,7 @@ pub async fn stop(conn: &mut PgConnection, g: &str, stop_id: &str) -> EditorResu
     let mut same_name: Vec<(f64, Value)> = sqlx::query(
         "SELECT s.stop_id, s.name, s.lat, s.lon, s.parent_station, s.platform_code, s.description, \
                 similarity(s.name, $3)::float8 AS similarity, \
-                (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop rs \
+                (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stop_effective rs \
                   WHERE rs.gtfs_id = s.gtfs_id AND rs.stop_id = s.stop_id) AS route_count \
          FROM gtfs_stop s \
          WHERE s.gtfs_id = $1 AND NOT s.deleted AND s.location_type = 0 AND s.stop_id <> $2 \
@@ -257,7 +257,7 @@ pub async fn route(conn: &mut PgConnection, g: &str, route_id: &str) -> EditorRe
 
     let stops_with_reviews = sqlx::query(
         "SELECT rs.stop_id, rs.sequence, r.review_id, r.status \
-         FROM gtfs_route_stop rs \
+         FROM gtfs_route_stop_effective rs \
          JOIN gtfs_position_review r ON r.gtfs_id = rs.gtfs_id AND r.stop_id = rs.stop_id \
          WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.pattern_key = 1 AND r.status = ANY($3) \
          ORDER BY rs.sequence, r.review_id",
@@ -280,7 +280,7 @@ pub async fn route(conn: &mut PgConnection, g: &str, route_id: &str) -> EditorRe
 
     // each served call's own detour, between the served stops either side
     let served: Vec<(i32, String, String, f64, f64)> = sqlx::query(
-        "SELECT rs.sequence, rs.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop rs \
+        "SELECT rs.sequence, rs.stop_id, s.name, s.lat, s.lon FROM gtfs_route_stop_effective rs \
          JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
          WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.pattern_key = 1 AND rs.stop_type <> ALL($3) \
          ORDER BY rs.sequence",

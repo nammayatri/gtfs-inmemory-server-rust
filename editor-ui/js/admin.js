@@ -184,10 +184,10 @@ export async function showFeedSettings() {
       })));
       const pending = new Map([...configs.entries()].map(([g, c]) => [g, c.pending || []]));
       clear(tableBox, h("div.table-wrap", h("table",
-        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Trips from"), h("th", "Feed version"), h("th", "Waiting in a draft"), h("th", ""))),
+        h("thead", h("tr", h("th", "Feed"), h("th", "Data source"), h("th", "Trips from"), h("th", "Routes built from"), h("th", "Feed version"), h("th", "Waiting in a draft"), h("th", ""))),
         h("tbody", feeds.length
           ? feeds.map((f) => feedRow(f, pending.get(f.gtfs_id) || [], configs.get(f.gtfs_id) || {}, load))
-          : h("tr", h("td", { colspan: "6" }, "No feeds yet."))))));
+          : h("tr", h("td", { colspan: "7" }, "No feeds yet."))))));
     } catch (e) {
       clear(tableBox, h("p.notice.error", e.message));
     }
@@ -240,11 +240,33 @@ function feedRow(f, pending, config, reload) {
     }
     reload();
   };
+  // Whether the feed is served from its stages. On, a route that has stages is
+  // what they say; off, the feed has no stages at all and a route is its stop
+  // list. It changes what passengers are served, so it goes through a draft.
+  const stages = !!config.use_stages;
+  const switchStages = async () => {
+    const ok = await confirmDialog(
+      stages ? `Stop building ${name}'s routes from stages?` : `Build ${name}'s routes from stages?`,
+      stages
+        ? "Every route goes back to its own stop list, and nothing about stages is offered on this feed. The stages themselves are kept, not deleted. It takes effect when the draft is committed."
+        : "A route that has stages will be what its stages say, everywhere: in the dashboard, in the export and for passengers. Its own stop list is no longer read or written. It takes effect when the draft is committed.",
+      { confirm: "Add to draft", danger: true },
+    );
+    if (!ok) return;
+    try {
+      await addChange({ entity: "feed_config", op: "update", entity_key: f.gtfs_id, after: { use_stages: !stages } });
+    } catch (e) {
+      toast(e.message, "error");
+    }
+    reload();
+  };
   return h("tr",
     h("td", h("strong", name), f.display_name ? h("div.hint", f.gtfs_id) : null),
     h("td", DATA_SOURCE_LABEL[f.data_source] || f.data_source),
     h("td", trips ? DATA_SOURCE_LABEL[trips] || trips : "",
       trips && current ? h("div", h("button.btn.quiet.small", { type: "button", on: { click: switchTrips } }, `Switch to ${DATA_SOURCE_LABEL[tripsTarget].toLowerCase()}`)) : null),
+    h("td", stages ? "Stages" : "Stop lists",
+      current ? h("div", h("button.btn.quiet.small", { type: "button", on: { click: switchStages } }, stages ? "Switch to stop lists" : "Switch to stages")) : null),
     h("td", f.version),
     h("td.feed-pending", pending.length
       ? h("ul.list", pending.map((p) => h("li",

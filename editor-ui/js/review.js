@@ -628,6 +628,7 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
 const SETTING_LABEL = {
   data_source: "Served from", trips_source: "Trips served from", default_run_s: "Default time between stops (s)",
   default_dwell_s: "Default time at a stop (s)", schedule_sync: "Schedule sync", sync_running_times: "Sync running times",
+  use_stages: "Routes built from stages",
 };
 function feedConfigDiff(ch, cs) {
   const b = ch.before || {}, a = ch.after || {};
