@@ -12,7 +12,9 @@ use super::import_jobs;
 use super::position_reviews;
 use super::proposals;
 use super::records;
+use super::route_issues;
 use super::service::{self as svc, Page, StopQuery};
+use super::stage_reviews;
 use super::stages;
 use super::trips;
 use super::validation::valid_lat_lon;
@@ -986,6 +988,8 @@ pub struct StagesQuery {
     direction: Option<String>,
     #[serde(default)]
     unused: bool,
+    /// `any`, `none`, or one review reason (section 19.1)
+    review: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -1004,6 +1008,7 @@ pub async fn stages(
         route_id: q.route_id.clone(),
         direction: q.direction.clone(),
         unused: q.unused,
+        review: q.review.clone(),
     };
     ok(stages::list_stages(&st, &path, &query, &page).await?)
 }
@@ -1016,7 +1021,8 @@ pub async fn stage(
     let (g, id) = path.into_inner();
     auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
-    ok(stages::stage_detail(&mut conn, &g, &id).await?)
+    let key = stages::resolve_key(&mut conn, &g, &id).await?;
+    ok(stages::stage_detail(&mut conn, &g, &key).await?)
 }
 
 pub async fn route_stages(
@@ -1688,6 +1694,85 @@ pub async fn commit(
     ok(svc::commit(&st, &ctx, *path).await?)
 }
 
+/// Several drafts of one feed at once: `POST /feeds/{g}/change-sets/submit`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSubmitBody {
+    change_set_ids: Vec<Uuid>,
+}
+
+pub async fn change_sets_submit(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<BatchSubmitBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_feed(&req, &st, &path, Role::Editor).await?;
+    ok(svc::submit_many(&st, &ctx, &path, &body.into_inner().change_set_ids).await?)
+}
+
+/// Several drafts of one feed at once: `POST /feeds/{g}/change-sets/approve`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchApproveBody {
+    change_set_ids: Vec<Uuid>,
+    #[serde(default)]
+    comment: Option<String>,
+    /// An admin approving the sets among these that they submitted says so here.
+    #[serde(default)]
+    self_approve: bool,
+}
+
+pub async fn change_sets_approve(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<BatchApproveBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_feed(&req, &st, &path, Role::Approver).await?;
+    let b = body.into_inner();
+    ok(svc::approve_many(
+        &st,
+        &ctx,
+        &path,
+        &b.change_set_ids,
+        b.comment.as_deref(),
+        b.self_approve,
+    )
+    .await?)
+}
+
+/// `POST /feeds/{g}/change-sets/commit`: the sets go live as one feed version.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchCommitBody {
+    change_set_ids: Vec<Uuid>,
+    /// Approve the submitted sets first, in the same transaction.
+    #[serde(default)]
+    approve: bool,
+    #[serde(default)]
+    self_approve: bool,
+}
+
+pub async fn change_sets_commit(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<BatchCommitBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_feed(&req, &st, &path, Role::Approver).await?;
+    let b = body.into_inner();
+    ok(svc::commit_many(
+        &st,
+        &ctx,
+        &path,
+        &b.change_set_ids,
+        b.approve,
+        b.self_approve,
+    )
+    .await?)
+}
+
 pub async fn discard(
     req: HttpRequest,
     st: Data,
@@ -1971,6 +2056,163 @@ pub async fn position_review(
     })
     .await?;
     ok(detail)
+}
+
+// ------------------------------------------------------------- stage reviews
+
+/// The stage review list's query: the proposal filters plus `reason`.
+#[derive(Deserialize)]
+pub struct StageReviewsQuery {
+    status: Option<String>,
+    q: Option<String>,
+    /// one of stage_reviews::REASONS (section 19.1)
+    reason: Option<String>,
+    /// only the reviews changing at least this many stop calls
+    min_impact: Option<i32>,
+    /// `stage` groups the list one row per stage id, its directions inside
+    group: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn stage_reviews(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<StageReviewsQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    let filters = proposals::ListQuery {
+        status: q.status.clone(),
+        bbox: None,
+        q: q.q.clone(),
+    };
+    if matches!(q.group.as_deref(), Some("stage") | Some("name")) {
+        return ok(stage_reviews::list_by_stage(
+            &st,
+            &path,
+            &filters,
+            q.reason.as_deref(),
+            q.min_impact,
+            &page,
+        )
+        .await?);
+    }
+    ok(stage_reviews::list(
+        &st,
+        &path,
+        &filters,
+        q.reason.as_deref(),
+        q.min_impact,
+        &page,
+    )
+    .await?)
+}
+
+pub async fn stage_review_summary(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    ok(stage_reviews::summary(&st, &path).await?)
+}
+
+pub async fn stage_review(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    auth::require_object(&req, &st, Object::StageReview(*path), Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(stage_reviews::detail(&mut conn, *path).await?)
+}
+
+pub async fn stage_review_close(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<stage_reviews::CloseBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_object(&req, &st, Object::StageReview(*path), Role::Editor).await?;
+    ok(stage_reviews::close(&st, &ctx, *path, &body).await?)
+}
+
+pub async fn stage_review_reopen(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_object(&req, &st, Object::StageReview(*path), Role::Editor).await?;
+    ok(stage_reviews::reopen(&st, &ctx, *path).await?)
+}
+
+// ------------------------------------------------------- routes to review
+
+/// The route-issue list's query: the proposal filters plus `issue`.
+#[derive(Deserialize)]
+pub struct RouteIssuesQuery {
+    status: Option<String>,
+    q: Option<String>,
+    /// one of route_issues::ISSUES (section 19.2)
+    issue: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn route_issues(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<RouteIssuesQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let page = Page::parse(q.limit, q.cursor.as_deref())?;
+    let filters = proposals::ListQuery {
+        status: q.status.clone(),
+        bbox: None,
+        q: q.q.clone(),
+    };
+    ok(route_issues::list(&st, &path, &filters, q.issue.as_deref(), &page).await?)
+}
+
+pub async fn route_issue_summary(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    ok(route_issues::summary(&st, &path).await?)
+}
+
+pub async fn route_issue(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    auth::require_object(&req, &st, Object::RouteIssue(*path), Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(route_issues::detail(&mut conn, *path).await?)
+}
+
+pub async fn route_issue_close(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+    body: web::Json<route_issues::CloseBody>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_object(&req, &st, Object::RouteIssue(*path), Role::Editor).await?;
+    ok(route_issues::close(&st, &ctx, *path, &body).await?)
+}
+
+pub async fn route_issue_reopen(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<i64>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_object(&req, &st, Object::RouteIssue(*path), Role::Editor).await?;
+    ok(route_issues::reopen(&st, &ctx, *path).await?)
 }
 
 pub async fn position_review_move(

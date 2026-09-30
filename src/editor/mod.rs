@@ -24,7 +24,9 @@ pub mod jwt;
 pub mod position_reviews;
 pub mod proposals;
 pub mod records;
+pub mod route_issues;
 pub mod service;
+pub mod stage_reviews;
 pub mod stages;
 pub mod static_ui;
 pub mod trips;
@@ -341,6 +343,18 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 "/feeds/{gtfs_id}/change-sets",
                 web::post().to(h::change_set_create),
             )
+            .route(
+                "/feeds/{gtfs_id}/change-sets/submit",
+                web::post().to(h::change_sets_submit),
+            )
+            .route(
+                "/feeds/{gtfs_id}/change-sets/approve",
+                web::post().to(h::change_sets_approve),
+            )
+            .route(
+                "/feeds/{gtfs_id}/change-sets/commit",
+                web::post().to(h::change_sets_commit),
+            )
             .route("/change-sets/{id}", web::get().to(h::change_set))
             .route("/change-sets/{id}/changes", web::post().to(h::change_add))
             .route(
@@ -444,6 +458,40 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/position-reviews/{id}/reopen",
                 web::post().to(h::position_review_reopen),
+            )
+            .route(
+                "/feeds/{gtfs_id}/stage-reviews",
+                web::get().to(h::stage_reviews),
+            )
+            .route(
+                "/feeds/{gtfs_id}/stage-reviews/summary",
+                web::get().to(h::stage_review_summary),
+            )
+            .route("/stage-reviews/{id}", web::get().to(h::stage_review))
+            .route(
+                "/stage-reviews/{id}/close",
+                web::post().to(h::stage_review_close),
+            )
+            .route(
+                "/stage-reviews/{id}/reopen",
+                web::post().to(h::stage_review_reopen),
+            )
+            .route(
+                "/feeds/{gtfs_id}/route-issues",
+                web::get().to(h::route_issues),
+            )
+            .route(
+                "/feeds/{gtfs_id}/route-issues/summary",
+                web::get().to(h::route_issue_summary),
+            )
+            .route("/route-issues/{id}", web::get().to(h::route_issue))
+            .route(
+                "/route-issues/{id}/close",
+                web::post().to(h::route_issue_close),
+            )
+            .route(
+                "/route-issues/{id}/reopen",
+                web::post().to(h::route_issue_reopen),
             )
             // cache state and webhooks
             .route(

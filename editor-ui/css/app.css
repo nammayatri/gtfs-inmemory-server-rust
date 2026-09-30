@@ -220,6 +220,54 @@ table.people .feed-col { white-space: nowrap; }
 }
 .nav .nav-menu-body a { display: grid; gap: 1px; padding: 8px 10px; white-space: normal; }
 .nav .nav-menu-body a span { font-size: var(--fs-xs); color: var(--muted); font-weight: 400; }
+/* Every page lives behind one button at the left of the bar, so the row does
+   not run out of width as pages are added. It says where you are when a page
+   of its own is open. */
+.nav-drawer > summary { display: flex; align-items: center; gap: 6px; }
+.nav-drawer > summary::before {
+  content: "\2630"; font-size: 15px; line-height: 1;
+}
+.nav-drawer > summary::after { content: none; }
+.nav-drawer > summary[data-here]:not([data-here=""])::after {
+  content: "\00a0\00b7\00a0" attr(data-here); font-weight: 400; color: var(--muted);
+}
+/* it sits at the right end of the bar, past the person's name, so its panel
+   hangs from the right edge */
+.topbar .nav-drawer { order: 99; }
+.nav-drawer > .nav-menu-body {
+  left: auto; right: 0; width: auto; min-width: 250px; max-height: 80vh; overflow: auto;
+}
+.nav-drawer .nav { display: grid; gap: 2px; }
+.nav-drawer .nav a { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+/* the Feed data menu inside the drawer opens in the flow, not over it */
+.nav-drawer .nav-menu { position: static; }
+.nav-drawer .nav-menu > .nav-menu-body {
+  position: static; width: auto; margin: 2px 0 2px 10px; padding: 2px;
+  border: 0; border-left: 2px solid var(--line); border-radius: 0; box-shadow: none;
+}
+/* what is a guess and what is a stand-in, said at the top of the queue */
+.filled-in { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 8px 0; }
+.filled-in > summary { cursor: pointer; font-weight: 700; font-size: var(--fs-s); }
+.filled-in ul { margin: 8px 0 4px; }
+.filled-in li { margin-bottom: 4px; }
+
+/* our fare stages against MTC's, lined up so the difference is what you see */
+.two-lists { display: grid; gap: 1px; font-size: var(--fs-s); }
+.two-lists-head, .two-lists-row {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 4px 8px; border-radius: 4px;
+}
+.two-lists-head { color: var(--muted); font-size: var(--fs-xs); }
+.two-lists-row.differs { background: var(--draft-tint); }
+.two-lists-row.differs span { font-weight: 700; }
+.two-lists-row .gap { color: var(--muted); font-weight: 400; }
+/* the same stage, spelt differently: lined up, and said so */
+.two-lists-row.spelt > span { color: var(--muted); }
+/* the marker belongs to the row, so only the first column carries it: `.ids` is
+   an element child of the second, and `span:first-child` would catch that too */
+.two-lists-row.spelt > span:first-child::after {
+  content: "\00a0\00b7 spelling"; font-size: var(--fs-xs);
+}
+.two-lists-row span { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
 .nav-count {
   display: inline-block; min-width: 20px; margin-left: 4px; padding: 0 6px; border-radius: 999px;
   background: var(--draft-tint); color: var(--draft); font-size: var(--fs-xs); text-align: center;
@@ -461,6 +509,8 @@ table.people .feed-col { white-space: nowrap; }
 .route-chip {
   min-height: 26px; padding: 1px 8px; border: 1px solid var(--rule-strong); border-radius: 999px; background: var(--surface);
   font: 700 var(--fs-xs)/1.2 var(--font); color: var(--ink); cursor: pointer;
+  /* in a flex row a chip is squeezed until its words wrap one letter a line */
+  flex: none; white-space: nowrap;
 }
 .route-chip:hover { background: var(--action-tint); }
 .route-chip[aria-pressed="true"] { background: #1f5fbf; border-color: #1f5fbf; color: #fff; }
@@ -823,6 +873,71 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
 .stage-list.editing .list-item { grid-template-columns: 64px 1fr auto; }
 .stage-list input.stage-no-input { width: 56px; }
 .stage-stops { margin: 0; padding-left: 22px; display: grid; gap: 4px; }
+/* one stage of a reviewed name beside the others, so where the routes part
+   company is visible rather than described */
+.stage-review-cards {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.stage-review-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0;
+}
+.stage-review-card h3 { margin: 0 0 6px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.stage-review-card .swatch {
+  width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex: none;
+}
+.stage-review-card .stage-stops { font-size: var(--fs-s); }
+/* the stop list the reviewer builds, and the lists the routes give to build it from */
+.stage-build li { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 3px 0; }
+.stage-build li .btn-row { margin-left: auto; gap: 4px; }
+/* a row is dragged by its handle; the row it would land on is ruled above.
+   It never wraps: the name gives way first, so the handle and the two buttons
+   stay on the line however long the stop is called. */
+.stage-build li.stop-row {
+  flex-wrap: nowrap; padding: 4px 2px; border-radius: 6px;
+}
+.stage-build li.stop-row:hover { background: var(--action-tint); }
+.stage-build li.stop-row.drop-here { box-shadow: inset 0 2px 0 var(--action); }
+.stage-build .stop-row-name {
+  flex: 1 1 auto; min-width: 3em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stage-build li.stop-row .ids { flex: none; }
+.stage-build li.stop-row .chip { flex: none; }
+.stage-build li.stop-row .btn-row { flex: none; flex-wrap: nowrap; }
+/* removed, but still here until the save, so Undo can put it back */
+.stage-build li.stop-row.is-removed { opacity: .65; }
+.stage-build li.stop-row.is-removed .stop-row-name,
+.stage-build li.stop-row.is-removed .ids { text-decoration: line-through; }
+.stage-build li.stop-row.is-removed:hover { background: none; }
+.stage-build .grip {
+  flex: none; width: 22px; min-height: 24px; padding: 0; border: 0; border-radius: 4px;
+  background: none; color: var(--muted); font: 700 var(--fs-s)/1 var(--font);
+  cursor: grab; letter-spacing: -2px;
+}
+.stage-build .grip:hover { background: var(--rule); color: var(--ink); }
+.stage-build .grip:active { cursor: grabbing; }
+.stage-build li.stop-row[draggable="true"] { cursor: default; }
+.stage-build .route-chip[disabled] { opacity: .4; cursor: not-allowed; }
+/* splitting a list of routes off onto a stage of their own */
+.split-form {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); display: grid; gap: 8px;
+}
+.split-form .field { margin: 0; }
+/* the lists the routes give a stage under review. Not ".candidate": the
+   coordinate review already owns that name, and its two-column grid. */
+.stop-choices { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.stop-choice {
+  display: block; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+}
+.stop-choice.is-current { border-color: var(--action); background: var(--action-tint); }
+.stop-choice-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
+.stop-choice-stops {
+  margin: 6px 0; padding-left: 20px; font-size: var(--fs-s); display: grid; gap: 2px;
+}
+.stop-choice-stops .is-new { color: var(--action); font-weight: 700; }
+.stop-choice p { margin: 4px 0 0; }
+.neighbours { line-height: 1.5; }
+.stop-choice .btn { margin-top: 8px; }
 .stage-stops li.head { font-weight: 700; }
 .stage-stops.editing { list-style: none; padding-left: 0; }
 .stage-stops.editing .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-top: 1px solid #e4ebea; }
