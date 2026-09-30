@@ -114,14 +114,48 @@ pub fn link_key(l: &StageLink) -> StageKey {
     key
 }
 
-/// Whether a route is built from stages.
+/// Whether feed `g` is served from its stages (`gtfs_feed.use_stages`,
+/// migration 0027). Off, the feed has no stages as far as anything here is
+/// concerned: a route is its rows in `gtfs_route_stop` and nothing about stages
+/// is offered or applied. On, a route that has stages IS what they say, and
+/// `gtfs_route_stop` is not written for it.
+pub async fn feed_uses_stages(conn: &mut PgConnection, g: &str) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query("SELECT use_stages FROM gtfs_feed WHERE gtfs_id = $1")
+            .bind(g)
+            .fetch_optional(&mut *conn)
+            .await?
+            .map(|r| r.try_get::<bool, _>("use_stages"))
+            .transpose()?
+            .unwrap_or(false),
+    )
+}
+
+/// Refuse a stage change on a feed that does not use stages. Said once here so
+/// every stage write gives the same answer.
+pub(super) async fn require_stages(conn: &mut PgConnection, g: &str) -> Result<(), ApplyError> {
+    if feed_uses_stages(conn, g).await? {
+        return Ok(());
+    }
+    Err(fail(
+        "stages_off",
+        format!(
+            "feed {g} does not use stages: its routes are edited as stop lists.              Turn on \"Use stages\" in Feed settings to build routes from stages."
+        ),
+    ))
+}
+
+/// Whether a route is built from stages. Never, on a feed that does not use
+/// them: whatever is in `gtfs_route_stage`, the route is its stop list there.
 pub async fn has_stages(
     conn: &mut PgConnection,
     g: &str,
     route_id: &str,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query(
-        "SELECT EXISTS (SELECT 1 FROM gtfs_route_stage WHERE gtfs_id = $1 AND route_id = $2) AS has",
+        "SELECT EXISTS (SELECT 1 FROM gtfs_route_stage rs \
+                          JOIN gtfs_feed f ON f.gtfs_id = rs.gtfs_id AND f.use_stages \
+                         WHERE rs.gtfs_id = $1 AND rs.route_id = $2) AS has",
     )
     .bind(g)
     .bind(route_id)
@@ -1626,6 +1660,16 @@ pub async fn route_stages_of(
             "route_not_found",
             format!("no route {route_id}"),
         ));
+    }
+    // a feed that does not use stages has none, whatever the tables hold
+    if !feed_uses_stages(conn, g).await? {
+        return Ok(json!({
+            "route_id": route_id,
+            "has_stages": false,
+            "in_sync": true,
+            "stages_hash": live_links_hash(conn, g, route_id, variant).await?,
+            "stages": [],
+        }));
     }
     let links = sqlx::query(
         "SELECT rs.position, rs.stage_id, rs.direction, rs.stage_no, s.name, s.description, \

@@ -1,6 +1,6 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
-import { state, can } from "./state.js";
+import { state, can, usesStages } from "./state.js";
 import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
@@ -112,8 +112,9 @@ export function initSearch() {
     if (q.length < 2 || !state.feedId) return close();
     const mine = ++seq;
     try {
-      // one page of every group at once, in the order they are listed
-      const names = Object.keys(groups);
+      // one page of every group at once, in the order they are listed. A feed
+      // that does not use stages has none to find, so that group is not asked.
+      const names = Object.keys(groups).filter((n) => n !== "Stages" || usesStages());
       const pages = await Promise.all(names.map((n) => get(pageUrl(groups[n], q))));
       if (mine !== seq) return;
       query = q;
@@ -124,7 +125,7 @@ export function initSearch() {
       });
       active = names.some((n) => groups[n].items.length) ? 0 : -1;
       if (active === 0) render();
-      else { items = []; clear(box, h("p.search-empty", `Nothing matches "${q}". Try a route number like 45B, a stop name, a stop id, or a stage name.`)); }
+      else { items = []; clear(box, h("p.search-empty", `Nothing matches "${q}". Try a route number like 45B, a stop name${usesStages() ? ", a stop id, or a stage name" : " or a stop id"}.`)); }
       box.scrollTop = 0;
       box.hidden = false;
       input.setAttribute("aria-expanded", "true");
@@ -156,8 +157,8 @@ export async function showHome() {
   map.clearFocus();
   const p = clear(panel(),
     h("section.section",
-      h("h1", "Find a stop, route or stage"),
-      h("p", "Search above by stop name, stop id, route number or stage name, or zoom the map in to see stops and click one."),
+      h("h1", usesStages() ? "Find a stop, route or stage" : "Find a stop or route"),
+      h("p", `Search above by stop name, stop id${usesStages() ? ", route number or stage name" : " or route number"}, or zoom the map in to see stops and click one.`),
       can("editor")
         ? h("p.hint", "To change something, open it and choose Edit. To add a stop, route or station, use New at the top. Edits collect in a draft; nothing changes for passengers until another person approves and commits it.")
         : h("p.hint", "You can look at everything. Ask an admin for the editor role to make changes."),
@@ -500,11 +501,15 @@ export async function showRoute(routeId, { preview } = {}) {
       live ? h("div.btn-row", h("a.btn.secondary.small", { href: `#/trips/${enc(routeId)}` }, "Trips and timing")) : null,
       // the editors start from the live route and lay the draft's change over it themselves
       can("editor") && (live || created) ? h("div.btn-row",
-        created ? null : h("button.btn.secondary#edit-stop-list", { type: "button", on: { click: () => editRouteRows(live) } }, "Edit stop list"),
+        // on a feed built from stages a route with no stages has no stop list
+        // to edit: it gets its stops by being given stages, below
+        created || (usesStages() && !(live.rows || []).length) ? null : h("button.btn.secondary#edit-stop-list", { type: "button", on: { click: () => editRouteRows(live) } }, "Edit stop list"),
         h("button.btn.secondary", { type: "button", on: { click: () => editRouteDetails(created ? r : live, { created: !!created }) } }, "Edit name, colour and map line")) : null,
     ),
     live ? gpsTripsSection(live) : null,
-    routeListsSection(created ? r : live, { created: !!created }),
+    // a feed that does not use stages shows nothing about them: the route is
+    // its stop list and that is the whole of it
+    usesStages() ? routeListsSection(created ? r : live, { created: !!created }) : null,
     h("section.section", h("h2", "Stops by fare stage"), ladderBox,
       removed.length ? h("p.pending-removed.notice.draft", `Taken off the route in the draft: ${removed.map((d) => d.before.stop_name || d.before.marker_name || d.before.stop_id).join(", ")}.`) : null),
     live ? routeContext(live, { onReviews: (m) => { reviews = m; drawLadder(); } }) : null,

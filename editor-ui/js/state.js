@@ -67,6 +67,12 @@ export function feedRole(feedId = state.feedId) {
   if (state.me.is_admin) return "admin";
   return (state.me.feeds || []).find((f) => f.gtfs_id === feedId)?.role || null;
 }
+// Whether a feed is served from its stages (gtfs_feed.use_stages). Off, the
+// feed has no stages as far as the dashboard is concerned: nothing about them
+// is offered, and a route is its stop list. This is the one place that asks.
+export const usesStages = (feedId = state.feedId) =>
+  !!(state.feeds || []).find((f) => f.gtfs_id === feedId)?.use_stages;
+
 export const can = (role, feedId = state.feedId) => {
   const mine = feedRole(feedId);
   return !!mine && RANK[mine] >= RANK[role];

@@ -1870,6 +1870,14 @@ def main():
           f"{n_runs} route stages, "
           f"{len(reviews)} raised for review.")
     print("Every route is now built from its stages.")
+    # Writing the stages does not turn them on. Whether a feed is SERVED from its
+    # stages is its own setting (gtfs_feed.use_stages), changed through a draft
+    # because it changes what passengers get - so it is said here, not done.
+    if scalar(db, f"SELECT use_stages::text FROM gtfs_feed WHERE gtfs_id = {lit(gtfs)}") != "true":
+        print()
+        print(f"Note: {gtfs} is not served from its stages yet (use_stages is off), so")
+        print("nothing above reaches the dashboard or passengers. Turn it on in Feed")
+        print("settings - \"Switch to stages\" - which goes through a draft like any edit.")
     return 0
 
 

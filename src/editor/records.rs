@@ -599,11 +599,17 @@ fn target(file: &str, field: &str) -> Option<Target> {
             f => t("gtfs_trip", column_in(TRIP_COLUMNS, f)?, ROUTE_LIVE),
         },
         "stop_times.txt" => match field {
-            "stop_id" => t("gtfs_route_stop", "stop_id", ROUTE_LIVE),
-            "pickup_booking_rule_id" => t("gtfs_route_stop", "pickup_booking_rule_id", ROUTE_LIVE),
-            "drop_off_booking_rule_id" => {
-                t("gtfs_route_stop", "drop_off_booking_rule_id", ROUTE_LIVE)
-            }
+            "stop_id" => t("gtfs_route_stop_effective", "stop_id", ROUTE_LIVE),
+            "pickup_booking_rule_id" => t(
+                "gtfs_route_stop_effective",
+                "pickup_booking_rule_id",
+                ROUTE_LIVE,
+            ),
+            "drop_off_booking_rule_id" => t(
+                "gtfs_route_stop_effective",
+                "drop_off_booking_rule_id",
+                ROUTE_LIVE,
+            ),
             _ => None,
         },
         "calendar.txt" | "calendar_dates.txt" if field == "service_id" => {
@@ -1144,7 +1150,7 @@ pub async fn list_files(conn: &mut PgConnection, g: &str) -> EditorResult<Value>
             "stop_times.txt",
             count(
                 "SELECT coalesce(sum(n), 0)::bigint FROM gtfs_trip t JOIN (SELECT gtfs_id, route_id, pattern_key, count(*) n \
-                 FROM gtfs_route_stop WHERE gtfs_id = $1 AND stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
+                 FROM gtfs_route_stop_effective_all WHERE gtfs_id = $1 AND stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
                  GROUP BY 1, 2, 3) p ON p.gtfs_id = t.gtfs_id AND p.route_id = t.route_id AND p.pattern_key = t.pattern_key \
                  JOIN gtfs_route r ON r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted \
                  WHERE t.gtfs_id = $1",
