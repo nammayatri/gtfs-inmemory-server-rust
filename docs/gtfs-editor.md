@@ -2702,7 +2702,7 @@ Settled while implementing:
 
 Same 5,000-row limit, dry run and one-transaction rules as section 5.
 `timing_profiles` and `route_trips` may reference patterns, profiles and
-services created earlier in the same draft.
+services created earlier in the same draft. Section 19 adds `stop_merges`.
 
 **Big drafts.** An import is thousands of changes, and `GET /change-sets/{id}`
 answers every change with its `before` snapshot; at 10,000 changes that already
@@ -3831,3 +3831,84 @@ Tests: `tests/editor_feed_io_flow.rs` (a seed job done with its report, a job
 that fails with the seed's `feed_not_empty`, a drafts job, a viewer, a job that
 does not exist); `editor-ui/dev/ui_e2e.mjs --only feed,newfeed`, both through
 jobs; the chennai_bus drafts check through the page as a 27 s job.
+
+## 19. Scripted writes without a replay per change (2026-09-30)
+
+Every single-change write - `POST /change-sets/{id}/changes`, `PUT` and
+`DELETE /change-sets/{id}/changes/{change_id}` - answers with the set's first
+page (16.5, "Paging"), and that page replays the whole draft: every change is
+applied again, under the feed's advisory lock, and rolled back. The dashboard
+wants that, to show findings after each edit. A script adding changes one at a
+time does not, and pays for every change already in the draft on every call:
+adding change *n* replays *n*, so a draft of *n* changes costs about n²/2
+applies. On prod's chennai_bus, carrying 6,673 retired stop ids to their
+survivors as create + merge pairs (section 1, "Merged-away stop ids keep
+answering"), a draft of 200 pairs (400 changes) took about 27 minutes, some 4 s
+a change and nearly all of it replay. Running scripts in parallel does not help:
+every replay and commit of a feed queues on the same lock, and people editing
+the feed wait behind them.
+
+**`replay=false`.** Each of the three writes takes `?replay=false` and then
+answers with the ids alone - `201 {change_set_id, change_id}` for an add,
+`200 {change_set_id, change_id}` for an edit, `200 {change_set_id,
+removed_change_id}` for a removal. The change is stored exactly as without the
+flag: the same shape checks, `before` snapshot, base versions and audit, all of
+which run per change and none of which replays. Nothing is left unchecked: the
+draft is replayed when anyone reads its first page, and at submit, approve and
+commit. Without the flag the answer is what it always was.
+
+**Bulk kind `stop_merges`.** `POST /change-sets/{id}/bulk` with
+`kind: "stop_merges"` takes rows of
+
+| column | |
+|---|---|
+| `from_stop_id` | the stop that goes (required) |
+| `into_stop_id` | the stop that stays (required) |
+| `name`, `lat`, `lon` | only when the feed has no row for `from_stop_id`: it is created there first |
+| `keep_name`, `keep_position` | as the merge change takes them: `"into"` or `"from"` |
+
+and becomes one `stop/merge` per row, preceded by a `stop/create` of the stop
+that goes when the feed has no row for it - an id retired before the editor was
+seeded, which riders and caches still hold, gets a row only so that it can be
+merged and answer as its survivor. There is no `action` column: the kind is the
+action. Each row is checked against one read of the stops the upload names and
+the draft as it stands:
+
+| finding | when |
+|---|---|
+| `stop_not_found` (error) | `from_stop_id` has no row and the row does not give name, lat and lon; or `into_stop_id` does not exist |
+| `stop_is_station` (error) | either side is a station |
+| `stop_deleted`, `stop_merged_away` (error) | the stop kept is deleted or merged away (live or by the draft), or the stop that goes is already merged into another stop |
+| `into_merged_in_upload` (error) | the stop kept is merged away by another row of the same upload |
+| `merge_same_stop`, `merge_prm_stop` (error) | as a single merge change |
+| `duplicate_in_upload` (error) | two rows for one `from_stop_id` |
+| `unchanged` (warning, no change) | the stop that goes is already merged into this stop, live or by the draft |
+| `cells_not_used` (warning) | the stop that goes exists, and the row gives name, lat or lon anyway |
+
+The dry run and one-transaction rules of section 5 hold, as does the 5,000-row
+limit (up to 10,000 changes). A real run stores its changes through the
+single-change path, one after another inside the upload's transaction, so each
+is exactly what `POST /change-sets/{id}/changes` would have stored - one
+`change_added` audit per change, plus the upload's `bulk_imported` - and the
+upload replays the draft once, for its answer. Every bulk kind takes
+`"replay": false` in the body to answer without the set's page.
+
+A merge upload run again finds every row `unchanged` and writes nothing, in the
+same draft or after it is committed.
+
+Settled while implementing:
+
+- Stored through `add_change_to` rather than planned in memory as the other kinds
+  are, because a merge's `before` holds both stops' rows and every route calling
+  at the stop that goes, and `after` gains the kept stop's `into_row_version`:
+  one path writing both keeps a single change and an uploaded one identical,
+  which the flow test compares field by field.
+- `plan_into_set` (the imports' way in) refuses this kind: it has no caller's
+  context to store changes the single-change way.
+
+Tests: `tests/editor_fast_writes_flow.rs` (the three writes with and without the
+flag storing the same changes; every finding above; a dry run and an erroring
+real run writing nothing; bulk changes identical to single adds; a commit after
+which the loader's alias map answers each retired id with its survivor and the
+route calls at the stop kept; the same upload again adding nothing); bulk unit
+tests for the kind's columns.
