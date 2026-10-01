@@ -494,6 +494,108 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "created_at",
             "updated_at",
         ]),
+        // transitV2 (services/operator_v2.rs). Reads fine; writes here skip the v2 rules
+        // (offsets, run creation, overlap handling) - use the /v2 APIs instead.
+        "trip_groups" => Some(&[
+            "id",
+            "gtfs_id",
+            "operator_id",
+            "code",
+            "description",
+            "shift",
+            "depot_id",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
+        "trips" => Some(&[
+            "id",
+            "trip_group_id",
+            "gtfs_id",
+            "operator_id",
+            "route_id",
+            "is_bookable",
+            "trip_number",
+            "trip_order",
+            "scheduled_start_time",
+            "scheduled_start_day_offset",
+            "scheduled_end_time",
+            "scheduled_end_day_offset",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
+        "duty_repeats" => Some(&[
+            "id",
+            "trip_group_id",
+            "gtfs_id",
+            "operator_id",
+            "repeat_status",
+            "recurrence_days",
+            "effective_from",
+            "effective_till",
+            "generated_till",
+            "vehicle_number",
+            "driver_token_number",
+            "driver_name",
+            "conductor_token_number",
+            "conductor_name",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
+        "duty_groups" => Some(&[
+            "id",
+            "waybill_no",
+            "trip_group_id",
+            "duty_repeat_id",
+            "gtfs_id",
+            "operator_id",
+            "operation_date",
+            "depot_id",
+            "vehicle_number",
+            "driver_token_number",
+            "driver_name",
+            "conductor_token_number",
+            "conductor_name",
+            "window_start_at",
+            "window_end_at",
+            "is_active",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
+        "duties" => Some(&[
+            "id",
+            "duty_group_id",
+            "trip_id",
+            "gtfs_id",
+            "operator_id",
+            "route_id",
+            "is_bookable",
+            "trip_number",
+            "trip_order",
+            "scheduled_start_at",
+            "scheduled_end_at",
+            "driver_token_number",
+            "driver_name",
+            "conductor_token_number",
+            "conductor_name",
+            "recorded_start_time",
+            "recorded_end_time",
+            "recorded_vehicle_number",
+            "run_active",
+            "is_active_trip",
+            "is_completed",
+            "is_skipped",
+            "is_cancelled",
+            "cancel_reason",
+            "cancelled_by",
+            "cancelled_at",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
         _ => None,
     }
 }
@@ -518,6 +620,7 @@ pub fn table_pk(table: &str) -> Option<&'static str> {
         "waybills_internal" => Some("waybill_id"),
         "bus_shift_type_internal" => Some("shift_type_id"),
         "bus_schedule_type_internal" => Some("schedule_type_id"),
+        "trip_groups" | "trips" | "duty_repeats" | "duty_groups" | "duties" => Some("id"),
         _ => None,
     }
 }
@@ -542,6 +645,12 @@ fn allowed_tables() -> &'static [&'static str] {
         "waybills_internal",
         "bus_shift_type_internal",
         "bus_schedule_type_internal",
+        // transitV2: documented as read-only through CRUD (see table_columns)
+        "trip_groups",
+        "trips",
+        "duty_repeats",
+        "duty_groups",
+        "duties",
     ]
 }
 
@@ -1263,6 +1372,8 @@ pub enum InternalRow {
     WaybillsInternal(WaybillsInternal),
     BusShiftTypeInternal(BusShiftTypeInternal),
     BusScheduleTypeInternal(BusScheduleTypeInternal),
+    /// transitV2 tables, passed through as the row's JSON (typed models live in operator_v2.rs).
+    TransitV2(serde_json::Value),
 }
 
 /// Deserialize a raw `row_to_json` value into the correct `InternalRow` variant
@@ -1300,6 +1411,9 @@ fn row_from_value(table: &str, v: serde_json::Value) -> AppResult<InternalRow> {
         "waybills_internal" => parse!(WaybillsInternal, WaybillsInternal),
         "bus_shift_type_internal" => parse!(BusShiftTypeInternal, BusShiftTypeInternal),
         "bus_schedule_type_internal" => parse!(BusScheduleTypeInternal, BusScheduleTypeInternal),
+        "trip_groups" | "trips" | "duty_repeats" | "duty_groups" | "duties" => {
+            Ok(InternalRow::TransitV2(v))
+        }
         other => Err(AppError::Internal(format!("Unknown table: {}", other))),
     }
 }

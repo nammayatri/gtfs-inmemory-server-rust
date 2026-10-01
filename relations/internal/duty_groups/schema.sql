@@ -1,0 +1,22 @@
+CREATE TABLE public.duty_groups (
+    id                     TEXT NOT NULL,
+    waybill_no             TEXT NOT NULL,
+    trip_group_id          TEXT NOT NULL,
+    duty_repeat_id         TEXT,
+    gtfs_id                TEXT NOT NULL,
+    operator_id            TEXT,
+    operation_date         DATE NOT NULL,
+    depot_id               TEXT,
+    vehicle_number         TEXT,
+    service_type_id        TEXT,
+    driver_token_number    TEXT,
+    driver_name            TEXT,
+    conductor_token_number TEXT,
+    conductor_name         TEXT,
+    window_start_at        TIMESTAMPTZ NOT NULL,
+    window_end_at          TIMESTAMPTZ NOT NULL,
+    is_active              BOOLEAN NOT NULL DEFAULT true,
+    deleted                BOOLEAN NOT NULL DEFAULT false,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
