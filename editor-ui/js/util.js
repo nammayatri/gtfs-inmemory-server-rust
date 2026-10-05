@@ -91,7 +91,9 @@ export function modal(title, build, { actions = [], wide = false } = {}) {
     dlg.addEventListener("cancel", (ev) => { ev.preventDefault(); close(undefined); });
     const body = h("div.dialog-body", h("h2", title), build(close));
     const bar = h("div.dialog-actions", actions.map((a) => a(close)));
-    dlg.append(body, actions.length ? bar : null);
+    // append() would write a null out as the text "null"
+    dlg.append(body);
+    if (actions.length) dlg.append(bar);
     document.body.appendChild(dlg);
     dlg.showModal();
     const first = dlg.querySelector("input, textarea, select");

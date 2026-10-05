@@ -39,6 +39,10 @@ const HTTP_FEED: &str = "editor_feed_io_http_test_feed";
 const NEW_FEED: &str = "editor_feed_io_new_test_feed";
 const BG_FEED: &str = "editor_feed_io_background_test_feed";
 const STAGE_FEED: &str = "editor_feed_io_fare_stage_test_feed";
+const RELOAD_FEED: &str = "editor_feed_io_reload_test_feed";
+/// An admin of its own: two tests signing one account in at once race its
+/// last used code.
+const RELOAD_ADMIN: &str = "reload-admin@editor-feed-io-test.invalid";
 const ADMIN: &str = "admin@editor-feed-io-test.invalid";
 const VIEWER: &str = "viewer@editor-feed-io-test.invalid";
 
@@ -389,7 +393,7 @@ fn state(pool: &PgPool, signer: &TestSigner) -> EditorState {
         EditorSettings {
             jwks_url: format!("file://{}", jwks.display()),
             audience: AUD.into(),
-            bootstrap_admins: vec![ADMIN.to_string()],
+            bootstrap_admins: vec![ADMIN.to_string(), RELOAD_ADMIN.to_string()],
             totp_key_b64: base64::engine::general_purpose::STANDARD
                 .encode(crypto::random_bytes(32)),
             session_hours: 1,
@@ -399,6 +403,183 @@ fn state(pool: &PgPool, signer: &TestSigner) -> EditorState {
         },
     )
     .unwrap()
+}
+
+#[actix_web::test]
+async fn an_admin_reloads_a_feed_confirming_twice() {
+    let Some(pool) = local_pool().await else {
+        return;
+    };
+    clear_feed(&pool, RELOAD_FEED).await;
+    sqlx::query(
+        "UPDATE gtfs_editor_user SET totp_enabled = false, totp_secret_enc = NULL, \
+         totp_last_step = NULL, status = 'active' WHERE email = $1",
+    )
+    .bind(RELOAD_ADMIN)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let signer = TestSigner::generate("feed-io-reload-key");
+    let st = state(&pool, &signer);
+    let app =
+        test::init_service(App::new().configure(|cfg| editor::configure(cfg, Some(Arc::new(st)))))
+            .await;
+    let mut admin = Caller {
+        signer: &signer,
+        email: RELOAD_ADMIN.into(),
+        session: None,
+    };
+    // a code is good for its 30 s step and the ones either side, so three are
+    // good at once: `code(-1)` signs in, `code(0)` checks, `code(1)` reloads -
+    // started clear of a step's end
+    let (s, b, _, _, _) = call!(&app, admin.req("POST", "/auth/totp/enroll"));
+    assert_eq!(s, 200, "{b}");
+    let secret = crypto::base32_decode(b["secret_base32"].as_str().unwrap()).unwrap();
+    let left = 30 - chrono::Utc::now().timestamp() % 30;
+    if left < 8 {
+        tokio::time::sleep(std::time::Duration::from_secs(left as u64 + 1)).await;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let code = |step: i64| crypto::totp_now(&secret, (now + 30 * step) as u64);
+    let (s, b, _, cookie, _) = call!(
+        &app,
+        admin
+            .req("POST", "/auth/totp/confirm")
+            .set_json(json!({"code": code(-1)}))
+    );
+    assert_eq!(s, 200, "{b}");
+    admin.session = cookie;
+    let old = fixture(RELOAD_FEED);
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", &format!("/feeds/{RELOAD_FEED}/import?seed=true"))
+            .set_payload(old)
+    );
+    assert_eq!(b["seeded"], true, "{s} {b}");
+    let version = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>("SELECT version FROM gtfs_feed WHERE gtfs_id = $1")
+            .bind(RELOAD_FEED)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let before = version(pool.clone()).await;
+    // the audit log keeps every earlier run's rows
+    let started: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let fresh = fare_stage_zip(RELOAD_FEED);
+    let reload = |confirm: Option<&str>, zip: &[u8], code: Option<String>| {
+        let path = match confirm {
+            Some(t) => format!("/feeds/{RELOAD_FEED}/reload?confirm={t}"),
+            None => format!("/feeds/{RELOAD_FEED}/reload"),
+        };
+        let mut r = admin.req("POST", &path).set_payload(zip.to_vec());
+        if let Some(c) = code {
+            r = r.insert_header(("X-Editor-Code", c));
+        }
+        r
+    };
+
+    // ---- no code, a wrong one: nothing checked
+    let (s, b, _, _, _) = call!(&app, reload(None, &fresh, None));
+    assert_eq!((s, code_of(&b)), (400, "code_required"), "{b}");
+    let (s, b, _, _, _) = call!(&app, reload(None, &fresh, Some("000000".into())));
+    assert_eq!((s, code_of(&b)), (401, "invalid_code"), "{b}");
+
+    // ---- 1 of 2: the check, which writes nothing
+    let (s, b, _, _, _) = call!(&app, reload(None, &fresh, Some(code(0))));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        (b["dry_run"].clone(), b["seeded"].clone()),
+        (json!(true), json!(false))
+    );
+    assert_eq!(
+        b["replaced"]["gtfs_stop"], 8,
+        "what the feed holds now: {b}"
+    );
+    assert_eq!(b["counts"]["stops.txt"], 4, "what the zip brings: {b}");
+    let token = b["confirm_token"]
+        .as_str()
+        .expect("a confirmation token")
+        .to_string();
+    assert_eq!(
+        version(pool.clone()).await,
+        before,
+        "a check writes nothing"
+    );
+    assert_eq!(count(&pool, "gtfs_stop", RELOAD_FEED).await, 8);
+
+    // ---- 2 of 2, refused: the first code again, another zip, a forged token
+    // (the last two before any code is looked at)
+    let (s, b, _, _, _) = call!(&app, reload(Some(&token), &fresh, Some(code(0))));
+    assert_eq!(
+        (s, code_of(&b)),
+        (401, "code_reused"),
+        "the first code is used up: {b}"
+    );
+    let (s, b, _, _, _) = call!(
+        &app,
+        reload(Some(&token), &fixture(RELOAD_FEED), Some(code(1)))
+    );
+    assert_eq!((s, code_of(&b)), (409, "zip_changed"), "{b}");
+    let (s, b, _, _, _) = call!(&app, reload(Some("bm90LWEtdG9rZW4"), &fresh, Some(code(1))));
+    assert_eq!((s, code_of(&b)), (400, "invalid_confirm_token"), "{b}");
+    assert_eq!(
+        version(pool.clone()).await,
+        before,
+        "none of them wrote anything"
+    );
+
+    // ---- 2 of 2: a newer code reloads the feed
+    let (s, b, _, _, _) = call!(&app, reload(Some(&token), &fresh, Some(code(1))));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["seeded"], true, "{b}");
+    assert_eq!(b["replaced"]["gtfs_pathway"], 3, "{b}");
+    assert_eq!(version(pool.clone()).await, before + 1);
+    assert_eq!(count(&pool, "gtfs_stop", RELOAD_FEED).await, 4);
+    assert_eq!(count(&pool, "gtfs_route", RELOAD_FEED).await, 1);
+    assert_eq!(
+        count(&pool, "gtfs_pathway", RELOAD_FEED).await,
+        0,
+        "what the new zip does not have is gone"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM gtfs_audit_log WHERE gtfs_id = $1 AND action = 'reload' \
+         AND actor_email = $2 AND detail->'replaced'->>'gtfs_stop' = '8' AND at >= $3",
+    )
+    .bind(RELOAD_FEED)
+    .bind(RELOAD_ADMIN)
+    .bind(started)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+    // the token was for the feed as it was (said before any code is looked at)
+    let (s, b, _, _, _) = call!(&app, reload(Some(&token), &fresh, Some(code(1))));
+    assert_eq!((s, code_of(&b)), (409, "feed_changed"), "{b}");
+
+    // ---- a feed somebody is editing is not reloaded
+    let (s, b, _, _, _) = call!(
+        &app,
+        admin
+            .req("POST", &format!("/feeds/{RELOAD_FEED}/change-sets"))
+            .set_json(json!({"title": "open"}))
+    );
+    assert_eq!(s, 201, "{b}");
+    let who = feed_io::Importer {
+        user_id: None,
+        email: None,
+        label: "editor_feed_io_flow".into(),
+    };
+    let err = feed_io::reload_zip(&pool, &fresh, RELOAD_FEED, true, &who, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "feed_has_open_drafts");
+
+    clear_feed(&pool, RELOAD_FEED).await;
 }
 
 /// A fare-stage feed's zip, as nandi writes chennai.bus and kolkata.bus: a

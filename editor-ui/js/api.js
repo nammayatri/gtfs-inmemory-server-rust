@@ -40,7 +40,10 @@ async function request(method, path, body, raw) {
   const headers = { Accept: "application/json" };
   if (method !== "GET") headers["X-Requested-With"] = "gtfs-editor";
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (raw) headers["Content-Type"] = raw.type;
+  if (raw) Object.assign(headers, { "Content-Type": raw.type }, raw.headers || {});
+  // a code asked for again (a feed reload, section 18.16): a wrong one is
+  // answered 401 without the session being gone
+  const codeAsked = !!(raw && raw.headers && raw.headers["X-Editor-Code"]);
   let res;
   try {
     res = await fetch(API_BASE + path.replace(/^\//, ""), {
@@ -62,7 +65,8 @@ async function request(method, path, body, raw) {
     const err = (data && data.error) || {};
     const e = new ApiError(res.status, err.code || `http_${res.status}`,
       err.message || `The server answered ${res.status}.`, err.details);
-    if (res.status === 401 && path !== "auth/session" && path !== "auth/totp/confirm") {
+    const wrongCode = codeAsked && (e.code === "invalid_code" || e.code === "code_reused");
+    if (res.status === 401 && !wrongCode && path !== "auth/session" && path !== "auth/totp/confirm") {
       window.dispatchEvent(new CustomEvent("auth:required", { detail: e }));
     }
     // a grant taken away while the page was open (docs section 15)
@@ -80,7 +84,9 @@ export const put = (path, body) => api("PUT", path, body);
 export const patch = (path, body) => api("PATCH", path, body);
 export const del = (path) => api("DELETE", path);
 
-// A file's bytes as the body (a GTFS zip to import, section 18).
-export const postBytes = (path, bytes, type = "application/zip") => request("POST", path, undefined, { bytes, type });
+// A file's bytes as the body (a GTFS zip to import, section 18), with any
+// `headers` it needs (a reload's authenticator code, 18.16).
+export const postBytes = (path, bytes, type = "application/zip", headers = {}) =>
+  request("POST", path, undefined, { bytes, type, headers });
 
 export const enc = encodeURIComponent;
