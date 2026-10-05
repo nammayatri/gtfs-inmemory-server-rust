@@ -2184,7 +2184,8 @@ async fn create_repeat_waybills_bulk(
          SELECT u.waybill_no, $3, u.duty_date, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20, 'upcoming', false, false
          FROM UNNEST($1::text[], $2::text[]) AS u(duty_date, waybill_no)
-         ON CONFLICT (gtfs_id, schedule_trip_id, duty_date) WHERE deleted = false DO NOTHING
+         ON CONFLICT (gtfs_id, schedule_trip_id, duty_date)
+           WHERE deleted = false AND status NOT IN ('closed', 'audited') DO NOTHING
          RETURNING duty_date, waybill_id::text, waybill_no",
     )
     .bind(missing_duty_dates)
