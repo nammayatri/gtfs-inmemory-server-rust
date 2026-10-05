@@ -1047,7 +1047,7 @@ async fn a_map_line_from_gps_end_to_end() {
         b["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("stopped early"),
+            .contains("stopped at its time limit"),
         "{b}"
     );
     assert!(
@@ -1065,6 +1065,74 @@ async fn a_map_line_from_gps_end_to_end() {
     assert_eq!(s, 504, "{b}");
     assert_eq!(code_of(&b), "gps_timeout");
 
+    // ---- the same slow ClickHouse in the background (section 17.10): the
+    // job is not held to the request's budget, so each query has the time it
+    // needs, and the page polls for the line
+    let before_jobs = ch_count();
+    let (s, b, _, _) = call!(
+        &app,
+        editor_c.req(
+            "POST",
+            &format!("/feeds/{GPS_FEED}/routes/R_SLOW/polyline:gps?background=true"),
+        )
+    );
+    assert_eq!(s, 202, "{b}");
+    let job = b["job_id"].as_str().unwrap().to_string();
+    let poll = format!("/feeds/{GPS_FEED}/gps-jobs/{job}");
+    let t = std::time::Instant::now();
+    let done = loop {
+        let (s, b, _, _) = call!(&app, editor_c.req("GET", &poll));
+        assert_eq!(s, 200, "{b}");
+        if b["status"] != "running" {
+            break b;
+        }
+        assert!(t.elapsed() < Duration::from_secs(60), "still running: {b}");
+        actix_web::rt::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(done["kind"], "gps_line", "{done}");
+    let line = &done["report"];
+    assert_eq!(line["polyline_source"], "gps", "{done}");
+    assert!(!line["encoded_polyline"].as_str().unwrap_or("").is_empty());
+    assert_eq!(line["evidence"]["days_read"], 3, "every day read: {done}");
+    assert_ne!(line["evidence"]["stopped"], "budget", "{done}");
+    // the job is this feed's, and a job that is not one is not found
+    let (s, b, _, _) = call!(
+        &app,
+        editor_c.req(
+            "GET",
+            &format!("/feeds/{GPS_FEED}/gps-jobs/{}", uuid::Uuid::new_v4()),
+        )
+    );
+    assert_eq!((s, code_of(&b)), (404, "job_not_found"), "{b}");
+    // a job that finds no line fails with the error, details and all
+    let (s, b, _, _) = call!(
+        &app,
+        editor_c.req(
+            "POST",
+            &format!("/feeds/{GPS_FEED}/routes/R_NOBODY/polyline:gps?background=true"),
+        )
+    );
+    assert_eq!(s, 202, "{b}");
+    let poll = format!(
+        "/feeds/{GPS_FEED}/gps-jobs/{}",
+        b["job_id"].as_str().unwrap()
+    );
+    let failed = loop {
+        let (_, b, _, _) = call!(&app, editor_c.req("GET", &poll));
+        if b["status"] != "running" {
+            break b;
+        }
+        actix_web::rt::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "gps_not_enough_runs", "{failed}");
+    assert_eq!(failed["error"]["status"], 422, "{failed}");
+    assert!(
+        failed["error"]["details"]["runs_seen"].is_number(),
+        "{failed}"
+    );
+
     // ---- every statement: a bounded SELECT, readonly=2, basic auth
     use base64::Engine;
     let basic = format!(
@@ -1073,7 +1141,7 @@ async fn a_map_line_from_gps_end_to_end() {
     );
     let log = ch_log.lock().unwrap().clone();
     assert!(log.len() >= 8, "{} statements", log.len());
-    for r in &log {
+    for (i, r) in log.iter().enumerate() {
         assert!(
             r.query.split('&').any(|p| p == "readonly=2"),
             "readonly=2: {}",
@@ -1097,9 +1165,12 @@ async fn a_map_line_from_gps_end_to_end() {
             .unwrap()[1]
             .parse()
             .unwrap();
+        // a request's queries share its 4 s; a background job's each get up to
+        // the reader's ceiling
+        let budget = if i < before_jobs { 4 } else { 10 };
         assert!(
-            allowed <= 4,
-            "no query is allowed more than the budget: {}",
+            allowed <= budget,
+            "no query is allowed more than its budget ({budget} s): {}",
             r.query
         );
         assert!(

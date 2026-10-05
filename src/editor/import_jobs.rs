@@ -5,6 +5,9 @@
 //! its own - its own runtime and a small pool of its own, so its CPU-heavy
 //! steps never hold up a web worker - and its report is written to
 //! `gtfs_import_job`, where the page polls for it on whichever pod it lands.
+//!
+//! A map line from GPS (section 17.10) is a job of this table too, kind
+//! `gps_line`: [`record`] it, run it where its reader lives, [`finish`] it.
 
 use super::error::{EditorError, EditorResult};
 use actix_web::http::StatusCode;
@@ -17,22 +20,20 @@ use tracing::error;
 use uuid::Uuid;
 
 /// A job still running this long after it started is lost: the pod running it
-/// went away. An import is far shorter.
+/// went away. An import is far shorter, and a GPS line gives up sooner.
 const LOST_AFTER_MINUTES: i32 = 30;
 
 /// The import itself, given the job's own pool.
 pub type Work =
     Box<dyn FnOnce(PgPool) -> Pin<Box<dyn Future<Output = EditorResult<Value>>>> + Send>;
 
-/// Record a running job and start `work` on a thread of its own; the job's id,
-/// at once.
-pub async fn start(
+/// Record a running job: its id, for [`finish`] once it is done.
+pub async fn record(
     pool: &PgPool,
     gtfs_id: Option<&str>,
     kind: &str,
     dry_run: bool,
     user_id: Uuid,
-    work: Work,
 ) -> EditorResult<Uuid> {
     let job_id = Uuid::new_v4();
     sqlx::query(
@@ -47,6 +48,20 @@ pub async fn start(
     .bind(std::env::var("HOSTNAME").ok())
     .execute(pool)
     .await?;
+    Ok(job_id)
+}
+
+/// Record a running job and start `work` on a thread of its own; the job's id,
+/// at once.
+pub async fn start(
+    pool: &PgPool,
+    gtfs_id: Option<&str>,
+    kind: &str,
+    dry_run: bool,
+    user_id: Uuid,
+    work: Work,
+) -> EditorResult<Uuid> {
+    let job_id = record(pool, gtfs_id, kind, dry_run, user_id).await?;
     // a pool's connections belong to the runtime that made them: the job's
     // thread opens its own, with the same settings
     let options = pool.connect_options().as_ref().clone();
@@ -90,21 +105,23 @@ pub async fn start(
     Ok(job_id)
 }
 
-async fn finish(
+/// Write a job's outcome: its report, or the error it answered, with the
+/// error's details (a GPS line's counts say why it found none).
+pub async fn finish(
     pool: &PgPool,
     job_id: Uuid,
     outcome: EditorResult<Value>,
 ) -> Result<(), sqlx::Error> {
     let (status, report, error) = match outcome {
         Ok(report) => ("done", Some(report.to_string()), None),
-        Err(e) => (
-            "failed",
-            None,
-            Some(
-                json!({"status": e.status.as_u16(), "code": e.code, "message": e.message})
-                    .to_string(),
-            ),
-        ),
+        Err(e) => {
+            let mut error =
+                json!({"status": e.status.as_u16(), "code": e.code, "message": e.message});
+            if !e.details.is_null() {
+                error["details"] = e.details;
+            }
+            ("failed", None, Some(error.to_string()))
+        }
     };
     sqlx::query(
         "UPDATE gtfs_import_job SET status = $2, report = $3::jsonb, error = $4::jsonb, \
@@ -133,7 +150,7 @@ pub async fn get(pool: &PgPool, job_id: Uuid) -> EditorResult<Value> {
     .bind(LOST_AFTER_MINUTES)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| EditorError::not_found("job_not_found", format!("no import job {job_id}")))?;
+    .ok_or_else(|| EditorError::not_found("job_not_found", format!("no job {job_id}")))?;
     let json_of = |s: Option<String>| {
         s.and_then(|s| serde_json::from_str::<Value>(&s).ok())
             .unwrap_or(Value::Null)
@@ -141,7 +158,7 @@ pub async fn get(pool: &PgPool, job_id: Uuid) -> EditorResult<Value> {
     let status: String = row.try_get("status")?;
     let error = if status == "lost" {
         json!({"status": 500, "code": "job_lost",
-               "message": "The import stopped without an answer: the server running it restarted. Try it again."})
+               "message": "The job stopped without an answer: the server running it restarted. Try it again."})
     } else {
         json_of(row.try_get("error")?)
     };

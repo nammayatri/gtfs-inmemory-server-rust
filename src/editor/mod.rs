@@ -299,6 +299,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::get().to(h::route_gps_trips),
             )
             .route(
+                "/feeds/{gtfs_id}/gps-jobs/{job_id}",
+                web::get().to(h::gps_job),
+            )
+            .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/patterns/{pattern_key}",
                 web::get().to(h::route_pattern),
             )

@@ -3056,7 +3056,7 @@ gps_no_route_number` (the route has no `short_name` to find its buses by), `422
 gps_not_enough_stops` (fewer than two served stops with a position), `422
 gps_not_enough_runs` (fewer than 3 runs passed the stops in order; `details` holds
 the evidence counts above plus `min_runs` - with `stopped: "budget"` the reading
-was cut short to answer in time, and asking again reads the days not yet read), `504
+was cut short at its time limit before every day was read), `504
 gps_timeout` (the backstop: the whole suggestion ran past its limit, 25 s by
 default - only when ClickHouse does not stop a query at its
 `max_execution_time`, or another suggestion held the pod's turn too long), `502
@@ -3203,9 +3203,12 @@ Each query is sent with `max_execution_time` = the time left (never more than
 stops a query at its limit (`TIMEOUT_EXCEEDED`, HTTP 408), or the time runs out
 between queries, reading stops: the line is built from what was read, or the
 answer is 422 `gps_not_enough_runs` with the counts - in both cases with
-`stopped: "budget"`, and neither is cached, so the next click reads again - only
-the days not yet read, the ones read being kept. 504 `gps_timeout` is left only
-as the backstop.
+`stopped: "budget"`, and neither is cached, so the next click reads again. Past
+days whose bus-days were read are kept, but a day whose query was stopped is
+not, and every read starts again from today. So against a cluster slower than
+the budget, asking again reads the same days and stops again. That is why the
+dashboard asks in the background (17.10). 504 `gps_timeout` is left only as the
+backstop.
 
 **Why a week, three at a time (2026-09-29).** On master a suggestion read one
 day: step 1 went a day at a time, one query at a time, and gave up going back
@@ -3393,6 +3396,59 @@ back, variant or parallel road; a past day's trips kept; a day no bus ran);
 day to come, one past the lookback and not a date refused, the feed's `gps` in
 `/auth/me`); `dev/ui_smoke.mjs --gps-trips` against the mock (the day defaults to
 today and goes no later, three trips listed, one picked out, hidden again).
+
+### 17.10 A map line from GPS in the background (2026-10-05) - `0025_gps_line_jobs.sql`
+
+On 2026-10-05, route 2289 (12G) failed every time on master. Step 1's three
+day-queries were each stopped by ClickHouse at 10 s, when it estimated they would
+run past their `max_execution_time` of about 11 s. Nothing was read, the other
+four days were never asked about, and the answer was 422 `gps_not_enough_runs`
+with `days_read: 0, stopped: "budget"`. The same queries measured 0.5-1.4 s in
+17.4. Asking again could not help: a stopped day is not kept, and each read
+starts again from today.
+
+So the suggestion is no longer held to a request's 30 s.
+`POST .../polyline:gps?background=true` answers `202 {job_id}` at once and reads
+with `gps_line::background_budget()`:
+
+- 20 minutes in all (`BACKGROUND_TIMEOUT`), less than the 30 minutes after which
+  a job counts as lost;
+- half of that for step 1;
+- 60 s held back for OSRM and the build.
+
+Each query is given what is left, up to `MAX_QUERY_TIME` (5 minutes). The
+reader's ceiling is now that, and a request's own budget still keeps its
+queries within 25 s.
+
+The job is a row of `gtfs_import_job` (18.15), of a new kind, `gps_line`, which
+`0025` adds to the CHECK. Apply it before the image. The job runs on the worker
+that took the request, where the GPS reader's HTTP connections live, and not on
+a thread of its own as an import does. It still takes the pod's one-at-a-time
+turn (17.4), so a second suggestion, or a day's trips (17.8), on that pod waits
+for it. Its answer, or its error with `details`, is written to the row, and the
+answer is cached as a request's is (17.4).
+
+`GET /feeds/{g}/gps-jobs/{job_id}` (an editor of the feed) is the row:
+
+- `running`;
+- `done` with `report`, the line exactly as `polyline:gps` answers it;
+- `failed` with `error {status, code, message, details}`;
+- `lost`.
+
+Any other kind of job, or another feed's, is 404 `job_not_found`. Each finished
+job is logged under `[GTFS EDITOR GPS]`, with how long it took, `days_read`,
+`stopped` and `read_seconds`, so a slow cluster shows in the logs.
+
+The dashboard always asks in the background. It polls every 2 s and shows how
+long it has been reading. "Stop waiting" stops polling: the job carries on, and
+its answer is cached for the next click. Without `background` the endpoint
+answers in the request, as before.
+
+Tests: `tests/editor_gps_line_flow.rs`. A ClickHouse slower than the request's
+budget fails in the request (`stopped: "budget"`) but gives a line in the
+background, with every day read. A job that finds no line fails with its counts,
+and an unknown job is 404. `editor-ui/dev/ui_smoke.mjs --map-line` runs every
+map-line flow through the job against the mock, which answers a job after 2.5 s.
 
 ## 18. The whole GTFS reference, and every feed in the tables (2026-09-24)
 
