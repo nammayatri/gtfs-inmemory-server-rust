@@ -21,8 +21,8 @@ use super::stages::StageKey;
 use super::trips::{self, check_trips, TripRules, TripSpec};
 use super::validation::{
     check_payload, check_route_rows_for, check_route_rows_labelled, check_stage_rows,
-    grade_against_live, Finding, Level, RouteRow, StageLink, StageRow, INTERMEDIATE_STOP, JUMP_STOP,
-    NEW_STOP, ROUTE_CORRECTION,
+    grade_against_live, Finding, Level, RouteRow, StageLink, StageRow, INTERMEDIATE_STOP,
+    JUMP_STOP, NEW_STOP, ROUTE_CORRECTION,
 };
 use super::EditorState;
 use crate::gtfs::spec;

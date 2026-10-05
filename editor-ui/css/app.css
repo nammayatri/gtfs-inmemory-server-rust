@@ -895,6 +895,9 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
    stay on the line however long the stop is called. */
 .stage-build li.stop-row {
   flex-wrap: nowrap; padding: 4px 2px; border-radius: 6px;
+  /* the list is a grid, and a grid item is as wide as its content unless told
+     otherwise: without this a long name pushed ✎ and ✕ out of the panel */
+  min-width: 0;
 }
 .stage-build li.stop-row:hover { background: var(--action-tint); }
 .stage-build li.stop-row.drop-here { box-shadow: inset 0 2px 0 var(--action); }
@@ -902,7 +905,11 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
   flex: 1 1 auto; min-width: 3em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .stage-build li.stop-row .ids { flex: none; }
-.stage-build li.stop-row .chip { flex: none; }
+/* a chip gives way first - well before the name, and the buttons never: cut
+   short rather than pushing ✎ and ✕ off the edge of the panel */
+.stage-build li.stop-row .chip {
+  flex: 0 6 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .stage-build li.stop-row .btn-row { flex: none; flex-wrap: nowrap; }
 /* removed, but still here until the save, so Undo can put it back */
 .stage-build li.stop-row.is-removed { opacity: .65; }
@@ -923,9 +930,14 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
   margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); display: grid; gap: 8px;
 }
 .split-form .field { margin: 0; }
+/* a grid column grows to its widest child unless told not to, and a stop row
+   never wraps: without this the new stage's list ran out of the panel */
+.split-form > * { min-width: 0; }
 /* the lists the routes give a stage under review. Not ".candidate": the
    coordinate review already owns that name, and its two-column grid. */
 .stop-choices { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+/* the same for a card holding a new stage's stops: it stays the panel's width */
+.stop-choices > li { min-width: 0; }
 .stop-choice {
   display: block; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
 }
