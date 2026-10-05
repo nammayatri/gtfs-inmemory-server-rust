@@ -383,6 +383,218 @@ function candidateCard(c, onUse, inList, split) {
     split && split.open ? split.form(c, allKnown) : null);
 }
 
+// A stage's stops being edited: reordered by dragging the handle (or with the
+// arrow keys while the handle has focus), a stop changed for another (✎), taken
+// out (✕, and Undo puts it back) or added. The review's stage and a new stage
+// being made from one of the lists both use this, so the two edit alike.
+// `onChange` runs after every redraw; `beforePick` before the stop search opens,
+// so a page with two of these can close the other one's search.
+function stopListEditor({ rows: start, editable, idPrefix, layer, color, empty, what, onChange, beforePick }) {
+  let rows = (start || []).map((x) => ({ ...x }));
+  // A removed stop is kept in the list, struck through, until the save: the
+  // reviewer can put it back. Only these reach the draft.
+  const kept = () => rows.filter((x) => !x.removed);
+  const retype = () => {
+    let first = true;
+    for (const x of rows) {
+      if (x.removed || x.stop_type === "ROUTE CORRECTION") continue;
+      x.stop_type = first ? "NEW STOP" : (x.stop_type === "NEW STOP" ? "INTERMEDIATE STOP" : x.stop_type);
+      first = false;
+    }
+  };
+  const listEl = h("ol.stage-stops.stage-build");
+  const pickerSlot = h("div");
+
+  // Reordering: dragged by the handle, or moved with the arrow keys while the
+  // handle has focus. `dropAt` is only a highlight, so it is painted straight
+  // onto the list - a redraw mid-drag would throw away the row being dragged.
+  let dragFrom = null;
+  let dropAt = null;
+  let focusGrip = null;
+  const paintDrop = () => {
+    for (const li of listEl.children) {
+      li.classList.toggle("drop-here", dropAt !== null && li.dataset.i === String(dropAt));
+    }
+  };
+  const moveTo = (from, to) => {
+    dragFrom = null;
+    dropAt = null;
+    if (from === null || to === from || to < 0 || to >= rows.length) return paintDrop();
+    const [row] = rows.splice(from, 1);
+    rows.splice(to, 0, row);
+    retype();
+    focusGrip = to;
+    closePicker();
+    draw();
+  };
+
+  // stopPicker builds the search and hands it back to be placed; it does not
+  // put itself anywhere, so it is mounted under the list while it is open.
+  // Adding and changing share it: the only difference is where the stop lands.
+  let picker = null;
+  const closePicker = () => {
+    if (picker) picker.close();
+    picker = null;
+    clear(pickerSlot);
+    addBtn.hidden = false;
+  };
+  const openPicker = (opts) => {
+    closePicker();
+    if (beforePick) beforePick(api);
+    addBtn.hidden = true;
+    picker = stopPicker({ ...opts, onCancel: closePicker });
+    clear(pickerSlot, picker.el);
+    picker.focus();
+    pickerSlot.scrollIntoView({ block: "nearest" });
+  };
+  const addStop = () => {
+    if (picker) return closePicker();
+    openPicker({
+      title: `Add a stop to ${what}`,
+      exclude: kept().map((x) => x.stop_id).filter(Boolean),
+      excludeReason: `it is already in ${what}.`,
+      mapMessage: `Click the stop to add it to the end of ${what}.`,
+      onPick: (stop) => {
+        rows.push({
+          stop_id: stop.stop_id,
+          stop_type: kept().length ? "INTERMEDIATE STOP" : "NEW STOP",
+          stop_name: stop.name,
+          lat: stop.lat,
+          lon: stop.lon,
+        });
+        closePicker();
+        draw();
+        toast(`Added ${stop.name} as stop ${kept().length} of ${what}.`);
+      },
+    });
+  };
+  // The pencil: the stage still calls somewhere at this point in its order, at
+  // a different stop. The row keeps its place and its kind; only the stop moves.
+  const changeStop = (i) => {
+    const was = rows[i];
+    openPicker({
+      title: `Change stop ${i + 1}, ${stopLabel(was)}, for another`,
+      near: was.lat != null && was.lon != null ? { lat: was.lat, lon: was.lon, label: stopLabel(was) } : null,
+      exclude: rows.map((x, n) => (n === i || x.removed ? null : x.stop_id)).filter(Boolean),
+      excludeReason: `it is already in ${what}.`,
+      mapMessage: "Click the stop this one becomes.",
+      onPick: (stop) => {
+        rows[i] = {
+          ...was,
+          stop_id: stop.stop_id,
+          stop_name: stop.name,
+          lat: stop.lat,
+          lon: stop.lon,
+          stop_name_override: null,
+        };
+        closePicker();
+        focusGrip = i;
+        draw();
+        toast(`Stop ${i + 1} is now ${stop.name}.`);
+      },
+    });
+  };
+  const addBtn = h("button.btn.secondary", { type: "button", on: { click: addStop } }, "Add a stop");
+
+  const draw = () => {
+    map.clearRoute(layer);
+    const live = kept();
+    if (live.some((x) => x.lat != null)) {
+      map.showRoute({ route_id: layer, rows: live }, { layer, fit: false, color, weight: 4 });
+      map.fitPoints(live.filter((x) => x.lat != null));
+    }
+    clear(listEl, rows.length
+      ? rows.map((row, i) => h("li.stop-row", {
+          draggable: editable && !row.removed,
+          class: row.removed ? "is-removed" : "",
+          dataset: { i: String(i) },
+          // hovering a row shows you where it is, which is the question the
+          // list cannot answer on its own
+          on: {
+            mouseenter: () => { if (row.lat != null) map.focusStop(row, { zoom: 16 }); },
+            mouseleave: () => map.clearFocus(),
+            ...(editable && !row.removed ? {
+            dragstart: (ev) => {
+              dragFrom = i;
+              ev.dataTransfer.effectAllowed = "move";
+              // Firefox starts no drag without a payload; the index rides along
+              ev.dataTransfer.setData("text/plain", String(i));
+            },
+            dragover: (ev) => {
+              if (dragFrom === null || dragFrom === i) return;
+              ev.preventDefault();
+              ev.dataTransfer.dropEffect = "move";
+              if (dropAt !== i) { dropAt = i; paintDrop(); }
+            },
+            dragleave: () => { if (dropAt === i) { dropAt = null; paintDrop(); } },
+            drop: (ev) => { ev.preventDefault(); moveTo(dragFrom, i); },
+            dragend: () => { dragFrom = null; dropAt = null; paintDrop(); },
+            } : {}),
+          },
+        },
+          // the handle is a button so the list can be reordered from the
+          // keyboard as well: the arrow keys move the row it belongs to
+          editable ? h("button.grip", {
+            type: "button", id: `grip-${idPrefix}-${i}`,
+            "aria-label": `${stopLabel(row)}, stop ${i + 1} of ${rows.length}. Drag it, or move it with the arrow keys.`,
+            on: { keydown: (ev) => {
+              const by = ev.key === "ArrowUp" ? -1 : ev.key === "ArrowDown" ? 1 : 0;
+              if (!by) return;
+              ev.preventDefault();
+              moveTo(i, i + by);
+            } },
+          }, h("span", { "aria-hidden": "true" }, "⋮⋮")) : null,
+          h("span.stop-row-name", { title: stopLabel(row) }, stopLabel(row)),
+          row.stop_id ? h("span.ids", row.stop_id) : null,
+          row.stop_type === "ROUTE CORRECTION"
+            ? h("span.chip", { title: "A point the line is drawn through so it follows the road. No passenger boards here, and it is in no GTFS file." }, "map point, not a stop")
+            : null,
+          row.removed ? h("span.chip.warn", "removed when you save") : null,
+          !row.removed && kept()[0] === row ? h("span.chip", "first stop") : null,
+          row.unserviceable ? h("span.chip.warn", "out of use") : null,
+          editable && row.removed ? h("span.btn-row",
+            h("button.route-chip", {
+              type: "button", title: "Put this stop back",
+              "aria-label": `Put ${stopLabel(row)} back`,
+              on: { click: () => { delete row.removed; retype(); closePicker(); draw(); } },
+            }, "Undo")) : null,
+          editable && !row.removed ? h("span.btn-row",
+            h("button.route-chip", {
+              type: "button", title: "Change this stop for another",
+              "aria-label": `Change ${stopLabel(row)} for another stop`,
+              disabled: row.stop_type === "ROUTE CORRECTION",
+              on: { click: () => changeStop(i) },
+            }, "✎"),
+            h("button.route-chip", {
+              type: "button", title: "Remove this stop",
+              "aria-label": `Remove ${stopLabel(row)}`,
+              // struck through rather than taken out: nothing is lost until
+              // the save, and Undo puts it back where it was
+              on: { click: () => { row.removed = true; retype(); closePicker(); draw(); } },
+            }, "✕")) : null))
+      : h("li", h("span.hint", empty)));
+    if (focusGrip !== null) {
+      document.getElementById(`grip-${idPrefix}-${focusGrip}`)?.focus();
+      focusGrip = null;
+    }
+    if (onChange) onChange();
+  };
+
+  const api = {
+    listEl, pickerSlot, addBtn, kept, draw, closePicker,
+    setRows(next) {
+      rows = next.map((x) => ({ ...x }));
+      closePicker();
+      draw();
+    },
+    destroy() {
+      closePicker();
+      map.clearRoute(layer);
+    },
+  };
+  return api;
+}
+
 export async function showStageReview(id) {
   resetForFeed();
   setLeaveGuard(null);
@@ -439,165 +651,96 @@ export async function showStageReview(id) {
       ])));
   })();
 
-  // the list being built, as rows in the shape a stage/update takes
-  let rows = stage ? (stage.rows || []).map((x) => ({ ...x })) : [];
   // What is unsaved: the stops AND the name. Changing only the name is a real
   // edit - two stages of a corridor are told apart by being renamed - and it
   // used to leave Save disabled with nothing saying why.
   const startedName = stage ? stage.name : r.name;
+  const candidateEl = h("ul.stop-choices");
+  const unsaved = h("span.chip.warn", { hidden: true }, "not saved yet");
+
+  // Two editors can be open at once - this stage's, and a new stage's being
+  // made from one of the lists below - with one stop search between them:
+  // opening it in one closes it in the other.
+  let newEditor = null;
+  const editor = stopListEditor({
+    rows: stage ? stage.rows || [] : [],
+    editable, idPrefix: "stage", layer: "stage-review-0", color: COLOURS[0],
+    empty: "No stops yet. Use one of the lists below, or add a stop.",
+    what: "this stage",
+    beforePick: () => { if (newEditor) newEditor.closePicker(); },
+    onChange: () => drawHost(),
+  });
+  const kept = () => editor.kept();
   const shape = () => JSON.stringify([
     nameInput.value.trim(),
-    rows.filter((x) => !x.removed).map((x) => x.stop_id || x.marker_id),
+    kept().map((x) => x.stop_id || x.marker_id),
   ]);
   let started = null;
   const dirty = () => started !== null && shape() !== started;
 
-  // A removed stop is kept in the list, struck through, until the save: the
-  // reviewer can put it back. Only these reach the draft.
-  const kept = () => rows.filter((x) => !x.removed);
-  const retype = () => {
-    let first = true;
-    for (const x of rows) {
-      if (x.removed || x.stop_type === "ROUTE CORRECTION") continue;
-      x.stop_type = first ? "NEW STOP" : (x.stop_type === "NEW STOP" ? "INTERMEDIATE STOP" : x.stop_type);
-      first = false;
-    }
-  };
-
-  const listEl = h("ol.stage-stops.stage-build");
-  const candidateEl = h("ul.stop-choices");
-  const unsaved = h("span.chip.warn", { hidden: true }, "not saved yet");
-
-  // Reordering: dragged by the handle, or moved with the arrow keys while the
-  // handle has focus. `dropAt` is only a highlight, so it is painted straight
-  // onto the list - a redraw mid-drag would throw away the row being dragged.
-  let dragFrom = null;
-  let dropAt = null;
-  let focusGrip = null;
-  const paintDrop = () => {
-    for (const li of listEl.children) {
-      li.classList.toggle("drop-here", dropAt !== null && li.dataset.i === String(dropAt));
-    }
-  };
-  const moveTo = (from, to) => {
-    dragFrom = null;
-    dropAt = null;
-    if (from === null || to === from || to < 0 || to >= rows.length) return paintDrop();
-    const [row] = rows.splice(from, 1);
-    rows.splice(to, 0, row);
-    retype();
-    focusGrip = to;
-    closePicker();
-    draw();
-  };
-
-  const draw = () => {
-    map.clearRoute("stage-review-0");
-    const live = kept();
-    if (live.some((x) => x.lat != null)) {
-      map.showRoute({ route_id: "stage-review", rows: live }, {
-        layer: "stage-review-0", fit: false, color: COLOURS[0], weight: 4,
-      });
-      map.fitPoints(live.filter((x) => x.lat != null));
-    }
-    clear(listEl, rows.length
-      ? rows.map((row, i) => h("li.stop-row", {
-          draggable: editable && !row.removed,
-          class: row.removed ? "is-removed" : "",
-          dataset: { i: String(i) },
-          // hovering a row shows you where it is, which is the question the
-          // list cannot answer on its own
-          on: {
-            mouseenter: () => { if (row.lat != null) map.focusStop(row, { zoom: 16 }); },
-            mouseleave: () => map.clearFocus(),
-            ...(editable && !row.removed ? {
-            dragstart: (ev) => {
-              dragFrom = i;
-              ev.dataTransfer.effectAllowed = "move";
-              // Firefox starts no drag without a payload; the index rides along
-              ev.dataTransfer.setData("text/plain", String(i));
-            },
-            dragover: (ev) => {
-              if (dragFrom === null || dragFrom === i) return;
-              ev.preventDefault();
-              ev.dataTransfer.dropEffect = "move";
-              if (dropAt !== i) { dropAt = i; paintDrop(); }
-            },
-            dragleave: () => { if (dropAt === i) { dropAt = null; paintDrop(); } },
-            drop: (ev) => { ev.preventDefault(); moveTo(dragFrom, i); },
-            dragend: () => { dragFrom = null; dropAt = null; paintDrop(); },
-            } : {}),
-          },
-        },
-          // the handle is a button so the list can be reordered from the
-          // keyboard as well: the arrow keys move the row it belongs to
-          editable ? h("button.grip", {
-            type: "button", id: `grip-${i}`,
-            "aria-label": `${stopLabel(row)}, stop ${i + 1} of ${rows.length}. Drag it, or move it with the arrow keys.`,
-            on: { keydown: (ev) => {
-              const by = ev.key === "ArrowUp" ? -1 : ev.key === "ArrowDown" ? 1 : 0;
-              if (!by) return;
-              ev.preventDefault();
-              moveTo(i, i + by);
-            } },
-          }, h("span", { "aria-hidden": "true" }, "⋮⋮")) : null,
-          h("span.stop-row-name", { title: stopLabel(row) }, stopLabel(row)),
-          row.stop_id ? h("span.ids", row.stop_id) : null,
-          row.stop_type === "ROUTE CORRECTION"
-            ? h("span.chip", { title: "A point the line is drawn through so it follows the road. No passenger boards here, and it is in no GTFS file." }, "map point, not a stop")
-            : null,
-          row.removed ? h("span.chip.warn", "removed when you save") : null,
-          !row.removed && kept()[0] === row ? h("span.chip", "first stop") : null,
-          row.unserviceable ? h("span.chip.warn", "out of use") : null,
-          editable && row.removed ? h("span.btn-row",
-            h("button.route-chip", {
-              type: "button", title: "Put this stop back",
-              "aria-label": `Put ${stopLabel(row)} back`,
-              on: { click: () => { delete row.removed; retype(); closePicker(); draw(); } },
-            }, "Undo")) : null,
-          editable && !row.removed ? h("span.btn-row",
-            h("button.route-chip", {
-              type: "button", title: "Change this stop for another",
-              "aria-label": `Change ${stopLabel(row)} for another stop`,
-              disabled: row.stop_type === "ROUTE CORRECTION",
-              on: { click: () => changeStop(i) },
-            }, "✎"),
-            h("button.route-chip", {
-              type: "button", title: "Remove this stop",
-              "aria-label": `Remove ${stopLabel(row)}`,
-              // struck through rather than taken out: nothing is lost until
-              // the save, and Undo puts it back where it was
-              on: { click: () => { row.removed = true; retype(); closePicker(); draw(); } },
-            }, "✕")) : null))
-      : h("li", h("span.hint", "No stops yet. Use one of the lists below, or add a stop.")));
-    if (focusGrip !== null) {
-      document.getElementById(`grip-${focusGrip}`)?.focus();
-      focusGrip = null;
-    }
+  // what changes around the list when it does: Save, and which stops of each
+  // route's list are not in it
+  const drawHost = () => {
     save.disabled = !dirty();
     unsaved.hidden = !dirty();
     const inList = kept().map((x) => x.stop_id).filter(Boolean);
     clear(candidateEl, candidates.map((c) => candidateCard(c, useList, inList, {
       open: splitting === c,
-      start: (cand) => {
-        splitting = cand;
-        splitName = suggestSplitName(cand);
-        splitDir = stage ? (stage.direction || "") : (r.direction || "");
-        draw();
-      },
+      start: startSplit,
       form: splitForm,
     })));
   };
 
+  // A route's list as stage rows. A stop is its id; a map point (a ROUTE
+  // CORRECTION, no stop id) is only named in the review, so it is taken from
+  // this stage's own map point of that name, which has its position. One the
+  // stage does not have cannot be placed and is left out: written as a stop
+  // with no id, it made a stage the server refused.
+  const listRows = (c) => {
+    const known = new Map();
+    const markers = new Map();
+    for (const st of r.stages || []) {
+      for (const x of st.rows || []) {
+        if (x.stop_type === "ROUTE CORRECTION") markers.set(stopLabel(x), x);
+        else if (x.stop_id) known.set(x.stop_id, x);
+      }
+    }
+    const out = [];
+    let dropped = 0;
+    c.stops.forEach((sid, i) => {
+      const name = (c.stop_names || [])[i];
+      if (sid) {
+        const x = known.get(sid);
+        out.push(x ? { ...x } : { stop_id: sid, stop_type: "INTERMEDIATE STOP", stop_name: name || sid, lat: null, lon: null });
+      } else if (markers.has(name)) {
+        out.push({ ...markers.get(name) });
+      } else {
+        dropped += 1;
+      }
+    });
+    // the first stop is where the fare stage begins
+    let first = true;
+    for (const x of out) {
+      if (x.stop_type === "ROUTE CORRECTION") continue;
+      x.stop_type = first ? "NEW STOP" : (x.stop_type === "NEW STOP" ? "INTERMEDIATE STOP" : x.stop_type);
+      first = false;
+    }
+    return { rows: out, dropped };
+  };
+  const tellDropped = (n) => {
+    if (n) toast(`${plural(n, "map point")} of that list could not be placed, so ${n === 1 ? "it is" : "they are"} left out. Map points only shape the line; add them on the stage's page if you need them.`);
+  };
+
   // ---- a new stage for one list's routes. The reviewer has decided these
-  // routes are not this stage at all: they get a stage of their own, carrying
-  // the stops they actually give, and come off this one. Two changes go into
-  // the draft - the stage, then each route's stage list with the new one in
-  // place of this one - so committing moves them together.
+  // routes are not this stage at all: they get a stage of their own, and come
+  // off this one. It starts with the stops that list gives and is edited like
+  // the stage above - reordered, stops changed, removed or added - before it is
+  // made. One change goes into the draft, however many routes move.
   let splitting = null;
   let splitName = "";
   let splitDir = "";
   let splitBusy = false;
+  let splitGo = null;
 
   const suggestSplitName = (c) => {
     const base = (stage ? stage.name : r.name).trim();
@@ -607,30 +750,62 @@ export async function showStageReview(id) {
     if (first && first.toUpperCase() !== base.toUpperCase()) return `${base} (from ${first})`;
     return `${base} (${plural(c.stops.length, "stop")})`;
   };
+  const canSplit = (allKnown) => allKnown && !splitBusy && !!splitName.trim()
+    && !!newEditor && newEditor.kept().some((x) => x.stop_type !== "ROUTE CORRECTION");
+
+  const startSplit = (c) => {
+    if (newEditor) newEditor.destroy();
+    splitting = c;
+    splitName = suggestSplitName(c);
+    splitDir = stage ? (stage.direction || "") : (r.direction || "");
+    const made = listRows(c);
+    const allKnown = (c.routes || []).length > 0 && (c.routes || []).length >= (c.route_count || 0);
+    newEditor = stopListEditor({
+      rows: made.rows, editable: true, idPrefix: "new", layer: "stage-review-new", color: COLOURS[1],
+      empty: "No stops yet. Add a stop.",
+      what: "the new stage",
+      beforePick: () => editor.closePicker(),
+      onChange: () => { if (splitGo) splitGo.disabled = !canSplit(allKnown); },
+    });
+    tellDropped(made.dropped);
+    drawHost();
+    newEditor.draw();
+    document.getElementById("split-name")?.focus();
+  };
+  const endSplit = () => {
+    if (newEditor) newEditor.destroy();
+    newEditor = null;
+    splitting = null;
+    splitGo = null;
+    drawHost();
+  };
 
   const splitForm = (c, allKnown) => {
     const name = h("input", {
       type: "text", id: "split-name", value: splitName, autocomplete: "off", spellcheck: "false",
-      on: { input: (ev) => { splitName = ev.target.value; go.disabled = !splitName.trim() || splitBusy; } },
+      on: { input: (ev) => { splitName = ev.target.value; splitGo.disabled = !canSplit(allKnown); } },
     });
     const dir = h("select", { id: "split-direction", on: { change: (ev) => { splitDir = ev.target.value; } } },
       h("option", { value: "", selected: splitDir === "" }, "Either way"),
       h("option", { value: "up", selected: splitDir === "up" }, "Up"),
       h("option", { value: "down", selected: splitDir === "down" }, "Down"));
-    const go = h("button.btn.small", {
-      type: "button", disabled: !splitName.trim() || splitBusy || !allKnown,
+    splitGo = h("button.btn.small", {
+      type: "button", disabled: !canSplit(allKnown),
       on: { click: () => splitOff(c, name.value, dir.value) },
-    }, splitBusy ? "Creating\u2026" : "Create the stage");
+    }, splitBusy ? "Creating…" : "Create the stage");
     return h("div.split-form",
-      h("p.hint", `A new stage with these ${plural(c.stops.length, "stop")}. `
-        + `${(c.routes || []).length === 1 ? `Route ${c.routes[0]} runs` : `Routes ${(c.routes || []).join(", ")} run`} `
+      h("p.hint", `A new stage. ${(c.routes || []).length === 1 ? `Route ${c.routes[0]} runs` : `Routes ${(c.routes || []).join(", ")} run`} `
         + `it instead of ${stage ? stage.name : r.name}; every other route stays where it is.`),
       h("label.field", { for: "split-name" }, h("span", "Name"), name),
       h("label.field", { for: "split-direction" }, h("span", "Direction"), dir),
-      h("div.btn-row", go,
+      h("p.hint", "Its stops, from this list. Reorder, change, remove or add them before you create it."),
+      newEditor ? newEditor.listEl : null,
+      newEditor ? h("div.btn-row", newEditor.addBtn) : null,
+      newEditor ? newEditor.pickerSlot : null,
+      h("div.btn-row", splitGo,
         h("button.btn.quiet.small", {
           type: "button", disabled: splitBusy,
-          on: { click: () => { splitting = null; draw(); } },
+          on: { click: endSplit },
         }, "Cancel")));
   };
 
@@ -638,18 +813,19 @@ export async function showStageReview(id) {
     name = (name || "").trim();
     const routeIds = c.routes || [];
     const key = stage && (stage.stage_key || stage.stage_id);
-    if (!name || !routeIds.length || !key) return;
+    const stops = newEditor ? newEditor.kept() : [];
+    if (!name || !routeIds.length || !key || !stops.length) return;
     if (!(await requireDraft("A new stage goes into a draft. Nothing changes for passengers until someone else approves it and it is committed."))) return;
     if (!(await confirmDialog(
       `Move ${plural(routeIds.length, "route")} to a new stage?`,
-      `${name} becomes a new stage with these ${plural(c.stops.length, "stop")}, and `
+      `${name} becomes a new stage with ${plural(stops.length, "stop")}, and `
         + `${routeIds.length === 1 ? `route ${routeIds[0]}` : `routes ${routeIds.join(", ")}`} `
         + `will run it in place of ${stage.name} (stage ${stage.stage_id}). It goes into your draft; `
         + "nothing changes for passengers until the draft is approved and committed.",
       { confirm: "Create the stage" },
     ))) return;
     splitBusy = true;
-    draw();
+    if (splitGo) { splitGo.disabled = true; splitGo.textContent = "Creating…"; }
     try {
       // One change, however many routes: the server makes the stage and moves
       // them in the same transaction. This used to be a create plus one call
@@ -663,103 +839,43 @@ export async function showStageReview(id) {
           description: null,
           from_stage_id: key,
           routes: routeIds,
-          rows: c.stops.map((sid, i) => ({
-            stop_id: sid, stop_type: i === 0 ? "NEW STOP" : "INTERMEDIATE STOP",
-          })),
+          rows: stops.map(asStageRow),
         },
       }, { merge: false });
       if (!res) return;
       const bad = (res.problems || []).find((pb) => pb.level === "error");
       if (bad) return toast(bad.message, "error");
       toast(`${name} is in your draft, and ${plural(routeIds.length, "route")} now run it.`, "ok");
+      if (newEditor) newEditor.destroy();
+      newEditor = null;
       showStageReview(id);
       return;
     } catch (e) {
       toast(e.message, "error");
     } finally {
       splitBusy = false;
-      if (splitting) draw();
+      if (splitGo) { splitGo.textContent = "Create the stage"; splitGo.disabled = false; }
     }
   };
 
   const useList = (c) => {
-    const byId = new Map();
-    for (const st of r.stages || []) for (const x of st.rows || []) byId.set(x.stop_id, x);
-    rows = c.stops.map((sid, i) => byId.get(sid) || {
-      stop_id: sid, stop_type: i === 0 ? "NEW STOP" : "INTERMEDIATE STOP",
-      stop_name: (c.stop_names || [])[i] || sid, lat: null, lon: null,
-    });
-    rows.forEach((x, i) => { x.stop_type = i === 0 ? "NEW STOP" : (x.stop_type === "ROUTE CORRECTION" ? x.stop_type : (x.stop_type === "NEW STOP" ? "INTERMEDIATE STOP" : x.stop_type)); });
-    draw();
+    const made = listRows(c);
+    editor.setRows(made.rows);
+    tellDropped(made.dropped);
   };
 
-  // stopPicker builds the search and hands it back to be placed; it does not
-  // put itself anywhere, so it is mounted under the list while it is open.
-  // Adding and changing share it: the only difference is where the stop lands.
-  const pickerSlot = h("div");
-  let picker = null;
-  const closePicker = () => {
-    if (picker) picker.close();
-    picker = null;
-    clear(pickerSlot);
-    addBtn.hidden = false;
+  // a row as a stage change stores it
+  const asStageRow = (row) => {
+    const marker = row.stop_type === "ROUTE CORRECTION";
+    return {
+      stop_id: marker ? null : row.stop_id, stop_type: row.stop_type,
+      marker_id: marker ? row.marker_id || null : null,
+      marker_name: marker ? row.marker_name || null : null,
+      marker_lat: marker ? row.marker_lat ?? null : null,
+      marker_lon: marker ? row.marker_lon ?? null : null,
+      stop_name_override: marker ? null : row.stop_name_override ?? null,
+    };
   };
-  const openPicker = (opts) => {
-    closePicker();
-    addBtn.hidden = true;
-    picker = stopPicker({ ...opts, onCancel: closePicker });
-    clear(pickerSlot, picker.el);
-    picker.focus();
-    pickerSlot.scrollIntoView({ block: "nearest" });
-  };
-  const addStop = () => {
-    if (picker) return closePicker();
-    openPicker({
-      title: "Add a stop to this stage",
-      exclude: kept().map((x) => x.stop_id).filter(Boolean),
-      excludeReason: "it is already in this stage.",
-      mapMessage: "Click the stop to add it to the end of this stage.",
-      onPick: (stop) => {
-        rows.push({
-          stop_id: stop.stop_id,
-          stop_type: kept().length ? "INTERMEDIATE STOP" : "NEW STOP",
-          stop_name: stop.name,
-          lat: stop.lat,
-          lon: stop.lon,
-        });
-        closePicker();
-        draw();
-        toast(`Added ${stop.name} as stop ${kept().length} of this stage.`);
-      },
-    });
-  };
-  // The pencil: the stage still calls somewhere at this point in its order, at
-  // a different stop. The row keeps its place and its kind; only the stop moves.
-  const changeStop = (i) => {
-    const was = rows[i];
-    openPicker({
-      title: `Change stop ${i + 1}, ${stopLabel(was)}, for another`,
-      near: was.lat != null && was.lon != null ? { lat: was.lat, lon: was.lon, label: stopLabel(was) } : null,
-      exclude: rows.map((x, n) => (n === i || x.removed ? null : x.stop_id)).filter(Boolean),
-      excludeReason: "it is already in this stage.",
-      mapMessage: "Click the stop this one becomes.",
-      onPick: (stop) => {
-        rows[i] = {
-          ...was,
-          stop_id: stop.stop_id,
-          stop_name: stop.name,
-          lat: stop.lat,
-          lon: stop.lon,
-          stop_name_override: null,
-        };
-        closePicker();
-        focusGrip = i;
-        draw();
-        toast(`Stop ${i + 1} is now ${stop.name}.`);
-      },
-    });
-  };
-  const addBtn = h("button.btn.secondary", { type: "button", on: { click: addStop } }, "Add a stop");
 
   const save = h("button.btn", { type: "button", hidden: !editable, disabled: true }, "Save these stops to a draft");
   save.addEventListener("click", async () => {
@@ -772,17 +888,7 @@ export async function showStageReview(id) {
           name: nameInput.value.trim() || stage.name,
           direction: stage.direction || null,
           description: stage.description || null,
-          rows: kept().map((row) => {
-            const marker = row.stop_type === "ROUTE CORRECTION";
-            return {
-              stop_id: marker ? null : row.stop_id, stop_type: row.stop_type,
-              marker_id: marker ? row.marker_id || null : null,
-              marker_name: marker ? row.marker_name || null : null,
-              marker_lat: marker ? row.marker_lat ?? null : null,
-              marker_lon: marker ? row.marker_lon ?? null : null,
-              stop_name_override: marker ? null : row.stop_name_override ?? null,
-            };
-          }),
+          rows: kept().map(asStageRow),
         },
       });
       if (!res) return void (save.disabled = false);
@@ -944,9 +1050,9 @@ export async function showStageReview(id) {
         ? "This is what every route using the stage will call at. Reorder or remove them, take one of the lists below, or add any stop. Saving puts it in your draft; it reaches passengers when the draft is approved and committed."
         : "What every route using this stage calls at."),
       h("p.ids", h("label.field", { for: "stage-review-name" }, h("span", "Stage name"), nameInput)),
-      listEl,
-      editable ? h("div.btn-row", addBtn, save) : null,
-      editable ? pickerSlot : null,
+      editor.listEl,
+      editable ? h("div.btn-row", editor.addBtn, save) : null,
+      editable ? editor.pickerSlot : null,
       // a route using the stage twice is listed once
       (() => {
         const seen = new Map();
@@ -992,6 +1098,6 @@ export async function showStageReview(id) {
       editable ? h("label.field", { for: "stage-review-note" }, h("span", "Note"), note) : null,
       editable ? h("label.field", { for: "stage-review-draft" }, h("span", "Draft"), draftInput) : null,
       h("div.btn-row", fixed, left, reopen)) : null);
-  draw();
+  editor.draw();
   drawMerge();
 }
