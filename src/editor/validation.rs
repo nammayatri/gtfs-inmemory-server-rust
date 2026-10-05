@@ -232,8 +232,11 @@ pub const FARE_STAGE_CODES: [&str; 5] = [
 /// stages.
 ///
 /// The fare invariant: an INTERMEDIATE STOP carries the stage number and name
-/// of the NEW STOP before it. A stop on the wrong side of a stage boundary
-/// changes what a passenger is charged.
+/// of the stage it is in - opened by the NEW STOP before it, or by a JUMP STOP
+/// with a stage of its own. A JUMP STOP (a stage the bus passes without
+/// stopping) need not have a stage of its own: one carrying the stage it is in
+/// opens nothing. A stop on the wrong side of a stage boundary changes what a
+/// passenger is charged.
 pub fn check_route_rows(rows: &[RouteRow]) -> Vec<Finding> {
     check_route_rows_for(rows, true)
 }
@@ -270,7 +273,8 @@ fn stop_list_rules(rows: &[RouteRow], label: &dyn Fn(usize) -> String) -> Vec<Fi
         ));
         return out;
     }
-    let mut last_stage: Option<(i32, &str)> = None; // most recent NEW STOP
+    // the stage open: the most recent NEW STOP, or JUMP STOP with a stage of its own
+    let mut last_stage: Option<(i32, &str)> = None;
     let mut max_stage: Option<i32> = None;
     let mut prev_served: Option<&str> = None;
     let mut first_served_seen = false;
@@ -365,6 +369,21 @@ fn stop_list_rules(rows: &[RouteRow], label: &dyn Fn(usize) -> String) -> Vec<Fi
             "NEW STOP" => {
                 last_stage = Some((r.stage_no, r.stage_name.as_str()));
             }
+            // in the stage before it, or the first stop of a stage of its own
+            "JUMP STOP" => match last_stage {
+                Some((no, name)) if no == r.stage_no && name != r.stage_name => out.push(
+                    Finding::error(
+                        "fare_stage_mismatch",
+                        format!("{sid}|{}|{}", r.stage_no, r.stage_name),
+                        format!(
+                            "{pos} ({sid}): a JUMP STOP in stage {no} carries its name {name:?}, not {:?}; or give it a stage number of its own",
+                            r.stage_name
+                        ),
+                    )
+                    .at(i),
+                ),
+                _ => last_stage = Some((r.stage_no, r.stage_name.as_str())),
+            },
             "INTERMEDIATE STOP" => match last_stage {
                 None => out.push(
                     Finding::error(
@@ -379,7 +398,7 @@ fn stop_list_rules(rows: &[RouteRow], label: &dyn Fn(usize) -> String) -> Vec<Fi
                         "fare_stage_mismatch",
                         format!("{sid}|{}|{}", r.stage_no, r.stage_name),
                         format!(
-                            "{pos} ({sid}): an INTERMEDIATE STOP must carry the preceding NEW STOP's stage {no} {name:?}, not {} {:?}",
+                            "{pos} ({sid}): an INTERMEDIATE STOP must carry the stage it is in, {no} {name:?} (from the NEW STOP or JUMP STOP before it), not {} {:?}",
                             r.stage_no, r.stage_name
                         ),
                     )
@@ -1739,6 +1758,41 @@ mod tests {
         let mut rows = good();
         rows[1].stage_name = "ADYAR B.T".into();
         assert_eq!(codes(&check_route_rows(&rows)), vec!["fare_stage_mismatch"]);
+    }
+
+    #[test]
+    fn a_jump_stop_may_open_a_stage_of_its_own() {
+        // what MTC's route 10 does: the bus passes stage 2 without stopping,
+        // and the stops after it are in stage 2
+        let mut rows = good();
+        rows.insert(4, row("K", "JUMP STOP", 2, "KOTTUR"));
+        rows.insert(5, row("L", "INTERMEDIATE STOP", 2, "KOTTUR"));
+        rows[6].stage_no = 3;
+        rows[7].stage_no = 3;
+        assert!(codes(&check_route_rows(&rows)).is_empty());
+        // a run of jump stops, each its own stage
+        let mut run = rows.clone();
+        run.insert(5, row("P", "JUMP STOP", 3, "PORUR"));
+        for r in &mut run[6..] {
+            r.stage_no += 1;
+        }
+        run[6].stage_name = "PORUR".into();
+        assert!(codes(&check_route_rows(&run)).is_empty(), "{run:?}");
+        // a stop after the jump stop still in the stage before it
+        let mut stale = rows.clone();
+        stale[5].stage_no = 1;
+        stale[5].stage_name = "ADYAR".into();
+        assert_eq!(
+            codes(&check_route_rows(&stale)),
+            vec!["stage_decreases", "fare_stage_mismatch"]
+        );
+        // the stage number of the stage it is in, with another name
+        let mut named = good();
+        named[3].stage_name = "JUMP".into();
+        assert_eq!(
+            codes(&check_route_rows(&named)),
+            vec!["fare_stage_mismatch"]
+        );
     }
 
     #[test]

@@ -27,9 +27,10 @@ function number(name, { blankOk = false } = {}) {
     return n;
   };
 }
-function whole(name) {
+function whole(name, { blankOk = false } = {}) {
   return (v) => {
     const s = v.trim();
+    if (s === "" && blankOk) return undefined;
     if (!/^-?\d+$/.test(s)) throw new Error(`${name} must be a whole number.`);
     return Number(s);
   };
@@ -143,11 +144,17 @@ const KINDS = {
       { name: "sequence", required: true, read: whole("sequence"), help: "Position in the route: 1, 2, 3…" },
       { name: "stop_id", required: true, read: text, help: "An existing stop, or one new in your draft." },
       { name: "stop_type", required: true, read: stopType, help: STOP_TYPES.join(", ") },
-      { name: "stage_no", required: true, read: whole("stage_no"), help: "Fare stage number." },
-      { name: "stage_name", required: true, read: text, help: "Fare stage name." },
+      // the column is required; a JUMP STOP's cell may be empty (rowCheck)
+      { name: "stage_no", required: false, header: true, read: whole("stage_no", { blankOk: true }), help: "Fare stage number. A JUMP STOP may leave it empty: it is then in the stage before it." },
+      { name: "stage_name", required: false, header: true, read: optional, help: "Fare stage name. A JUMP STOP in the stage before it may leave it empty." },
       ...ROUTE_STOP_GTFS,
     ],
     show: ["action", "route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"],
+    rowCheck: (row) => {
+      if (row.stop_type === "JUMP STOP") return [];
+      return ["stage_no", "stage_name"].filter((k) => row[k] === undefined)
+        .map((k) => `${k} is empty. Only a JUMP STOP may leave its stage empty.`);
+    },
   },
   route_trips: {
     label: "Trips",
@@ -260,7 +267,7 @@ export function readFile(kind, csvText) {
   if (header.some((c, i) => !c && records.slice(headerAt + 1).some((r) => (r[i] || "").trim()))) {
     fileProblems.push("A column with values has no name in the header row.");
   }
-  const missing = spec.columns.filter((c) => c.required && !header.includes(c.name)).map((c) => c.name);
+  const missing = spec.columns.filter((c) => (c.required || c.header) && !header.includes(c.name)).map((c) => c.name);
   if (missing.length) fileProblems.push(`The file has no ${missing.join(", ")} column${missing.length === 1 ? "" : "s"}. The header row must name them.`);
   const rows = [], sheetRows = [], rowProblems = new Map();
   if (fileProblems.length) return { rows, sheetRows, fileProblems, rowProblems };
@@ -394,7 +401,7 @@ export async function showImport(kind, file) {
         recordPicker,
         h("details.columns",
           h("summary", `Columns for ${spec.short || spec.label.toLowerCase()}`),
-          h("table.column-table", h("tbody", spec.columns.map((c) => h("tr", h("th", { scope: "row" }, h("code", c.name)), h("td", c.required ? "Required" : "Optional"), h("td", c.help)))))),
+          h("table.column-table", h("tbody", spec.columns.map((c) => h("tr", h("th", { scope: "row" }, h("code", c.name)), h("td", c.required ? "Required" : c.header ? "Required column" : "Optional"), h("td", c.help)))))),
         h("div.btn-row", h("a.btn.secondary.small", { href: templateHref(view.kind), download: `${view.kind}-template.csv` }, `Download the ${spec.short || spec.label.toLowerCase()} template`))),
       h("section.import-step",
         h("h2", "2. Choose the file"),
