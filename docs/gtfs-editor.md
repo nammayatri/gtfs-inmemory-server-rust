@@ -113,9 +113,10 @@ rows all have a null `stop_headsign` — still gets the synthesis on every row.
 the loader builds equals the one the pre-`0017` code built from the same row.
 
 `stage_no` and `stage_name` stay NOT NULL and keep their meaning for a fare-stage
-feed (an INTERMEDIATE STOP carries the preceding NEW STOP's stage — section 6's
-fare invariant). For a feed with `headsign_source = 'none'` they are internal and
-default to `0` / `''`: nothing public reads either column, and a seeder does not
+feed (an INTERMEDIATE STOP carries the stage it is in — section 6's fare
+invariant). A JUMP STOP with no stage of its own stores the stage it is in.
+A feed seeded from a zip gets its stages from its headsigns (18.4). For a feed
+with `headsign_source = 'none'` they are internal and default to `0` / `''`: nothing public reads either column, and a seeder does not
 have to invent fare stages to insert a route.
 
 ### The timetable
@@ -3523,6 +3524,30 @@ the version and audits `seed` with the zip's sha256, the counts and the
 findings. A missing `gtfs_feed` row is made, named after the feed's agency
 (`display_name`; the publisher is often a city body that publishes several
 feeds - CUMTA publishes Chennai's bus and metro).
+
+**Fare stages come from the headsigns (2026-10-05).** nandi writes a fare-stage
+feed's stages into `stop_headsign`. A stage stop's headsign is
+`{'fareStageNumber': 'N', 'isStageStop': true}`, and every other stop's is its
+stage number (chennai.bus and kolkata.bus). A seed used to store every route stop
+as a NEW STOP of stage 0 with no name. The stage stayed only inside the
+headsign, so the editor showed no stages and had no fare rules to hold. Now, when
+at least one headsign is that dictionary and every stop time's headsign gives a
+stage, the seed (`fare_stages_of`):
+
+- sets `headsign_source = 'fare_stage'`;
+- makes each row a NEW STOP or an INTERMEDIATE STOP with its `stage_no`;
+- names each stage after its stage stop, because GTFS has no stage names. A
+  stage whose stage stop the zip leaves out (a jump stop is never in a zip) is
+  named after its first stop;
+- leaves `stop_headsign` empty wherever the stage gives back exactly the same
+  text, so the served headsign follows the stage when it is edited. A headsign
+  spelt any other way stays the row's own, and the zip still round-trips.
+
+Any other feed is seeded as before, with `headsign_source = 'none'`. Read this
+way, both shipped zips round-trip clean: kolkata.bus has 83 stage stops and no
+fare finding. chennai.bus has 47,371 stage stops, plus 376 `fare_stage_mismatch`
+findings, all of them stops after a jump stop the zip does not carry. The report
+gives `stage_stops`.
 
 `gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]` (a dry run without
 `--seed`), or `POST /feeds/{g}/import?seed=true` with the zip as the body (admin,

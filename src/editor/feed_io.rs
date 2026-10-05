@@ -16,13 +16,16 @@
 //! other file is a record table whose columns are the file's own fields.
 
 use super::error::{EditorError, EditorResult};
+use super::validation::{INTERMEDIATE_STOP, NEW_STOP};
 use crate::gtfs::model::{
     FeedModel, Frequency, Pattern, PatternStop, Profile, Record, Route, Row, Service, Shape,
     ShapePoint, Stop, Trip, PATTERN_STOP_FIELDS,
 };
 use crate::gtfs::spec::{self, FileSpec, Key};
 use crate::gtfs::Finding;
-use crate::services::gtfs_db_source::{headsign, HeadsignSource};
+use crate::services::gtfs_db_source::{
+    fare_stage_headsign, headsign, is_fare_stage_dict, parse_headsign_stage, HeadsignSource,
+};
 use actix_web::http::StatusCode;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, Row as _};
@@ -493,6 +496,90 @@ pub struct SeedReport {
     pub gtfs_id: String,
     pub counts: BTreeMap<String, usize>,
     pub feed_version: i64,
+    /// The stage stops read from the zip's headsigns ([`fare_stages_of`]);
+    /// 0 for a feed without fare stages.
+    pub stage_stops: usize,
+}
+
+/// A route stop's fare stage, as a seed reads it back from its headsign.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedStage {
+    pub stop_type: &'static str,
+    pub stage_no: i32,
+    pub stage_name: String,
+    /// The zip spells the headsign otherwise than the stage gives it, so the
+    /// row keeps it as its own.
+    pub keep_headsign: bool,
+}
+
+/// MTC's fare stages, read back from the headsigns a fare-stage feed's zip
+/// serves (section 1, "The headsign"): a stage stop's is
+/// `{'fareStageNumber': 'N', 'isStageStop': true}`, every other stop's its
+/// stage number. A feed has fare stages when one headsign is that dictionary
+/// and every stop time's headsign gives a stage; each pattern stop is then a
+/// NEW STOP or an INTERMEDIATE STOP of its stage. GTFS names no stage: a stage
+/// is named after its stage stop, or, when the zip has none before it (a jump
+/// stop is never in a zip), after its first stop. A headsign the stage gives back exactly is left to
+/// the feed to give, so editing the stage changes what is served; any other
+/// spelling stays the row's own, so the zip still round-trips. `None`: the
+/// feed has no fare stages, by pattern and stop of `m.patterns` otherwise.
+pub fn fare_stages_of(m: &FeedModel) -> Option<Vec<Vec<SeedStage>>> {
+    fn headsign_of(s: &PatternStop) -> &str {
+        s.values
+            .get("stop_headsign")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+    let any_stage_stop = m
+        .patterns
+        .iter()
+        .flat_map(|p| &p.stops)
+        .any(|s| is_fare_stage_dict(headsign_of(s)));
+    if !any_stage_stop {
+        return None;
+    }
+    let names: HashMap<&str, &str> = m
+        .stops
+        .iter()
+        .map(|s| {
+            let name = s.values.get("stop_name").and_then(Value::as_str);
+            (s.stop_id.as_str(), name.unwrap_or("").trim())
+        })
+        .collect();
+    let mut out = Vec::with_capacity(m.patterns.len());
+    for p in &m.patterns {
+        let mut open: Option<(i32, &str)> = None;
+        let mut stops = Vec::with_capacity(p.stops.len());
+        for s in &p.stops {
+            let h = headsign_of(s);
+            let (Some(stage_no), flag) = parse_headsign_stage(h, true) else {
+                return None;
+            };
+            let own = names.get(s.stop_id.as_str()).copied().unwrap_or("");
+            let (stop_type, stage_name) = if flag == Some(true) {
+                open = Some((stage_no, own));
+                (NEW_STOP, own)
+            } else {
+                match open {
+                    Some((no, name)) if no == stage_no => (INTERMEDIATE_STOP, name),
+                    // a stage whose stage stop the zip leaves out (a jump stop):
+                    // named after its first stop, as one stage
+                    _ => {
+                        open = Some((stage_no, own));
+                        (INTERMEDIATE_STOP, own)
+                    }
+                }
+            };
+            stops.push(SeedStage {
+                stop_type,
+                stage_no,
+                stage_name: stage_name.to_string(),
+                keep_headsign: fare_stage_headsign(stage_no, stop_type) != h,
+            });
+        }
+        out.push(stops);
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------- seed
@@ -656,14 +743,22 @@ pub async fn seed(
         .execute(&mut *conn)
         .await?;
     refuse_unless_empty(conn, g).await?;
+    // a fare-stage feed's headsigns become its route stops' stages
+    let stages = fare_stages_of(m);
+    let headsign_source = if stages.is_some() {
+        "fare_stage"
+    } else {
+        "none"
+    };
     sqlx::query(
         "UPDATE gtfs_feed SET stops_scope = 'all', agency_name = coalesce($2, agency_name), \
-         default_run_s = $3, default_dwell_s = $4 WHERE gtfs_id = $1",
+         default_run_s = $3, default_dwell_s = $4, headsign_source = $5 WHERE gtfs_id = $1",
     )
     .bind(g)
     .bind(&agency_name)
     .bind(m.default_timing.0)
     .bind(m.default_timing.1)
+    .bind(headsign_source)
     .execute(&mut *conn)
     .await?;
     sqlx::query("DELETE FROM gtfs_agency WHERE gtfs_id = $1")
@@ -849,18 +944,31 @@ pub async fn seed(
     )
     .await?;
     let mut stop_rows: Vec<Value> = Vec::new();
-    for p in &m.patterns {
+    for (k, p) in m.patterns.iter().enumerate() {
         for (i, s) in p.stops.iter().enumerate() {
-            let mut pairs: Vec<(&str, Value)> =
-                s.values.iter().map(|(k, v)| (*k, v.clone())).collect();
+            let stage = stages.as_ref().map(|st| &st[k][i]);
+            let mut pairs: Vec<(&str, Value)> = s
+                .values
+                .iter()
+                .filter(|(f, _)| {
+                    **f != "stop_headsign" || stage.map_or(true, |st| st.keep_headsign)
+                })
+                .map(|(f, v)| (*f, v.clone()))
+                .collect();
             pairs.extend([
                 ("route_id", json!(p.route_id)),
                 ("pattern_key", json!(p.pattern_key)),
                 ("sequence", json!(i + 1)),
                 ("stop_id", json!(s.stop_id)),
-                ("stop_type", json!("NEW STOP")),
-                ("stage_no", json!(0)),
-                ("stage_name", json!("")),
+                (
+                    "stop_type",
+                    json!(stage.map_or(NEW_STOP, |st| st.stop_type)),
+                ),
+                ("stage_no", json!(stage.map_or(0, |st| st.stage_no))),
+                (
+                    "stage_name",
+                    json!(stage.map_or("", |st| st.stage_name.as_str())),
+                ),
                 ("updated_by", json!(actor)),
             ]);
             stop_rows.push(row_of(g, pairs));
@@ -1067,10 +1175,17 @@ pub async fn seed(
     .bind(g)
     .fetch_one(&mut *conn)
     .await?;
+    let stage_stops = stages.map_or(0, |st| {
+        st.iter()
+            .flatten()
+            .filter(|s| s.stop_type == NEW_STOP)
+            .count()
+    });
     Ok(SeedReport {
         gtfs_id: g.to_string(),
         counts: m.counts(),
         feed_version: version,
+        stage_stops,
     })
 }
 
@@ -1103,6 +1218,9 @@ pub struct ImportReport {
     pub round_trip_sample: Vec<crate::gtfs::compare::Diff>,
     pub seeded: bool,
     pub feed_version: Option<i64>,
+    /// The fare stage stops read from the zip's headsigns (the seed's
+    /// `stage_stops`): 0 for a feed without fare stages.
+    pub stage_stops: usize,
     /// What the zip breaks of the GTFS reference, as the feed report reads it:
     /// kept, as the import keeps what the feed ships.
     pub validation: crate::gtfs::validate::Report,
@@ -1183,6 +1301,7 @@ pub async fn import_zip(
         round_trip_sample: vec![],
         seeded: false,
         feed_version: None,
+        stage_stops: 0,
         validation: crate::gtfs::validate::summarise(
             &crate::gtfs::validate::validate(&m, &chrono::Utc::now().date_naive().to_string()),
             5,
@@ -1194,6 +1313,7 @@ pub async fn import_zip(
 
     let mut tx = pool.begin().await?;
     let seeded = seed(&mut tx, &g, &m, &who.label).await?;
+    report.stage_stops = seeded.stage_stops;
     let (back, export_findings) = load_model(&mut tx, &g).await?;
     report.findings.extend(export_findings);
     let diffs = compare::compare(&raw, &write::to_raw(&back), &m.dropped);
@@ -1223,6 +1343,7 @@ pub async fn import_zip(
             "warnings": report.warnings,
             "findings": summary,
             "feed_version": seeded.feed_version,
+            "stage_stops": seeded.stage_stops,
         }),
     )
     .await?;
@@ -1234,7 +1355,87 @@ pub async fn import_zip(
 
 #[cfg(test)]
 mod tests {
-    use super::check_gtfs_id;
+    use super::{check_gtfs_id, fare_stages_of, SeedStage};
+    use crate::gtfs::model::{FeedModel, Pattern, PatternStop, Row, Stop};
+    use serde_json::json;
+
+    fn model(stops: &[(&str, &str)]) -> FeedModel {
+        let stop = |id: &str| {
+            let mut values = Row::new();
+            values.insert("stop_name", json!(format!("STOP {id}")));
+            Stop {
+                stop_id: id.into(),
+                values,
+                sort_key: None,
+            }
+        };
+        let pattern_stop = |(id, h): &(&str, &str)| {
+            let mut values = Row::new();
+            if !h.is_empty() {
+                values.insert("stop_headsign", json!(h));
+            }
+            PatternStop {
+                stop_id: id.to_string(),
+                values,
+            }
+        };
+        FeedModel {
+            stops: stops.iter().map(|(id, _)| stop(id)).collect(),
+            patterns: vec![Pattern {
+                route_id: "R".into(),
+                pattern_key: 1,
+                stops: stops.iter().map(pattern_stop).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_fare_stage_feeds_headsigns_become_its_stages() {
+        let stage = |t: &'static str, no: i32, name: &str, keep: bool| SeedStage {
+            stop_type: t,
+            stage_no: no,
+            stage_name: name.into(),
+            keep_headsign: keep,
+        };
+        // as chennai.bus.gtfs.zip writes them
+        let m = model(&[
+            ("A", "{'fareStageNumber': '1', 'isStageStop': true}"),
+            ("B", "1"),
+            ("C", "{'fareStageNumber': '2', 'isStageStop': true}"),
+            ("D", "2"),
+            // a stage no stage stop before it opened: named after its first stop
+            ("E", "3"),
+            ("G", "3"),
+            // spelt otherwise than the stage gives it: the row keeps it
+            ("F", "{\"fareStageNumber\": \"4\", \"isStageStop\": true}"),
+        ]);
+        assert_eq!(
+            fare_stages_of(&m).unwrap()[0],
+            vec![
+                stage("NEW STOP", 1, "STOP A", false),
+                stage("INTERMEDIATE STOP", 1, "STOP A", false),
+                stage("NEW STOP", 2, "STOP C", false),
+                stage("INTERMEDIATE STOP", 2, "STOP C", false),
+                stage("INTERMEDIATE STOP", 3, "STOP E", false),
+                stage("INTERMEDIATE STOP", 3, "STOP E", false),
+                stage("NEW STOP", 4, "STOP F", true),
+            ]
+        );
+        // headsigns that are places, numbers alone, or a stop time with none
+        assert_eq!(
+            fare_stages_of(&model(&[("A", "Madavara"), ("B", "Muttom")])),
+            None
+        );
+        assert_eq!(fare_stages_of(&model(&[("A", "1"), ("B", "2")])), None);
+        assert_eq!(
+            fare_stages_of(&model(&[
+                ("A", "{'fareStageNumber': '1', 'isStageStop': true}"),
+                ("B", ""),
+            ])),
+            None
+        );
+    }
 
     #[test]
     fn a_feed_id_is_what_gims_and_a_url_carry_as_it_is() {
