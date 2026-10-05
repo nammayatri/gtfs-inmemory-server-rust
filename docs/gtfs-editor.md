@@ -634,9 +634,17 @@ nothing else (unknown fields are refused). Send `stop_name_override` and
 takes the route's usual one. The per-row `provenance` of the cleanup is kept for
 every row that is the same stop (or marker) at the same position. Rules: stop ids
 exist and are not stations; the first served row is a NEW STOP; every
-INTERMEDIATE STOP carries the preceding NEW STOP's `stage_no` and `stage_name`;
+INTERMEDIATE STOP carries the `stage_no` and `stage_name` of the stage it is in;
 stage numbers never decrease; no stop twice in a row; ROUTE CORRECTION rows have a
-marker position and no stop id. **Only problems the edit introduces block it**: a
+marker position and no stop id. A stage opens at a NEW STOP and at a JUMP STOP
+with a stage of its own. A JUMP STOP is a fare stage the bus passes without
+stopping, and its stage number is optional. With a number above the open stage,
+it opens that stage, and the INTERMEDIATE STOPs after it carry it (as MTC's
+route 10 does after MOOTAKARAN CHAVADI). With no stage of its own, it carries
+the open stage's number and name, the way an INTERMEDIATE STOP does. One with
+the open stage's number but another name is `fare_stage_mismatch`. The
+dashboard's stage field on a jump stop may be left empty, and then fills in the
+stage it is in. **Only problems the edit introduces block it**: a
 problem the live route already had is reported as a warning ("already present
 before this edit"), matched by code and stop, counted.
 
@@ -1003,7 +1011,7 @@ accepts, and what the row becomes:
 | `routes` | `add` | `{action, route_id, short_name, long_name?, color?}` | one `route/create` per row |
 | `routes` | `update` | `{action, route_id, short_name?, long_name?, color?}` | one `route/update` per row, with exactly the cells given |
 | `routes` | `delete` | `{action, route_id}` | one `route/delete` per row; any other cell filled is `invalid_row` |
-| `route_stops` | `add` \| `update` | `{action, route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`) |
+| `route_stops` | `add` \| `update` | `{action, route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`). A JUMP STOP may leave `stage_no` and `stage_name` empty: it then takes the stage open before it in the sorted rows. One given that stage's number with no name takes its name |
 | `stop_updates` | `update` | `{action, stop_id, platform_code?, description?, name?}` | one `stop/update` per row (a station: `station/update`), with exactly the cells given — section 11 |
 
 - **`stops`**: `add` refuses an id that is live or already created in this draft

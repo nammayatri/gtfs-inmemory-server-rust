@@ -4,7 +4,7 @@ import { get, post, enc } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
 import {
   h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, STOP_TYPE_LABEL, SERVED_EXCLUDE,
-  validateRows, renumberStages, decodePolyline, plural, ID_RE, ID_RULE,
+  validateRows, renumberStages, stageOpeners, decodePolyline, plural, ID_RE, ID_RULE,
   PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField,
 } from "./util.js";
 import * as map from "./map.js";
@@ -362,8 +362,11 @@ export async function editRouteRows(route, { created = false } = {}) {
     else if (focus) document.getElementById(focus)?.focus();
   };
 
+  // the row that opened the stage row i is in: a stage stop, or a jump stop
+  // with a stage of its own
   const stageBefore = (i) => {
-    for (let k = i; k >= 0; k--) if (rows[k].stop_type === "NEW STOP") return rows[k];
+    const opens = stageOpeners(rows);
+    for (let k = i; k >= 0; k--) if (opens[k]) return rows[k];
     return null;
   };
 
@@ -436,14 +439,15 @@ export async function editRouteRows(route, { created = false } = {}) {
     toast(`Stop ${i + 1} is now ${stop.name} (${stop.stop_id}).${dropped ? ` The route's own spelling "${dropped}" was for the old stop and is removed.` : ""}`);
   }
 
-  // Changing a stage stop's number or name carries along the rows of its stage
-  // that matched it, so the fare rule keeps holding.
+  // Changing a stage stop's (or a jump stop's) number or name carries along the
+  // rows after it in its stage that matched it, so the fare rule keeps holding.
   function setStage(i, patch) {
     const r = rows[i];
+    const opens = stageOpeners(rows);
     const old = { stage_no: r.stage_no, stage_name: r.stage_name };
     Object.assign(r, patch);
-    if (r.stop_type === "NEW STOP") {
-      for (let k = i + 1; k < rows.length && rows[k].stop_type !== "NEW STOP"; k++) {
+    if (r.stop_type === "NEW STOP" || r.stop_type === "JUMP STOP") {
+      for (let k = i + 1; k < rows.length && !opens[k]; k++) {
         if (String(rows[k].stage_no) === String(old.stage_no) && (rows[k].stage_name || "") === (old.stage_name || "")) {
           rows[k].stage_no = r.stage_no;
           rows[k].stage_name = r.stage_name;
@@ -452,6 +456,22 @@ export async function editRouteRows(route, { created = false } = {}) {
     }
     edited(`changed the fare stage at stop ${i + 1}`);
     redraw();
+  }
+
+  // A jump stop's stage number is optional. Left empty, the stop is in the
+  // stage before it; a number of its own opens that stage, named after the stop
+  // until another name is chosen.
+  function setJumpStage(i, value) {
+    const r = rows[i];
+    const open = stageBefore(i - 1);
+    const no = value === "" ? null : Number(value);
+    if (no === null || (open && no === Number(open.stage_no))) {
+      setStage(i, open ? { stage_no: open.stage_no, stage_name: open.stage_name } : { stage_no: null });
+    } else if (open && String(r.stage_no) === String(open.stage_no)) {
+      setStage(i, { stage_no: no, stage_name: (r.stop_name || "").trim() || r.stage_name });
+    } else {
+      setStage(i, { stage_no: no });
+    }
   }
 
   function stageNameControl(r, i) {
@@ -513,6 +533,17 @@ export async function editRouteRows(route, { created = false } = {}) {
           h("input.stage-no-input", { type: "number", min: "0", id: `stage-no-${i}`, value: String(r.stage_no ?? ""), "aria-label": `Stage number at stop ${i + 1}`,
             on: { change: (ev) => setStage(i, { stage_no: ev.target.value === "" ? null : Number(ev.target.value) }) } }),
           ...stageNameControl(r, i));
+      } else if (r.stop_type === "JUMP STOP") {
+        const open = stageBefore(i - 1);
+        const own = !open || String(r.stage_no) !== String(open.stage_no);
+        line.push(
+          h("label.inline", { for: `stage-no-${i}` }, "stage"),
+          h("input.stage-no-input", { type: "number", min: "0", id: `stage-no-${i}`, value: own ? String(r.stage_no ?? "") : "", placeholder: "none",
+            "aria-label": `Stage number at stop ${i + 1}, optional`, "aria-describedby": own ? null : `stage-hint-${i}`,
+            on: { change: (ev) => setJumpStage(i, ev.target.value) } }),
+          ...(own
+            ? stageNameControl(r, i)
+            : [h("span.meta", { id: `stage-hint-${i}` }, open ? `optional; in stage ${open.stage_no}, ${open.stage_name || "no name"}` : "optional")]));
       } else {
         line.push(h("span.meta", `stage ${r.stage_no ?? "?"}, ${r.stage_name || "no name"}`));
       }
@@ -580,9 +611,10 @@ export async function editRouteRows(route, { created = false } = {}) {
   });
 
   async function renumber() {
-    const firstStage = rows.find((r) => r.stop_type === "NEW STOP");
+    const opens = stageOpeners(rows);
+    const firstStage = rows.find((r, i) => opens[i]);
     if (!firstStage) { toast("There are no stage stops to number yet.", "error"); return; }
-    const stages = rows.filter((r) => r.stop_type === "NEW STOP").length;
+    const stages = opens.filter(Boolean).length;
     const from = await modal("Renumber stages in order", (close) => {
       const startIn = h("input", { type: "number", id: "renumber-start", min: "0", value: String(Number.parseInt(firstStage.stage_no, 10) || 1) });
       const preview = h("p", { "aria-live": "polite" });
@@ -597,7 +629,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       startIn.addEventListener("input", show);
       show();
       return h("form", { style: "display:grid;gap:12px", on: { submit: (ev) => { ev.preventDefault(); const s = Number.parseInt(startIn.value, 10); if (!Number.isNaN(s)) close(s); } } },
-        h("p", "Stage stops are numbered one after another in route order. Every other stop then takes the number and name of the stage it is in."),
+        h("p", "Stage stops, and jump stops with a stage of their own, are numbered one after another in route order. Every other stop then takes the number and name of the stage it is in."),
         h("p.notice.warning", "Fares depend on how many stages apart two stops are. If this route skips a stage number on purpose, check the fare chart before renumbering."),
         h("label.field", { for: "renumber-start" }, h("span", "Number of the first stage"), startIn),
         preview,
@@ -653,7 +685,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       h("h1", created ? `Stops of the new route ${label}` : `Edit stops of ${label}`),
       h("p", route.long_name || ""),
       created ? h("p.notice.draft", "This route is new in your draft. Add its stops in order: the first stop starts fare stage 1.") : null,
-      h("p.hint", "A stage stop starts a fare stage. Every intermediate stop after it carries the same stage number and name, or passengers are charged the wrong fare. Changing a stage stop's number or name updates the stops in its stage."),
+      h("p.hint", "A stage stop starts a fare stage. Every intermediate stop after it carries the same stage number and name, or passengers are charged the wrong fare. A jump stop's stage number is optional: give it one and it starts that stage, leave it empty and it is in the stage before it. Changing a stage's number or name updates the stops in its stage."),
       summary,
       h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: renumber } }, "Renumber stages in order"), fixAllBtn),
       history.buttons()),

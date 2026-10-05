@@ -665,6 +665,16 @@ def validate_rows(proj, rows, route_id, change_id):
         max_stage = no if max_stage is None else max(max_stage, no)
         if t == "NEW STOP":
             stage_no, stage_name = no, r.get("stage_name")
+        elif t == "JUMP STOP":
+            # in the stage before it, or the first stop of a stage of its own
+            if stage_no is not None and no == stage_no and (r.get("stage_name") or "") != (stage_name or ""):
+                err("jump_wrong_stage_name",
+                    f"Stop {n} ({name_of(r)}) is a jump stop in stage {stage_no}, whose name is '{stage_name}', "
+                    f"but it carries the name '{r.get('stage_name')}'. Give it that name, or a stage number of its own.",
+                    key=f"{sid}|{no}|{r.get('stage_name')}", row=n, expected_stage_no=stage_no,
+                    expected_stage_name=stage_name)
+            else:
+                stage_no, stage_name = no, r.get("stage_name")
         elif t == "INTERMEDIATE STOP":
             if stage_no is None:
                 err("intermediate_before_stage", f"Stop {n} ({name_of(r)}) is an intermediate stop before any stage stop.",
@@ -694,6 +704,31 @@ def validate_rows(proj, rows, route_id, change_id):
     if served < 2:
         err("too_few_stops", "A route needs at least two stops a passenger can board.")
     return out
+
+
+def carry_jump_stages(rows):
+    """A JUMP STOP left without a stage takes the stage open before it (the last
+    NEW STOP's, or a JUMP STOP's with a stage of its own); one given that stage's
+    number without a name takes its name. As the server's bulk import does."""
+    open_stage = None
+    for r in rows:
+        t = r.get("stop_type")
+        blank_name = not (isinstance(r.get("stage_name"), str) and r["stage_name"].strip())
+        if t == "JUMP STOP":
+            if open_stage:
+                if r.get("stage_no") in (None, ""):
+                    r["stage_no"] = open_stage[0]
+                if blank_name and r.get("stage_no") == open_stage[0]:
+                    r["stage_name"] = open_stage[1]
+            if blank_name and r.get("stage_name") is None:
+                r["stage_name"] = ""
+            if r.get("stage_no") in (None, ""):
+                r["stage_no"] = 0
+            if open_stage and open_stage[0] == r["stage_no"] and open_stage[1] != r["stage_name"]:
+                continue
+        elif t != "NEW STOP":
+            continue
+        open_stage = (r.get("stage_no"), r.get("stage_name"))
 
 
 def grade(found, live_found):
@@ -2504,9 +2539,11 @@ class Handler(BaseHTTPRequestHandler):
                     msg(i, "unknown_stop", f"Stop {sid} does not exist, in the feed or in this draft.")
                 elif st.get("location_type") == 1:
                     msg(i, "stop_is_station", f"{st['name']} ({sid}) is a station. Use one of its stops.")
-            if not is_int(r.get("stage_no")):
+            # a JUMP STOP may leave its stage empty: it is in the stage before it
+            jump = t == "JUMP STOP"
+            if not is_int(r.get("stage_no")) and not (jump and r.get("stage_no") in (None, "")):
                 msg(i, "missing_stage", "stage_no must be a whole number.")
-            if not (isinstance(r.get("stage_name"), str) and r["stage_name"].strip()):
+            if not (isinstance(r.get("stage_name"), str) and r["stage_name"].strip()) and not jump:
                 msg(i, "stage_name_missing", "Each row needs a stage_name.")
             by_route.setdefault(rid, []).append(i)
         changes = []
@@ -2546,6 +2583,7 @@ class Handler(BaseHTTPRequestHandler):
                          "stage_no": rows[i].get("stage_no"), "stage_name": rows[i].get("stage_name"),
                          "marker_id": None, "marker_name": None, "marker_lat": None, "marker_lon": None,
                          "stop_name_override": None, "provider_id": None} for i in ordered]
+            carry_jump_stages(new_rows)
             found = validate_rows(proj, new_rows, rid, None)
             live_rows = s.rows.get((g, rid), [])
             if live_rows:

@@ -20,7 +20,7 @@ use super::service::{self, rows_hash, ChangeInsert, FIRST_PATTERN};
 use super::trips::{self, check_trips, TripRules, TripSpec};
 use super::validation::{
     check_payload, check_route_rows_for, check_route_rows_labelled, grade_against_live, Finding,
-    Level, RouteRow,
+    Level, RouteRow, JUMP_STOP, NEW_STOP,
 };
 use super::EditorState;
 use crate::gtfs::spec;
@@ -982,6 +982,43 @@ struct StopRow {
     upload: usize,
     sequence: i32,
     row: RouteRow,
+    /// A JUMP STOP's `stage_no` / `stage_name` left empty: it is in the stage
+    /// open before it ([`carry_jump_stages`]).
+    blank_stage: (bool, bool),
+}
+
+/// A JUMP STOP need not have a stage of its own: one uploaded without a stage
+/// number is in the stage open before it - the most recent NEW STOP's, or a
+/// JUMP STOP's with a stage of its own - and takes its number and name; one
+/// given that stage's number without a name takes its name. `list` is in route
+/// order. A jump stop with nothing open before it keeps 0 / "", for the fare
+/// check to report.
+fn carry_jump_stages(list: &mut [StopRow]) {
+    let mut open: Option<(i32, String)> = None;
+    for r in list.iter_mut() {
+        let row = &mut r.row;
+        if row.stop_type == JUMP_STOP {
+            if let Some((no, name)) = &open {
+                if r.blank_stage.0 {
+                    row.stage_no = *no;
+                }
+                if r.blank_stage.1 && row.stage_no == *no {
+                    row.stage_name = name.clone();
+                }
+            }
+            // the same number with another name opens nothing: the fare
+            // check reports it
+            if open
+                .as_ref()
+                .is_some_and(|(no, name)| *no == row.stage_no && *name != row.stage_name)
+            {
+                continue;
+            }
+        } else if row.stop_type != NEW_STOP {
+            continue;
+        }
+        open = Some((row.stage_no, row.stage_name.clone()));
+    }
 }
 
 /// A route's stop order, as the upload groups its rows.
@@ -1028,20 +1065,26 @@ async fn plan_route_stops(
             }
         };
         let (route_id, stop_id, stop_type) = (text("route_id"), text("stop_id"), text("stop_type"));
+        // a JUMP STOP may leave its stage empty: it is in the stage before it
+        let jump = stop_type.as_deref() == Some(JUMP_STOP);
         // an empty stage name is the fare check's to report, like a single change
         let stage_name = match m.get("stage_name") {
+            None | Some(Value::Null) if jump => Some(None),
             None | Some(Value::Null) => {
                 bad.push("stage_name is required".into());
                 None
             }
-            Some(Value::String(s)) => Some(s.trim().to_string()),
+            Some(Value::String(s)) => {
+                Some(Some(s.trim().to_string()).filter(|s| !(jump && s.is_empty())))
+            }
             Some(_) => {
                 bad.push("stage_name must be text".into());
                 None
             }
         };
-        let mut whole = |k: &str| match cell_i32(m, k) {
-            Ok(Some(v)) => Some(v),
+        let mut whole = |k: &str, blank_ok: bool| match cell_i32(m, k) {
+            Ok(Some(v)) => Some(Some(v)),
+            Ok(None) if blank_ok => Some(None),
             Ok(None) => {
                 bad.push(format!("{k} is required"));
                 None
@@ -1051,7 +1094,7 @@ async fn plan_route_stops(
                 None
             }
         };
-        let (sequence, stage_no) = (whole("sequence"), whole("stage_no"));
+        let (sequence, stage_no) = (whole("sequence", false).flatten(), whole("stage_no", jump));
         if sequence.is_some_and(|s| s < 1) {
             bad.push("sequence must be 1 or more".into());
         }
@@ -1122,11 +1165,12 @@ async fn plan_route_stops(
         routes[at].1.push(StopRow {
             upload: i,
             sequence,
+            blank_stage: (stage_no.is_none(), stage_name.is_none()),
             row: RouteRow {
                 stop_id: Some(stop_id),
                 stop_type,
-                stage_no,
-                stage_name,
+                stage_no: stage_no.unwrap_or(0),
+                stage_name: stage_name.unwrap_or_default(),
                 marker_id: None,
                 marker_name: None,
                 marker_lat: None,
@@ -1155,6 +1199,7 @@ async fn plan_route_stops(
     });
     for (_, list) in routes.iter_mut() {
         list.sort_by_key(|r| (r.sequence, r.upload));
+        carry_jump_stages(list);
     }
 
     // everything the upload references, in a few queries
@@ -3731,5 +3776,58 @@ mod tests {
         assert_eq!(plan.rows[3].findings.len(), 1);
         assert!(plan.rows[1].findings.is_empty() && plan.rows[2].findings.is_empty());
         assert!(plan.has_errors());
+    }
+
+    #[test]
+    fn a_jump_stop_left_without_a_stage_is_in_the_stage_before_it() {
+        let stop = |t: &str, no: Option<i32>, name: Option<&str>| StopRow {
+            upload: 0,
+            sequence: 0,
+            blank_stage: (no.is_none(), name.is_none()),
+            row: RouteRow {
+                stop_id: Some("S".into()),
+                stop_type: t.into(),
+                stage_no: no.unwrap_or(0),
+                stage_name: name.unwrap_or_default().into(),
+                ..Default::default()
+            },
+        };
+        let mut list = vec![
+            stop(NEW_STOP, Some(4), Some("PERUNGALATHUR")),
+            stop(JUMP_STOP, None, None),
+            stop(JUMP_STOP, Some(5), Some("MUDICHUR")),
+            stop(JUMP_STOP, Some(5), None),
+            stop("INTERMEDIATE STOP", Some(5), Some("MUDICHUR")),
+            stop(JUMP_STOP, Some(6), None),
+            stop(NEW_STOP, Some(7), Some("TOLL PLAZA")),
+        ];
+        for (k, r) in list.iter_mut().enumerate() {
+            r.row.stop_id = Some(format!("S{k}"));
+        }
+        carry_jump_stages(&mut list);
+        let stages: Vec<(i32, &str)> = list
+            .iter()
+            .map(|r| (r.row.stage_no, r.row.stage_name.as_str()))
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                (4, "PERUNGALATHUR"),
+                (4, "PERUNGALATHUR"),
+                (5, "MUDICHUR"),
+                (5, "MUDICHUR"),
+                (5, "MUDICHUR"),
+                // a stage of its own needs its name: the fare check says so
+                (6, ""),
+                (7, "TOLL PLAZA"),
+            ]
+        );
+        let rows: Vec<RouteRow> = list.into_iter().map(|r| r.row).collect();
+        let codes: Vec<String> = check_route_rows_for(&rows, true)
+            .into_iter()
+            .filter(|f| f.level == Level::Error)
+            .map(|f| f.code)
+            .collect();
+        assert_eq!(codes, vec!["stage_name_missing"]);
     }
 }

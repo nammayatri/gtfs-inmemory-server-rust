@@ -207,6 +207,19 @@ export function decodePolyline(str) {
 // ------------------------------------------------------------------ route rules
 export const SERVED_EXCLUDE = new Set(["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"]);
 
+// Which rows open a fare stage: every stage stop, and a jump stop with a stage
+// of its own (a number other than the stage open before it). A jump stop need
+// not have one: carrying the stage it is in, it opens nothing.
+export function stageOpeners(rows) {
+  let open = null;
+  return rows.map((r) => {
+    const opens = r.stop_type === "NEW STOP"
+      || (r.stop_type === "JUMP STOP" && (!open || String(r.stage_no) !== String(open.stage_no)));
+    if (opens) open = r;
+    return opens;
+  });
+}
+
 // The same rules the server applies to a route_stops change (docs section 3),
 // run while editing so a mistake shows on the row that caused it. The server
 // remains the authority.
@@ -245,6 +258,15 @@ export function validateRows(rows) {
     if (r.stop_type === "NEW STOP") {
       stageNo = no;
       stageName = r.stage_name || "";
+    } else if (r.stop_type === "JUMP STOP") {
+      // in the stage before it, or the first stop of a stage of its own
+      if (stageNo !== null && no === stageNo && (r.stage_name || "") !== stageName) {
+        add(i, "jump_wrong_stage_name", `Stop ${n} (${name}) is a jump stop in stage ${stageNo}, named "${stageName}", but carries the name "${r.stage_name || ""}". Give it that name, or a stage number of its own.`,
+          { fix: { stage_no: stageNo, stage_name: stageName } });
+      } else {
+        stageNo = no;
+        stageName = r.stage_name || "";
+      }
     } else if (r.stop_type === "INTERMEDIATE STOP" && stageNo !== null) {
       if (no !== stageNo) {
         add(i, "intermediate_wrong_stage", `Stop ${n} (${name}) is an intermediate stop in stage ${stageNo} but carries stage ${no}.`,
@@ -263,14 +285,16 @@ export function validateRows(rows) {
   return problems;
 }
 
-// The stage of every row after renumbering: stage stops count up from `start`
-// in route order, and every other row takes the number and name of the stage
-// stop before it. Returns the new rows and how many rows change.
+// The stage of every row after renumbering: the rows that open a stage (stage
+// stops, and jump stops with a stage of their own) count up from `start` in
+// route order, and every other row takes the number and name of the stage it
+// is in. Returns the new rows and how many rows change.
 export function renumberStages(rows, start = 1) {
+  const opens = stageOpeners(rows);
   let no = start - 1, stage = null, changed = 0;
-  const out = rows.map((r) => {
+  const out = rows.map((r, i) => {
     const next = { ...r };
-    if (r.stop_type === "NEW STOP") {
+    if (opens[i]) {
       no += 1;
       next.stage_no = no;
       stage = { stage_no: no, stage_name: r.stage_name };
@@ -284,12 +308,14 @@ export function renumberStages(rows, start = 1) {
   return { rows: out, changed };
 }
 
-// Group ordered rows into fare stages: a stage starts at a NEW STOP; rows before
-// the first one (should not happen) form a stage of their own.
+// Group ordered rows into fare stages: a stage starts at a NEW STOP or at a
+// jump stop with a stage of its own; rows before the first one (should not
+// happen) form a stage of their own.
 export function groupStages(rows) {
   const stages = [];
+  const opens = stageOpeners(rows);
   rows.forEach((r, i) => {
-    if (r.stop_type === "NEW STOP" || stages.length === 0) {
+    if (opens[i] || stages.length === 0) {
       stages.push({ stage_no: r.stage_no, stage_name: r.stage_name, rows: [] });
     }
     stages[stages.length - 1].rows.push({ row: r, index: i });
