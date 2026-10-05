@@ -119,6 +119,7 @@ async fn import(args: &[String]) -> ExitCode {
                     "findings": report.findings,
                     "round_trip": report.round_trip,
                     "round_trip_sample": report.round_trip_sample,
+                    "stage_stops": report.stage_stops,
                     "ms": started.elapsed().as_millis() as u64,
                 }))
                 .unwrap_or_default()

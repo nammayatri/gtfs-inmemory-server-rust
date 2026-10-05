@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 #[path = "support/gtfs_fixture.rs"]
 mod gtfs_fixture;
-use gtfs_fixture::fixture;
+use gtfs_fixture::{fixture, zip_of};
 
 const AUD: &str = "gtfs.editor-feed-io-test.local";
 const BASE: &str = "/internal/gtfs-editor";
@@ -38,6 +38,7 @@ const FEED: &str = "editor_feed_io_test_feed";
 const HTTP_FEED: &str = "editor_feed_io_http_test_feed";
 const NEW_FEED: &str = "editor_feed_io_new_test_feed";
 const BG_FEED: &str = "editor_feed_io_background_test_feed";
+const STAGE_FEED: &str = "editor_feed_io_fare_stage_test_feed";
 const ADMIN: &str = "admin@editor-feed-io-test.invalid";
 const VIEWER: &str = "viewer@editor-feed-io-test.invalid";
 
@@ -398,6 +399,98 @@ fn state(pool: &PgPool, signer: &TestSigner) -> EditorState {
         },
     )
     .unwrap()
+}
+
+/// A fare-stage feed's zip, as nandi writes chennai.bus and kolkata.bus: a
+/// stage stop's headsign is `{'fareStageNumber': 'N', 'isStageStop': true}`,
+/// every other stop's its stage number.
+fn fare_stage_zip(feed_id: &str) -> Vec<u8> {
+    let feed_info = format!(
+        "feed_publisher_name,feed_publisher_url,feed_lang,feed_id\nMTC,https://mtc.example,en,{feed_id}\n"
+    );
+    zip_of(&[
+        ("agency.txt", "agency_id,agency_name,agency_url,agency_timezone\nMTC,MTC,https://mtc.example,Asia/Kolkata\n"),
+        ("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\nA,ADYAR,13.006,80.257\nB,KOTTUR,13.013,80.243\nC,GUINDY,13.008,80.212\nD,SAIDAPET,13.021,80.223\n"),
+        ("routes.txt", "route_id,agency_id,route_short_name,route_long_name,route_type\nR,MTC,21G,Adyar - Saidapet,3\n"),
+        ("trips.txt", "route_id,service_id,trip_id\nR,WK,T1\n"),
+        ("calendar.txt", "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nWK,1,1,1,1,1,1,1,20260101,20261231\n"),
+        ("stop_times.txt", "trip_id,arrival_time,departure_time,stop_id,stop_sequence,stop_headsign\n\
+T1,06:00:00,06:00:00,A,1,\"{'fareStageNumber': '1', 'isStageStop': true}\"\n\
+T1,06:05:00,06:05:00,B,2,1\n\
+T1,06:10:00,06:10:00,C,3,\"{'fareStageNumber': '2', 'isStageStop': true}\"\n\
+T1,06:15:00,06:15:00,D,4,2\n"),
+        ("feed_info.txt", feed_info.as_str()),
+    ])
+}
+
+#[actix_web::test]
+async fn a_fare_stage_feeds_headsigns_become_its_stages() {
+    let Some(pool) = local_pool().await else {
+        return;
+    };
+    clear_feed(&pool, STAGE_FEED).await;
+    let who = feed_io::Importer {
+        user_id: None,
+        email: None,
+        label: "editor_feed_io_flow".into(),
+    };
+    let report = feed_io::import_zip(&pool, &fare_stage_zip(STAGE_FEED), None, false, &who)
+        .await
+        .unwrap();
+    assert!(report.seeded, "{report:#?}");
+    assert!(
+        report.round_trip.is_empty(),
+        "{:#?}",
+        report.round_trip_sample
+    );
+    assert_eq!(report.stage_stops, 2);
+    let source: String =
+        sqlx::query_scalar("SELECT headsign_source FROM gtfs_feed WHERE gtfs_id = $1")
+            .bind(STAGE_FEED)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(source, "fare_stage");
+    let rows: Vec<(String, String, i32, String, Option<String>)> = sqlx::query_as(
+        "SELECT stop_id, stop_type, stage_no, stage_name, stop_headsign FROM gtfs_route_stop \
+         WHERE gtfs_id = $1 ORDER BY sequence",
+    )
+    .bind(STAGE_FEED)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let row = |id: &str, t: &str, no: i32, name: &str| {
+        (id.to_string(), t.to_string(), no, name.to_string(), None)
+    };
+    assert_eq!(
+        rows,
+        vec![
+            row("A", "NEW STOP", 1, "ADYAR"),
+            row("B", "INTERMEDIATE STOP", 1, "ADYAR"),
+            row("C", "NEW STOP", 2, "GUINDY"),
+            row("D", "INTERMEDIATE STOP", 2, "GUINDY"),
+        ],
+        "the stages are in the columns, and the feed gives the headsigns from them"
+    );
+    // the export gives the zip's headsigns back
+    let mut tx = pool.begin().await.unwrap();
+    let (back, _) = feed_io::load_model(&mut tx, STAGE_FEED).await.unwrap();
+    tx.rollback().await.unwrap();
+    let served: Vec<Option<&str>> = back.patterns[0]
+        .stops
+        .iter()
+        .map(|s| s.values.get("stop_headsign").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        served,
+        vec![
+            Some("{'fareStageNumber': '1', 'isStageStop': true}"),
+            Some("1"),
+            Some("{'fareStageNumber': '2', 'isStageStop': true}"),
+            Some("2"),
+        ]
+    );
+    clear_feed(&pool, STAGE_FEED).await;
 }
 
 async fn sign_in(

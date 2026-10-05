@@ -210,6 +210,9 @@ function seedReport(res) {
     Object.keys(res.round_trip || {}).length
       ? h("div.notice.error", h("p", "Exported again, the feed would differ from the zip:"), h("ul", Object.entries(res.round_trip).map(([k, n]) => h("li", `${k}: ${fmtCount(n)}`))))
       : h("p.notice.ok", "Exported again, the feed gives the zip back."),
+    res.stage_stops
+      ? h("p", `Fare stages read from the stop headsigns: ${plural(res.stage_stops, "stage stop")}. Each stage is named after its stage stop; the headsigns are served from the stages.`)
+      : null,
     res.findings && res.findings.length ? h("details", h("summary", plural(res.findings.length, "finding")), h("ul", res.findings.slice(0, 100).map((f) => h("li", `${f.level}: ${f.code} ${f.message}`)))) : null,
     res.validation ? reportView(res.validation, "The feed report on the zip.") : null);
 }
