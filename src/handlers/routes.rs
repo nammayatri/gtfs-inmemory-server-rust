@@ -27,7 +27,7 @@ use crate::models::{
     BusScheduleDetail, BusScheduleDetails, GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee,
     NandiRoutesRes, RepeatWalkEntry, RouteStopMapping, ScheduleTripRepeatConfig,
     StopCodeFromProviderStopCodeResponse, TripDetails, UpdateWaybillDetailsBody, VehicleData,
-    VehicleMetadataResponse, VehicleOperationData, VehicleServiceTypeResponse,
+    VehicleMetadataResponse, VehicleOperationData, VehicleProperties, VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
@@ -1662,30 +1662,39 @@ pub async fn get_service_type_by_vehicle_by_gtfs_id(
 }
 
 // DB-first with CSV fallback; gate skips guaranteed-None DB round-trip on non-operator feeds.
-async fn resolve_tag_number(
+async fn resolve_vehicle_properties(
     app_state: &AppState,
     gtfs_id: &str,
     vehicle_no: &str,
-) -> Option<String> {
-    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+) -> VehicleProperties {
+    let mut props = if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
         match app_state
             .db_vehicle_reader_internal
-            .get_vehicle_tag_number(vehicle_no, gtfs_id)
+            .get_vehicle_properties(vehicle_no, gtfs_id)
             .await
         {
-            Ok(Some(tag)) => return Some(tag),
-            Ok(None) => {}
-            Err(e) => warn!(
-                "resolve_tag_number: DB lookup failed for ({}, {}): {}; falling back to fleet_tag_list.csv",
-                gtfs_id, vehicle_no, e
-            ),
+            Ok(props) => props,
+            Err(e) => {
+                warn!(
+                    "resolve_vehicle_properties: DB lookup failed for ({}, {}): {}; falling back to fleet_tag_list.csv for the tag",
+                    gtfs_id, vehicle_no, e
+                );
+                VehicleProperties::default()
+            }
         }
+    } else {
+        VehicleProperties::default()
+    };
+
+    if props.tag_number.is_none() {
+        props.tag_number = app_state
+            .fleet_tag_list
+            .get(gtfs_id)
+            .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
+            .cloned();
     }
-    app_state
-        .fleet_tag_list
-        .get(gtfs_id)
-        .and_then(|by_vehicle| by_vehicle.get(vehicle_no))
-        .cloned()
+
+    props
 }
 
 #[utoipa::path(
@@ -1715,7 +1724,9 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         .cloned()
         .unwrap_or(path_vehicle);
 
-    let vehicle_tag_number = resolve_tag_number(&app_state, &gtfs_id, &vehicle_no).await;
+    let props = resolve_vehicle_properties(&app_state, &gtfs_id, &vehicle_no).await;
+    let vehicle_tag_number = props.tag_number;
+    let vehicle_variant = props.variant;
 
     let service_sub_types = app_state
         .vehicle_service_sub_types
@@ -1747,6 +1758,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         service_type,
         service_sub_types,
         bus_tag_number: vehicle_tag_number,
+        vehicle_variant,
         is_actually_valid,
     }))
 }
@@ -2142,7 +2154,9 @@ async fn get_service_type_by_vehicle_impl(
         path
     };
 
-    let tag_number = resolve_tag_number(&app_state, gtfs_id, vehicle_no).await;
+    let props = resolve_vehicle_properties(&app_state, gtfs_id, vehicle_no).await;
+    let tag_number = props.tag_number;
+    let vehicle_variant = props.variant;
 
     // Get vehicle verification if requested
     let is_valid = if pass_verify_req {
@@ -2248,6 +2262,7 @@ async fn get_service_type_by_vehicle_impl(
                 service_sub_types,
                 seat_layout_id,
                 bus_tag_number: tag_number,
+                vehicle_variant,
                 waybill_status: None,
                 is_historic: false,
                 schedule_based_active_trip: None,
@@ -2297,6 +2312,7 @@ async fn get_service_type_by_vehicle_impl(
                     service_sub_types,
                     seat_layout_id,
                     bus_tag_number: tag_number,
+                    vehicle_variant,
                     waybill_status: None,
                     is_historic: false,
                     schedule_based_active_trip: None,
@@ -2419,6 +2435,7 @@ async fn get_service_type_by_vehicle_impl(
             service_sub_types,
             seat_layout_id,
             bus_tag_number: tag_number,
+            vehicle_variant,
             waybill_status: vehicle_data.waybill_status,
             is_historic,
             schedule_based_active_trip: None,
@@ -2617,6 +2634,7 @@ async fn get_service_type_by_vehicle_impl(
         service_sub_types,
         seat_layout_id,
         bus_tag_number: tag_number,
+        vehicle_variant,
         waybill_status: vehicle_data.waybill_status,
         is_historic,
         schedule_based_active_trip: None,
@@ -2918,8 +2936,10 @@ pub async fn get_waybill_metadata(
         .get_waybill_metadata(&gtfs_id, &waybill_no)
         .await?;
 
-    waybill_metadata.bus_tag_number =
-        resolve_tag_number(&app_state, &gtfs_id, &waybill_metadata.vehicle_no).await;
+    let props =
+        resolve_vehicle_properties(&app_state, &gtfs_id, &waybill_metadata.vehicle_no).await;
+    waybill_metadata.bus_tag_number = props.tag_number;
+    waybill_metadata.vehicle_variant = props.variant;
 
     Ok(HttpResponse::Ok().json(waybill_metadata))
 }
@@ -4000,6 +4020,16 @@ pub async fn upsert_vehicles(
         .operator_service
         .upsert_vehicles(&gtfs_id, items)
         .await?;
+
+    for row in &rows {
+        if let Some(fleet_no) = row.fleet_no.as_deref() {
+            app_state
+                .db_vehicle_reader_internal
+                .invalidate_vehicle_properties(fleet_no, &gtfs_id)
+                .await;
+        }
+    }
+
     Ok(HttpResponse::Ok().json(rows))
 }
 

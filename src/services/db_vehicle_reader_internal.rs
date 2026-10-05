@@ -8,8 +8,8 @@ use sqlx::PgPool;
 use tracing::{debug, error, info, warn};
 
 use crate::models::{
-    BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillMetadataResponse, WaybillStatus,
-    WaybillTripInfo,
+    BusSchedule, VehicleData, VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse,
+    WaybillStatus, WaybillTripInfo,
 };
 use crate::tools::error::{AppError, AppResult};
 
@@ -52,11 +52,13 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         waybill_no: &str,
     ) -> AppResult<WaybillMetadataResponse>;
 
-    async fn get_vehicle_tag_number(
+    async fn get_vehicle_properties(
         &self,
         fleet_no: &str,
         gtfs_id: &str,
-    ) -> AppResult<Option<String>>;
+    ) -> AppResult<VehicleProperties>;
+
+    async fn invalidate_vehicle_properties(&self, fleet_no: &str, gtfs_id: &str);
 
     /// Service type only: same waybill priority as `get_vehicle_data`, without the trip/schedule queries.
     async fn get_vehicle_service_type(
@@ -141,13 +143,15 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         ))
     }
 
-    async fn get_vehicle_tag_number(
+    async fn get_vehicle_properties(
         &self,
         _fleet_no: &str,
         _gtfs_id: &str,
-    ) -> AppResult<Option<String>> {
-        Ok(None)
+    ) -> AppResult<VehicleProperties> {
+        Ok(VehicleProperties::default())
     }
+
+    async fn invalidate_vehicle_properties(&self, _fleet_no: &str, _gtfs_id: &str) {}
 
     async fn get_vehicle_service_type(
         &self,
@@ -165,14 +169,15 @@ pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
-    tag_number_cache: Arc<RwLock<HashMap<(String, String), (Option<String>, SystemTime)>>>,
+    vehicle_properties_cache:
+        Arc<RwLock<HashMap<(String, String), (VehicleProperties, SystemTime)>>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 30; // short TTL so bus swaps are reflected quickly
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
-const TAG_NUMBER_CACHE_DURATION: u64 = 43200; // 12 hours — tag_number rarely changes
-const TAG_NUMBER_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
-const TAG_NUMBER_CACHE_MAX_ENTRIES: usize = 4000;
+const VEHICLE_PROPS_CACHE_DURATION: u64 = 43200; // 12 hours — these columns rarely change
+const VEHICLE_PROPS_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
+const VEHICLE_PROPS_CACHE_MAX_ENTRIES: usize = 4000;
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
@@ -180,7 +185,7 @@ impl DBVehicleReaderInternal {
             pool: Some(pool),
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
-            tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
+            vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -191,7 +196,7 @@ impl DBVehicleReaderInternal {
             pool: None,
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
-            tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
+            vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1450,72 +1455,72 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
     }
 
-    async fn get_vehicle_tag_number(
+    async fn get_vehicle_properties(
         &self,
         fleet_no: &str,
         gtfs_id: &str,
-    ) -> AppResult<Option<String>> {
+    ) -> AppResult<VehicleProperties> {
         let pool = match &self.pool {
             Some(p) => p,
-            None => return Ok(None),
+            None => return Ok(VehicleProperties::default()),
         };
 
         let cache_key = (fleet_no.to_string(), gtfs_id.to_string());
         {
-            let cache = self.tag_number_cache.read().await;
-            if let Some((tag, fetched_at)) = cache.get(&cache_key) {
-                let ttl = if tag.is_some() {
-                    TAG_NUMBER_CACHE_DURATION
+            let cache = self.vehicle_properties_cache.read().await;
+            if let Some((props, fetched_at)) = cache.get(&cache_key) {
+                let ttl = if props.tag_number.is_some() || props.variant.is_some() {
+                    VEHICLE_PROPS_CACHE_DURATION
                 } else {
-                    TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                    VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
                 };
                 if fetched_at.elapsed().unwrap_or_default() < Duration::from_secs(ttl) {
-                    return Ok(tag.clone());
+                    return Ok(props.clone());
                 }
             }
         }
 
-        let db_result = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT tag_number FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
+        let db_result = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT tag_number, vehicle_variant FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
         )
         .bind(fleet_no)
         .bind(gtfs_id)
         .fetch_optional(pool)
         .await;
 
-        // Blank DB tag_number must not beat a real CSV value at the handler.
-        // On DB error, cache None with the negative TTL so a dead DB is paid once
-        // per window instead of per request.
-        let tag = match db_result {
-            Ok(row) => row.flatten().and_then(|s| {
-                let t = s.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
+        fn non_blank(v: Option<String>) -> Option<String> {
+            v.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
+        }
+
+        let props = match db_result {
+            Ok(row) => {
+                let (tag, variant) = row.unwrap_or((None, None));
+                VehicleProperties {
+                    tag_number: non_blank(tag),
+                    variant: non_blank(variant),
                 }
-            }),
+            }
             Err(e) => {
                 warn!(
-                    "get_vehicle_tag_number: DB failure for ({}, {}): {}; caching negative for {}s",
-                    gtfs_id, fleet_no, e, TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                    "get_vehicle_properties: DB failure for ({}, {}): {}; caching negative for {}s",
+                    gtfs_id, fleet_no, e, VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
                 );
-                None
+                VehicleProperties::default()
             }
         };
 
         {
-            let mut cache = self.tag_number_cache.write().await;
-            if cache.len() >= TAG_NUMBER_CACHE_MAX_ENTRIES {
-                cache.retain(|_, (t, stamp)| {
-                    let ttl = if t.is_some() {
-                        TAG_NUMBER_CACHE_DURATION
+            let mut cache = self.vehicle_properties_cache.write().await;
+            if cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
+                cache.retain(|_, (p, stamp)| {
+                    let ttl = if p.tag_number.is_some() || p.variant.is_some() {
+                        VEHICLE_PROPS_CACHE_DURATION
                     } else {
-                        TAG_NUMBER_NEGATIVE_CACHE_DURATION
+                        VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
                     };
                     stamp.elapsed().unwrap_or_default() < Duration::from_secs(ttl)
                 });
-                while cache.len() >= TAG_NUMBER_CACHE_MAX_ENTRIES {
+                while cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
                     let oldest = cache
                         .iter()
                         .min_by_key(|(_, (_, stamp))| *stamp)
@@ -1528,10 +1533,15 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
                     }
                 }
             }
-            cache.insert(cache_key, (tag.clone(), SystemTime::now()));
+            cache.insert(cache_key, (props.clone(), SystemTime::now()));
         }
 
-        Ok(tag)
+        Ok(props)
+    }
+
+    async fn invalidate_vehicle_properties(&self, fleet_no: &str, gtfs_id: &str) {
+        let mut cache = self.vehicle_properties_cache.write().await;
+        cache.remove(&(fleet_no.to_string(), gtfs_id.to_string()));
     }
 }
 
@@ -1596,6 +1606,7 @@ impl DBVehicleReaderInternal {
             driver_name,
             driver_mobile_number,
             bus_tag_number: None,
+            vehicle_variant: None,
         };
 
         Ok(response)

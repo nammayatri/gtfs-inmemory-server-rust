@@ -369,6 +369,8 @@ pub struct VehicleServiceTypeResponse {
     pub seat_layout_id: Option<String>,
     #[serde(rename = "busTagNumber")]
     pub bus_tag_number: Option<String>,
+    #[serde(rename = "vehicleVariant")]
+    pub vehicle_variant: Option<String>,
     pub waybill_status: Option<WaybillStatus>,
     pub is_historic: bool,
     pub schedule_based_active_trip: Option<bool>,
@@ -388,6 +390,8 @@ pub struct VehicleMetadataResponse {
     pub service_sub_types: Option<Vec<String>>,
     #[serde(rename = "busTagNumber")]
     pub bus_tag_number: Option<String>,
+    #[serde(rename = "vehicleVariant")]
+    pub vehicle_variant: Option<String>,
     pub is_actually_valid: Option<bool>,
 }
 
@@ -404,6 +408,8 @@ pub struct WaybillMetadataResponse {
     pub driver_mobile_number: Option<String>,
     #[serde(rename = "busTagNumber")]
     pub bus_tag_number: Option<String>,
+    #[serde(rename = "vehicleVariant")]
+    pub vehicle_variant: Option<String>,
 }
 
 /// Granular, update-only body for editing a waybill's mutable operational fields (crew, fleet, devices)
@@ -466,6 +472,28 @@ pub struct WaybillTripInfo {
     pub driver_first_name: Option<String>,
     pub driver_last_name: Option<String>,
     pub driver_mobile_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct VehicleProperties {
+    pub tag_number: Option<String>,
+    pub variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VehicleVariant {
+    ShuttleBus,
+    ShuttleTempo,
+}
+
+impl VehicleVariant {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VehicleVariant::ShuttleBus => "SHUTTLE_BUS",
+            VehicleVariant::ShuttleTempo => "SHUTTLE_TEMPO",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

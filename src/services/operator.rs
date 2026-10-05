@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::models::{
     repeat_statuses, IdValue, RepeatWalkEntry, ScheduleTripRepeatConfig, ServiceTierType,
+    VehicleVariant,
 };
 use crate::services::field_generator;
 use crate::tools::error::{AppError, AppResult};
@@ -868,6 +869,9 @@ pub struct FleetRow {
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vehicle_variant: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -1151,6 +1155,7 @@ pub struct VehicleUpsertRequest {
     pub fleet_no: Option<String>,
     pub tag_number: Option<String>,
     pub status: Option<String>,
+    pub vehicle_variant: Option<VehicleVariant>,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillDeviceInternal {
@@ -3205,7 +3210,7 @@ impl OperatorService for DBOperatorService {
         }
 
         let sql = format!(
-            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no \
+            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no, vehicle_variant \
              FROM public.vehicles_internal \
              WHERE {} \
              ORDER BY created_at DESC NULLS LAST, vehicle_id DESC \
@@ -3336,13 +3341,14 @@ impl OperatorService for DBOperatorService {
                 v.fleet_no.is_some(),
                 v.tag_number.is_some(),
                 v.status.is_some(),
+                v.vehicle_variant.is_some(),
             )
         };
         let shape0 = shape(&items[0]);
         for (i, item) in items.iter().enumerate().skip(1) {
             if shape(item) != shape0 {
                 return Err(AppError::BadRequest(format!(
-                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status as items[0]",
+                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status/vehicle_variant as items[0]",
                     i
                 )));
             }
@@ -3358,6 +3364,9 @@ impl OperatorService for DBOperatorService {
         }
         if shape0.2 {
             cols.push("status");
+        }
+        if shape0.3 {
+            cols.push("vehicle_variant");
         }
         cols.push("gtfs_id");
 
@@ -3389,7 +3398,7 @@ impl OperatorService for DBOperatorService {
             "INSERT INTO public.vehicles_internal ({}) VALUES {} \
              ON CONFLICT (gtfs_id, vehicle_no) WHERE deleted = false \
              DO UPDATE SET {} \
-             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at",
+             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant",
             cols.join(", "),
             placeholders.join(", "),
             update_set
@@ -3408,6 +3417,9 @@ impl OperatorService for DBOperatorService {
             }
             if cols.contains(&"status") {
                 q = q.bind(item.status.clone());
+            }
+            if cols.contains(&"vehicle_variant") {
+                q = q.bind(item.vehicle_variant.map(|v| v.as_str()));
             }
         }
         q = q.bind(gtfs_id);
@@ -3528,7 +3540,7 @@ impl OperatorService for DBOperatorService {
         offset: Option<i64>,
     ) -> AppResult<Vec<FleetRow>> {
         let mut sql = String::from(
-            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at \
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant \
              FROM public.vehicles_internal \
              WHERE deleted = false AND gtfs_id = $1 \
              ORDER BY vehicle_no",
