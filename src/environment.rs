@@ -197,6 +197,9 @@ pub struct AppConfig {
     /// The password of `gtfs_gps.user` (secrets dhall).
     #[serde(default)]
     pub gtfs_gps_clickhouse_password: Option<String>,
+    /// Longest span one ops ETA override window may cover.
+    #[serde(default)]
+    pub max_eta_override_seconds: Option<u64>,
 }
 
 /// The GPS block of [`AppConfig`]. Only `url` and `user` are required.
@@ -253,7 +256,16 @@ impl AppConfig {
                 .collect(),
         }
     }
+
+    pub fn max_eta_override_seconds(&self) -> u64 {
+        self.max_eta_override_seconds
+            .unwrap_or(MAX_ETA_OVERRIDE_SECONDS_DEFAULT)
+    }
 }
+
+/// 2 days — on window span, not on how far ahead it starts, so an overnight disruption takes one
+/// set. Short enough that a window nobody clears cannot quietly become the schedule.
+const MAX_ETA_OVERRIDE_SECONDS_DEFAULT: u64 = 172800;
 
 fn default_preprocessed_data_dir() -> String {
     "./assets".to_string()
@@ -956,5 +968,26 @@ impl AppState {
         );
 
         Ok(phone_to_manager)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A value pinned in dhall drifts from the default: a stale 12h ceiling survived the move to
+    /// windows here and would have rejected the two-day span the feature allows.
+    #[test]
+    fn dev_dhall_leaves_the_override_ceiling_at_its_default() {
+        let cfg = read_dhall_config("./dhall-configs/dev/gtfs_in_memory_server_rust.dhall")
+            .expect("dev dhall parses");
+        assert!(
+            cfg.max_eta_override_seconds.is_none(),
+            "dev dhall should omit max_eta_override_seconds and inherit the default"
+        );
+        assert_eq!(
+            cfg.max_eta_override_seconds(),
+            MAX_ETA_OVERRIDE_SECONDS_DEFAULT
+        );
     }
 }

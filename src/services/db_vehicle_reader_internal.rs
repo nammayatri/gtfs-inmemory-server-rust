@@ -5,13 +5,18 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 use sqlx::PgPool;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::models::{
-    BusSchedule, VehicleData, VehicleDataWithRouteId, WaybillMetadataResponse, WaybillStatus,
-    WaybillTripInfo,
+    ActiveTripEtaOverride, BusSchedule, EtaVariant, StationEtaEntry, StationEtaMap, StationEtaRow,
+    VehicleData, VehicleDataWithRouteId, WaybillMetadataResponse, WaybillStatus, WaybillTripInfo,
 };
 use crate::tools::error::{AppError, AppResult};
+
+// eta_override_select_sql expands to the other two, whose names resolve at this call site.
+use super::eta_variants::{
+    eta_override_in_force_sql, eta_override_select_sql, eta_override_window_overlap_sql,
+};
 
 #[async_trait]
 pub trait VehicleDataReaderInternal: Send + Sync {
@@ -36,15 +41,71 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
     ) -> AppResult<Vec<VehicleData>>;
 
-    async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>>;
+    async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<Arc<StationEtaMap>>;
 
-    async fn upsert_station_eta(
+    /// One statement, one transaction — a UI saving a route's worth of pairs cannot be a
+    /// request per pair, and the single-pair endpoint funnels through here too.
+    async fn upsert_station_etas(
         &self,
         gtfs_id: &str,
-        source_station_code: &str,
-        destination_station_code: &str,
-        eta_in_seconds: i32,
+        variant_id: Option<&str>,
+        entries: &[StationEtaEntry],
+    ) -> AppResult<u64>;
+
+    /// The stored segment times themselves, for the screen that edits them. Scoped to one
+    /// variant when given; retired variants never appear, matching what resolution sees.
+    async fn list_station_etas(
+        &self,
+        gtfs_id: &str,
+        variant_id: Option<&str>,
+    ) -> AppResult<Vec<StationEtaRow>>;
+
+    /// Variant catalogue for a feed, newest-safe: soft-deleted rows are never returned.
+    async fn get_eta_variants(&self, gtfs_id: &str) -> AppResult<Vec<EtaVariant>>;
+
+    async fn upsert_eta_variant(&self, variant: &EtaVariant) -> AppResult<EtaVariant>;
+
+    /// Soft delete. A variant still referenced by an override or a schedule default reads as
+    /// absent afterwards and resolution falls through to the feed default.
+    async fn delete_eta_variant(&self, gtfs_id: &str, variant_id: &str) -> AppResult<u64>;
+
+    /// Swaps a variant in for one trip over a wall-clock window. The window is matched against
+    /// the trip's own clock, so it addresses the runs it covers rather than whichever waybill
+    /// happens to be live; a window that covers no run of the addressed trip is rejected.
+    async fn set_trip_eta_override(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+        trip_number: i32,
+        variant_id: &str,
+        effective_from: chrono::DateTime<chrono::Utc>,
+        effective_untill: chrono::DateTime<chrono::Utc>,
     ) -> AppResult<()>;
+
+    /// The variant a schedule trip uses when no override is in force. Set once with the
+    /// schedule, so it survives the daily waybill turnover. None clears it back to the feed
+    /// default.
+    async fn set_schedule_default_variant(
+        &self,
+        gtfs_id: &str,
+        schedule_trip_id: &str,
+        trip_number: Option<i32>,
+        variant_id: Option<&str>,
+    ) -> AppResult<u64>;
+
+    async fn clear_trip_eta_override(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+        trip_number: i32,
+    ) -> AppResult<u64>;
+
+    /// Every override still in force for a feed. Small by construction, and the only thing a
+    /// caching consumer needs in order to know which trips it must not cache.
+    async fn list_active_trip_eta_overrides(
+        &self,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<ActiveTripEtaOverride>>;
 
     async fn get_waybill_metadata(
         &self,
@@ -117,18 +178,77 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         Ok(Vec::new())
     }
 
-    async fn get_station_etas(&self, _gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
-        Ok(HashMap::new())
+    async fn get_station_etas(&self, _gtfs_id: &str) -> AppResult<Arc<StationEtaMap>> {
+        Ok(Arc::new(StationEtaMap::new()))
     }
 
-    async fn upsert_station_eta(
+    async fn upsert_station_etas(
         &self,
         _gtfs_id: &str,
-        _source_station_code: &str,
-        _destination_station_code: &str,
-        _eta_in_seconds: i32,
+        _variant_id: Option<&str>,
+        _entries: &[StationEtaEntry],
+    ) -> AppResult<u64> {
+        Ok(0)
+    }
+
+    async fn list_station_etas(
+        &self,
+        _gtfs_id: &str,
+        _variant_id: Option<&str>,
+    ) -> AppResult<Vec<StationEtaRow>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_eta_variants(&self, _gtfs_id: &str) -> AppResult<Vec<EtaVariant>> {
+        Ok(Vec::new())
+    }
+
+    async fn upsert_eta_variant(&self, _variant: &EtaVariant) -> AppResult<EtaVariant> {
+        Err(AppError::NotFound(
+            "Database is not connected in local testing mode.".to_string(),
+        ))
+    }
+
+    async fn delete_eta_variant(&self, _gtfs_id: &str, _variant_id: &str) -> AppResult<u64> {
+        Ok(0)
+    }
+
+    async fn set_trip_eta_override(
+        &self,
+        _gtfs_id: &str,
+        _waybill_no: &str,
+        _trip_number: i32,
+        _variant_id: &str,
+        _effective_from: chrono::DateTime<chrono::Utc>,
+        _effective_untill: chrono::DateTime<chrono::Utc>,
     ) -> AppResult<()> {
         Ok(())
+    }
+
+    async fn set_schedule_default_variant(
+        &self,
+        _gtfs_id: &str,
+        _schedule_trip_id: &str,
+        _trip_number: Option<i32>,
+        _variant_id: Option<&str>,
+    ) -> AppResult<u64> {
+        Ok(0)
+    }
+
+    async fn clear_trip_eta_override(
+        &self,
+        _gtfs_id: &str,
+        _waybill_no: &str,
+        _trip_number: i32,
+    ) -> AppResult<u64> {
+        Ok(0)
+    }
+
+    async fn list_active_trip_eta_overrides(
+        &self,
+        _gtfs_id: &str,
+    ) -> AppResult<Vec<ActiveTripEtaOverride>> {
+        Ok(Vec::new())
     }
 
     async fn get_waybill_metadata(
@@ -162,14 +282,14 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
 
 #[allow(clippy::type_complexity)]
 pub struct DBVehicleReaderInternal {
-    pool: Option<PgPool>,
+    pub(super) pool: Option<PgPool>,
     waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
-    station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
+    pub(super) station_eta_cache: Arc<RwLock<HashMap<String, (Arc<StationEtaMap>, SystemTime)>>>,
+    pub(super) eta_variant_cache: Arc<RwLock<HashMap<String, (Vec<EtaVariant>, SystemTime)>>>,
     tag_number_cache: Arc<RwLock<HashMap<(String, String), (Option<String>, SystemTime)>>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 30; // short TTL so bus swaps are reflected quickly
-const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 const TAG_NUMBER_CACHE_DURATION: u64 = 43200; // 12 hours — tag_number rarely changes
 const TAG_NUMBER_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
 const TAG_NUMBER_CACHE_MAX_ENTRIES: usize = 4000;
@@ -180,6 +300,7 @@ impl DBVehicleReaderInternal {
             pool: Some(pool),
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
+            eta_variant_cache: Arc::new(RwLock::new(HashMap::new())),
             tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -191,11 +312,12 @@ impl DBVehicleReaderInternal {
             pool: None,
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
+            eta_variant_cache: Arc::new(RwLock::new(HashMap::new())),
             tag_number_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    fn pool(&self) -> AppResult<&PgPool> {
+    pub(super) fn pool(&self) -> AppResult<&PgPool> {
         self.pool.as_ref().ok_or_else(|| {
             AppError::Internal("DBVehicleReaderInternal: no pool available".to_string())
         })
@@ -206,11 +328,6 @@ impl DBVehicleReaderInternal {
         elapsed >= Duration::from_secs(WAYBILL_ROUTE_CACHE_DURATION)
     }
 
-    fn is_station_eta_cache_expired(&self, timestamp: SystemTime) -> bool {
-        let elapsed = timestamp.elapsed().unwrap_or_default();
-        elapsed >= Duration::from_secs(STATION_ETA_CACHE_DURATION)
-    }
-
     fn get_waybills_by_route_cache_key(
         &self,
         gtfs_id: &str,
@@ -218,10 +335,6 @@ impl DBVehicleReaderInternal {
         max_duty_date: Option<&str>,
     ) -> String {
         format!("{}_{}_{}", gtfs_id, route_id, max_duty_date.unwrap_or("*"))
-    }
-
-    fn get_station_eta_cache_key(&self, gtfs_id: &str) -> String {
-        format!("eta_map_{}", gtfs_id)
     }
 
     /// Returns true if vehicle_no exists in vehicles_internal for the given gtfs_id.
@@ -263,58 +376,6 @@ impl DBVehicleReaderInternal {
                 false
             }
         }
-    }
-
-    pub async fn get_station_etas_impl(
-        &self,
-        gtfs_id: &str,
-    ) -> AppResult<HashMap<(String, String), i32>> {
-        let cache_key = self.get_station_eta_cache_key(gtfs_id);
-
-        // Check cache
-        {
-            let cache = self.station_eta_cache.read().await;
-            if let Some((etas, timestamp)) = cache.get(&cache_key) {
-                if !self.is_station_eta_cache_expired(*timestamp) {
-                    debug!("station_eta_cache HIT for gtfs_id={}", gtfs_id);
-                    return Ok(etas.clone());
-                }
-            }
-        }
-
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(HashMap::new()),
-        };
-
-        let query = r#"
-            SELECT source_station_code, destination_station_code, eta_in_seconds
-            FROM station_eta
-            WHERE gtfs_id = $1
-        "#;
-
-        let rows = sqlx::query(query)
-            .bind(gtfs_id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
-
-        let mut eta_map = HashMap::new();
-        for row in rows {
-            use sqlx::Row;
-            let src: String = row.get::<String, &str>("source_station_code");
-            let dst: String = row.get::<String, &str>("destination_station_code");
-            let secs: i32 = row.get::<i32, &str>("eta_in_seconds");
-            eta_map.insert((src, dst), secs);
-        }
-
-        // Update cache
-        {
-            let mut cache = self.station_eta_cache.write().await;
-            cache.insert(cache_key, (eta_map.clone(), SystemTime::now()));
-        }
-
-        Ok(eta_map)
     }
 
     /// Full vehicle data fetch against _internal tables, mirroring DBVehicleReader::get_vehicle_data.
@@ -1029,7 +1090,8 @@ impl DBVehicleReaderInternal {
         // Use separate queries for better index utilization
         let (query, bound_vehicle): (&str, Option<&str>) = if let Some(vn) = vehicle_number {
             (
-                r#"
+                concat!(
+                    r#"
                 WITH base AS (
                     SELECT
                         w.waybill_id::text,
@@ -1066,7 +1128,10 @@ impl DBVehicleReaderInternal {
                         CASE
                             WHEN w.is_flexi THEN NULL
                             ELSE bstd.is_completed
-                        END AS is_completed
+                        END AS is_completed,
+"#,
+                    eta_override_select_sql!(),
+                    r#"
                     FROM waybills_internal w
                     LEFT JOIN entities_internal e
                         ON e.entity_id = w.entity_id
@@ -1099,12 +1164,14 @@ impl DBVehicleReaderInternal {
                         )
                 )
                 SELECT * FROM base WHERE (status <> 'online' OR is_completed IS NOT TRUE) ORDER BY waybill_no, trip_number;
-                "#,
+                "#
+                ),
                 Some(vn),
             )
         } else {
             (
-                r#"
+                concat!(
+                    r#"
                 WITH base AS (
                     SELECT
                         w.waybill_id::text,
@@ -1141,7 +1208,10 @@ impl DBVehicleReaderInternal {
                         CASE
                             WHEN w.is_flexi THEN NULL
                             ELSE bstd.is_completed
-                        END AS is_completed
+                        END AS is_completed,
+"#,
+                    eta_override_select_sql!(),
+                    r#"
                     FROM waybills_internal w
                     LEFT JOIN entities_internal e
                         ON e.entity_id = w.entity_id
@@ -1173,7 +1243,8 @@ impl DBVehicleReaderInternal {
                         )
                 )
                 SELECT * FROM base WHERE (status <> 'online' OR is_completed IS NOT TRUE) ORDER BY waybill_no, trip_number;
-                "#,
+                "#
+                ),
                 None::<&str>,
             )
         };
@@ -1228,7 +1299,8 @@ impl DBVehicleReaderInternal {
             }
         };
 
-        let query = r#"
+        let query = concat!(
+            r#"
             SELECT
                 w.waybill_id::text,
                 w.waybill_no::text,
@@ -1264,7 +1336,10 @@ impl DBVehicleReaderInternal {
                 CASE
                     WHEN w.is_flexi THEN NULL
                     ELSE bstd.is_completed
-                END AS is_completed
+                END AS is_completed,
+"#,
+            eta_override_select_sql!(),
+            r#"
             FROM waybills_internal w
             LEFT JOIN entities_internal e
                 ON e.entity_id = w.entity_id
@@ -1295,7 +1370,8 @@ impl DBVehicleReaderInternal {
                     (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
                 )
             ORDER BY w.waybill_no, trip_number;
-        "#;
+        "#
+        );
 
         match sqlx::query_as::<_, VehicleData>(query)
             .bind(waybill_no)
@@ -1323,56 +1399,6 @@ impl DBVehicleReaderInternal {
                 Ok(Vec::new())
             }
         }
-    }
-
-    async fn upsert_station_eta_impl(
-        &self,
-        gtfs_id: &str,
-        source_station_code: &str,
-        destination_station_code: &str,
-        eta_in_seconds: i32,
-    ) -> AppResult<()> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| AppError::DbError("Internal Database pool is not active".into()))?;
-
-        let query = r#"
-            INSERT INTO station_eta (gtfs_id, source_station_code, destination_station_code, eta_in_seconds)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (gtfs_id, source_station_code, destination_station_code)
-            DO UPDATE SET
-                eta_in_seconds = EXCLUDED.eta_in_seconds,
-                updated_at = CURRENT_TIMESTAMP
-        "#;
-
-        sqlx::query(query)
-            .bind(gtfs_id)
-            .bind(source_station_code)
-            .bind(destination_station_code)
-            .bind(eta_in_seconds)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to upsert station_eta for gtfs_id={}: {}",
-                    gtfs_id, e
-                );
-                AppError::DbError(e.to_string())
-            })?;
-
-        // Invalidate cache
-        {
-            let mut cache = self.station_eta_cache.write().await;
-            cache.remove(gtfs_id);
-        }
-
-        info!(
-            "Successfully upserted station_eta for gtfs_id={} src={} dst={}",
-            gtfs_id, source_station_code, destination_station_code
-        );
-
-        Ok(())
     }
 }
 
@@ -1413,22 +1439,56 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             .await
     }
 
-    async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
+    async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<Arc<StationEtaMap>> {
         self.get_station_etas_impl(gtfs_id).await
     }
 
-    async fn upsert_station_eta(
+    async fn upsert_station_etas(
         &self,
         gtfs_id: &str,
-        source_station_code: &str,
-        destination_station_code: &str,
-        eta_in_seconds: i32,
+        variant_id: Option<&str>,
+        entries: &[StationEtaEntry],
+    ) -> AppResult<u64> {
+        self.upsert_station_etas_impl(gtfs_id, variant_id, entries)
+            .await
+    }
+
+    async fn list_station_etas(
+        &self,
+        gtfs_id: &str,
+        variant_id: Option<&str>,
+    ) -> AppResult<Vec<StationEtaRow>> {
+        self.list_station_etas_impl(gtfs_id, variant_id).await
+    }
+
+    async fn get_eta_variants(&self, gtfs_id: &str) -> AppResult<Vec<EtaVariant>> {
+        self.get_eta_variants_impl(gtfs_id).await
+    }
+
+    async fn upsert_eta_variant(&self, variant: &EtaVariant) -> AppResult<EtaVariant> {
+        self.upsert_eta_variant_impl(variant).await
+    }
+
+    async fn delete_eta_variant(&self, gtfs_id: &str, variant_id: &str) -> AppResult<u64> {
+        self.delete_eta_variant_impl(gtfs_id, variant_id).await
+    }
+
+    async fn set_trip_eta_override(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+        trip_number: i32,
+        variant_id: &str,
+        effective_from: chrono::DateTime<chrono::Utc>,
+        effective_untill: chrono::DateTime<chrono::Utc>,
     ) -> AppResult<()> {
-        self.upsert_station_eta_impl(
+        self.set_trip_eta_override_impl(
             gtfs_id,
-            source_station_code,
-            destination_station_code,
-            eta_in_seconds,
+            waybill_no,
+            trip_number,
+            variant_id,
+            effective_from,
+            effective_untill,
         )
         .await
     }
@@ -1440,6 +1500,34 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     ) -> AppResult<Option<String>> {
         self.get_vehicle_service_type_impl(vehicle_no, gtfs_id)
             .await
+    }
+
+    async fn set_schedule_default_variant(
+        &self,
+        gtfs_id: &str,
+        schedule_trip_id: &str,
+        trip_number: Option<i32>,
+        variant_id: Option<&str>,
+    ) -> AppResult<u64> {
+        self.set_schedule_default_variant_impl(gtfs_id, schedule_trip_id, trip_number, variant_id)
+            .await
+    }
+
+    async fn clear_trip_eta_override(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+        trip_number: i32,
+    ) -> AppResult<u64> {
+        self.clear_trip_eta_override_impl(gtfs_id, waybill_no, trip_number)
+            .await
+    }
+
+    async fn list_active_trip_eta_overrides(
+        &self,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<ActiveTripEtaOverride>> {
+        self.list_active_trip_eta_overrides_impl(gtfs_id).await
     }
 
     async fn get_waybill_metadata(
