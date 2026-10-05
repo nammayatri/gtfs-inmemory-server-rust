@@ -263,6 +263,12 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                     .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
                     .route(web::post().to(h::feed_import)),
             )
+            // a fresh reload of a feed from its zip, confirmed twice (section 18.16)
+            .service(
+                web::resource("/feeds/{gtfs_id}/reload")
+                    .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+                    .route(web::post().to(h::feed_reload)),
+            )
             .route("/import-jobs/{job_id}", web::get().to(h::import_job))
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))

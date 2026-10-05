@@ -1,12 +1,13 @@
 // The feed as a whole (docs section 18): what it serves from, its GTFS zip as
 // the tables give it, the feed report (what it breaks of the GTFS reference),
 // and - for an admin - bringing a GTFS zip in: a seed for a feed with no rows,
-// or change sets for one that has them, always checked first without writing;
-// and a new feed made from its zip.
+// change sets for one that has them, or a fresh reload that replaces all of
+// it (confirmed twice with the authenticator), always checked first without
+// writing; and a new feed made from its zip.
 import { get, postBytes, enc, ApiError } from "./api.js";
 import { API_BASE } from "./config.js";
 import { state, isAdmin } from "./state.js";
-import { h, clear, fmtCount, plural, errorText, toast } from "./util.js";
+import { h, clear, fmtCount, plural, errorText, toast, modal } from "./util.js";
 import { nameHere } from "./trail.js";
 
 const page = () => document.getElementById("page");
@@ -88,9 +89,54 @@ function importForm(box) {
     name = f ? f.name : null;
     clear(out);
   });
+  // A fresh reload (docs section 18.16): checked, then done, each step
+  // confirmed with a code of its own from the authenticator.
+  const g = enc(state.feedId);
+  const reloadCheck = async () => {
+    const code = await askCode(1, [
+      h("p", "This checks ", h("strong", name), ` as a fresh load of ${state.feedId}. The whole reload runs and is undone, so nothing is written yet.`),
+    ], "Check the reload");
+    if (!code) return;
+    const doing = `Checking ${name} as a fresh load of ${state.feedId}`;
+    clear(out, h("p.empty", `${doing}…`));
+    let res;
+    try {
+      res = await runImport(`feeds/${g}/reload`, bytes, (s) => clear(out, h("p.empty", `${doing}… ${s} s`)), { "X-Editor-Code": code });
+    } catch (e) {
+      return clear(out, codeError(e), h("div.btn-row", h("button.btn.secondary", { type: "button", on: { click: reloadCheck } }, "Try again")));
+    }
+    clear(out,
+      replacedView(res.replaced),
+      seedReport(res),
+      res.confirm_token
+        ? h("div.btn-row", h("button.btn.danger", { type: "button", id: "reload-confirm", on: { click: () => reloadDo(res) } }, `Reload ${state.feedId}…`))
+        : h("p.notice.error", "This zip cannot be loaded as it is; nothing was written."));
+  };
+  const reloadDo = async (checked) => {
+    const code = await askCode(2, [
+      h("p.notice.warning", "This deletes ", h("strong", replacedWords(checked.replaced)), ` of ${state.feedId}, and loads `, h("strong", name), " in their place. It cannot be undone."),
+      h("p.hint", "Drafts already committed, releases, the history, reviews, webhooks and who may work on the feed are kept."),
+    ], "Delete and reload", state.feedId);
+    if (!code) return;
+    const doing = `Reloading ${state.feedId} from ${name}`;
+    clear(out, h("p.empty", `${doing}…`));
+    try {
+      const res = await runImport(`feeds/${g}/reload?confirm=${enc(checked.confirm_token)}`, bytes,
+        (s) => clear(out, h("p.empty", `${doing}… ${s} s`)), { "X-Editor-Code": code });
+      toast(`Feed ${state.feedId} is reloaded from ${name}: version ${res.feed_version}.`);
+      window.dispatchEvent(new CustomEvent("feeds:changed", { detail: { select: state.feedId } }));
+    } catch (e) {
+      // a wrong or used code leaves the check good: confirm again
+      const again = e instanceof ApiError && ["invalid_code", "code_reused"].includes(e.code);
+      clear(out, codeError(e), h("div.btn-row", again
+        ? h("button.btn.danger", { type: "button", on: { click: () => reloadDo(checked) } }, "Confirm again")
+        : h("button.btn.secondary", { type: "button", on: { click: reloadCheck } }, "Check again")));
+    }
+  };
   const run = async (write) => {
     if (!bytes) return clear(out, h("p.notice.error", "Choose a GTFS zip first."));
     const how = box.querySelector("input[name=import-mode]:checked").value;
+    if (how === "reload") return reloadCheck();
     const qs = new URLSearchParams();
     if (how === "drafts") {
       qs.set("mode", "drafts");
@@ -117,18 +163,79 @@ function importForm(box) {
     h("label.field", { for: "import-zip" }, h("span", "GTFS zip"), file),
     h("div.radio-cards", { role: "radiogroup", "aria-label": "How" },
       mode("seed", "Load an empty feed", "For a feed with no rows yet: the whole zip in one go, checked by exporting it again.", true),
-      mode("drafts", "Bring into drafts", "For a feed that has rows: change sets for review. Stops, routes and stop orders are compared, never written.", false)),
+      mode("drafts", "Bring into drafts", "For a feed that has rows: change sets for review. Stops, routes and stop orders are compared, never written.", false),
+      mode("reload", "Reload the feed fresh", "Deletes every stop, route, trip and file the feed has and loads the zip in their place, with no drafts. Confirmed twice with your authenticator app.", false)),
     h("label.field", { for: "import-files" }, h("span", "Only these files (drafts)"), files),
     h("div.btn-row", h("button.btn.secondary", { type: "button", id: "import-check", on: { click: () => run(false) } }, "Check without writing")),
     out);
 }
 
+// A code from the authenticator, for confirmation `n` of a reload's two;
+// `typed`, when given, must be typed out too. Undefined when cancelled.
+function askCode(n, body, action, typed = null) {
+  return modal(`Reload the feed: confirmation ${n} of 2`, (close) => {
+    const feed = typed ? h("input#reload-feed-id", { type: "text", autocomplete: "off", spellcheck: false }) : null;
+    const code = h("input.code-input#reload-code", {
+      type: "text", inputmode: "numeric", autocomplete: "one-time-code", maxlength: "6", pattern: "[0-9]{6}",
+    });
+    code.addEventListener("input", () => { code.value = code.value.replace(/\D/g, "").slice(0, 6); });
+    const err = h("p.notice.error", { role: "alert", hidden: true });
+    const fail = (text, el) => { err.hidden = false; err.textContent = text; el.focus(); };
+    const submit = (ev) => {
+      ev.preventDefault();
+      if (feed && feed.value.trim() !== typed) return fail(`Type ${typed} to confirm.`, feed);
+      if (code.value.length !== 6) return fail("Enter the 6-digit code your authenticator app shows.", code);
+      close(code.value);
+    };
+    return h("form", { style: "display:grid;gap:12px", on: { submit } },
+      ...body,
+      feed ? h("label.field", { for: "reload-feed-id" }, h("span", `Type ${typed} to confirm`), feed) : null,
+      h("label.field", { for: "reload-code" }, h("span", n === 1 ? "Code from your authenticator app" : "A new code from your authenticator app"), code),
+      n === 2 ? h("p.hint", "The code you used for the check does not work again: wait for the app to show the next one.") : null,
+      err,
+      h("div.btn-row",
+        h(n === 2 ? "button.btn.danger" : "button.btn", { type: "submit" }, action),
+        h("button.btn.secondary", { type: "button", on: { click: () => close(undefined) } }, "Cancel")));
+  });
+}
+
+// What a wrong code, or anything else a reload was refused for, means.
+function codeError(e) {
+  if (e instanceof ApiError && e.code === "invalid_code") {
+    const left = e.details.attempts_left;
+    return h("p.notice.error", `That code is not right.${left !== undefined ? ` ${left} more tr${left === 1 ? "y" : "ies"} before sign-in pauses for 10 minutes.` : ""} Codes change every 30 seconds; use the one showing now.`);
+  }
+  if (e instanceof ApiError && e.code === "code_reused") {
+    return h("p.notice.error", "That code was already used. Wait for the app to show a new one.");
+  }
+  return h("p.notice.error", errorText(e));
+}
+
+const TABLE_WORDS = {
+  gtfs_stop: "stop", gtfs_route: "route", gtfs_route_stop: "stop list row", gtfs_trip: "trip", gtfs_service: "service",
+};
+
+// The rows a reload deletes, in words: the main tables by name, the rest counted.
+function replacedWords(replaced) {
+  const r = replaced || {};
+  const named = Object.entries(TABLE_WORDS).filter(([t]) => r[t]).map(([t, w]) => plural(r[t], w));
+  const rest = Object.entries(r).filter(([t]) => !TABLE_WORDS[t]).reduce((n, [, v]) => n + v, 0);
+  if (rest) named.push(plural(rest, "row") + " of other files");
+  return named.length ? named.join(", ") : "nothing (the feed is empty)";
+}
+
+function replacedView(replaced) {
+  return h("p.notice.warning", h("strong", "A reload deletes what the feed holds now: "), replacedWords(replaced),
+    ". The zip's rows below take their place.");
+}
+
 // An import in the background (docs section 18.15): the request is answered
 // at once with a job, and its report polled for, so an import may take longer
 // than the 30 s the load balancer and Pomerium in front of the editor wait.
-// `waiting(seconds)` hears how long it has been running.
-async function runImport(path, bytes, waiting) {
-  const { job_id } = await postBytes(`${path}${path.includes("?") ? "&" : "?"}background=true`, bytes);
+// `waiting(seconds)` hears how long it has been running; `headers` go with the
+// zip (a reload's code).
+async function runImport(path, bytes, waiting, headers = {}) {
+  const { job_id } = await postBytes(`${path}${path.includes("?") ? "&" : "?"}background=true`, bytes, "application/zip", headers);
   const started = Date.now();
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, 1500));

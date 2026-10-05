@@ -23,7 +23,9 @@ use actix_web::cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use actix_web::error::{JsonPayloadError, PathError, QueryPayloadError};
 use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
-use serde::Deserialize;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -280,6 +282,51 @@ pub async fn totp_confirm(
         .json(json!({"totp_enabled": true, "expires_at": expires_at})))
 }
 
+/// Check a code from `user`'s authenticator and use it up: within the lockout,
+/// at a step newer than any used before - two pods racing one code cannot both
+/// win - and a wrong or replayed code counted toward the lockout. `sign_in`
+/// also stamps `last_login_at`. Returns the step the code was for.
+async fn use_code(
+    st: &EditorState,
+    user: &auth::User,
+    code: &str,
+    sign_in: bool,
+) -> EditorResult<i64> {
+    if let Some(s) = auth::lockout_seconds(st, user.user_id).await? {
+        return Err(locked_error(s));
+    }
+    let secret = open_secret(st, user)?;
+    let now = chrono::Utc::now().timestamp() as u64;
+    match crypto::totp_check(&secret, code, now, user.totp_last_step) {
+        TotpCheck::Valid(step) => {
+            let won = sqlx::query(if sign_in {
+                "UPDATE gtfs_editor_user SET totp_last_step = $2, last_login_at = now() \
+                 WHERE user_id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2) RETURNING user_id"
+            } else {
+                "UPDATE gtfs_editor_user SET totp_last_step = $2 \
+                 WHERE user_id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2) RETURNING user_id"
+            })
+            .bind(user.user_id)
+            .bind(step)
+            .fetch_optional(&st.pool)
+            .await?;
+            if won.is_none() {
+                let left = record_failure(st, user, "reused").await?;
+                return Err(code_reused(left));
+            }
+            Ok(step)
+        }
+        TotpCheck::Reused => {
+            let left = record_failure(st, user, "reused").await?;
+            Err(code_reused(left))
+        }
+        TotpCheck::Invalid => {
+            let left = record_failure(st, user, "invalid").await?;
+            Err(invalid_code(left))
+        }
+    }
+}
+
 pub async fn session_create(
     req: HttpRequest,
     st: Data,
@@ -292,50 +339,21 @@ pub async fn session_create(
             "set up your authenticator app first",
         ));
     }
-    if let Some(s) = auth::lockout_seconds(&st, user.user_id).await? {
-        return Err(locked_error(s));
-    }
-    let secret = open_secret(&st, &user)?;
-    let now = chrono::Utc::now().timestamp() as u64;
-    match crypto::totp_check(&secret, &body.code, now, user.totp_last_step) {
-        TotpCheck::Valid(step) => {
-            // conditional on the step: two pods racing the same code cannot both win
-            let won = sqlx::query(
-                "UPDATE gtfs_editor_user SET totp_last_step = $2, last_login_at = now() \
-                 WHERE user_id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2) RETURNING user_id",
-            )
-            .bind(user.user_id)
-            .bind(step)
-            .fetch_optional(&st.pool)
-            .await?;
-            if won.is_none() {
-                let left = record_failure(&st, &user, "reused").await?;
-                return Err(code_reused(left));
-            }
-            let (token, expires_at) = start_session(&req, &st, &user).await?;
-            auth::audit(
-                &st.pool,
-                Some(user.user_id),
-                Some(&user.email),
-                "session_created",
-                None,
-                None,
-                json!({}),
-            )
-            .await?;
-            Ok(HttpResponse::Ok()
-                .cookie(session_cookie(token, st.session_hours))
-                .json(json!({"expires_at": expires_at})))
-        }
-        TotpCheck::Reused => {
-            let left = record_failure(&st, &user, "reused").await?;
-            Err(code_reused(left))
-        }
-        TotpCheck::Invalid => {
-            let left = record_failure(&st, &user, "invalid").await?;
-            Err(invalid_code(left))
-        }
-    }
+    use_code(&st, &user, &body.code, true).await?;
+    let (token, expires_at) = start_session(&req, &st, &user).await?;
+    auth::audit(
+        &st.pool,
+        Some(user.user_id),
+        Some(&user.email),
+        "session_created",
+        None,
+        None,
+        json!({}),
+    )
+    .await?;
+    Ok(HttpResponse::Ok()
+        .cookie(session_cookie(token, st.session_hours))
+        .json(json!({"expires_at": expires_at})))
 }
 
 pub async fn session_delete(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
@@ -617,6 +635,176 @@ async fn seed_import(
 /// `202`: the import runs in the background as job `job_id`.
 fn accepted(job_id: Uuid) -> EditorResult<HttpResponse> {
     Ok(HttpResponse::Accepted().json(json!({"job_id": job_id, "status": "running"})))
+}
+
+/// The header a reload's authenticator code comes in: the body is the zip.
+pub const CODE_HEADER: &str = "x-editor-code";
+/// How long a checked reload waits for its second confirmation.
+const RELOAD_CONFIRM_MINUTES: i64 = 10;
+const RELOAD_AAD: &[u8] = b"gtfs-editor feed reload";
+
+/// What the first of a reload's two confirmations checked, sealed with the
+/// editor's key so only this server can have made it. The second confirmation
+/// brings it back with the same zip and a newer code.
+#[derive(Serialize, Deserialize)]
+struct ReloadTicket {
+    gtfs_id: String,
+    user_id: Uuid,
+    zip_sha256: String,
+    /// The feed's version when it was checked: anything committed since
+    /// makes the check stale.
+    version: i64,
+    /// The step of the first code: the second must be newer.
+    step: i64,
+    expires_at: i64,
+}
+
+impl ReloadTicket {
+    fn seal(&self, st: &EditorState) -> String {
+        let plain = serde_json::to_vec(self).expect("a ticket serialises");
+        URL_SAFE_NO_PAD.encode(st.secrets.seal(&plain, RELOAD_AAD))
+    }
+
+    fn open(st: &EditorState, token: &str) -> EditorResult<Self> {
+        URL_SAFE_NO_PAD
+            .decode(token.trim())
+            .ok()
+            .and_then(|sealed| st.secrets.open(&sealed, RELOAD_AAD))
+            .and_then(|plain| serde_json::from_slice(&plain).ok())
+            .ok_or_else(|| {
+                EditorError::bad_request(
+                    "invalid_confirm_token",
+                    "this confirmation is not one the editor gave; check the zip again",
+                )
+            })
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ReloadQuery {
+    /// The token the check answered with: present, this is the reload itself.
+    pub confirm: Option<String>,
+    /// `true`: answer at once with a job to poll (section 18.15).
+    pub background: Option<bool>,
+}
+
+/// Reload feed `g` fresh from a GTFS zip, the request's body (section 18.16):
+/// every row of its GTFS tables is deleted and the zip loaded in their place.
+/// Admin only, and confirmed twice with the authenticator, each time with a
+/// code in [`CODE_HEADER`]:
+///
+/// 1. without `confirm`, the zip is checked: the whole reload runs and is
+///    rolled back. When it would load, the report carries `confirm_token`,
+///    good for [`RELOAD_CONFIRM_MINUTES`] for this admin, this feed, this zip
+///    and the feed as it is now;
+/// 2. with `confirm`, the same zip and a newer code - the first is used up -
+///    reload the feed, audited `reload`.
+pub async fn feed_reload(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<ReloadQuery>,
+    body: web::Bytes,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    let ctx = auth::require_admin(&req, &st).await?;
+    let code = req
+        .headers()
+        .get(CODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if code.is_empty() {
+        return Err(EditorError::bad_request(
+            "code_required",
+            "a reload is confirmed with a code from your authenticator app",
+        ));
+    }
+    let version: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM gtfs_feed WHERE gtfs_id = $1")
+            .bind(&g)
+            .fetch_optional(&st.pool)
+            .await?;
+    let Some(version) = version else {
+        return Err(EditorError::not_found(
+            "feed_not_found",
+            format!("there is no feed {g} to reload; make it from its zip as a new feed"),
+        ));
+    };
+    let zip_sha256 = crypto::sha256_hex(&body);
+    let now = chrono::Utc::now().timestamp();
+    let (dry_run, expect, confirm) = match q.confirm.as_deref() {
+        // 1 of 2: the check
+        None => {
+            let step = use_code(&st, &ctx.user, code, false).await?;
+            let ticket = ReloadTicket {
+                gtfs_id: g.clone(),
+                user_id: ctx.user.user_id,
+                zip_sha256: zip_sha256.clone(),
+                version,
+                step,
+                expires_at: now + RELOAD_CONFIRM_MINUTES * 60,
+            };
+            (true, None, Some((ticket.seal(&st), ticket.expires_at)))
+        }
+        // 2 of 2: the reload
+        Some(token) => {
+            let t = ReloadTicket::open(&st, token)?;
+            if t.user_id != ctx.user.user_id || t.gtfs_id != g {
+                return Err(EditorError::forbidden(
+                    "invalid_confirm_token",
+                    format!("this confirmation was not given to you for feed {g}"),
+                ));
+            }
+            if now > t.expires_at {
+                return Err(EditorError::conflict(
+                    "confirm_expired",
+                    format!(
+                        "the check was more than {RELOAD_CONFIRM_MINUTES} minutes ago; check the zip again"
+                    ),
+                ));
+            }
+            if t.zip_sha256 != zip_sha256 {
+                return Err(EditorError::conflict(
+                    "zip_changed",
+                    "this is not the zip that was checked; check it again",
+                ));
+            }
+            if t.version != version {
+                return Err(EditorError::conflict(
+                    "feed_changed",
+                    format!(
+                        "feed {g} changed since the reload was checked (version {} then, {version} now); check it again",
+                        t.version
+                    ),
+                ));
+            }
+            // a newer code than the first: the replay guard has used that one up
+            use_code(&st, &ctx.user, code, false).await?;
+            (false, Some(t.version), None)
+        }
+    };
+    let who = importer(&ctx);
+    let job_g = g.clone();
+    let work: import_jobs::Work = Box::new(move |pool| {
+        Box::pin(async move {
+            let report = feed_io::reload_zip(&pool, &body, &job_g, dry_run, &who, expect).await?;
+            let loads = report.errors == 0 && report.round_trip.is_empty();
+            let mut out = json!(report);
+            if let (true, Some((token, expires_at))) = (loads, confirm) {
+                out["confirm_token"] = json!(token);
+                out["confirm_expires_at"] =
+                    json!(chrono::DateTime::from_timestamp(expires_at, 0).map(|t| t.to_rfc3339()));
+            }
+            Ok(out)
+        })
+    });
+    if !q.background.unwrap_or(false) {
+        return ok(work(st.pool.clone()).await?);
+    }
+    let job_id =
+        import_jobs::start(&st.pool, Some(&g), "seed", dry_run, ctx.user.user_id, work).await?;
+    accepted(job_id)
 }
 
 /// An import running in the background (section 18.15): whether it is still

@@ -681,6 +681,12 @@ async fn refuse_unless_empty(conn: &mut PgConnection, g: &str) -> EditorResult<(
             ),
         ));
     }
+    refuse_open_drafts(conn, g).await
+}
+
+/// A feed somebody is editing is not loaded over: its drafts were made against
+/// rows a seed or a reload replaces.
+async fn refuse_open_drafts(conn: &mut PgConnection, g: &str) -> EditorResult<()> {
     let open: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM gtfs_change_set WHERE gtfs_id = $1 \
          AND status IN ('draft', 'submitted', 'approved')",
@@ -692,10 +698,58 @@ async fn refuse_unless_empty(conn: &mut PgConnection, g: &str) -> EditorResult<(
         return Err(EditorError::new(
             StatusCode::CONFLICT,
             "feed_has_open_drafts",
-            format!("feed {g} has {open} open drafts; a seed only loads a feed nobody is editing"),
-        ));
+            format!(
+                "feed {g} has {open} open drafts; discard or commit them first - a feed is only loaded while nobody is editing it"
+            ),
+        )
+        .with_details(json!({"open_drafts": open})));
     }
     Ok(())
+}
+
+/// The tables holding a feed's GTFS, in an order their keys allow deleting:
+/// what a reload empties. History and settings stay - the feed row, its drafts
+/// and releases, the audit log, reviews, proposals, webhooks and who may work
+/// on it.
+pub fn feed_data_tables() -> Vec<String> {
+    let mut tables: Vec<String> = [
+        "gtfs_frequency",
+        "gtfs_trip",
+        "gtfs_timing_profile",
+        "gtfs_route_stop",
+        "gtfs_pattern",
+        "gtfs_service_date",
+        "gtfs_service",
+        "gtfs_route",
+        "gtfs_stop",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for t in spec::FILES.iter().filter_map(|f| f.table()) {
+        if !tables.contains(&t) {
+            tables.push(t);
+        }
+    }
+    tables
+}
+
+/// Empty feed `g`'s GTFS tables ([`feed_data_tables`]) inside the caller's
+/// transaction, which holds the feed's lock: what each held, by table, for the
+/// reload's report and its audit row.
+async fn clear_feed_data(conn: &mut PgConnection, g: &str) -> EditorResult<BTreeMap<String, u64>> {
+    let mut gone = BTreeMap::new();
+    for table in feed_data_tables() {
+        let n = sqlx::query(&format!("DELETE FROM {table} WHERE gtfs_id = $1"))
+            .bind(g)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        if n > 0 {
+            gone.insert(table, n);
+        }
+    }
+    Ok(gone)
 }
 
 /// Write `m` into feed `g`, which must have no rows yet, inside the caller's
@@ -1221,6 +1275,9 @@ pub struct ImportReport {
     /// The fare stage stops read from the zip's headsigns (the seed's
     /// `stage_stops`): 0 for a feed without fare stages.
     pub stage_stops: usize,
+    /// A reload ([`reload_zip`]): the rows the feed held, by table, that the
+    /// zip replaces. None for a seed.
+    pub replaced: Option<BTreeMap<String, u64>>,
     /// What the zip breaks of the GTFS reference, as the feed report reads it:
     /// kept, as the import keeps what the feed ships.
     pub validation: crate::gtfs::validate::Report,
@@ -1264,6 +1321,36 @@ pub async fn import_zip(
     dry_run: bool,
     who: &Importer,
 ) -> EditorResult<ImportReport> {
+    load_zip(pool, bytes, gtfs_id, dry_run, who, None).await
+}
+
+/// Reload feed `g` fresh from a GTFS zip (section 18.16): in one transaction,
+/// with the feed's lock held, every row of its GTFS tables is deleted and the
+/// zip seeded in their place, read back and compared with the zip, and
+/// committed only when nothing differs and not `dry_run`. The feed must exist,
+/// have no open drafts and, when `expect_version` is given, still be at that
+/// version - what the person confirming saw. Audited `reload`.
+pub async fn reload_zip(
+    pool: &sqlx::PgPool,
+    bytes: &[u8],
+    g: &str,
+    dry_run: bool,
+    who: &Importer,
+    expect_version: Option<i64>,
+) -> EditorResult<ImportReport> {
+    load_zip(pool, bytes, Some(g), dry_run, who, Some(expect_version)).await
+}
+
+/// [`import_zip`], or with `reload` ([`reload_zip`]'s `expect_version`) a
+/// reload of a feed that has rows.
+async fn load_zip(
+    pool: &sqlx::PgPool,
+    bytes: &[u8],
+    gtfs_id: Option<&str>,
+    dry_run: bool,
+    who: &Importer,
+    reload: Option<Option<i64>>,
+) -> EditorResult<ImportReport> {
     use crate::gtfs::{compare, model, read, write, Level};
     let bad = |code: &'static str, m: String| EditorError::new(StatusCode::BAD_REQUEST, code, m);
     let (raw, mut findings) = read::read_zip(bytes).map_err(|e| bad("invalid_zip", e))?;
@@ -1283,6 +1370,12 @@ pub async fn import_zip(
             .bind(&g)
             .fetch_one(pool)
             .await?;
+    if reload.is_some() && !exists {
+        return Err(EditorError::not_found(
+            "feed_not_found",
+            format!("there is no feed {g} to reload; make it from its zip as a new feed"),
+        ));
+    }
     let (m, more) = model::FeedModel::from_raw(&raw, &g, model::BuildOptions::default());
     findings.extend(more);
     let mut report = ImportReport {
@@ -1302,6 +1395,7 @@ pub async fn import_zip(
         seeded: false,
         feed_version: None,
         stage_stops: 0,
+        replaced: None,
         validation: crate::gtfs::validate::summarise(
             &crate::gtfs::validate::validate(&m, &chrono::Utc::now().date_naive().to_string()),
             5,
@@ -1312,6 +1406,25 @@ pub async fn import_zip(
     }
 
     let mut tx = pool.begin().await?;
+    if let Some(expect_version) = reload {
+        super::feed_lock::lock_feed(&mut tx, &g).await?;
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM gtfs_feed WHERE gtfs_id = $1 FOR UPDATE")
+                .bind(&g)
+                .fetch_one(&mut *tx)
+                .await?;
+        if expect_version.is_some_and(|v| v != version) {
+            return Err(EditorError::conflict(
+                "feed_changed",
+                format!(
+                    "feed {g} changed since the reload was checked (version {} then, {version} now); check it again",
+                    expect_version.unwrap_or_default()
+                ),
+            ));
+        }
+        refuse_open_drafts(&mut tx, &g).await?;
+        report.replaced = Some(clear_feed_data(&mut tx, &g).await?);
+    }
     let seeded = seed(&mut tx, &g, &m, &who.label).await?;
     report.stage_stops = seeded.stage_stops;
     let (back, export_findings) = load_model(&mut tx, &g).await?;
@@ -1333,7 +1446,7 @@ pub async fn import_zip(
         &mut *tx,
         who.user_id,
         who.email.as_deref(),
-        "seed",
+        if reload.is_some() { "reload" } else { "seed" },
         Some(&g),
         None,
         json!({
@@ -1344,6 +1457,7 @@ pub async fn import_zip(
             "findings": summary,
             "feed_version": seeded.feed_version,
             "stage_stops": seeded.stage_stops,
+            "replaced": report.replaced,
         }),
     )
     .await?;

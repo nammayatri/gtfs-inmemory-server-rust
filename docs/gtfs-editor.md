@@ -3865,6 +3865,65 @@ that fails with the seed's `feed_not_empty`, a drafts job, a viewer, a job that
 does not exist); `editor-ui/dev/ui_e2e.mjs --only feed,newfeed`, both through
 jobs; the chennai_bus drafts check through the page as a 27 s job.
 
+### 18.16 Reloading a feed fresh, confirmed twice (2026-10-05)
+
+A seed loads only an empty feed (18.4), and a draft import never writes stops,
+routes or stop orders (18.8). Starting a feed over from a new zip used to mean
+emptying its tables by hand. `POST /feeds/{g}/reload` does it in one
+transaction. With the feed's lock held, it deletes every row of the feed's GTFS
+tables (`feed_io::feed_data_tables`):
+
+- stops, routes and stop orders, with their patterns and timings;
+- services, trips and frequencies;
+- every record file.
+
+It then seeds the zip in their place (18.4, fare stages included), reads it back,
+compares it with the zip, and commits only when nothing differs. The feed row and
+its settings are kept, as are drafts already committed, releases, the audit log,
+coordinate reviews, station proposals, webhooks and feed access. The version is
+bumped, so GIMS loads the new rows. A feed with open drafts is refused
+(`feed_has_open_drafts`): those drafts were made against the rows the reload
+replaces. Discard or commit them first.
+
+It is an admin's, and it is confirmed twice with the authenticator. Each request
+carries a code in the `X-Editor-Code` header, checked as a sign-in checks one:
+lockout, replay guard, and a wrong code counted toward the lockout. A wrong or
+used code answers 401 `invalid_code` / `code_reused`, and the dashboard does not
+treat that as a lost session.
+
+1. **The check:** no `confirm`. The whole reload runs and is rolled back. The
+   report is the seed's, plus `replaced`: what each table held, which the reload
+   deletes. When the zip would load, the report also carries `confirm_token` and
+   `confirm_expires_at`. The token is sealed with the editor's key and is good
+   for 10 minutes. It binds the admin, the feed, the zip's sha256, the feed's
+   version and the code's time step.
+2. **The reload:** `?confirm=<token>`, the same zip, and a newer code. The first
+   code is used up, so the authenticator must show the next one. These are
+   refused before any code is looked at:
+   - another admin or feed (`invalid_confirm_token`);
+   - an expired check (`confirm_expired`);
+   - another zip (`zip_changed`);
+   - a feed committed to since the check (`feed_changed`, checked again inside
+     the transaction).
+
+   A reload that loads is audited `reload`, with the zip's sha256, counts,
+   findings, `replaced` and the new version.
+
+Both steps take `background=true` and run as import jobs (18.15). The job kind
+is `seed`, so `0024`'s CHECK needs no change. The check of a big feed holds the
+feed's lock while it runs: chennai_bus takes tens of seconds, during which
+commits to it wait.
+
+On the dashboard it is the third way on the feed page's import box, "Reload the
+feed fresh". "Check without writing" asks for the first code (confirmation 1 of
+2), then shows what the reload deletes and the seed report. "Reload {feed}…" asks
+for the feed id typed out and a new code (confirmation 2 of 2). A used or wrong
+code there can be tried again without checking again. Once reloaded, the feed is
+opened afresh.
+
+`tests/editor_feed_io_flow.rs` (`an_admin_reloads_a_feed_confirming_twice`)
+covers the refusals and the reload, through HTTP.
+
 ## 19. Scripted writes without a replay per change (2026-09-30)
 
 Every single-change write - `POST /change-sets/{id}/changes`, `PUT` and
