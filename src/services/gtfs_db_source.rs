@@ -1077,6 +1077,7 @@ impl GtfsDbSource {
                 }),
                 service_tier_type: None,
                 encoded_polyline: None,
+                route_tag: None,
             });
             out.patterns.push(NandiPatternDetails {
                 id: overlay.pattern_id.clone(),
@@ -1370,6 +1371,7 @@ impl GtfsDbSource {
                 end_point: Some(end),
                 service_tier_type: None,
                 encoded_polyline: None,
+                route_tag: None,
             });
         }
         out.trips = Some(Arc::new(index));

@@ -409,7 +409,7 @@ impl GTFSService {
 
         let mut data = snapshot.data;
         // Re-apply DB polylines (not Nandi) so a snapshot boot matches a JSON boot.
-        self.enrich_routes_with_polylines(&mut data.routes_by_gtfs)
+        self.enrich_routes_from_route_internal(&mut data.routes_by_gtfs)
             .await;
         self.enrich_routes_with_db_service_tiers(&mut data.routes_by_gtfs)
             .await;
@@ -655,7 +655,8 @@ impl GTFSService {
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
 
         // Enrich with encoded_polyline from route_internal (DB-only field)
-        self.enrich_routes_with_polylines(&mut routes_by_gtfs).await;
+        self.enrich_routes_from_route_internal(&mut routes_by_gtfs)
+            .await;
         // A DB feed's polylines are the editor's, including a cleared one.
         for (gtfs_id, polylines) in &db_polylines {
             Self::apply_db_polylines(&mut routes_by_gtfs, gtfs_id, polylines);
@@ -1411,6 +1412,7 @@ impl GTFSService {
                 end_point: route.end_point,
                 service_tier_type,
                 encoded_polyline: None,
+                route_tag: None,
             };
             routes_by_gtfs
                 .entry(gtfs_id.to_string())
@@ -1420,7 +1422,14 @@ impl GTFSService {
         routes_by_gtfs
     }
 
-    async fn enrich_routes_with_polylines(
+    /// Fills the fields a route only has in `route_internal` -- the feed carries neither, so
+    /// `build_routes_by_gtfs` leaves them None and they are backfilled here. Every path that
+    /// rebuilds routes calls this -- JSON build, snapshot, and both single-feed rebuilds -- so a
+    /// field added here cannot go missing on one of them the way `service_tier_type` once did.
+    ///
+    /// A failed lookup leaves existing values alone rather than clearing them: a stale tag is
+    /// recoverable, every route silently losing its tag and repricing a city is not.
+    async fn enrich_routes_from_route_internal(
         &self,
         routes_by_gtfs: &mut HashMap<String, HashMap<String, NandiRoutesRes>>,
     ) {
@@ -1432,20 +1441,36 @@ impl GTFSService {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "enrich_routes_with_polylines: get_routes_list({}) failed: {}",
+                        "enrich_routes_from_route_internal: get_routes_list({}) failed, routes left as-is: {}",
                         gtfs_id, e
                     );
                     continue;
                 }
             };
+            let mut tagged = 0usize;
             for row in rows {
-                if row.encoded_polyline.is_none() {
+                let Some(route) = routes.get_mut(&row.route_id.to_string()) else {
                     continue;
-                }
-                let route_key = row.route_id.to_string();
-                if let Some(route) = routes.get_mut(&route_key) {
+                };
+                if row.encoded_polyline.is_some() {
                     route.encoded_polyline = row.encoded_polyline;
                 }
+                // Unconditional so a cleared column clears the tag; blank normalises to None.
+                route.route_tag = row
+                    .route_tag
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                if route.route_tag.is_some() {
+                    tagged += 1;
+                }
+            }
+            if tagged > 0 {
+                info!(
+                    "enrich_routes_from_route_internal({}): {} routes tagged",
+                    gtfs_id, tagged
+                );
             }
         }
     }
@@ -2349,6 +2374,8 @@ impl GTFSService {
         let ids: HashSet<String> = [gtfs_id.to_string()].into_iter().collect();
         let (trip_map, trip_details) = Self::build_example_trip_from_patterns(&feed.patterns, &ids);
         self.update_start_end_points(&mut routes, &route_data);
+        // Same order as build_data: route_internal first, then the feed's own polylines win.
+        self.enrich_routes_from_route_internal(&mut routes).await;
         Self::apply_db_polylines(&mut routes, gtfs_id, &feed.polylines);
         let stations = Self::build_station_platforms(&feed.stops);
         let children = self.build_children_mapping(feed.stops);
@@ -2463,7 +2490,8 @@ impl GTFSService {
             self.build_routes_by_gtfs(routes, &trip_counts, &stop_counts, &tiers);
         // Preprocessed routes get their polyline from route_internal, same as
         // a normal boot - unlike a DB feed, which takes it from gtfs_route.
-        self.enrich_routes_with_polylines(&mut routes_by_gtfs).await;
+        self.enrich_routes_from_route_internal(&mut routes_by_gtfs)
+            .await;
         let stop_map = self.build_stops_by_gtfs(stops.clone(), &data.stop_regional_names_by_gtfs);
         let alternates = self.build_alternate_stops_by_gtfs(stops.clone());
         let route_data = self.build_route_data(
