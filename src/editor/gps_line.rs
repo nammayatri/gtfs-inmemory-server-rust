@@ -1405,6 +1405,47 @@ pub struct GpsLineSettings {
     pub params: Params,
 }
 
+/// How long a suggestion may take, all told. One answered in its request has
+/// to fit the 30 s the load balancer waits ([`GpsLineSettings::request_budget`]);
+/// one run as a background job ([`background_budget`], section 17.10) may read
+/// for minutes, as long as a slow cluster needs.
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    /// The whole suggestion - waiting for another one, the queries, OSRM.
+    pub total: Duration,
+    /// Step 1 stops looking further back after this long.
+    pub bus_days: Duration,
+    /// Reading stops this long before `total`, for OSRM and the build.
+    pub osrm_reserve: Duration,
+}
+
+/// A suggestion run in the background gives up only after this long - less
+/// than the half hour after which its job counts as lost.
+pub const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// The longest one ClickHouse query may run (`max_execution_time`): a
+/// request's own budget keeps its queries far shorter.
+pub const MAX_QUERY_TIME: Duration = Duration::from_secs(5 * 60);
+
+/// A background suggestion's budget: half of it for finding the bus-days.
+pub fn background_budget() -> Budget {
+    Budget {
+        total: BACKGROUND_TIMEOUT,
+        bus_days: BACKGROUND_TIMEOUT / 2,
+        osrm_reserve: Duration::from_secs(60),
+    }
+}
+
+impl GpsLineSettings {
+    /// A suggestion answered in its request: [`Self::timeout`] in all.
+    pub fn request_budget(&self) -> Budget {
+        Budget {
+            total: self.timeout,
+            bus_days: self.bus_days_budget,
+            osrm_reserve: self.osrm_reserve,
+        }
+    }
+}
+
 /// The settings the dhall block describes, defaults filled in.
 pub fn settings_from_config(
     c: &crate::environment::GtfsGpsConfig,
@@ -1425,7 +1466,8 @@ pub fn settings_from_config(
             url: c.url.clone(),
             user: c.user.clone(),
             password,
-            query_timeout: Duration::from_secs(30).min(timeout),
+            // each query is given what its budget has left, never more
+            query_timeout: MAX_QUERY_TIME,
             min_gap: crate::services::clickhouse_reader::DEFAULT_MIN_GAP,
             max_concurrent: crate::services::clickhouse_reader::DEFAULT_MAX_CONCURRENT,
         },
@@ -1640,11 +1682,24 @@ impl GpsLine {
         }
     }
 
-    /// Suggest a line for a route. `osrm_base` is the OSRM server, if any.
+    /// Suggest a line for a route, inside the request's budget. `osrm_base`
+    /// is the OSRM server, if any.
     pub async fn suggest(
         &self,
         osrm_base: Option<&str>,
         q: RouteQuery<'_>,
+    ) -> Result<Value, GpsFailure> {
+        self.suggest_within(osrm_base, q, self.settings.request_budget())
+            .await
+    }
+
+    /// [`Self::suggest`] with `budget` for all of it: a background job's
+    /// ([`background_budget`]) reads every day it can, however long that takes.
+    pub async fn suggest_within(
+        &self,
+        osrm_base: Option<&str>,
+        q: RouteQuery<'_>,
+        budget: Budget,
     ) -> Result<Value, GpsFailure> {
         let spellings = label_spellings(q.short_name);
         if spellings.is_empty() {
@@ -1659,10 +1714,12 @@ impl GpsLine {
             answer["evidence"]["cached"] = json!(true);
             return Ok(answer);
         }
-        let deadline = Instant::now() + self.settings.timeout;
-        let read_until = deadline - self.settings.osrm_reserve;
+        let deadline = Instant::now() + budget.total;
+        let read_until = deadline - budget.osrm_reserve;
         let work = async {
-            let (line, evidence) = self.stage(&q, &spellings, &key, now, read_until).await?;
+            let (line, evidence) = self
+                .stage(&q, &spellings, &key, now, read_until, budget.bus_days)
+                .await?;
             // whoever held the permit before us may have answered this already
             if let (Some(mut answer), _) = self.cached(&key) {
                 answer["evidence"]["cached"] = json!(true);
@@ -1712,8 +1769,15 @@ impl GpsLine {
         }
         let now = chrono::Utc::now().timestamp();
         let key = Self::cache_key(q, today(now));
-        self.stage(q, &spellings, &key, now, Instant::now() + budget)
-            .await
+        self.stage(
+            q,
+            &spellings,
+            &key,
+            now,
+            Instant::now() + budget,
+            self.settings.bus_days_budget,
+        )
+        .await
     }
 
     async fn stage(
@@ -1723,6 +1787,7 @@ impl GpsLine {
         key: &str,
         now: i64,
         read_until: Instant,
+        bus_days_budget: Duration,
     ) -> Result<(Vec<(f64, f64)>, Value), GpsFailure> {
         let stage = {
             let wait = read_until.saturating_duration_since(Instant::now());
@@ -1733,8 +1798,9 @@ impl GpsLine {
             match self.cached(key).1 {
                 Some(stage) => stage,
                 None => {
-                    let (stage, complete) =
-                        self.read_and_build(q, spellings, now, read_until).await?;
+                    let (stage, complete) = self
+                        .read_and_build(q, spellings, now, read_until, bus_days_budget)
+                        .await?;
                     // a read cut short by the clock is not the day's answer
                     if complete {
                         self.remember(key, Some(stage.clone()), None);
@@ -2025,6 +2091,7 @@ impl GpsLine {
         spellings: &[String],
         now: i64,
         read_until: Instant,
+        bus_days_budget: Duration,
     ) -> Result<(Stage, bool), GpsFailure> {
         let s = &self.settings;
         let p = &s.params;
@@ -2037,7 +2104,7 @@ impl GpsLine {
         let at_once = s.clickhouse.max_concurrent.max(1);
 
         // 1. bus-days: every day of the lookback, a few at a time, today first
-        let step1_until = read_until.min(started + s.bus_days_budget);
+        let step1_until = read_until.min(started + bus_days_budget);
         let per_day = BUS_DAYS_PER_DAY.min(s.max_bus_days);
         let dates: Vec<chrono::NaiveDate> = (0..s.days)
             .map(|k| last_day - chrono::Duration::days(i64::from(k)))
@@ -3061,7 +3128,13 @@ pub mod tests {
         let now = chrono::Utc::now().timestamp();
         let started = Instant::now();
         let (stage, complete) = gps
-            .read_and_build(&q, &label_spellings("21G"), now, started + budget)
+            .read_and_build(
+                &q,
+                &label_spellings("21G"),
+                now,
+                started + budget,
+                gps.settings.bus_days_budget,
+            )
             .await
             .unwrap();
         (stage, complete, started.elapsed())
@@ -3168,12 +3241,13 @@ pub mod tests {
                 .count()
         };
         let until = || Instant::now() + Duration::from_secs(30);
-        gps.read_and_build(&q, &spellings, now, until())
+        let step1 = gps.settings.bus_days_budget;
+        gps.read_and_build(&q, &spellings, now, until(), step1)
             .await
             .unwrap();
         assert_eq!(asked(), 7);
         let (stage, complete) = gps
-            .read_and_build(&q, &spellings, now, until())
+            .read_and_build(&q, &spellings, now, until(), step1)
             .await
             .unwrap();
         assert!(complete);

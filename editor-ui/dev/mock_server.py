@@ -1378,8 +1378,8 @@ class Handler(BaseHTTPRequestHandler):
         if mode == "budget":
             raise ApiError(422, "gps_not_enough_runs",
                            f"in the last 6 day(s) 2 of 7 bus runs labelled {number} passed this route's stops in "
-                           "order; a line needs at least 3. Reading stopped early to answer in time; asking "
-                           "again usually reads further",
+                           "order; a line needs at least 3. Reading stopped at its time limit before every "
+                           "day was read; the GPS store may be slow",
                            {**counts, "from": (today - timedelta(days=5)).isoformat(), "days_read": 6,
                             "stopped": "budget", "bus_days": 3, "bus_days_read": 3, "runs_seen": 7,
                             "runs_used": 2, "min_runs": 3, "buses": 3})
@@ -1533,6 +1533,16 @@ class Handler(BaseHTTPRequestHandler):
                              "stops": len(served), "trips": trips if len(served) >= 2 else [],
                              "evidence": {"buses": 3, "buses_read": 3, "runs_seen": 5, "runs_used": 3,
                                           "stopped": "complete", "cached": False}}
+            if len(rest) == 2 and rest[0] == "gps-jobs" and method == "GET":
+                self.require_role(u, "editor")
+                job = getattr(s, "gps_jobs", {}).get(rest[1])
+                if not job or job["gtfs_id"] != g:
+                    raise ApiError(404, "job_not_found", f"no map line job {rest[1]} for feed {g}")
+                ready = time.time() >= job["ready_at"]
+                status = "running" if not ready else "failed" if "error" in job else "done"
+                return 200, {"job_id": rest[1], "gtfs_id": g, "kind": "gps_line", "dry_run": True, "status": status,
+                             "report": job.get("report") if ready else None,
+                             "error": job.get("error") if ready else None}
             if len(rest) == 3 and rest[0] == "routes" and rest[2] in ("polyline:osrm", "polyline:gps") and method == "POST":
                 self.require_role(u, "editor")
                 cs = s.change_sets.get(q.get("change_set", [""])[0])
@@ -1544,7 +1554,20 @@ class Handler(BaseHTTPRequestHandler):
                 pts = [(r["lat"], r["lon"]) for r in served]
                 dist = sum(haversine(*a, *b) for a, b in zip(pts, pts[1:]))
                 if rest[2] == "polyline:gps":
-                    return 200, self.map_line_gps(g, rest[1], d, served, pts, dist)
+                    if q.get("background", [""])[0] != "true":
+                        return 200, self.map_line_gps(g, rest[1], d, served, pts, dist)
+                    # a job (docs section 17.10): the outcome is worked out now
+                    # and served once the job has "run" a few seconds
+                    try:
+                        outcome = {"report": self.map_line_gps(g, rest[1], d, served, pts, dist)}
+                    except ApiError as e:
+                        outcome = {"error": {"status": e.status, "code": e.code, "message": e.message,
+                                             "details": e.details}}
+                    job_id = str(uuid.uuid4())
+                    if not hasattr(s, "gps_jobs"):
+                        s.gps_jobs = {}
+                    s.gps_jobs[job_id] = {"gtfs_id": g, "ready_at": time.time() + 2.5, **outcome}
+                    return 202, {"job_id": job_id, "status": "running"}
                 self.map_line_osrm_failure(served)
                 return 200, {"route_id": rest[1], "encoded_polyline": polyline_encode(pts),
                              "polyline_source": "osrm", "waypoints": len(pts), "distance_m": round(dist),

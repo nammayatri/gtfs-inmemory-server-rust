@@ -1,6 +1,6 @@
 // Edit screens. Each builds a change and hands it to drafts.addChange(); none
 // of them writes live data.
-import { get, post, enc } from "./api.js";
+import { get, post, enc, ApiError } from "./api.js";
 import { state, setLeaveGuard } from "./state.js";
 import {
   h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, STOP_TYPE_LABEL, SERVED_EXCLUDE,
@@ -750,12 +750,13 @@ function gpsFailure(e) {
       : `Of ${plural(d.runs_seen || 0, "bus run")} seen between ${dayRange(d.from, d.to)}, ${d.runs_used || 0} passed this route's stops in order; at least ${d.min_runs || 3} are needed.`;
     return [h("p.notice.error", { "data-failure-reason": e.code }, saw),
       d.stopped === "budget"
-        ? h("p.hint", { "data-stopped": "budget" }, `Reading stopped after ${plural(d.days_read || 0, "day")} to answer in time. Asking again reads the days not yet read: the ones already read are kept.`)
+        ? h("p.hint", { "data-stopped": "budget" }, `Reading stopped at its time limit, after ${plural(d.days_read || 0, "day")}. The GPS store may be slow right now; try again later.`)
         : h("p.hint", "Check the route number and the stops' order and positions, or route the line through the stops instead.")];
   }
   const hint = {
     gps_unavailable: "Map lines from GPS are not set up for this feed. Route the line through the stops instead.",
-    gps_timeout: "Reading the GPS took too long. Try again in a minute.",
+    gps_timeout: "Reading the GPS took too long. The GPS store may be slow right now; try again later.",
+    job_lost: "The server reading the GPS restarted. Ask again.",
     gps_query_failed: "The GPS store could not be read. Try again in a minute.",
     gps_no_route_number: "Give the route its number first: the buses are found by it.",
   }[e.code];
@@ -814,15 +815,18 @@ export async function editRouteDetails(route, { created = false } = {}) {
   };
 
   // one suggestion at a time: a second click while the first is out would
-  // only queue behind it on the server
+  // only queue behind it on the server. `fetchLine(status)` gets the line, or
+  // null when the person stopped waiting.
   let asking = false;
-  const ask = async (waiting, path, label, fail) => {
+  const ask = async (waiting, label, fail, fetchLine) => {
     if (asking) return;
     asking = true;
     suggestButtons.forEach((b) => { b.disabled = true; });
-    clear(lineStatus, h("p.hint", { "aria-live": "polite" }, waiting));
+    const status = h("p.hint", { "aria-live": "polite" }, waiting);
+    clear(lineStatus, status);
     try {
-      const res = await post(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/${path}?change_set=${enc(state.draft.change_set_id)}`);
+      const res = await fetchLine(status);
+      if (!res) return;
       unsaved.touch();
       setLine({ encoded_polyline: res.encoded_polyline, polyline_source: res.polyline_source, evidence: res.evidence || null }, label);
     } catch (e) {
@@ -832,11 +836,41 @@ export async function editRouteDetails(route, { created = false } = {}) {
       suggestButtons.forEach((b) => { b.disabled = false; });
     }
   };
-  const suggest = () => ask("Asking the road router for a line through the stops…", "polyline:osrm", "suggested a map line through the stops", osrmFailure);
+  const linePath = (path) => `feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/${path}?change_set=${enc(state.draft.change_set_id)}`;
+  const suggest = () => ask("Asking the road router for a line through the stops…", "suggested a map line through the stops", osrmFailure,
+    () => post(linePath("polyline:osrm")));
+  // A line from GPS is read in the background (docs section 17.10): the
+  // request answers at once with a job, polled here for as long as reading
+  // the buses' GPS takes - minutes, when the GPS store is slow.
+  const gpsJob = async (status) => {
+    const { job_id } = await post(`${linePath("polyline:gps")}&background=true`);
+    const said = status.textContent;
+    const started = Date.now();
+    let stopped = false;
+    const stop = h("button.btn.quiet.small", { type: "button", on: { click: () => { stopped = true; } } }, "Stop waiting");
+    lineStatus.append(stop);
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // the editor was closed, or the person stopped waiting
+      if (!lineStatus.isConnected) return null;
+      if (stopped) {
+        clear(lineStatus, h("p.hint", "Stopped waiting. The GPS is still being read: ask again in a while and the line comes from what it read."));
+        return null;
+      }
+      const job = await get(`feeds/${enc(state.feedId)}/gps-jobs/${enc(job_id)}`);
+      if (job.status === "done") return job.report;
+      if (job.status !== "running") {
+        const e = job.error || {};
+        throw new ApiError(e.status || 500, e.code || "gps_failed", e.message || "Reading the GPS failed.", e.details);
+      }
+      const s = Math.round((Date.now() - started) / 1000);
+      status.textContent = `${said} ${s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`}`;
+    }
+  };
   // how far back the feed's GPS looks (docs section 17), as /auth/me says
   const gpsDays = ((state.feeds.find((f) => f.gtfs_id === state.feedId) || {}).gps || {}).days || 7;
-  const suggestGps = () => ask(`Reading where the buses of route ${route.short_name || route.route_id} drove over the last ${gpsDays} days… this can take up to 25 seconds.`,
-    "polyline:gps", "suggested a map line from GPS", gpsFailure);
+  const suggestGps = () => ask(`Reading where the buses of route ${route.short_name || route.route_id} drove over the last ${gpsDays} days. This can take a few minutes; you can go on editing meanwhile.`,
+    "suggested a map line from GPS", gpsFailure, gpsJob);
   const suggestButtons = [
     h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Route through stops"),
     h("button.btn.secondary", { type: "button", on: { click: suggestGps } }, `Suggest from GPS (last ${gpsDays} days)`),
@@ -904,7 +938,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
     ),
     h("section.section",
       h("h2", "Map line"),
-      h("p.hint", "The map line is the road path drawn between the stops. The road router can suggest one through this route's stops, or the buses can: the path this route's buses drove in the last 14 days, snapped to the roads."),
+      h("p.hint", `The map line is the road path drawn between the stops. The road router can suggest one through this route's stops, or the buses can: the path this route's buses drove in the last ${gpsDays} days, snapped to the roads.`),
       lineStatus,
       h("div.btn-row", ...suggestButtons),
       problems),

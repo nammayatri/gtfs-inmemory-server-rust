@@ -967,6 +967,9 @@ pub async fn route_context(
 #[derive(Deserialize)]
 pub struct PolylineQuery {
     change_set: Option<Uuid>,
+    /// `polyline:gps` only: `true` answers at once with a job to poll
+    /// (section 17.10), which reads for as long as the cluster needs.
+    background: Option<bool>,
 }
 
 /// How long a suggestion through the stops may take, all chunks together.
@@ -1095,6 +1098,9 @@ pub async fn polyline_gps(
     let detail = route_for_line(&st, &ctx, &g, &route_id, q.change_set).await?;
     let stops = gps_line::served_stops(&detail);
     let short_name = detail["short_name"].as_str().unwrap_or("").to_string();
+    if q.background.unwrap_or(false) {
+        return gps_line_job(&st, &ctx, gps, g, route_id, short_name, stops).await;
+    }
     let asked = gps_line::RouteQuery {
         gtfs_id: &g,
         route_id: &route_id,
@@ -1105,6 +1111,77 @@ pub async fn polyline_gps(
         Ok(v) => ok(v),
         Err(f) => Err(gps_error(f, &short_name)),
     }
+}
+
+/// A map line from GPS as a background job (section 17.10): `202 {job_id}` at
+/// once, and the suggestion read with [`gps_line::background_budget`] - minutes,
+/// not the request's 25 s - its answer, or the error it would have answered,
+/// written to `gtfs_import_job` for [`gps_job`]. It runs on this worker's
+/// runtime, where the GPS reader's connections live.
+async fn gps_line_job(
+    st: &Data,
+    ctx: &auth::Ctx,
+    gps: std::sync::Arc<gps_line::GpsLine>,
+    g: String,
+    route_id: String,
+    short_name: String,
+    stops: Vec<gps_line::Stop>,
+) -> EditorResult<HttpResponse> {
+    let job_id =
+        import_jobs::record(&st.pool, Some(&g), "gps_line", true, ctx.user.user_id).await?;
+    let pool = st.pool.clone();
+    let osrm = st.osrm_url.clone();
+    actix_web::rt::spawn(async move {
+        let started = std::time::Instant::now();
+        let asked = gps_line::RouteQuery {
+            gtfs_id: &g,
+            route_id: &route_id,
+            short_name: &short_name,
+            stops: &stops,
+        };
+        let outcome = gps
+            .suggest_within(osrm.as_deref(), asked, gps_line::background_budget())
+            .await
+            .map_err(|f| gps_error(f, &short_name));
+        let evidence = outcome
+            .as_ref()
+            .map_or_else(|e| e.details.clone(), |v| v["evidence"].clone());
+        tracing::info!(
+            tag = "[GTFS EDITOR GPS]",
+            job = %job_id,
+            feed = %g,
+            route = %route_id,
+            outcome = outcome.as_ref().err().map_or("line", |e| e.code),
+            seconds = started.elapsed().as_secs(),
+            days_read = %evidence["days_read"],
+            stopped = %evidence["stopped"],
+            read_seconds = %evidence["read_seconds"],
+        );
+        if let Err(e) = import_jobs::finish(&pool, job_id, outcome).await {
+            tracing::error!(tag = "[GTFS EDITOR GPS]", job = %job_id, "its outcome was not recorded: {e}");
+        }
+    });
+    accepted(job_id)
+}
+
+/// A map line from GPS being read in the background (section 17.10):
+/// `running`, `done` with the line as `polyline:gps` answers it, `failed` with
+/// the error it would have answered, or `lost`. Any editor of the feed.
+pub async fn gps_job(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, Uuid)>,
+) -> EditorResult<HttpResponse> {
+    let (g, job_id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Editor).await?;
+    let job = import_jobs::get(&st.pool, job_id).await?;
+    if job["kind"] != "gps_line" || job["gtfs_id"] != g.as_str() {
+        return Err(EditorError::not_found(
+            "job_not_found",
+            format!("no map line job {job_id} for feed {g}"),
+        ));
+    }
+    ok(job)
 }
 
 #[derive(Deserialize)]
@@ -1195,7 +1272,7 @@ fn gps_error(failure: GpsFailure, short_name: &str) -> EditorError {
             );
             if counts["stopped"] == "budget" {
                 message.push_str(
-                    ". Reading stopped early to answer in time; asking again reads the days not yet read",
+                    ". Reading stopped at its time limit before every day was read; the GPS store may be slow",
                 );
             }
             EditorError::new(
