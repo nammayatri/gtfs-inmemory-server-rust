@@ -17,5 +17,6 @@ CREATE TABLE public.route_internal (
     route_distance real DEFAULT 0,
     gtfs_id character varying(100) DEFAULT 'chennai_bus'::character varying NOT NULL,
     deleted boolean DEFAULT false NOT NULL,
-    encoded_polyline text
+    encoded_polyline text,
+    route_tag text
 );

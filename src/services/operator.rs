@@ -196,6 +196,7 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "start_point_id",
             "route_distance",
             "encoded_polyline",
+            "route_tag",
             "gtfs_id",
         ]),
         "route_point_internal" => Some(&[
@@ -595,6 +596,7 @@ pub struct RouteRow {
     pub start_point_id: Option<IdValue>,
     pub end_point_id: Option<IdValue>,
     pub encoded_polyline: Option<String>,
+    pub route_tag: Option<String>,
 }
 
 // ===== Stop & route management (clubber / editor) =====
@@ -3015,7 +3017,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>> {
         sqlx::query_as::<_, RouteRow>(
-            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id, encoded_polyline
+            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id, encoded_polyline, route_tag
              FROM public.route_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY route_number",

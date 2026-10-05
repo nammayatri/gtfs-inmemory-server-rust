@@ -592,6 +592,9 @@ pub struct NandiRoutesRes {
         skip_serializing_if = "Option::is_none"
     )]
     pub encoded_polyline: Option<String>,
+    /// Operator-managed fare classification; `default` so older snapshots deserialize as None.
+    #[serde(rename = "routeTag", default, skip_serializing_if = "Option::is_none")]
+    pub route_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

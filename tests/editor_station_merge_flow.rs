@@ -320,6 +320,7 @@ fn write_preprocessed(dir: &Path) {
                 }),
                 service_tier_type: None,
                 encoded_polyline: None,
+                route_tag: None,
             })
             .collect(),
     )]);
