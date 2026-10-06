@@ -437,7 +437,7 @@ STOP_TEXTS = ("platform_code", "description")
 
 def stored_text(v):
     return (v.strip() or None) if isinstance(v, str) else None
-ROUTE_FIELDS = {"short_name", "long_name", "color", "text_color", "encoded_polyline", "polyline_source"}
+ROUTE_FIELDS = {"short_name", "long_name", "color", "text_color", "encoded_polyline", "polyline_source", "active"}
 
 
 class Projection:
@@ -1034,6 +1034,7 @@ def route_detail(proj, rid):
     return {k: rt.get(k) for k in ("route_id", "short_name", "long_name", "route_type", "agency_id", "color",
                                    "text_color", "encoded_polyline", "polyline_source", "provenance",
                                    "deleted", "row_version")} | {
+        "active": rt.get("active", True) is not False,
         "rows": out_rows, "rows_hash": rows_hash(rows),
         "stop_count": sum(1 for r in rows if r["stop_type"] not in SERVED_EXCLUDE)}
 
@@ -1761,7 +1762,8 @@ class Handler(BaseHTTPRequestHandler):
             rt = s.routes[(g, rid)]
             row = next(r for r in s.rows[(g, rid)] if r["sequence"] == seq)
             routes.append({"route_id": rid, "short_name": rt["short_name"], "long_name": rt["long_name"],
-                           "sequence": seq, "stop_type": row["stop_type"], "stage_no": row["stage_no"]})
+                           "sequence": seq, "stop_type": row["stop_type"], "stage_no": row["stage_no"],
+                           "active": rt.get("active", True) is not False})
         children = [stop_out(s, g, c) for (gg, _), c in s.stops.items()
                     if gg == g and c.get("parent_station") == sid and not c.get("deleted")]
         nearby = []
@@ -1779,6 +1781,10 @@ class Handler(BaseHTTPRequestHandler):
     def list_routes(self, g, q):
         s = self.store
         items = [rt for (gg, _), rt in s.routes.items() if gg == g and not rt.get("deleted")]
+        # ?active=false: only the inactive routes (docs section 18.17)
+        want = (q.get("active", [""])[0] or "").strip().lower()
+        if want in ("true", "false"):
+            items = [rt for rt in items if (rt.get("active", True) is not False) == (want == "true")]
         term = (q.get("q", [""])[0] or "").strip().lower()
         if term:
             def rank(rt):
@@ -1796,7 +1802,8 @@ class Handler(BaseHTTPRequestHandler):
                           "color": rt.get("color"), "has_polyline": bool(rt.get("encoded_polyline")),
                           "stop_count": sum(1 for r in s.rows.get((g, rt["route_id"]), [])
                                             if r["stop_type"] not in SERVED_EXCLUDE),
-                          "row_version": rt["row_version"]} for rt in page["items"]]
+                          "row_version": rt["row_version"], "active": rt.get("active", True) is not False}
+                         for rt in page["items"]]
         return page
 
     # ---- change sets

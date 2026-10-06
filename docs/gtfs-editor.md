@@ -38,10 +38,15 @@ and service calendars (section 16), `0020` the MTC sync's system account (sectio
 16.8), `0021` lets a map line come from GPS (section 17), `0022` is the release
 button's (section 12.6), `0023` holds every other file and field of the GTFS
 reference (section 18), `0024` is where a background import's report waits
-(section 18.15). All are safe to run twice. **`0012`, `0017` and `0023`
+(section 18.15), `0025` lets a map line from GPS run as a background job
+(section 17.10), `0026` marks a route inactive (section 18.17). All are safe to
+run twice. **`0012`, `0017` and `0023`
 go on a database before the build that reads them:** both the editor and the GIMS loader select those columns, so a DB feed
 fails to load (and serves its preprocessed data) on a database without them.
-`0024` too, or the dashboard's imports fail; GIMS itself serves without it.)
+`0024` too, or the dashboard's imports fail; GIMS itself serves without it.
+`0025` too, or every map line from GPS fails with a 500. `0026` too, or the
+dashboard's route screens fail with `schema_behind`; GIMS serves without it,
+every route active.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -3979,6 +3984,93 @@ opened afresh.
 
 `tests/editor_feed_io_flow.rs` (`an_admin_reloads_a_feed_confirming_twice`)
 covers the refusals and the reload, through HTTP.
+
+### 18.17 Inactive routes (2026-10-06) - `0026_route_active.sql`
+
+A route can be marked inactive. It is kept whole: stops, stop orders, trips and
+map line. GIMS still answers a lookup of it by its id, but leaves it out of
+every list. A route that runs only for live buses and waybills, or that is
+suspended for a while, stays reachable by apps that already hold its id, and
+nobody finds it by browsing.
+
+**The column.** `gtfs_route.active boolean NOT NULL DEFAULT true`. It changes
+through a draft like any other route field: `route/update` with `{"active":
+false}` (or `true`), anything but a boolean is refused. It is reviewed,
+committed by someone else and audited, and the commit bumps the feed's version,
+so GIMS picks it up on its next poll. The route detail and the routes list carry
+`active`. `GET /feeds/{g}/routes?active=false` lists only the inactive routes
+(`true` only the active ones). The stop detail's routes carry it too.
+
+**GIMS.** Only for a feed GIMS serves from these tables (`data_source = 'db'`):
+for a preprocessed feed the routes come from the nightly build, which has no
+such flag. The dashboard disables the switch there. GIMS reads the column with
+`to_jsonb`, so a database without `0026` serves every route as active instead
+of failing to load the feed. An inactive route stays in `routes_by_gtfs` and in
+its route data's `mappings` and `by_route`, and is left out of `by_stop`. Every
+stop-based list starts from `by_stop`, so leaving it out there covers them all.
+
+| Leaves it out (lists) | Still answers (lookups by id) |
+|---|---|
+| `GET /routes/{g}`, `GET /routes/{g}/fuzzy/{q}` | `GET /route/{g}/{id}`, with `"isActive": false` |
+| `GET /route-stop-mapping/{g}/stop/{code}` (and across a cluster), `POST /getAllRouteStopMappingsByStopCodes` | `POST /getRoutesByIds/{g}`, `POST /getAllRoutesByIds` |
+| `GET /cluster/{g}/routes/{from}/{to}`, `GET /cluster/{g}/destinations/{code}` | `GET /route-stop-mapping/{g}/route/{code}` (and `/draw`), `POST /getAllRouteStopMappingsByRouteCodes` |
+| `GET /stops/{g}` and its fuzzy search, for a stop no active route serves | `GET /stop/{g}/{code}`, that stop too |
+| `GET /example-trip-map`, `GET /cached-data` | `GET /example-trip/{g}/{route}`, `GET /trip/{id}`, the schedules |
+
+`isActive` is sent only when it is false, so an active route's JSON is what it
+always was, and the field defaults to true for Nandi's data and older
+snapshots. A stop only inactive routes serve still answers `/stop` with its
+mapping on one of them. Making a route inactive or active again changes the
+feed's data hash, so `/version/{g}` moves. Stations are listed as before,
+whatever routes their platforms have.
+
+**The zips.** The full download, `GET /feeds/{g}/gtfs.zip` and `gtfs_feed
+export --full`, keeps every route. An inactive one is marked `route_active = 0`,
+an extension column of `routes.txt` (`spec.rs`) that an active route leaves
+empty. The column appears only when some route is inactive. A seed or reload of
+such a zip writes the routes inactive again, so reloading a feed from its own
+download gives it back as it was. The published zip, `GET
+/feeds/{g}/gtfs.zip?as=published` and `gtfs_feed export` without `--full` (what
+nandi's `build_from_exporter.py` runs), leaves out, through `feed_io::published`:
+
+- the inactive routes, with their stop orders, timings and trips;
+- every record that names one of them or one of their trips, found through the
+  spec's references: fare rules, attributions, route networks and transfers;
+- the shapes only their trips drew.
+
+Their stops stay. The published download says how many routes it left out in
+`X-Inactive-Routes-Left-Out`. **nandi's generator path does not go through
+this.** Until chennai_bus's trips are in the tables, `release_from_db.sh`
+builds from `export_mapping.sql`, which selects routes `NOT r.deleted` only. It
+needs `AND r.active` too, or the published GTFS keeps inactive routes.
+
+**A reload from another zip.** A zip that does not mark a route makes it active.
+The reload report's `reactivated` lists the routes that were inactive and that
+the zip makes active again, and the dashboard says so before the second
+confirmation.
+
+**A missing migration.** An editor query that names a column or table the
+database does not have (SQLSTATE `42703` / `42P01`) answers 500
+`schema_behind`, "the editor database is missing a migration this version
+needs", instead of `database error`. Inside a draft it is not blamed on the
+change. The `0025` outage on master, a background map line failing on a CHECK
+constraint, was the case that called for this (it was a constraint, so it still
+reads `database error`).
+
+**Dashboard.** The route editor has an "Active: listed for passengers" switch,
+which is part of undo and redo. A draft that changes it says so on the route's
+page, and the review page shows the change as a `Status` row. An inactive route's
+page says what that means. Search results add ", inactive", and the stop page
+says which of its routes are inactive. The home panel lists a feed's inactive
+routes, which no search would surface otherwise. The feed page offers the
+download "as published" beside the full one.
+
+Tests: `tests/gtfs_route_inactive_flow.rs` covers every list and lookup above
+through GIMS, and the route listed again after a reload.
+`tests/editor_route_inactive_flow.rs` covers the draft, the list filter, both
+zips and the reloads. Unit tests cover `feed_io::published`,
+`GTFSRouteData::without_routes`, `isActive` and `schema_behind`.
+`dev/ui_smoke.mjs --route-active` runs the dashboard flow against the mock.
 
 ## 19. Scripted writes without a replay per change (2026-09-30)
 

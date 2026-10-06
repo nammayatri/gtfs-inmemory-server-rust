@@ -794,9 +794,12 @@ impl GtfsDbSource {
             feed.try_get::<i32, _>("default_dwell_s").map_err(db_err)?,
         );
 
+        // `active` through to_jsonb: every route is active on a database that
+        // does not have the column yet (0026), so serving never waits on it
         let route_rows = sqlx::query(
-            "SELECT route_id, short_name, long_name, route_type, color, encoded_polyline, agency_id
-             FROM gtfs_route WHERE gtfs_id = $1 AND NOT deleted",
+            "SELECT route_id, short_name, long_name, route_type, color, encoded_polyline, agency_id,
+                    COALESCE((to_jsonb(r) ->> 'active')::boolean, true) AS active
+             FROM gtfs_route r WHERE gtfs_id = $1 AND NOT deleted",
         )
         .bind(gtfs_id)
         .fetch_all(&self.pool)
@@ -1078,6 +1081,7 @@ impl GtfsDbSource {
                 service_tier_type: None,
                 encoded_polyline: None,
                 route_tag: None,
+                is_active: r.try_get("active").map_err(db_err)?,
             });
             out.patterns.push(NandiPatternDetails {
                 id: overlay.pattern_id.clone(),
@@ -1372,6 +1376,7 @@ impl GtfsDbSource {
                 service_tier_type: None,
                 encoded_polyline: None,
                 route_tag: None,
+                is_active: r.try_get("active").map_err(db_err)?,
             });
         }
         out.trips = Some(Arc::new(index));

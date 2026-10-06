@@ -80,6 +80,41 @@ impl From<sqlx::Error> for EditorError {
         }
         // The message is logged, never returned: it can carry SQL and values.
         tracing::error!(tag = "[GTFS EDITOR DB]", error = %e);
+        if is_schema_behind(&e) {
+            return EditorError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "schema_behind",
+                "the editor database is missing a migration this version needs: \
+                 apply the newest db/gtfs_editor migrations",
+            );
+        }
         EditorError::internal("database error")
+    }
+}
+
+/// A column or table this version reads that the database does not have: an
+/// image deployed before its migration was applied.
+pub fn is_schema_behind(e: &sqlx::Error) -> bool {
+    matches!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("42703") | Some("42P01")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::feed_lock::tests::db_error;
+
+    #[test]
+    fn a_missing_column_says_a_migration_is_missing() {
+        let e: EditorError = db_error("42703", "column \"active\" does not exist").into();
+        assert_eq!(e.code, "schema_behind");
+        assert!(!e.message.contains("active"), "{}", e.message);
+        let e: EditorError = db_error("42P01", "relation \"x\" does not exist").into();
+        assert_eq!(e.code, "schema_behind");
+        let e: EditorError = db_error("23505", "duplicate key").into();
+        assert_eq!(e.code, "internal");
+        assert_eq!(e.message, "database error");
     }
 }

@@ -48,9 +48,10 @@ export async function showFeed() {
       h("dt", "Default timing"), h("dd", `${config.default_run_s} s a hop, ${config.default_dwell_s} s at a stop`)),
     h("section.feed-section",
       h("h2", "The feed's GTFS"),
-      h("p.hint", "The zip the tables give: every file of the reference the feed has, as passengers' apps would read it."),
+      h("p.hint", "The zip the tables give: every file of the reference the feed has. It keeps inactive routes, marked route_active = 0, so reloading it gives them back as they were. The published zip, the one passengers' apps read, leaves them and their trips out."),
       h("div.btn-row",
         h("a.btn.secondary", { href: `${API_BASE}feeds/${g}/gtfs.zip`, download: `${state.feedId}.gtfs.zip`, id: "download-zip" }, "Download the GTFS zip"),
+        h("a.btn.secondary", { href: `${API_BASE}feeds/${g}/gtfs.zip?as=published`, download: `${state.feedId}.published.gtfs.zip`, id: "download-published-zip" }, "Download as published"),
         h("a.btn.secondary", { href: "#/files" }, "Browse the files"))),
     h("section.feed-section",
       h("h2", "Feed report"),
@@ -107,6 +108,7 @@ function importForm(box) {
     }
     clear(out,
       replacedView(res.replaced),
+      reactivatedView(res.reactivated),
       seedReport(res),
       res.confirm_token
         ? h("div.btn-row", h("button.btn.danger", { type: "button", id: "reload-confirm", on: { click: () => reloadDo(res) } }, `Reload ${state.feedId}…`))
@@ -222,6 +224,17 @@ function replacedWords(replaced) {
   const rest = Object.entries(r).filter(([t]) => !TABLE_WORDS[t]).reduce((n, [, v]) => n + v, 0);
   if (rest) named.push(plural(rest, "row") + " of other files");
   return named.length ? named.join(", ") : "nothing (the feed is empty)";
+}
+
+// Inactive routes (docs section 18.17) a zip that does not mark them would
+// list again: any zip but this feed's own download.
+function reactivatedView(ids) {
+  if (!ids || !ids.length) return null;
+  const shown = ids.slice(0, 12);
+  return h("p.notice.warning", { id: "reload-reactivated" },
+    h("strong", `${plural(ids.length, "inactive route")} would be active again: `),
+    shown.join(", "), ids.length > shown.length ? ` and ${ids.length - shown.length} more` : "",
+    ". This zip does not mark them inactive. Reload from the feed's own download to keep them inactive, or make them inactive again afterwards.");
 }
 
 function replacedView(replaced) {

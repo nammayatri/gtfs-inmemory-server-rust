@@ -254,6 +254,7 @@ const KEY = {
 const FIELD_WORDS = {
   platform_code: "platform label", description: "description", cluster_id: "cluster", regional_name: "Tamil name", hindi_name: "Hindi name",
   short_name: "route number", long_name: "route name", color: "colour", text_color: "text colour", encoded_polyline: "map line", polyline_source: null,
+  active: "status (active or inactive)",
 };
 const stopLink = (id, words) => h("a", { href: `#/stop/${enc(id)}` }, words || id);
 

@@ -777,7 +777,8 @@ function routeCreateDiff(ch, cs) {
 
 function routeDiff(ch) {
   const b = ch.before || {}, a = ch.after || {};
-  const rows = fieldRows(b, a, [["short_name", "Route number"], ["long_name", "Route name"], ["color", "Colour"]]).concat(gtfsRows(b, a, ROUTE_GTFS_DIFF));
+  const status = (v) => (v === false ? "Inactive: in no list, answered by its id" : "Active: listed");
+  const rows = fieldRows(b, a, [["short_name", "Route number"], ["long_name", "Route name"], ["color", "Colour"], ["active", "Status", status]]).concat(gtfsRows(b, a, ROUTE_GTFS_DIFF));
   const lineChanged = a.encoded_polyline && a.encoded_polyline !== b.encoded_polyline;
   if (lineChanged) rows.push(h("tr", h("th", "Map line"), h("td.before", b.encoded_polyline ? "saved line" : "none"), h("td.after", `new line (${a.polyline_source || "source unknown"})`)));
   const table = h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows));

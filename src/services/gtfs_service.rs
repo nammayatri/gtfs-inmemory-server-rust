@@ -1413,6 +1413,7 @@ impl GTFSService {
                 service_tier_type,
                 encoded_polyline: None,
                 route_tag: None,
+                is_active: route.is_active,
             };
             routes_by_gtfs
                 .entry(gtfs_id.to_string())
@@ -1802,6 +1803,14 @@ impl GTFSService {
                 .unwrap_or_else(|| Arc::from("UNKNOWN"));
             let route_code_arc: Arc<str> = Arc::from(route_code);
             let fare_stage_feed = fare_stage_feeds.contains(gtfs_id);
+            // An inactive route (docs/gtfs-editor.md section 18.17) keeps its
+            // mappings, for a lookup by its code, but is in no stop's list:
+            // the routes at a stop, between two stops, through a cluster, and
+            // the stops list all start from `by_stop`.
+            let listed = routes_by_gtfs
+                .get(gtfs_id)
+                .and_then(|r| r.get(route_code))
+                .is_none_or(|route| route.is_active);
 
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
             let mut visited_mapping: HashSet<String> = HashSet::new();
@@ -1909,11 +1918,13 @@ impl GTFSService {
                     .entry(route_code.to_string())
                     .or_default()
                     .push(mapping_idx);
-                route_data
-                    .by_stop
-                    .entry(stop.code.clone())
-                    .or_default()
-                    .push(mapping_idx);
+                if listed {
+                    route_data
+                        .by_stop
+                        .entry(stop.code.clone())
+                        .or_default()
+                        .push(mapping_idx);
+                }
             }
         }
         route_data_by_gtfs
@@ -2932,11 +2943,13 @@ impl GTFSService {
             .ok_or_else(|| AppError::NotFound("Route not found".to_string()))
     }
 
+    /// The feed's routes, every active one: an inactive route is answered by
+    /// [`Self::get_route`] and [`Self::get_routes_by_ids`] only.
     pub async fn get_routes(&self, gtfs_id: &str) -> AppResult<Vec<NandiRoutesRes>> {
         let data = self.data.load_full();
         data.routes_by_gtfs
             .get(clean_identifier(gtfs_id).as_str())
-            .map(|r| r.values().cloned().collect())
+            .map(|r| r.values().filter(|r| r.is_active).cloned().collect())
             .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
@@ -3685,9 +3698,27 @@ impl GTFSService {
             .and_then(|route_data| {
                 route_data
                     .by_stop
-                    .get(&stop_code)?
-                    .first()
+                    .get(&stop_code)
+                    .and_then(|idx| idx.first())
                     .and_then(|&i| route_data.mappings.get(i).cloned())
+                    // a stop only inactive routes serve is in no stop's list,
+                    // but a lookup of it still reads its mapping on them
+                    .or_else(|| {
+                        data.routes_by_gtfs
+                            .get(&gtfs_id)?
+                            .iter()
+                            .filter(|(_, r)| !r.is_active)
+                            .filter_map(|(code, _)| {
+                                route_data
+                                    .by_route
+                                    .get(code)?
+                                    .iter()
+                                    .filter_map(|&i| route_data.mappings.get(i))
+                                    .find(|m| *m.stop_code == *stop_code)
+                            })
+                            .min_by(|a, b| a.route_code.cmp(&b.route_code))
+                            .cloned()
+                    })
             });
 
         Ok((stop, first_mapping))
@@ -4119,8 +4150,32 @@ impl GTFSService {
     /// endpoint can serve bytes directly without lock contention or cloning.
     async fn update_cached_data_bytes(&self) {
         let data = self.data.load_full();
+        // a dump is a list: inactive routes are left out of it
+        let route_data_by_gtfs = data
+            .route_data_by_gtfs
+            .iter()
+            .map(|(gtfs_id, route_data)| {
+                let inactive: HashSet<&str> = data
+                    .routes_by_gtfs
+                    .get(gtfs_id)
+                    .map(|routes| {
+                        routes
+                            .iter()
+                            .filter(|(_, r)| !r.is_active)
+                            .map(|(code, _)| code.as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let listed = if inactive.is_empty() {
+                    route_data.clone()
+                } else {
+                    route_data.without_routes(&inactive)
+                };
+                (gtfs_id.clone(), listed)
+            })
+            .collect();
         let response = CachedDataResponse {
-            route_data_by_gtfs: data.route_data_by_gtfs.clone(),
+            route_data_by_gtfs,
             stops_by_gtfs: data.stops_by_gtfs.clone(),
             stop_geojsons_by_gtfs: data.stop_geojsons_by_gtfs.clone(),
         };
@@ -4283,9 +4338,17 @@ impl GTFSService {
         Some(trips.trip(trip_id))
     }
 
+    /// Every listed route's example trip: an inactive route's is answered by
+    /// [`Self::get_example_trip`] only.
     pub async fn get_route_example_trip_map(&self) -> HashMap<String, HashMap<String, String>> {
         let data = self.data.load_full();
-        data.route_example_trip_by_gtfs.clone()
+        let mut map = data.route_example_trip_by_gtfs.clone();
+        for (gtfs_id, trips) in map.iter_mut() {
+            if let Some(routes) = data.routes_by_gtfs.get(gtfs_id) {
+                trips.retain(|code, _| routes.get(code).is_none_or(|r| r.is_active));
+            }
+        }
+        map
     }
 
     // GraphQL query execution
