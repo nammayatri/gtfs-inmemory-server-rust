@@ -1038,6 +1038,11 @@ accepts, and what the row becomes:
   pointing at the `stops` file (it carries the position a new stop needs).
 - A blank cell still means "not given": it leaves that field as it is on an
   `update`, rather than clearing it.
+- A `stops` upload's `update` and `delete` rows store the stop's live row as the
+  change's `before` (a dry run does not read it), as a single change does, so the
+  review shows what they replace and how far a stop moves. A `create` has none,
+  and neither has a stop made in the same draft. A draft uploaded before this
+  has no `before` on those rows; upload the file again.
 
 Response (both modes): `{dry_run, summary: {rows, ok, warnings, errors, changes},
 rows: [{row, status: ok|warning|error, messages: [{code, message}], change:

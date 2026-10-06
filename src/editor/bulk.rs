@@ -470,6 +470,7 @@ async fn plan_stops(
     g: &str,
     rows: &[Value],
     draft: &DraftView,
+    with_before: bool,
 ) -> EditorResult<Plan> {
     let mut plan = Plan::new(rows.len());
     let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
@@ -753,6 +754,23 @@ async fn plan_stops(
             base,
         });
         plan.rows[i].change = Some(plan.changes.len() - 1);
+    }
+    if with_before {
+        // `before` as a single change snapshots it, so the review shows what an
+        // update or a delete replaces; a create has none, and a stop made in
+        // this draft has no live row
+        let ids: Vec<String> = plan
+            .changes
+            .iter()
+            .filter(|c| c.op != "create")
+            .filter_map(|c| c.key.clone())
+            .collect();
+        let mut read = service::stop_rows(conn, g, &ids).await?;
+        for c in plan.changes.iter_mut().filter(|c| c.op != "create") {
+            if let Some(row) = c.key.as_deref().and_then(|k| read.remove(k)) {
+                c.before = row;
+            }
+        }
     }
     Ok(plan)
 }
@@ -3436,7 +3454,7 @@ async fn plan_kind(
 ) -> EditorResult<Plan> {
     let (rows, with_before) = (&req.rows, !req.dry_run);
     Ok(match kind {
-        Kind::Stops => plan_stops(conn, g, rows, draft).await?,
+        Kind::Stops => plan_stops(conn, g, rows, draft, with_before).await?,
         Kind::Routes => plan_routes(conn, g, rows, draft).await?,
         Kind::RouteStops => plan_route_stops(conn, g, rows, draft, with_before).await?,
         Kind::StopUpdates => {
