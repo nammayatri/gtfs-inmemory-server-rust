@@ -6,6 +6,7 @@
 //   node dev/ui_smoke.mjs --station-merge    # only the merge-two-stations screen
 //   node dev/ui_smoke.mjs --feed-access      # only who may work on which feed
 //   node dev/ui_smoke.mjs --gps-trips        # only a route's trips from GPS on a day
+//   node dev/ui_smoke.mjs --route-active     # only making a route inactive and active again
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -1543,6 +1544,104 @@ async function gpsTripsFlow() {
   await shot("gt-01-gps-trips");
   await click("Hide trips");
   await waitFor(`!document.querySelector(".gps-trips-table")`, "the trips hidden");
+}
+
+// An inactive route (docs section 18.17): unticked in the route editor, pending
+// on its page, a status change on the review page, committed; then listed on
+// the home panel, marked in search and on its page; and ticked active again.
+async function routeActiveFlow() {
+  const routes = (await api("feeds/chennai_bus/routes?limit=30")).items
+    .filter((r) => r.stop_count >= 3 && r.active !== false && (r.short_name || "").trim());
+  if (!check(routes.length > 0, "a route to make inactive")) return;
+  const route = routes[0];
+  await go(`#/route/${route.route_id}`);
+  await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
+  check(!(await has("#panel [data-route-active]")), "an active route's page says nothing about it");
+  await click("Edit name, colour and map line");
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Inactive route");
+  await waitFor(`!!document.getElementById("route-active")`, "the Active switch");
+  check(await evaluate(`document.getElementById("route-active").checked`), "an active route starts ticked");
+  check((await text("#route-active-hint")).includes("leaves it out of every list"), "the hint says what inactive means");
+  await evaluate(`document.getElementById("route-active").click()`);
+  await shot("ra-01-unticked");
+  await click("Add to draft", ".sticky-actions");
+  await sleep(800);
+  const draftId = await activeDraftId();
+  const change = ((await api(`change-sets/${draftId}`)).changes || [])
+    .find((c) => c.entity === "route" && c.entity_key === route.route_id);
+  check(!!change && change.after.active === false && Object.keys(change.after).length === 1,
+    `the draft holds only active: false (${JSON.stringify(change && change.after)})`);
+  await waitFor(`!!document.querySelector('#panel [data-route-active="false"]')`, "the pending notice on the route's page");
+  check((await text('#panel [data-route-active="false"]')).includes("The draft makes this route inactive"), "the route's page says the draft makes it inactive");
+  check((await text("#panel")).includes("status (active or inactive)"), "and lists the status among what the draft changes");
+
+  await go(`#/drafts/${draftId}`);
+  await waitFor(`document.body.innerText.includes("Inactive: in no list, answered by its id")`, "the status change on the review page");
+  await shot("ra-02-review");
+
+  await apiSend("POST", `change-sets/${draftId}/submit`);
+  const approved = await apiSend("POST", `change-sets/${draftId}/approve`, { self_approve: true });
+  const committed = await apiSend("POST", `change-sets/${draftId}/commit`);
+  check(approved.status === 200 && committed.status === 200, `the draft commits (${approved.status}, ${committed.status})`);
+  const listed = (await api("feeds/chennai_bus/routes?active=false&limit=50")).items.map((r) => r.route_id);
+  check(listed.includes(route.route_id), "the routes list gives it with active=false");
+  await reloadPage();
+  await waitFor(`!document.getElementById("app").hidden`, "the app after the commit");
+  await go("#/");
+  await waitFor(`document.getElementById("panel").innerText.includes("Inactive routes")`, "inactive routes on the home panel");
+  check(await evaluate(`[...document.querySelectorAll("#panel a")].some((a) => a.getAttribute("href") === "#/route/${encodeURIComponent(route.route_id)}")`),
+    "the home panel links the inactive route");
+  await shot("ra-03-home");
+  // by its id: a route number can be shorter than the search box asks for
+  await type("#search-input", route.route_id);
+  await waitFor(`document.querySelectorAll(".search-item").length > 0`, "search results");
+  await sleep(500);
+  const subs = await evaluate(`[...document.querySelectorAll(".search-item .sub")].map((e) => e.textContent)`);
+  check(subs.some((t) => t.startsWith(`Route id ${route.route_id},`) && t.endsWith(", inactive")), `search marks it inactive: ${JSON.stringify(subs.slice(0, 4))}`);
+  await type("#search-input", "");
+  await go(`#/route/${route.route_id}`);
+  await waitFor(`!!document.querySelector('#panel [data-route-active="false"]')`, "the inactive notice on its page");
+  check((await text('#panel [data-route-active="false"]')).includes("Asked for by its id, it still answers"), "its page says what inactive means");
+  await shot("ra-04-route");
+
+  // ticked again: active, in a new draft
+  await click("Edit name, colour and map line");
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Active again");
+  await waitFor(`!!document.getElementById("route-active")`, "the Active switch again");
+  check(!(await evaluate(`document.getElementById("route-active").checked`)), "an inactive route starts unticked");
+  await evaluate(`document.getElementById("route-active").click()`);
+  await click("Add to draft", ".sticky-actions");
+  await sleep(800);
+  const again = ((await api(`change-sets/${await activeDraftId()}`)).changes || [])
+    .find((c) => c.entity === "route" && c.entity_key === route.route_id);
+  check(!!again && again.after.active === true, `the new draft makes it active (${JSON.stringify(again && again.after)})`);
+  await waitFor(`!!document.querySelector('#panel [data-route-active="true"]')`, "the pending notice for active again");
+}
+
+// ---- only making a route inactive
+if (process.argv.includes("--route-active")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await routeActiveFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
 }
 
 // ---- only a route's trips from GPS

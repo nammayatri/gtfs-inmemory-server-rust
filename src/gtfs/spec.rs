@@ -159,7 +159,8 @@ pub struct FieldSpec {
     /// What it may point at. More than one target means any of them.
     pub refs: &'static [Ref],
     /// Not in the reference: a column a feed of ours carries and GIMS reads
-    /// (`stops.info_json`, `feed_info.feed_id`).
+    /// (`stops.info_json`, `feed_info.feed_id`), or the editor's own
+    /// (`routes.route_active`).
     pub extension: bool,
 }
 
@@ -392,6 +393,12 @@ pub static FILES: &[FileSpec] = &[
                 Id,
                 Cond("forbidden when route_networks.txt exists"),
                 &[],
+            ),
+            // the editor's inactive route (docs/gtfs-editor.md section 18.17),
+            // in the full download only: the published zip leaves the route out
+            ext(
+                "route_active",
+                Enum(&[(0, "inactive: in no list, found only by its id"), (1, "active")]),
             ),
         ],
     },

@@ -68,6 +68,7 @@ fn write_preprocessed(dir: &Path) {
                 service_tier_type: None,
                 encoded_polyline: None,
                 route_tag: None,
+                is_active: true,
             },
             NandiRoutesRes {
                 id: format!("{FEED}:R2"),
@@ -89,6 +90,7 @@ fn write_preprocessed(dir: &Path) {
                 service_tier_type: None,
                 encoded_polyline: None,
                 route_tag: None,
+                is_active: true,
             },
         ],
     )]);

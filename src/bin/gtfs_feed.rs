@@ -16,8 +16,10 @@
 //!     drafted by EMAIL: its records and calendars first, its trips once
 //!     those are committed (run it again). Stops, routes and the feed's stop
 //!     orders are compared, never written. Without --write it is a dry run.
-//! gtfs_feed export --db URL --gtfs-id G --out FILE
-//!     the feed's GTFS zip, from the tables.
+//! gtfs_feed export --db URL --gtfs-id G --out FILE [--full]
+//!     the feed's GTFS zip, from the tables: the one it publishes, without
+//!     its inactive routes; with --full, every route, an inactive one marked
+//!     route_active = 0 (docs/gtfs-editor.md section 18.17).
 //! gtfs_feed validate (--zip Z | --db URL --gtfs-id G) [--today YYYY-MM-DD] [--show N]
 //!     the feed report: what the zip, or the feed as its tables hold it,
 //!     breaks of the GTFS reference, counted by kind.
@@ -44,7 +46,7 @@ fn usage() -> ExitCode {
         "usage: gtfs_feed roundtrip --zip Z [--gtfs-id G] [--show N]\n       \
          gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]\n       \
          gtfs_feed draft-import --db URL --zip Z --as EMAIL [--gtfs-id G] [--files F,F] [--write]\n       \
-         gtfs_feed export --db URL --gtfs-id G --out FILE\n       \
+         gtfs_feed export --db URL --gtfs-id G --out FILE [--full]\n       \
          gtfs_feed validate (--zip Z | --db URL --gtfs-id G) [--today D] [--show N]\n       \
          gtfs_feed compare --a Z --b Z [--files F,F] [--show N]"
     );
@@ -212,7 +214,7 @@ async fn export(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let (m, findings) = match feed_io::load_model(&mut conn, &g).await {
+    let (mut m, findings) = match feed_io::load_model(&mut conn, &g).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}: {}", e.code, e.message);
@@ -221,6 +223,16 @@ async fn export(args: &[String]) -> ExitCode {
     };
     for f in &findings {
         eprintln!("{:?} {} {}", f.level, f.code, f.message);
+    }
+    if !args.iter().any(|a| a == "--full") {
+        let left_out = feed_io::published(&mut m);
+        if !left_out.is_empty() {
+            println!(
+                "{} inactive route(s) left out: {}",
+                left_out.len(),
+                left_out.join(", ")
+            );
+        }
     }
     let bytes = match write::zip_bytes(&write::to_raw(&m)) {
         Ok(b) => b,

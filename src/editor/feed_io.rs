@@ -29,7 +29,7 @@ use crate::services::gtfs_db_source::{
 use actix_web::http::StatusCode;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, Row as _};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// `stops.txt` field -> `gtfs_stop` column (every field but `stop_id`).
 pub const STOP_COLUMNS: &[(&str, &str)] = &[
@@ -66,6 +66,16 @@ pub const ROUTE_COLUMNS: &[(&str, &str)] = &[
     ("continuous_drop_off", "continuous_drop_off"),
     ("network_id", "network_id"),
 ];
+
+/// The column of the full download that marks an inactive route `0`
+/// (section 18.17); `gtfs_route.active`, which is a boolean, so not in
+/// [`ROUTE_COLUMNS`]. An active route leaves it empty.
+pub const ROUTE_ACTIVE: &str = "route_active";
+
+/// Whether a route's GTFS values mark it inactive.
+pub fn route_inactive(values: &Row) -> bool {
+    values.get(ROUTE_ACTIVE).and_then(Value::as_i64) == Some(0)
+}
 
 /// `trips.txt` field -> `gtfs_trip` column (its own fields; the ids and the
 /// timetable are columns of their own).
@@ -236,7 +246,11 @@ pub async fn load_model(
     .await?
     {
         let route_id = text(&r, "route_id");
-        let values = fields_of(routes_spec, &r, ROUTE_COLUMNS, &route_id, &mut findings);
+        let mut values = fields_of(routes_spec, &r, ROUTE_COLUMNS, &route_id, &mut findings);
+        // the full download marks an inactive route; [`published`] leaves it out
+        if r["active"] == Value::Bool(false) {
+            values.insert(ROUTE_ACTIVE, json!(0));
+        }
         m.routes.push(Route {
             route_id,
             values,
@@ -488,6 +502,83 @@ pub async fn load_model(
         }
     }
     Ok((m, findings))
+}
+
+/// The zip a feed publishes (section 18.17): the model without its inactive
+/// routes and what only they have - their stop orders, timings and trips, the
+/// records that name one of them or one of their trips, and the shapes only
+/// their trips drew. Their stops stay. Returns the routes it left out.
+pub fn published(m: &mut FeedModel) -> Vec<String> {
+    let gone: HashSet<String> = m
+        .routes
+        .iter()
+        .filter(|r| route_inactive(&r.values))
+        .map(|r| r.route_id.clone())
+        .collect();
+    for r in &mut m.routes {
+        r.values.remove(ROUTE_ACTIVE);
+    }
+    if gone.is_empty() {
+        return Vec::new();
+    }
+    let shape_of = |t: &Trip| {
+        t.values
+            .get("shape_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let (dropped, kept): (Vec<&Trip>, Vec<&Trip>) =
+        m.trips.iter().partition(|t| gone.contains(&t.route_id));
+    let trips_gone: HashSet<String> = dropped.iter().map(|t| t.trip_id.clone()).collect();
+    let shapes_kept: HashSet<String> = kept.iter().filter_map(|t| shape_of(t)).collect();
+    let shapes_gone: HashSet<String> = dropped
+        .iter()
+        .filter_map(|t| shape_of(t))
+        .filter(|s| !shapes_kept.contains(s))
+        .collect();
+
+    m.routes.retain(|r| !gone.contains(&r.route_id));
+    m.patterns.retain(|p| !gone.contains(&p.route_id));
+    m.profiles.retain(|p| !gone.contains(&p.route_id));
+    m.trips.retain(|t| !gone.contains(&t.route_id));
+    m.shapes.retain(|s| !shapes_gone.contains(&s.shape_id));
+    // a record naming a route or a trip that is gone would point at nothing
+    for fspec in spec::FILES {
+        let Some(records) = fspec.entity().and_then(|e| m.records.get_mut(e)) else {
+            continue;
+        };
+        let naming: Vec<(&str, &HashSet<String>)> = fspec
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let to = |file: &str, field: &str| {
+                    f.refs.iter().any(|r| r.file == file && r.field == field)
+                };
+                if to("routes.txt", "route_id") {
+                    Some((f.name, &gone))
+                } else if to("trips.txt", "trip_id") {
+                    Some((f.name, &trips_gone))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if naming.is_empty() {
+            continue;
+        }
+        records.retain(|rec| {
+            !naming.iter().any(|(field, ids)| {
+                rec.values
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| ids.contains(id))
+            })
+        });
+    }
+    m.records.retain(|_, records| !records.is_empty());
+    let mut gone: Vec<String> = gone.into_iter().collect();
+    gone.sort();
+    gone
 }
 
 /// What a seed wrote, for its audit row and its answer.
@@ -952,7 +1043,10 @@ pub async fn seed(
     .await?;
 
     // ---- routes (a trigger gives each its pattern 1), then the other stop
-    // orders, their rows and their timings
+    // orders, their rows and their timings. `active` is written only when the
+    // zip marks a route inactive (a full download's), so a zip without the
+    // column loads on a database that does not have it yet.
+    let any_inactive = m.routes.iter().any(|r| route_inactive(&r.values));
     let routes: Vec<Value> = m
         .routes
         .iter()
@@ -961,16 +1055,20 @@ pub async fn seed(
             pairs.push(("route_id", json!(r.route_id)));
             pairs.push(("sort_key", json!(r.sort_key)));
             pairs.push(("updated_by", json!(actor)));
+            if any_inactive {
+                pairs.push(("active", json!(!route_inactive(&r.values))));
+            }
             row_of(g, pairs)
         })
         .collect();
+    let mut route_extra = vec!["gtfs_id", "route_id", "sort_key", "updated_by"];
+    if any_inactive {
+        route_extra.push("active");
+    }
     insert_rows(
         conn,
         "gtfs_route",
-        &columns_of(
-            ROUTE_COLUMNS,
-            &["gtfs_id", "route_id", "sort_key", "updated_by"],
-        ),
+        &columns_of(ROUTE_COLUMNS, &route_extra),
         &routes,
         false,
     )
@@ -1278,6 +1376,10 @@ pub struct ImportReport {
     /// A reload ([`reload_zip`]): the rows the feed held, by table, that the
     /// zip replaces. None for a seed.
     pub replaced: Option<BTreeMap<String, u64>>,
+    /// A reload: the routes that were inactive (section 18.17) and that the
+    /// zip makes active again - any zip but the feed's full download, which
+    /// marks them.
+    pub reactivated: Vec<String>,
     /// What the zip breaks of the GTFS reference, as the feed report reads it:
     /// kept, as the import keeps what the feed ships.
     pub validation: crate::gtfs::validate::Report,
@@ -1396,6 +1498,7 @@ async fn load_zip(
         feed_version: None,
         stage_stops: 0,
         replaced: None,
+        reactivated: vec![],
         validation: crate::gtfs::validate::summarise(
             &crate::gtfs::validate::validate(&m, &chrono::Utc::now().date_naive().to_string()),
             5,
@@ -1423,6 +1526,23 @@ async fn load_zip(
             ));
         }
         refuse_open_drafts(&mut tx, &g).await?;
+        // read whether or not the database has the column yet
+        let inactive: Vec<String> = sqlx::query_scalar(
+            "SELECT route_id FROM gtfs_route r \
+             WHERE gtfs_id = $1 AND NOT deleted AND to_jsonb(r) ->> 'active' = 'false' \
+             ORDER BY route_id",
+        )
+        .bind(&g)
+        .fetch_all(&mut *tx)
+        .await?;
+        report.reactivated = inactive
+            .into_iter()
+            .filter(|id| {
+                m.routes
+                    .iter()
+                    .any(|r| &r.route_id == id && !route_inactive(&r.values))
+            })
+            .collect();
         report.replaced = Some(clear_feed_data(&mut tx, &g).await?);
     }
     let seeded = seed(&mut tx, &g, &m, &who.label).await?;
@@ -1458,6 +1578,7 @@ async fn load_zip(
             "feed_version": seeded.feed_version,
             "stage_stops": seeded.stage_stops,
             "replaced": report.replaced,
+            "reactivated": report.reactivated,
         }),
     )
     .await?;
@@ -1577,5 +1698,83 @@ mod tests {
             let e = check_gtfs_id(bad).unwrap_err();
             assert_eq!(e.code, "invalid_gtfs_id", "{bad}");
         }
+    }
+
+    /// A feed as its zip's files, read the way an import reads them.
+    fn feed_of(files: &[(&str, &str)]) -> (crate::gtfs::read::RawFeed, FeedModel) {
+        use crate::gtfs::model::BuildOptions;
+        use crate::gtfs::read::{parse_csv, RawFeed};
+        let mut raw = RawFeed::default();
+        for (name, text) in files {
+            raw.files
+                .insert(name.to_string(), parse_csv(text, name, &mut Vec::new()));
+        }
+        let m = FeedModel::from_raw(&raw, "t", BuildOptions::default()).0;
+        (raw, m)
+    }
+
+    #[test]
+    fn the_published_zip_leaves_out_an_inactive_route_and_what_only_it_has() {
+        use super::{published, route_inactive};
+        use crate::gtfs::{compare, write};
+        let (raw, mut m) = feed_of(&[
+            ("agency.txt", "agency_id,agency_name,agency_url,agency_timezone\nA,Bus,https://b.example,Asia/Kolkata"),
+            ("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\nP1,One,13.0,80.0\nP2,Two,13.1,80.1\nP3,Three,13.2,80.2"),
+            ("routes.txt", "route_id,agency_id,route_short_name,route_type,route_active\nR1,A,1,3,\nR2,A,2,3,0"),
+            ("trips.txt", "route_id,service_id,trip_id,shape_id\nR1,WK,T1,SH1\nR2,WK,T2,SH1\nR2,WK,T3,SH2"),
+            ("stop_times.txt", "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                T1,06:00:00,06:00:00,P1,1\nT1,06:05:00,06:05:00,P2,2\n\
+                T2,07:00:00,07:00:00,P1,1\nT2,07:05:00,07:05:00,P2,2\n\
+                T3,08:00:00,08:00:00,P2,1\nT3,08:05:00,08:05:00,P3,2"),
+            ("calendar.txt", "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nWK,1,1,1,1,1,0,0,20260101,20261231"),
+            ("shapes.txt", "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\nSH1,13.0,80.0,1\nSH1,13.1,80.1,2\nSH2,13.1,80.1,1\nSH2,13.2,80.2,2"),
+            ("fare_attributes.txt", "fare_id,price,currency_type,payment_method,transfers\nF1,10,INR,0,0"),
+            ("fare_rules.txt", "fare_id,route_id\nF1,R1\nF1,R2"),
+            ("transfers.txt", "from_stop_id,to_stop_id,from_trip_id,to_trip_id,transfer_type\nP2,P2,T1,T3,1\nP1,P2,,,2"),
+        ]);
+        let inactive: Vec<&str> = m
+            .routes
+            .iter()
+            .filter(|r| route_inactive(&r.values))
+            .map(|r| r.route_id.as_str())
+            .collect();
+        assert_eq!(inactive, vec!["R2"]);
+        // the full form gives the zip back, the column too
+        let diffs = compare::compare(&raw, &write::to_raw(&m), &m.dropped);
+        assert!(diffs.is_empty(), "{diffs:?}");
+
+        assert_eq!(published(&mut m), vec!["R2".to_string()]);
+        let out = write::to_raw(&m);
+        let rows = |file: &str, field: &str| -> Vec<String> {
+            let t = out.table(file).unwrap_or_else(|| panic!("no {file}"));
+            t.rows
+                .iter()
+                .map(|r| t.cell(r, field).to_string())
+                .collect()
+        };
+        assert_eq!(rows("routes.txt", "route_id"), vec!["R1"]);
+        assert!(
+            !out.table("routes.txt")
+                .unwrap()
+                .header
+                .iter()
+                .any(|h| h == "route_active"),
+            "the published zip has no column of the editor's own"
+        );
+        assert_eq!(rows("trips.txt", "trip_id"), vec!["T1"]);
+        let mut times = rows("stop_times.txt", "trip_id");
+        times.dedup();
+        assert_eq!(times, vec!["T1"]);
+        // SH1 is T1's too; SH2 was only T3's
+        let mut shapes = rows("shapes.txt", "shape_id");
+        shapes.dedup();
+        assert_eq!(shapes, vec!["SH1"]);
+        assert_eq!(rows("fare_rules.txt", "route_id"), vec!["R1"]);
+        assert_eq!(rows("transfers.txt", "from_stop_id"), vec!["P1"]);
+        // stops stay, P3 too
+        assert_eq!(rows("stops.txt", "stop_id"), vec!["P1", "P2", "P3"]);
+
+        // nothing inactive: nothing left out
+        assert!(published(&mut m).is_empty());
     }
 }

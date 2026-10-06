@@ -28,7 +28,7 @@ export function initSearch() {
   const groups = {
     Routes: {
       path: "routes", more: "Load more routes",
-      item: (r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops`, href: `#/route/${enc(r.route_id)}` }),
+      item: (r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops${r.active === false ? ", inactive" : ""}`, href: `#/route/${enc(r.route_id)}` }),
     },
     Stops: {
       path: "stops", more: "Load more stops",
@@ -163,6 +163,19 @@ export async function showHome() {
     clear(review, h("h2", "Stations to review"),
       h("p", `${plural(c.pending, "suggested station")} ${c.pending === 1 ? "is" : "are"} waiting for someone to check ${c.pending === 1 ? "it" : "them"}.`),
       h("div.btn-row", h("a.btn.secondary", { href: "#/stations" }, "Review stations")));
+  }).catch(() => {});
+  // routes GIMS lists for nobody (docs section 18.17): found here, not by browsing
+  const inactive = h("section.section", { hidden: true });
+  p.appendChild(inactive);
+  get(`feeds/${enc(state.feedId)}/routes?active=false&limit=20`).then((page) => {
+    if (!page.items.length) return;
+    inactive.hidden = false;
+    clear(inactive, h("h2", "Inactive routes"),
+      h("p", "Left out of every list GIMS gives and of the published GTFS zip; asked for by id, they still answer."),
+      h("ul.list", page.items.map((r) => h("li.list-item",
+        h("a", { href: `#/route/${enc(r.route_id)}` }, r.short_name || r.route_id),
+        h("span.sub", r.long_name || `Route id ${r.route_id}`)))),
+      page.next_cursor ? h("p.hint", "More are inactive than shown here; search for a route to open it.") : null);
   }).catch(() => {});
   const work = h("section.section", h("h2", "Drafts in progress"), h("p.empty", "Loading…"));
   p.appendChild(work);
@@ -328,7 +341,7 @@ export async function showStop(stopId) {
         h("span.key", r.short_name || r.route_id),
         h("a", { href: `#/route/${enc(r.route_id)}` }, r.long_name || `Route ${r.route_id}`),
         h("span.hint", `stop ${r.sequence}`),
-        h("span.sub", `${STOP_TYPE_LABEL[r.stop_type] || r.stop_type} in stage ${r.stage_no}, route id ${r.route_id}`)))) : h("p.empty", "No route uses this stop.")) : null,
+        h("span.sub", `${STOP_TYPE_LABEL[r.stop_type] || r.stop_type} in stage ${r.stage_no}, route id ${r.route_id}${r.active === false ? ", inactive: not listed for passengers" : ""}`)))) : h("p.empty", "No route uses this stop.")) : null,
     h("section.section.nearby-stops",
       h("h2", "Other stops within 60 m"),
       h("p.hint", "Two stops close together are often the two sides of the road: club them into a station. Merge them only if they are the same kerb entered twice."),
@@ -434,7 +447,7 @@ export async function showRoute(routeId, { preview } = {}) {
         h("p", drafted ? "You are looking at this route with your draft applied. It is not live: rows the draft adds, moves or changes are marked, and what is live is marked “live”." : "This is what is live now, without your draft."),
         drafted ? h("ul", [
           o.gone ? h("li", "The draft deletes this route.") : null,
-          o.changed.size ? h("li", `Changes its ${[...o.changed].filter((k) => k !== "polyline_source").map((k) => ({ short_name: "route number", long_name: "name", color: "colour", text_color: "text colour", encoded_polyline: "map line" }[k] || k)).join(", ")}.`) : null,
+          o.changed.size ? h("li", `Changes its ${[...o.changed].filter((k) => k !== "polyline_source").map((k) => ({ short_name: "route number", long_name: "name", color: "colour", text_color: "text colour", encoded_polyline: "map line", active: "status (active or inactive)" }[k] || k)).join(", ")}.`) : null,
           o.stops.length ? h("li", `Replaces its stop list: ${plural(diff.filter((d) => d.kind === "added").length, "stop")} added, ${removed.length} removed, ${diff.filter((d) => d.kind === "moved" || d.kind === "changed").length} moved or changed.`) : null,
           !o.stops.length && diff.some((d) => d.kind !== "same") ? h("li", "A merge in the draft switches some of its rows to the stop that stays.") : null,
           movedStops.size ? h("li", `${plural(movedStops.size, "stop")} on it ${movedStops.size === 1 ? "is" : "are"} moved, renamed or removed in the draft.`) : null].filter(Boolean)) : null,
@@ -443,6 +456,7 @@ export async function showRoute(routeId, { preview } = {}) {
             ? h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: false }) } }, "Show what is live now")
             : h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: true }) } }, "Show it with my draft"))) : null,
       !created && notInFeed ? h("p.notice", "This route is not in the published GTFS feed yet, so passengers do not see it. It appears in the live apps once the nightly GTFS build gives it trips from the MTC schedule.") : null,
+      !created ? inactiveNotice(r, drafted && o.changed.has("active") ? live : null) : null,
       h("dl.facts",
         h("dt", "Map line"), h("dd", r.encoded_polyline
           ? [drafted && o.changed.has("encoded_polyline") ? h("span.drafted-value", `New in the draft (${r.polyline_source || "source unknown"})`) : `Saved (${r.polyline_source || "source unknown"})`,
@@ -463,6 +477,23 @@ export async function showRoute(routeId, { preview } = {}) {
     live ? routeContext(live, { onReviews: (m) => { reviews = m; drawLadder(); } }) : null,
   );
   drawLadder();
+}
+
+// What an inactive route is (docs section 18.17), and what the draft does to
+// that when it changes it (`live`: the route as it is live).
+function inactiveNotice(r, live) {
+  const inactive = r.active === false;
+  if (live) {
+    return h("div.notice.draft", { "data-route-active": String(!inactive) },
+      h("p", h("strong", inactive ? "The draft makes this route inactive." : "The draft makes this route active again.")),
+      h("p", inactive
+        ? "Once it is committed, GIMS leaves the route out of every list: the route list, route search, the routes at a stop and the published GTFS zip. Asked for by its id, it still answers."
+        : "Once it is committed, the route is back in the route list, search, the routes at its stops and the published GTFS zip."));
+  }
+  if (!inactive) return null;
+  return h("div.notice", { "data-route-active": "false" },
+    h("p", h("strong", "Inactive. "), "GIMS leaves this route out of every list: the route list, route search, the routes at a stop or between two stops, and the published GTFS zip. Asked for by its id, it still answers, with its stops and trips."),
+    h("p", "To list it again, choose Edit name, colour and map line and tick Active."));
 }
 
 // An Indian service day as YYYY-MM-DD, `daysAgo` days before today.

@@ -385,7 +385,7 @@ pub async fn stop_detail(
     // is a metro short turn or express run, section 16): the stop is used there.
     // A call on another stop order than the route's stop list says which.
     let routes = sqlx::query(
-        "SELECT rs.route_id, r.short_name, r.long_name, rs.pattern_key, rs.sequence, rs.stop_type, rs.stage_no \
+        "SELECT rs.route_id, r.short_name, r.long_name, r.active, rs.pattern_key, rs.sequence, rs.stop_type, rs.stage_no \
          FROM gtfs_route_stop rs \
          JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
          WHERE rs.gtfs_id = $1 AND rs.stop_id = $2 ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
@@ -403,6 +403,7 @@ pub async fn stop_detail(
             "sequence": r.try_get::<i32, _>("sequence")?,
             "stop_type": r.try_get::<String, _>("stop_type")?,
             "stage_no": r.try_get::<i32, _>("stage_no")?,
+            "active": r.try_get::<bool, _>("active")?,
         });
         let pattern: i16 = r.try_get("pattern_key")?;
         if pattern != FIRST_PATTERN {
@@ -479,7 +480,7 @@ pub async fn stop_detail(
 const ROUTE_COLS: &str =
     "route_id, short_name, long_name, route_type, agency_id, color, text_color, \
      encoded_polyline, polyline_source, service_type, provenance::text AS provenance, deleted, \
-     row_version, updated_at, updated_by, schedule_source";
+     row_version, updated_at, updated_by, schedule_source, active";
 
 fn route_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -499,6 +500,8 @@ fn route_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
         "updated_by": r.try_get::<Option<String>, _>("updated_by")?,
         "schedule_source": r.try_get::<String, _>("schedule_source")?,
+        // false: kept, and answered by its id, but in no list GIMS gives
+        "active": r.try_get::<bool, _>("active")?,
     }))
 }
 
@@ -517,10 +520,13 @@ pub async fn route_row(
     Ok(row.as_ref().map(route_json).transpose()?)
 }
 
+/// A feed's live routes matching `q`; with `active`, only the active ones or
+/// only the inactive ones (section 18.17).
 pub async fn list_routes(
     state: &EditorState,
     gtfs_id: &str,
     q: Option<&str>,
+    active: Option<bool>,
     page: &Page,
 ) -> EditorResult<Value> {
     let q = q.map(str::trim).filter(|s| !s.is_empty());
@@ -532,6 +538,7 @@ pub async fn list_routes(
          FROM gtfs_route r \
          WHERE r.gtfs_id = $1 AND NOT r.deleted \
            AND ($2::text IS NULL OR r.route_id = $2 OR r.short_name ILIKE $3 OR r.long_name ILIKE $3) \
+           AND ($6::boolean IS NULL OR r.active = $6) \
          ORDER BY (r.route_id = $2 OR lower(r.short_name) = lower($2)) DESC NULLS LAST, \
                   r.short_name, r.route_id \
          LIMIT $4 OFFSET $5"
@@ -541,6 +548,7 @@ pub async fn list_routes(
     .bind(q.map(like_pattern))
     .bind(page.limit + 1)
     .bind(page.offset)
+    .bind(active)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -1324,7 +1332,8 @@ fn finding_json(change_id: Option<i64>, f: &Finding) -> Value {
 /// the error itself, 503 `try_again`, so the whole transaction is retried and
 /// the change is never blamed.
 fn db_failure(e: sqlx::Error) -> Result<Finding, EditorError> {
-    if is_transient(&e) {
+    // a missing migration is not the change's fault either
+    if is_transient(&e) || super::error::is_schema_behind(&e) {
         return Err(e.into());
     }
     Ok(db_finding(&e))
@@ -2246,9 +2255,12 @@ async fn route_update(
     let (has_poly, poly) = field(m, "encoded_polyline");
     let (has_src, src) = field(m, "polyline_source");
     let (has_schedule, schedule) = field(m, "schedule_source");
+    // in GIMS's lists or out of them (section 18.17); never null
+    let active = m.get("active").and_then(Value::as_bool);
     sqlx::query(
         "UPDATE gtfs_route SET \
             schedule_source = CASE WHEN $16 THEN $17 ELSE schedule_source END, \
+            active = COALESCE($18, active), \
             short_name = CASE WHEN $3 THEN $4 ELSE short_name END, \
             long_name = CASE WHEN $5 THEN $6 ELSE long_name END, \
             color = CASE WHEN $7 THEN upper($8) ELSE color END, \
@@ -2277,6 +2289,7 @@ async fn route_update(
     .bind(actor)
     .bind(has_schedule)
     .bind(schedule)
+    .bind(active)
     .execute(&mut *conn)
     .await?;
     route_gtfs_fields(conn, g, id, m, &before).await

@@ -1136,6 +1136,7 @@ pub fn check_payload(
                 "schedule_source",
                 "agency_id",
                 "route_type",
+                "active",
             ];
             // the rest of routes.txt, by its GTFS names (section 18)
             allowed.extend(super::records::ROUTE_GTFS_FIELDS);
@@ -1201,6 +1202,16 @@ pub fn check_payload(
                         "invalid_payload",
                         s,
                         format!("{what}: polyline_source is osrm, gps, manual or imported"),
+                    ));
+                }
+            }
+            // in GIMS's lists or only answered by its id (section 18.17)
+            if let Some(v) = m.get("active") {
+                if !v.is_boolean() {
+                    return Err(Finding::error(
+                        "invalid_payload",
+                        "active",
+                        format!("{what}: active is true or false"),
                     ));
                 }
             }
@@ -2007,6 +2018,15 @@ mod tests {
         assert!(
             check_payload("route", "update", "R", &json!({"encoded_polyline": "!!!"})).is_err()
         );
+        // in GIMS's lists or not (section 18.17): true or false, never null
+        assert!(check_payload("route", "update", "R", &json!({"active": false})).is_ok());
+        assert!(check_payload("route", "update", "R", &json!({"active": true})).is_ok());
+        for bad in [json!(null), json!("no"), json!(0)] {
+            assert!(
+                check_payload("route", "update", "R", &json!({ "active": bad })).is_err(),
+                "{bad}"
+            );
+        }
         assert!(check_payload(
             "route_stops",
             "replace",

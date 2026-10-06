@@ -467,26 +467,58 @@ pub async fn change_set_preview_file(
     ok(svc::preview_records(&st, &ctx, id, fspec, q.q.as_deref(), &page).await?)
 }
 
-/// A feed's whole GTFS as the zip it publishes, from the tables (section 18).
+#[derive(Deserialize)]
+pub struct GtfsZipQuery {
+    /// `published`: the zip the feed publishes, without its inactive routes.
+    /// Otherwise everything the tables hold, an inactive route marked
+    /// `route_active = 0`, which a reload takes back as it was (section 18.17).
+    #[serde(rename = "as")]
+    form: Option<String>,
+}
+
+/// A feed's whole GTFS as a zip, from the tables (section 18).
 pub async fn feed_gtfs_zip(
     req: HttpRequest,
     st: Data,
     path: web::Path<String>,
+    q: web::Query<GtfsZipQuery>,
 ) -> EditorResult<HttpResponse> {
     let g = path.into_inner();
     auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let published = match q.form.as_deref() {
+        None | Some("full") => false,
+        Some("published") => true,
+        Some(other) => {
+            return Err(EditorError::bad_request(
+                "invalid_query",
+                format!("as is full or published, not {other:?}"),
+            ))
+        }
+    };
     let mut conn = st.pool.acquire().await?;
-    let (m, findings) = feed_io::load_model(&mut conn, &g).await?;
+    let (mut m, findings) = feed_io::load_model(&mut conn, &g).await?;
+    let left_out = if published {
+        feed_io::published(&mut m).len()
+    } else {
+        0
+    };
     let bytes = gtfs_write::zip_bytes(&gtfs_write::to_raw(&m))
         .map_err(|e| EditorError::new(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", e))?;
+    let name = if published {
+        format!("{g}.published.gtfs.zip")
+    } else {
+        format!("{g}.gtfs.zip")
+    };
     Ok(HttpResponse::Ok()
         .content_type("application/zip")
         .insert_header((
             "Content-Disposition",
-            format!("attachment; filename=\"{g}.gtfs.zip\""),
+            format!("attachment; filename=\"{name}\""),
         ))
         // values the tables hold that the reference does not accept, left out
         .insert_header(("X-Export-Findings", findings.len().to_string()))
+        // inactive routes the published zip leaves out
+        .insert_header(("X-Inactive-Routes-Left-Out", left_out.to_string()))
         .body(bytes))
 }
 
@@ -915,6 +947,8 @@ pub async fn stop(
 #[derive(Deserialize)]
 pub struct RoutesQuery {
     q: Option<String>,
+    /// `false`: only the inactive routes; `true`: only the active ones.
+    active: Option<bool>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -927,7 +961,7 @@ pub async fn routes(
 ) -> EditorResult<HttpResponse> {
     auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
-    ok(svc::list_routes(&st, &path, q.q.as_deref(), &page).await?)
+    ok(svc::list_routes(&st, &path, q.q.as_deref(), q.active, &page).await?)
 }
 
 pub async fn route(

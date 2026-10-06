@@ -595,6 +595,24 @@ pub struct NandiRoutesRes {
     /// Operator-managed fare classification; `default` so older snapshots deserialize as None.
     #[serde(rename = "routeTag", default, skip_serializing_if = "Option::is_none")]
     pub route_tag: Option<String>,
+    /// False for a route the editor marked inactive (docs/gtfs-editor.md
+    /// section 18.17): answered when asked for by its id, left out of every
+    /// list. Sent only when false, so an active route reads as it always has;
+    /// absent (true) in Nandi's data and older snapshots.
+    #[serde(
+        rename = "isActive",
+        default = "route_active_default",
+        skip_serializing_if = "route_is_active"
+    )]
+    pub is_active: bool,
+}
+
+fn route_active_default() -> bool {
+    true
+}
+
+fn route_is_active(active: &bool) -> bool {
+    *active
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -748,6 +766,36 @@ pub struct GTFSRouteData {
     pub mappings: Vec<Arc<RouteStopMapping>>,
     pub by_route: HashMap<String, Vec<usize>>,
     pub by_stop: HashMap<String, Vec<usize>>,
+}
+
+impl GTFSRouteData {
+    /// The same data without the routes `gone` names - their mappings out, and
+    /// both indexes pointing at what is left - for a dump of what is listed.
+    pub fn without_routes(&self, gone: &HashSet<&str>) -> GTFSRouteData {
+        let mut out = GTFSRouteData::default();
+        let mut moved: Vec<Option<usize>> = vec![None; self.mappings.len()];
+        for (i, m) in self.mappings.iter().enumerate() {
+            if !gone.contains(&*m.route_code) {
+                moved[i] = Some(out.mappings.len());
+                out.mappings.push(m.clone());
+            }
+        }
+        let reindex = |index: &HashMap<String, Vec<usize>>| -> HashMap<String, Vec<usize>> {
+            index
+                .iter()
+                .filter_map(|(key, idx)| {
+                    let idx: Vec<usize> = idx
+                        .iter()
+                        .filter_map(|&i| moved.get(i).copied().flatten())
+                        .collect();
+                    (!idx.is_empty()).then(|| (key.clone(), idx))
+                })
+                .collect()
+        };
+        out.by_route = reindex(&self.by_route);
+        out.by_stop = reindex(&self.by_stop);
+        out
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1166,4 +1214,77 @@ pub struct SeatLayoutMappingRecord {
     pub fleet_id: String,
     pub gtfs_id: String,
     pub seat_layout_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mapping(route: &str, stop: &str) -> Arc<RouteStopMapping> {
+        Arc::new(RouteStopMapping {
+            estimated_travel_time_from_previous_stop: None,
+            provider_code: Arc::from("GTFS"),
+            route_code: Arc::from(route),
+            sequence_num: 1,
+            stop_code: Arc::from(stop),
+            stop_name: Arc::from(stop),
+            stop_point: LatLong { lat: 0.0, lon: 0.0 },
+            vehicle_type: Arc::from("BUS"),
+            geo_json: None,
+            gates: None,
+            hindi_name: None,
+            regional_name: None,
+            platform: None,
+            parent_stop_code: None,
+            cluster_id: None,
+            location_type: default_location_type(),
+            stage_number: None,
+            is_stage_stop: None,
+        })
+    }
+
+    #[test]
+    fn route_data_without_a_route_keeps_the_rest_pointing_right() {
+        let mut data = GTFSRouteData::default();
+        for (route, stop) in [("R1", "A"), ("R2", "A"), ("R2", "B"), ("R1", "C")] {
+            let i = data.mappings.len();
+            data.mappings.push(mapping(route, stop));
+            data.by_route.entry(route.into()).or_default().push(i);
+            data.by_stop.entry(stop.into()).or_default().push(i);
+        }
+        let out = data.without_routes(&HashSet::from(["R2"]));
+        assert_eq!(out.mappings.len(), 2);
+        let at = |idx: &[usize]| -> Vec<(String, String)> {
+            idx.iter()
+                .map(|&i| {
+                    let m = &out.mappings[i];
+                    (m.route_code.to_string(), m.stop_code.to_string())
+                })
+                .collect()
+        };
+        assert_eq!(
+            at(&out.by_route["R1"]),
+            vec![("R1".into(), "A".into()), ("R1".into(), "C".into())]
+        );
+        assert!(!out.by_route.contains_key("R2"));
+        assert_eq!(at(&out.by_stop["A"]), vec![("R1".into(), "A".into())]);
+        assert!(!out.by_stop.contains_key("B"), "B was only R2's");
+    }
+
+    #[test]
+    fn a_route_says_it_is_inactive_only_when_it_is() {
+        let mut route: NandiRoutesRes = serde_json::from_value(serde_json::json!({
+            "id": "R", "shortName": "1", "longName": null, "mode": "BUS", "agencyName": null,
+            "tripCount": 1, "stopCount": 2, "startPoint": null, "endPoint": null,
+            "serviceTierType": null
+        }))
+        .unwrap();
+        assert!(route.is_active, "data without the field is active");
+        assert!(serde_json::to_value(&route)
+            .unwrap()
+            .get("isActive")
+            .is_none());
+        route.is_active = false;
+        assert_eq!(serde_json::to_value(&route).unwrap()["isActive"], false);
+    }
 }
