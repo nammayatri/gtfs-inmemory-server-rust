@@ -829,7 +829,7 @@ impl DBFleetOperatorService {
     async fn close_waybill_after_last_trip(&self, waybill: &WaybillRow) {
         let result: AppResult<()> = async {
             sqlx::query(
-                "UPDATE waybills_internal SET status = 'closed', updated_at = now() WHERE waybill_id::text = $1",
+                "UPDATE waybills_internal SET status = 'audited', updated_at = now() WHERE waybill_id::text = $1",
             )
             .bind(&waybill.waybill_id)
             .execute(&self.pool)
