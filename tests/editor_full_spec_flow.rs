@@ -422,6 +422,17 @@ async fn existing_entities_carry_every_gtfs_field() {
         false
     );
     assert_eq!(res["summary"]["changes"], 1, "{res}");
+    // an update from a stops upload carries what it replaces, as a single
+    // change does, so the review has a before; a dry run does not read it
+    let set = detail!(a);
+    let upload = set["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["entity"] == "stop" && c["entity_key"] == "B2")
+        .unwrap_or_else(|| panic!("{set}"));
+    assert_eq!(upload["before"]["stop_id"], "B2", "{upload}");
+    assert_eq!(upload["before"]["name"], "Beach 2", "{upload}");
     let res = bulk!(
         a,
         "route_stops",
