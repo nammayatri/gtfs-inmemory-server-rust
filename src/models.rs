@@ -594,7 +594,27 @@ pub struct NandiRoutesRes {
     pub encoded_polyline: Option<String>,
     /// Operator-managed fare classification; `default` so older snapshots deserialize as None.
     #[serde(rename = "routeTag", default, skip_serializing_if = "Option::is_none")]
-    pub route_tag: Option<String>,
+    pub route_tag: Option<RouteTag>,
+}
+
+/// Mirrors `Domain.Types.FRFSGtfsStageFare.RouteTag` on the Haskell side -- the backend
+/// deserializes exact-match constructor names, so these variants and the DB column values must stay in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum RouteTag {
+    MetroFeeder,
+    RegularRoute,
+    LongRoute,
+}
+
+impl RouteTag {
+    pub fn parse(raw: &str) -> Option<RouteTag> {
+        match raw.trim() {
+            "MetroFeeder" => Some(RouteTag::MetroFeeder),
+            "RegularRoute" => Some(RouteTag::RegularRoute),
+            "LongRoute" => Some(RouteTag::LongRoute),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
