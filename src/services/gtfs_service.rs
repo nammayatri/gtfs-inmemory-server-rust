@@ -1455,13 +1455,12 @@ impl GTFSService {
                 if row.encoded_polyline.is_some() {
                     route.encoded_polyline = row.encoded_polyline;
                 }
-                // Unconditional so a cleared column clears the tag; blank normalises to None.
+                // Unconditional so a cleared column clears the tag; unknown values clear it rather than
+                // propagating a free-form string that the backend wouldn't recognise anyway.
                 route.route_tag = row
                     .route_tag
                     .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string);
+                    .and_then(crate::models::RouteTag::parse);
                 if route.route_tag.is_some() {
                     tagged += 1;
                 }
