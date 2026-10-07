@@ -94,6 +94,12 @@ Rerunning is safe and idempotent: the run reads the same rows every time and
 writes only the stage tables. `--reset` replaces the generated stages of the
 routes this run covers and leaves a skipped route's stages alone.
 
+Inactive routes (`gtfs_route.active = false`, docs/gtfs-editor.md section 18.17)
+are skipped like the premium and shuttle routes: their stop lists are not
+observations of any stage, no review or route issue is raised for them, and the
+replica's spine for them is set aside so they are not reported as missing.
+`--include-inactive` maps them as before.
+
 `--no-replica` takes the stage order and names from `gtfs_route_stop` alone and
 leaves every direction NULL. It is for trying a run out where the replica is not
 reachable; a real run wants the directions, or the two directions of one corridor
@@ -445,6 +451,32 @@ def read_internal(url: str, gtfs: str):
     for r in rows:
         routes[r[0]].append(Row(*r[1:]))
     return routes
+
+
+def read_inactive(url: str, gtfs: str) -> "set[str]":
+    """The routes the editor marked inactive (gtfs_route.active = false): in no
+    list passengers see, so in no stage mapping either. `active` is read through
+    to_jsonb, so a database without the column has none."""
+    rows = query(
+        url,
+        "SELECT route_id FROM gtfs_route r"
+        f" WHERE gtfs_id = {lit(gtfs)} AND NOT deleted"
+        " AND NOT coalesce((to_jsonb(r) ->> 'active')::boolean, true)",
+    )
+    return {num(r[0]) for r in rows}
+
+
+def leave_out(live_rows, spine, route_ids):
+    """Drop `route_ids` from our rows and from the replica's spine, in place: no
+    stage is built from them, no review or issue is raised for them, and a route
+    the replica carries but we leave out is not reported as missing. Returns the
+    routes that were in our rows, sorted."""
+    gone = sorted(set(route_ids) & set(live_rows), key=route_sort)
+    for route_id in gone:
+        del live_rows[route_id]
+    for route_id in route_ids:
+        spine.pop(route_id, None)
+    return gone
 
 
 def cut_runs(routes, problems):
@@ -1623,6 +1655,32 @@ def self_test():
     # and --reset replaces only the stages of the routes this run covers
     assert "DELETE FROM gtfs_route_stage WHERE gtfs_id = 'feed' AND route_id IN ('9');" in sql
 
+    # 14. an inactive route is left out: its stop list is no observation of a
+    # stage, and no review or issue is raised for it
+    def three():
+        live = {"1": staged("1", [(1, "ALPHA", "ab")]), "2": staged("2", [(1, "ALPHA", "ab")]),
+                "3": staged("3", [(1, "ALPHA", "abc")])}
+        spine = {r: ("up", [("ALPHA", "11")]) for r in ("1", "2", "3")}
+        return live, spine
+
+    def mapped(live, spine):
+        by = cut_runs(live, collections.defaultdict(list))
+        verdicts = {}
+        stages, reviews = choose_stages(by, spine, "commonest", NAMES, verdicts)
+        return stages, {r["reason"] for r in reviews}, route_issues(by, verdicts, {}, spine)
+
+    live, spine = three()
+    _, reasons, _ = mapped(live, spine)
+    assert reasons == {"stretch_differs"}, f"with route 3 its longer list is a dissent: {reasons}"
+    live, spine = three()
+    assert leave_out(live, {}, {"3", "99"}) == ["3"], "only routes we have are reported"
+    leave_out({}, spine, {"3", "99"})
+    assert sorted(live) == ["1", "2"] and sorted(spine) == ["1", "2"]
+    stages, reasons, issues = mapped(live, spine)
+    assert [[x[0] for x in st.stops] for st in stages] == [["sa", "sb"]], [st.stops for st in stages]
+    assert reasons == {"agreed"}, f"without route 3 the routes agree: {reasons}"
+    assert not [i for i in issues if i["route_id"] == "3"], "no issue for an inactive route"
+
     print("self-test: ok")
 
 
@@ -1672,6 +1730,12 @@ def main():
         "on chennai_bus it maps 1,474 stages that are otherwise named after "
         "themselves, at the cost of deciding that two spellings mean one place",
     )
+    p.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="map the routes the editor marked inactive too; by default they are "
+        "left alone, like the premium and shuttle routes",
+    )
     p.add_argument("--self-test", action="store_true", help="check the choosing and stop")
     args = p.parse_args()
 
@@ -1712,6 +1776,15 @@ def main():
             + f": {' '.join(left_alone[:8])}"
             + (" ..." if len(left_alone) > 8 else "")
         )
+    # inactive routes are in no list, so in no stage (docs section 18.17)
+    inactive = set() if args.include_inactive else read_inactive(source, gtfs)
+    left_inactive = leave_out(live_rows, {}, inactive)
+    if left_inactive:
+        log(
+            f"  leaving {len(left_inactive)} inactive route(s) alone: "
+            + " ".join(left_inactive[:8])
+            + (" ..." if len(left_inactive) > 8 else "")
+        )
 
     problems = collections.defaultdict(list)
     runs_by_route = cut_runs(live_rows, problems)
@@ -1728,8 +1801,13 @@ def main():
     else:
         p.error("pass one of --replica-db, --replica-csv or --no-replica")
     spine = spine_from_rows(spine_rows) if spine_rows else {}
+    # the replica still carries the inactive routes; set them aside, or each
+    # would be raised as a route our feed does not have
+    set_aside = len(set(spine) & inactive)
+    leave_out({}, spine, inactive)
     if spine_rows:
-        log(f"  spine: {len(spine)} routes, {len(spine_rows)} fare stages")
+        log(f"  spine: {len(spine)} routes, {len(spine_rows)} fare stages"
+            + (f" ({set_aside} inactive routes set aside)" if set_aside else ""))
 
     verdicts = {}
     stages, reviews = choose_stages(runs_by_route, spine, args.pick, stop_names, verdicts)
