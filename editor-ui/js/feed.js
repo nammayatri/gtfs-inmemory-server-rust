@@ -109,6 +109,7 @@ function importForm(box) {
     clear(out,
       replacedView(res.replaced),
       reactivatedView(res.reactivated),
+      stagesOffView(res.stages_turned_off),
       seedReport(res),
       res.confirm_token
         ? h("div.btn-row", h("button.btn.danger", { type: "button", id: "reload-confirm", on: { click: () => reloadDo(res) } }, `Reload ${state.feedId}…`))
@@ -117,6 +118,7 @@ function importForm(box) {
   const reloadDo = async (checked) => {
     const code = await askCode(2, [
       h("p.notice.warning", "This deletes ", h("strong", replacedWords(checked.replaced)), ` of ${state.feedId}, and loads `, h("strong", name), " in their place. It cannot be undone."),
+      stagesOffView(checked.stages_turned_off),
       h("p.hint", "Drafts already committed, releases, the history, reviews, webhooks and who may work on the feed are kept."),
     ], "Delete and reload", state.feedId);
     if (!code) return;
@@ -215,6 +217,8 @@ function codeError(e) {
 
 const TABLE_WORDS = {
   gtfs_stop: "stop", gtfs_route: "route", gtfs_route_stop: "stop list row", gtfs_trip: "trip", gtfs_service: "service",
+  gtfs_stage: "stage", gtfs_stage_stop: "stage stop", gtfs_route_stage: "route-to-stage link",
+  gtfs_stage_review: "stage review", gtfs_route_stage_issue: "route stage issue",
 };
 
 // The rows a reload deletes, in words: the main tables by name, the rest counted.
@@ -228,6 +232,15 @@ function replacedWords(replaced) {
 
 // Inactive routes (docs section 18.17) a zip that does not mark them would
 // list again: any zip but this feed's own download.
+// A feed served from its stages (docs section 19) loses them in a reload: it
+// is served from the zip's stop lists until its stages are mapped again.
+function stagesOffView(off) {
+  if (!off) return null;
+  return h("p.notice.warning", { id: "reload-stages-off" },
+    h("strong", `${state.feedId} is served from its stages. `),
+    "A reload deletes them, with their links to routes and their reviews, and the feed is then served from the stop lists in this zip. To build it from stages again, map them again from the new stops.");
+}
+
 function reactivatedView(ids) {
   if (!ids || !ids.length) return null;
   const shown = ids.slice(0, 12);

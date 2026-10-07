@@ -3950,7 +3950,21 @@ tables (`feed_io::feed_data_tables`):
 
 - stops, routes and stop orders, with their patterns and timings;
 - services, trips and frequencies;
-- every record file.
+- every record file;
+- the feed's stages (section 19): the links from routes to stages, the stages'
+  stops, the stages, the stage reviews and the route stage issues.
+
+**Stages.** A stage is a list of the feed's stops, so it cannot outlive them,
+and a zip carries stop lists, not stages. So a reload of a feed served from its
+stages (`use_stages`) deletes them and turns `use_stages` off: the feed is then
+served from the zip's stop lists, which is also what the round trip reads back.
+Building it from stages again means mapping them again from the new stops. The
+report says so (`stages_turned_off`), and the dashboard shows it at the check
+and again at the second confirmation. Found when a reload of chennai_bus on
+master failed with "database error": `gtfs_stage_stop` pointed at the stops it
+was deleting. Any other table that still points at the rows a reload deletes now
+fails the reload with 409 `feed_data_in_use`, naming the table and its key
+(`details.referenced_from`, `details.constraint`), instead of "database error".
 
 It then seeds the zip in their place (18.4, fare stages included), reads it back,
 compares it with the zip, and commits only when nothing differs. The feed row and
