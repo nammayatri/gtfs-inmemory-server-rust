@@ -1,7 +1,7 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can, usesStages } from "./state.js";
-import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords } from "./util.js";
+import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords, routeStatusTag } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
@@ -25,13 +25,17 @@ export function initSearch() {
   let items = [], active = -1, seq = 0;
   let query = "";
 
-  // Per group: its items and next page (the API's cursor is an offset). Routes
-  // first, then the stages they are built from, then stops.
+  // Per group: its items and next page (the API's cursor is an offset). Active
+  // routes first, then the stages they are built from, then stops; inactive
+  // routes (docs section 18.17) apart, last, so they never crowd out what
+  // passengers see. Every route says which it is.
+  const routeItem = (group) => (r) => ({
+    group, key: r.short_name || r.route_id, text: r.long_name || "",
+    sub: `Route id ${r.route_id}, ${plural(r.stop_count, "stop")}`, href: `#/route/${enc(r.route_id)}`,
+    tag: routeStatusTag(r, { both: true }),
+  });
   const groups = {
-    Routes: {
-      path: "routes", more: "Load more routes",
-      item: (r) => ({ group: "Routes", key: r.short_name || r.route_id, text: r.long_name || "", sub: `Route id ${r.route_id}, ${r.stop_count} stops${r.active === false ? ", inactive" : ""}`, href: `#/route/${enc(r.route_id)}` }),
-    },
+    Routes: { path: "routes", params: "&active=true", more: "Load more routes", item: routeItem("Routes") },
     Stages: {
       path: "stages", more: "Load more stages",
       // two stages of one corridor share a name, so the line says which way it
@@ -51,11 +55,15 @@ export function initSearch() {
       path: "stops", more: "Load more stops",
       item: (s) => ({ group: "Stops", key: s.location_type === 1 ? "Station" : "Stop", text: s.name, sub: `${s.stop_id}, ${s.route_count} route${s.route_count === 1 ? "" : "s"}`, href: `#/stop/${enc(s.stop_id)}` }),
     },
+    "Inactive routes": {
+      path: "routes", params: "&active=false", more: "Load more inactive routes", item: routeItem("Inactive routes"),
+      note: "not listed for passengers; open one by its id",
+    },
   };
   const reset = () => { for (const g of Object.values(groups)) Object.assign(g, { items: [], cursor: null, loading: false }); };
   reset();
   const pageUrl = (g, q, cursor) =>
-    `feeds/${enc(state.feedId)}/${g.path}?q=${enc(q)}&limit=${SEARCH_PAGE}${cursor ? `&cursor=${enc(cursor)}` : ""}`;
+    `feeds/${enc(state.feedId)}/${g.path}?q=${enc(q)}${g.params || ""}&limit=${SEARCH_PAGE}${cursor ? `&cursor=${enc(cursor)}` : ""}`;
 
   const render = () => {
     items = Object.values(groups).flatMap((g) => g.items);
@@ -67,7 +75,7 @@ export function initSearch() {
         return h("div.search-item", {
           role: "option", id: `search-opt-${n}`, "aria-selected": String(n === active),
           on: { mousedown: (ev) => { ev.preventDefault(); choose(it); } },
-        }, h("span.key", it.key), h("span", it.text), h("span.sub", it.sub));
+        }, h("span.key", it.key), h("span", it.text), it.tag || h("span"), h("span.sub", it.sub));
       });
       // mousedown, not click, so the search box keeps focus and the list stays open
       const more = g.cursor
@@ -76,7 +84,7 @@ export function initSearch() {
             on: { mousedown: (ev) => { ev.preventDefault(); loadMore(g); } },
           }, g.loading ? "Loading…" : g.more)
         : null;
-      return [h("div.search-group", name), rows, more];
+      return [h("div.search-group", { "data-group": name }, name, g.note ? h("span.search-group-note", ` · ${g.note}`) : null), rows, more];
     }));
   };
 
@@ -189,9 +197,11 @@ export async function showHome() {
     inactive.hidden = false;
     clear(inactive, h("h2", "Inactive routes"),
       h("p", "Left out of every list GIMS gives and of the published GTFS zip; asked for by id, they still answer."),
-      h("ul.list", page.items.map((r) => h("li.list-item",
-        h("a", { href: `#/route/${enc(r.route_id)}` }, r.short_name || r.route_id),
-        h("span.sub", r.long_name || `Route id ${r.route_id}`)))),
+      h("ul.list.inactive-routes", page.items.map((r) => h("li.list-item",
+        h("span.key", r.short_name || r.route_id),
+        h("a", { href: `#/route/${enc(r.route_id)}` }, r.long_name || `Route ${r.route_id}`),
+        routeStatusTag(r),
+        h("span.sub", `Route id ${r.route_id}, ${plural(r.stop_count, "stop")}`)))),
       page.next_cursor ? h("p.hint", "More are inactive than shown here; search for a route to open it.") : null);
   }).catch(() => {});
   const work = h("section.section", h("h2", "Drafts in progress"), h("p.empty", "Loading…"));
@@ -209,6 +219,33 @@ export async function showHome() {
   } catch (e) {
     clear(work, h("p.notice.error", e.message));
   }
+}
+
+// A stop's routes, the inactive ones (docs section 18.17) apart: passengers
+// see only the first list.
+function stopRoutesSection(routes) {
+  const row = (r) => h("li.list-item", { "data-route-active": String(r.active !== false) },
+    h("span.key", r.short_name || r.route_id),
+    h("a", { href: `#/route/${enc(r.route_id)}` }, r.long_name || `Route ${r.route_id}`),
+    h("span.item-end", routeStatusTag(r), h("span.hint", `stop ${r.sequence}`)),
+    h("span.sub", `${STOP_TYPE_LABEL[r.stop_type] || r.stop_type} in stage ${r.stage_no}, route id ${r.route_id}`));
+  const live = routes.filter((r) => r.active !== false);
+  const inactive = routes.filter((r) => r.active === false);
+  // a button, not a #fragment link: the hash is the page
+  const jump = inactive.length && live.length
+    ? h("button.btn.quiet.small", { type: "button", id: "jump-inactive-routes",
+        on: { click: () => document.getElementById("inactive-routes-here")?.scrollIntoView({ behavior: "smooth", block: "start" }) } },
+        `${plural(inactive.length, "inactive route")} below`)
+    : null;
+  return h("section.section.stop-routes",
+    h("div.section-head", h("h2", `Routes stopping here (${live.length})`), jump),
+    live.length ? h("ul.list", live.map(row))
+      : h("p.empty", inactive.length ? "No active route uses this stop: passengers see no route here." : "No route uses this stop."),
+    inactive.length ? [
+      h("h3", { id: "inactive-routes-here" }, `Inactive routes stopping here (${inactive.length})`),
+      h("p.hint", "Not listed for passengers: GIMS leaves them out of the routes at this stop."),
+      h("ul.list.inactive-routes", inactive.map(row)),
+    ] : null);
 }
 
 // ------------------------------------------------------------------ stop as a file
@@ -364,13 +401,7 @@ export async function showStop(stopId) {
           : c.movesTo ? h("span.chip.draft", `moves to ${c.movesTo} in the draft`)
           : c.leaves ? h("span.chip.draft", "leaves in the draft") : `${c.route_count} route${c.route_count === 1 ? "" : "s"}`),
         h("span.sub", c.stop_id)))) : h("p.empty", "This station has no stops.")) : null,
-    !isStation ? h("section.section",
-      h("h2", `Routes stopping here (${s.routes.length})`),
-      s.routes.length ? h("ul.list", s.routes.map((r) => h("li.list-item",
-        h("span.key", r.short_name || r.route_id),
-        h("a", { href: `#/route/${enc(r.route_id)}` }, r.long_name || `Route ${r.route_id}`),
-        h("span.hint", `stop ${r.sequence}`),
-        h("span.sub", `${STOP_TYPE_LABEL[r.stop_type] || r.stop_type} in stage ${r.stage_no}, route id ${r.route_id}${r.active === false ? ", inactive: not listed for passengers" : ""}`)))) : h("p.empty", "No route uses this stop.")) : null,
+    !isStation ? stopRoutesSection(s.routes) : null,
     h("section.section.nearby-stops",
       h("h2", "Other stops within 60 m"),
       h("p.hint", "Two stops close together are often the two sides of the road: club them into a station. Merge them only if they are the same kerb entered twice."),
@@ -467,7 +498,8 @@ export async function showRoute(routeId, { preview } = {}) {
     h("section.section",
       backLink(),
       h("div.title-block",
-        h("h1", r.short_name || `Route ${r.route_id}`, drafted && o.changed.has("short_name") ? h("span.live-value", h("span.live-tag", "live: "), h("s", live.short_name || "none")) : null),
+        h("h1", r.short_name || `Route ${r.route_id}`, drafted && o.changed.has("short_name") ? h("span.live-value", h("span.live-tag", "live: "), h("s", live.short_name || "none")) : null,
+          r.active === false ? [" ", routeStatusTag(r)] : null),
         h("p", field("long_name")),
         h("p.ids", `Route id ${r.route_id}, ${plural(r.stop_count, "stop")}, ${plural(r.rows.length ? groupStages(served).length : 0, "fare stage")}`)),
       created ? h("div.notice.draft",

@@ -291,15 +291,17 @@ export async function showProposal(id) {
       if (cur && cur.name !== m.name) now.push(`Now called ${cur.name}.`);
       if (cur && haversine(cur.lat, cur.lon, m.lat, m.lon) > 5) now.push(`Moved ${fmtMetres(haversine(cur.lat, cur.lon, m.lat, m.lon))} since it was suggested.`);
       const routes = m.routes;
-      // one chip per route number; variants of a number share it
+      // one chip per route number; variants of a number share it. Inactive
+      // variants (docs section 18.17) get chips of their own, after the rest.
       const byNumber = new Map();
       (routes || []).forEach((r) => {
-        const key = r.short_name || r.route_id;
-        if (!byNumber.has(key)) byNumber.set(key, { ...r, variants: [] });
+        const inactive = r.active === false;
+        const key = `${inactive ? "inactive" : "active"}|${r.short_name || r.route_id}`;
+        if (!byNumber.has(key)) byNumber.set(key, { ...r, inactive, variants: [] });
         const entry = byNumber.get(key);
         if (!entry.variants.some((v) => v.route_id === r.route_id)) entry.variants.push(r);
       });
-      const unique = [...byNumber.values()];
+      const unique = [...byNumber.values()].sort((a, b) => a.inactive - b.inactive);
       const shown = m.allRoutes ? unique : unique.slice(0, 12);
       return h("li.member-card", { class: m.dropped ? "dropped" : "" },
         h("div.member-card-head",
@@ -314,11 +316,13 @@ export async function showProposal(id) {
         h("div.member-routes",
           h("span.hint", routes === null ? "Loading routes…" : unique.length ? "Routes here:" : "No route uses this stop."),
           shown.map((r) => h("button.route-chip", {
-            type: "button", "aria-pressed": String(m.showing === r.route_id),
-            title: r.variants.map((v) => `${v.long_name || v.route_id} (route id ${v.route_id})`).join("\n"),
-            "aria-label": `Show route ${r.short_name || r.route_id} on the map${r.variants.length > 1 ? `, ${r.variants.length} variants` : ""}`,
+            type: "button", "aria-pressed": String(m.showing === r.route_id), class: r.inactive ? "inactive" : "",
+            "data-route-active": String(!r.inactive),
+            title: (r.inactive ? "Inactive: not listed for passengers\n" : "") + r.variants.map((v) => `${v.long_name || v.route_id} (route id ${v.route_id})`).join("\n"),
+            "aria-label": `Show ${r.inactive ? "inactive " : ""}route ${r.short_name || r.route_id} on the map${r.variants.length > 1 ? `, ${r.variants.length} variants` : ""}`,
             on: { click: () => showRouteOf(m, r) },
-          }, r.short_name || r.route_id, r.variants.length > 1 ? h("span.variants", ` ×${r.variants.length}`) : null)),
+          }, r.short_name || r.route_id, r.variants.length > 1 ? h("span.variants", ` ×${r.variants.length}`) : null,
+            r.inactive ? h("span.variants", " inactive") : null)),
           unique.length > shown.length
             ? h("button.btn.quiet.small", { type: "button", on: { click: () => { m.allRoutes = true; drawMembers(); } } }, `+${unique.length - shown.length} more`) : null),
         h("div.btn-row",

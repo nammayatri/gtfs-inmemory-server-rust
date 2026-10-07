@@ -161,6 +161,16 @@ export function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+// Whether a route is listed for passengers (docs section 18.17): an inactive
+// route is in no list GIMS gives and only answers when asked for by its id.
+// `both` tags an active route too, where the two are shown side by side.
+export function routeStatusTag(r, { both = false } = {}) {
+  if (r && r.active === false) {
+    return h("span.chip.route-inactive", { "data-route-active": "false", title: "Inactive: in no list GIMS gives and not in the published GTFS; it still answers when asked for by its id" }, "Inactive");
+  }
+  return both ? h("span.chip.route-active", { "data-route-active": "true", title: "Active: listed for passengers" }, "Active") : null;
+}
+
 export const STOP_TYPE_LABEL = {
   "NEW STOP": "Stage stop",
   "INTERMEDIATE STOP": "Intermediate stop",
