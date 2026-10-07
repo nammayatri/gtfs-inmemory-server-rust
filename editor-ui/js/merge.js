@@ -5,7 +5,7 @@
 // that stays, and the other stops are removed.
 import { get, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
-import { h, clear, toast, confirmDialog, fmtCoord, fmtMetres, haversine, nameLikeness, plural } from "./util.js";
+import { h, clear, toast, confirmDialog, fmtCoord, fmtMetres, haversine, nameLikeness, plural, routeStatusTag } from "./util.js";
 import * as map from "./map.js";
 import { addChange, requireDraft, removeChange } from "./drafts.js";
 import { stopPicker } from "./picker.js";
@@ -153,7 +153,7 @@ const routeCount = (s) => new Set(s.routes.map((r) => r.route_id)).size;
 function byRoute(s) {
   const out = new Map();
   for (const r of s.routes) {
-    if (!out.has(r.route_id)) out.set(r.route_id, { route_id: r.route_id, short_name: r.short_name, long_name: r.long_name, sequences: [] });
+    if (!out.has(r.route_id)) out.set(r.route_id, { route_id: r.route_id, short_name: r.short_name, long_name: r.long_name, active: r.active, sequences: [] });
     out.get(r.route_id).sequences.push(r.sequence);
   }
   return out;
@@ -331,7 +331,9 @@ function renderImpact(box, into, from, keptName) {
     const adjacent = all.some((x, i) => i > 0 && x - all[i - 1] === 1);
     (adjacent ? clashes : twice).push({ ...r, all });
   }
-  const switching = [...rowsByRoute.values()].filter((r) => r.moving.length);
+  // inactive routes (docs section 18.17) after the ones passengers see
+  const switching = [...rowsByRoute.values()].filter((r) => r.moving.length)
+    .sort((a, b) => (a.active === false) - (b.active === false));
   const movingRows = from.reduce((n, s) => n + s.routes.length, 0);
   const goingIds = from.map((s) => s.stop_id).join(", ");
   const far = from.map((s) => ({ s, d: haversine(into.lat, into.lon, s.lat, s.lon) })).filter((x) => x.d > FAR_METRES);
@@ -348,7 +350,7 @@ function renderImpact(box, into, from, keptName) {
     switching.length ? h("ul.list.route-switch", switching.slice(0, 60).map((r) => h("li.list-item",
       h("span.key", r.short_name || r.route_id),
       h("span", r.long_name || `Route ${r.route_id}`),
-      h("span.hint", stopsWord([...r.moving].sort((x, y) => x - y)))))) : null,
+      h("span.item-end", routeStatusTag(r), h("span.hint", stopsWord([...r.moving].sort((x, y) => x - y))))))) : null,
     switching.length > 60 ? h("p.hint", `and ${switching.length - 60} more routes.`) : null);
 }
 

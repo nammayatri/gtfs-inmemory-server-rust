@@ -1572,7 +1572,7 @@ async function routeActiveFlow() {
   const route = routes[0];
   await go(`#/route/${route.route_id}`);
   await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
-  check(!(await has("#panel [data-route-active]")), "an active route's page says nothing about it");
+  check(!(await has("#panel .notice[data-route-active]")), "an active route's page says nothing about it");
   await click("Edit name, colour and map line");
   await sleep(300);
   if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Inactive route");
@@ -1588,8 +1588,8 @@ async function routeActiveFlow() {
     .find((c) => c.entity === "route" && c.entity_key === route.route_id);
   check(!!change && change.after.active === false && Object.keys(change.after).length === 1,
     `the draft holds only active: false (${JSON.stringify(change && change.after)})`);
-  await waitFor(`!!document.querySelector('#panel [data-route-active="false"]')`, "the pending notice on the route's page");
-  check((await text('#panel [data-route-active="false"]')).includes("The draft makes this route inactive"), "the route's page says the draft makes it inactive");
+  await waitFor(`!!document.querySelector('#panel .notice[data-route-active="false"]')`, "the pending notice on the route's page");
+  check((await text('#panel .notice[data-route-active="false"]')).includes("The draft makes this route inactive"), "the route's page says the draft makes it inactive");
   check((await text("#panel")).includes("status (active or inactive)"), "and lists the status among what the draft changes");
 
   await go(`#/drafts/${draftId}`);
@@ -1609,16 +1609,73 @@ async function routeActiveFlow() {
   check(await evaluate(`[...document.querySelectorAll("#panel a")].some((a) => a.getAttribute("href") === "#/route/${encodeURIComponent(route.route_id)}")`),
     "the home panel links the inactive route");
   await shot("ra-03-home");
-  // by its id: a route number can be shorter than the search box asks for
+  // search: inactive routes in a group of their own, after the stops, and
+  // every route tagged Active or Inactive. By its id: a route number can be
+  // shorter than the search box asks for.
+  const searchResults = () => evaluate(`(() => {
+    let group = null; const out = [];
+    for (const el of document.getElementById("search-results").children) {
+      if (el.classList.contains("search-group")) group = el.dataset.group;
+      else if (el.classList.contains("search-item")) out.push({ group, sub: el.querySelector(".sub")?.textContent || "",
+        tag: el.querySelector(".chip")?.textContent || null });
+    }
+    return out;
+  })()`);
   await type("#search-input", route.route_id);
   await waitFor(`document.querySelectorAll(".search-item").length > 0`, "search results");
   await sleep(500);
-  const subs = await evaluate(`[...document.querySelectorAll(".search-item .sub")].map((e) => e.textContent)`);
-  check(subs.some((t) => t.startsWith(`Route id ${route.route_id},`) && t.endsWith(", inactive")), `search marks it inactive: ${JSON.stringify(subs.slice(0, 4))}`);
+  let found = await searchResults();
+  const mine = found.filter((r) => r.sub.startsWith(`Route id ${route.route_id},`));
+  check(mine.length === 1 && mine[0].group === "Inactive routes" && mine[0].tag === "Inactive",
+    `search lists it only under Inactive routes, tagged Inactive: ${JSON.stringify(mine)}`);
+  const groupsSeen = [...new Set(found.map((r) => r.group))];
+  check(groupsSeen[groupsSeen.length - 1] === "Inactive routes", `the inactive group comes last: ${JSON.stringify(groupsSeen)}`);
+  check(found.filter((r) => r.group === "Routes").every((r) => r.tag === "Active"), "every route in the Routes group is tagged Active");
+  await shot("ra-05-search");
+  await type("#search-input", routes[1].route_id);
+  await waitFor(`document.querySelectorAll(".search-item").length > 0`, "search results for an active route");
+  await sleep(500);
+  found = await searchResults();
+  const other = found.filter((r) => r.sub.startsWith(`Route id ${routes[1].route_id},`));
+  check(other.length === 1 && other[0].group === "Routes" && other[0].tag === "Active", `an active route is under Routes, tagged Active: ${JSON.stringify(other)}`);
   await type("#search-input", "");
+  // its stops list it apart, under Inactive routes stopping here
+  const firstStop = (await api(`feeds/chennai_bus/routes/${route.route_id}`)).rows.find((x) => x.stop_id);
+  if (check(!!firstStop, "a stop of the inactive route")) {
+    await go(`#/stop/${firstStop.stop_id}`);
+    await waitFor(`!!document.getElementById("inactive-routes-here")`, "the stop's inactive routes");
+    const lists = await evaluate(`({
+      live: [...document.querySelectorAll(".stop-routes > ul.list:not(.inactive-routes) .list-item")].map((li) => li.dataset.routeActive),
+      inactive: [...document.querySelectorAll(".stop-routes ul.inactive-routes .list-item")].map((li) => li.querySelector("a")?.getAttribute("href")),
+    })`);
+    check(lists.live.every((a) => a === "true") && lists.inactive.includes(`#/route/${encodeURIComponent(route.route_id)}`),
+      `the stop lists the inactive route apart from the active ones: ${JSON.stringify(lists)}`);
+    if (lists.live.length) {
+      check(await has("#jump-inactive-routes"), "a button by the heading points to the inactive routes below");
+      await evaluate(`document.getElementById("jump-inactive-routes").click()`);
+      await sleep(700);
+    }
+    await shot("ra-06-stop");
+  }
+  // a search that finds routes, stops and the inactive route: in that order
+  const word = (route.long_name || "").split(/[^A-Za-z]+/).find((w) => w.length >= 5);
+  if (check(!!word, `a word of the inactive route's name to search by (${word})`)) {
+    await type("#search-input", word);
+    await waitFor(`document.querySelectorAll(".search-item").length > 0`, "mixed search results");
+    await sleep(600);
+    const mixed = await searchResults();
+    const order = [...new Set(mixed.map((r) => r.group))];
+    check(JSON.stringify(order) === JSON.stringify(["Routes", "Stops", "Inactive routes"]),
+      `routes, then stops, then inactive routes apart: ${JSON.stringify(order)}`);
+    check(mixed.filter((r) => r.group !== "Stops").every((r) => r.tag === (r.group === "Routes" ? "Active" : "Inactive")),
+      "every route result is tagged by its group");
+    check(mixed.filter((r) => r.group === "Stops").every((r) => r.tag === null), "stops carry no route tag");
+    await shot("ra-07-mixed-search");
+    await type("#search-input", "");
+  }
   await go(`#/route/${route.route_id}`);
-  await waitFor(`!!document.querySelector('#panel [data-route-active="false"]')`, "the inactive notice on its page");
-  check((await text('#panel [data-route-active="false"]')).includes("Asked for by its id, it still answers"), "its page says what inactive means");
+  await waitFor(`!!document.querySelector('#panel .notice[data-route-active="false"]')`, "the inactive notice on its page");
+  check((await text('#panel .notice[data-route-active="false"]')).includes("Asked for by its id, it still answers"), "its page says what inactive means");
   await shot("ra-04-route");
 
   // ticked again: active, in a new draft
@@ -1633,7 +1690,7 @@ async function routeActiveFlow() {
   const again = ((await api(`change-sets/${await activeDraftId()}`)).changes || [])
     .find((c) => c.entity === "route" && c.entity_key === route.route_id);
   check(!!again && again.after.active === true, `the new draft makes it active (${JSON.stringify(again && again.after)})`);
-  await waitFor(`!!document.querySelector('#panel [data-route-active="true"]')`, "the pending notice for active again");
+  await waitFor(`!!document.querySelector('#panel .notice[data-route-active="true"]')`, "the pending notice for active again");
 }
 
 // ---- only making a route inactive

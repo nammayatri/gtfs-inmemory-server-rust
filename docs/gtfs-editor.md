@@ -4073,11 +4073,25 @@ reads `database error`).
 
 **Dashboard.** The route editor has an "Active: listed for passengers" switch,
 which is part of undo and redo. A draft that changes it says so on the route's
-page, and the review page shows the change as a `Status` row. An inactive route's
-page says what that means. Search results add ", inactive", and the stop page
-says which of its routes are inactive. The home panel lists a feed's inactive
-routes, which no search would surface otherwise. The feed page offers the
-download "as published" beside the full one.
+page, and the review page shows the change as a `Status` row. Inactive routes
+are kept apart from the rest wherever routes are listed, and tagged:
+
+- **Search** asks for routes twice, `active=true` and `active=false`. Active
+  routes come first, then stops, then an "Inactive routes" group of its own,
+  so inactive ones never crowd out what passengers see. Every route result is
+  tagged **Active** or **Inactive**.
+- **A stop's page** lists its active routes, then "Inactive routes stopping
+  here", tagged. A button by the heading scrolls to them.
+- **A route's page** carries the Inactive tag beside its number, and says what
+  inactive means.
+- **A station suggestion** gives inactive variants of a route number a dashed
+  chip of their own, after the others.
+- **A merge preview** lists the routes that switch stop with the inactive ones
+  last, tagged.
+- **The home panel** lists the feed's inactive routes.
+
+A coordinate review's routes are not tagged: its route legs do not carry
+`active`. The feed page offers the download "as published" beside the full one.
 
 Tests: `tests/gtfs_route_inactive_flow.rs` covers every list and lookup above
 through GIMS, and the route listed again after a reload.
