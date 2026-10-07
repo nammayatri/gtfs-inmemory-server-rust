@@ -7,20 +7,20 @@
 //! "OSRM could not route through these stops": where the stops are wrong or
 //! the router's map disagrees with them, the buses still know the way.
 //!
-//! The ideas are nandi's `s0_gps_ingest.py`, ported, with one change of
-//! emphasis learned the hard way: a route NUMBER (`21G`) covers both
-//! directions and several variants, each its own route_id here, and the
-//! operator-entered label is sometimes wrong. Averaging everything labelled
-//! `21G` draws a path through none of its stops. So a run counts only if it
-//! passes at least [`Params::stop_share`] of THIS route's served stops, within
-//! [`Params::stop_radius_m`], in increasing sequence order - which rejects the
-//! other direction (it meets the stops backwards), other variants (they miss
-//! the stops of the stretch they do not share) and mislabelled buses at once.
+//! The ideas are nandi's `s0_gps_ingest.py`, ported. Pings are taken by the
+//! GTFS `route_id` their trip was assigned (the waybill's trip, set by
+//! gps-processor), not by the route number on them: a number (`21G`) covers
+//! both directions and several variants, and the number on the pings can
+//! differ from the GTFS one (1987 is `104A` here, `104ACT` on its pings). A
+//! run still counts only if it passes at least [`Params::stop_share`] of this
+//! route's served stops, within [`Params::stop_radius_m`], in increasing
+//! sequence order: that cuts each trip at its first and last stop, and drops
+//! the start of a next trip still carrying this route's id.
 //!
 //! The pipeline:
 //!
 //!  1. **Bus-days** (one query per day, the `days` days read three at a time,
-//!     today first): which devices carried this route number that day, with
+//!     today first): which devices carried this route id that day, with
 //!     enough pings inside a box around the route's stops - the busiest few a
 //!     day. `enough_bus_days` are then taken across the days, the busiest bus
 //!     of each day first, so the line draws on the whole week rather than its
@@ -30,7 +30,7 @@
 //!     took 40 s and hit the 30 s ceiling; a day takes a second or three.
 //!  2. **Tracks** (one query per day, or per few hours of one; the days three
 //!     at a time): those devices'
-//!     pings around the hours they carried the number, still inside the box,
+//!     pings around the hours they carried the route id, still inside the box,
 //!     averaged to one point per `bucket_s` seconds, and packed one device-hour
 //!     per row - ClickHouse does the thinning, each answer is at most
 //!     `page_rows` rows (some network paths stall above ~300), and no stretch
@@ -60,6 +60,8 @@
 //! buses made along a route on one day ([`GpsLine::trips_on`]) - steps 1 to 3
 //! for that day, every run that passed the stops in order, with when it did,
 //! which bus, and its line.
+
+pub mod batch;
 
 use crate::services::clickhouse_reader::{
     quote, ClickHouseError, ClickHouseReader, ClickHouseSettings, RowSource,
@@ -106,7 +108,8 @@ const COL_TIME: &str = "timestamp";
 const COL_LAT: &str = "lat";
 const COL_LON: &str = "long";
 const COL_DEVICE: &str = "deviceId";
-const COL_ROUTE: &str = "routeNumber";
+/// The trip's GTFS route id, as the trip assignment set it on each ping.
+const COL_ROUTE_ID: &str = "route_id";
 /// Service days are Indian days (UTC+05:30): a bus's night is not split at
 /// 05:30. Each day is asked for by its own bounds in unix seconds, so the
 /// server's time zone never matters.
@@ -117,7 +120,7 @@ const DAY_OFFSET_S: i64 = 5 * 3600 + 30 * 60;
 pub struct Params {
     /// Pings are averaged to one point per this many seconds, in ClickHouse.
     pub bucket_s: i64,
-    /// A bus-day needs this many route-labelled pings in the box to be read.
+    /// A bus-day needs this many pings carrying the route id in the box to be read.
     pub min_bus_day_pings: u32,
     /// Stop reading tracks after this many averaged points.
     pub max_points: usize,
@@ -1107,73 +1110,10 @@ pub fn gps_trips(tracks: &[Track], stops: &[Stop], p: &Params) -> (Vec<GpsTrip>,
 
 // ---------------------------------------------------------------- queries
 
-/// The route number, trimmed. None when it cannot be one (empty, too long, or
-/// holding a character the reader refuses).
-pub fn route_label(short_name: &str) -> Option<String> {
-    let t = short_name.trim();
-    (!t.is_empty() && t.chars().count() <= 32 && !t.contains(';') && !t.contains('\n'))
-        .then(|| t.to_string())
-}
-
-/// Case variants are tried for every letter up to this many letters.
-const SPELLING_LETTERS: usize = 6;
-
-/// The ways the pings spell a route number, as a list the queries match with
-/// `routeNumber IN (...)`. Operators type the number by hand: `57Fct` for
-/// `57FCT`, ` 51AXCT` with a leading space. So: every upper/lower case
-/// combination of its letters (as typed, upper and lower when it has more than
-/// six), each with and without one leading and one trailing space.
-///
-/// A plain `IN` on the LowCardinality column is what keeps the query cheap:
-/// `lowerUTF8(trimBoth(...))` converted every row of the scan, and on a cold
-/// 14-day read that was the difference between answering and timing out.
-/// Rarer spellings (two spaces, a stray dot) are missed; they were 0.16% of
-/// labelled pings.
-pub fn label_spellings(short_name: &str) -> Vec<String> {
-    let Some(t) = route_label(short_name) else {
-        return vec![];
-    };
-    let chars: Vec<char> = t.chars().collect();
-    let letters: Vec<usize> = (0..chars.len())
-        .filter(|&i| chars[i].is_ascii_alphabetic())
-        .collect();
-    let mut bases: Vec<String> = Vec::new();
-    let add = |v: String, bases: &mut Vec<String>| {
-        if !bases.contains(&v) {
-            bases.push(v);
-        }
-    };
-    if letters.len() <= SPELLING_LETTERS {
-        for mask in 0u32..(1 << letters.len()) {
-            let mut c = chars.clone();
-            for (bit, &i) in letters.iter().enumerate() {
-                c[i] = if mask & (1 << bit) != 0 {
-                    c[i].to_ascii_lowercase()
-                } else {
-                    c[i].to_ascii_uppercase()
-                };
-            }
-            add(c.into_iter().collect(), &mut bases);
-        }
-    } else {
-        add(t.clone(), &mut bases);
-        add(t.to_ascii_uppercase(), &mut bases);
-        add(t.to_ascii_lowercase(), &mut bases);
-    }
-    let mut out = Vec::with_capacity(bases.len() * 4);
-    for b in &bases {
-        for v in [
-            b.clone(),
-            format!(" {b}"),
-            format!("{b} "),
-            format!(" {b} "),
-        ] {
-            if !out.contains(&v) {
-                out.push(v);
-            }
-        }
-    }
-    out
+/// The route id as the pings carry it, as a one-value list for `route_id IN
+/// (...)`. Empty when the id cannot be one.
+pub fn route_ids(route_id: &str) -> Vec<String> {
+    batch::route_key(route_id).into_iter().collect()
 }
 
 fn in_list(values: &[String]) -> String {
@@ -1225,15 +1165,15 @@ impl Bbox {
     }
 }
 
-/// Step 1, for one day: the devices that carried the route number in `[from,
-/// to)` with at least `min_pings` pings in the box, busiest first, at most
+/// Step 1, for one day: the devices whose pings carry one of `ids` as their
+/// `route_id` in `[from, to)` with at least `min_pings` pings in the box, busiest first, at most
 /// `limit`, with the first and last ping that carried it - step 2 reads only
 /// around that span.
 pub fn bus_days_sql(
     table: &str,
     from: i64,
     to: i64,
-    spellings: &[String],
+    ids: &[String],
     bbox: &Bbox,
     min_pings: u32,
     limit: usize,
@@ -1243,11 +1183,11 @@ pub fn bus_days_sql(
          toUnixTimestamp(min({COL_TIME})) AS first_seen, toUnixTimestamp(max({COL_TIME})) AS last_seen \
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
-         AND {COL_ROUTE} IN ({labels}) AND {bbox} AND {COL_DEVICE} != '' \
+         AND {COL_ROUTE_ID} IN ({ids}) AND {bbox} AND {COL_DEVICE} != '' \
          GROUP BY device HAVING n >= {min_pings} \
          ORDER BY n DESC, device \
          LIMIT {limit}",
-        labels = in_list(spellings),
+        ids = in_list(ids),
         bbox = bbox.sql(),
     )
 }
@@ -1277,8 +1217,8 @@ fn bus_days_of(rows: &[Vec<String>], limit: usize) -> Vec<BusDay> {
 
 /// Step 2: some devices' pings over one stretch of time, averaged to one point
 /// per `bucket_s`, packed one device-hour per row as `t,lat,lon|t,lat,lon|...`.
-/// Pings labelled with another route are left out; unlabelled ones stay (a
-/// quarter of pings carry no label). At most one row per device and hour, so
+/// Pings carrying another route id are left out; ones with none stay (a
+/// quarter of pings carry no route id). At most one row per device and hour, so
 /// `limit` = devices x hours of the stretch holds the whole answer: it is never
 /// paged, and never read twice.
 #[allow(clippy::too_many_arguments)]
@@ -1287,7 +1227,7 @@ pub fn tracks_sql(
     from: i64,
     to: i64,
     devices: &[String],
-    spellings: &[String],
+    ids: &[String],
     bbox: &Bbox,
     bucket_s: i64,
     limit: usize,
@@ -1301,13 +1241,13 @@ pub fn tracks_sql(
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
          AND {COL_DEVICE} IN ({list}) \
-         AND (isNull({COL_ROUTE}) OR {COL_ROUTE} IN ('', {labels})) AND {bbox} \
+         AND (isNull({COL_ROUTE_ID}) OR {COL_ROUTE_ID} IN ('', {ids})) AND {bbox} \
          GROUP BY device, t) \
          GROUP BY device, h \
          ORDER BY device, h \
          LIMIT {limit}",
         list = in_list(devices),
-        labels = in_list(spellings),
+        ids = in_list(ids),
         bbox = bbox.sql(),
     )
 }
@@ -1354,7 +1294,7 @@ pub fn parse_packed(track: &str) -> Vec<Ping> {
         .collect()
 }
 
-/// Pings read before a bus-day's first labelled ping and after its last.
+/// Pings read before a bus-day's first ping with the route id and after its last.
 const SPAN_MARGIN_S: i64 = 45 * 60;
 
 /// The unix second an Indian service day starts at.
@@ -1504,8 +1444,8 @@ pub fn settings_from_config(
 /// Why no line.
 #[derive(Debug)]
 pub enum GpsFailure {
-    /// The route has no usable number to look the pings up by.
-    NoRouteNumber,
+    /// The route id cannot be used to look the pings up by.
+    BadRouteId,
     /// Fewer than two served stops with a position.
     NotEnoughStops(usize),
     /// Too little evidence, with the counts.
@@ -1636,7 +1576,7 @@ impl GpsLine {
     }
 
     fn cache_key(q: &RouteQuery, day: chrono::NaiveDate) -> String {
-        let mut basis = format!("{}\n", q.short_name.trim());
+        let mut basis = String::new();
         for s in q.stops {
             basis.push_str(&format!("{}|{:.6}|{:.6}\n", s.stop_id, s.lat, s.lon));
         }
@@ -1701,9 +1641,9 @@ impl GpsLine {
         q: RouteQuery<'_>,
         budget: Budget,
     ) -> Result<Value, GpsFailure> {
-        let spellings = label_spellings(q.short_name);
-        if spellings.is_empty() {
-            return Err(GpsFailure::NoRouteNumber);
+        let ids = route_ids(q.route_id);
+        if ids.is_empty() {
+            return Err(GpsFailure::BadRouteId);
         }
         if q.stops.len() < 2 {
             return Err(GpsFailure::NotEnoughStops(q.stops.len()));
@@ -1718,7 +1658,7 @@ impl GpsLine {
         let read_until = deadline - budget.osrm_reserve;
         let work = async {
             let (line, evidence) = self
-                .stage(&q, &spellings, &key, now, read_until, budget.bus_days)
+                .stage(&q, &ids, &key, now, read_until, budget.bus_days)
                 .await?;
             // whoever held the permit before us may have answered this already
             if let (Some(mut answer), _) = self.cached(&key) {
@@ -1760,9 +1700,9 @@ impl GpsLine {
         q: &RouteQuery<'_>,
         budget: Duration,
     ) -> Result<(Vec<(f64, f64)>, Value), GpsFailure> {
-        let spellings = label_spellings(q.short_name);
-        if spellings.is_empty() {
-            return Err(GpsFailure::NoRouteNumber);
+        let ids = route_ids(q.route_id);
+        if ids.is_empty() {
+            return Err(GpsFailure::BadRouteId);
         }
         if q.stops.len() < 2 {
             return Err(GpsFailure::NotEnoughStops(q.stops.len()));
@@ -1771,7 +1711,7 @@ impl GpsLine {
         let key = Self::cache_key(q, today(now));
         self.stage(
             q,
-            &spellings,
+            &ids,
             &key,
             now,
             Instant::now() + budget,
@@ -1783,7 +1723,7 @@ impl GpsLine {
     async fn stage(
         &self,
         q: &RouteQuery<'_>,
-        spellings: &[String],
+        ids: &[String],
         key: &str,
         now: i64,
         read_until: Instant,
@@ -1799,7 +1739,7 @@ impl GpsLine {
                 Some(stage) => stage,
                 None => {
                     let (stage, complete) = self
-                        .read_and_build(q, spellings, now, read_until, bus_days_budget)
+                        .read_and_build(q, ids, now, read_until, bus_days_budget)
                         .await?;
                     // a read cut short by the clock is not the day's answer
                     if complete {
@@ -1864,7 +1804,7 @@ impl GpsLine {
     async fn day_bus_days(
         &self,
         q: &RouteQuery<'_>,
-        spellings: &[String],
+        ids: &[String],
         bbox: &Bbox,
         date: chrono::NaiveDate,
         now: i64,
@@ -1884,15 +1824,7 @@ impl GpsLine {
             return Ok(None);
         }
         let (a, b) = (day_start(date), (day_start(date) + 86_400).min(now));
-        let sql = bus_days_sql(
-            &s.table,
-            a,
-            b,
-            spellings,
-            bbox,
-            s.params.min_bus_day_pings,
-            limit,
-        );
+        let sql = bus_days_sql(&s.table, a, b, ids, bbox, s.params.min_bus_day_pings, limit);
         match self.reader.rows(&sql, time).await {
             Ok(rows) => {
                 if past {
@@ -1916,13 +1848,13 @@ impl GpsLine {
     }
 
     /// Step 2 for one day: these devices' pings over `span` (their first and
-    /// last labelled ping), with a margin each side, never before
+    /// last ping with the route id), with a margin each side, never before
     /// `bounds.0` nor after `bounds.1`, in stretches of at most `page_rows`
     /// rows, each read once. Stops at `until`.
     #[allow(clippy::too_many_arguments)]
     async fn day_tracks(
         &self,
-        spellings: &[String],
+        ids: &[String],
         bbox: &Bbox,
         date: chrono::NaiveDate,
         devices: &[String],
@@ -1947,7 +1879,7 @@ impl GpsLine {
                 wa,
                 wb,
                 &group,
-                spellings,
+                ids,
                 bbox,
                 s.params.bucket_s,
                 limit,
@@ -1976,16 +1908,17 @@ impl GpsLine {
     /// The trips the buses made along a route on `date` (docs section 17.8):
     /// every run that passed its stops in order, with when it did, which bus
     /// and its line - steps 1 to 3 for that one day, the busiest
-    /// [`TRIP_BUSES`] buses carrying its number. A past day's answer is kept:
-    /// it cannot change.
+    /// [`TRIP_BUSES`] buses whose trips were assigned its route id (not the
+    /// number the crew typed, see [`batch`]). A past day's answer is kept: it
+    /// cannot change.
     pub async fn trips_on(
         &self,
         q: RouteQuery<'_>,
         date: chrono::NaiveDate,
     ) -> Result<Value, GpsFailure> {
-        let spellings = label_spellings(q.short_name);
-        if spellings.is_empty() {
-            return Err(GpsFailure::NoRouteNumber);
+        let ids = route_ids(q.route_id);
+        if ids.is_empty() {
+            return Err(GpsFailure::BadRouteId);
         }
         if q.stops.len() < 2 {
             return Err(GpsFailure::NotEnoughStops(q.stops.len()));
@@ -2013,7 +1946,7 @@ impl GpsLine {
             let started = Instant::now();
             let queries_before = self.reader.sent();
             let Some(rows) = self
-                .day_bus_days(&q, &spellings, &bbox, date, now, TRIP_BUSES, until)
+                .day_bus_days(&q, &ids, &bbox, date, now, TRIP_BUSES, until)
                 .await?
             else {
                 return Err(GpsFailure::Timeout);
@@ -2026,7 +1959,7 @@ impl GpsLine {
                 (Some(first), Some(last)) => {
                     let devices: Vec<String> = buses.iter().map(|b| b.0.clone()).collect();
                     self.day_tracks(
-                        &spellings,
+                        &ids,
                         &bbox,
                         date,
                         &devices,
@@ -2088,7 +2021,7 @@ impl GpsLine {
     async fn read_and_build(
         &self,
         q: &RouteQuery<'_>,
-        spellings: &[String],
+        ids: &[String],
         now: i64,
         read_until: Instant,
         bus_days_budget: Duration,
@@ -2113,7 +2046,7 @@ impl GpsLine {
             futures::stream::iter(dates)
                 .map(|date| async move {
                     let rows = self
-                        .day_bus_days(q, spellings, &bbox, date, now, per_day, step1_until)
+                        .day_bus_days(q, ids, &bbox, date, now, per_day, step1_until)
                         .await;
                     (date, rows)
                 })
@@ -2153,9 +2086,9 @@ impl GpsLine {
         };
 
         // 2. their tracks, a few days at a time: only around the hours the
-        // chosen buses carried the route number (the sort key is the
+        // chosen buses carried the route id (the sort key is the
         // timestamp, so a narrower span is fewer rows read), with room for a
-        // run that began before its first labelled ping or ended after its
+        // run that began before its first ping with the route id or ended after its
         // last; each stretch read once, in answers of at most `page_rows` rows
         let mut by_day: BTreeMap<chrono::NaiveDate, (Vec<String>, i64, i64)> = BTreeMap::new();
         for (device, date, first, last) in &chosen {
@@ -2172,7 +2105,7 @@ impl GpsLine {
         let day_reads: Vec<Result<DayTracks, GpsFailure>> = futures::stream::iter(&days)
             .map(|(date, devices, first, last)| {
                 self.day_tracks(
-                    spellings,
+                    ids,
                     &bbox,
                     *date,
                     devices,
@@ -2211,6 +2144,7 @@ impl GpsLine {
             "days_read": days_read,
             "days_unread": unread,
             "stopped": stopped,
+            "route_id": q.route_id,
             "route_number": q.short_name.trim(),
             "stops": q.stops.len(),
             "bus_days": chosen.len(),
@@ -2796,12 +2730,12 @@ pub mod tests {
         ];
         let bbox = Bbox::around(&stops, 1_000.0).unwrap();
         assert!(bbox.min_lat < 13.0 - 0.008 && bbox.max_lon > 80.25 + 0.008);
-        let labels = label_spellings("21G");
+        let ids = route_ids(" 2288 ");
         let q1 = bus_days_sql(
             DEFAULT_TABLE,
             1_757_000_000,
             1_757_086_400,
-            &labels,
+            &ids,
             &bbox,
             120,
             4,
@@ -2811,7 +2745,7 @@ pub mod tests {
             1_757_000_000,
             1_757_007_200,
             &["864'1".into(), "x".into()],
-            &labels,
+            &ids,
             &bbox,
             20,
             4,
@@ -2827,26 +2761,27 @@ pub mod tests {
                 q.contains("lat BETWEEN") && q.contains("long BETWEEN"),
                 "box: {q}"
             );
-            // the column as it is: no per-row conversion of the label
+            // the column as it is: no per-row conversion, and never the route number
             assert!(
-                !q.contains("lowerUTF8") && !q.contains("toString(routeNumber)"),
+                !q.contains("lowerUTF8") && !q.contains("toString(route_id)"),
                 "{q}"
             );
+            assert!(!q.contains("routeNumber"), "{q}");
         }
         assert!(
-            q1.contains("routeNumber IN ('21G', ' 21G', '21G ', ' 21G ', '21g',")
-                && q1.ends_with("LIMIT 4"),
+            q1.contains("route_id IN ('2288')") && q1.ends_with("LIMIT 4"),
             "{q1}"
         );
         assert!(
             q2.contains("deviceId IN ('864\\'1', 'x')")
-                && q2.contains("(isNull(routeNumber) OR routeNumber IN ('', '21G',")
+                && q2.contains("(isNull(route_id) OR route_id IN ('', '2288'))")
                 && q2.ends_with("LIMIT 4"),
             "{q2}"
         );
-        assert_eq!(route_label(" 21G "), Some("21G".into()));
-        assert_eq!(route_label("  "), None);
-        assert_eq!(route_label("a;b"), None);
+        assert_eq!(route_ids(" 2288 "), vec!["2288".to_string()]);
+        assert!(route_ids("  ").is_empty() && route_ids("a;b").is_empty());
+        // a quote in an id cannot leave the literal
+        assert!(in_list(&route_ids("5'A")).starts_with("'5\\'A'"));
         assert_eq!(
             parse_packed("1757000000,13.1,80.2|1757000020,13.2,80.3|junk"),
             vec![
@@ -2862,48 +2797,6 @@ pub mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn a_route_number_is_matched_as_operators_type_it() {
-        let v = label_spellings("12G");
-        assert_eq!(
-            v,
-            vec!["12G", " 12G", "12G ", " 12G ", "12g", " 12g", "12g ", " 12g "]
-        );
-        // stored with a stray space, typed in any case
-        let v = label_spellings(" 51AXCT");
-        assert_eq!(v.len(), 16 * 4);
-        for spelling in ["51AXCT", " 51AXCT", "51axct", "51AxCt ", " 51aXcT "] {
-            assert!(v.contains(&spelling.to_string()), "{spelling}");
-        }
-        let v = label_spellings("57FCT");
-        assert!(v.contains(&"57Fct".to_string()) && v.contains(&"57fct".to_string()));
-        // more than six letters: as typed, upper and lower only
-        let v = label_spellings("SuperFast1");
-        assert_eq!(
-            v,
-            vec![
-                "SuperFast1",
-                " SuperFast1",
-                "SuperFast1 ",
-                " SuperFast1 ",
-                "SUPERFAST1",
-                " SUPERFAST1",
-                "SUPERFAST1 ",
-                " SUPERFAST1 ",
-                "superfast1",
-                " superfast1",
-                "superfast1 ",
-                " superfast1 ",
-            ]
-        );
-        // digits only: the number and its spaces
-        assert_eq!(label_spellings("570"), vec!["570", " 570", "570 ", " 570 "]);
-        assert!(label_spellings("  ").is_empty() && label_spellings("a;b").is_empty());
-        // a quote in a number cannot leave the literal
-        let q = in_list(&label_spellings("5'A"));
-        assert!(q.starts_with("'5\\'A', ' 5\\'A'"), "{q}");
     }
 
     #[test]
@@ -3088,7 +2981,7 @@ pub mod tests {
         }
     }
 
-    fn settings_for_tests() -> GpsLineSettings {
+    pub fn settings_for_tests() -> GpsLineSettings {
         GpsLineSettings {
             clickhouse: ClickHouseSettings {
                 url: "http://127.0.0.1:1".into(),
@@ -3130,7 +3023,7 @@ pub mod tests {
         let (stage, complete) = gps
             .read_and_build(
                 &q,
-                &label_spellings("21G"),
+                &route_ids(q.route_id),
                 now,
                 started + budget,
                 gps.settings.bus_days_budget,
@@ -3231,7 +3124,7 @@ pub mod tests {
             short_name: "21G",
             stops: &stops,
         };
-        let spellings = label_spellings("21G");
+        let ids = route_ids(q.route_id);
         let asked = || {
             rows.log
                 .lock()
@@ -3242,12 +3135,12 @@ pub mod tests {
         };
         let until = || Instant::now() + Duration::from_secs(30);
         let step1 = gps.settings.bus_days_budget;
-        gps.read_and_build(&q, &spellings, now, until(), step1)
+        gps.read_and_build(&q, &ids, now, until(), step1)
             .await
             .unwrap();
         assert_eq!(asked(), 7);
         let (stage, complete) = gps
-            .read_and_build(&q, &spellings, now, until(), step1)
+            .read_and_build(&q, &ids, now, until(), step1)
             .await
             .unwrap();
         assert!(complete);

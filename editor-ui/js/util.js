@@ -216,6 +216,77 @@ export function decodePolyline(str) {
   return pts;
 }
 
+export function lineDeviation(a, b, { step = 10, off = 50 } = {}) {
+  if (a.length < 2 || b.length < 2) return null;
+  const lat0 = a[0][0], kx = 111320 * Math.cos((lat0 * Math.PI) / 180), ky = 110540;
+  const xy = (p) => [(p[1] - a[0][1]) * kx, (p[0] - lat0) * ky];
+  const resample = (pts) => {
+    const out = [pts[0]];
+    let carry = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const [x0, y0] = xy(pts[i - 1]), [x1, y1] = xy(pts[i]);
+      const len = Math.hypot(x1 - x0, y1 - y0);
+      let at = step - carry;
+      while (at <= len) {
+        const t = at / len;
+        out.push([pts[i - 1][0] + t * (pts[i][0] - pts[i - 1][0]), pts[i - 1][1] + t * (pts[i][1] - pts[i - 1][1])]);
+        at += step;
+      }
+      carry = len - (at - step);
+    }
+    if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+    return out;
+  };
+  const length = (pts) => pts.reduce((s, p, i) => (i ? s + Math.hypot(...[0, 1].map((k) => xy(p)[k] - xy(pts[i - 1])[k])) : 0), 0);
+  const toLine = (p, segs) => {
+    let best = Infinity;
+    for (const [x0, y0, dx, dy, l2] of segs) {
+      const t = l2 ? Math.max(0, Math.min(1, ((p[0] - x0) * dx + (p[1] - y0) * dy) / l2)) : 0;
+      best = Math.min(best, Math.hypot(p[0] - x0 - t * dx, p[1] - y0 - t * dy));
+    }
+    return best;
+  };
+  const segsOf = (pts) => pts.slice(1).map((p, i) => {
+    const [x0, y0] = xy(pts[i]), [x1, y1] = xy(p);
+    const dx = x1 - x0, dy = y1 - y0;
+    return [x0, y0, dx, dy, dx * dx + dy * dy];
+  });
+  const offM = [0, 0];
+  let longest = 0, p95 = 0;
+  [[a, b], [b, a]].forEach(([from, to], side) => {
+    const segs = segsOf(to), dists = [];
+    let run = 0;
+    const close = () => {
+      longest = Math.max(longest, run * step);
+      offM[side] += run * step;
+      run = 0;
+    };
+    for (const p of resample(from)) {
+      const d = toLine(xy(p), segs);
+      dists.push(d);
+      if (d > off) run += 1;
+      else close();
+    }
+    close();
+    dists.sort((x, y) => x - y);
+    p95 = Math.max(p95, dists[Math.round((dists.length - 1) * 0.95)]);
+  });
+  const la = length(a), lb = length(b);
+  return {
+    longestM: longest,
+    oldOffM: offM[0],
+    newOffM: offM[1],
+    p95M: p95,
+    lengthRatio: la > 0 ? Math.abs(lb - la) / la : Infinity,
+  };
+}
+
+export function deviationText(d) {
+  const tail = `95% of points within ${fmtMetres(d.p95M)}; length ${Math.round(d.lengthRatio * 100)}% different.`;
+  if (!d.oldOffM && !d.newOffM) return `Within 50 m of each other all along; ${tail}`;
+  return `More than 50 m apart: ${fmtMetres(d.newOffM)} of the new line, ${fmtMetres(d.oldOffM)} of the old; longest stretch ${fmtMetres(d.longestM)}; ${tail}`;
+}
+
 // ------------------------------------------------------------------ route rules
 export const SERVED_EXCLUDE = new Set(["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"]);
 

@@ -21,6 +21,21 @@ let GtfsGps =
       , timeout_seconds : Optional Natural
       }
 
+-- Weekly drafts of routes' map lines from GPS (docs/gtfs-editor.md section 19).
+-- Needs gtfs_gps. Only author_email is required.
+let GpsPolylineSync =
+      { author_email : Text
+      , feeds : Optional (List Text)
+      , draft_size : Optional Natural
+      , bus_days_per_route : Optional Natural
+      , groups : Optional Natural
+      , osrm_parallel : Optional Natural
+      , run_budget_minutes : Optional Natural
+      , route_ids : Optional (List Text)
+      , min_runs : Optional Natural
+      , max_missed_stops : Optional Natural
+      }
+
 in {
   -- Logger configuration
   logger_cfg = logger_cfg,
@@ -134,5 +149,19 @@ in {
   -- on every query), one query at a time, and only bounded SELECTs.
   gtfs_gps = None GtfsGps,
   gtfs_gps_clickhouse_password = secrets.clickhouse_password,
+  -- Off here. To turn it on:
+  --   gtfs_gps_polyline_sync = Some
+  --     { author_email = "gps-polyline-sync@nammayatri.in"
+  --     , feeds = Some [ "chennai_bus" ]
+  --     , draft_size = None Natural
+  --     , bus_days_per_route = None Natural
+  --     , groups = None Natural
+  --     , osrm_parallel = None Natural
+  --     , run_budget_minutes = None Natural
+  --     , route_ids = None (List Text)
+  --     , min_runs = None Natural
+  --     , max_missed_stops = None Natural
+  --     },
+  gtfs_gps_polyline_sync = None GpsPolylineSync,
   gen_int_for_id = Some True,
 }

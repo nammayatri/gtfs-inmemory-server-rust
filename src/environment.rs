@@ -197,6 +197,49 @@ pub struct AppConfig {
     /// The password of `gtfs_gps.user` (secrets dhall).
     #[serde(default)]
     pub gtfs_gps_clickhouse_password: Option<String>,
+    /// Weekly drafts of routes' map lines from GPS.
+    /// Absent - the default - and nothing runs. Needs `gtfs_gps`.
+    #[serde(default)]
+    pub gtfs_gps_polyline_sync: Option<GpsPolylineSyncConfig>,
+}
+
+/// The weekly GPS polyline sync block of [`AppConfig`]. Only `author_email` is required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpsPolylineSyncConfig {
+    /// The editor account the drafts are made as, created once from the dashboard's Users page.
+    pub author_email: String,
+    /// Default `["chennai_bus"]`.
+    #[serde(default)]
+    pub feeds: Option<Vec<String>>,
+    /// Routes per draft: a week's proposals go into drafts of at most this
+    /// many. Default 100.
+    #[serde(default)]
+    pub draft_size: Option<u32>,
+    /// Bus-days read per route. Default 16.
+    #[serde(default)]
+    pub bus_days_per_route: Option<u32>,
+    /// Routes are read and built this many groups at a time; more groups,
+    /// less memory. Default 8.
+    #[serde(default)]
+    pub groups: Option<u32>,
+    /// Routes built and snapped by OSRM at once. Default 4.
+    #[serde(default)]
+    pub osrm_parallel: Option<u32>,
+    /// The whole run. Default 360.
+    #[serde(default)]
+    pub run_budget_minutes: Option<u32>,
+    /// Only these route ids, e.g. `["761", "1987"]` (testing). Default: every
+    /// route.
+    #[serde(default)]
+    pub route_ids: Option<Vec<String>>,
+    /// Runs a proposal needs. Default 3.
+    #[serde(default)]
+    pub min_runs: Option<u32>,
+    /// A changed line misses at most this many served stops (more than 30 m
+    /// away), or no more than the live line. Default 5. Not applied to a route
+    /// with no line.
+    #[serde(default)]
+    pub max_missed_stops: Option<u32>,
 }
 
 /// The GPS block of [`AppConfig`]. Only `url` and `user` are required.

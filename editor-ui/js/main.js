@@ -262,7 +262,9 @@ function route() {
   } else if (parts[0] === "route" && parts[1]) {
     markNav("map"); showWorkspace(true); // ?draft=1 asks for the draft applied; without it the route page decides (it
     // applies the draft whenever the draft touches the route)
-    showRoute(parts[1], { preview: params.get("draft") === "1" ? true : undefined });
+    // ?draft=<change set id> shows that set's version, read-only when it is not the open draft
+    const d = params.get("draft");
+    showRoute(parts[1], { preview: d === "1" || (d && d !== "0") ? true : undefined, draftId: d && d !== "1" && d !== "0" ? d : undefined });
   } else if (parts[0] === "stage" && parts[1]) {
     markNav("stages"); showWorkspace(true); showStage(parts[1]);
   } else if (parts[0] === "diversions") {
