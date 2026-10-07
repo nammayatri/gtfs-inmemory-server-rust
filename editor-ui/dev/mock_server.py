@@ -1505,6 +1505,10 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.stop_detail(g, rest[1])
             if rest == ["routes"] and method == "GET":
                 return 200, self.list_routes(g, q)
+            # stage search (docs section 19): the feeds report use_stages, so the
+            # search box asks; the sample has no stages, so it finds none
+            if rest == ["stages"] and method == "GET":
+                return 200, paginate([], q)
             if len(rest) == 2 and rest[0] == "routes" and method == "GET":
                 if (g, rest[1]) not in s.routes:
                     raise ApiError(404, "unknown_route", f"Route {rest[1]} does not exist.")
