@@ -830,22 +830,66 @@ pub fn feed_data_tables() -> Vec<String> {
     tables
 }
 
-/// Empty feed `g`'s GTFS tables ([`feed_data_tables`]) inside the caller's
-/// transaction, which holds the feed's lock: what each held, by table, for the
-/// reload's report and its audit row.
+/// The stage tables (section 19) a reload clears with the feed, in an order
+/// their keys allow: the links from routes to stages, the stages' stops, the
+/// stages, then what reviewing them found. A stage is a list of the feed's
+/// stops, so it cannot outlive them; a feed reloaded from a zip is served from
+/// the zip's stop lists, and its stages are mapped again from those.
+const STAGE_TABLES: &[&str] = &[
+    "gtfs_route_stage",
+    "gtfs_stage_stop",
+    "gtfs_stage",
+    "gtfs_stage_review",
+    "gtfs_route_stage_issue",
+];
+
+/// Empty feed `g`'s stage tables ([`STAGE_TABLES`]) and GTFS tables
+/// ([`feed_data_tables`]) inside the caller's transaction, which holds the
+/// feed's lock: what each held, by table, for the reload's report and its
+/// audit row.
 async fn clear_feed_data(conn: &mut PgConnection, g: &str) -> EditorResult<BTreeMap<String, u64>> {
     let mut gone = BTreeMap::new();
-    for table in feed_data_tables() {
+    let tables = STAGE_TABLES
+        .iter()
+        .map(|t| t.to_string())
+        .chain(feed_data_tables());
+    for table in tables {
         let n = sqlx::query(&format!("DELETE FROM {table} WHERE gtfs_id = $1"))
             .bind(g)
             .execute(&mut *conn)
-            .await?
+            .await
+            .map_err(|e| still_used(e, &table))?
             .rows_affected();
         if n > 0 {
             gone.insert(table, n);
         }
     }
     Ok(gone)
+}
+
+/// A delete that rows of a table the reload does not know still point at: 409
+/// naming that table and its key, instead of a bare "database error". The
+/// message is Postgres's own for a foreign key, which names tables and the
+/// constraint, never values.
+fn still_used(e: sqlx::Error, table: &str) -> EditorError {
+    let Some(d) = e.as_database_error() else {
+        return e.into();
+    };
+    if d.code().as_deref() != Some("23503") {
+        return e.into();
+    }
+    let from = d.table().unwrap_or("another table").to_string();
+    let constraint = d.constraint().unwrap_or_default().to_string();
+    tracing::warn!(tag = "[GTFS EDITOR RELOAD]", table, from = %from, constraint = %constraint, "a reload's delete is blocked");
+    EditorError::conflict(
+        "feed_data_in_use",
+        format!(
+            "the reload cannot delete the feed's {table}: rows of {from} still point at them \
+             ({constraint}). That table is not one the reload knows to clear; clear the feed's \
+             rows in it first"
+        ),
+    )
+    .with_details(json!({"table": table, "referenced_from": from, "constraint": constraint}))
 }
 
 /// Write `m` into feed `g`, which must have no rows yet, inside the caller's
@@ -1385,6 +1429,10 @@ pub struct ImportReport {
     /// zip makes active again - any zip but the feed's full download, which
     /// marks them.
     pub reactivated: Vec<String>,
+    /// A reload of a feed served from its stages (section 19): its stages are
+    /// deleted with it and it is served from the zip's stop lists, until they
+    /// are mapped again.
+    pub stages_turned_off: bool,
     /// What the zip breaks of the GTFS reference, as the feed report reads it:
     /// kept, as the import keeps what the feed ships.
     pub validation: crate::gtfs::validate::Report,
@@ -1504,6 +1552,7 @@ async fn load_zip(
         stage_stops: 0,
         replaced: None,
         reactivated: vec![],
+        stages_turned_off: false,
         validation: crate::gtfs::validate::summarise(
             &crate::gtfs::validate::validate(&m, &chrono::Utc::now().date_naive().to_string()),
             5,
@@ -1549,6 +1598,15 @@ async fn load_zip(
             })
             .collect();
         report.replaced = Some(clear_feed_data(&mut tx, &g).await?);
+        // its stages are gone, so it is served from the stop lists the zip
+        // gives, which the round trip below reads back
+        report.stages_turned_off = sqlx::query_scalar::<_, bool>(
+            "UPDATE gtfs_feed SET use_stages = false WHERE gtfs_id = $1 AND use_stages RETURNING true",
+        )
+        .bind(&g)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
     }
     let seeded = seed(&mut tx, &g, &m, &who.label).await?;
     report.stage_stops = seeded.stage_stops;
@@ -1584,6 +1642,7 @@ async fn load_zip(
             "stage_stops": seeded.stage_stops,
             "replaced": report.replaced,
             "reactivated": report.reactivated,
+            "stages_turned_off": report.stages_turned_off,
         }),
     )
     .await?;
