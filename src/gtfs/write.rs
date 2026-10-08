@@ -165,14 +165,16 @@ pub fn to_raw(m: &FeedModel) -> RawFeed {
         // A trip left with fewer than two calls is not a trip a feed may carry,
         // so while a stop is out of use (section 21) a trip that called at two
         // stops and now calls at one is not published at all - neither its
-        // trips.txt row nor its frequencies. It comes back with the stop.
-        if pattern
+        // trips.txt row nor its frequencies. It comes back with the stop. Only
+        // a trip the out-of-use stops shortened: one the feed itself has with a
+        // single call (chennai_bus has 158) is written as it came, or a reload
+        // of the feed's own zip would not round-trip.
+        let calls = pattern
             .stops
             .iter()
             .filter(|s| !m.unserviceable.contains(&s.stop_id))
-            .count()
-            < 2
-        {
+            .count();
+        if calls < 2 && calls < pattern.stops.len() {
             continue;
         }
         trips_out.push_row(
@@ -384,4 +386,60 @@ pub fn zip_bytes(raw: &RawFeed) -> Result<Vec<u8>, String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(w.finish().map_err(|e| e.to_string())?.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_raw;
+    use crate::gtfs::model::{BuildOptions, FeedModel};
+    use crate::gtfs::read::{parse_csv, RawFeed};
+
+    fn feed() -> FeedModel {
+        let mut raw = RawFeed::default();
+        for (name, text) in [
+            ("agency.txt", "agency_id,agency_name,agency_url,agency_timezone\nA,Bus,https://b.example,Asia/Kolkata"),
+            ("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\nP1,One,13.0,80.0\nP2,Two,13.1,80.1"),
+            ("routes.txt", "route_id,agency_id,route_short_name,route_type\nR1,A,1,3\nR2,A,2,3"),
+            ("trips.txt", "route_id,service_id,trip_id\nR1,WK,ONE\nR2,WK,TWO"),
+            ("stop_times.txt", "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                ONE,06:00:00,06:00:00,P1,1\n\
+                TWO,07:00:00,07:00:00,P1,1\nTWO,07:05:00,07:05:00,P2,2"),
+            ("calendar.txt", "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nWK,1,1,1,1,1,0,0,20260101,20261231"),
+        ] {
+            raw.files.insert(name.to_string(), parse_csv(text, name, &mut Vec::new()));
+        }
+        FeedModel::from_raw(&raw, "t", BuildOptions::default()).0
+    }
+
+    fn trips(m: &FeedModel) -> Vec<String> {
+        // no trip left: no trips.txt at all
+        let out = to_raw(m);
+        out.table("trips.txt")
+            .map(|t| {
+                t.rows
+                    .iter()
+                    .map(|r| t.cell(r, "trip_id").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_trip_the_feed_has_with_one_call_is_written_as_it_came() {
+        assert_eq!(trips(&feed()), vec!["ONE", "TWO"]);
+    }
+
+    #[test]
+    fn a_trip_an_out_of_use_stop_leaves_with_one_call_is_not_written() {
+        let mut m = feed();
+        m.unserviceable.insert("P2".into());
+        // TWO is down to P1 alone; ONE always called at P1 alone
+        assert_eq!(trips(&m), vec!["ONE"]);
+        m.unserviceable.insert("P1".into());
+        assert!(
+            trips(&m).is_empty(),
+            "ONE has no call left: {:?}",
+            trips(&m)
+        );
+    }
 }
