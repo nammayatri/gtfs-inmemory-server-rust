@@ -12,7 +12,7 @@ import { get, post, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
 import { h, clear, toast, confirmDialog, fmtCount, fmtDate, plural } from "./util.js";
 import * as map from "./map.js";
-import { addChange, requireDraft } from "./drafts.js";
+import { addChange, requireDraft, stageChanges, sameStageKey, stageKey } from "./drafts.js";
 import { stopPicker } from "./picker.js";
 import { nameHere } from "./trail.js";
 
@@ -123,8 +123,10 @@ function flashNotice() {
 }
 
 // ------------------------------------------------------------------ the list
-export async function showStageReviewsList() {
+export async function showStageReviewsList({ q = null } = {}) {
   resetForFeed();
+  // a stage's page links here by its name
+  if (q !== null && q !== list.q) Object.assign(list, { q, items: [], cursor: null, loaded: false });
   setLeaveGuard(null);
   leaveStageReviews();
   map.endModes();
@@ -343,7 +345,7 @@ function neighbours(label, list) {
     ]));
 }
 
-function candidateCard(c, onUse, inList, split) {
+function candidateCard(c, onUse, inList, split, movedTo) {
   const names = c.stop_names || [];
   const same = c.stops.length === inList.length
     && c.stops.every((id, i) => id === inList[i]);
@@ -356,7 +358,8 @@ function candidateCard(c, onUse, inList, split) {
       h("strong", plural(c.stops.length, "stop")),
       h("span.hint", plural(c.route_count, "route")),
       same ? h("span.chip", "the list above") : null,
-      c.chosen && !same ? h("span.chip", "what the backfill chose") : null),
+      c.chosen && !same ? h("span.chip", "what the backfill chose") : null,
+      movedTo ? h("span.chip.draft", `moved to ${movedTo} in your draft`) : null),
     h("ol.stop-choice-stops", names.map((name, i) => h("li",
       { class: inList.includes(c.stops[i]) ? "" : "is-new" }, name))),
     // where these routes came from and where they go next: a stage the routes
@@ -366,7 +369,7 @@ function candidateCard(c, onUse, inList, split) {
     neighbours("then goes to", c.goes_to),
     h("p.hint", `Routes ${(c.routes || []).slice(0, 6).join(", ")}`
       + (c.route_count > 6 ? ` and ${c.route_count - 6} more` : "")),
-    h("div.btn-row",
+    onUse ? h("div.btn-row",
       h("button.btn.secondary.small", {
         type: "button", disabled: same,
         on: { click: () => onUse(c) },
@@ -374,12 +377,12 @@ function candidateCard(c, onUse, inList, split) {
       // The other way out of a disagreement: these routes are not wrong, they
       // are a different stage. Give them one of their own and leave the rest
       // of the routes on this one.
-      split && !split.open ? h("button.btn.quiet.small", {
+      split && !split.open && !movedTo ? h("button.btn.quiet.small", {
         type: "button", disabled: !allKnown,
         title: allKnown ? null
           : `The review names only ${known} of this list's ${c.route_count} routes, so they cannot all be moved.`,
         on: { click: () => split.start(c) },
-      }, "Create a new stage") : null),
+      }, "Create a new stage") : null) : null,
     split && split.open ? split.form(c, allKnown) : null);
 }
 
@@ -595,7 +598,24 @@ function stopListEditor({ rows: start, editable, idPrefix, layer, color, empty, 
   return api;
 }
 
-export async function showStageReview(id) {
+// What the open draft already does to stage `key`: edits it, takes routes off
+// it onto a new stage, or merges other stages into it.
+function draftFor(key) {
+  const none = { edits: [], splits: [], merges: [], any: false };
+  if (!state.draft || !key) return none;
+  const all = state.draft.changes.filter((c) => c.entity === "stage" && c.after);
+  const out = {
+    edits: stageChanges(key).filter((c) => c.op === "update"),
+    splits: all.filter((c) => c.op === "split" && sameStageKey(c.after.from_stage_id || "", key)),
+    merges: all.filter((c) => c.op === "merge" && sameStageKey(c.after.into_stage_id || "", key)),
+  };
+  out.any = out.edits.length + out.splits.length + out.merges.length > 0;
+  return out;
+}
+
+// `keep`: the stops and name being edited, carried over when the page is drawn
+// again after a split or a merge went into the draft, so they are not lost.
+export async function showStageReview(id, { keep = null } = {}) {
   resetForFeed();
   setLeaveGuard(null);
   map.endModes();
@@ -611,9 +631,31 @@ export async function showStageReview(id) {
       h("p.notice.error", e.message)));
   }
   nameHere(`Review: ${r.name}`);
-  const stage = (r.stages || [])[0];
+  let stage = (r.stages || [])[0];
+  // A draft that already changes this stage is what the reviewer is working
+  // in: show the stage with it applied, or Save and the split and merge
+  // buttons offer again what the draft already does, and a second Save starts
+  // from the live stops and drops the first one's edits.
+  const key = stage && stageKey(stage);
+  const drafted = draftFor(key);
+  let previewFailed = null;
+  if (drafted.any) {
+    try {
+      const mine = await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(key)}`);
+      stage = { ...stage, name: mine.name, description: mine.description, rows: mine.rows, routes: mine.routes, route_count: mine.route_count };
+    } catch (e) {
+      previewFailed = e.message;
+    }
+  }
+  // routes the draft has already taken off this stage, and the stage each went to
+  const movedTo = new Map();
+  for (const c of drafted.splits) for (const rt of c.after.routes || []) movedTo.set(rt, c.after.name || c.entity_key);
+  const mergingIn = new Set(drafted.merges.map((c) => c.entity_key));
   const ev = r.evidence || {};
   const editable = can("editor") && r.status === "pending" && !!stage;
+  // a review whose stages have all gone (merged or deleted) has nothing to
+  // edit, and is still closed: it said something about stages no longer there
+  const canClose = can("editor") && r.status === "pending";
 
   // ---- moving between the stages of this name without going back to the list.
   // MOOLAKADAI is up and down, and several of MTC's stops besides; a person
@@ -684,11 +726,14 @@ export async function showStageReview(id) {
     save.disabled = !dirty();
     unsaved.hidden = !dirty();
     const inList = kept().map((x) => x.stop_id).filter(Boolean);
-    clear(candidateEl, candidates.map((c) => candidateCard(c, useList, inList, {
-      open: splitting === c,
-      start: startSplit,
-      form: splitForm,
-    })));
+    clear(candidateEl, candidates.map((c) => {
+      const to = (c.routes || []).length && c.routes.every((rt) => movedTo.has(rt)) ? movedTo.get(c.routes[0]) : null;
+      return candidateCard(c, editable ? useList : null, inList, editable ? {
+        open: splitting === c,
+        start: startSplit,
+        form: splitForm,
+      } : null, to);
+    }));
   };
 
   // A route's list as stage rows. A stop is its id; a map point (a ROUTE
@@ -848,7 +893,7 @@ export async function showStageReview(id) {
       toast(`${name} is in your draft, and ${plural(routeIds.length, "route")} now run it.`, "ok");
       if (newEditor) newEditor.destroy();
       newEditor = null;
-      showStageReview(id);
+      showStageReview(id, { keep: editing() });
       return;
     } catch (e) {
       toast(e.message, "error");
@@ -898,7 +943,6 @@ export async function showStageReview(id) {
         return void (save.disabled = false);
       }
       toast(`Saved to draft “${(state.draft && state.draft.title) || "untitled"}”. Mark the review fixed when you are happy.`, "ok");
-      if (state.draft) draftInput.value = state.draft.change_set_id;
       showStageReview(id);
     } catch (e) {
       toast(e.message, "error");
@@ -913,8 +957,11 @@ export async function showStageReview(id) {
     on: { input: () => { save.disabled = !dirty(); unsaved.hidden = !dirty(); } },
   });
   started = shape();
+  const editing = () => (dirty() ? { name: nameInput.value, rows: kept() } : null);
   const note = h("textarea", { id: "stage-review-note", rows: "2", placeholder: "What you found, and what you did about it" });
   const draftInput = h("input", { type: "text", id: "stage-review-draft", placeholder: "Draft id (optional)", autocomplete: "off", spellcheck: "false" });
+  // the draft that holds the fix is the one to name
+  if (drafted.any) draftInput.value = state.draft.change_set_id;
 
   const close = async (decision) => {
     const body = { decision };
@@ -926,6 +973,9 @@ export async function showStageReview(id) {
     }
     const set = draftInput.value.trim();
     if (decision === "fixed" && set) body.change_set = set;
+    if (decision === "fixed" && !set && stage && !(await confirmDialog("Mark it fixed without naming a draft?",
+      "Nothing records what fixed it. If the fix is in a draft, put that draft's id in Draft first, so whoever approves it can see why.",
+      { confirm: "Mark fixed" }))) return;
     try {
       const after = await post(`stage-reviews/${enc(id)}/close`, body);
       flash = {
@@ -940,8 +990,8 @@ export async function showStageReview(id) {
       toast(e.message, "error");
     }
   };
-  const fixed = h("button.btn", { type: "button", hidden: !editable, on: { click: () => close("fixed") } }, "Mark fixed");
-  const left = h("button.btn.secondary", { type: "button", hidden: !editable, on: { click: () => close("confirmed") } }, "Leave it alone");
+  const fixed = h("button.btn", { type: "button", hidden: !canClose, on: { click: () => close("fixed") } }, "Mark fixed");
+  const left = h("button.btn.secondary", { type: "button", hidden: !canClose, on: { click: () => close("confirmed") } }, "Leave it alone");
   const reopen = h("button.btn.secondary", {
     type: "button", hidden: !(can("editor") && ["fixed", "confirmed"].includes(r.status)),
     on: { click: async () => {
@@ -971,18 +1021,20 @@ export async function showStageReview(id) {
       : "Merge the ones you pick into this one";
     clear(mergeEl, siblings.map((sib) => {
       const on = picked.has(sib.stage_key);
+      const done = [...mergingIn].some((k) => sameStageKey(k, sib.stage_key));
       return h("li.stop-choice", { class: on ? "stop-choice is-current" : "stop-choice" },
         h("div.stop-choice-head",
           h("strong", sib.name),
           h("span.hint", `stage ${sib.stage_id}`),
           h("span.hint", plural(sib.stop_count, "stop")),
           h("span.hint", plural(sib.route_count, "route")),
-          sib.review ? h("span.chip.warn", "to review") : null),
+          sib.review ? h("span.chip.warn", "to review") : null,
+          done ? h("span.chip.draft", "merged in your draft") : null),
         h("div.btn-row",
-          h("button.btn.secondary.small", {
+          editable && !done ? h("button.btn.secondary.small", {
             type: "button",
             on: { click: () => { on ? picked.delete(sib.stage_key) : picked.add(sib.stage_key); drawMerge(); } },
-          }, on ? "Chosen — click to drop" : "Merge this one in"),
+          }, on ? "Chosen — click to drop" : "Merge this one in") : null,
           h("a.btn.quiet.small", { href: `#/stage/${enc(sib.stage_key)}` }, "Open")));
     }));
   };
@@ -1012,8 +1064,7 @@ export async function showStageReview(id) {
     }
     if (added) {
       toast(`${plural(added, "stage")} merged in your draft “${(state.draft && state.draft.title) || "untitled"}”.`, "ok");
-      if (state.draft) draftInput.value = state.draft.change_set_id;
-      showStageReview(id);
+      showStageReview(id, { keep: editing() });
       return;
     }
     drawMerge();
@@ -1044,6 +1095,17 @@ export async function showStageReview(id) {
         r.review_note ? [h("dt", "Note"), h("dd", r.review_note)] : null,
         r.change_set_id ? [h("dt", "Draft"), h("dd", h("a", { href: `#/drafts/${enc(r.change_set_id)}` }, r.change_set_title || r.change_set_id))] : null)),
     !stage ? h("section.section", h("p.notice.error", "No stage of this name is live any more.")) : null,
+    stage && drafted.any ? h("section.section", h("div.notice.draft.pending",
+      h("p", h("strong", `Your draft “${state.draft.title}” already changes this stage: `),
+        [
+          drafted.edits.length ? "its stops or name" : null,
+          drafted.splits.length ? `${plural(movedTo.size, "route")} moved to ${drafted.splits.map((c) => c.after.name || c.entity_key).join(", ")}` : null,
+          drafted.merges.length ? `${plural(drafted.merges.length, "stage")} merged into it` : null,
+        ].filter(Boolean).join("; "), "."),
+      previewFailed
+        ? h("p", `The draft could not be applied to show it (${previewFailed}), so this is the live stage.`)
+        : h("p", "What you see here has the draft applied. Saving changes the same draft."),
+      h("p", h("a", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft")))) : null,
     stage ? h("section.section",
       h("h2", "The stage's stops", unsaved),
       h("p.hint", editable
@@ -1092,12 +1154,19 @@ export async function showStageReview(id) {
         h("a", { href: `#/merge/${enc(ev.heads[0])}?with=${enc(ev.heads.slice(1).join(","))}` },
           `merge ${plural(ev.heads.length, "stop")} into one`),
         ". The stage comes right on its own once the stops are one.")) : null,
-    editable || !reopen.hidden ? h("section.section",
+    canClose || !reopen.hidden ? h("section.section",
       h("h2", "Close it"),
-      editable ? h("p.hint", "Mark it fixed once the stops are right (name the draft if you like), or leave it alone if the routes really do differ and nothing should change.") : null,
-      editable ? h("label.field", { for: "stage-review-note" }, h("span", "Note"), note) : null,
-      editable ? h("label.field", { for: "stage-review-draft" }, h("span", "Draft"), draftInput) : null,
+      canClose ? h("p.hint", stage
+        ? "Mark it fixed once the stops are right (name the draft if you like), or leave it alone if the routes really do differ and nothing should change."
+        : "Its stages are gone, so there is nothing left to fix here: mark it fixed, naming the draft that merged or deleted them if you have it.") : null,
+      canClose ? h("label.field", { for: "stage-review-note" }, h("span", "Note"), note) : null,
+      canClose ? h("label.field", { for: "stage-review-draft" }, h("span", "Draft"), draftInput) : null,
       h("div.btn-row", fixed, left, reopen)) : null);
-  editor.draw();
+  if (keep) {
+    nameInput.value = keep.name;
+    editor.setRows(keep.rows);
+  } else {
+    editor.draw();
+  }
   drawMerge();
 }

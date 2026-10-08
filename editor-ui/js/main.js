@@ -285,7 +285,7 @@ function route() {
   } else if (parts[0] === "stage-reviews" && parts[1]) {
     markNav("stage-reviews"); showWorkspace(true); showStageReview(parts[1]);
   } else if (parts[0] === "stage-reviews") {
-    markNav("stage-reviews"); showWorkspace(true); showStageReviewsList();
+    markNav("stage-reviews"); showWorkspace(true); showStageReviewsList({ q: params.get("q") });
   } else if (parts[0] === "coordinates" && parts[1]) {
     markNav("coordinates"); showWorkspace(true); showCoordinateReview(parts[1]);
   } else if (parts[0] === "coordinates") {

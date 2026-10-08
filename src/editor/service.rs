@@ -1532,13 +1532,30 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
             ("route", key),
         ],
         ("service", "create") => vec![("service", key)],
-        ("stage", "create" | "split") => vec![("stage", key)],
+        // named by its id alone, with the direction in `after`; recorded as the
+        // pair, so making `143|down` cannot hide a conflict on the live `143|up`
+        ("stage", "create" | "split") => vec![(
+            "stage",
+            super::stages::StageKey::new(&key, c.after["direction"].as_str()).entity_key(),
+        )],
         (e, "create") if super::records::spec_for(e).is_some() => {
             vec![("record", format!("{e}#{key}"))]
         }
         // replacing a stop order that does not exist creates it
         ("route_stops", "replace") => vec![("pattern", format!("{key}#{}", pattern_of(&c.after)))],
         _ => vec![],
+    }
+}
+
+/// Whether `want`, a stage as a change names it, is the stage `made`, an
+/// `id|direction` pair from [`created_by`]. The pair must match both ways; a
+/// bare id, from before direction joined the key, names the stage whichever way
+/// it runs.
+fn same_stage(want: &str, made: &str) -> bool {
+    let made = super::stages::StageKey::parse(made);
+    match want.split_once('|') {
+        Some((id, direction)) => id == made.stage_id && direction == made.direction,
+        None => want == made.stage_id,
     }
 }
 
@@ -1818,7 +1835,16 @@ pub async fn evaluate(
             conn,
             g,
             c,
-            &|kind, key| created.iter().any(|(k, v)| *k == kind && v.as_str() == key),
+            &|kind, key| {
+                created.iter().any(|(k, v)| {
+                    *k == kind
+                        && if kind == "stage" {
+                            same_stage(key, v)
+                        } else {
+                            v.as_str() == key
+                        }
+                })
+            },
             &|route, variant| lists.contains(&(route.to_string(), variant.to_string())),
         )
         .await?;
@@ -4358,7 +4384,7 @@ pub fn editable(set: &ChangeSet) -> EditorResult<()> {
 }
 
 /// The `after` of the create, earlier in the set, that makes row `key` (a stop
-/// or station for `routes = false`, a route otherwise).
+/// or station for kind `stop`, a route or a stage otherwise).
 async fn created_in_set(
     conn: &mut PgConnection,
     change_set_id: Uuid,
@@ -4367,7 +4393,7 @@ async fn created_in_set(
 ) -> EditorResult<Option<(String, Value)>> {
     let entities: &[&str] = match kind {
         "route" => &["route"],
-        "stage" => &["stage"],
+        "stage" => return stage_created_in_set(conn, change_set_id, key).await,
         _ => &["stop", "station"],
     };
     let row = sqlx::query(
@@ -4384,6 +4410,39 @@ async fn created_in_set(
         Some(r) => Some((r.try_get("entity")?, json_col(&r, "after")?)),
         None => None,
     })
+}
+
+/// The stage `key` (`id|direction`, or a bare id) as a create or a split
+/// earlier in the set makes it. Both name the stage by its id alone and carry
+/// the direction in `after`; a split's routes are not part of the stage.
+async fn stage_created_in_set(
+    conn: &mut PgConnection,
+    change_set_id: Uuid,
+    key: &str,
+) -> EditorResult<Option<(String, Value)>> {
+    let id = super::stages::StageKey::parse(key).stage_id;
+    let rows = sqlx::query(
+        "SELECT after::text AS after FROM gtfs_change \
+         WHERE change_set_id = $1 AND entity = 'stage' AND op IN ('create', 'split') \
+           AND entity_key = $2 \
+         ORDER BY position",
+    )
+    .bind(change_set_id)
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for r in rows {
+        let mut after = json_col(&r, "after")?;
+        let made = super::stages::StageKey::new(&id, after["direction"].as_str()).entity_key();
+        if same_stage(key, &made) {
+            if let Some(m) = after.as_object_mut() {
+                m.remove("from_stage_id");
+                m.remove("routes");
+            }
+            return Ok(Some(("stage".to_string(), after)));
+        }
+    }
+    Ok(None)
 }
 
 /// The `after` of the create, earlier in the set, that makes service `key`.

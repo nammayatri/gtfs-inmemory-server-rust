@@ -195,55 +195,59 @@ const VIEWER: &str = "viewer@editor-stage-review-test.invalid";
 /// backfill raises `head_differs` for, plus a KOYAMBEDU pair the routes spell two
 /// ways. The rows are the shape `scripts/backfill_stages.py` writes.
 fn seed() -> Vec<String> {
-    let mut s = clear_feed(FEED);
+    seed_for(FEED, &[ADMIN, EDITOR, VIEWER])
+}
+
+fn seed_for(feed: &str, accounts: &[&str]) -> Vec<String> {
+    let mut s = clear_feed(feed);
     s.push(format!(
-        "INSERT INTO gtfs_feed (gtfs_id, display_name, use_stages) VALUES ('{FEED}', 'Stage review test feed', true)"
+        "INSERT INTO gtfs_feed (gtfs_id, display_name, use_stages) VALUES ('{feed}', 'Stage review test feed', true)"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stop (gtfs_id, stop_id, stop_code, name, lat, lon) \
-         SELECT '{FEED}', c, c, 'STOP ' || c, 13.0 + ascii(c) * 0.001, 80.2 \
+         SELECT '{feed}', c, c, 'STOP ' || c, 13.0 + ascii(c) * 0.001, 80.2 \
          FROM unnest(ARRAY['A','B','C','D','E']) c"
     ));
     s.push(format!(
         "INSERT INTO gtfs_route (gtfs_id, route_id, short_name, long_name, agency_id) VALUES \
-         ('{FEED}', 'R1', '1', 'up', 'AG'), ('{FEED}', 'R2', '2', 'also up', 'AG')"
+         ('{feed}', 'R1', '1', 'up', 'AG'), ('{feed}', 'R2', '2', 'also up', 'AG')"
     ));
     // SAIDAPET: R1 starts it at A, R2 at B - the same name, two places
     s.push(format!(
         "INSERT INTO gtfs_stage (gtfs_id, stage_id, name, direction, review, provenance) VALUES \
-         ('{FEED}', 'stg_one', 'SAIDAPET', 'up', 'head_differs', \
+         ('{feed}', 'stg_one', 'SAIDAPET', 'up', 'head_differs', \
           '{{\"source\": \"backfill\", \"review\": {{\"heads\": [\"A\", \"B\"]}}}}'::jsonb), \
-         ('{FEED}', 'stg_two', 'SAIDAPET', 'up', 'head_differs', \
+         ('{feed}', 'stg_two', 'SAIDAPET', 'up', 'head_differs', \
           '{{\"source\": \"backfill\"}}'::jsonb), \
-         ('{FEED}', 'stg_other', 'SAIDAPET', 'down', NULL, '{{\"source\": \"backfill\"}}'::jsonb)"
+         ('{feed}', 'stg_other', 'SAIDAPET', 'down', NULL, '{{\"source\": \"backfill\"}}'::jsonb)"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stage_stop (gtfs_id, stage_id, direction, position, stop_id, stop_type) VALUES \
-         ('{FEED}', 'stg_one', 'up', 1, 'A', 'NEW STOP'), \
-         ('{FEED}', 'stg_one', 'up', 2, 'C', 'INTERMEDIATE STOP'), \
-         ('{FEED}', 'stg_one', 'up', 3, 'D', 'INTERMEDIATE STOP'), \
-         ('{FEED}', 'stg_two', 'up', 1, 'B', 'NEW STOP'), \
-         ('{FEED}', 'stg_other', 'down', 1, 'E', 'NEW STOP')"
+         ('{feed}', 'stg_one', 'up', 1, 'A', 'NEW STOP'), \
+         ('{feed}', 'stg_one', 'up', 2, 'C', 'INTERMEDIATE STOP'), \
+         ('{feed}', 'stg_one', 'up', 3, 'D', 'INTERMEDIATE STOP'), \
+         ('{feed}', 'stg_two', 'up', 1, 'B', 'NEW STOP'), \
+         ('{feed}', 'stg_other', 'down', 1, 'E', 'NEW STOP')"
     ));
     s.push(format!(
         "INSERT INTO gtfs_route_stage (gtfs_id, route_id, position, stage_id, direction, stage_no) VALUES \
-         ('{FEED}', 'R1', 1, 'stg_one', 'up', 1), ('{FEED}', 'R2', 1, 'stg_two', 'up', 1)"
+         ('{feed}', 'R1', 1, 'stg_one', 'up', 1), ('{feed}', 'R2', 1, 'stg_two', 'up', 1)"
     ));
     s.push(format!(
         "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, provider_id) VALUES \
-         ('{FEED}', 'R1', 1, 'A', 'NEW STOP', 1, 'SAIDAPET', '11'), \
-         ('{FEED}', 'R1', 2, 'C', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11'), \
-         ('{FEED}', 'R1', 3, 'D', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11'), \
-         ('{FEED}', 'R2', 1, 'B', 'NEW STOP', 1, 'SAIDAPET', '22')"
+         ('{feed}', 'R1', 1, 'A', 'NEW STOP', 1, 'SAIDAPET', '11'), \
+         ('{feed}', 'R1', 2, 'C', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11'), \
+         ('{feed}', 'R1', 3, 'D', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11'), \
+         ('{feed}', 'R2', 1, 'B', 'NEW STOP', 1, 'SAIDAPET', '22')"
     ));
     s.push(format!(
         "INSERT INTO gtfs_stage_review (gtfs_id, batch, name, name_key, direction, reason, impact, evidence) VALUES \
-         ('{FEED}', 'test batch', 'SAIDAPET', 'SAIDAPET', 'up', 'head_differs', 40, \
+         ('{feed}', 'test batch', 'SAIDAPET', 'SAIDAPET', 'up', 'head_differs', 40, \
           '{{\"heads\": [\"A\", \"B\"], \"routes\": [\"R1\", \"R2\"], \"stages\": [\"stg_one\", \"stg_two\"]}}'::jsonb), \
-         ('{FEED}', 'test batch', 'KOYAMBEDU', 'KOYAMBEDU', 'up', 'stretch_differs', 4, \
+         ('{feed}', 'test batch', 'KOYAMBEDU', 'KOYAMBEDU', 'up', 'stretch_differs', 4, \
           '{{\"stops\": [\"C\"], \"routes\": [\"R1\"]}}'::jsonb)"
     ));
-    s.extend(reset_accounts(&[ADMIN, EDITOR, VIEWER]));
+    s.extend(reset_accounts(accounts));
     s
 }
 
@@ -680,5 +684,372 @@ async fn the_team_works_through_the_stage_review_queue() {
 
     call!(&app, ed.req("POST", &format!("/change-sets/{set}/discard")));
     exec(&pool, &clear_feed(FEED)).await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// ---------------------------------------------------------------- fixing one in a draft
+
+const DRAFT_FEED: &str = "editor_stage_review_draft_feed";
+const DRAFT_ADMIN: &str = "admin@editor-stage-review-draft-test.invalid";
+const DRAFT_EDITOR: &str = "editor@editor-stage-review-draft-test.invalid";
+
+fn errors(v: &Value) -> Vec<Value> {
+    v["validation"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|x| x["level"] == "error")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The order the review page asks for: fix the stage in a draft, then Mark
+/// fixed naming that draft. Closing is not an edit of the stage, so the draft
+/// it names still submits. And a stage the draft makes - by a create or a
+/// split - can be edited again in that draft by the key every page uses for a
+/// stage, `id|direction`.
+#[actix_web::test]
+async fn a_stage_fixed_in_a_draft_and_marked_fixed_still_submits() {
+    let Some(pool) = local_pool().await else {
+        return;
+    };
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'gtfs_stage_touch' \
+             AND tgfoid = 'gtfs_stage_touch_row'::regproc"
+        )
+        .await,
+        1,
+        "apply db/gtfs_editor/0029_stage_review_flag_keeps_version.sql"
+    );
+    exec(&pool, &seed_for(DRAFT_FEED, &[DRAFT_ADMIN, DRAFT_EDITOR])).await;
+    let signer = TestSigner::generate("stage-review-draft-test-key");
+    let (st, dir) = state(&pool, &signer, DRAFT_ADMIN);
+    let app =
+        test::init_service(App::new().configure(|cfg| editor::configure(cfg, Some(Arc::new(st)))))
+            .await;
+    let mut admin = Caller {
+        signer: &signer,
+        email: DRAFT_ADMIN.into(),
+        session: None,
+    };
+    let mut ed = Caller {
+        signer: &signer,
+        email: DRAFT_EDITOR.into(),
+        session: None,
+    };
+    let (s, b, _) = call!(&app, admin.req("POST", "/auth/totp/enroll"));
+    assert_eq!(s, 200, "{b}");
+    let secret = crypto::base32_decode(b["secret_base32"].as_str().unwrap()).unwrap();
+    let (s, b, cookie) = call!(
+        &app,
+        admin
+            .req("POST", "/auth/totp/confirm")
+            .set_json(json!({"code": crypto::totp_now(&secret, now())}))
+    );
+    assert_eq!(s, 200, "{b}");
+    admin.session = cookie;
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("POST", "/users")
+            .set_json(json!({"email": DRAFT_EDITOR, "role": "editor"}))
+    );
+    assert!(s == 201 || code_of(&b) == "user_exists", "{s} {b}");
+    let (_, users, _) = call!(&app, admin.req("GET", "/users"));
+    let uid = users["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["email"] == DRAFT_EDITOR)
+        .unwrap()["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("PATCH", &format!("/users/{uid}"))
+            .set_json(json!({"role": "editor", "status": "active"}))
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("PUT", &format!("/users/{uid}/feeds/{DRAFT_FEED}"))
+            .set_json(json!({"role": "editor"}))
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = call!(&app, ed.req("POST", "/auth/totp/enroll"));
+    assert_eq!(s, 200, "{b}");
+    let secret = crypto::base32_decode(b["secret_base32"].as_str().unwrap()).unwrap();
+    let (s, b, cookie) = call!(
+        &app,
+        ed.req("POST", "/auth/totp/confirm")
+            .set_json(json!({"code": crypto::totp_now(&secret, now())}))
+    );
+    assert_eq!(s, 200, "{b}");
+    ed.session = cookie;
+
+    let version = || async {
+        scalar_i64(
+            &pool,
+            format!(
+                "SELECT row_version::bigint FROM gtfs_stage \
+                 WHERE gtfs_id = '{DRAFT_FEED}' AND stage_id = 'stg_one' AND direction = 'up'"
+            ),
+        )
+        .await
+    };
+    let (_, b, _) = call!(
+        &app,
+        ed.req("GET", &format!("/feeds/{DRAFT_FEED}/stage-reviews"))
+    );
+    let id = b["items"][0]["review_id"].as_i64().unwrap();
+    assert_eq!(b["items"][0]["name"], "SAIDAPET", "{b}");
+
+    // ---- the stage's stops fixed in a draft, from the review
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/feeds/{DRAFT_FEED}/change-sets"))
+            .set_json(json!({"title": "SAIDAPET ends at C"}))
+    );
+    assert_eq!(s, 201, "{b}");
+    let set = b["change_set_id"].as_str().unwrap().to_string();
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "update", "entity_key": "stg_one|up",
+                "after": {"name": "SAIDAPET", "direction": "up", "rows": [
+                    {"stop_id": "A", "stop_type": "NEW STOP"},
+                    {"stop_id": "C", "stop_type": "INTERMEDIATE STOP"},
+                ]}
+            }))
+    );
+    assert_eq!(s, 201, "{b}");
+    assert!(errors(&b).is_empty(), "{b}");
+
+    // ---- then marked fixed, naming it: the flag comes off, the version stays
+    let before = version().await;
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/stage-reviews/{id}/close"))
+            .set_json(json!({"decision": "fixed", "change_set": set}))
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        scalar_text(
+            &pool,
+            format!(
+                "SELECT review FROM gtfs_stage WHERE gtfs_id = '{DRAFT_FEED}' AND stage_id = 'stg_one'"
+            )
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        version().await,
+        before,
+        "closing a review is not an edit of the stage"
+    );
+    // reopening is not either
+    let (s, b, _) = call!(&app, ed.req("POST", &format!("/stage-reviews/{id}/reopen")));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(version().await, before);
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/stage-reviews/{id}/close"))
+            .set_json(json!({"decision": "fixed", "change_set": set}))
+    );
+    assert_eq!(s, 200, "{b}");
+
+    // ---- a stage made in this draft is edited by the key every page uses
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "create", "entity_key": "",
+                "after": {"name": "GUINDY", "direction": "down", "rows": [
+                    {"stop_id": "E", "stop_type": "NEW STOP"},
+                ]}
+            }))
+    );
+    assert_eq!(s, 201, "{b}");
+    let made = b["changes"].as_array().unwrap().last().unwrap()["entity_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !made.contains('|'),
+        "a create names its stage by id: {made}"
+    );
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "update", "entity_key": format!("{made}|down"),
+                "after": {"name": "GUINDY", "direction": "down", "rows": [
+                    {"stop_id": "E", "stop_type": "NEW STOP"},
+                    {"stop_id": "D", "stop_type": "INTERMEDIATE STOP"},
+                ]}
+            }))
+    );
+    assert_eq!(s, 201, "editing a stage this draft creates: {b}");
+    assert!(errors(&b).is_empty(), "{b}");
+    // the other direction is not the stage the draft made
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "update", "entity_key": format!("{made}|up"),
+                "after": {"name": "GUINDY"}
+            }))
+    );
+    assert_eq!(s, 404, "{b}");
+    assert_eq!(code_of(&b), "entity_not_found", "{b}");
+    let (s, p, _) = call!(
+        &app,
+        ed.req(
+            "GET",
+            &format!("/change-sets/{set}/preview/stages/{made}%7Cdown")
+        )
+    );
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["rows"].as_array().unwrap().len(), 2, "{p}");
+
+    // ---- and so is one a split makes, routes and all
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "split", "entity_key": "stg_split",
+                "after": {"stage_id": "stg_split", "name": "SAIDAPET (to B)", "direction": "up",
+                    "from_stage_id": "stg_two|up", "routes": ["R2"],
+                    "rows": [{"stop_id": "B", "stop_type": "NEW STOP"}]}
+            }))
+    );
+    assert_eq!(s, 201, "{b}");
+    assert!(errors(&b).is_empty(), "{b}");
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "update", "entity_key": "stg_split|up",
+                "after": {"name": "SAIDAPET (towards B)", "direction": "up"}
+            }))
+    );
+    assert_eq!(s, 201, "editing a stage this draft splits off: {b}");
+    assert!(errors(&b).is_empty(), "{b}");
+    let (s, p, _) = call!(
+        &app,
+        ed.req(
+            "GET",
+            &format!("/change-sets/{set}/preview/stages/stg_split%7Cup")
+        )
+    );
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["name"], "SAIDAPET (towards B)", "{p}");
+    assert_eq!(p["routes"][0]["route_id"], "R2", "{p}");
+
+    // ---- none of it conflicts with itself
+    let (s, b, _) = call!(&app, ed.req("POST", &format!("/change-sets/{set}/submit")));
+    assert_eq!(s, 200, "submit: {b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{set}/approve"))
+    );
+    assert_eq!(s, 200, "approve: {b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{set}/commit"))
+    );
+    assert_eq!(s, 200, "commit: {b}");
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            format!(
+                "SELECT count(*) FROM gtfs_stage_stop WHERE gtfs_id = '{DRAFT_FEED}' \
+                 AND stage_id = 'stg_one' AND direction = 'up'"
+            )
+        )
+        .await,
+        2,
+        "the fix is live"
+    );
+    assert_eq!(
+        scalar_text(
+            &pool,
+            format!(
+                "SELECT stage_id FROM gtfs_route_stage WHERE gtfs_id = '{DRAFT_FEED}' AND route_id = 'R2'"
+            )
+        )
+        .await
+        .as_deref(),
+        Some("stg_split")
+    );
+
+    // ---- a temporary route R1 is not running still names its stages: stg_two,
+    //      which no running list uses any more, is not deleted from under it,
+    //      nor merged into stg_one, which that temporary route runs as well
+    exec(
+        &pool,
+        &[format!(
+            "INSERT INTO gtfs_route_stage (gtfs_id, route_id, variant_id, position, stage_id, direction, stage_no) VALUES \
+             ('{DRAFT_FEED}', 'R1', 'r1_detour', 1, 'stg_one', 'up', 1), \
+             ('{DRAFT_FEED}', 'R1', 'r1_detour', 2, 'stg_two', 'up', 2)"
+        )],
+    )
+    .await;
+    for (change, code) in [
+        (
+            json!({"entity": "stage", "op": "delete", "entity_key": "stg_two|up", "after": null}),
+            "stage_in_use",
+        ),
+        (
+            json!({"entity": "stage", "op": "merge", "entity_key": "stg_two|up",
+                   "after": {"into_stage_id": "stg_one|up"}}),
+            "stage_repeated",
+        ),
+    ] {
+        let (s, b, _) = call!(
+            &app,
+            ed.req("POST", &format!("/feeds/{DRAFT_FEED}/change-sets"))
+                .set_json(json!({"title": format!("tidy SAIDAPET: {code}")}))
+        );
+        assert_eq!(s, 201, "{b}");
+        let tidy = b["change_set_id"].as_str().unwrap().to_string();
+        let (s, b, _) = call!(
+            &app,
+            ed.req("POST", &format!("/change-sets/{tidy}/changes"))
+                .set_json(change)
+        );
+        assert!(format!("{b}").contains(code), "{code}: {s} {b}");
+        assert!(
+            format!("{b}").contains("1 (R1)"),
+            "and names the route: {b}"
+        );
+        call!(
+            &app,
+            ed.req("POST", &format!("/change-sets/{tidy}/discard"))
+        );
+    }
+
+    // ---- a real edit still moves the version, as a stop merge's touch does
+    let before = version().await;
+    exec(
+        &pool,
+        &[format!(
+            "UPDATE gtfs_stage SET updated_by = 'stop merge' \
+             WHERE gtfs_id = '{DRAFT_FEED}' AND stage_id = 'stg_one' AND direction = 'up'"
+        )],
+    )
+    .await;
+    assert_eq!(version().await, before + 1);
+
+    exec(&pool, &clear_feed(DRAFT_FEED)).await;
     std::fs::remove_dir_all(dir).ok();
 }

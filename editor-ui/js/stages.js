@@ -7,7 +7,7 @@ import { get, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
 import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERVED_EXCLUDE } from "./util.js";
 import * as map from "./map.js";
-import { addChange, existingChange, createdChange, requireDraft } from "./drafts.js";
+import { addChange, updateChange, existingChange, createdChange, requireDraft, stageKey, stageChanges, sameStageKey } from "./drafts.js";
 import { stopPicker } from "./picker.js";
 import { idKind } from "./stage_reviews.js";
 import { showRoute } from "./explore.js";
@@ -40,14 +40,21 @@ export function draftTouchesStages() {
   return !!state.draft && state.draft.changes.some((c) => c.entity === "stage" || c.entity === "route_stages");
 }
 
-// Stages the open draft creates, in the list shape, for the stage search.
+// Stages the open draft makes, by a create or a split, in the list shape, for
+// the stage search. A later edit of one in the same draft is shown, not the
+// stage as it was first made.
 function createdStages() {
   if (!state.draft) return [];
-  return state.draft.changes.filter((c) => c.entity === "stage" && c.op === "create" && c.after).map((c) => {
-    const rows = c.after.rows || [];
+  return state.draft.changes.filter((c) => c.entity === "stage" && (c.op === "create" || c.op === "split") && c.after).map((c) => {
+    const key = `${c.entity_key}|${c.after.direction || ""}`;
+    const edit = existingChange("stage", key);
+    const after = edit ? { ...c.after, ...edit.after } : c.after;
+    const rows = after.rows || [];
     return {
-      stage_id: c.entity_key, name: c.after.name, description: c.after.description || null, draft: true,
-      stop_count: rows.filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length, route_count: 0,
+      stage_id: c.entity_key, stage_key: key, direction: after.direction || null,
+      name: after.name, description: after.description || null, draft: true,
+      stop_count: rows.filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length,
+      route_count: c.op === "split" ? (c.after.routes || []).length : 0,
     };
   });
 }
@@ -98,12 +105,14 @@ function flatten(links) {
 // The stages of one list, as the route page and a temporary route both show
 // them: fare stage number, name, who else uses it, and its stops.
 export function stageListView(stages) {
-  const inDraft = new Map((state.draft ? state.draft.changes : [])
-    .filter((c) => c.entity === "stage").map((c) => [c.entity_key, c.op]));
+  const draftOp = (s) => {
+    const ops = stageChanges(stageKey(s)).map((c) => c.op);
+    return ops.includes("create") || ops.includes("split") ? "create" : ops[0] || null;
+  };
   return h("ol.stage-list", (stages || []).map((s) => h("li.list-item",
     h("span.key", { "aria-label": `Fare stage ${s.stage_no}` }, String(s.stage_no)),
     h("a", { href: `#/stage/${enc(s.stage_key || s.stage_id)}` }, s.name),
-    h("span.item-end", inDraft.has(s.stage_id) ? h("span.chip.draft", inDraft.get(s.stage_id) === "create" ? "new in draft" : "changed in draft") : null,
+    h("span.item-end", draftOp(s) ? h("span.chip.draft", draftOp(s) === "create" ? "new in draft" : "changed in draft") : null,
       h("span.hint", s.route_count > 1 ? `shared by ${plural(s.route_count, "route")}` : "only this route")),
     h("span.sub", `${plural(s.stop_count, "stop")}: ${(s.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`),
     (s.rows || []).some((r) => r.unserviceable)
@@ -189,33 +198,36 @@ export async function editRouteStages(route, { created = false, variant = null }
       h("label.visually-hidden", { for: `stage-no-${i}` }, `Fare stage number of ${l.name}`),
       h("input.stage-no-input", { type: "number", min: "0", id: `stage-no-${i}`, value: String(l.stage_no ?? ""),
         on: { change: (ev) => { l.stage_no = ev.target.value === "" ? null : Number(ev.target.value); edited(); } } }),
-      h("a", { href: `#/stage/${enc(l.stage_key || l.stage_id)}` }, l.name),
+      h("a", { href: `#/stage/${enc(stageKey(l))}` }, l.name),
       h("span.item-end",
         h("button.btn.quiet.small", { type: "button", disabled: i === 0, "aria-label": `Move ${l.name} up`, on: { click: () => { [links[i - 1], links[i]] = [links[i], links[i - 1]]; edited(); } } }, "↑"),
         h("button.btn.quiet.small", { type: "button", disabled: i === links.length - 1, "aria-label": `Move ${l.name} down`, on: { click: () => { [links[i + 1], links[i]] = [links[i], links[i + 1]]; edited(); } } }, "↓"),
         h("button.btn.quiet.small", { type: "button", "aria-label": `Take ${l.name} off the route`, on: { click: () => { links.splice(i, 1); edited(); } } }, "Remove")),
-      h("span.sub", `${l.stage_id} · ${plural((l.rows || []).filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length, "stop")}: ${(l.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`)))
+      h("span.sub", `${l.stage_id}${l.direction ? ` (${l.direction})` : ""} · ${plural((l.rows || []).filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length, "stop")}: ${(l.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`)))
       : h("li.empty-route", h("p", "No stages yet. Add the first one below; it is fare stage 1.")));
     map.showRoute({ ...route, rows }, { fit: rows.some((r) => r.lat != null) });
   };
 
-  const onRoute = (id) => links.some((l) => l.stage_id === id);
+  // a stage is its id and its direction: the two directions of a corridor share
+  // an id, and a route runs only one of them
+  const onRoute = (s) => links.some((l) => sameStageKey(stageKey(l), stageKey(s)));
   const addStage = async (s) => {
-    if (onRoute(s.stage_id)) {
+    if (onRoute(s)) {
       toast(`${s.name} is already on this route: a route uses a stage once.`, "error");
       return;
     }
     let detail;
     try {
       detail = s.draft
-        ? await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(s.stage_key || s.stage_id)}`)
-        : await get(`feeds/${enc(state.feedId)}/stages/${enc(s.stage_key || s.stage_id)}`);
+        ? await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(stageKey(s))}`)
+        : await get(`feeds/${enc(state.feedId)}/stages/${enc(stageKey(s))}`);
     } catch (e) {
       toast(e.message, "error");
       return;
     }
     const last = links[links.length - 1];
-    links.push({ stage_id: detail.stage_id, name: detail.name, rows: detail.rows, route_count: detail.route_count, stage_no: last && last.stage_no != null ? last.stage_no + 1 : 1 });
+    links.push({ stage_id: detail.stage_id, stage_key: stageKey(detail), direction: detail.direction, name: detail.name, rows: detail.rows,
+      route_count: detail.route_count, stage_no: last && last.stage_no != null ? last.stage_no + 1 : 1 });
     toast(`Added ${detail.name} as fare stage ${links[links.length - 1].stage_no}.`);
     edited();
     // the results now mark it as on the route
@@ -228,13 +240,13 @@ export async function editRouteStages(route, { created = false, variant = null }
     shownMessage = message;
     status.textContent = message;
     clear(results, items.map((s, i) => h("li", h("button.picker-item", {
-      type: "button", disabled: onRoute(s.stage_id), title: onRoute(s.stage_id) ? "Already on this route" : null,
+      type: "button", disabled: onRoute(s), title: onRoute(s) ? "Already on this route" : null,
       on: { click: () => addStage(s) },
     },
       h("span.picker-no", { "aria-hidden": "true" }, String(i + 1)),
       h("span.picker-main", h("span.picker-name", s.name), s.draft ? h("span.chip.draft", "New") : null,
-        onRoute(s.stage_id) ? h("span.chip", "already on this route") : null),
-      h("span.picker-meta", `${s.stage_id} · ${s.draft ? `${plural(s.stop_count, "stop")}, new in your draft` : stageLine(s)}${s.description ? ` · ${s.description}` : ""}`)))));
+        onRoute(s) ? h("span.chip", "already on this route") : null),
+      h("span.picker-meta", `${s.stage_id}${s.direction ? ` (${s.direction})` : ""} · ${s.draft ? `${plural(s.stop_count, "stop")}, new in your draft` : stageLine(s)}${s.description ? ` · ${s.description}` : ""}`)))));
   };
   const input = h("input", { type: "search", id: "stage-search", autocomplete: "off", placeholder: "Stage name or stage id" });
   const search = debounce(async () => {
@@ -242,7 +254,7 @@ export async function editRouteStages(route, { created = false, variant = null }
     if (q.length < 2) return showResults([], "Type at least two letters of the stage name, or find stages through a stop.");
     try {
       const page = await get(`feeds/${enc(state.feedId)}/stages?q=${enc(q)}&limit=20`);
-      const drafts = createdStages().filter((s) => s.name.toLowerCase().includes(q.toLowerCase()) || s.stage_id === q);
+      const drafts = createdStages().filter((s) => (s.name || "").toLowerCase().includes(q.toLowerCase()) || s.stage_id === q);
       const items = [...drafts, ...page.items];
       if (!items.length && !drafts.length) {
         // a feed with no stages at all: say so, rather than that the name is wrong
@@ -323,7 +335,7 @@ export async function editRouteStages(route, { created = false, variant = null }
         entity: "route_variant", op: variant.creating ? "create" : "update", entity_key: route.route_id,
         after: {
           variant_id: id,
-          stages: links.map((l) => ({ stage_id: l.stage_id, stage_no: l.stage_no })),
+          stages: links.map((l) => ({ stage_id: stageKey(l), stage_no: l.stage_no })),
         },
         // a second save of this temporary route replaces its own change
       }, { merge: false, sameAs: (c) => (c.after || {}).variant_id === id });
@@ -349,7 +361,7 @@ export async function editRouteStages(route, { created = false, variant = null }
       { confirm: "Replace its stop list" }))) return;
     try {
       const res = await addChange({ entity: "route_stages", op: "replace", entity_key: route.route_id,
-        after: { stages: links.map((l) => ({ stage_id: l.stage_id, stage_no: l.stage_no })), base_stages_hash: baseHash } });
+        after: { stages: links.map((l) => ({ stage_id: stageKey(l), stage_no: l.stage_no })), base_stages_hash: baseHash } });
       if (!res) return;
       unsaved.done();
       serverProblems = res.problems;
@@ -401,8 +413,10 @@ export async function editRouteStages(route, { created = false, variant = null }
 export async function showStage(stageId) {
   map.endModes();
   clear(panel(), h("section.section", h("p.empty", "Loading stage…")));
+  // a draft names a stage it makes by its id alone, and an edit by id and
+  // direction: either finds the other
   const created = createdChange("stage", stageId);
-  const drafted = !!state.draft && (!!created || state.draft.changes.some((c) => c.entity === "stage" && c.entity_key === stageId));
+  const drafted = !!created || stageChanges(stageId).length > 0;
   let s;
   try {
     s = drafted
@@ -417,8 +431,8 @@ export async function showStage(stageId) {
   const remove = async () => {
     if (!(await confirmDialog("Delete this stage?", `${s.name} (${s.stage_id}) is used by no route. Deleting it takes it out of the stage list once the draft is committed.`, { confirm: "Delete stage", danger: true }))) return;
     try {
-      const res = await addChange({ entity: "stage", op: "delete", entity_key: s.stage_key || s.stage_id, after: null }, { merge: false });
-      if (res) showStage(s.stage_key || s.stage_id);
+      const res = await addChange({ entity: "stage", op: "delete", entity_key: stageKey(s), after: null }, { merge: false });
+      if (res) showStage(stageKey(s));
     } catch (e) {
       toast(e.message, "error");
     }
@@ -487,6 +501,11 @@ export async function editStage(stage, { mode = "update" } = {}) {
     h("option", { value: "down", selected: !!(stage && stage.direction === "down") }, "Down"));
   const desc = h("textarea", { id: "stage-desc", rows: "2", maxlength: "500", placeholder: "To tell same-named stages apart further, for example: via the flyover" });
   desc.value = (stage && stage.description) || "";
+  // a stage this draft makes is still its create (or split): editing it again
+  // changes that change, so the draft keeps one change for the new stage
+  const made = stage && mode === "update" ? createdChange("stage", stageKey(stage)) : null;
+  // direction is half a stage's key and a live stage keeps it (stage_direction_fixed)
+  if (mode === "update" && !made) direction.disabled = true;
   const routes = (stage && mode === "update" && stage.routes) || [];
   const routeIds = [...new Set(routes.map((r) => r.route_id))];
   const list = h("ol.stage-stops.editing");
@@ -590,9 +609,14 @@ export async function editStage(stage, { mode = "update" } = {}) {
     try {
       const res = creating
         ? await addChange({ entity: "stage", op: "create", entity_key: "", after: payload }, { merge: false })
-        : await addChange({ entity: "stage", op: "update", entity_key: stage.stage_key || stage.stage_id, after: payload });
+        : made
+          ? await updateChange(made, { ...made.after, ...payload })
+          : await addChange({ entity: "stage", op: "update", entity_key: stageKey(stage), after: payload });
       if (!res) return;
-      const id = creating ? res.draft.changes.find((c) => c.change_id === res.changeId).entity_key : stage.stage_id;
+      if (made) toast(`Updated in draft "${res.draft.title}".`);
+      const id = creating || made
+        ? `${res.draft.changes.find((c) => c.change_id === res.changeId).entity_key}|${payload.direction || ""}`
+        : stageKey(stage);
       serverProblems = res.problems;
       if (res.problems.some((p) => p.level === "error")) {
         unsaved.done();
@@ -608,7 +632,7 @@ export async function editStage(stage, { mode = "update" } = {}) {
 
   clear(panel(),
     h("section.section",
-      h("button.btn.quiet.small", { type: "button", style: "justify-self:start", on: { click: () => back(stage && stage.stage_id) } }, stage ? "Back to the stage" : "Back to stages"),
+      h("button.btn.quiet.small", { type: "button", style: "justify-self:start", on: { click: () => back(stage && stageKey(stage)) } }, stage ? "Back to the stage" : "Back to stages"),
       h("h1", mode === "update" ? `Edit stage ${stage.name}` : mode === "copy" ? `Duplicate ${stage.name}` : "New stage"),
       mode === "copy" ? h("p.notice", "The copy is a new stage. Change it, then put it on the routes that need it with Change stages; every other route keeps the original.") : null,
       routeIds.length ? h("div.notice.warning",
@@ -618,14 +642,16 @@ export async function editStage(stage, { mode = "update" } = {}) {
       h("div.field-row",
         h("label.field", { for: "stage-name" }, h("span", "Stage name"), name),
         h("label.field", { for: "stage-direction" }, h("span", "Direction"), direction,
-          h("span.hint", "Which way along the corridor. Two stages may share a name and run opposite ways."))),
+          h("span.hint", direction.disabled
+            ? "A stage keeps its direction. For the other way, Duplicate stage and give the copy to the routes that run it."
+            : "Which way along the corridor. Two stages may share a name and run opposite ways."))),
       h("label.field", { for: "stage-desc" }, h("span", "Description (optional)"), desc),
       h("p.hint", "A stage starts with its stage stop; the intermediate stops after it are charged as the same fare stage."),
       summary),
     h("section.section", h("h2", "Stops"), h("div.ladder.editing", list)),
     h("div.sticky-actions", h("div.btn-row",
-      h("button.btn", { type: "button", on: { click: save } }, creating ? "Add to draft" : existingChange("stage", stage.stage_id) ? "Update in draft" : "Add to draft"),
-      h("button.btn.secondary", { type: "button", on: { click: () => back(stage && stage.stage_id) } }, "Cancel"))),
+      h("button.btn", { type: "button", on: { click: save } }, creating ? "Add to draft" : made || existingChange("stage", stageKey(stage)) ? "Update in draft" : "Add to draft"),
+      h("button.btn.secondary", { type: "button", on: { click: () => back(stage && stageKey(stage)) } }, "Cancel"))),
   );
   redraw();
 }
@@ -659,7 +685,8 @@ export async function showStagesList() {
     try {
       const res = await get(`feeds/${enc(state.feedId)}/stages?${params}`);
       cursor = res.next_cursor;
-      const drafts = append ? [] : createdStages().filter((s) => !q || s.name.toLowerCase().includes(q.toLowerCase()));
+      const drafts = append ? [] : createdStages().filter((s) => (!q || (s.name || "").toLowerCase().includes(q.toLowerCase()) || s.stage_id === q)
+        && (!direction.value || s.direction === direction.value));
       if (!append) clear(list);
       [...drafts, ...res.items].forEach((s) => list.appendChild(item(s)));
       status.textContent = list.children.length ? "" : q ? `No stage matches “${q}”.` : "No stages yet.";
