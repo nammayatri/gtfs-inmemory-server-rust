@@ -122,6 +122,7 @@ use crate::services::operator::QueryBody;
         models::ServiceTierType,
         models::VehicleServiceTypeResponse,
         models::VehicleMetadataResponse,
+        models::VehicleVariant,
         models::WaybillStatus,
         models::VehicleData,
         models::BusSchedule,
