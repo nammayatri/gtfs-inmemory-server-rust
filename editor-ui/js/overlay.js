@@ -40,6 +40,8 @@ function build() {
     if (c.entity === "route" || c.entity === "route_stops" || c.entity === "route_stages") index.routes.add(c.entity_key);
     // a stage change reaches every route that uses the stage
     if (c.entity === "stage") ((c.before && c.before.routes) || []).forEach((r) => index.routes.add(r.route_id));
+    // and a split reaches the routes it moves onto the new stage
+    if (c.entity === "stage" && c.op === "split") (after.routes || []).forEach((r) => index.routes.add(r));
     if (c.entity === "stop" && c.op === "merge" && after.into_stop_id) {
       push(index.absorbs, after.into_stop_id, c);
       // the routes a merge switches to the stop that stays

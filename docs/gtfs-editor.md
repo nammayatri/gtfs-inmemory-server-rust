@@ -4177,8 +4177,19 @@ whose routes are not built from stages serves exactly what it served before.
 |---|---|---|
 | `stage` / `create` | `{stage_id?, name, description?, rows: [...]}` | a new stage; the id is minted when left out (`entity_key` may be `""`) |
 | `stage` / `update` | any of `{name, description, rows}` | changes the stage, then rewrites the rows of **every live route that uses it** |
-| `stage` / `delete` | `null` | soft delete; `stage_in_use` while a live route uses it |
+| `stage` / `delete` | `null` | soft delete; `stage_in_use` while any list of a live route names it - its normal list or a temporary route, running or not |
+| `stage` / `merge` | `{into_stage_id}` | the stage named by `entity_key` goes away and every list using it is pointed at `into_stage_id`, rewriting the routes that run them. Same direction only (`merge_across_directions`), never into itself (`merge_same_stage`), and `stage_repeated` when a list already runs both - which of its two places to drop is that route's call |
+| `stage` / `split` | `{stage_id, name, direction?, description?, rows, from_stage_id, routes: [route_id]}` | a new stage, and the named routes taken off `from_stage_id` onto it in the same transaction; every other route stays |
 | `route_stages` / `replace` | `{stages: [{stage_id, stage_no?}], base_stages_hash}` | sets the route's stages and rewrites its rows; a missing `stage_no` is the one before plus 1 (1 first) |
+
+A stage is its id **and** its direction, so an edit, a delete or a merge names it
+as `entity_key` `<stage_id>|<direction>` (`143|down`, `143|` for one that runs
+either way); a bare id is taken as the only stage with that id. A create or a
+split names the stage it makes by its id alone and carries the direction in
+`after`. A later change in the **same draft** may edit, merge or delete that
+stage by `<stage_id>|<direction>`: the draft's own create or split stands in for
+the live row, and only a create of that direction counts - making `143|down`
+does not excuse an edit of the live `143|up` from its version check.
 
 A stage row is `{stop_id, stop_type, marker_id?, marker_name?, marker_lat?,
 marker_lon?, stop_name_override?}` - nothing else. A marker without an id gets
@@ -4430,7 +4441,11 @@ Two places record it, kept in step:
   what the dashboard puts in front of the reviewer.
 
 Closing a row clears the flag on the stage in the same transaction; reopening
-puts it back.
+puts it back. Neither is an edit of the stage: `gtfs_stage` has its own touch
+trigger (migration 0029) that keeps `row_version` when only `review` changes, so
+the order the screen asks for - fix the stage in a draft, then *Mark fixed*
+naming that draft - does not leave the draft conflicting with itself. A review
+whose stages have all gone (merged or deleted) is still closed the same way.
 
 ```
 GET  /feeds/{g}/stage-reviews?status=&reason=&q=&min_impact=   the queue
@@ -4458,7 +4473,11 @@ they build:
   no route recorded;
 - the stage's name, editable beside it.
 
-*Save these stops to a draft* puts one `stage/update` in the open draft. Nothing
+*Save these stops to a draft* puts one `stage/update` in the open draft. When the
+open draft already changes the stage - edits it, splits routes off it, or merges
+others into it - the screen shows the stage with the draft applied, says so, marks
+the lists already split off and the stages already merged, and fills in *Draft*;
+a second save changes the same `stage/update`. Nothing
 reaches passengers until somebody else approves that draft and it is committed,
 as with every other change - there is deliberately no way to change the feed from
 this screen. Then *Mark fixed* (naming the draft) or *Leave it alone* (with a

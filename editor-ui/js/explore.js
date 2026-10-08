@@ -458,7 +458,8 @@ export async function showRoute(routeId, { preview } = {}) {
   const drafted = usePreview && r !== live;
   // the draft gives the route new stages, or changes a stage it uses
   const stagesChanged = !!state.draft && state.draft.changes.some((c) => (c.entity === "route_stages" && c.entity_key === routeId)
-    || (c.entity === "stage" && ((c.before && c.before.routes) || []).some((x) => x.route_id === routeId)));
+    || (c.entity === "stage" && ((c.before && c.before.routes) || []).some((x) => x.route_id === routeId))
+    || (c.entity === "stage" && c.op === "split" && ((c.after && c.after.routes) || []).includes(routeId)));
   const o = live ? applyToRoute(live) : { changed: new Set(), actions: [], stops: [], gone: null };
   nameHere(r.short_name || `Route ${r.route_id}`);
   map.clearFocus();

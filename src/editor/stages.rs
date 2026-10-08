@@ -889,6 +889,42 @@ pub(super) async fn stage_merge(
         ));
     }
 
+    // A route uses a stage once (`stage_repeated`). A list that runs both
+    // would run the kept one twice, and which of its two places to drop - and
+    // how its fare stages renumber - is that route's call, not the merge's.
+    let both: Vec<(String, Option<String>)> = sqlx::query(
+        "SELECT DISTINCT r.route_id, r.short_name FROM gtfs_route_stage a \
+         JOIN gtfs_route_stage b ON b.gtfs_id = a.gtfs_id AND b.route_id = a.route_id \
+              AND b.variant_id IS NOT DISTINCT FROM a.variant_id \
+         JOIN gtfs_route r ON r.gtfs_id = a.gtfs_id AND r.route_id = a.route_id AND NOT r.deleted \
+         WHERE a.gtfs_id = $1 AND a.stage_id = $2 AND a.direction = $3 \
+           AND b.stage_id = $4 AND b.direction = $5 \
+         ORDER BY r.short_name, r.route_id",
+    )
+    .bind(g)
+    .bind(&gone.stage_id)
+    .bind(&gone.direction)
+    .bind(&into.stage_id)
+    .bind(&into.direction)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| Ok((r.try_get("route_id")?, r.try_get("short_name")?)))
+    .collect::<Result<_, sqlx::Error>>()?;
+    if !both.is_empty() {
+        return Err(fail(
+            "stage_repeated",
+            format!(
+                "{} already runs both {} and {}, so merging would put {} on it twice; \
+                 take one of them off that route's stages first",
+                route_names(&both),
+                gone.label(),
+                into.label(),
+                into.label()
+            ),
+        ));
+    }
+
     // Every route using either stage must match its stages before the change,
     // or rewriting it from them would undo an edit made some other way.
     let routes = routes_using(conn, g, &gone).await?;
@@ -1151,12 +1187,29 @@ pub(super) async fn stage_delete(
 ) -> Result<Vec<Finding>, ApplyError> {
     let sk = key_of_change(conn, g, key).await;
     stage_to_change(conn, g, &sk).await?;
-    let routes = routes_using(conn, g, &sk).await?;
+    // any list of a route, not only the one it runs: a temporary route that is
+    // not running today, or the normal list of a route running one, still
+    // names the stage, and would run a deleted stage once it is switched to
+    let routes: Vec<(String, Option<String>)> = sqlx::query(
+        "SELECT DISTINCT r.route_id, r.short_name FROM gtfs_route_stage rs \
+         JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+         WHERE rs.gtfs_id = $1 AND rs.stage_id = $2 AND rs.direction = $3 \
+         ORDER BY r.short_name, r.route_id",
+    )
+    .bind(g)
+    .bind(&sk.stage_id)
+    .bind(&sk.direction)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| Ok((r.try_get("route_id")?, r.try_get("short_name")?)))
+    .collect::<Result<_, sqlx::Error>>()?;
     if !routes.is_empty() {
         return Err(fail(
             "stage_in_use",
             format!(
-                "stage {} is used by {}: {}; take it off those routes first",
+                "stage {} is used by {} (a normal list or a temporary route): {}; \
+                 take it off those routes first",
                 sk.label(),
                 plural(routes.len(), "route"),
                 route_names(&routes)

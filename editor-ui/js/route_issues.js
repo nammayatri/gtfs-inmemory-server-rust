@@ -14,6 +14,7 @@ import { get, post, enc } from "./api.js";
 import { state, can } from "./state.js";
 import { h, clear, toast, confirmDialog, fmtCount, fmtDate, plural } from "./util.js";
 import { nameHere } from "./trail.js";
+import { editRouteStages } from "./stages.js";
 
 const panel = () => document.getElementById("panel");
 const PAGE = 50;
@@ -351,7 +352,14 @@ export async function showRouteIssue(id) {
         + "out of date, leave the route alone and say so."),
       h("div.btn-row",
         h("a.btn", { href: `#/route/${enc(r.route_id)}` }, "Open the route"),
-        h("a.btn.secondary", { href: `#/route/${enc(r.route_id)}?stages=1` }, "Change its stages")),
+        // the stages editor opens over the route; there is no address for it
+        can("editor") ? h("button.btn.secondary", { type: "button", on: { click: async () => {
+          try {
+            editRouteStages(await get(`feeds/${enc(state.feedId)}/routes/${enc(r.route_id)}`));
+          } catch (e) {
+            toast(e.message, "error");
+          }
+        } } }, "Change its stages") : null),
       editable ? h("p.hint", "Come back here when the change is in a draft and mark it fixed.") : null),
 
     editable || !reopen.hidden ? h("section.section",

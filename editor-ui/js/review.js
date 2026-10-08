@@ -271,6 +271,7 @@ const KIND_LABEL = {
   "service:create": ["new service", "new services"], "service:update": ["service edit", "service edits"], "service:delete": ["service deleted", "services deleted"],
   "pattern:update": ["stop order edit", "stop order edits"], "pattern:delete": ["stop order deleted", "stop orders deleted"],
   "stage:create": ["new stage", "new stages"], "stage:update": ["stage edit", "stage edits"], "stage:delete": ["stage deleted", "stages deleted"],
+  "stage:merge": ["stage merged", "stages merged"], "stage:split": ["stage split off", "stages split off"],
   "route_stages:replace": ["route stages change", "route stages changes"],
 };
 const kindOf = (ch) => `${ch.entity}:${ch.op}`;
@@ -519,7 +520,7 @@ const ENTITY_LABEL = {
   stage: "Stage", route_stages: "Stages of route", route_variant: "Temporary route",
 };
 const TIMETABLE = new Set(["route_trips", "timing_profile", "pattern"]);
-const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged" };
+const OP_LABEL = { create: "new", update: "changed", delete: "deleted", replace: "changed", merge: "merged", split: "new, split off" };
 
 // A stop the draft creates and puts on route stop lists in place of another stop,
 // as splitting routes off in a coordinate review does: {from, routeIds}, or null.
@@ -821,6 +822,7 @@ function stageDiff(ch, cs, draftNames) {
   const b = ch.before || {}, a = ch.after || {};
   if (ch.op === "delete") return h("p", `Stage ${b.name || ch.entity_key} is deleted. No route uses it.`);
   const live = cs.stop_names || {};
+  const routeList = (list) => [...new Map(list.map((r) => [r.route_id, r])).values()].map((r) => r.short_name || r.route_id).join(", ");
   const beforeNames = new Map((b.rows || []).map((r) => [r.stop_id, r.stop_name]));
   const name = (r) => (r.stop_type === "ROUTE CORRECTION" ? `Map shaping point ${r.marker_name || r.marker_id || ""}`
     : `${r.stop_name || r.stop_name_override || beforeNames.get(r.stop_id) || live[r.stop_id] || draftNames.get(r.stop_id) || r.stop_id} (${r.stop_id})`);
@@ -828,6 +830,25 @@ function stageDiff(ch, cs, draftNames) {
     ? h("ol", rows.map((r) => h("li", { class: r.stop_type === "NEW STOP" ? "head" : "" }, name(r), h("span.hint", ` ${STOP_TYPE_LABEL[r.stop_type] || r.stop_type}`))))
     : h("p.empty", "none"));
   const routes = [...new Map((b.routes || []).map((r) => [r.route_id, r])).values()];
+  // a merge's after names only the stage it goes into; what it says is which
+  // routes move, and what they called at before
+  if (ch.op === "merge") {
+    return h("div", { style: "display:grid;gap:10px" },
+      h("p", `Stage ${b.name || ""} (${ch.entity_key}) goes away, merged into stage ${a.into_stage_id}.`),
+      routes.length
+        ? h("p.notice.warning", `${plural(routes.length, "route")} call at that stage's stops instead: ${routeList(routes)}.`)
+        : h("p.hint", "No route uses it."),
+      h("div", h("h4", "Its stops, which those routes stop calling at"), col(b.rows)));
+  }
+  // a split makes a stage and moves routes onto it, off the one it names
+  if (ch.op === "split") {
+    const moved = a.routes || [];
+    return h("div", { style: "display:grid;gap:10px" },
+      h("p", `A new stage ${a.name || ch.entity_key} (${ch.entity_key}${a.direction ? `, ${a.direction}` : ""}), `
+        + `taken off stage ${a.from_stage_id}.`),
+      h("p.notice.warning", `${plural(moved.length, "route")} run it in place of ${a.from_stage_id}: ${moved.join(", ")}. Every other route stays on ${a.from_stage_id}.`),
+      h("div", h("h4", "Stops"), col(a.rows)));
+  }
   const fields = fieldRows(b, a, [["name", "Stage name"], ["description", "Description"]]);
   return h("div", { style: "display:grid;gap:10px" },
     fields.length ? h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", fields)) : null,

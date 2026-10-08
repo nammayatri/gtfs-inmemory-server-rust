@@ -124,15 +124,37 @@ export async function requireDraft(reason) {
 const patternOf = (c) => (c.after && c.after.pattern_key) || 1;
 export function existingChange(entity, key, pattern = 1) {
   if (!state.draft) return null;
-  return state.draft.changes.find((c) => c.entity === entity && c.entity_key === key && (c.op === "update" || c.op === "replace")
+  return state.draft.changes.find((c) => c.entity === entity && sameKey(c, key) && (c.op === "update" || c.op === "replace")
     && (entity !== "route_stops" || patternOf(c) === pattern)) || null;
 }
 
+// A stage is its id and its direction, `143|down`. An edit names it so; a
+// create or a split names it by its id and carries the direction in `after`;
+// a bare id (from before direction joined the key) is the stage either way.
+export const stageKey = (s) => s.stage_key || (s.direction ? `${s.stage_id}|${s.direction}` : s.stage_id);
+function changeStageKey(c) {
+  if (c.entity_key.includes("|") || (c.op !== "create" && c.op !== "split")) return c.entity_key;
+  return `${c.entity_key}|${(c.after && c.after.direction) || ""}`;
+}
+export function sameStageKey(a, b) {
+  if (a.includes("|") && b.includes("|")) return a === b;
+  return a.split("|")[0] === b.split("|")[0];
+}
+const sameKey = (c, key) => (c.entity === "stage" ? sameStageKey(changeStageKey(c), key) : c.entity_key === key);
+
 // What the draft creates. Stops and routes created in a draft count as existing
-// for its later changes, so the editors offer them alongside live data.
+// for its later changes, so the editors offer them alongside live data. A stage
+// is also made by a split, which takes routes off another stage onto it.
 export function createdChange(entity, key) {
   if (!state.draft) return null;
-  return state.draft.changes.find((c) => c.entity === entity && c.op === "create" && c.entity_key === key) || null;
+  return state.draft.changes.find((c) => c.entity === entity && sameKey(c, key)
+    && (c.op === "create" || (entity === "stage" && c.op === "split"))) || null;
+}
+
+// The changes of the draft to stage `key`, whichever way the change names it.
+export function stageChanges(key) {
+  if (!state.draft) return [];
+  return state.draft.changes.filter((c) => c.entity === "stage" && sameKey(c, key));
 }
 
 export function createdStops() {
