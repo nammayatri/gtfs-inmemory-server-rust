@@ -1025,6 +1025,57 @@ pub async fn stage(
     ok(stages::stage_detail(&mut conn, &g, &key).await?)
 }
 
+/// Stages going the same way that may be the same place as this one.
+pub async fn stage_similar(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+) -> EditorResult<HttpResponse> {
+    let (g, id) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    let key = stages::resolve_key(&mut conn, &g, &id).await?;
+    ok(stages::similar_stages(&mut conn, &g, &key, None).await?)
+}
+
+/// Stages named after themselves with exactly one MTC stage of their name.
+pub async fn stage_twins(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(stages::stage_twins(&mut conn, &path).await?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenReviewsQuery {
+    /// stage keys, comma separated
+    stages: Option<String>,
+}
+
+/// The open stage reviews and routes to review that stages touch.
+pub async fn open_reviews(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<OpenReviewsQuery>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let keys: Vec<stages::StageKey> = q
+        .stages
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(stages::StageKey::parse)
+        .collect();
+    let mut conn = st.pool.acquire().await?;
+    ok(stage_reviews::open_about_stages(&mut conn, &path, &keys).await?)
+}
+
 pub async fn route_stages(
     req: HttpRequest,
     st: Data,
@@ -1614,6 +1665,34 @@ pub async fn change_set_preview_stage(
     ok(stages::preview_stage(&st, &ctx, id, &stage_id).await?)
 }
 
+pub async fn change_set_preview_stage_similar(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+) -> EditorResult<HttpResponse> {
+    let (id, stage_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(stages::preview_stage_similar(&st, &ctx, id, &stage_id).await?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeCheckQuery {
+    /// the stage to keep
+    into: String,
+}
+
+/// What merging a stage into another would do, with the draft applied.
+pub async fn change_set_preview_stage_merge(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(Uuid, String)>,
+    q: web::Query<MergeCheckQuery>,
+) -> EditorResult<HttpResponse> {
+    let (id, stage_id) = path.into_inner();
+    let ctx = auth::require_object(&req, &st, Object::ChangeSet(id), Role::Viewer).await?;
+    ok(stages::preview_stage_merge(&st, &ctx, id, &stage_id, &q.into).await?)
+}
+
 pub async fn change_set_preview_route_stages(
     req: HttpRequest,
     st: Data,
@@ -2067,10 +2146,15 @@ pub struct StageReviewsQuery {
     q: Option<String>,
     /// one of stage_reviews::REASONS (section 19.1)
     reason: Option<String>,
+    /// `settle` (every reason but agreed) or `verify` (agreed only)
+    side: Option<String>,
     /// only the reviews changing at least this many stop calls
     min_impact: Option<i32>,
     /// `stage` groups the list one row per stage id, its directions inside
     group: Option<String>,
+    /// only the ones closed as fixed naming a draft that was then discarded
+    /// or rejected
+    lost: Option<bool>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -2088,13 +2172,16 @@ pub async fn stage_reviews(
         bbox: None,
         q: q.q.clone(),
     };
+    let side = stage_reviews::parse_side(q.side.as_deref())?;
     if matches!(q.group.as_deref(), Some("stage") | Some("name")) {
         return ok(stage_reviews::list_by_stage(
             &st,
             &path,
             &filters,
             q.reason.as_deref(),
+            side,
             q.min_impact,
+            q.lost.unwrap_or(false),
             &page,
         )
         .await?);
@@ -2104,7 +2191,9 @@ pub async fn stage_reviews(
         &path,
         &filters,
         q.reason.as_deref(),
+        side,
         q.min_impact,
+        q.lost.unwrap_or(false),
         &page,
     )
     .await?)
@@ -2157,6 +2246,9 @@ pub struct RouteIssuesQuery {
     q: Option<String>,
     /// one of route_issues::ISSUES (section 19.2)
     issue: Option<String>,
+    /// only the ones closed as fixed naming a draft that was then discarded
+    /// or rejected
+    lost: Option<bool>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -2174,7 +2266,15 @@ pub async fn route_issues(
         bbox: None,
         q: q.q.clone(),
     };
-    ok(route_issues::list(&st, &path, &filters, q.issue.as_deref(), &page).await?)
+    ok(route_issues::list(
+        &st,
+        &path,
+        &filters,
+        q.issue.as_deref(),
+        q.lost.unwrap_or(false),
+        &page,
+    )
+    .await?)
 }
 
 pub async fn route_issue_summary(

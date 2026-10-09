@@ -4242,7 +4242,12 @@ Settled while implementing:
 | GET | `/feeds/{g}/stages?q=&stop_id=&route_id=&unused=&limit=&cursor=` | live stages by name (trigram) or exact id, by a stop they call at, or by a route using them; `unused=true` only those no live route uses. Item: `stage_id, name, description, provenance, deleted, row_version, created_at, updated_at, updated_by, stop_count` (boardable rows) `, route_count, first_stop {stop_id, name}, last_stop` |
 | GET | `/feeds/{g}/stages/{stage_id}` | the stage + `rows` (read shape: `position, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, marker_*, stop_name_override`) + `routes: [{route_id, short_name, long_name, position, stage_no}]` + `route_count` + `stop_count` |
 | GET | `/feeds/{g}/routes/{route_id}/stages` | `{route_id, has_stages, in_sync, stages_hash, stages: [{position, stage_id, stage_no, name, description, deleted, row_version, route_count, stop_count, rows}]}` |
+| GET | `/feeds/{g}/stages/{stage_id}/similar` | stages going the same way that may be the same place, at most 12, in this order: the same name ignoring case, spaces and dots starting within 2 km (`why: same_name`); a name alike by pg_trgm word similarity (0.5 or more) starting within 2 km (`like_name`); any starting within 250 m (`nearby`); and last the same name further off (`same_name`, as likely another place of the name). Item: `stage_id, stage_key, direction, name, review, stop_count, route_count, first_stop, why, likeness, distance_m` (between first stops, or null) `, far` (more than 1 km apart) `, shared_routes: [{route_id, short_name}]` (routes running both, which a merge either way refuses). Also `other_way`: the other direction's stages of this place (the same id, or the same name within 2 km), never mergeable; and `in_other_drafts`: stages like it being made in other open drafts, `{stage_key, name, distance_m, change_set_id, change_set_title, change_set_status, author_email}` |
+| GET | `/feeds/{g}/stage-twins` | every live `nm_` stage with exactly one MTC-keyed stage of the same name and direction: `{stage_key, name, route_count, twin: {stage_key, name}, distance_m, far, shared_routes}`; `several` counts the ones with more than one |
+| GET | `/feeds/{g}/open-reviews?stages=k1,k2` | the pending stage reviews of those stages and the pending routes to review of every route running one: `{stage_reviews: [...], route_issues: [...]}` |
 | GET | `/change-sets/{id}/preview/stages/{stage_id}` | the stage with the draft applied, plus the draft's `validation` and `conflicts` |
+| GET | `/change-sets/{id}/preview/stages/{stage_id}/similar` | the same with the draft applied, for a stage the draft makes; `in_other_drafts` leaves this draft out |
+| GET | `/change-sets/{id}/preview/stages/{stage_id}/merge?into=` | what merging the stage into `into` would do, with the draft applied and nothing written: `stage, into, distance_m, far, routes: [{route_id, short_name, normal, temporary}], shared_routes, stops_lost, stops_gained, stops_kept, problems` (what the draft would say; an `error` means it would be refused) `, reviews` (as `open-reviews`) |
 | GET | `/change-sets/{id}/preview/routes/{route_id}/stages` | the route's stages with the draft applied, the same way |
 
 ### Dashboard
@@ -4445,10 +4450,11 @@ puts it back. Neither is an edit of the stage: `gtfs_stage` has its own touch
 trigger (migration 0029) that keeps `row_version` when only `review` changes, so
 the order the screen asks for - fix the stage in a draft, then *Mark fixed*
 naming that draft - does not leave the draft conflicting with itself. A review
-whose stages have all gone (merged or deleted) is still closed the same way.
+whose stages have all gone (merged or deleted) is still closed the same way, and
+a commit closes most of those itself (below).
 
 ```
-GET  /feeds/{g}/stage-reviews?status=&reason=&q=&min_impact=   the queue
+GET  /feeds/{g}/stage-reviews?status=&side=&reason=&q=&min_impact=&lost=   the queue
 GET  /feeds/{g}/stage-reviews/summary              how much is left, and of what
 GET  /stage-reviews/{id}                           it, and the stage in full
 POST /stage-reviews/{id}/close                     {decision, note?, change_set?}
@@ -4483,6 +4489,99 @@ as with every other change - there is deliberately no way to change the feed fro
 this screen. Then *Mark fixed* (naming the draft) or *Leave it alone* (with a
 note). For `head_duplicate_stops` the screen links straight to the stop merge
 with the duplicate head stops preselected, since renaming would be the wrong fix.
+
+Routes are named by number as well as id wherever the review lists them (the
+evidence holds only ids, so the detail carries `route_names`). *Draft* is a
+dropdown of the feed's drafts - open, waiting for approval, and live - with the
+open one marked, and "Another draft, by its id…" for an older one.
+
+**A stage that is wrong, and the stages like it** (2026-10-08). Below the lists,
+*Stages like this one* offers the stages going the same way that may be the same
+place (`GET .../similar`): the same name, a name written another way, one
+starting close by, and the stages the open draft makes. For each, two ways out:
+
+- **Merge it into this one** — it is the same place; its routes call at this
+  stage's stops and it goes away.
+- **Use it instead of this one** — this stage is wrong altogether. Every route
+  using it, temporary routes included, runs the other, and this one is deleted
+  when the draft is committed. To make the right stage first, use *Create a new
+  stage* on a list or New stage, then use it instead. The page then says the
+  stage is replaced and by what, stops offering edits, and fills in the note and
+  the draft for *Mark fixed*. *Undo the replacement* takes it back out; a new
+  stage made by mistake has *Take it out* and *Open or edit it*.
+- **Only on some routes…** — wrong for a few routes and right for the rest: each
+  of its routes opens its stage list with the one swapped for the other, unsaved,
+  to check and add.
+
+Both are a `stage/merge`, and neither goes in without asking the server first
+(`.../preview/stages/{id}/merge?into=`). The dialog says which routes change,
+**which stops they stop calling at and start calling at** - these are fare
+stages, so that is where fares change - and how far apart the two start. More
+than 1 km apart is called out and the button reads *anyway*: one name is often
+several places (a BUS STAND, a CHURCH in every area), and the same-name stage
+across the city is offered last for that reason. What the draft would refuse is
+shown instead of a button: a route running both stages (`stage_repeated`) comes
+with a button opening each such route's stages, so it can come off one first.
+
+A stage the draft already replaces is followed to where that ends: replacing A
+with B when the draft replaces B with C replaces A with C, and the pages say "by
+way of B". Going the other way and in somebody else's draft are only mentioned:
+a merge across directions is refused (the two hold opposite kerbs - a stage
+holding the other way's stops is put right by editing its stops), and a stage in
+another open draft is not live until that draft is committed.
+
+Closing a review whose draft merges stages away offers the other open reviews it
+settles, with a box each (`GET /feeds/{g}/open-reviews`): the review of a stage
+merged away is ticked, the review of the stage that takes the routes and the
+routes to review of the routes that ran it are not - only somebody who has
+looked at a route's whole list can say it is right. *Mark fixed* closes the
+ticked ones with the same draft and note. The queue marks a stage the open draft
+already changes *in your draft*.
+
+**A fix whose draft never went live.** A review marked fixed names a draft, and
+the draft can still be discarded or rejected - then the review says fixed for a
+fix that is not coming. The detail says so, in red, with *Put it back in the
+queue*; `?lost=true` lists exactly those (fixed, naming a discarded or rejected
+draft), the summary counts them per side as `fixed_lost`, the queue's Fixed tab
+has them as a filter, and the To review tab says how many there are. The same
+holds for routes to review (section 19.2).
+
+**Only what still wants a decision.** The queue is worked by searching it as
+much as by paging it, so a stage somebody has already dealt with must not turn
+up again:
+
+- `side=settle` is every reason but `agreed`, `side=verify` only `agreed` - the
+  split the summary counts in. *To settle* with *Anything* used to send no reason
+  at all, and listed the stages that mapped cleanly beside the ones to settle.
+- **A stage merged away or deleted takes its review with it.** Committing a
+  draft that merges a stage into another, or deletes it, closes that stage's
+  open review in the same transaction: fixed, naming the draft and whoever made
+  it, with the note *Closed on its own: draft “T” merged stage X into Y.* and a
+  `stage_review_closed` audit row carrying `automatic: true`. A review naming
+  its stage by the folded name closes only once the last stage of that name and
+  direction is gone. Before this a merge cleared the stage's flag but left the
+  review pending, so a search for the name found stages that no longer existed.
+  Migration 0030 closes the reviews left open that way by drafts committed
+  before, once, the same way (its audit rows have `actor_email` `migration
+  0030`).
+- **What happened since, said rather than guessed.** Each row has
+  `closed_ways`, the other directions of its stage already closed with nothing
+  open (*down fixed already*), and `changed`, the last committed draft that
+  changed the stage - edited it, merged a stage into it or split one off it -
+  after its open reviews were raised (*changed since*). The review says the
+  same for its own direction, with *Mark fixed with “T”*. A draft that changed
+  a stage is not taken to have fixed it - it may have changed something else -
+  so those stay in the queue for a person. Closing a review also offers the
+  stage's other direction, unticked.
+- `q` matches the name, a name like it, or the stage id exactly; the names it
+  actually contains come before the ones it only resembles.
+
+**Running the mapper again.** `scripts/map_mtc_stages.py --reset` rebuilds the
+stages of every route it maps, which would put every committed fix above back to
+the mapper's guess while the reviews still say fixed. It refuses once a draft
+holding `stage`, `route_stages` or `route_variant` changes has been committed
+since its last run (`stages_mapped` in the audit log), lists those drafts and how
+many reviews were closed since, and runs only with `--discard-edits`.
 
 Tests: `tests/editor_stage_review_flow.rs`, registered in
 `scripts/editor_flow_test.sh`; and `scripts/backfill_stages.py --self-test`
@@ -4537,6 +4636,22 @@ route and we have not, change the route's stages to match (section 18, in a
 draft) and **Mark it fixed**. If our feed is right and MTC's table is the one out
 of date, **Leave it alone** with a note saying so. Nothing on the screen edits
 anything itself.
+
+**The duplicates.** A name-keyed stage with exactly one MTC-keyed stage of the
+same name and direction (case, spaces and dots aside) has *Use MTC's stage N
+instead*: the stage/merge of section 19.1, through the same dialog saying which
+stops change and how far apart the two start. More than 1 km apart, the stage
+says so before anyone clicks; a route running both has no button, and says why.
+With several MTC stages of the name, *Choose which MTC stage it is* opens the
+stage page. Because these are the same few hundred names over and over, the
+queue also has **Replace the duplicates with MTC's stage…**
+(`GET /feeds/{g}/stage-twins`): every such stage in a list to untick - one far
+from its twin starts unticked, one a route runs with its twin cannot be ticked -
+and each ticked one goes into the draft as a merge. They are added without
+replaying the draft after each, the draft is read once, and any it refuses come
+straight back out and are listed. A route in the queue whose name-based stages
+the open draft replaces says how many of them; closing it offers the reviews of
+those stages too.
 
 `order_differs` exists in the table's vocabulary and nothing raises it: a route
 whose lists are the same length pairs by position and the names differing down

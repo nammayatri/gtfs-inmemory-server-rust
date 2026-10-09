@@ -94,6 +94,12 @@ Rerunning is safe and idempotent: the run reads the same rows every time and
 writes only the stage tables. `--reset` replaces the generated stages of the
 routes this run covers and leaves a skipped route's stages alone.
 
+**Once the team has worked the reviews, `--reset` refuses.** Their fixes are
+committed drafts - stages merged, replaced, split, edited, route stage lists
+changed - and a reset puts every route it covers back to this run's stages,
+undoing all of it while the reviews still say fixed. It lists the drafts it
+would undo and stops; `--discard-edits` is the deliberate way past.
+
 `--no-replica` takes the stage order and names from `gtfs_route_stop` alone and
 leaves every direction NULL. It is for trying a run out where the replica is not
 reachable; a real run wants the directions, or the two directions of one corridor
@@ -1153,6 +1159,50 @@ def build_sql(gtfs, stages, runs_by_route, reviews, issues, args, batch):
 # --------------------------------------------------------------------- checks
 
 
+def plural_of(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+# The last run, or the start of time when there has been none. Everything the
+# team commits after it is theirs, and --reset would write over it: the run's
+# DELETE takes every stage list of the routes it covers, and the stages it
+# writes are its own choice again.
+LAST_RUN = (
+    "coalesce((SELECT max(at) FROM gtfs_audit_log"
+    " WHERE gtfs_id = {g} AND action = 'stages_mapped'), '-infinity'::timestamptz)"
+)
+
+
+def edits_since_last_run_sql(g):
+    """Committed drafts that changed stages, route stage lists or temporary
+    routes since the last run: one row each, oldest first."""
+    return (
+        "SELECT cs.change_set_id::text, cs.title, cs.committed_at::text, u.email,"
+        " count(*) FILTER (WHERE ch.entity = 'stage'),"
+        " count(*) FILTER (WHERE ch.entity = 'route_stages'),"
+        " count(*) FILTER (WHERE ch.entity = 'route_variant')"
+        " FROM gtfs_change_set cs"
+        " JOIN gtfs_change ch ON ch.change_set_id = cs.change_set_id"
+        " LEFT JOIN gtfs_editor_user u ON u.user_id = cs.committed_by"
+        f" WHERE cs.gtfs_id = {g} AND cs.status = 'committed'"
+        "   AND ch.entity IN ('stage', 'route_stages', 'route_variant')"
+        f"   AND cs.committed_at > {LAST_RUN.format(g=g)}"
+        " GROUP BY cs.change_set_id, cs.title, cs.committed_at, u.email"
+        " ORDER BY cs.committed_at"
+    )
+
+
+def reviews_closed_since_last_run_sql(g):
+    """Stage reviews and routes to review closed as fixed since the last run."""
+    since = LAST_RUN.format(g=g)
+    return (
+        "SELECT (SELECT count(*) FROM gtfs_stage_review"
+        f"  WHERE gtfs_id = {g} AND status = 'fixed' AND reviewed_at > {since})"
+        " + (SELECT count(*) FROM gtfs_route_stage_issue"
+        f"  WHERE gtfs_id = {g} AND status = 'fixed' AND reviewed_at > {since})"
+    )
+
+
 def refuse_if_busy(url, gtfs, args, writing):
     """What would stop a write. A dry run reports the same things and carries on:
     it writes nothing, so nothing it finds can do any harm."""
@@ -1236,6 +1286,29 @@ def refuse_if_busy(url, gtfs, args, writing):
             "a route_stops change cannot be submitted once its route has stages "
             "(route_has_stages). Commit or discard these first, or pass --force."
         )
+    if args.reset:
+        edits = query(url, edits_since_last_run_sql(g))
+        if edits and not args.discard_edits:
+            for cs, title, at, by, stages, lists, temporary in edits:
+                what = ", ".join(
+                    plural_of(int(n), word)
+                    for n, word in ((stages, "stage change"), (lists, "route stage list"),
+                                    (temporary, "temporary route"))
+                    if int(n)
+                )
+                log(f"  draft {cs} “{title}”, committed {at} by {by or 'unknown'}: {what}")
+            closed = scalar(url, reviews_closed_since_last_run_sql(g))
+            stop(
+                f"{len(edits)} committed draft(s) changed this feed's stages since it was "
+                "last mapped, and --reset would put every route this run covers back to "
+                "the mapper's stages, undoing them"
+                + (f" ({closed} review(s) closed as fixed would then say fixed for a fix "
+                   "that is gone)" if closed and int(closed) else "")
+                + ". Leave the stages as the team has them, or pass --discard-edits to "
+                "undo those drafts' work."
+            )
+        elif edits:
+            log(f"  --discard-edits: undoing {len(edits)} committed draft(s) of stage edits")
     bad = query(
         url,
         "SELECT route_id, count(*) FROM gtfs_route_stop"
@@ -1623,6 +1696,40 @@ def self_test():
     # and --reset replaces only the stages of the routes this run covers
     assert "DELETE FROM gtfs_route_stage WHERE gtfs_id = 'feed' AND route_id IN ('9');" in sql
 
+    # 14. --reset refuses to write over stage edits the team committed since the
+    # last run, unless told to with --discard-edits; a dry run only says so
+    def fake_query(url, sql):
+        if "cs.status = 'committed'" in sql:
+            return [["cs-1", "Saidapet put right", "2026-10-08 10:00", "ops@test", "2", "1", "0"]]
+        return []
+
+    def fake_scalar(url, sql):
+        return "3" if "status = 'fixed'" in sql else "0"
+
+    class Busy:
+        reset = True
+        force = False
+        discard_edits = False
+
+    real = globals()["query"], globals()["scalar"]
+    globals()["query"], globals()["scalar"] = fake_query, fake_scalar
+    try:
+        try:
+            refuse_if_busy("fake", "feed", Busy(), writing=True)
+            raise AssertionError("--reset wrote over committed stage edits")
+        except SystemExit:
+            pass
+        refuse_if_busy("fake", "feed", Busy(), writing=False)
+        Busy.discard_edits = True
+        refuse_if_busy("fake", "feed", Busy(), writing=True)
+        # and with nothing committed since, there is nothing to refuse
+        Busy.discard_edits = False
+        globals()["query"] = lambda url, sql: []
+        refuse_if_busy("fake", "feed", Busy(), writing=True)
+    finally:
+        globals()["query"], globals()["scalar"] = real
+    assert "committed_at > coalesce((SELECT max(at) FROM gtfs_audit_log" in edits_since_last_run_sql("'feed'")
+
     print("self-test: ok")
 
 
@@ -1661,6 +1768,12 @@ def main():
     p.add_argument("--write", action="store_true", help="write it; without this, nothing is written")
     p.add_argument("--reset", action="store_true", help="replace this feed's stages")
     p.add_argument("--force", action="store_true", help="write even with open change sets")
+    p.add_argument(
+        "--discard-edits",
+        action="store_true",
+        help="with --reset, write even when drafts committed since the last run "
+        "changed the stages: the team's edits to the routes this run covers are undone",
+    )
     p.add_argument("--actor", default="backfill", help="goes in updated_by and the audit row")
     p.add_argument("--batch", help="names this run on the review rows (default: the date and time)")
     p.add_argument("--review-csv", metavar="PATH", help="every name raised for review, one row each")
