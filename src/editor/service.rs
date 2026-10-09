@@ -5664,6 +5664,31 @@ async fn commit_in(
         }),
     )
     .await?;
+    // a stage merged away or deleted has nothing left to review: its open
+    // review closes with the draft that took it away (section 19.1)
+    if changes
+        .iter()
+        .any(|c| c.entity == "stage" && matches!(c.op.as_str(), "merge" | "delete"))
+    {
+        let closed = super::stage_reviews::close_settled(
+            conn,
+            gtfs_id,
+            id,
+            set.json["title"].as_str().unwrap_or("untitled"),
+            set.created_by,
+        )
+        .await?;
+        auth::audit_many(
+            &mut *conn,
+            Some(ctx.user.user_id),
+            Some(&ctx.user.email),
+            "stage_review_closed",
+            Some(gtfs_id),
+            Some(id),
+            &closed,
+        )
+        .await?;
+    }
     auth::audit_many(
         &mut *conn,
         Some(ctx.user.user_id),

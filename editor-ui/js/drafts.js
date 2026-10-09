@@ -2,7 +2,7 @@
 // adding changes to it. Every edit screen goes through addChange().
 import { get, post, put, del, enc, ApiError } from "./api.js";
 import { state, set, setPref, pref, can } from "./state.js";
-import { h, modal, toast, fmtDate, plural, STATUS_LABEL } from "./util.js";
+import { h, modal, toast, fmtDate, plural, STATUS_LABEL, SERVED_EXCLUDE } from "./util.js";
 
 // Remembered per person and feed: two people sharing a browser must not edit
 // into each other's drafts.
@@ -157,6 +157,25 @@ export function stageChanges(key) {
   return state.draft.changes.filter((c) => c.entity === "stage" && sameKey(c, key));
 }
 
+// Stages the open draft makes, by a create or a split, in the list shape, for
+// the stage search. A later edit of one in the same draft is shown, not the
+// stage as it was first made.
+export function createdStages() {
+  if (!state.draft) return [];
+  return state.draft.changes.filter((c) => c.entity === "stage" && (c.op === "create" || c.op === "split") && c.after).map((c) => {
+    const key = `${c.entity_key}|${c.after.direction || ""}`;
+    const edit = existingChange("stage", key);
+    const after = edit ? { ...c.after, ...edit.after } : c.after;
+    const rows = after.rows || [];
+    return {
+      stage_id: c.entity_key, stage_key: key, direction: after.direction || null,
+      name: after.name, description: after.description || null, draft: true,
+      stop_count: rows.filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length,
+      route_count: c.op === "split" ? (c.after.routes || []).length : 0,
+    };
+  });
+}
+
 export function createdStops() {
   if (!state.draft) return [];
   return state.draft.changes.filter((c) => c.entity === "stop" && c.op === "create" && c.after).map((c) => ({
@@ -220,4 +239,71 @@ export async function addChange(change, { merge = true, quiet = false, sameAs = 
   if (!quiet) toast(errors ? `Added to "${cs.title}" with ${errors} problem${errors === 1 ? "" : "s"} to fix before submitting.`
     : `Added to draft "${cs.title}".`, errors ? "error" : "");
   return { draft: cs, problems, changeId: mine };
+}
+
+// The draft a review names when it is closed, chosen from the feed's drafts
+// rather than typed: still open, waiting for approval, or committed lately,
+// newest first, with the one open here marked. "Another draft" takes an id for
+// anything older. `value()` is the chosen id, or "" for none.
+const OTHER_DRAFT = "other";
+export function draftPicker({ id, preselect = null }) {
+  const select = h("select", { id });
+  const other = h("input", {
+    type: "text", id: `${id}-other`, hidden: true, autocomplete: "off", spellcheck: "false",
+    placeholder: "Draft id", "aria-label": "Draft id",
+  });
+  select.addEventListener("change", () => {
+    other.hidden = select.value !== OTHER_DRAFT;
+    if (!other.hidden) other.focus();
+  });
+  const groups = [
+    ["Open drafts", ["draft"]],
+    ["Waiting for approval", ["submitted", "approved"]],
+    ["Live", ["committed"]],
+  ];
+  const fill = (sets) => {
+    const want = select.value && select.value !== OTHER_DRAFT ? select.value : preselect;
+    // the open draft is always offered, even before the list comes back
+    if (state.draft && !sets.some((cs) => cs.change_set_id === state.draft.change_set_id)) sets = [state.draft, ...sets];
+    const option = (cs) => h("option", { value: cs.change_set_id, selected: cs.change_set_id === want },
+      [
+        cs.title || "untitled",
+        state.draft && cs.change_set_id === state.draft.change_set_id ? "(open here)" : null,
+        "\u2014",
+        plural(cs.change_count ?? (cs.changes || []).length, "change"),
+        cs.created_by_email ? `by ${cs.created_by_email}` : null,
+      ].filter(Boolean).join(" "));
+    select.replaceChildren(
+      h("option", { value: "", selected: !want }, "No draft"),
+      ...groups.map(([label, statuses]) => {
+        const of = sets.filter((cs) => statuses.includes(cs.status));
+        return of.length ? h("optgroup", { label }, of.map(option)) : null;
+      }).filter(Boolean),
+      h("option", { value: OTHER_DRAFT }, "Another draft, by its id\u2026"));
+    // a preselected draft that is in none of the groups is typed in instead
+    if (want && ![...select.options].some((o) => o.value === want)) {
+      select.value = OTHER_DRAFT;
+      other.value = want;
+      other.hidden = false;
+    }
+  };
+  fill([]);
+  get(`feeds/${enc(state.feedId)}/change-sets?status=draft,submitted,approved,committed&limit=50`)
+    .then((page) => fill(page.items || []))
+    .catch(() => {});
+  return {
+    el: h("span.draft-picker", select, other),
+    value: () => (select.value === OTHER_DRAFT ? other.value.trim() : select.value),
+    set(v) {
+      preselect = v;
+      if ([...select.options].some((o) => o.value === v)) {
+        select.value = v;
+        other.hidden = true;
+      } else if (v) {
+        select.value = OTHER_DRAFT;
+        other.value = v;
+        other.hidden = false;
+      }
+    },
+  };
 }

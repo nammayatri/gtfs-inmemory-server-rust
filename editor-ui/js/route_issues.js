@@ -10,11 +10,13 @@
 // screen puts the two lists side by side, marks where they part company, and
 // lets the person either fix the route's stages in a draft or say our side is
 // right as it stands.
-import { get, post, enc } from "./api.js";
+import { get, post, del, enc } from "./api.js";
 import { state, can } from "./state.js";
-import { h, clear, toast, confirmDialog, fmtCount, fmtDate, plural } from "./util.js";
+import { h, clear, toast, confirmDialog, modal, fmtCount, fmtDate, fmtMetres, plural } from "./util.js";
 import { nameHere } from "./trail.js";
 import { editRouteStages } from "./stages.js";
+import { draftPicker, requireDraft, refreshDraft } from "./drafts.js";
+import { confirmMerge, draftMerges, finalStage, undoChange, alsoClose, fixedByNotice, openRouteStages } from "./stage_like.js";
 
 const panel = () => document.getElementById("panel");
 const PAGE = 50;
@@ -66,12 +68,12 @@ const CONFIRM_NOTES = [
   "Our feed is right; MTC's route table is behind and it is not ours to change.",
 ];
 
-const list = { feedId: null, status: "pending", issue: "", q: "", items: [], cursor: null, counts: null, loaded: false };
+const list = { feedId: null, status: "pending", issue: "", q: "", lost: false, items: [], cursor: null, counts: null, loaded: false };
 let flash = null;
 
 function resetForFeed() {
   if (list.feedId === state.feedId) return;
-  Object.assign(list, { feedId: state.feedId, status: "pending", issue: "", q: "", items: [], cursor: null, counts: null, loaded: false });
+  Object.assign(list, { feedId: state.feedId, status: "pending", issue: "", q: "", lost: false, items: [], cursor: null, counts: null, loaded: false });
 }
 
 export async function refreshRouteIssueCount() {
@@ -97,6 +99,105 @@ function statusChip(r) {
   return h("span.chip", { class: r.status === "fixed" ? "ok" : "" }, word);
 }
 
+const lostDraft = (r) => r.status === "fixed" && ["discarded", "rejected"].includes(r.change_set_status);
+
+// ------------------------------------------------------------------ duplicates
+// Every stage named after itself (an nm_ id) that has exactly one MTC stage of
+// its name going the same way is a duplicate of it, and they are many: the
+// same few hundred names over and over. They are replaced here in one go, each
+// a merge in the draft, after a list to untick: one starting far from its twin
+// is another place of that name and starts unticked, and one a route runs
+// with its twin cannot be merged until that route is off one of them.
+async function replaceDuplicates(onDone) {
+  if (!(await requireDraft("The replacements go into a draft. Nothing changes for passengers until someone else approves it and it is committed."))) return;
+  let t;
+  try {
+    t = await get(`feeds/${enc(state.feedId)}/stage-twins`);
+  } catch (e) {
+    return toast(e.message, "error");
+  }
+  const items = (t.items || []).filter((x) => !draftMerges(x.stage_key).replacedBy);
+  let ran = false;
+  await modal("Replace the duplicates with MTC's stage", (close) => {
+    const boxes = items.map((x) => {
+      const shared = x.shared_routes || [];
+      return h("input", { type: "checkbox", id: `twin-${x.stage_key}`, checked: !x.far && !shared.length, disabled: shared.length > 0 });
+    });
+    const progress = h("p.hint", { "aria-live": "polite" });
+    const count = () => boxes.filter((b) => b.checked).length;
+    const go = h("button.btn", { type: "button" });
+    const label = () => { go.textContent = `Add ${plural(count(), "replacement")} to the draft`; go.disabled = !count(); };
+    boxes.forEach((b) => b.addEventListener("change", label));
+    const all = (on) => { boxes.forEach((b, i) => { if (!b.disabled) b.checked = on && !items[i].far; }); label(); };
+    go.addEventListener("click", async () => {
+      const chosen = items.filter((_, i) => boxes[i].checked);
+      go.disabled = true;
+      boxes.forEach((b) => { b.disabled = true; });
+      const set = state.draft.change_set_id;
+      const added = [];
+      const failed = [];
+      // one change at a time without replaying the draft after each, then the
+      // draft read once: what it refuses comes straight back out
+      for (const [n, x] of chosen.entries()) {
+        progress.textContent = `Adding ${n + 1} of ${chosen.length}…`;
+        try {
+          const res = await post(`change-sets/${enc(set)}/changes?replay=false`, {
+            entity: "stage", op: "merge", entity_key: x.stage_key, after: { into_stage_id: x.twin.stage_key },
+          });
+          added.push({ x, id: res.change_id });
+        } catch (e) {
+          failed.push(`${x.stage_id}: ${e.message}`);
+        }
+      }
+      progress.textContent = "Checking the draft…";
+      try {
+        const cs = await get(`change-sets/${enc(set)}`);
+        for (const a of added) {
+          const bad = (cs.validation || []).find((v) => v.change_id === a.id && v.level === "error");
+          if (!bad) continue;
+          await del(`change-sets/${enc(set)}/changes/${a.id}?replay=false`);
+          failed.push(`${a.x.stage_id}: ${bad.message}`);
+          a.out = true;
+        }
+        await refreshDraft();
+      } catch (e) {
+        failed.push(e.message);
+      }
+      ran = true;
+      const ok = added.filter((a) => !a.out).length;
+      clear(progress,
+        h("strong", `${plural(ok, "stage")} replaced in your draft “${state.draft ? state.draft.title : ""}”.`),
+        failed.length ? [` ${plural(failed.length, "could", "could")} not be, and ${failed.length === 1 ? "is" : "are"} not in the draft:`,
+          h("ul.compact-list", failed.slice(0, 20).map((f) => h("li", f)))] : null);
+      go.hidden = true;
+    });
+    label();
+    return h("div",
+      h("p", `${plural(items.length, "stage")} named after ${items.length === 1 ? "itself has" : "themselves have"} exactly one MTC stage of the same name going the same way. `
+        + "Each ticked one is replaced by its MTC stage: every route using it runs MTC's stage instead, and it goes away."),
+      t.several ? h("p.hint", `${plural(t.several, "other")} share a name with several of MTC's stops; which one each is, is decided on its stage page.`) : null,
+      items.length ? [
+        h("div.btn-row",
+          h("button.btn.quiet.small", { type: "button", on: { click: () => all(true) } }, "Tick all that start close by"),
+          h("button.btn.quiet.small", { type: "button", on: { click: () => all(false) } }, "Untick all")),
+        h("ul.twin-list", items.map((x, i) => {
+          const shared = x.shared_routes || [];
+          return h("li", h("label.check", { for: `twin-${x.stage_key}` }, boxes[i],
+            h("span", h("strong", x.name), ` ${x.stage_id} \u2192 MTC's ${x.twin.stage_id}`,
+              x.direction ? ` (${x.direction})` : "",
+              h("span.hint", ` · ${plural(x.route_count, "route")}`),
+              x.distance_m != null ? h("span.hint", x.distance_m < 10 ? " · same place" : ` · starts ${fmtMetres(x.distance_m)} apart`) : null,
+              x.far ? h("span.chip.warn", "far apart: another place?") : null,
+              shared.length ? h("span.chip.warn", `${shared.map((r) => r.short_name || r.route_id).join(", ")} ${shared.length === 1 ? "runs" : "run"} both`) : null)),
+            h("a.btn.quiet.small", { href: `#/stage/${enc(x.stage_key)}`, on: { click: () => close() } }, "Open"));
+        })),
+        progress,
+        h("div.btn-row", go),
+      ] : h("p.empty", "None left: every such stage is already replaced in your draft, or there are none."));
+  }, { wide: true, actions: [(close) => h("button.btn.secondary", { type: "button", on: { click: () => close() } }, "Close")] });
+  if (ran && onDone) onDone();
+}
+
 // ------------------------------------------------------------------ the queue
 
 export async function showRouteIssuesList() {
@@ -115,9 +216,24 @@ export async function showRouteIssuesList() {
     const n = list.counts ? list.counts[key] : null;
     return h("button.route-chip", {
       type: "button", "aria-pressed": String(list.status === key),
-      on: { click: () => { list.status = key; reload(); } },
+      on: { click: () => { list.status = key; list.lost = false; reload(); } },
     }, text, n ? h("span.count", fmtCount(n)) : null);
   }));
+  // a fix whose draft was thrown away never went live
+  const lostChips = h("div.filter-chips", { role: "group", "aria-label": "Which fixed routes" });
+  const lostNotice = h("div.notice.error", { role: "status", hidden: true });
+  const renderLost = () => {
+    const n = (list.counts && list.counts.fixed_lost) || 0;
+    lostChips.hidden = list.status !== "fixed" || (!n && !list.lost);
+    clear(lostChips, list.status === "fixed" ? [[false, "All fixed"], [true, "Draft thrown away"]].map(([on, text]) => h("button.route-chip", {
+      type: "button", "aria-pressed": String(list.lost === on),
+      on: { click: () => { list.lost = on; reload(); } },
+    }, text, on ? h("span.count", fmtCount(n)) : null)) : null);
+    lostNotice.hidden = !(n && list.status === "pending");
+    clear(lostNotice, lostNotice.hidden ? null : h("p", h("strong", `${plural(n, "route")} marked fixed with a draft that was then discarded or rejected.`),
+      " Those fixes never went live. ",
+      h("button.btn.quiet.small", { type: "button", on: { click: () => { list.status = "fixed"; list.lost = true; reload(); } } }, "See them")));
+  };
   const renderIssues = () => clear(issues, [["", "All"], ...Object.entries(ISSUES).map(([k, [t]]) => [k, t])]
     .map(([key, text]) => {
       const n = key && list.counts ? (list.counts.issues || {})[key] : null;
@@ -134,7 +250,18 @@ export async function showRouteIssuesList() {
           h("h3",
             h("a", { href: `#/route-issues/${enc(r.issue_id)}` }, label(r)),
             statusChip(r),
-            r.route_deleted ? h("span.chip.warn", "route deleted") : null),
+            lostDraft(r) ? h("span.chip.warn", { title: "Marked fixed with a draft that was discarded or rejected: the fix never went live." }, "draft thrown away") : null,
+            r.route_deleted ? h("span.chip.warn", "route deleted") : null,
+            (() => {
+              // the route's name-based stages the open draft already replaces
+              const keys = r.unkeyed_keys || [];
+              const done = keys.filter((k) => draftMerges(k).replacedBy).length;
+              return r.status === "pending" && done
+                ? h("span.chip.draft", done === keys.length
+                    ? "all its name-based stages replaced in your draft"
+                    : `${done} of ${keys.length} name-based stages replaced in your draft`)
+                : null;
+            })()),
           h("p.hint", (ISSUES[r.issue] || [r.issue])[0],
             " — ",
             `ours ${plural((r.ours || []).length, "fare stage")}, MTC ${(r.theirs || []).length}`),
@@ -155,6 +282,7 @@ export async function showRouteIssuesList() {
   const load = async (append = false) => {
     const qs = new URLSearchParams({ status: list.status, limit: String(PAGE) });
     if (list.issue) qs.set("issue", list.issue);
+    if (list.status === "fixed" && list.lost) qs.set("lost", "true");
     if (list.q.trim()) qs.set("q", list.q.trim());
     if (append && list.cursor) qs.set("cursor", list.cursor);
     try {
@@ -167,7 +295,7 @@ export async function showRouteIssuesList() {
     }
     draw();
   };
-  const reload = () => { list.items = []; list.cursor = null; list.loaded = false; renderTabs(); renderIssues(); draw(); load(); };
+  const reload = () => { list.items = []; list.cursor = null; list.loaded = false; renderTabs(); renderIssues(); renderLost(); draw(); load(); };
   search.addEventListener("change", () => { list.q = search.value; reload(); });
 
   clear(panel(),
@@ -182,14 +310,22 @@ export async function showRouteIssuesList() {
         ? h("p.hint", h("strong", plural(list.counts.stages_unkeyed, "stage")),
           " across the routes still open are named this way.")
         : null,
+      can("editor") ? h("div.notice",
+        h("p", h("strong", "Most of these are duplicates."), " A stage named after itself that has exactly one MTC stage "
+          + "of the same name going the same way is that stage twice. Replace them all at once, after a list to untick."),
+        h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: () => replaceDuplicates(reload) } },
+          "Replace the duplicates with MTC's stage\u2026"))) : null,
+      lostNotice,
       tabs,
+      lostChips,
       issues,
       h("label.field", { for: "route-issue-search" }, h("span", "Search"), search)),
     h("section.section", items, more));
   flash = null;
   renderTabs();
   renderIssues();
-  refreshRouteIssueCount().then(() => { renderTabs(); renderIssues(); load(); });
+  renderLost();
+  refreshRouteIssueCount().then(() => { renderTabs(); renderIssues(); renderLost(); load(); });
 }
 
 // ------------------------------------------------------------------ one route
@@ -254,18 +390,24 @@ export async function showRouteIssue(id) {
   const same = rows.filter(([, , ok]) => ok).length;
 
   const note = h("textarea", { id: "route-issue-note", rows: "2", placeholder: "What you found" });
-  const draftInput = h("input", {
-    type: "text", id: "route-issue-draft", placeholder: "Draft id (optional)",
-    autocomplete: "off", spellcheck: "false",
-    value: state.draft ? state.draft.change_set_id : "",
-  });
+  const draftChoice = draftPicker({ id: "route-issue-draft", preselect: state.draft ? state.draft.change_set_id : null });
+  // the reviews of this route's name-based stages the draft replaces are
+  // settled with it, and close with it
+  const replaced = (r.stages || []).filter((st) => st.name_keyed && draftMerges(st.stage_key).replacedBy);
+  const also = editable && replaced.length
+    ? alsoClose({
+        gone: replaced.map((st) => st.stage_key),
+        kept: [...new Set(replaced.map((st) => finalStage(st.stage_key)))],
+        except: { issue_id: r.issue_id },
+      })
+    : null;
   const close = async (decision) => {
     const text = note.value.trim();
     if (decision === "confirmed" && !text) {
       note.focus();
       return toast("Say why the route is right as it stands.", "error");
     }
-    const set = draftInput.value.trim();
+    const set = draftChoice.value();
     if (!(await confirmDialog(
       decision === "fixed" ? `Mark ${label(r)} fixed?` : `Leave ${label(r)} as it is?`,
       decision === "fixed"
@@ -274,12 +416,17 @@ export async function showRouteIssue(id) {
       { confirm: decision === "fixed" ? "Mark it fixed" : "Leave it alone" },
     ))) return;
     try {
-      await post(`route-issues/${enc(id)}/close`, {
+      const body = {
         decision,
         note: text || null,
         change_set: decision === "fixed" && set ? set : null,
-      });
-      flash = `${label(r)} is ${decision === "fixed" ? "marked fixed" : "left as it is"}.`;
+      };
+      await post(`route-issues/${enc(id)}/close`, body);
+      const more = decision === "fixed" && also ? await also.closeAll(body) : { closed: 0, failed: [] };
+      flash = [`${label(r)} is ${decision === "fixed" ? "marked fixed" : "left as it is"}.`,
+        more.closed ? `${plural(more.closed, "other review")} marked fixed with it.` : null,
+        more.failed.length ? `${plural(more.failed.length, "other review")} could not be closed: ${more.failed.join(" ")}` : null,
+      ].filter(Boolean).join(" ");
       list.items = [];
       list.loaded = false;
       refreshRouteIssueCount();
@@ -290,7 +437,7 @@ export async function showRouteIssue(id) {
   };
   const reopen = h("button.btn.secondary", { type: "button", hidden: !(can("editor") && ["fixed", "confirmed"].includes(r.status)) },
     "Put it back in the queue");
-  reopen.addEventListener("click", async () => {
+  const doReopen = async () => {
     if (!(await confirmDialog(`Put ${label(r)} back?`, "It goes back into the queue as if nobody had looked at it.", { confirm: "Put it back" }))) return;
     try {
       await post(`route-issues/${enc(id)}/reopen`, {});
@@ -299,9 +446,19 @@ export async function showRouteIssue(id) {
     } catch (e) {
       toast(e.message, "error");
     }
-  });
+  };
+  reopen.addEventListener("click", doReopen);
 
   const unkeyed = (r.stages || []).filter((s) => s.name_keyed);
+  // A name-keyed stage with one MTC-keyed twin is a duplicate of it: its
+  // routes run the twin instead and it goes away, one merge in the draft,
+  // after the server has said what it would do - the stops the routes gain and
+  // lose, and how far apart the two start. With several twins (one name,
+  // several of MTC's stops) which is this one's is decided on the stage page,
+  // among the stages like it.
+  const useTwin = async (s) => {
+    if (await confirmMerge({ gone: s.stage_key, into: s.twin_key, mode: "replace" })) showRouteIssue(id);
+  };
   clear(panel(),
     h("section.section",
       h("a.crumb", { href: "#/route-issues" }, "Routes to review"),
@@ -316,7 +473,8 @@ export async function showRouteIssue(id) {
         h("dt", "Raised by"), h("dd", r.batch),
         r.reviewed_by_email ? [h("dt", "Closed by"), h("dd", `${r.reviewed_by_email}${r.reviewed_at ? ` on ${fmtDate(r.reviewed_at)}` : ""}`)] : null,
         r.review_note ? [h("dt", "Note"), h("dd", r.review_note)] : null,
-        r.change_set_id ? [h("dt", "Draft"), h("dd", h("a", { href: `#/drafts/${enc(r.change_set_id)}` }, r.change_set_title || r.change_set_id))] : null)),
+        r.change_set_id ? [h("dt", "Draft"), h("dd", h("a", { href: `#/drafts/${enc(r.change_set_id)}` }, r.change_set_title || r.change_set_id))] : null),
+      fixedByNotice(r, { onReopen: can("editor") ? doReopen : null })),
 
     h("section.section",
       h("h2", "The two lists"),
@@ -337,12 +495,35 @@ export async function showRouteIssue(id) {
       h("p.hint", `${plural(unkeyed.length, "stage")} on this route carries a name-based id `
         + "because the route could not be lined up. One marked “also exists with MTC's id” "
         + "is the same place as a stage the other routes already use — those are the duplicates."),
-      h("ul.compact-list", unkeyed.map((s) => h("li",
-        h("a", { href: `#/stage/${enc(s.stage_key)}` }, s.name),
-        h("span.ids", s.stage_id),
-        s.direction ? h("span.chip", s.direction) : null,
-        h("span.hint", `${plural(s.stop_count, "stop")}, ${plural(s.route_count, "route")}`),
-        s.twin ? h("span.chip.warn", "also exists with MTC's id") : null)))) : null,
+      h("ul.compact-list", unkeyed.map((s) => {
+        const done = draftMerges(s.stage_key).replacedBy;
+        const shared = s.twin_shared || [];
+        return h("li",
+          h("a", { href: `#/stage/${enc(s.stage_key)}` }, s.name),
+          h("span.ids", s.stage_id),
+          s.direction ? h("span.chip", s.direction) : null,
+          h("span.hint", `${plural(s.stop_count, "stop")}, ${plural(s.route_count, "route")}`),
+          s.twin ? h("span.chip.warn", "also exists with MTC's id") : null,
+          !done && s.twin_key && s.twin_far ? h("span.chip.warn", { title: "The same name this far away may be another place." },
+            `MTC's starts ${fmtMetres(s.twin_distance_m)} away`) : null,
+          done ? h("span.chip.draft", `replaced by ${finalStage(s.stage_key).split("|")[0]} in your draft`) : null,
+          done && state.draft ? h("button.btn.quiet.small", {
+            type: "button",
+            on: { click: async () => { if (await undoChange(done, `Replacing ${s.stage_id}`)) showRouteIssue(id); } },
+          }, "Undo") : null,
+          !done && s.twin_key && !shared.length && can("editor") ? h("button.btn.secondary.small", {
+            type: "button", on: { click: () => useTwin(s) },
+          }, `Use MTC's stage ${s.twin_key.split("|")[0]} instead`) : null,
+          // a route running both cannot have one merged into the other
+          !done && s.twin_key && shared.length ? h("span.hint",
+            ` ${shared.join(", ")} ${shared.length === 1 ? "runs" : "run"} both this and MTC's stage ${s.twin_key.split("|")[0]}, `
+            + "so it comes off one of them first: ",
+            h("button.btn.quiet.small", { type: "button", on: { click: () => openRouteStages(r.route_id) } }, "Change this route's stages")) : null,
+          // several of MTC's stops share the name, or the name is written
+          // another way: the stage page lists the stages like it
+          !done && !s.twin_key ? h("a.btn.quiet.small", { href: `#/stage/${enc(s.stage_key)}` },
+            s.twin ? "Choose which MTC stage it is" : "Find stages like it") : null);
+      }))) : null,
 
     h("section.section",
       h("h2", "Fix it"),
@@ -369,7 +550,8 @@ export async function showRouteIssue(id) {
       editable ? h("div.btn-row", ...CONFIRM_NOTES.map((t) => h("button.route-chip", {
         type: "button", on: { click: () => { note.value = t; note.focus(); } },
       }, t.slice(0, 40) + "…"))) : null,
-      editable ? h("label.field", { for: "route-issue-draft" }, h("span", "Draft"), draftInput) : null,
+      editable ? h("label.field", { for: "route-issue-draft" }, h("span", "Draft"), draftChoice.el) : null,
+      also ? also.el : null,
       h("div.btn-row",
         editable ? h("button.btn", { type: "button", on: { click: () => close("fixed") } }, "Mark it fixed") : null,
         editable ? h("button.btn.secondary", { type: "button", on: { click: () => close("confirmed") } }, "Leave it alone") : null,

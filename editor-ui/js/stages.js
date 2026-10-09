@@ -7,9 +7,10 @@ import { get, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
 import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERVED_EXCLUDE } from "./util.js";
 import * as map from "./map.js";
-import { addChange, updateChange, existingChange, createdChange, requireDraft, stageKey, stageChanges, sameStageKey } from "./drafts.js";
+import { addChange, updateChange, existingChange, createdChange, createdStages, requireDraft, stageKey, stageChanges, sameStageKey } from "./drafts.js";
 import { stopPicker } from "./picker.js";
 import { idKind } from "./stage_reviews.js";
+import { stagesLike, draftMerges, finalStage, stageBrief, undoChange } from "./stage_like.js";
 import { showRoute } from "./explore.js";
 
 const panel = () => document.getElementById("panel");
@@ -38,25 +39,6 @@ function unsavedGuard(what) {
 // through the draft's preview, which applies it.
 export function draftTouchesStages() {
   return !!state.draft && state.draft.changes.some((c) => c.entity === "stage" || c.entity === "route_stages");
-}
-
-// Stages the open draft makes, by a create or a split, in the list shape, for
-// the stage search. A later edit of one in the same draft is shown, not the
-// stage as it was first made.
-function createdStages() {
-  if (!state.draft) return [];
-  return state.draft.changes.filter((c) => c.entity === "stage" && (c.op === "create" || c.op === "split") && c.after).map((c) => {
-    const key = `${c.entity_key}|${c.after.direction || ""}`;
-    const edit = existingChange("stage", key);
-    const after = edit ? { ...c.after, ...edit.after } : c.after;
-    const rows = after.rows || [];
-    return {
-      stage_id: c.entity_key, stage_key: key, direction: after.direction || null,
-      name: after.name, description: after.description || null, draft: true,
-      stop_count: rows.filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length,
-      route_count: c.op === "split" ? (c.after.routes || []).length : 0,
-    };
-  });
 }
 
 const directionWord = (d) => (d ? `direction: ${d}` : null);
@@ -159,7 +141,10 @@ export function routeStagesSection(route, { created = false, onInfo } = {}) {
 
 // `variant`: the same screen, saving a temporary route instead of the route's
 // normal list (docs section 19). `{ id, name, reason, creating, stages, hash }`.
-export async function editRouteStages(route, { created = false, variant = null } = {}) {
+// `swap`: `{ from, to }` - a stage key, and the stage to run in its place - for
+// a stage that is wrong on this route only (section 19.1): the screen opens
+// with the one already swapped for the other, unsaved, for the person to check.
+export async function editRouteStages(route, { created = false, variant = null, swap = null } = {}) {
   if (!(await requireDraft("A route's stages are changed in a draft. Nothing changes for passengers until someone else approves it and it is committed."))) return;
   const prior = variant ? null : existingChange("route_stages", route.route_id);
   let live, current;
@@ -406,6 +391,29 @@ export async function editRouteStages(route, { created = false, variant = null }
   );
   showResults([], "Type at least two letters of the stage name, or find stages through a stop.");
   redraw();
+  if (swap) {
+    const i = links.findIndex((l) => sameStageKey(stageKey(l), swap.from));
+    const to = swap.to;
+    if (i < 0) {
+      toast(`Route ${label} does not run stage ${swap.from.split("|")[0]} on its normal route.`, "error");
+    } else if (onRoute(to)) {
+      toast(`${to.name} is already on route ${label}, and a route uses a stage once: remove ${links[i].name} instead.`, "error");
+    } else {
+      try {
+        const toKey = stageKey(to);
+        const detail = to.draft || createdChange("stage", toKey)
+          ? await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(toKey)}`)
+          : await get(`feeds/${enc(state.feedId)}/stages/${enc(toKey)}`);
+        const was = links[i];
+        links[i] = { stage_id: detail.stage_id, stage_key: stageKey(detail), direction: detail.direction, name: detail.name,
+          rows: detail.rows, route_count: detail.route_count, stage_no: was.stage_no };
+        edited();
+        toast(`${was.name} is swapped for ${detail.name} as fare stage ${was.stage_no ?? i + 1} of route ${label}. Check it, then add it to your draft.`);
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    }
+  }
 }
 
 // ------------------------------------------------------------------ one stage
@@ -427,7 +435,17 @@ export async function showStage(stageId) {
   }
   map.clearFocus();
   map.showRoute({ route_id: s.stage_id, rows: s.rows });
+  // a stage the draft replaces with another is deleted in the preview; say by
+  // what, rather than only that it is deleted
+  const { replacedBy } = draftMerges(stageKey(s));
+  // replaced by B, and B in turn by C, ends on C
+  const replacement = replacedBy ? await stageBrief(finalStage(stageKey(s))) : null;
+  const via = replacedBy && !sameStageKey(finalStage(stageKey(s)), replacedBy.after.into_stage_id)
+    ? replacedBy.after.into_stage_id.split("|")[0] : null;
   const editor = can("editor") && !s.deleted;
+  const like = !s.deleted || replacement
+    ? stagesLike(s, { editable: editor, onChange: () => showStage(stageKey(s)) })
+    : null;
   const remove = async () => {
     if (!(await confirmDialog("Delete this stage?", `${s.name} (${s.stage_id}) is used by no route. Deleting it takes it out of the stage list once the draft is committed.`, { confirm: "Delete stage", danger: true }))) return;
     try {
@@ -455,7 +473,17 @@ export async function showStage(stageId) {
         h("p", h("strong", "This stage holds a map point."),
           " A map point is not a stop: it is a position the line is drawn through so it "
           + "follows the road. No passenger boards there and it is in no GTFS file.")) : null,
-      s.deleted ? h("p.notice.error", "This stage is deleted.") : null,
+      replacement ? h("div.notice.draft.pending",
+        h("p", h("strong", `Your draft “${state.draft.title}” replaces this stage with ${replacement.name} (stage ${replacement.stage_id})`
+          + `${via ? `, by way of stage ${via}` : ""}.`),
+          ` Every route using it runs ${replacement.name} instead, and this stage is deleted when the draft is committed.`),
+        h("div.btn-row",
+          h("a.btn.secondary.small", { href: `#/stage/${enc(replacement.stage_key || finalStage(stageKey(s)))}` }, `Open ${replacement.name}`),
+          can("editor") ? h("button.btn.quiet.small", {
+            type: "button",
+            on: { click: async () => { if (await undoChange(replacedBy, `Replacing ${s.name} with ${replacement.name}`)) showStage(stageKey(s)); } },
+          }, "Undo the replacement") : null))
+        : s.deleted ? h("p.notice.error", "This stage is deleted.") : null,
       s.review ? h("div.notice",
         h("p", h("strong", "The routes using this name do not agree about it: "),
           `${REVIEW_TEXT[s.review] || s.review}.`),
@@ -483,6 +511,13 @@ export async function showStage(stageId) {
             h("span.hint", `fare stage ${r.stage_no}`)),
           h("span.sub", `${r.long_name || ""} · route id ${r.route_id}`))))
         : h("p.empty", "No route uses this stage yet.")),
+    like ? h("section.section", h("h2", "Stages like this one"),
+      h("p.hint", "Going the same way and maybe the same place: the same name, a name written another way, "
+        + "or one starting close by. Merge one into this stage, or, if this stage is wrong altogether, "
+        + "use the right one instead: every route using this stage runs that one, and this one goes away. "
+        + "Wrong on only some routes? Use \u201cOnly on some routes\u2026\u201d. Each one says first which stops "
+        + "the routes gain and lose, and how far apart the two start."),
+      like.el) : null,
   );
 }
 
