@@ -33,6 +33,8 @@ use super::auth::{self, Ctx};
 use super::error::{EditorError, EditorResult};
 use super::proposals::{parse_status_list, ListQuery};
 use super::service::{self, Page};
+use super::stage_reviews::LOST_DRAFT;
+use super::stages;
 use super::EditorState;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -70,7 +72,11 @@ const SELECT: &str = "SELECT i.issue_id, i.gtfs_id, i.batch, i.route_id, i.short
         cs.title AS change_set_title, cs.status AS change_set_status, \
         u.email AS reviewed_by_email, i.reviewed_at, i.review_note, \
         i.created_at, i.updated_at, \
-        r.short_name AS live_short_name, r.long_name AS live_long_name, r.deleted \
+        r.short_name AS live_short_name, r.long_name AS live_long_name, r.deleted, \
+        (SELECT coalesce(array_agg(rs.stage_id || '|' || rs.direction ORDER BY rs.position), '{}') \
+           FROM gtfs_route_stage rs \
+          WHERE rs.gtfs_id = i.gtfs_id AND rs.route_id = i.route_id AND rs.variant_id IS NULL \
+            AND rs.stage_id LIKE 'nm\\_%') AS unkeyed_keys \
      FROM gtfs_route_stage_issue i \
      LEFT JOIN gtfs_change_set cs ON cs.change_set_id = i.change_set_id \
      LEFT JOIN gtfs_editor_user u ON u.user_id = i.reviewed_by \
@@ -118,6 +124,9 @@ fn from_row(r: &PgRow) -> Result<Issue, sqlx::Error> {
         "ours": ours,
         "theirs": theirs,
         "stages_unkeyed": r.try_get::<i32, _>("stages_unkeyed")?,
+        // the route's stages still named after themselves, by key, so the
+        // queue can say which of them an open draft has replaced
+        "unkeyed_keys": r.try_get::<Vec<String>, _>("unkeyed_keys")?,
         "status": issue.status,
         "change_set_id": r.try_get::<Option<Uuid>, _>("change_set_id")?,
         "change_set_title": r.try_get::<Option<String>, _>("change_set_title")?,
@@ -152,6 +161,7 @@ pub async fn list(
     gtfs_id: &str,
     query: &ListQuery,
     issue: Option<&str>,
+    lost: bool,
     page: &Page,
 ) -> EditorResult<Value> {
     let statuses = parse_status_list(query.status.as_deref(), &STATUSES)?;
@@ -169,6 +179,7 @@ pub async fn list(
            AND ($3::text IS NULL OR i.issue = $3) \
            AND ($4::text IS NULL OR i.route_id = $4 OR i.short_name ILIKE $5 \
                 OR r.short_name ILIKE $5) \
+           AND (NOT $10 OR (i.status = 'fixed' AND cs.status IN {LOST_DRAFT})) \
          ORDER BY array_position($6::text[], i.status), i.stages_unkeyed DESC, \
                   array_position($7::text[], i.issue), \
                   CASE WHEN i.route_id ~ '^[0-9]+$' THEN 0 ELSE 1 END, \
@@ -185,6 +196,7 @@ pub async fn list(
     .bind(&ISSUES[..])
     .bind(page.limit + 1)
     .bind(page.offset)
+    .bind(lost)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -196,21 +208,25 @@ pub async fn list(
 
 /// `GET /feeds/{g}/route-issues/summary`: how much is left, and of what.
 pub async fn summary(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> {
-    let row = sqlx::query(
-        "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, \
-                count(*) FILTER (WHERE status = 'fixed') AS fixed, \
-                count(*) FILTER (WHERE status = 'confirmed') AS confirmed, \
-                count(*) FILTER (WHERE status = 'superseded') AS superseded, \
-                coalesce(sum(stages_unkeyed) FILTER (WHERE status = 'pending'), 0) AS stages_unkeyed, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'count_differs') AS count_differs, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'set_differs') AS set_differs, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'ambiguous_names') AS ambiguous_names, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'absent') AS absent, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'missing_internal') AS missing_internal, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'order_differs') AS order_differs, \
-                count(*) FILTER (WHERE status = 'pending' AND issue = 'name_differs') AS name_differs \
-         FROM gtfs_route_stage_issue WHERE gtfs_id = $1",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT count(*) FILTER (WHERE i.status = 'pending') AS pending, \
+                count(*) FILTER (WHERE i.status = 'fixed') AS fixed, \
+                count(*) FILTER (WHERE i.status = 'fixed' AND cs.status IN {LOST_DRAFT}) \
+                    AS fixed_lost, \
+                count(*) FILTER (WHERE i.status = 'confirmed') AS confirmed, \
+                count(*) FILTER (WHERE i.status = 'superseded') AS superseded, \
+                coalesce(sum(stages_unkeyed) FILTER (WHERE i.status = 'pending'), 0) AS stages_unkeyed, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'count_differs') AS count_differs, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'set_differs') AS set_differs, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'ambiguous_names') AS ambiguous_names, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'absent') AS absent, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'missing_internal') AS missing_internal, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'order_differs') AS order_differs, \
+                count(*) FILTER (WHERE i.status = 'pending' AND issue = 'name_differs') AS name_differs \
+         FROM gtfs_route_stage_issue i \
+         LEFT JOIN gtfs_change_set cs ON cs.change_set_id = i.change_set_id \
+         WHERE i.gtfs_id = $1"
+    ))
     .bind(gtfs_id)
     .fetch_one(&state.pool)
     .await?;
@@ -219,6 +235,8 @@ pub async fn summary(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> 
         "gtfs_id": gtfs_id,
         "pending": n("pending")?,
         "fixed": n("fixed")?,
+        // of those, the ones whose draft was discarded or rejected
+        "fixed_lost": n("fixed_lost")?,
         "confirmed": n("confirmed")?,
         "superseded": n("superseded")?,
         // how many stages carry a name-keyed id because of the routes still open
@@ -247,14 +265,36 @@ pub async fn detail(conn: &mut PgConnection, id: i64) -> EditorResult<Value> {
                 (SELECT count(DISTINCT o.route_id) FROM gtfs_route_stage o \
                   WHERE o.gtfs_id = rs.gtfs_id AND o.stage_id = rs.stage_id \
                     AND o.direction = rs.direction) AS route_count, \
-                EXISTS (SELECT 1 FROM gtfs_stage t \
-                         WHERE t.gtfs_id = s.gtfs_id AND t.name = s.name \
-                           AND t.direction = s.direction AND NOT t.deleted \
-                           AND t.stage_id <> s.stage_id \
-                           AND t.stage_id NOT LIKE 'nm\\_%') AS twin \
+                tw.n AS twins, tw.one AS twin_id, a.lat, a.lon, b.lat AS twin_lat, b.lon AS twin_lon, \
+                (SELECT coalesce(array_agg(DISTINCT coalesce(r.short_name, r.route_id)), '{}') \
+                   FROM gtfs_route_stage x \
+                   JOIN gtfs_route_stage y ON y.gtfs_id = x.gtfs_id AND y.route_id = x.route_id \
+                        AND y.variant_id IS NOT DISTINCT FROM x.variant_id \
+                   JOIN gtfs_route r ON r.gtfs_id = x.gtfs_id AND r.route_id = x.route_id \
+                        AND NOT r.deleted \
+                  WHERE tw.n = 1 AND x.gtfs_id = s.gtfs_id AND x.stage_id = s.stage_id \
+                    AND x.direction = s.direction AND y.stage_id = tw.one \
+                    AND y.direction = s.direction) AS twin_shared \
            FROM gtfs_route_stage rs \
            JOIN gtfs_stage s ON s.gtfs_id = rs.gtfs_id AND s.stage_id = rs.stage_id \
                             AND s.direction = rs.direction \
+           CROSS JOIN LATERAL (SELECT count(*) AS n, min(t.stage_id) AS one FROM gtfs_stage t \
+                         WHERE t.gtfs_id = s.gtfs_id \
+                           AND upper(regexp_replace(t.name, '[^A-Za-z0-9]+', '', 'g')) \
+                             = upper(regexp_replace(s.name, '[^A-Za-z0-9]+', '', 'g')) \
+                           AND t.direction = s.direction AND NOT t.deleted \
+                           AND t.stage_id <> s.stage_id \
+                           AND t.stage_id NOT LIKE 'nm\\_%') tw \
+           LEFT JOIN LATERAL (SELECT st.lat, st.lon FROM gtfs_stage_stop ss \
+                         JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id AND st.stop_id = ss.stop_id \
+                         WHERE ss.gtfs_id = s.gtfs_id AND ss.stage_id = s.stage_id \
+                           AND ss.direction = s.direction AND st.lat IS NOT NULL \
+                         ORDER BY ss.position LIMIT 1) a ON true \
+           LEFT JOIN LATERAL (SELECT st.lat, st.lon FROM gtfs_stage_stop ss \
+                         JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id AND st.stop_id = ss.stop_id \
+                         WHERE tw.n = 1 AND ss.gtfs_id = s.gtfs_id AND ss.stage_id = tw.one \
+                           AND ss.direction = s.direction AND st.lat IS NOT NULL \
+                         ORDER BY ss.position LIMIT 1) b ON true \
           WHERE rs.gtfs_id = $1 AND rs.route_id = $2 AND rs.variant_id IS NULL \
           ORDER BY rs.position",
     )
@@ -267,6 +307,15 @@ pub async fn detail(conn: &mut PgConnection, id: i64) -> EditorResult<Value> {
         .map(|r| -> Result<Value, sqlx::Error> {
             let stage_id: String = r.try_get("stage_id")?;
             let direction: String = r.try_get("direction")?;
+            let twins: i64 = r.try_get("twins")?;
+            let at = |lat: &str, lon: &str| -> Result<Option<(f64, f64)>, sqlx::Error> {
+                Ok(r.try_get::<Option<f64>, _>(lat)?
+                    .zip(r.try_get::<Option<f64>, _>(lon)?))
+            };
+            let distance = match (at("lat", "lon")?, at("twin_lat", "twin_lon")?) {
+                (Some(a), Some(b)) => Some(stages::metres_between(a, b)),
+                _ => None,
+            };
             Ok(json!({
                 "stage_no": r.try_get::<i32, _>("stage_no")?,
                 "stage_id": stage_id,
@@ -279,7 +328,21 @@ pub async fn detail(conn: &mut PgConnection, id: i64) -> EditorResult<Value> {
                 "name_keyed": stage_id.starts_with("nm_"),
                 // and there is an MTC-keyed stage of the same name and
                 // direction, so this one is a twin of it
-                "twin": r.try_get::<bool, _>("twin")?,
+                "twin": twins > 0,
+                // that stage, when there is just one: what this one is
+                // replaced by. Several are different stops of one name, and
+                // which is this one's is a person's call on the stage page.
+                "twin_key": (twins == 1)
+                    .then(|| r.try_get::<Option<String>, _>("twin_id"))
+                    .transpose()?
+                    .flatten()
+                    .map(|t| format!("{t}|{direction}")),
+                // how far apart the two start: the same name across the city
+                // is another place, and replacing asks again
+                "twin_distance_m": distance.map(|d| d.round() as i64),
+                "twin_far": distance.is_some_and(|d| d > stages::FAR_M),
+                // routes running both, which the merge refuses
+                "twin_shared": r.try_get::<Vec<String>, _>("twin_shared")?,
             }))
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;

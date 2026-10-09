@@ -113,6 +113,18 @@ input[aria-invalid="true"] { border-color: var(--danger); background: var(--dang
 .field { display: grid; gap: 4px; }
 .field > span { font-size: var(--fs-s); color: var(--muted); }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+/* the draft a review names: chosen from the feed's drafts, or typed under "Another draft" */
+.draft-picker { display: grid; gap: 6px; }
+/* stages that may be the same place as the one shown, and their merges */
+.stages-like { display: grid; gap: 10px; }
+/* what a merge would do, the reviews closed with one, and the duplicates replaced at once */
+.merge-check { display: grid; gap: 10px; max-width: 60ch; }
+.merge-check .compact-list { margin: 0; }
+fieldset.also-close { display: grid; gap: 8px; border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; }
+fieldset.also-close .check { align-items: flex-start; }
+.twin-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 50vh; overflow-y: auto; }
+.twin-list li { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
+.twin-list .check { align-items: flex-start; }
 .hint { font-size: var(--fs-s); color: var(--muted); }
 .hint.ok { color: var(--ok); font-weight: 700; }
 .field-error { font-size: var(--fs-s); color: var(--danger); font-weight: 700; }

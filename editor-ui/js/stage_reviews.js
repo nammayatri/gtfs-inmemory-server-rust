@@ -12,7 +12,8 @@ import { get, post, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
 import { h, clear, toast, confirmDialog, fmtCount, fmtDate, plural } from "./util.js";
 import * as map from "./map.js";
-import { addChange, requireDraft, stageChanges, sameStageKey, stageKey } from "./drafts.js";
+import { addChange, removeChange, requireDraft, draftPicker, stageChanges, sameStageKey, stageKey } from "./drafts.js";
+import { stagesLike, draftMerges, finalStage, draftTouchesStage, stageBrief, undoChange, alsoClose, fixedByNotice } from "./stage_like.js";
 import { stopPicker } from "./picker.js";
 import { nameHere } from "./trail.js";
 
@@ -50,12 +51,12 @@ const COLOURS = ["#1f6feb", "#c2410c", "#15803d", "#7e22ce", "#b91c1c", "#0e7490
 // The list survives opening a review and coming back, and gives "Next".
 // `big` opens the queue on the reviews carrying most of the difference; the
 // small ones are still there, behind the toggle.
-const list = { feedId: null, side: "settle", status: "pending", reason: "", q: "", big: true, items: [], cursor: null, counts: null, loaded: false };
+const list = { feedId: null, side: "settle", status: "pending", reason: "", q: "", big: true, lost: false, items: [], cursor: null, counts: null, loaded: false };
 let flash = null;
 
 function resetForFeed() {
   if (list.feedId === state.feedId) return;
-  Object.assign(list, { feedId: state.feedId, side: "settle", status: "pending", reason: "", q: "", big: true, items: [], cursor: null, counts: null, loaded: false });
+  Object.assign(list, { feedId: state.feedId, side: "settle", status: "pending", reason: "", q: "", big: true, lost: false, items: [], cursor: null, counts: null, loaded: false });
 }
 
 export function leaveStageReviews() {
@@ -78,14 +79,17 @@ export async function refreshStageReviewCount() {
 async function fetchPage({ append = false } = {}) {
   // one row per STAGE ID, its two directions inside. Names are not grouped: MTC
   // gives 160 names to more than one stop, and those are different places.
-  const params = new URLSearchParams({ status: list.status, limit: String(PAGE), group: "stage" });
+  // The side goes to the server as itself: "Anything" on the settle side is
+  // every reason but mapped cleanly, which a stage that mapped cleanly is not.
+  const params = new URLSearchParams({ status: list.status, limit: String(PAGE), group: "stage", side: list.side });
   if (list.q) params.set("q", list.q);
-  if (list.side === "verify") params.set("reason", AGREED);
-  else if (list.reason) params.set("reason", list.reason);
+  if (list.side === "settle" && list.reason) params.set("reason", list.reason);
   const worth = list.counts && list.counts.worth_a_look;
   if (list.side === "settle" && list.big && list.status === "pending" && worth) {
     params.set("min_impact", String(worth.threshold));
   }
+  // marked fixed with a draft that was then discarded or rejected
+  if (list.status === "fixed" && list.lost) params.set("lost", "true");
   if (append && list.cursor) params.set("cursor", list.cursor);
   const page = await get(`feeds/${enc(state.feedId)}/stage-reviews?${params}`);
   list.items = append ? list.items.concat(page.items) : page.items;
@@ -134,12 +138,13 @@ export async function showStageReviewsList({ q = null } = {}) {
   map.clearFocus();
   nameHere("Stages to review");
 
-  const search = h("input", { type: "search", id: "stage-review-search", value: list.q, autocomplete: "off", spellcheck: "false", placeholder: "Stage name" });
+  const search = h("input", { type: "search", id: "stage-review-search", value: list.q, autocomplete: "off", spellcheck: "false", placeholder: "Stage name or stage id" });
   const tabs = h("div.tabs.count-tabs", { role: "group", "aria-label": "Show reviews that are" });
   const reasons = h("div.filter-chips", { role: "group", "aria-label": "Show reviews whose reason is" });
   const scope = h("div.filter-chips", { role: "group", "aria-label": "How much of the queue to show" });
   const sides = h("div.tabs.count-tabs", { role: "group", "aria-label": "Which side of the work" });
   const sideHint = h("p.hint");
+  const lostNotice = h("div.notice.error", { hidden: true, role: "status" });
   const items = h("div", { "aria-live": "polite" }, h("p.empty", "Loading…"));
   const more = h("button.btn.secondary", { type: "button", hidden: true }, "Show more");
 
@@ -149,7 +154,7 @@ export async function showStageReviewsList({ q = null } = {}) {
   const sideCounts = () => (list.counts && list.counts[list.side]) || {};
   const renderTabs = () => clear(tabs, STATUSES.map(([key, label]) => h("button", {
     type: "button", "aria-pressed": String(list.status === key),
-    on: { click: () => { if (list.status === key) return; list.status = key; renderTabs(); renderScope(); load(); } },
+    on: { click: () => { if (list.status === key) return; list.status = key; list.lost = false; renderTabs(); renderScope(); load(); } },
   }, label, list.counts ? h("span.count", fmtCount(sideCounts()[key] || 0)) : null)));
 
   const renderReasons = () => {
@@ -175,6 +180,26 @@ export async function showStageReviewsList({ q = null } = {}) {
 
   const renderScope = () => {
     const w = sideCounts().worth_a_look;
+    const lost = sideCounts().fixed_lost || 0;
+    // A fix whose draft was thrown away never went live: on the Fixed tab
+    // those are a filter of their own, and the queue says how many there are.
+    if (list.status === "fixed") {
+      scope.hidden = !lost && !list.lost;
+      const chip = (on, label, n) => h("button.route-chip", {
+        type: "button", "aria-pressed": String(list.lost === on),
+        on: { click: () => { if (list.lost === on) return; list.lost = on; renderScope(); load(); } },
+      }, label, n != null ? h("span.count", fmtCount(n)) : null);
+      clear(scope, chip(false, "All fixed", sideCounts().fixed || 0), chip(true, "Draft thrown away", lost));
+      return;
+    }
+    lostNotice.hidden = !(lost && list.status === "pending");
+    if (!lostNotice.hidden) {
+      clear(lostNotice, h("p", h("strong", `${plural(lost, "stage")} marked fixed with a draft that was then discarded or rejected.`),
+        " Those fixes never went live. ",
+        h("button.btn.quiet.small", { type: "button", on: { click: () => {
+          list.status = "fixed"; list.lost = true; renderTabs(); renderScope(); load();
+        } } }, "See them")));
+    }
     scope.hidden = !w || list.status !== "pending" || list.side !== "settle";
     if (!w) return;
     const chip = (big, label, n) => h("button.route-chip", {
@@ -190,7 +215,7 @@ export async function showStageReviewsList({ q = null } = {}) {
     more.hidden = !list.cursor;
     if (!list.items.length) {
       const why = list.q
-        ? `No stage name matches \u201c${list.q}\u201d.`
+        ? `No stage ${list.status === "pending" ? "still to review" : "here"} matches \u201c${list.q}\u201d.`
         : list.side === "verify"
           ? "Nothing left to look over."
           : "Nothing is waiting to be settled.";
@@ -202,6 +227,11 @@ export async function showStageReviewsList({ q = null } = {}) {
         : "either way";
       const reasons = (r.reasons || []).filter((x) => x !== AGREED)
         .map((x) => REASON_TEXT[x] || x);
+      // on the queue: the other way of the stage already closed, and a draft
+      // that changed the stage and went live after it was raised
+      const open = list.status === "pending";
+      const closedWays = open ? (r.closed_ways || []).map((w) => `${w.direction || "either way"} ${w.status === "fixed" ? "fixed" : "left alone"}`) : [];
+      const changed = open && r.changed ? r.changed : null;
       return h("li.proposal-item",
         h("a.proposal-link", { href: `#/stage-reviews/${r.review_id}` },
           h("span.proposal-name", r.name || r.stage_id,
@@ -210,12 +240,19 @@ export async function showStageReviewsList({ q = null } = {}) {
             r.impact ? `${plural(r.impact, "stop call")} wrong` : null,
             ways,
             r.done ? `${r.done} of ${r.parts} done` : null,
+            closedWays.length ? `${closedWays.join(", ")} already` : null,
           ].filter(Boolean).join(" \u00b7 "))),
         r.left_to_do
           ? h("span.chip.submitted", r.left_to_do === r.parts
               ? "To review"
               : `${r.left_to_do} left`)
           : h("span.chip.committed", "Done"),
+        r.lost ? h("span.chip.warn", { title: "Marked fixed with a draft that was discarded or rejected: the fix never went live." }, "draft thrown away") : null,
+        r.left_to_do && draftTouchesStage(r.stage_id)
+          ? h("span.chip.draft", { title: "Your open draft already changes this stage. Open it to finish and mark it fixed." }, "in your draft") : null,
+        changed
+          ? h("span.chip.warn", { title: `Draft \u201c${changed.title}\u201d changed this stage after it was raised, and went live on ${fmtDate(changed.committed_at)}. If that fixed it, open it and mark it fixed.` },
+            "changed since") : null,
         reasons.length ? h("span.review-reason", reasons.join(" \u00b7 ")) : null);
     })));
   };
@@ -269,6 +306,7 @@ export async function showStageReviewsList({ q = null } = {}) {
             " It is a position the line is drawn through so it follows the road. No passenger "
             + "boards there and it is in no GTFS file, so a list that differs only by one is "
             + "not a disagreement about where the bus stops."))),
+      lostNotice,
       tabs,
       scope,
       reasons,
@@ -345,7 +383,10 @@ function neighbours(label, list) {
     ]));
 }
 
-function candidateCard(c, onUse, inList, split, movedTo) {
+// `label(id)` names a route by its number and id, `moved` is what the draft
+// has already done with the list's routes: {to, count} or null.
+function candidateCard(c, onUse, inList, split, moved, label) {
+  const movedTo = moved && moved.count >= (c.routes || []).length ? moved.to : null;
   const names = c.stop_names || [];
   const same = c.stops.length === inList.length
     && c.stops.every((id, i) => id === inList[i]);
@@ -359,7 +400,8 @@ function candidateCard(c, onUse, inList, split, movedTo) {
       h("span.hint", plural(c.route_count, "route")),
       same ? h("span.chip", "the list above") : null,
       c.chosen && !same ? h("span.chip", "what the backfill chose") : null,
-      movedTo ? h("span.chip.draft", `moved to ${movedTo} in your draft`) : null),
+      movedTo ? h("span.chip.draft", `moved to ${movedTo} in your draft`) : null,
+      moved && !movedTo ? h("span.chip.draft", `${moved.count} of its routes moved to ${moved.to} in your draft`) : null),
     h("ol.stop-choice-stops", names.map((name, i) => h("li",
       { class: inList.includes(c.stops[i]) ? "" : "is-new" }, name))),
     // where these routes came from and where they go next: a stage the routes
@@ -367,7 +409,8 @@ function candidateCard(c, onUse, inList, split, movedTo) {
     // the boundary, so this is what says which list belongs to which road
     neighbours("comes from", c.comes_from),
     neighbours("then goes to", c.goes_to),
-    h("p.hint", `Routes ${(c.routes || []).slice(0, 6).join(", ")}`
+    h("p.hint", `${(c.routes || []).length === 1 && c.route_count <= 1 ? "Route" : "Routes"} `
+      + `${(c.routes || []).slice(0, 6).map(label).join(", ")}`
       + (c.route_count > 6 ? ` and ${c.route_count - 6} more` : "")),
     onUse ? h("div.btn-row",
       h("button.btn.secondary.small", {
@@ -599,18 +642,54 @@ function stopListEditor({ rows: start, editable, idPrefix, layer, color, empty, 
 }
 
 // What the open draft already does to stage `key`: edits it, takes routes off
-// it onto a new stage, or merges other stages into it.
+// it onto a new stage, merges other stages into it, or replaces it with
+// another stage altogether.
 function draftFor(key) {
-  const none = { edits: [], splits: [], merges: [], any: false };
+  const none = { edits: [], splits: [], merges: [], replacedBy: null, any: false };
   if (!state.draft || !key) return none;
   const all = state.draft.changes.filter((c) => c.entity === "stage" && c.after);
+  const { into, replacedBy } = draftMerges(key);
   const out = {
     edits: stageChanges(key).filter((c) => c.op === "update"),
     splits: all.filter((c) => c.op === "split" && sameStageKey(c.after.from_stage_id || "", key)),
-    merges: all.filter((c) => c.op === "merge" && sameStageKey(c.after.into_stage_id || "", key)),
+    merges: into,
+    replacedBy,
   };
-  out.any = out.edits.length + out.splits.length + out.merges.length > 0;
+  out.any = out.edits.length + out.splits.length + out.merges.length > 0 || !!replacedBy;
   return out;
+}
+
+// The key a create or split names the stage it makes by.
+const madeKey = (c) => `${c.entity_key}|${(c.after && c.after.direction) || ""}`;
+
+// The changes of the draft that build on stage `key` being there: edits of
+// it, merges into or out of it, and route stage lists naming it. Taking out
+// the change that makes it takes these with it, or they fail.
+function buildsOn(key) {
+  const names = (c) => ((c.after && c.after.stages) || []).some((l) => sameStageKey(String(l.stage_id || ""), key));
+  return state.draft.changes.filter((c) => (c.entity === "stage" && c.op !== "create" && c.op !== "split"
+      && (sameStageKey(c.entity_key, key) || sameStageKey((c.after && c.after.into_stage_id) || "", key)))
+    || ((c.entity === "route_stages" || c.entity === "route_variant") && names(c)));
+}
+
+// Take a split back out of the draft, and everything that builds on the stage
+// it made: the routes go back onto this stage.
+async function undoSplit(c) {
+  const after = buildsOn(madeKey(c));
+  const name = c.after.name || c.entity_key;
+  if (!(await confirmDialog(`Take ${name} out of the draft?`,
+    `${name} is not made, and ${plural((c.after.routes || []).length, "route")} stay on this stage.`
+      + (after.length ? ` ${plural(after.length, "other change")} of the draft that ${after.length === 1 ? "uses" : "use"} ${name} come${after.length === 1 ? "s" : ""} out with it.` : ""),
+    { confirm: "Take it out" }))) return false;
+  try {
+    for (const d of after.reverse()) await removeChange(d.change_id);
+    await removeChange(c.change_id);
+    toast(`${name} is out of the draft.`, "ok");
+    return true;
+  } catch (e) {
+    toast(e.message, "error");
+    return false;
+  }
 }
 
 // `keep`: the stops and name being edited, carried over when the page is drawn
@@ -639,7 +718,13 @@ export async function showStageReview(id, { keep = null } = {}) {
   const key = stage && stageKey(stage);
   const drafted = draftFor(key);
   let previewFailed = null;
-  if (drafted.any) {
+  // A stage the draft replaces is shown as it is live, and not edited: the
+  // draft deletes it.
+  // Replaced by B, and B in turn by C, ends on C.
+  const replacement = drafted.replacedBy ? await stageBrief(finalStage(key)) : null;
+  const via = drafted.replacedBy && !sameStageKey(finalStage(key), drafted.replacedBy.after.into_stage_id)
+    ? drafted.replacedBy.after.into_stage_id.split("|")[0] : null;
+  if (drafted.any && !replacement) {
     try {
       const mine = await get(`change-sets/${enc(state.draft.change_set_id)}/preview/stages/${enc(key)}`);
       stage = { ...stage, name: mine.name, description: mine.description, rows: mine.rows, routes: mine.routes, route_count: mine.route_count };
@@ -650,9 +735,12 @@ export async function showStageReview(id, { keep = null } = {}) {
   // routes the draft has already taken off this stage, and the stage each went to
   const movedTo = new Map();
   for (const c of drafted.splits) for (const rt of c.after.routes || []) movedTo.set(rt, c.after.name || c.entity_key);
-  const mergingIn = new Set(drafted.merges.map((c) => c.entity_key));
   const ev = r.evidence || {};
-  const editable = can("editor") && r.status === "pending" && !!stage;
+  const editable = can("editor") && r.status === "pending" && !!stage && !replacement;
+  // a route by its number as well as its id: the evidence holds only ids
+  const routeNames = r.route_names || {};
+  const label = (rt) => (routeNames[rt] && routeNames[rt] !== rt ? `${routeNames[rt]} (${rt})` : rt);
+  const labels = (ids) => `${ids.length === 1 ? "route" : "routes"} ${ids.map(label).join(", ")}`;
   // a review whose stages have all gone (merged or deleted) has nothing to
   // edit, and is still closed: it said something about stages no longer there
   const canClose = can("editor") && r.status === "pending";
@@ -727,12 +815,13 @@ export async function showStageReview(id, { keep = null } = {}) {
     unsaved.hidden = !dirty();
     const inList = kept().map((x) => x.stop_id).filter(Boolean);
     clear(candidateEl, candidates.map((c) => {
-      const to = (c.routes || []).length && c.routes.every((rt) => movedTo.has(rt)) ? movedTo.get(c.routes[0]) : null;
+      const gone = (c.routes || []).filter((rt) => movedTo.has(rt));
+      const moved = gone.length ? { to: movedTo.get(gone[0]), count: gone.length } : null;
       return candidateCard(c, editable ? useList : null, inList, editable ? {
         open: splitting === c,
         start: startSplit,
         form: splitForm,
-      } : null, to);
+      } : null, moved, label);
     }));
   };
 
@@ -839,7 +928,7 @@ export async function showStageReview(id, { keep = null } = {}) {
       on: { click: () => splitOff(c, name.value, dir.value) },
     }, splitBusy ? "Creating…" : "Create the stage");
     return h("div.split-form",
-      h("p.hint", `A new stage. ${(c.routes || []).length === 1 ? `Route ${c.routes[0]} runs` : `Routes ${(c.routes || []).join(", ")} run`} `
+      h("p.hint", `A new stage. ${(c.routes || []).length === 1 ? `Route ${label(c.routes[0])} runs` : `Routes ${(c.routes || []).map(label).join(", ")} run`} `
         + `it instead of ${stage ? stage.name : r.name}; every other route stays where it is.`),
       h("label.field", { for: "split-name" }, h("span", "Name"), name),
       h("label.field", { for: "split-direction" }, h("span", "Direction"), dir),
@@ -864,7 +953,7 @@ export async function showStageReview(id, { keep = null } = {}) {
     if (!(await confirmDialog(
       `Move ${plural(routeIds.length, "route")} to a new stage?`,
       `${name} becomes a new stage with ${plural(stops.length, "stop")}, and `
-        + `${routeIds.length === 1 ? `route ${routeIds[0]}` : `routes ${routeIds.join(", ")}`} `
+        + `${labels(routeIds)} `
         + `will run it in place of ${stage.name} (stage ${stage.stage_id}). It goes into your draft; `
         + "nothing changes for passengers until the draft is approved and committed.",
       { confirm: "Create the stage" },
@@ -959,11 +1048,31 @@ export async function showStageReview(id, { keep = null } = {}) {
   started = shape();
   const editing = () => (dirty() ? { name: nameInput.value, rows: kept() } : null);
   const note = h("textarea", { id: "stage-review-note", rows: "2", placeholder: "What you found, and what you did about it" });
-  const draftInput = h("input", { type: "text", id: "stage-review-draft", placeholder: "Draft id (optional)", autocomplete: "off", spellcheck: "false" });
-  // the draft that holds the fix is the one to name
-  if (drafted.any) draftInput.value = state.draft.change_set_id;
+  // the draft that holds the fix is the one to name: offered from the feed's
+  // drafts, the open one chosen when it changes this stage
+  const draftChoice = draftPicker({ id: "stage-review-draft", preselect: drafted.any ? state.draft.change_set_id : null });
+  // a stage replaced altogether says so, and by what, unless the note says otherwise
+  if (replacement) note.value = `The stage was wrong: replaced by ${replacement.name} (stage ${replacement.stage_id}).`;
 
-  const close = async (decision) => {
+  // The other open reviews the draft's merges settle: a stage merged away has
+  // nothing left to review, and closes with this one.
+  // The other way of this stage, still open, is offered unticked: a draft
+  // often fixes up and down together, but only the person who made it knows.
+  const otherWays = family
+    .filter((f) => f.status === "pending" && String(f.review_id) !== String(id))
+    .map((f) => ({ review_id: f.review_id, name: r.name, stage_id: f.stage_id, direction: f.direction }));
+  const merging = !!stage && (drafted.merges.length > 0 || !!replacement);
+  const also = canClose && (merging || otherWays.length)
+    ? alsoClose({
+        gone: merging ? [...drafted.merges.map((c) => c.entity_key), ...(replacement ? [key] : [])] : [],
+        kept: merging ? [replacement ? finalStage(key) : key] : [],
+        ways: otherWays,
+        except: { review_id: r.review_id },
+      })
+    : null;
+
+  // `set` names the draft without the picker: the live draft that changed it
+  const close = async (decision, { set: named = null } = {}) => {
     const body = { decision };
     const text = note.value.trim();
     if (text) body.note = text;
@@ -971,16 +1080,22 @@ export async function showStageReview(id, { keep = null } = {}) {
       toast("Say why the routes really do differ before leaving it alone.", "error");
       return note.focus();
     }
-    const set = draftInput.value.trim();
+    const set = named || draftChoice.value();
     if (decision === "fixed" && set) body.change_set = set;
     if (decision === "fixed" && !set && stage && !(await confirmDialog("Mark it fixed without naming a draft?",
-      "Nothing records what fixed it. If the fix is in a draft, put that draft's id in Draft first, so whoever approves it can see why.",
+      "Nothing records what fixed it. If the fix is in a draft, choose that draft under Draft first, so whoever approves it can see why.",
       { confirm: "Mark fixed" }))) return;
     try {
       const after = await post(`stage-reviews/${enc(id)}/close`, body);
+      const more = decision === "fixed" && also
+        ? await also.closeAll({ decision: "fixed", note: body.note || null, change_set: body.change_set || null })
+        : { closed: 0, failed: [] };
       flash = {
         title: decision === "fixed" ? `“${r.name}” marked fixed.` : `“${r.name}” left alone.`,
-        text: "The flag is off its stage.",
+        text: ["The flag is off its stage.",
+          more.closed ? `${plural(more.closed, "other review")} marked fixed with it.` : null,
+          more.failed.length ? `${plural(more.failed.length, "other review")} could not be closed: ${more.failed.join(" ")}` : null,
+        ].filter(Boolean).join(" "),
         draftId: after.change_set_id, draftTitle: after.change_set_title,
       };
       list.loaded = false;
@@ -992,83 +1107,42 @@ export async function showStageReview(id, { keep = null } = {}) {
   };
   const fixed = h("button.btn", { type: "button", hidden: !canClose, on: { click: () => close("fixed") } }, "Mark fixed");
   const left = h("button.btn.secondary", { type: "button", hidden: !canClose, on: { click: () => close("confirmed") } }, "Leave it alone");
+  const doReopen = async () => {
+    try {
+      await post(`stage-reviews/${enc(id)}/reopen`, {});
+      list.loaded = false;
+      refreshStageReviewCount();
+      showStageReview(id);
+    } catch (e) { toast(e.message, "error"); }
+  };
   const reopen = h("button.btn.secondary", {
     type: "button", hidden: !(can("editor") && ["fixed", "confirmed"].includes(r.status)),
-    on: { click: async () => {
-      try {
-        await post(`stage-reviews/${enc(id)}/reopen`, {});
-        list.loaded = false;
-        refreshStageReviewCount();
-        showStageReview(id);
-      } catch (e) { toast(e.message, "error"); }
-    } },
+    on: { click: doReopen },
   }, "Reopen");
+
+  // A draft changed this stage after the review was raised, and is live:
+  // perhaps the fix, made without anybody marking it here.
+  const changed = r.status === "pending" ? r.changed : null;
+  const changedEl = changed ? h("div.notice",
+    h("p", h("strong", "Draft "),
+      h("a", { href: `#/drafts/${enc(changed.change_set_id)}` }, `\u201c${changed.title || "untitled"}\u201d`),
+      h("strong", ` changed this stage after it was raised, and went live on ${fmtDate(changed.committed_at)}.`),
+      " If that fixed it, close it naming that draft; if not, carry on below."),
+    canClose ? h("div.btn-row", h("button.btn.small", {
+      type: "button", on: { click: () => close("fixed", { set: changed.change_set_id }) },
+    }, `Mark fixed with \u201c${changed.title || "untitled"}\u201d`)) : null) : null;
 
   const candidates = (ev.candidates || []).filter((c) => (c.stops || []).length);
 
-  // ---- merging: other stages of this name going the SAME way. MTC gives 160
-  // names more than one stop, so a name is often several stages each way;
-  // whether they are really one place is a person's call. The other direction is
-  // never offered, and the server refuses it: the two hold different stops.
-  const siblings = r.siblings || [];
-  const picked = new Set();
-  const mergeEl = h("ul.stop-choices");
-  const mergeBtn = h("button.btn", { type: "button", disabled: true });
-  const drawMerge = () => {
-    mergeBtn.disabled = !picked.size;
-    mergeBtn.textContent = picked.size
-      ? `Merge ${plural(picked.size, "stage")} into this one`
-      : "Merge the ones you pick into this one";
-    clear(mergeEl, siblings.map((sib) => {
-      const on = picked.has(sib.stage_key);
-      const done = [...mergingIn].some((k) => sameStageKey(k, sib.stage_key));
-      return h("li.stop-choice", { class: on ? "stop-choice is-current" : "stop-choice" },
-        h("div.stop-choice-head",
-          h("strong", sib.name),
-          h("span.hint", `stage ${sib.stage_id}`),
-          h("span.hint", plural(sib.stop_count, "stop")),
-          h("span.hint", plural(sib.route_count, "route")),
-          sib.review ? h("span.chip.warn", "to review") : null,
-          done ? h("span.chip.draft", "merged in your draft") : null),
-        h("div.btn-row",
-          editable && !done ? h("button.btn.secondary.small", {
-            type: "button",
-            on: { click: () => { on ? picked.delete(sib.stage_key) : picked.add(sib.stage_key); drawMerge(); } },
-          }, on ? "Chosen — click to drop" : "Merge this one in") : null,
-          h("a.btn.quiet.small", { href: `#/stage/${enc(sib.stage_key)}` }, "Open")));
-    }));
-  };
-  mergeBtn.addEventListener("click", async () => {
-    if (!stage || !picked.size) return;
-    const names = siblings.filter((x) => picked.has(x.stage_key)).map((x) => `${x.name} (stage ${x.stage_id})`);
-    if (!(await confirmDialog(
-      `Merge ${plural(picked.size, "stage")} into ${stage.name} (stage ${stage.stage_id})?`,
-      `${names.join(", ")} will be merged away, and every route using ${picked.size === 1 ? "it" : "them"} will call at this stage's stops instead. It goes into your draft; nothing changes for passengers until the draft is approved and committed.`,
-      { confirm: "Merge into this stage" },
-    ))) return;
-    mergeBtn.disabled = true;
-    let added = 0;
-    try {
-      for (const key of picked) {
-        const res = await addChange({
-          entity: "stage", op: "merge", entity_key: key,
-          after: { into_stage_id: stage.stage_key || stage.stage_id },
-        }, { merge: false });
-        if (!res) break;
-        const bad = (res.problems || []).find((pb) => pb.level === "error");
-        if (bad) { toast(bad.message, "error"); break; }
-        added += 1;
-      }
-    } catch (e) {
-      toast(e.message, "error");
-    }
-    if (added) {
-      toast(`${plural(added, "stage")} merged in your draft “${(state.draft && state.draft.title) || "untitled"}”.`, "ok");
-      showStageReview(id, { keep: editing() });
-      return;
-    }
-    drawMerge();
-  });
+  // ---- stages that may be the same place: the others of this name, names
+  // written another way (MTC's B.T, a case change), stages starting at the next
+  // kerb, and the stages the draft makes. Each can be merged into this one, or
+  // put in its place when this stage is wrong altogether. Only the same way:
+  // the server refuses a merge across directions.
+  const like = stage ? stagesLike(stage, {
+    editable,
+    onChange: () => showStageReview(id, { keep: editing() }),
+  }) : null;
 
   clear(panel(),
     h("section.section",
@@ -1093,9 +1167,25 @@ export async function showStageReview(id, { keep = null } = {}) {
         h("dt", "Raised by"), h("dd", r.batch),
         r.reviewed_by_email ? [h("dt", "Closed by"), h("dd", `${r.reviewed_by_email}${r.reviewed_at ? ` on ${fmtDate(r.reviewed_at)}` : ""}`)] : null,
         r.review_note ? [h("dt", "Note"), h("dd", r.review_note)] : null,
-        r.change_set_id ? [h("dt", "Draft"), h("dd", h("a", { href: `#/drafts/${enc(r.change_set_id)}` }, r.change_set_title || r.change_set_id))] : null)),
+        r.change_set_id ? [h("dt", "Draft"), h("dd", h("a", { href: `#/drafts/${enc(r.change_set_id)}` }, r.change_set_title || r.change_set_id))] : null),
+      fixedByNotice(r, { onReopen: can("editor") ? doReopen : null }),
+      changedEl),
     !stage ? h("section.section", h("p.notice.error", "No stage of this name is live any more.")) : null,
-    stage && drafted.any ? h("section.section", h("div.notice.draft.pending",
+    stage && replacement ? h("section.section", h("div.notice.draft.pending",
+      h("p", h("strong", `Your draft “${state.draft.title}” replaces this stage with ${replacement.name} (stage ${replacement.stage_id})`
+        + `${via ? `, by way of stage ${via}` : ""}.`),
+        ` Every route using ${stage.name} runs ${replacement.name} instead, and ${stage.name} is deleted when the draft is committed. `
+        + "This is the stage as it is live; there is nothing left to edit on it."),
+      h("div.btn-row",
+        h("a.btn.secondary.small", { href: `#/stage/${enc(replacement.stage_key || finalStage(key))}` }, `Open ${replacement.name}`),
+        canClose ? h("button.btn.quiet.small", {
+          type: "button",
+          on: { click: async () => {
+            if (await undoChange(drafted.replacedBy, `Replacing ${stage.name} with ${replacement.name}`)) showStageReview(id);
+          } },
+        }, "Undo the replacement") : null,
+        h("a.btn.quiet.small", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft")))) : null,
+    stage && drafted.any && !replacement ? h("section.section", h("div.notice.draft.pending",
       h("p", h("strong", `Your draft “${state.draft.title}” already changes this stage: `),
         [
           drafted.edits.length ? "its stops or name" : null,
@@ -1105,6 +1195,20 @@ export async function showStageReview(id, { keep = null } = {}) {
       previewFailed
         ? h("p", `The draft could not be applied to show it (${previewFailed}), so this is the live stage.`)
         : h("p", "What you see here has the draft applied. Saving changes the same draft."),
+      // a change made here by mistake comes out again here: a new stage that
+      // is wrong is taken out (or opened and edited), not left in the draft
+      canClose ? h("ul.compact-list",
+        drafted.edits.map((c) => h("li", "Your edit of its stops or name ",
+          h("button.btn.quiet.small", {
+            type: "button",
+            on: { click: async () => { if (await undoChange(c, `Your edit of ${stage.name}`)) showStageReview(id); } },
+          }, "Take it out"))),
+        drafted.splits.map((c) => h("li", `New stage ${c.after.name || c.entity_key}, for ${labels(c.after.routes || [])} `,
+          h("a.btn.quiet.small", { href: `#/stage/${enc(madeKey(c))}` }, "Open or edit it"),
+          h("button.btn.quiet.small", {
+            type: "button",
+            on: { click: async () => { if (await undoSplit(c)) showStageReview(id, { keep: editing() }); } },
+          }, "Take it out")))) : null,
       h("p", h("a", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft")))) : null,
     stage ? h("section.section",
       h("h2", "The stage's stops", unsaved),
@@ -1140,15 +1244,17 @@ export async function showStageReview(id, { keep = null } = {}) {
         + "is not a stop: it is a point the route is drawn through so the line follows the road, "
         + "and no passenger boards there."),
       candidateEl) : null,
-    siblings.length ? h("section.section",
-      h("h2", "Other stages with this name"),
-      h("p.hint", `${plural(siblings.length, "other stage")} named ${r.name} `
-        + `${r.direction ? `also running ${r.direction}` : "running either way"}. `
-        + "If they are really the same place, merge them into this one: every route "
-        + "using them will call at this stage's stops instead. "
-        + "Stages going the other way are never offered — they hold different stops."),
-      mergeEl,
-      editable ? h("div.btn-row", mergeBtn) : null) : null,
+    like ? h("section.section",
+      h("h2", "Stages like this one"),
+      h("p.hint", `Stages ${r.direction ? `running ${r.direction}` : "running either way"} that may be the same place: `
+        + "the same name, a name written another way, one starting close by, or one made in your draft. "
+        + "If one is the same place, merge it into this one, and its routes call at this stage's stops. "
+        + "If this stage is wrong altogether, use the right one instead: every route using this stage runs "
+        + "that one, and this one goes away. Wrong on only some routes? Use \u201cOnly on some routes\u2026\u201d. "
+        + "To make the right one first, use \u201cCreate a new stage\u201d on a list above, or New stage. "
+        + "Each one says first which stops the routes gain and lose, and how far apart the two start. "
+        + "Stages going the other way are never offered \u2014 they hold different stops."),
+      like.el) : null,
     r.reason === "head_duplicate_stops" && (ev.heads || []).length > 1 ? h("section.section",
       h("p.hint", "These begin at stops that all carry one name, so the stops are the thing to fix: ",
         h("a", { href: `#/merge/${enc(ev.heads[0])}?with=${enc(ev.heads.slice(1).join(","))}` },
@@ -1160,7 +1266,11 @@ export async function showStageReview(id, { keep = null } = {}) {
         ? "Mark it fixed once the stops are right (name the draft if you like), or leave it alone if the routes really do differ and nothing should change."
         : "Its stages are gone, so there is nothing left to fix here: mark it fixed, naming the draft that merged or deleted them if you have it.") : null,
       canClose ? h("label.field", { for: "stage-review-note" }, h("span", "Note"), note) : null,
-      canClose ? h("label.field", { for: "stage-review-draft" }, h("span", "Draft"), draftInput) : null,
+      canClose ? h("div.btn-row", CONFIRM_NOTES.map((t) => h("button.route-chip", {
+        type: "button", title: t, on: { click: () => { note.value = t; note.focus(); } },
+      }, `${t.slice(0, 40)}\u2026`))) : null,
+      canClose ? h("label.field", { for: "stage-review-draft" }, h("span", "Draft"), draftChoice.el) : null,
+      also ? also.el : null,
       h("div.btn-row", fixed, left, reopen)) : null);
   if (keep) {
     nameInput.value = keep.name;
@@ -1168,5 +1278,4 @@ export async function showStageReview(id, { keep = null } = {}) {
   } else {
     editor.draw();
   }
-  drawMerge();
 }
