@@ -59,6 +59,48 @@ pub const REASONS: [&str; 4] = [
 /// the queue finishable.
 pub const WORTH_A_LOOK: i32 = 20;
 
+/// A draft in one of these never goes live: a review closed as fixed naming it
+/// says fixed for a fix that is not coming. Kept as SQL, for the queries.
+pub const LOST_DRAFT: &str = "('discarded', 'rejected')";
+
+/// `side`: `settle` is the reviews somebody has to decide (every reason but
+/// `agreed`), `verify` the ones that mapped cleanly and only want looking over:
+/// the split the summary counts in. As SQL, whether `reason = 'agreed'`.
+pub fn parse_side(side: Option<&str>) -> EditorResult<Option<bool>> {
+    match side.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some("settle") => Ok(Some(false)),
+        Some("verify") => Ok(Some(true)),
+        Some(_) => Err(EditorError::bad_request(
+            "invalid_side",
+            "side is settle or verify",
+        )),
+    }
+}
+
+/// The last committed draft that changed the stage `id` (SQL), or merged a
+/// stage into it, or split one off it, after `since` (SQL): an open review of a
+/// stage somebody has since fixed without saying so. `dir` (SQL) narrows it to
+/// one direction; without it, either. A jsonb object, or NULL.
+fn changed_since_sql(id: &str, dir: Option<&str>, since: &str) -> String {
+    let keys = match dir {
+        Some(d) => format!("ARRAY[{id} || '|' || {d}]"),
+        None => format!("ARRAY[{id} || '|up', {id} || '|down', {id} || '|', {id}]"),
+    };
+    format!(
+        "(SELECT jsonb_build_object('change_set_id', cs.change_set_id, 'title', cs.title, \
+                 'committed_at', cs.committed_at) \
+            FROM gtfs_change ch \
+            JOIN gtfs_change_set cs ON cs.change_set_id = ch.change_set_id \
+           WHERE cs.gtfs_id = $1 AND cs.status = 'committed' AND ch.entity = 'stage' \
+             AND (ch.entity_key = ANY({keys}) \
+                  OR ch.after->>'into_stage_id' = ANY({keys}) \
+                  OR ch.after->>'from_stage_id' = ANY({keys})) \
+             AND cs.committed_at > {since} \
+           ORDER BY cs.committed_at DESC LIMIT 1)"
+    )
+}
+
 const SELECT: &str = "SELECT r.review_id, r.gtfs_id, r.batch, r.name, r.name_key, r.direction, \
         r.reason, r.impact, r.evidence::text AS evidence, r.status, r.change_set_id, \
         cs.title AS change_set_title, cs.status AS change_set_status, \
@@ -182,12 +224,15 @@ async fn stage_ids(
 /// really are different places. GOVT ESTATE METRO R.S is stops 143, 148, 170 and
 /// 1834, so it is four rows here - whether any of them are the same place is
 /// what the merge is for.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_by_stage(
     state: &EditorState,
     gtfs_id: &str,
     query: &ListQuery,
     reason: Option<&str>,
+    side: Option<bool>,
     min_impact: Option<i32>,
+    lost: bool,
     page: &Page,
 ) -> EditorResult<Value> {
     let statuses = parse_status_list(query.status.as_deref(), &STATUSES)?;
@@ -199,24 +244,51 @@ pub async fn list_by_stage(
         ));
     }
     let q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let rows = sqlx::query(
+    // what has happened to the stage since its open reviews were raised
+    let changed = changed_since_sql(
+        "r.name_key",
+        None,
+        "min(r.created_at) FILTER (WHERE r.status = 'pending')",
+    );
+    let rows = sqlx::query(&format!(
         "SELECT r.name_key AS stage_id, max(r.name) AS name, \
                 count(*) AS parts, \
                 count(*) FILTER (WHERE r.status = 'pending') AS left_to_do, \
+                count(*) FILTER (WHERE r.status = 'fixed' AND cs.status IN {LOST_DRAFT}) AS lost, \
                 coalesce(sum(r.impact), 0)::int AS impact, \
                 min(r.review_id) FILTER (WHERE r.status = 'pending') AS next_id, \
+                min(r.review_id) FILTER (WHERE r.status = 'fixed' AND cs.status IN {LOST_DRAFT}) \
+                    AS lost_id, \
                 min(r.review_id) AS any_id, \
                 array_agg(DISTINCT r.reason) AS reasons, \
-                array_agg(DISTINCT nullif(r.direction, '')) AS directions \
+                array_agg(DISTINCT nullif(r.direction, '')) AS directions, \
+                (SELECT coalesce(jsonb_agg(jsonb_build_object( \
+                            'direction', nullif(d.direction, ''), 'status', d.status) \
+                          ORDER BY d.direction), '[]'::jsonb) \
+                   FROM (SELECT DISTINCT ON (x.direction) x.direction, x.status \
+                           FROM gtfs_stage_review x \
+                          WHERE x.gtfs_id = $1 AND x.name_key = r.name_key \
+                            AND x.status IN ('fixed', 'confirmed') \
+                            AND NOT EXISTS (SELECT 1 FROM gtfs_stage_review p \
+                                 WHERE p.gtfs_id = x.gtfs_id AND p.name_key = x.name_key \
+                                   AND p.direction = x.direction AND p.status = 'pending') \
+                          ORDER BY x.direction, x.reviewed_at DESC NULLS LAST) d) AS closed_ways, \
+                {changed} AS changed \
          FROM gtfs_stage_review r \
+         LEFT JOIN gtfs_change_set cs ON cs.change_set_id = r.change_set_id \
          WHERE r.gtfs_id = $1 AND r.status = ANY($2) \
            AND ($3::text IS NULL OR r.reason = $3) \
-           AND ($4::text IS NULL OR r.name ILIKE $5 OR r.name % $4) \
+           AND ($4::text IS NULL OR r.name ILIKE $5 OR r.name % $4 \
+                OR lower(r.name_key) = lower($4)) \
            AND ($8::int IS NULL OR r.impact >= $8) \
+           AND (NOT $9 OR (r.status = 'fixed' AND cs.status IN {LOST_DRAFT})) \
+           AND ($10::bool IS NULL OR (r.reason = 'agreed') = $10) \
          GROUP BY r.name_key \
-         ORDER BY coalesce(sum(r.impact), 0) DESC, max(r.name), r.name_key \
-         LIMIT $6 OFFSET $7",
-    )
+         ORDER BY ($4::text IS NOT NULL \
+                   AND NOT bool_or(r.name ILIKE $5 OR lower(r.name_key) = lower($4))), \
+                  coalesce(sum(r.impact), 0) DESC, max(r.name), r.name_key \
+         LIMIT $6 OFFSET $7"
+    ))
     .bind(gtfs_id)
     .bind(&statuses)
     .bind(reason)
@@ -225,6 +297,8 @@ pub async fn list_by_stage(
     .bind(page.limit + 1)
     .bind(page.offset)
     .bind(min_impact)
+    .bind(lost)
+    .bind(side)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -233,6 +307,12 @@ pub async fn list_by_stage(
             let left: i64 = r.try_get("left_to_do")?;
             let directions: Vec<Option<String>> = r.try_get("directions")?;
             Ok(json!({
+                // the other ways of this stage, closed with nothing left open:
+                // up fixed while down still waits is one row, and says so
+                "closed_ways": r.try_get::<Value, _>("closed_ways")?,
+                // the last committed draft to change the stage after its open
+                // reviews were raised, which may have fixed it unannounced
+                "changed": r.try_get::<Option<Value>, _>("changed")?,
                 "stage_id": r.try_get::<String, _>("stage_id")?,
                 "name": r.try_get::<Option<String>, _>("name")?,
                 // how many of this stop's directions are in the queue, and how
@@ -241,9 +321,14 @@ pub async fn list_by_stage(
                 "left_to_do": left,
                 "done": r.try_get::<i64, _>("parts")? - left,
                 "impact": r.try_get::<i32, _>("impact")?,
-                // the one to open: the first still waiting, else the first of them
+                // closed as fixed naming a draft that was discarded or
+                // rejected: the fix never went live
+                "lost": r.try_get::<i64, _>("lost")?,
+                // the one to open: the first still waiting, else the first
+                // whose fix was lost, else the first of them
                 "review_id": r
                     .try_get::<Option<i64>, _>("next_id")?
+                    .or(r.try_get::<Option<i64>, _>("lost_id")?)
                     .or(r.try_get::<Option<i64>, _>("any_id")?),
                 "reasons": r.try_get::<Vec<String>, _>("reasons")?,
                 "directions": directions.into_iter().flatten().collect::<Vec<_>>(),
@@ -253,14 +338,18 @@ pub async fn list_by_stage(
     Ok(page.wrap(items))
 }
 
-/// `GET /feeds/{g}/stage-reviews`. `reason` narrows to one reason; `q` matches
-/// the name.
+/// `GET /feeds/{g}/stage-reviews`. `reason` narrows to one reason, `side` to
+/// one side of the work ([`parse_side`]); `q` matches the name, or the stage id
+/// exactly.
+#[allow(clippy::too_many_arguments)]
 pub async fn list(
     state: &EditorState,
     gtfs_id: &str,
     query: &ListQuery,
     reason: Option<&str>,
+    side: Option<bool>,
     min_impact: Option<i32>,
+    lost: bool,
     page: &Page,
 ) -> EditorResult<Value> {
     let statuses = parse_status_list(query.status.as_deref(), &STATUSES)?;
@@ -276,9 +365,14 @@ pub async fn list(
         "{SELECT} \
          WHERE r.gtfs_id = $1 AND r.status = ANY($2) \
            AND ($3::text IS NULL OR r.reason = $3) \
-           AND ($4::text IS NULL OR r.name ILIKE $5 OR r.name % $4) \
+           AND ($4::text IS NULL OR r.name ILIKE $5 OR r.name % $4 \
+                OR lower(r.name_key) = lower($4)) \
            AND ($10::int IS NULL OR r.impact >= $10) \
-         ORDER BY array_position($6::text[], r.status), r.impact DESC, \
+           AND (NOT $11 OR (r.status = 'fixed' AND cs.status IN {LOST_DRAFT})) \
+           AND ($12::bool IS NULL OR (r.reason = 'agreed') = $12) \
+         ORDER BY ($4::text IS NOT NULL \
+                   AND NOT (r.name ILIKE $5 OR lower(r.name_key) = lower($4))), \
+                  array_position($6::text[], r.status), r.impact DESC, \
                   array_position($7::text[], r.reason), r.name, r.review_id \
          LIMIT $8 OFFSET $9"
     ))
@@ -292,6 +386,8 @@ pub async fn list(
     .bind(page.limit + 1)
     .bind(page.offset)
     .bind(min_impact)
+    .bind(lost)
+    .bind(side)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -312,19 +408,22 @@ pub async fn summary(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> 
     // the total, and a stop with one direction done is in both `pending` and
     // `fixed`.
     let side = |agreed: bool| async move {
-        let rows = sqlx::query(
-            "SELECT count(DISTINCT name_key) FILTER (WHERE status = 'pending') AS pending, \
-                    count(DISTINCT name_key) FILTER (WHERE status = 'fixed') AS fixed, \
-                    count(DISTINCT name_key) FILTER (WHERE status = 'confirmed') AS confirmed, \
-                    count(DISTINCT name_key) FILTER (WHERE status = 'superseded') AS superseded, \
-                    count(DISTINCT name_key) FILTER (WHERE status = 'pending' AND impact >= $3) \
+        let rows = sqlx::query(&format!(
+            "SELECT count(DISTINCT name_key) FILTER (WHERE r.status = 'pending') AS pending, \
+                    count(DISTINCT name_key) FILTER (WHERE r.status = 'fixed') AS fixed, \
+                    count(DISTINCT name_key) FILTER (WHERE r.status = 'fixed' \
+                        AND cs.status IN {LOST_DRAFT}) AS fixed_lost, \
+                    count(DISTINCT name_key) FILTER (WHERE r.status = 'confirmed') AS confirmed, \
+                    count(DISTINCT name_key) FILTER (WHERE r.status = 'superseded') AS superseded, \
+                    count(DISTINCT name_key) FILTER (WHERE r.status = 'pending' AND impact >= $3) \
                         AS worth_a_look, \
-                    coalesce(sum(impact) FILTER (WHERE status = 'pending' AND impact >= $3), 0) \
+                    coalesce(sum(impact) FILTER (WHERE r.status = 'pending' AND impact >= $3), 0) \
                         AS big_impact, \
-                    coalesce(sum(impact) FILTER (WHERE status = 'pending'), 0) AS all_impact \
-             FROM gtfs_stage_review \
-             WHERE gtfs_id = $1 AND (reason = 'agreed') = $2",
-        )
+                    coalesce(sum(impact) FILTER (WHERE r.status = 'pending'), 0) AS all_impact \
+             FROM gtfs_stage_review r \
+             LEFT JOIN gtfs_change_set cs ON cs.change_set_id = r.change_set_id \
+             WHERE r.gtfs_id = $1 AND (reason = 'agreed') = $2"
+        ))
         .bind(gtfs_id)
         .bind(agreed)
         .bind(WORTH_A_LOOK)
@@ -337,6 +436,8 @@ pub async fn summary(state: &EditorState, gtfs_id: &str) -> EditorResult<Value> 
         Ok::<Value, sqlx::Error>(json!({
             "pending": pending,
             "fixed": rows.try_get::<i64, _>("fixed")?,
+            // of those, the ones whose draft was discarded or rejected
+            "fixed_lost": rows.try_get::<i64, _>("fixed_lost")?,
             "confirmed": rows.try_get::<i64, _>("confirmed")?,
             "superseded": rows.try_get::<i64, _>("superseded")?,
             "worth_a_look": {
@@ -466,7 +567,65 @@ pub async fn detail(conn: &mut PgConnection, id: i64) -> EditorResult<Value> {
         })
         .collect::<Result<_, _>>()?;
 
+    // The routes the evidence names, by number: it holds route ids, which mean
+    // nothing to the people working the queue, who know a route as 21G.
+    let mut named: Vec<String> = r.json["evidence"]["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| c["routes"].as_array().into_iter().flatten())
+        .chain(
+            r.json["evidence"]["routes"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    named.sort();
+    named.dedup();
+    let mut route_names = serde_json::Map::new();
+    if !named.is_empty() {
+        for row in sqlx::query(
+            "SELECT route_id, short_name FROM gtfs_route WHERE gtfs_id = $1 AND route_id = ANY($2)",
+        )
+        .bind(&r.gtfs_id)
+        .bind(&named)
+        .fetch_all(&mut *conn)
+        .await?
+        {
+            if let Some(short) = row.try_get::<Option<String>, _>("short_name")? {
+                route_names.insert(row.try_get("route_id")?, json!(short));
+            }
+        }
+    }
+
+    // A draft that changed this stage after the review was raised, and is live:
+    // somebody may have fixed it without saying so, and the page offers to
+    // close it naming that draft.
+    let changed: Option<Value> = if r.status == "pending" {
+        sqlx::query_scalar(&format!(
+            "SELECT {}",
+            changed_since_sql(
+                "$2::text",
+                Some("$3::text"),
+                "(SELECT created_at FROM gtfs_stage_review WHERE review_id = $4)",
+            )
+        ))
+        .bind(&r.gtfs_id)
+        .bind(&r.name_key)
+        .bind(r.direction.clone().unwrap_or_default())
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?
+    } else {
+        None
+    };
+
     let mut out = r.json;
+    out["changed"] = json!(changed);
+    // route id -> its number, for every route the evidence names
+    out["route_names"] = Value::Object(route_names);
     // the other reviews of this name, so the page can switch between them
     out["family"] = json!(family);
     out["stages"] = json!(stages_json);
@@ -474,6 +633,90 @@ pub async fn detail(conn: &mut PgConnection, id: i64) -> EditorResult<Value> {
     // other stages of this name going the same way, which this may merge with
     out["siblings"] = json!(siblings);
     Ok(out)
+}
+
+/// The open reviews a change to these stages touches: each stage's own stage
+/// review, and the open routes to review of `routes` (section 19.2). A merge or
+/// a replacement settles a stage's review once its stage is gone, and may
+/// settle a route's - though only a person can say the route's whole list is
+/// right now - so the page offers to close them with the same draft.
+pub async fn open_about(
+    conn: &mut PgConnection,
+    g: &str,
+    keys: &[StageKey],
+    routes: &[String],
+) -> EditorResult<Value> {
+    let reviews = sqlx::query(
+        "SELECT review_id, name, name_key, direction, reason, impact FROM gtfs_stage_review \
+         WHERE gtfs_id = $1 AND status = 'pending' \
+           AND (name_key, direction) IN (SELECT * FROM UNNEST($2::text[], $3::text[])) \
+         ORDER BY name, direction, review_id",
+    )
+    .bind(g)
+    .bind(keys.iter().map(|k| k.stage_id.clone()).collect::<Vec<_>>())
+    .bind(keys.iter().map(|k| k.direction.clone()).collect::<Vec<_>>())
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        let stage_id: String = r.try_get("name_key")?;
+        let direction: String = r.try_get("direction")?;
+        Ok(json!({
+            "review_id": r.try_get::<i64, _>("review_id")?,
+            "name": r.try_get::<String, _>("name")?,
+            "stage_id": stage_id,
+            "stage_key": StageKey::new(&stage_id, Some(&direction)).entity_key(),
+            "direction": (!direction.is_empty()).then_some(direction),
+            "reason": r.try_get::<String, _>("reason")?,
+            "impact": r.try_get::<i32, _>("impact")?,
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let issues = sqlx::query(
+        "SELECT i.issue_id, i.route_id, coalesce(r.short_name, i.short_name) AS short_name, \
+                i.issue, i.stages_unkeyed \
+         FROM gtfs_route_stage_issue i \
+         LEFT JOIN gtfs_route r ON r.gtfs_id = i.gtfs_id AND r.route_id = i.route_id \
+         WHERE i.gtfs_id = $1 AND i.status = 'pending' AND i.route_id = ANY($2) \
+         ORDER BY coalesce(r.short_name, i.short_name), i.route_id",
+    )
+    .bind(g)
+    .bind(routes)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        Ok(json!({
+            "issue_id": r.try_get::<i64, _>("issue_id")?,
+            "route_id": r.try_get::<String, _>("route_id")?,
+            "short_name": r.try_get::<Option<String>, _>("short_name")?,
+            "issue": r.try_get::<String, _>("issue")?,
+            "stages_unkeyed": r.try_get::<i32, _>("stages_unkeyed")?,
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({ "stage_reviews": reviews, "route_issues": issues }))
+}
+
+/// `GET /feeds/{g}/open-reviews?stages=`: [`open_about`] the stages named, and
+/// the routes that run any of them today.
+pub async fn open_about_stages(
+    conn: &mut PgConnection,
+    g: &str,
+    keys: &[StageKey],
+) -> EditorResult<Value> {
+    let routes: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT rs.route_id FROM gtfs_route_stage rs \
+         JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+         WHERE rs.gtfs_id = $1 \
+           AND (rs.stage_id, rs.direction) IN (SELECT * FROM UNNEST($2::text[], $3::text[]))",
+    )
+    .bind(g)
+    .bind(keys.iter().map(|k| k.stage_id.clone()).collect::<Vec<_>>())
+    .bind(keys.iter().map(|k| k.direction.clone()).collect::<Vec<_>>())
+    .fetch_all(&mut *conn)
+    .await?;
+    open_about(conn, g, keys, &routes).await
 }
 
 // ---------------------------------------------------------------- closing
@@ -650,6 +893,74 @@ pub async fn reopen(state: &EditorState, ctx: &Ctx, id: i64) -> EditorResult<Val
     tx.commit().await?;
     let mut conn = state.pool.acquire().await?;
     detail(&mut conn, id).await
+}
+
+/// The open reviews a committed draft settles by itself: those about a stage it
+/// merged away or deleted, with no stage of the review's key left. Closed as
+/// fixed naming the draft and whoever made it, in the commit's transaction, so
+/// the queue never offers a stage that is not there any more. A review that
+/// names a stage by its folded name closes only once the last stage of that
+/// name and direction is gone. Returns what it closed, for the audit.
+pub async fn close_settled(
+    conn: &mut PgConnection,
+    g: &str,
+    set: Uuid,
+    title: &str,
+    author: Uuid,
+) -> EditorResult<Vec<Value>> {
+    let rows = sqlx::query(
+        "WITH gone AS ( \
+            SELECT s.stage_id, s.direction, ch.op, \
+                   split_part(ch.after->>'into_stage_id', '|', 1) AS into_id, \
+                   upper(btrim(regexp_replace(s.name, '\\s+', ' ', 'g'))) AS folded \
+              FROM gtfs_change ch \
+              JOIN gtfs_stage s ON s.gtfs_id = $1 AND s.deleted \
+               AND s.stage_id = split_part(ch.entity_key, '|', 1) \
+               AND s.direction = split_part(ch.entity_key, '|', 2) \
+             WHERE ch.change_set_id = $2 AND ch.entity = 'stage' \
+               AND ch.op IN ('merge', 'delete')) \
+         UPDATE gtfs_stage_review r \
+            SET status = 'fixed', reviewed_by = $3, reviewed_at = now(), change_set_id = $2, \
+                review_note = CASE WHEN g.op = 'merge' \
+                    THEN format('Closed on its own: draft “%s” merged stage %s into %s.', \
+                                $4::text, g.stage_id, g.into_id) \
+                    ELSE format('Closed on its own: draft “%s” deleted stage %s.', \
+                                $4::text, g.stage_id) END \
+           FROM gone g \
+          WHERE r.gtfs_id = $1 AND r.status = 'pending' AND r.direction = g.direction \
+            AND (r.name_key = g.stage_id OR r.name_key = g.folded) \
+            AND NOT EXISTS (SELECT 1 FROM gtfs_stage s \
+                 WHERE s.gtfs_id = r.gtfs_id AND NOT s.deleted AND s.direction = r.direction \
+                   AND (s.stage_id = r.name_key \
+                        OR upper(btrim(regexp_replace(s.name, '\\s+', ' ', 'g'))) = r.name_key)) \
+         RETURNING r.review_id, r.name, r.direction, r.reason, g.op, g.stage_id, g.into_id",
+    )
+    .bind(g)
+    .bind(set)
+    .bind(author)
+    .bind(title)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter()
+        .map(|row| -> Result<Value, sqlx::Error> {
+            let direction: String = row.try_get("direction")?;
+            let op: String = row.try_get("op")?;
+            Ok(json!({
+                "review_id": row.try_get::<i64, _>("review_id")?,
+                "name": row.try_get::<String, _>("name")?,
+                "direction": (!direction.is_empty()).then_some(direction),
+                "reason": row.try_get::<String, _>("reason")?,
+                "decision": "fixed",
+                // nobody pressed Mark fixed: the draft took the stage away
+                "automatic": true,
+                "stage": row.try_get::<String, _>("stage_id")?,
+                "merged_into": (op == "merge")
+                    .then(|| row.try_get::<String, _>("into_id"))
+                    .transpose()?,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Set `gtfs_stage.review` on the stages a review covers: `None` clears it,

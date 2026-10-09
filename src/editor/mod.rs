@@ -309,6 +309,18 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::get().to(h::stage),
             )
             .route(
+                "/feeds/{gtfs_id}/stages/{stage_id}/similar",
+                web::get().to(h::stage_similar),
+            )
+            .route(
+                "/feeds/{gtfs_id}/stage-twins",
+                web::get().to(h::stage_twins),
+            )
+            .route(
+                "/feeds/{gtfs_id}/open-reviews",
+                web::get().to(h::open_reviews),
+            )
+            .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:osrm",
                 web::post().to(h::polyline_osrm),
             )
@@ -392,6 +404,14 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/change-sets/{id}/preview/stages/{stage_id}",
                 web::get().to(h::change_set_preview_stage),
+            )
+            .route(
+                "/change-sets/{id}/preview/stages/{stage_id}/similar",
+                web::get().to(h::change_set_preview_stage_similar),
+            )
+            .route(
+                "/change-sets/{id}/preview/stages/{stage_id}/merge",
+                web::get().to(h::change_set_preview_stage_merge),
             )
             .route("/change-sets/{id}/submit", web::post().to(h::submit))
             .route("/change-sets/{id}/reopen", web::post().to(h::reopen))

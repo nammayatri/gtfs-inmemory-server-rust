@@ -1689,6 +1689,642 @@ pub async fn stage_detail(conn: &mut PgConnection, g: &str, key: &StageKey) -> E
     Ok(stage)
 }
 
+/// Two stages starting this close are one place whatever they are called: the
+/// bays of a bus stand, the two kerbs of a stop.
+const NEARBY_M: f64 = 250.0;
+/// How alike two names must be (pg_trgm, 0 to 1) to be offered as one place.
+/// Word similarity both ways, so ISLAND GROUND is like ISLAND GROUND B.T.
+const LIKE_NAME: f32 = 0.5;
+/// ...and how far apart two like-named stages may start: ISLAND GROUND and
+/// ISLAND GROUND B.T are a few hundred metres apart, while ANNA NAGAR and ANNA
+/// SALAI, alike by one word, are kilometres.
+const LIKE_NAME_M: f64 = 2000.0;
+/// Starting further apart than this, two stages are said to be far apart
+/// wherever they are offered, and a merge or replacement between them asks
+/// again: one name is often several places - MTC has a BUS STAND, a CHURCH and
+/// a POST OFFICE in every part of the city - and putting a route on the wrong
+/// one sends its passengers kilometres from where the bus really stops.
+pub const FAR_M: f64 = 1000.0;
+const SIMILAR_LIMIT: i64 = 12;
+/// Stages going the other way, and stages in other people's drafts, are
+/// mentioned rather than offered, so a few are enough.
+const MENTION_LIMIT: i64 = 4;
+
+/// The stage being compared, as a CTE `me`: its name, the name folded for
+/// comparing (no case, no spaces or dots) and where its first stop is. $1 is
+/// the feed, $2 the stage id, $3 its direction.
+const ME_CTE: &str = "me AS ( \
+    SELECT s.name, upper(regexp_replace(s.name, '[^A-Za-z0-9]+', '', 'g')) AS folded, \
+           f.lat, f.lon \
+    FROM gtfs_stage s \
+    LEFT JOIN LATERAL (SELECT st.lat, st.lon FROM gtfs_stage_stop ss \
+                       JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id AND st.stop_id = ss.stop_id \
+                       WHERE ss.gtfs_id = s.gtfs_id AND ss.stage_id = s.stage_id \
+                         AND ss.direction = s.direction AND st.lat IS NOT NULL \
+                       ORDER BY ss.position LIMIT 1) f ON true \
+    WHERE s.gtfs_id = $1 AND s.stage_id = $2 AND s.direction = $3)";
+
+/// Metres between the first stops at `f` and `me`, as SQL; NULL when either
+/// has no position. Flat-earth is plenty at the scale of a city.
+const DISTANCE_SQL: &str = "CASE WHEN f.lat IS NULL OR me.lat IS NULL THEN NULL \
+    ELSE 111320.0 * sqrt(power(f.lat - me.lat, 2) \
+         + power((f.lon - me.lon) * cos(radians(me.lat)), 2)) END";
+
+/// How alike a name `col` is to `me.name`, as SQL (pg_trgm, 0 to 1).
+fn likeness_sql(col: &str) -> String {
+    format!(
+        "greatest(similarity(upper({col}), upper(me.name)), \
+                  word_similarity(upper(me.name), upper({col})), \
+                  word_similarity(upper({col}), upper(me.name)))"
+    )
+}
+
+/// Metres between two points, the way [`DISTANCE_SQL`] measures them.
+pub fn metres_between(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dlat = b.0 - a.0;
+    let dlon = (b.1 - a.1) * a.0.to_radians().cos();
+    111_320.0 * (dlat * dlat + dlon * dlon).sqrt()
+}
+
+/// `GET /feeds/{g}/stages/{id}/similar`: stages going the same way that may be
+/// the same place as this one, so what it may be merged with or replaced by.
+/// Those are the stages that share its name, ignoring case, spaces and dots
+/// (M.G.R.KOYAMBEDU and M G R KOYAMBEDU); those named alike that start within
+/// [`LIKE_NAME_M`] (Redhills Bus Terminus and REDHILLS B.T); and any that start
+/// within [`NEARBY_M`] whatever they are called. A stage of the same name
+/// starting further off than [`LIKE_NAME_M`] is still offered, last: it is as
+/// likely another place of that name as this one.
+///
+/// Each says which routes run both it and this stage. A merge either way
+/// refuses those (`stage_repeated`), so the page can say why before anyone
+/// tries.
+///
+/// Two more lists are only mentioned, never offered for a merge:
+///
+///   - `other_way`: the stages going the other way that are this place - the
+///     same id, or the same name close by. A merge refuses them
+///     (`merge_across_directions`): the two directions hold opposite kerbs. A
+///     stage carrying the other way's stops is put right by editing its stops,
+///     and a route running the wrong one by changing that route's stages.
+///   - `in_other_drafts`: stages like this one being made in somebody else's
+///     open draft, `own_set` excepted. They are not live, so nothing can be
+///     merged into or replaced by one until that draft is committed.
+pub async fn similar_stages(
+    conn: &mut PgConnection,
+    g: &str,
+    key: &StageKey,
+    own_set: Option<Uuid>,
+) -> EditorResult<Value> {
+    let me = stage_row(conn, g, key).await?.ok_or_else(|| {
+        EditorError::not_found("stage_not_found", format!("no stage {}", key.label()))
+    })?;
+    let likeness = likeness_sql("s.name");
+    let rows = sqlx::query(&format!(
+        "WITH {ME_CTE}, \
+         cand AS ( \
+            SELECT s.stage_id, s.direction, s.name, s.review, \
+                   upper(regexp_replace(s.name, '[^A-Za-z0-9]+', '', 'g')) = me.folded AS same_name, \
+                   {likeness} AS likeness, \
+                   f.stop_id AS first_stop_id, f.stop_name AS first_stop_name, \
+                   {DISTANCE_SQL} AS distance_m \
+            FROM gtfs_stage s CROSS JOIN me \
+            LEFT JOIN LATERAL (SELECT ss.stop_id, coalesce(ss.stop_name_override, st.name) AS stop_name, \
+                                      st.lat, st.lon \
+                               FROM gtfs_stage_stop ss \
+                               JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id AND st.stop_id = ss.stop_id \
+                               WHERE ss.gtfs_id = s.gtfs_id AND ss.stage_id = s.stage_id \
+                                 AND ss.direction = s.direction \
+                               ORDER BY ss.position LIMIT 1) f ON true \
+            WHERE s.gtfs_id = $1 AND NOT s.deleted AND s.direction = $3 AND s.stage_id <> $2), \
+         ranked AS ( \
+            SELECT c.*, CASE \
+                     WHEN c.same_name AND coalesce(c.distance_m, 0) <= $5 THEN 0 \
+                     WHEN c.likeness >= $4 AND coalesce(c.distance_m, 0) <= $5 THEN 1 \
+                     WHEN c.distance_m <= $6 THEN 2 \
+                     ELSE 3 END AS rank \
+            FROM cand c \
+            WHERE c.same_name \
+               OR (c.likeness >= $4 AND coalesce(c.distance_m, 0) <= $5) \
+               OR c.distance_m <= $6), \
+         picked AS ( \
+            SELECT * FROM ranked \
+            ORDER BY rank, distance_m NULLS LAST, likeness DESC, stage_id \
+            LIMIT $7) \
+         SELECT p.*, \
+            (SELECT count(*) FROM gtfs_stage_stop ss \
+              WHERE ss.gtfs_id = $1 AND ss.stage_id = p.stage_id AND ss.direction = p.direction \
+                AND ss.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count, \
+            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stage rs \
+               JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+              WHERE rs.gtfs_id = $1 AND rs.stage_id = p.stage_id \
+                AND rs.direction = p.direction) AS route_count, \
+            (SELECT coalesce(json_agg(json_build_object('route_id', x.route_id, \
+                                                        'short_name', x.short_name) \
+                                      ORDER BY x.short_name, x.route_id), '[]'::json)::text \
+               FROM (SELECT DISTINCT r.route_id, r.short_name FROM gtfs_route_stage a \
+                     JOIN gtfs_route_stage b ON b.gtfs_id = a.gtfs_id AND b.route_id = a.route_id \
+                          AND b.variant_id IS NOT DISTINCT FROM a.variant_id \
+                     JOIN gtfs_route r ON r.gtfs_id = a.gtfs_id AND r.route_id = a.route_id \
+                          AND NOT r.deleted \
+                     WHERE a.gtfs_id = $1 AND a.stage_id = $2 AND a.direction = $3 \
+                       AND b.stage_id = p.stage_id AND b.direction = p.direction) x) AS shared_routes \
+         FROM picked p \
+         ORDER BY p.rank, p.distance_m NULLS LAST, p.likeness DESC, p.stage_id"
+    ))
+    .bind(g)
+    .bind(&key.stage_id)
+    .bind(&key.direction)
+    .bind(LIKE_NAME)
+    .bind(LIKE_NAME_M)
+    .bind(NEARBY_M)
+    .bind(SIMILAR_LIMIT)
+    .fetch_all(&mut *conn)
+    .await?;
+    let items = rows
+        .iter()
+        .map(|r| -> Result<Value, sqlx::Error> {
+            let rank: i32 = r.try_get("rank")?;
+            let likeness: f32 = r.try_get("likeness")?;
+            let distance: Option<f64> = r.try_get("distance_m")?;
+            let shared: Value = r
+                .try_get::<Option<String>, _>("shared_routes")?
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_else(|| json!([]));
+            let stage_id: String = r.try_get("stage_id")?;
+            let direction: String = r.try_get("direction")?;
+            Ok(json!({
+                "stage_id": stage_id,
+                "stage_key": StageKey::new(&stage_id, Some(&direction)).entity_key(),
+                "direction": direction.into_option_when_not_empty(),
+                "name": r.try_get::<String, _>("name")?,
+                "review": r.try_get::<Option<String>, _>("review")?,
+                "stop_count": r.try_get::<i64, _>("stop_count")?,
+                "route_count": r.try_get::<i64, _>("route_count")?,
+                "first_stop": {
+                    "stop_id": r.try_get::<Option<String>, _>("first_stop_id")?,
+                    "name": r.try_get::<Option<String>, _>("first_stop_name")?,
+                },
+                // why it is offered, the strongest reason first
+                "why": match rank {
+                    0 | 3 => "same_name",
+                    1 => "like_name",
+                    _ => "nearby",
+                },
+                "likeness": (likeness * 100.0).round() / 100.0,
+                // between the first stops, null when either has no position
+                "distance_m": distance.map(|d| d.round() as i64),
+                // far enough apart to be another place of the name: merging
+                // or replacing asks again
+                "far": distance.is_some_and(|d| d > FAR_M),
+                // routes running both: neither merge can be made until each
+                // of them is off one of the two
+                "shared_routes": shared,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let other_way = sqlx::query(&format!(
+        "WITH {ME_CTE} \
+         SELECT s.stage_id, s.direction, s.name, {DISTANCE_SQL} AS distance_m, \
+                (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stage rs \
+                   JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id \
+                        AND NOT r.deleted \
+                  WHERE rs.gtfs_id = s.gtfs_id AND rs.stage_id = s.stage_id \
+                    AND rs.direction = s.direction) AS route_count \
+         FROM gtfs_stage s CROSS JOIN me \
+         LEFT JOIN LATERAL (SELECT st.lat, st.lon FROM gtfs_stage_stop ss \
+                            JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id AND st.stop_id = ss.stop_id \
+                            WHERE ss.gtfs_id = s.gtfs_id AND ss.stage_id = s.stage_id \
+                              AND ss.direction = s.direction AND st.lat IS NOT NULL \
+                            ORDER BY ss.position LIMIT 1) f ON true \
+         WHERE s.gtfs_id = $1 AND NOT s.deleted AND s.direction <> $3 \
+           AND (s.stage_id = $2 \
+                OR (upper(regexp_replace(s.name, '[^A-Za-z0-9]+', '', 'g')) = me.folded \
+                    AND coalesce({DISTANCE_SQL}, 0) <= $4)) \
+         ORDER BY (s.stage_id = $2) DESC, 4 NULLS LAST, s.stage_id, s.direction \
+         LIMIT $5"
+    ))
+    .bind(g)
+    .bind(&key.stage_id)
+    .bind(&key.direction)
+    .bind(LIKE_NAME_M)
+    .bind(MENTION_LIMIT)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        let stage_id: String = r.try_get("stage_id")?;
+        let direction: String = r.try_get("direction")?;
+        Ok(json!({
+            "stage_id": stage_id,
+            "stage_key": StageKey::new(&stage_id, Some(&direction)).entity_key(),
+            "direction": direction.into_option_when_not_empty(),
+            "name": r.try_get::<String, _>("name")?,
+            "route_count": r.try_get::<i64, _>("route_count")?,
+            "distance_m": r.try_get::<Option<f64>, _>("distance_m")?.map(|d| d.round() as i64),
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+
+    // A stage made in a draft has no row until that draft is applied, so these
+    // come from the drafts themselves: the name and direction the change gives
+    // it, and where the first of its stops is.
+    let likeness = likeness_sql("x.name");
+    let in_other_drafts = sqlx::query(&format!(
+        "WITH {ME_CTE}, \
+         x AS ( \
+            SELECT ch.entity_key AS stage_id, coalesce(ch.after->>'name', '') AS name, \
+                   coalesce(ch.after->>'direction', '') AS direction, ch.op, \
+                   cs.change_set_id, cs.title, cs.status, u.email AS author, \
+                   f.lat, f.lon \
+            FROM gtfs_change ch \
+            JOIN gtfs_change_set cs ON cs.change_set_id = ch.change_set_id \
+            LEFT JOIN gtfs_editor_user u ON u.user_id = cs.created_by \
+            LEFT JOIN LATERAL (SELECT st.lat, st.lon \
+                               FROM jsonb_array_elements(coalesce(ch.after->'rows', '[]'::jsonb)) \
+                                    WITH ORDINALITY e(el, i) \
+                               JOIN gtfs_stop st ON st.gtfs_id = cs.gtfs_id \
+                                    AND st.stop_id = e.el->>'stop_id' \
+                               WHERE st.lat IS NOT NULL ORDER BY e.i LIMIT 1) f ON true \
+            WHERE cs.gtfs_id = $1 AND cs.status IN ('draft', 'submitted', 'approved') \
+              AND ($7::uuid IS NULL OR cs.change_set_id <> $7) \
+              AND ch.entity = 'stage' AND ch.op IN ('create', 'split') \
+              AND coalesce(ch.after->>'direction', '') = $3), \
+         scored AS ( \
+            SELECT x.*, \
+                   upper(regexp_replace(x.name, '[^A-Za-z0-9]+', '', 'g')) = me.folded AS same_name, \
+                   {likeness} AS likeness, \
+                   {} AS distance_m \
+            FROM x CROSS JOIN me) \
+         SELECT * FROM scored \
+         WHERE same_name OR (likeness >= $4 AND coalesce(distance_m, 0) <= $5) OR distance_m <= $6 \
+         ORDER BY same_name DESC, distance_m NULLS LAST, likeness DESC, stage_id \
+         LIMIT $8",
+        DISTANCE_SQL.replace("f.lat", "x.lat").replace("f.lon", "x.lon")
+    ))
+    .bind(g)
+    .bind(&key.stage_id)
+    .bind(&key.direction)
+    .bind(LIKE_NAME)
+    .bind(LIKE_NAME_M)
+    .bind(NEARBY_M)
+    .bind(own_set)
+    .bind(MENTION_LIMIT)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        let stage_id: String = r.try_get("stage_id")?;
+        let direction: String = r.try_get("direction")?;
+        Ok(json!({
+            "stage_id": stage_id,
+            "stage_key": StageKey::new(&stage_id, Some(&direction)).entity_key(),
+            "direction": direction.into_option_when_not_empty(),
+            "name": r.try_get::<String, _>("name")?,
+            "distance_m": r.try_get::<Option<f64>, _>("distance_m")?.map(|d| d.round() as i64),
+            "change_set_id": r.try_get::<Uuid, _>("change_set_id")?,
+            "change_set_title": r.try_get::<String, _>("title")?,
+            "change_set_status": r.try_get::<String, _>("status")?,
+            "author_email": r.try_get::<Option<String>, _>("author")?,
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(json!({
+        "stage_key": key.entity_key(),
+        "name": me["name"],
+        "direction": key.direction_opt(),
+        "items": items,
+        "other_way": other_way,
+        "in_other_drafts": in_other_drafts,
+    }))
+}
+
+/// The served stops of a stage's rows, in order: `(stop_id, name, lat, lon)`.
+fn served_stops(rows: &[Value]) -> Vec<(String, String, Option<f64>, Option<f64>)> {
+    rows.iter()
+        .filter(|r| {
+            r["stop_type"]
+                .as_str()
+                .is_some_and(|t| !UNSERVED_TYPES.contains(&t))
+        })
+        .filter_map(|r| {
+            let id = r["stop_id"].as_str()?.to_string();
+            let name = r["stop_name"].as_str().unwrap_or(&id).to_string();
+            Some((id, name, r["lat"].as_f64(), r["lon"].as_f64()))
+        })
+        .collect()
+}
+
+/// What merging stage `gone` into `into` would do, asked before it is put in a
+/// draft: the server's answer to the merge itself (`problems`, the findings the
+/// draft would show - `stage_repeated`, `route_out_of_sync` and the rest), how
+/// far apart the two start, the routes that would change, and the stops those
+/// routes stop calling at and start calling at. These are fare stages: a stop
+/// lost is a stop the bus no longer serves on those routes, and one gained is a
+/// stop it is now said to serve, so both are shown before anyone confirms.
+///
+/// Read inside a transaction the caller rolls back; the merge is tried in a
+/// savepoint of its own.
+pub async fn merge_check(
+    conn: &mut PgConnection,
+    g: &str,
+    gone: &StageKey,
+    into: &StageKey,
+    actor: &str,
+) -> EditorResult<Value> {
+    let not_found =
+        |k: &StageKey| EditorError::not_found("stage_not_found", format!("no stage {}", k.label()));
+    let stage = stage_row(conn, g, gone)
+        .await?
+        .ok_or_else(|| not_found(gone))?;
+    let keeper = stage_row(conn, g, into)
+        .await?
+        .ok_or_else(|| not_found(into))?;
+    let mut rows = stages_read_rows(conn, g, &[gone.clone(), into.clone()]).await?;
+    let gone_stops = served_stops(&rows.remove(gone).unwrap_or_default());
+    let into_stops = served_stops(&rows.remove(into).unwrap_or_default());
+    let first = |s: &[(String, String, Option<f64>, Option<f64>)]| {
+        s.iter()
+            .find_map(|(_, _, lat, lon)| Some(((*lat)?, (*lon)?)))
+    };
+    let distance = match (first(&gone_stops), first(&into_stops)) {
+        (Some(a), Some(b)) => Some(metres_between(a, b)),
+        _ => None,
+    };
+    let ids = |s: &[(String, String, Option<f64>, Option<f64>)]| -> HashSet<String> {
+        s.iter().map(|(id, ..)| id.clone()).collect()
+    };
+    let (gone_ids, into_ids) = (ids(&gone_stops), ids(&into_stops));
+    let listed = |s: &[(String, String, Option<f64>, Option<f64>)], other: &HashSet<String>| {
+        s.iter()
+            .filter(|(id, ..)| !other.contains(id))
+            .map(|(id, name, ..)| json!({"stop_id": id, "name": name}))
+            .collect::<Vec<_>>()
+    };
+
+    // every route using it, its normal list or one of its temporary ones
+    let routes = sqlx::query(
+        "SELECT r.route_id, r.short_name, bool_or(rs.variant_id IS NULL) AS normal, \
+                coalesce(array_agg(DISTINCT rs.variant_id) \
+                         FILTER (WHERE rs.variant_id IS NOT NULL), '{}') AS temporary \
+         FROM gtfs_route_stage rs \
+         JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+         WHERE rs.gtfs_id = $1 AND rs.stage_id = $2 AND rs.direction = $3 \
+         GROUP BY r.route_id, r.short_name \
+         ORDER BY r.short_name, r.route_id",
+    )
+    .bind(g)
+    .bind(&gone.stage_id)
+    .bind(&gone.direction)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        Ok(json!({
+            "route_id": r.try_get::<String, _>("route_id")?,
+            "short_name": r.try_get::<Option<String>, _>("short_name")?,
+            "normal": r.try_get::<bool, _>("normal")?,
+            "temporary": r.try_get::<Vec<String>, _>("temporary")?,
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+
+    // routes running both, on one list: what `stage_repeated` names, here so
+    // the page can open each of them
+    let shared = sqlx::query(
+        "SELECT DISTINCT r.route_id, r.short_name FROM gtfs_route_stage a \
+         JOIN gtfs_route_stage b ON b.gtfs_id = a.gtfs_id AND b.route_id = a.route_id \
+              AND b.variant_id IS NOT DISTINCT FROM a.variant_id \
+         JOIN gtfs_route r ON r.gtfs_id = a.gtfs_id AND r.route_id = a.route_id AND NOT r.deleted \
+         WHERE a.gtfs_id = $1 AND a.stage_id = $2 AND a.direction = $3 \
+           AND b.stage_id = $4 AND b.direction = $5 \
+         ORDER BY r.short_name, r.route_id",
+    )
+    .bind(g)
+    .bind(&gone.stage_id)
+    .bind(&gone.direction)
+    .bind(&into.stage_id)
+    .bind(&into.direction)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| -> Result<Value, sqlx::Error> {
+        Ok(json!({
+            "route_id": r.try_get::<String, _>("route_id")?,
+            "short_name": r.try_get::<Option<String>, _>("short_name")?,
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+
+    // the merge itself, exactly as the draft would apply it, then undone
+    sqlx::query("SAVEPOINT stage_merge_check")
+        .execute(&mut *conn)
+        .await?;
+    let tried = stage_merge(
+        conn,
+        g,
+        &gone.entity_key(),
+        &json!({"into_stage_id": into.entity_key()}),
+        actor,
+    )
+    .await;
+    sqlx::query("ROLLBACK TO SAVEPOINT stage_merge_check")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT stage_merge_check")
+        .execute(&mut *conn)
+        .await?;
+    let findings = match tried {
+        Ok(f) | Err(ApplyError::Findings(f)) => f,
+        Err(ApplyError::Db(e)) => return Err(e.into()),
+    };
+    let problems: Vec<Value> = findings
+        .iter()
+        .map(|f| json!({"level": f.level, "code": f.code, "message": f.message}))
+        .collect();
+
+    let route_ids: Vec<String> = routes
+        .iter()
+        .filter_map(|r| r["route_id"].as_str().map(str::to_string))
+        .collect();
+    let reviews =
+        super::stage_reviews::open_about(conn, g, &[gone.clone(), into.clone()], &route_ids)
+            .await?;
+    let brief = |s: &Value, stops: usize, deleted: bool| {
+        json!({
+            "stage_id": s["stage_id"],
+            "stage_key": s["stage_key"],
+            "name": s["name"],
+            "direction": s["direction"],
+            "stop_count": stops,
+            "deleted": deleted,
+        })
+    };
+    Ok(json!({
+        "stage": brief(&stage, gone_stops.len(), stage["deleted"].as_bool().unwrap_or(false)),
+        "into": brief(&keeper, into_stops.len(), keeper["deleted"].as_bool().unwrap_or(false)),
+        // between the two first stops, null when either has no position
+        "distance_m": distance.map(|d| d.round() as i64),
+        "far": distance.is_some_and(|d| d > FAR_M),
+        "routes": routes,
+        // routes running both, which the merge refuses until each is off one
+        "shared_routes": shared,
+        // what every one of those routes stops calling at, and starts calling at
+        "stops_lost": listed(&gone_stops, &into_ids),
+        "stops_gained": listed(&into_stops, &gone_ids),
+        "stops_kept": gone_ids.intersection(&into_ids).count(),
+        // what the draft would say about the merge: an error means it is refused
+        "problems": problems,
+        // the open reviews and routes to review it touches
+        "reviews": reviews,
+    }))
+}
+
+/// `GET /change-sets/{id}/preview/stages/{stage_id}/merge?into=`: [`merge_check`]
+/// with the draft applied, so a stage the draft makes can be merged into, and
+/// the answer is the one the draft would give with the merge added to it.
+pub async fn preview_stage_merge(
+    state: &EditorState,
+    ctx: &Ctx,
+    set_id: Uuid,
+    stage_id: &str,
+    into: &str,
+) -> EditorResult<Value> {
+    let (raw, into) = (stage_id.to_string(), into.to_string());
+    let actor = ctx.user.email.clone();
+    with_draft_applied(state, ctx, set_id, |conn, g| {
+        let (raw, into, actor) = (raw.clone(), into.clone(), actor.clone());
+        Box::pin(async move {
+            let gone = key_of_change(conn, g, &raw).await;
+            let keeper = key_of_change(conn, g, into.trim()).await;
+            if keeper.stage_id.is_empty() {
+                return Err(EditorError::bad_request(
+                    "invalid_payload",
+                    "into names the stage to keep",
+                ));
+            }
+            merge_check(conn, g, &gone, &keeper, &actor).await
+        })
+    })
+    .await
+}
+
+/// `GET /feeds/{g}/stage-twins`: every stage named after itself (an `nm_` id)
+/// that has exactly one MTC-keyed stage of the same name going the same way -
+/// the duplicates a route that could not be lined up with MTC's left behind,
+/// each with the one stage it most likely is. Same name means the same once
+/// case, spaces and dots are set aside, as for [`similar_stages`].
+///
+/// Each says how far apart the two start (`far` past [`FAR_M`]: the same name
+/// in another part of the city) and which routes run both, which a merge
+/// refuses. `several` counts the ones left out because more than one of MTC's
+/// stops carries the name: which is meant is a person's call, stage by stage.
+pub async fn stage_twins(conn: &mut PgConnection, g: &str) -> EditorResult<Value> {
+    let rows = sqlx::query(
+        "WITH nm AS ( \
+            SELECT s.stage_id, s.direction, s.name, \
+                   upper(regexp_replace(s.name, '[^A-Za-z0-9]+', '', 'g')) AS folded \
+            FROM gtfs_stage s \
+            WHERE s.gtfs_id = $1 AND NOT s.deleted AND s.stage_id LIKE 'nm\\_%'), \
+         mtc AS ( \
+            SELECT s.stage_id, s.direction, s.name, \
+                   upper(regexp_replace(s.name, '[^A-Za-z0-9]+', '', 'g')) AS folded \
+            FROM gtfs_stage s \
+            WHERE s.gtfs_id = $1 AND NOT s.deleted AND s.stage_id NOT LIKE 'nm\\_%'), \
+         pairs AS ( \
+            SELECT nm.stage_id, nm.direction, nm.name, \
+                   count(*) OVER (PARTITION BY nm.stage_id, nm.direction) AS twins, \
+                   mtc.stage_id AS twin_id, mtc.name AS twin_name \
+            FROM nm JOIN mtc ON mtc.folded = nm.folded AND mtc.direction = nm.direction) \
+         SELECT p.*, \
+            (SELECT st.lat FROM gtfs_stage_stop ss JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id \
+               AND st.stop_id = ss.stop_id WHERE ss.gtfs_id = $1 AND ss.stage_id = p.stage_id \
+               AND ss.direction = p.direction AND st.lat IS NOT NULL ORDER BY ss.position LIMIT 1) AS lat, \
+            (SELECT st.lon FROM gtfs_stage_stop ss JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id \
+               AND st.stop_id = ss.stop_id WHERE ss.gtfs_id = $1 AND ss.stage_id = p.stage_id \
+               AND ss.direction = p.direction AND st.lat IS NOT NULL ORDER BY ss.position LIMIT 1) AS lon, \
+            (SELECT st.lat FROM gtfs_stage_stop ss JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id \
+               AND st.stop_id = ss.stop_id WHERE ss.gtfs_id = $1 AND ss.stage_id = p.twin_id \
+               AND ss.direction = p.direction AND st.lat IS NOT NULL ORDER BY ss.position LIMIT 1) AS twin_lat, \
+            (SELECT st.lon FROM gtfs_stage_stop ss JOIN gtfs_stop st ON st.gtfs_id = ss.gtfs_id \
+               AND st.stop_id = ss.stop_id WHERE ss.gtfs_id = $1 AND ss.stage_id = p.twin_id \
+               AND ss.direction = p.direction AND st.lat IS NOT NULL ORDER BY ss.position LIMIT 1) AS twin_lon, \
+            (SELECT count(DISTINCT rs.route_id) FROM gtfs_route_stage rs \
+               JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
+              WHERE rs.gtfs_id = $1 AND rs.stage_id = p.stage_id AND rs.direction = p.direction) AS route_count, \
+            (SELECT coalesce(json_agg(json_build_object('route_id', x.route_id, \
+                                                        'short_name', x.short_name) \
+                                      ORDER BY x.short_name, x.route_id), '[]'::json)::text \
+               FROM (SELECT DISTINCT r.route_id, r.short_name FROM gtfs_route_stage a \
+                     JOIN gtfs_route_stage b ON b.gtfs_id = a.gtfs_id AND b.route_id = a.route_id \
+                          AND b.variant_id IS NOT DISTINCT FROM a.variant_id \
+                     JOIN gtfs_route r ON r.gtfs_id = a.gtfs_id AND r.route_id = a.route_id \
+                          AND NOT r.deleted \
+                     WHERE a.gtfs_id = $1 AND a.stage_id = p.stage_id AND a.direction = p.direction \
+                       AND b.stage_id = p.twin_id AND b.direction = p.direction) x) AS shared_routes \
+         FROM pairs p WHERE p.twins = 1 \
+         ORDER BY p.name, p.direction, p.stage_id",
+    )
+    .bind(g)
+    .fetch_all(&mut *conn)
+    .await?;
+    let items = rows
+        .iter()
+        .map(|r| -> Result<Value, sqlx::Error> {
+            let stage_id: String = r.try_get("stage_id")?;
+            let direction: String = r.try_get("direction")?;
+            let twin_id: String = r.try_get("twin_id")?;
+            let at = |lat: &str, lon: &str| -> Result<Option<(f64, f64)>, sqlx::Error> {
+                Ok(r.try_get::<Option<f64>, _>(lat)?
+                    .zip(r.try_get::<Option<f64>, _>(lon)?))
+            };
+            let distance = match (at("lat", "lon")?, at("twin_lat", "twin_lon")?) {
+                (Some(a), Some(b)) => Some(metres_between(a, b)),
+                _ => None,
+            };
+            let shared: Value = r
+                .try_get::<Option<String>, _>("shared_routes")?
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_else(|| json!([]));
+            Ok(json!({
+                "stage_id": stage_id,
+                "stage_key": StageKey::new(&stage_id, Some(&direction)).entity_key(),
+                "direction": direction.clone().into_option_when_not_empty(),
+                "name": r.try_get::<String, _>("name")?,
+                "route_count": r.try_get::<i64, _>("route_count")?,
+                "twin": {
+                    "stage_id": twin_id,
+                    "stage_key": StageKey::new(&twin_id, Some(&direction)).entity_key(),
+                    "name": r.try_get::<String, _>("twin_name")?,
+                },
+                "distance_m": distance.map(|d| d.round() as i64),
+                "far": distance.is_some_and(|d| d > FAR_M),
+                "shared_routes": shared,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let several: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ( \
+            SELECT nm.stage_id, nm.direction FROM gtfs_stage nm \
+            JOIN gtfs_stage mtc ON mtc.gtfs_id = nm.gtfs_id AND mtc.direction = nm.direction \
+                 AND NOT mtc.deleted AND mtc.stage_id NOT LIKE 'nm\\_%' \
+                 AND upper(regexp_replace(mtc.name, '[^A-Za-z0-9]+', '', 'g')) \
+                   = upper(regexp_replace(nm.name, '[^A-Za-z0-9]+', '', 'g')) \
+            WHERE nm.gtfs_id = $1 AND NOT nm.deleted AND nm.stage_id LIKE 'nm\\_%' \
+            GROUP BY nm.stage_id, nm.direction HAVING count(*) > 1) t",
+    )
+    .bind(g)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(json!({
+        "gtfs_id": g,
+        "items": items,
+        "several": several,
+        "far_m": FAR_M,
+    }))
+}
+
 /// `GET /feeds/{g}/routes/{route_id}/stages`: the route's stages in order, each
 /// with its stops. `has_stages` false means the route is not built from stages
 /// yet; `in_sync` false that its stop list no longer matches them.
@@ -1884,6 +2520,25 @@ pub async fn preview_stage(
         Box::pin(async move {
             let key = key_of_change(conn, g, &raw).await;
             stage_detail(conn, g, &key).await
+        })
+    })
+    .await
+}
+
+/// `GET /change-sets/{id}/preview/stages/{stage_id}/similar`: the same, with
+/// the draft applied, so a stage the draft makes has stages like it too.
+pub async fn preview_stage_similar(
+    state: &EditorState,
+    ctx: &Ctx,
+    set_id: Uuid,
+    stage_id: &str,
+) -> EditorResult<Value> {
+    let raw = stage_id.to_string();
+    with_draft_applied(state, ctx, set_id, |conn, g| {
+        let raw = raw.clone();
+        Box::pin(async move {
+            let key = key_of_change(conn, g, &raw).await;
+            similar_stages(conn, g, &key, Some(set_id)).await
         })
     })
     .await
