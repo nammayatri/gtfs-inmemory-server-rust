@@ -867,19 +867,19 @@ function gpsFailure(e) {
   const d = e.details || {};
   if (e.code === "gps_not_enough_runs") {
     const saw = d.bus_days === 0
-      ? `No bus carrying route number ${d.route_number || "this"} was seen near these stops between ${dayRange(d.from, d.to)}.`
+      ? `No bus on route id ${d.route_id || "this"} was seen near these stops between ${dayRange(d.from, d.to)}.`
       : `Of ${plural(d.runs_seen || 0, "bus run")} seen between ${dayRange(d.from, d.to)}, ${d.runs_used || 0} passed this route's stops in order; at least ${d.min_runs || 3} are needed.`;
     return [h("p.notice.error", { "data-failure-reason": e.code }, saw),
       d.stopped === "budget"
         ? h("p.hint", { "data-stopped": "budget" }, `Reading stopped at its time limit, after ${plural(d.days_read || 0, "day")}. The GPS store may be slow right now; try again later.`)
-        : h("p.hint", "Check the route number and the stops' order and positions, or route the line through the stops instead.")];
+        : h("p.hint", "Check that buses ran this route id (trips assigned to it), and the stops' order and positions, or route the line through the stops instead.")];
   }
   const hint = {
     gps_unavailable: "Map lines from GPS are not set up for this feed. Route the line through the stops instead.",
     gps_timeout: "Reading the GPS took too long. The GPS store may be slow right now; try again later.",
     job_lost: "The server reading the GPS restarted. Ask again.",
     gps_query_failed: "The GPS store could not be read. Try again in a minute.",
-    gps_no_route_number: "Give the route its number first: the buses are found by it.",
+    gps_bad_route_id: "This route's id cannot be used to find its buses.",
   }[e.code];
   return [h("p.notice.error", { "data-failure-reason": e.code }, e.message), hint ? h("p.hint", hint) : null];
 }
@@ -996,7 +996,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
   };
   // how far back the feed's GPS looks (docs section 17), as /auth/me says
   const gpsDays = ((state.feeds.find((f) => f.gtfs_id === state.feedId) || {}).gps || {}).days || 7;
-  const suggestGps = () => ask(`Reading where the buses of route ${route.short_name || route.route_id} drove over the last ${gpsDays} days. This can take a few minutes; you can go on editing meanwhile.`,
+  const suggestGps = () => ask(`Reading where the buses on route id ${route.route_id} drove over the last ${gpsDays} days. This can take a few minutes; you can go on editing meanwhile.`,
     "suggested a map line from GPS", gpsFailure, gpsJob);
   const suggestButtons = [
     h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Route through stops"),
