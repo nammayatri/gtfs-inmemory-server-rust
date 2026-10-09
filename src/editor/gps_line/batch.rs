@@ -190,8 +190,9 @@ pub fn choose(index: &WeekIndex, want: usize, min_pings: u64) -> HashMap<String,
 }
 
 /// Step 3 for some buses over `[from, to)`: their pings averaged to one point
-/// per `bucket_s`, each with a route id it carried in that bucket (empty when
-/// none), packed one bus-hour per row as `t,lat,lon,hex(route_id)|...`.
+/// per `bucket_s`, each with a route id it carried in that bucket and that
+/// ping's trip id (empty when none), packed one bus-hour per row as
+/// `t,lat,lon,hex(route_id),hex(trip_id)|...`.
 pub fn group_tracks_sql(
     table: &str,
     from: i64,
@@ -202,11 +203,13 @@ pub fn group_tracks_sql(
 ) -> String {
     format!(
         "SELECT device, intDiv(t, 3600) AS h, count() AS points, sum(n) AS pings, \
-         arrayStringConcat(groupArray(concat(toString(t), ',', toString(la), ',', toString(lo), ',', hex(lab))), '|') AS track \
+         arrayStringConcat(groupArray(concat(toString(t), ',', toString(la), ',', toString(lo), ',', \
+         hex(tupleElement(lt, 1)), ',', hex(tupleElement(lt, 2)))), '|') AS track \
          FROM (\
          SELECT toString({COL_DEVICE}) AS device, intDiv(toUnixTimestamp({COL_TIME}), {bucket_s}) * {bucket_s} AS t, \
          round(avg({COL_LAT}), 6) AS la, round(avg({COL_LON}), 6) AS lo, count() AS n, \
-         anyIf(ifNull(toString({COL_ROUTE_ID}), ''), ifNull(toString({COL_ROUTE_ID}), '') != '') AS lab \
+         anyIf((ifNull(toString({COL_ROUTE_ID}), ''), ifNull(toString({COL_TRIP_ID}), '')), \
+         ifNull(toString({COL_ROUTE_ID}), '') != '') AS lt \
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
          AND {COL_DEVICE} IN ({list}) \
@@ -218,7 +221,8 @@ pub fn group_tracks_sql(
     )
 }
 
-/// One packed row of [`group_tracks_sql`]: (ping, route id, empty when none).
+/// One packed row of [`group_tracks_sql`]: (ping with its trip id, route id;
+/// either empty when none).
 pub fn parse_labelled(track: &str) -> Vec<(Ping, String)> {
     track
         .split('|')
@@ -230,7 +234,18 @@ pub fn parse_labelled(track: &str) -> Vec<(Ping, String)> {
             let label = unhex(it.next().unwrap_or(""))
                 .and_then(|l| route_key(&l))
                 .unwrap_or_default();
-            Some((Ping { t, lat, lon }, label))
+            let trip_id = unhex(it.next().unwrap_or(""))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            Some((
+                Ping {
+                    t,
+                    lat,
+                    lon,
+                    trip_id,
+                },
+                label,
+            ))
         })
         .collect()
 }
@@ -243,7 +258,7 @@ pub fn attribute(points: &[(Ping, String)], route: &str, d: &RouteDay) -> Vec<Pi
     points
         .iter()
         .filter(|(p, l)| p.t >= a && p.t <= b && (l.is_empty() || l == route))
-        .map(|(p, _)| *p)
+        .map(|(p, _)| p.clone())
         .collect()
 }
 
@@ -582,6 +597,7 @@ mod tests {
             t,
             lat: 13.0,
             lon: 80.2,
+            trip_id: String::new(),
         };
         let points = vec![
             (p(100), "1987".to_string()),
@@ -598,6 +614,35 @@ mod tests {
         };
         let got: Vec<i64> = attribute(&points, "1987", &d).iter().map(|p| p.t).collect();
         assert_eq!(got, vec![100, 200]);
+    }
+
+    #[test]
+    fn each_point_carries_its_trip_id_to_the_trip_split() {
+        let h = |v: &str| hex::encode(v);
+        let row = format!(
+            "100,13.0,80.2,{},{}|120,13.1,80.3,,|140,13.2,80.4,{}",
+            h("1369"),
+            h("T179-3"),
+            h("1369")
+        );
+        let got: Vec<(i64, String, String)> = parse_labelled(&row)
+            .into_iter()
+            .map(|(p, l)| (p.t, l, p.trip_id))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (100, "1369".into(), "T179-3".into()),
+                (120, String::new(), String::new()),
+                (140, "1369".into(), String::new()),
+            ]
+        );
+        let sql = group_tracks_sql(DEFAULT_TABLE, 0, 3_600, &["a".into()], 20, 2);
+        assert!(
+            sql.contains("trip_id") && sql.contains("tupleElement(lt, 2)"),
+            "{sql}"
+        );
+        assert_read_only(&sql).unwrap();
     }
 
     /// The fleet of `gps_line`'s self-test on each of the last `days` days, on

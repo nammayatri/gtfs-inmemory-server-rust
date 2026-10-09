@@ -43,9 +43,12 @@
 //!  line is built from what was read, or the answer is "not enough runs" with
 //!  the counts - and neither is cached, so the next click reads further (the
 //!  days already read are kept, so it asks only for the rest).
-//!  3. **Runs**: clean (impossible jumps), split at feed gaps and terminal
-//!     dwells, match the stops, keep the runs that pass enough of them in
-//!     order, cut each from its first to its last matched stop.
+//!  3. **Runs**: clean (impossible jumps), split by the feed's `trip_id` (the
+//!     way control-center `/transit/routes` groups a trail), match the stops,
+//!     keep the runs that pass enough of them in order, cut each from its
+//!     first to its last matched stop. A trip id seen again after two hours
+//!     is a new run. Pings with no trip id still split at feed gaps and
+//!     terminal dwells.
 //!  4. **Consolidate**: grid cells over every kept run, the mean point of each,
 //!     ordered along a reference run (the one through the most-travelled
 //!     cells), thin cells and off-corridor samples dropped, the direction the
@@ -110,6 +113,11 @@ const COL_LON: &str = "long";
 const COL_DEVICE: &str = "deviceId";
 /// The trip's GTFS route id, as the trip assignment set it on each ping.
 const COL_ROUTE_ID: &str = "route_id";
+/// The waybill trip, as gps-processor set it on each ping (`{waybill}-{n}`).
+const COL_TRIP_ID: &str = "trip_id";
+/// A trip id seen again after this long is the next day's run of that leg
+/// (control-center `STALE_TRIP_ID_GAP_MS`).
+const STALE_TRIP_ID_GAP_S: i64 = 2 * 60 * 60;
 /// Service days are Indian days (UTC+05:30): a bus's night is not split at
 /// 05:30. Each day is asked for by its own bounds in unix seconds, so the
 /// server's time zone never matters.
@@ -188,12 +196,25 @@ pub struct Stop {
     pub lon: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ping {
     /// Unix seconds.
     pub t: i64,
     pub lat: f64,
     pub lon: f64,
+    /// The feed's `trip_id`, empty when the ping carries none.
+    pub trip_id: String,
+}
+
+impl Ping {
+    pub fn new(t: i64, lat: f64, lon: f64) -> Self {
+        Self {
+            t,
+            lat,
+            lon,
+            trip_id: String::new(),
+        }
+    }
 }
 
 /// One bus's (averaged) pings on one day.
@@ -240,11 +261,11 @@ pub fn served_stops(detail: &Value) -> Vec<Stop> {
 pub fn clean(pings: &[Ping], max_speed_kmh: f64) -> Vec<Ping> {
     let mut sorted: Vec<Ping> = pings
         .iter()
-        .copied()
+        .cloned()
         .filter(|p| super::validation::valid_lat_lon(p.lat, p.lon) && (p.lat, p.lon) != (0.0, 0.0))
         .collect();
-    sorted.sort_by(|a, b| a.t.cmp(&b.t));
-    sorted.dedup_by(|b, a| a.t == b.t);
+    sorted.sort_by(|a, b| a.t.cmp(&b.t).then(a.trip_id.cmp(&b.trip_id)));
+    sorted.dedup_by(|b, a| a.t == b.t && a.trip_id == b.trip_id);
     let mut kept: Vec<Ping> = Vec::with_capacity(sorted.len());
     let mut rejected = 0;
     for p in sorted {
@@ -303,11 +324,69 @@ pub fn despike(xy: &[(f64, f64)]) -> Vec<bool> {
 /// A dwell's own spot: the points this close to where the bus stood.
 const DWELL_CORE_M: f64 = 30.0;
 
-/// Split a cleaned track into runs: at a gap in the feed, and at a dwell - the
-/// bus standing within `dwell_radius_m` for `dwell_s`, which is what it does at
-/// a terminus before running the other way. The dwell point closes one run and
-/// opens the next. Stubs (too few points, too little extent) are dropped.
+/// Split a cleaned track into runs.
+///
+/// When the feed carries `trip_id` (control-center `/transit/routes`): one id
+/// is one run, even across a hole in the pings. The same id after
+/// [`STALE_TRIP_ID_GAP_S`] is a later day's run of that leg. Untagged pings
+/// that fall inside a tagged run's span stay with it. Pings with no trip id
+/// still split at a gap in the feed, and at a dwell - the bus standing within
+/// `dwell_radius_m` for `dwell_s`. Stubs (too few points, too little extent)
+/// are dropped.
 pub fn split_runs(pings: &[Ping], pl: &Planar, p: &Params) -> Vec<Vec<Ping>> {
+    let mut tagged: Vec<Vec<Ping>> = Vec::new();
+    let mut open: HashMap<String, usize> = HashMap::new();
+    for q in pings.iter().filter(|q| !q.trip_id.is_empty()) {
+        if let Some(&i) = open.get(&q.trip_id) {
+            if q.t - tagged[i].last().expect("open run").t <= STALE_TRIP_ID_GAP_S {
+                tagged[i].push(q.clone());
+                continue;
+            }
+        }
+        let i = tagged.len();
+        open.insert(q.trip_id.clone(), i);
+        tagged.push(vec![q.clone()]);
+    }
+    let mut claimed = vec![false; pings.len()];
+    for (i, q) in pings.iter().enumerate() {
+        if !q.trip_id.is_empty() {
+            claimed[i] = true;
+        }
+    }
+    for run in &mut tagged {
+        let (t0, t1) = (run[0].t, run.last().expect("non-empty").t);
+        for (i, q) in pings.iter().enumerate() {
+            if claimed[i] || q.t < t0 || q.t > t1 {
+                continue;
+            }
+            claimed[i] = true;
+            run.push(q.clone());
+        }
+        run.sort_by_key(|q| q.t);
+    }
+    let leftover: Vec<Ping> = pings
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !claimed[*i])
+        .map(|(_, q)| q.clone())
+        .collect();
+    let mut runs = tagged;
+    runs.extend(split_at_gaps_and_dwells(&leftover, pl, p));
+    runs.retain(|r| {
+        r.len() >= p.run_min_points && {
+            let o = pl.xy((r[0].lat, r[0].lon));
+            r.iter()
+                .any(|q| dist(o, pl.xy((q.lat, q.lon))) >= p.run_min_extent_m)
+        }
+    });
+    runs
+}
+
+/// Split untagged pings at a gap in the feed, and at a dwell.
+fn split_at_gaps_and_dwells(pings: &[Ping], pl: &Planar, p: &Params) -> Vec<Vec<Ping>> {
+    if pings.is_empty() {
+        return vec![];
+    }
     let xy: Vec<(f64, f64)> = pings.iter().map(|q| pl.xy((q.lat, q.lon))).collect();
     let mut runs: Vec<Vec<Ping>> = Vec::new();
     let mut cur: Vec<Ping> = Vec::new();
@@ -345,17 +424,10 @@ pub fn split_runs(pings: &[Ping], pl: &Planar, p: &Params) -> Vec<Vec<Ping>> {
             i = j + 1;
             continue;
         }
-        cur.push(pings[i]);
+        cur.push(pings[i].clone());
         i += 1;
     }
     runs.push(cur);
-    runs.retain(|r| {
-        r.len() >= p.run_min_points && {
-            let o = pl.xy((r[0].lat, r[0].lon));
-            r.iter()
-                .any(|q| dist(o, pl.xy((q.lat, q.lon))) >= p.run_min_extent_m)
-        }
-    });
     runs
 }
 
@@ -547,7 +619,7 @@ pub fn select_runs(
             let run: Vec<Ping> = run
                 .iter()
                 .zip(despike(&all))
-                .filter_map(|(q, k)| k.then_some(*q))
+                .filter_map(|(q, k)| k.then_some(q.clone()))
                 .collect();
             let xy: Vec<(f64, f64)> = run.iter().map(|q| pl.xy((q.lat, q.lon))).collect();
             let ts: Vec<i64> = run.iter().map(|q| q.t).collect();
@@ -1216,11 +1288,11 @@ fn bus_days_of(rows: &[Vec<String>], limit: usize) -> Vec<BusDay> {
 }
 
 /// Step 2: some devices' pings over one stretch of time, averaged to one point
-/// per `bucket_s`, packed one device-hour per row as `t,lat,lon|t,lat,lon|...`.
-/// Pings carrying another route id are left out; ones with none stay (a
-/// quarter of pings carry no route id). At most one row per device and hour, so
-/// `limit` = devices x hours of the stretch holds the whole answer: it is never
-/// paged, and never read twice.
+/// per `bucket_s` per `trip_id`, packed one device-hour per row as
+/// `t,lat,lon,hex(trip_id)|…`. Pings carrying another route id are left out;
+/// ones with none stay (a quarter of pings carry no route id). At most one row
+/// per device and hour, so `limit` = devices x hours of the stretch holds the
+/// whole answer: it is never paged, and never read twice.
 #[allow(clippy::too_many_arguments)]
 pub fn tracks_sql(
     table: &str,
@@ -1234,15 +1306,16 @@ pub fn tracks_sql(
 ) -> String {
     format!(
         "SELECT device, intDiv(t, 3600) AS h, count() AS points, sum(n) AS pings, \
-         arrayStringConcat(groupArray(concat(toString(t), ',', toString(la), ',', toString(lo))), '|') AS track \
+         arrayStringConcat(groupArray(concat(toString(t), ',', toString(la), ',', toString(lo), ',', hex(tid))), '|') AS track \
          FROM (\
          SELECT {COL_DEVICE} AS device, intDiv(toUnixTimestamp({COL_TIME}), {bucket_s}) * {bucket_s} AS t, \
+         ifNull(toString({COL_TRIP_ID}), '') AS tid, \
          round(avg({COL_LAT}), 6) AS la, round(avg({COL_LON}), 6) AS lo, count() AS n \
          FROM {table} \
          WHERE {COL_TIME} >= toDateTime({from}) AND {COL_TIME} < toDateTime({to}) AND {COL_TIME} <= now() \
          AND {COL_DEVICE} IN ({list}) \
          AND (isNull({COL_ROUTE_ID}) OR {COL_ROUTE_ID} IN ('', {ids})) AND {bbox} \
-         GROUP BY device, t) \
+         GROUP BY device, t, tid) \
          GROUP BY device, h \
          ORDER BY device, h \
          LIMIT {limit}",
@@ -1289,7 +1362,16 @@ pub fn parse_packed(track: &str) -> Vec<Ping> {
             let t = it.next()?.trim().parse::<i64>().ok()?;
             let lat = it.next()?.trim().parse::<f64>().ok()?;
             let lon = it.next()?.trim().parse::<f64>().ok()?;
-            Some(Ping { t, lat, lon })
+            let trip_id = it
+                .next()
+                .and_then(|h| String::from_utf8(hex::decode(h.trim()).ok()?).ok())
+                .unwrap_or_default();
+            Some(Ping {
+                t,
+                lat,
+                lon,
+                trip_id,
+            })
         })
         .collect()
 }
@@ -2352,7 +2434,7 @@ pub mod tests {
                     qs.iter().map(|q| q.0).sum::<f64>() / n,
                     qs.iter().map(|q| q.1).sum::<f64>() / n,
                 ));
-                Ping { t, lat, lon }
+                Ping::new(t, lat, lon)
             })
             .collect()
     }
@@ -2362,11 +2444,7 @@ pub mod tests {
         (0..secs / 20)
             .map(|i| {
                 let (lat, lon) = to_ll((at.0 + rng.gauss(4.0), at.1 + rng.gauss(4.0)));
-                Ping {
-                    t: t0 + i * 20,
-                    lat,
-                    lon,
-                }
+                Ping::new(t0 + i * 20, lat, lon)
             })
             .collect()
     }
@@ -2715,6 +2793,53 @@ pub mod tests {
     }
 
     #[test]
+    fn trip_ids_split_runs_the_way_control_center_does() {
+        let pl = Planar::new(ORIGIN.0, ORIGIN.1);
+        let p = Params::default();
+        let mut rng = Rng::new(9);
+        let leg: Vec<(f64, f64)> = vec![(0.0, 0.0), (3_000.0, 0.0)];
+        let mut a = drive(&leg, &mut rng, 0, 0.0);
+        for q in &mut a {
+            q.trip_id = "wb-1".into();
+        }
+        let t = a.last().unwrap().t;
+        // a long hole and a terminus dwell: still one trip when the id is the same
+        let mut dwell = stand((3_000.0, 0.0), &mut rng, t + 20, 600);
+        for q in &mut dwell {
+            q.trip_id = "wb-1".into();
+        }
+        let t = dwell.last().unwrap().t;
+        let mut hole = drive(&reversed(&leg), &mut rng, t + 1_200, 0.0);
+        for q in &mut hole {
+            q.trip_id = "wb-1".into();
+        }
+        let mut pings = a;
+        pings.extend(dwell);
+        pings.extend(hole);
+        let runs = split_runs(&clean(&pings, p.max_speed_kmh), &pl, &p);
+        assert_eq!(runs.len(), 1, "one trip_id stays one run");
+        assert!(runs[0].iter().all(|q| q.trip_id == "wb-1"));
+
+        let mut b = drive(&leg, &mut rng, pings.last().unwrap().t + 20, 0.0);
+        for q in &mut b {
+            q.trip_id = "wb-2".into();
+        }
+        pings.extend(b);
+        let runs = split_runs(&clean(&pings, p.max_speed_kmh), &pl, &p);
+        let ids: Vec<&str> = runs.iter().map(|r| r[0].trip_id.as_str()).collect();
+        assert_eq!(ids, vec!["wb-1", "wb-2"]);
+
+        let mut later = drive(&leg, &mut rng, pings.last().unwrap().t + 3 * 3600, 0.0);
+        for q in &mut later {
+            q.trip_id = "wb-2".into();
+        }
+        pings.extend(later);
+        let runs = split_runs(&clean(&pings, p.max_speed_kmh), &pl, &p);
+        let ids: Vec<&str> = runs.iter().map(|r| r[0].trip_id.as_str()).collect();
+        assert_eq!(ids, vec!["wb-1", "wb-2", "wb-2"]);
+    }
+
+    #[test]
     fn queries_are_bounded_and_pass_the_guard() {
         let stops = vec![
             Stop {
@@ -2785,17 +2910,28 @@ pub mod tests {
         assert_eq!(
             parse_packed("1757000000,13.1,80.2|1757000020,13.2,80.3|junk"),
             vec![
+                Ping::new(1_757_000_000, 13.1, 80.2),
+                Ping::new(1_757_000_020, 13.2, 80.3),
+            ]
+        );
+        assert_eq!(
+            parse_packed(&format!(
+                "1757000000,13.1,80.2,{}|1757000020,13.2,80.3,",
+                hex::encode("wb-1")
+            )),
+            vec![
                 Ping {
                     t: 1_757_000_000,
                     lat: 13.1,
-                    lon: 80.2
+                    lon: 80.2,
+                    trip_id: "wb-1".into(),
                 },
-                Ping {
-                    t: 1_757_000_020,
-                    lat: 13.2,
-                    lon: 80.3
-                },
+                Ping::new(1_757_000_020, 13.2, 80.3),
             ]
+        );
+        assert!(
+            q2.contains("trip_id") && q2.contains("GROUP BY device, t, tid"),
+            "{q2}"
         );
     }
 
