@@ -364,6 +364,9 @@ pub struct VehicleServiceTypeResponse {
     pub driver_id: Option<String>,
     pub conductor_id: Option<String>,
     pub eligible_pass_ids: Option<Vec<String>>,
+    /// Free-form tags sourced from assets/vehicle_service_sub_types.csv. Recognized values
+    /// consumed by the domain backend: "LF" (low floor), "EV" (electric vehicle),
+    /// "TRAVELLER" (tempo traveller vehicle, as opposed to a standard bus).
     pub service_sub_types: Option<Vec<String>>,
     #[serde(rename = "seatLayoutId")]
     pub seat_layout_id: Option<String>,
@@ -384,6 +387,9 @@ pub struct VehicleServiceTypeResponse {
 pub struct VehicleMetadataResponse {
     #[serde(rename = "serviceType")]
     pub service_type: Option<String>,
+    /// Free-form tags sourced from assets/vehicle_service_sub_types.csv. Recognized values
+    /// consumed by the domain backend: "LF" (low floor), "EV" (electric vehicle),
+    /// "TRAVELLER" (tempo traveller vehicle, as opposed to a standard bus).
     #[serde(rename = "serviceSubTypes")]
     pub service_sub_types: Option<Vec<String>>,
     #[serde(rename = "busTagNumber")]
