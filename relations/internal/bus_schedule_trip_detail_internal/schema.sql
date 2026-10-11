@@ -26,5 +26,9 @@ CREATE TABLE public.bus_schedule_trip_detail_internal (
     sync_start_time bigint,
     gtfs_id character varying(100) DEFAULT 'chennai_bus'::character varying NOT NULL,
     is_completed boolean DEFAULT false,
-    status text DEFAULT 'active'::text
+    status text DEFAULT 'active'::text,
+    default_variant_id text,
+    eta_override_variant_id text,
+    eta_override_effective_from timestamp(6) with time zone,
+    eta_override_effective_untill timestamp(6) with time zone
 );

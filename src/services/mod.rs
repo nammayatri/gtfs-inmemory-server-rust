@@ -4,6 +4,7 @@ pub mod clickhouse_reader;
 pub mod db_employee_reader;
 pub mod db_vehicle_reader;
 pub mod db_vehicle_reader_internal;
+pub mod eta_variants;
 pub mod field_generator;
 pub mod fleet_operator;
 pub mod gtfs_db_source;
