@@ -185,6 +185,74 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route(
                         "/waybill/details/v2",
                         web::post().to(update_waybill_details),
+                    )
+                    // transitV2: trip groups / trips / repeat rules / runs
+                    .route("/v2/trip-groups", web::get().to(v2_list_trip_groups))
+                    .route(
+                        "/v2/trip-groups/upsert",
+                        web::post().to(v2_upsert_trip_group),
+                    )
+                    .route("/v2/trip-groups/{id}", web::get().to(v2_get_trip_group))
+                    .route(
+                        "/v2/trip-groups/{id}/delete",
+                        web::post().to(v2_delete_trip_group),
+                    )
+                    .route("/v2/trip-groups/{id}/trips", web::get().to(v2_list_trips))
+                    .route(
+                        "/v2/trip-groups/{id}/trips/upsert",
+                        web::post().to(v2_upsert_trips),
+                    )
+                    .route("/v2/trips/{id}/delete", web::post().to(v2_delete_trip))
+                    .route("/v2/duty-repeats", web::get().to(v2_list_duty_repeats))
+                    .route(
+                        "/v2/duty-repeats/upsert",
+                        web::post().to(v2_upsert_duty_repeat),
+                    )
+                    .route(
+                        "/v2/duty-repeats/preview",
+                        web::post().to(v2_preview_duty_repeats),
+                    )
+                    .route(
+                        "/v2/duty-repeats/generate",
+                        web::post().to(v2_generate_duty_repeats),
+                    )
+                    .route(
+                        "/v2/duty-repeats/{id}/delete",
+                        web::post().to(v2_delete_duty_repeat),
+                    )
+                    .route("/v2/duty-groups", web::get().to(v2_list_duty_groups))
+                    .route(
+                        "/v2/duty-groups/create",
+                        web::post().to(v2_create_duty_group),
+                    )
+                    .route("/v2/duty-groups/{id}", web::get().to(v2_get_duty_group))
+                    .route("/v2/duty-groups/{id}/duties", web::get().to(v2_list_duties))
+                    .route("/v2/duty-groups/{id}/logs", web::get().to(v2_get_run_logs))
+                    .route(
+                        "/v2/duty-groups/{id}/vehicle",
+                        web::post().to(v2_update_run_vehicle),
+                    )
+                    .route(
+                        "/v2/duty-groups/{id}/crew",
+                        web::post().to(v2_update_run_crew),
+                    )
+                    .route(
+                        "/v2/duty-groups/{id}/active",
+                        web::post().to(v2_set_run_active),
+                    )
+                    .route(
+                        "/v2/duty-groups/{id}/delete",
+                        web::post().to(v2_delete_duty_group),
+                    )
+                    .route("/v2/duties/{id}/crew", web::post().to(v2_update_trip_crew))
+                    .route("/v2/duties/{id}/delete", web::post().to(v2_delete_duty))
+                    .route(
+                        "/v2/generation-failures",
+                        web::get().to(v2_list_generation_failures),
+                    )
+                    .route(
+                        "/v2/generation-failures/{id}/resolve",
+                        web::post().to(v2_resolve_generation_failure),
                     ),
             )
             .service(
@@ -206,7 +274,14 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route(
                         "/employee/register",
                         web::post().to(fleet_operator_employee_register),
-                    ),
+                    )
+                    // transitV2
+                    .route("/v2/tripAction", web::post().to(v2_fleet_trip_action))
+                    .route(
+                        "/v2/currentOperation",
+                        web::post().to(v2_fleet_current_operation),
+                    )
+                    .route("/v2/activeTrip", web::post().to(v2_fleet_active_trip)),
             )
             .route(
                 "/bus-route-schedule/{gtfs_id}/{route_id}",
@@ -1925,6 +2000,7 @@ fn reconcile_active_trip_by_schedule(
                 trip_order: response.trip_number,
                 db_start_time: response.db_start_time.clone(),
                 db_end_time: response.db_end_time.clone(),
+                duty_trip_id: response.duty_trip_id.clone(),
             };
             all_trips.insert(0, current_trip);
         }
@@ -1957,6 +2033,7 @@ fn reconcile_active_trip_by_schedule(
                 trip_order: response.trip_number,
                 db_start_time: response.db_start_time.clone(),
                 db_end_time: response.db_end_time.clone(),
+                duty_trip_id: response.duty_trip_id.clone(),
             };
             all_trips.insert(0, synthetic_first_trip);
         }
@@ -2099,6 +2176,7 @@ fn reconcile_active_trip_by_schedule(
     // Update response
     response.is_active_trip = true;
     response.trip_number = active_trip.trip_number;
+    response.duty_trip_id = active_trip.duty_trip_id.clone();
     response.route_id = Some(active_trip.route_id.clone());
     response.route_number = active_trip.route_number.clone();
     response.db_start_time = active_trip.db_start_time.clone();
@@ -2208,6 +2286,7 @@ async fn get_service_type_by_vehicle_impl(
                     trip_order: cached_data.trip_order,
                     db_start_time: cached_data.db_start_time.clone(),
                     db_end_time: cached_data.db_end_time.clone(),
+                    duty_trip_id: None,
                 }]);
             }
 
@@ -2253,6 +2332,7 @@ async fn get_service_type_by_vehicle_impl(
                 schedule_based_active_trip: None,
                 db_start_time: cached_data.db_start_time.clone(),
                 db_end_time: cached_data.db_end_time.clone(),
+                duty_trip_id: None,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -2302,6 +2382,7 @@ async fn get_service_type_by_vehicle_impl(
                     schedule_based_active_trip: None,
                     db_start_time: None,
                     db_end_time: None,
+                    duty_trip_id: None,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -2424,6 +2505,7 @@ async fn get_service_type_by_vehicle_impl(
             schedule_based_active_trip: None,
             db_start_time: vehicle_data.db_start_time.clone(),
             db_end_time: vehicle_data.db_end_time.clone(),
+            duty_trip_id: vehicle_data.duty_trip_id.clone(),
         };
 
         // Apply schedule-based reconciliation if enabled in config
@@ -2470,10 +2552,12 @@ async fn get_service_type_by_vehicle_impl(
                                 trip_order: response.trip_number,
                                 db_start_time: response.db_start_time.clone(),
                                 db_end_time: response.db_end_time.clone(),
+                                duty_trip_id: response.duty_trip_id.clone(),
                             };
 
                             // Update response to use trip 1
                             response.trip_number = trip_1.trip_number;
+                            response.duty_trip_id = trip_1.duty_trip_id.clone();
                             response.route_id = Some(trip_1.route_id.clone());
                             response.route_number = trip_1.route_number.clone();
                             response.db_start_time = trip_1.db_start_time.clone();
@@ -2622,6 +2706,7 @@ async fn get_service_type_by_vehicle_impl(
         schedule_based_active_trip: None,
         db_start_time: vehicle_data.db_start_time.clone(),
         db_end_time: vehicle_data.db_end_time.clone(),
+        duty_trip_id: vehicle_data.duty_trip_id.clone(),
     };
 
     // Apply schedule-based reconciliation if enabled in config
@@ -2661,10 +2746,12 @@ async fn get_service_type_by_vehicle_impl(
                             trip_order: response.trip_number,
                             db_start_time: response.db_start_time.clone(),
                             db_end_time: response.db_end_time.clone(),
+                            duty_trip_id: response.duty_trip_id.clone(),
                         };
 
                         // Update response to use trip 1
                         response.trip_number = trip_1.trip_number;
+                        response.duty_trip_id = trip_1.duty_trip_id.clone();
                         response.route_id = Some(trip_1.route_id.clone());
                         response.route_number = trip_1.route_number.clone();
                         response.db_start_time = trip_1.db_start_time.clone();
@@ -2897,6 +2984,12 @@ pub async fn get_trip_data(
     Ok(HttpResponse::Ok().json(trip_data))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WaybillMetadataQuery {
+    #[serde(rename = "tripNumber")]
+    trip_number: Option<i32>,
+}
+
 #[utoipa::path(
     get,
     path = "/waybill/{gtfs_id}/metadata/{waybill_no}",
@@ -2904,18 +2997,20 @@ pub async fn get_trip_data(
     params(
         ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
         ("waybill_no" = String, Path, description = "Waybill number"),
+        ("tripNumber" = Option<i32>, Query, description = "transitV2: crew of this trip of the run"),
     ),
     responses((status = 200, description = "Waybill metadata with driver details", body = crate::models::WaybillMetadataResponse))
 )]
 pub async fn get_waybill_metadata(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    query: Query<WaybillMetadataQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, waybill_no) = path.into_inner();
 
     let mut waybill_metadata = app_state
         .db_vehicle_reader_internal
-        .get_waybill_metadata(&gtfs_id, &waybill_no)
+        .get_waybill_metadata(&gtfs_id, &waybill_no, query.trip_number)
         .await?;
 
     waybill_metadata.bus_tag_number =
@@ -3196,6 +3291,7 @@ pub async fn get_bus_trip_schedule(
             is_active_trip: row.is_active_trip,
             waybill_no: Some(row.waybill_no),
             is_completed: row.is_completed,
+            duty_trip_id: row.duty_trip_id.clone(),
         });
     }
 
@@ -3325,6 +3421,7 @@ pub async fn get_bus_route_schedule(
                 },
                 waybill_no: Some(row.waybill_no),
                 is_completed: row.is_completed,
+                duty_trip_id: row.duty_trip_id.clone(),
             });
         }
 
@@ -3367,6 +3464,7 @@ pub async fn get_bus_route_schedule(
                     trip_number: None,
                     is_active_trip: None,
                     is_completed: None,
+                    duty_trip_id: None,
                 })
                 .collect()
         } else {
@@ -3463,6 +3561,7 @@ pub async fn get_bus_route_schedule(
             is_active_trip: None,
             waybill_no: None,
             is_completed: None,
+            duty_trip_id: None,
         });
     }
 
@@ -5411,4 +5510,711 @@ async fn metro_graph_info(
         "routes": route_info,
         "availableStops": graph.nodes.len(),
     })))
+}
+
+// ─── transitV2 handlers ──────────────────────────────────────────────────────
+// Service: services/operator_v2.rs, services/fleet_operator_v2.rs.
+// Plan: scripts/plans/gims/transitV2/README.md. Callers set `x-operator-id` (optional, scopes
+// every read/write) and `x-actor-person-id` (required on writes).
+
+use crate::services::operator_v2 as v2;
+
+fn v2_caller(req: &actix_web::HttpRequest) -> v2::Caller {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    v2::Caller {
+        operator_id: header("x-operator-id"),
+        actor_person_id: header("x-actor-person-id"),
+    }
+}
+
+fn v2_ok() -> HttpResponse {
+    HttpResponse::Ok().json(json!({ "success": true }))
+}
+
+/// `daysAhead` from today (IST), or an explicit `from`..`to`.
+fn v2_generate_range(body: &v2::GenerateReq) -> AppResult<(chrono::NaiveDate, chrono::NaiveDate)> {
+    match (body.days_ahead, body.from, body.to) {
+        (Some(days), _, _) => {
+            if days < 0 {
+                return Err(AppError::BadRequest("daysAhead must be >= 0".to_string()));
+            }
+            let today = v2::today_ist();
+            Ok((today, today + chrono::Duration::days(days)))
+        }
+        (None, Some(from), Some(to)) => Ok((from, to)),
+        _ => Err(AppError::BadRequest(
+            "provide daysAhead, or from and to".to_string(),
+        )),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/trip-groups",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("limit" = Option<i64>, Query), ("offset" = Option<i64>, Query),
+           ("shift" = Option<String>, Query), ("depotId" = Option<String>, Query),
+           ("zone" = Option<String>, Query), ("tripType" = Option<String>, Query),
+           ("code" = Option<String>, Query, description = "contains, case-insensitive"),
+           ("search" = Option<String>, Query, description = "partial text over code, zone, description, repeat configs' bus / driver / conductor"),
+           ("vehicleNumber" = Option<String>, Query, description = "a repeat config's default bus"),
+           ("driverTokenNumber" = Option<String>, Query, description = "a repeat config's default driver"),
+           ("conductorTokenNumber" = Option<String>, Query, description = "a repeat config's default conductor")),
+    responses((status = 200, description = "{items: [TripGroup], total}"))
+)]
+pub async fn v2_list_trip_groups(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    query: Query<v2::TripGroupListQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .list_trip_groups(&gtfs_id, &v2_caller(&req), query.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/trip-groups/upsert",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::UpsertTripGroupReq,
+    responses((status = 200, body = v2::TripGroup))
+)]
+pub async fn v2_upsert_trip_group(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::UpsertTripGroupReq>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .upsert_trip_group(&gtfs_id, &v2_caller(&req), body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/trip-groups/{id}",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = v2::TripGroup))
+)]
+pub async fn v2_get_trip_group(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .get_trip_group(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/trip-groups/{id}/delete",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, description = "Soft-deleted with its trips and repeat rules"))
+)]
+pub async fn v2_delete_trip_group(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    app_state
+        .operator_v2
+        .delete_trip_group(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(v2_ok())
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/trip-groups/{id}/trips",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = [v2::Trip]))
+)]
+pub async fn v2_list_trips(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .list_trips(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/trip-groups/{id}/trips/upsert",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    request_body = v2::UpsertTripsReq,
+    responses((status = 200, body = [v2::Trip], description = "All trips of the group, offsets recomputed"))
+)]
+pub async fn v2_upsert_trips(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+    body: Json<v2::UpsertTripsReq>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .upsert_trips(&gtfs_id, &v2_caller(&req), &id, body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/trips/{id}/delete",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, description = "Soft-deleted; group offsets recomputed"))
+)]
+pub async fn v2_delete_trip(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    app_state
+        .operator_v2
+        .delete_trip(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(v2_ok())
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/duty-repeats",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("limit" = Option<i64>, Query), ("offset" = Option<i64>, Query),
+           ("tripGroupId" = Option<String>, Query),
+           ("code" = Option<String>, Query, description = "trip group code contains, case-insensitive"),
+           ("search" = Option<String>, Query, description = "partial text over trip group code, bus, driver, conductor"),
+           ("vehicleNumber" = Option<String>, Query), ("driverTokenNumber" = Option<String>, Query),
+           ("conductorTokenNumber" = Option<String>, Query),
+           ("repeatStatus" = Option<String>, Query, description = "active | inactive")),
+    responses((status = 200, description = "{items: [DutyRepeat], total}"))
+)]
+pub async fn v2_list_duty_repeats(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    query: Query<v2::DutyRepeatListQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .list_duty_repeats(&gtfs_id, &v2_caller(&req), query.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-repeats/upsert",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::UpsertDutyRepeatReq,
+    responses((status = 200, body = v2::UpsertDutyRepeatResp))
+)]
+pub async fn v2_upsert_duty_repeat(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::UpsertDutyRepeatReq>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .upsert_duty_repeat(&gtfs_id, &v2_caller(&req), body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-repeats/{id}/delete",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, description = "Soft-deleted; generated runs stay"))
+)]
+pub async fn v2_delete_duty_repeat(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    app_state
+        .operator_v2
+        .delete_duty_repeat(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(v2_ok())
+}
+
+async fn v2_generate_impl(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    gtfs_id: String,
+    body: v2::GenerateReq,
+    dry_run: bool,
+) -> AppResult<HttpResponse> {
+    check_gtfs_id(&gtfs_id)?;
+    let (from, to) = v2_generate_range(&body)?;
+    let caller = v2_caller(&req);
+    // The k8s CronJob sends `x-generation-trigger: CRON`.
+    let trigger = match req
+        .headers()
+        .get("x-generation-trigger")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("CRON") => v2::GenerationTrigger::Cron,
+        _ => v2::GenerationTrigger::ManualGenerate,
+    };
+    let out = app_state
+        .operator_v2
+        .generate(
+            &gtfs_id,
+            from,
+            to,
+            body.duty_repeat_ids,
+            caller.operator_id,
+            dry_run,
+            trigger,
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-repeats/preview",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::GenerateReq,
+    responses((status = 200, body = [v2::GenerateEntry], description = "Dry run, no writes"))
+)]
+pub async fn v2_preview_duty_repeats(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::GenerateReq>,
+) -> AppResult<HttpResponse> {
+    v2_generate_impl(app_state, req, path.into_inner(), body.into_inner(), true).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-repeats/generate",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::GenerateReq,
+    responses((status = 200, body = [v2::GenerateEntry], description = "Idempotent; called by the k8s CronJob"))
+)]
+pub async fn v2_generate_duty_repeats(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::GenerateReq>,
+) -> AppResult<HttpResponse> {
+    v2_generate_impl(app_state, req, path.into_inner(), body.into_inner(), false).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("limit" = Option<i64>, Query), ("offset" = Option<i64>, Query),
+           ("code" = Option<String>, Query, description = "trip group code contains, or the exact waybill no"),
+           ("search" = Option<String>, Query, description = "partial text over waybill no, trip group code, bus, run / trip driver and conductor"),
+           ("operationDate" = Option<String>, Query), ("tripGroupId" = Option<String>, Query),
+           ("depotId" = Option<String>, Query), ("vehicleNumber" = Option<String>, Query),
+           ("driverTokenNumber" = Option<String>, Query), ("conductorTokenNumber" = Option<String>, Query),
+           ("isActive" = Option<bool>, Query)),
+    responses((status = 200, description = "{items: [DutyGroupListItem], total}"))
+)]
+pub async fn v2_list_duty_groups(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    query: Query<v2::DutyGroupListQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .list_duty_groups(&gtfs_id, &v2_caller(&req), query.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/create",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::CreateDutyGroupReq,
+    responses((status = 200, body = v2::DutyGroupDetail), (status = 409, description = "Overlap"))
+)]
+pub async fn v2_create_duty_group(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::CreateDutyGroupReq>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .create_duty_group(&gtfs_id, &v2_caller(&req), body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = v2::DutyGroupDetail))
+)]
+pub async fn v2_get_duty_group(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .get_duty_group_detail(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}/duties",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = [v2::Duty]))
+)]
+pub async fn v2_list_duties(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .list_duties(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}/logs",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = [v2::DutyEventLog]))
+)]
+pub async fn v2_get_run_logs(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .get_run_logs(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}/vehicle",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    request_body = v2::UpdateVehicleReq,
+    responses((status = 200, body = v2::DutyGroup), (status = 409, description = "Overlap"))
+)]
+pub async fn v2_update_run_vehicle(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+    body: Json<v2::UpdateVehicleReq>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .update_run_vehicle(
+            &gtfs_id,
+            &v2_caller(&req),
+            &id,
+            body.into_inner().vehicle_number,
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}/crew",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    request_body = v2::UpdateCrewReq,
+    responses((status = 200, body = v2::DutyGroupDetail), (status = 409, description = "Overlap"))
+)]
+pub async fn v2_update_run_crew(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+    body: Json<v2::UpdateCrewReq>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .update_run_crew(&gtfs_id, &v2_caller(&req), &id, body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}/active",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    request_body = v2::SetActiveReq,
+    responses((status = 200, body = v2::DutyGroup))
+)]
+pub async fn v2_set_run_active(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+    body: Json<v2::SetActiveReq>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .set_run_active(&gtfs_id, &v2_caller(&req), &id, body.is_active)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duty-groups/{id}/delete",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, description = "Soft-deleted (only before any trip starts)"))
+)]
+pub async fn v2_delete_duty_group(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    app_state
+        .operator_v2
+        .delete_duty_group(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(v2_ok())
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duties/{id}/crew",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    request_body = v2::UpdateCrewReq,
+    responses((status = 200, body = v2::Duty), (status = 409, description = "Overlap"))
+)]
+pub async fn v2_update_trip_crew(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+    body: Json<v2::UpdateCrewReq>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .update_trip_crew(&gtfs_id, &v2_caller(&req), &id, body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/duties/{id}/delete",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, description = "Soft-deleted (only before it starts)"))
+)]
+pub async fn v2_delete_duty(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    app_state
+        .operator_v2
+        .delete_duty(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(v2_ok())
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/operator/{gtfs_id}/v2/generation-failures",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("limit" = Option<i64>, Query), ("offset" = Option<i64>, Query),
+           ("resolved" = Option<bool>, Query)),
+    responses((status = 200, description = "{items: [DutyEventLog], total}"))
+)]
+pub async fn v2_list_generation_failures(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    query: Query<v2::FailureListQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .list_generation_failures(&gtfs_id, &v2_caller(&req), query.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/operator/{gtfs_id}/v2/generation-failures/{id}/resolve",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = v2::DutyEventLog))
+)]
+pub async fn v2_resolve_generation_failure(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, id) = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .operator_v2
+        .resolve_generation_failure(&gtfs_id, &v2_caller(&req), &id)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/v2/tripAction",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::TripActionV2Req,
+    responses((status = 200, body = v2::CurrentOperationV2, description = "The run after the action (same as currentOperation)"))
+)]
+pub async fn v2_fleet_trip_action(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::TripActionV2Req>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .fleet_operator_v2
+        .trip_action(&gtfs_id, &v2_caller(&req), body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/v2/currentOperation",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::AnchorReq,
+    responses((status = 200, body = v2::CurrentOperationV2))
+)]
+pub async fn v2_fleet_current_operation(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::AnchorReq>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .fleet_operator_v2
+        .current_operation(&gtfs_id, &v2_caller(&req), &body)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[utoipa::path(
+    post,
+    path = "/internal/fleet-operator/{gtfs_id}/v2/activeTrip",
+    tag = "Transit V2",
+    params(("gtfs_id" = String, Path)),
+    request_body = v2::AnchorReq,
+    responses((status = 200, body = v2::ActiveTripV2))
+)]
+pub async fn v2_fleet_active_trip(
+    app_state: Data<AppState>,
+    req: actix_web::HttpRequest,
+    path: Path<String>,
+    body: Json<v2::AnchorReq>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = path.into_inner();
+    check_gtfs_id(&gtfs_id)?;
+    let out = app_state
+        .fleet_operator_v2
+        .active_trip(&gtfs_id, &v2_caller(&req), &body)
+        .await?;
+    Ok(HttpResponse::Ok().json(out))
 }

@@ -729,6 +729,7 @@ impl DBVehicleReader {
                     db_end_time: None,
                     seat_layout_id: None,
                     waybill_status: None,
+                    duty_trip_id: None,
                 };
                 if let Some(schedule) = schedule_result {
                     vehicle_data_with_route_id.trip_number = schedule.trip_number;
@@ -791,6 +792,7 @@ impl DBVehicleReader {
                             db_end_time: None,
                             seat_layout_id: None,
                             waybill_status: None,
+                            duty_trip_id: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -817,6 +819,7 @@ impl DBVehicleReader {
                             db_end_time: None,
                             seat_layout_id: None,
                             waybill_status: None,
+                            duty_trip_id: None,
                         }
                     };
 
@@ -1568,6 +1571,7 @@ impl VehicleDataReader for DBVehicleReader {
                     db_end_time: None,
                     seat_layout_id: None,
                     waybill_status: Some(waybill_status),
+                    duty_trip_id: None,
                 };
 
                 // Set route and trip details from active schedule
@@ -1635,6 +1639,7 @@ impl VehicleDataReader for DBVehicleReader {
                             db_end_time: None,
                             seat_layout_id: None,
                             waybill_status: None,
+                            duty_trip_id: None,
                         }
                     } else {
                         VehicleDataWithRouteId {
@@ -1661,6 +1666,7 @@ impl VehicleDataReader for DBVehicleReader {
                             db_end_time: None,
                             seat_layout_id: None,
                             waybill_status: None,
+                            duty_trip_id: None,
                         }
                     };
 
@@ -1904,6 +1910,7 @@ impl VehicleDataReader for DBVehicleReader {
                 db_end_time: None,
                 seat_layout_id: None,
                 waybill_status: None,
+                duty_trip_id: None,
             };
 
             if let Some(schedule_no) = &vehicle_data_with_route_id.schedule_no {

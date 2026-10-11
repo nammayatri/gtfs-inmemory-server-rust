@@ -1,0 +1,60 @@
+# transitV2 repeat generation: keeps today .. today+7 of runs (duty_groups + duties) filled for
+# every active repeat rule. Idempotent, so reruns and overlaps with the run-finish trigger and
+# rule-save generation are harmless. One job per gtfs_id.
+#
+# Set before applying:
+#   - namespace
+#   - GIMS_URL: the in-cluster GIMS service (port 8000 by default)
+#   - GTFS_IDS: space-separated feeds with transitV2 runs
+#
+# See scripts/plans/gims/transitV2/README.md §8 and
+# POST /internal/operator/{gtfs_id}/v2/duty-repeats/generate.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gims-transit-v2-duty-generate
+  # namespace: <set me>
+spec:
+  schedule: "30 1 * * *"          # 01:30 every day
+  timeZone: "Asia/Kolkata"        # needs Kubernetes >= 1.27; otherwise the schedule is UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: generate
+              image: curlimages/curl:8.10.1
+              env:
+                - name: GIMS_URL
+                  value: "http://gtfs-inmemory-server:8000"   # <set me>
+                - name: GTFS_IDS
+                  value: "kolkata_bus"                         # <set me>
+                - name: DAYS_AHEAD
+                  value: "7"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  for gtfs in $GTFS_IDS; do
+                    echo "generating $gtfs"
+                    curl -fsS --max-time 300 -X POST \
+                      "$GIMS_URL/internal/operator/$gtfs/v2/duty-repeats/generate" \
+                      -H "Content-Type: application/json" \
+                      -H "x-generation-trigger: CRON" \
+                      -d "{\"daysAhead\": $DAYS_AHEAD}" \
+                      -o /dev/null -w "$gtfs: HTTP %{http_code}\n"
+                  done
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi

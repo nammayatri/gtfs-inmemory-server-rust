@@ -30,6 +30,12 @@ pub enum AppError {
 
     #[error("Invalid request: {0}")]
     BadRequest(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl ResponseError for AppError {
@@ -41,6 +47,8 @@ impl ResponseError for AppError {
             AppError::NotReady(msg) => msg.clone(),
             AppError::RateLimit => "Rate limit exceeded".to_string(),
             AppError::BadRequest(msg) => msg.clone(),
+            AppError::Conflict(msg) => msg.clone(),
+            AppError::Forbidden(msg) => msg.clone(),
             AppError::HttpRequest(err) => format!("HTTP request failed: {}", err),
             AppError::JsonSerialization(err) => format!("JSON serialization failed: {}", err),
             AppError::Configuration(err) => format!("Configuration error: {}", err),
@@ -53,6 +61,8 @@ impl ResponseError for AppError {
             AppError::NotReady(_) => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
             AppError::RateLimit => actix_web::http::StatusCode::TOO_MANY_REQUESTS,
             AppError::BadRequest(_) => actix_web::http::StatusCode::BAD_REQUEST,
+            AppError::Conflict(_) => actix_web::http::StatusCode::CONFLICT,
+            AppError::Forbidden(_) => actix_web::http::StatusCode::FORBIDDEN,
             AppError::HttpRequest(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             AppError::JsonSerialization(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Configuration(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,

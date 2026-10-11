@@ -340,6 +340,9 @@ pub struct AppState {
     pub db_employee_reader: Arc<dyn EmployeeReader>,
     pub operator_service: Arc<dyn OperatorService>,
     pub fleet_operator_service: Arc<dyn FleetOperatorService>,
+    /// transitV2 (trip groups / runs); NotReady without an internal DB.
+    pub operator_v2: crate::services::operator_v2::OperatorV2Service,
+    pub fleet_operator_v2: crate::services::fleet_operator_v2::FleetOperatorV2Service,
     pub trip_service: Arc<TripService>,
     pub chalo_vehicle_cache: Arc<ChaloVehicleCache>,
     pub osrtc_cache: Option<Arc<OsrtcStationCache>>,
@@ -531,6 +534,11 @@ impl AppState {
             )
         };
 
+        let operator_v2 =
+            crate::services::operator_v2::OperatorV2Service::new(operator_service.pool().cloned());
+        let fleet_operator_v2 =
+            crate::services::fleet_operator_v2::FleetOperatorV2Service::new(operator_v2.clone());
+
         gtfs_service.set_operator_service(operator_service.clone());
         gtfs_service.load_initial_data().await?;
 
@@ -587,6 +595,8 @@ impl AppState {
             db_employee_reader,
             operator_service,
             fleet_operator_service,
+            operator_v2,
+            fleet_operator_v2,
             trip_service,
             chalo_vehicle_cache,
             osrtc_cache,
