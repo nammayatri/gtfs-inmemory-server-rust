@@ -352,6 +352,53 @@ pub fn carry_over<S: AsRef<str>, T: AsRef<str>>(
     })
 }
 
+/// A profile laid over a stop list it was not made for, when no stop list it
+/// times is known: its first stop keeps its offsets, the last arrives when the
+/// profile's last stop did, and every stop between is placed by straight-line
+/// distance with the profile's median dwell, as [`carry_over`] places an
+/// inserted stop. So the run takes as long as before; every stop between is an
+/// estimate. `None` when either side has fewer than two stops.
+pub fn spread_over(old: &Offsets, new_positions: &[(f64, f64)]) -> Option<CarriedOver> {
+    let (k, n) = (old.len(), new_positions.len());
+    if k < 2 || n < 2 {
+        return None;
+    }
+    let inserted = n - 2;
+    let dwell = median_dwell(old);
+    let (from, to) = (old.departure[0], old.arrival[k - 1]);
+    let available = (to - from).max(0);
+    let wait = if dwell * inserted as i32 <= available {
+        dwell
+    } else {
+        0
+    };
+    let running = available - wait * inserted as i32;
+    let legs: Vec<f64> = new_positions
+        .windows(2)
+        .map(|w| haversine_m(w[0], w[1]))
+        .collect();
+    let total: f64 = legs.iter().sum();
+    let (mut arrival, mut departure) = (vec![old.arrival[0]; n], vec![old.departure[0]; n]);
+    let mut covered = 0.0;
+    for i in 1..n - 1 {
+        covered += legs[i - 1];
+        let share = if total > 0.0 {
+            covered / total
+        } else {
+            i as f64 / (n - 1) as f64
+        };
+        let at = from + (running as f64 * share).round() as i32 + wait * (i as i32 - 1);
+        arrival[i] = at;
+        departure[i] = at + wait;
+    }
+    arrival[n - 1] = to.max(from);
+    departure[n - 1] = to.max(from);
+    Some(CarriedOver {
+        offsets: Offsets { arrival, departure },
+        estimated: inserted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +550,42 @@ mod tests {
 
     fn at(lat: f64) -> (f64, f64) {
         (lat, 80.2)
+    }
+
+    #[test]
+    fn a_profile_spread_over_other_stops_keeps_its_running_time() {
+        // timed for four stops, 30 s dwells, 1000 s from first to last
+        let old = Offsets {
+            arrival: vec![0, 300, 700, 1000],
+            departure: vec![30, 330, 730, 1000],
+        };
+        // laid over five stops, the middle three a quarter of the way apart
+        let c = spread_over(
+            &old,
+            &[at(13.00), at(13.01), at(13.02), at(13.03), at(13.04)],
+        )
+        .unwrap();
+        assert_eq!(c.estimated, 3);
+        assert_eq!(
+            c.offsets,
+            Offsets {
+                // 970 s to cover after the first departure, 90 s of it dwells
+                arrival: vec![0, 250, 500, 750, 1000],
+                departure: vec![30, 280, 530, 780, 1000]
+            }
+        );
+        // two stops keep the ends and nothing else
+        let c = spread_over(&old, &[at(13.0), at(13.1)]).unwrap();
+        assert_eq!(c.offsets.arrival, vec![0, 1000]);
+        assert_eq!(c.offsets.departure, vec![30, 1000]);
+        assert_eq!(c.estimated, 0);
+        // nothing to spread from or over
+        assert!(spread_over(&old, &[at(13.0)]).is_none());
+        let one = Offsets {
+            arrival: vec![0],
+            departure: vec![0],
+        };
+        assert!(spread_over(&one, &[at(13.0), at(13.1)]).is_none());
     }
 
     #[test]

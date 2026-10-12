@@ -2618,7 +2618,22 @@ change, so a trip never runs to offsets that no longer line up:
 The change's validation then carries the warning `timing_interpolated` with the
 number of profiles and stops that were estimated, and its preview shows the new
 times. Trips on the default timing need nothing: the formula follows the list,
-which is exactly what chennai_bus does today when a stop is added.
+which is exactly what chennai_bus does today when a stop is added. A stage
+change that alters routes carries their profiles over the same way, and says so
+the same way.
+
+A profile that does not time the stops the pattern served was made for another
+list. chennai_bus's profiles were imported against each route's own rows
+(`gtfs_route_stop`), and once the feed was served from its stages (migration
+0027) most of them timed no list a route served: on master 2,957 of its 3,681
+routes, and every stage edit touching one was refused with
+`profile_length_mismatch`. Such a profile is now carried over from the route's
+own rows when it times them - the stops they share keep their imported times -
+and otherwise spread over the new stops: the first stop and the running time to
+the last are kept, and the stops between are placed by distance with the
+profile's median dwell. Either way the change carries the warning
+`timing_rebuilt` and the profile's `source` becomes `interpolated`.
+`profile_length_mismatch` is left only for a profile of a single stop.
 
 **Fare rules only for fare-stage feeds.** The stop-list rules about MTC's fare
 stages - `fare_stage_mismatch`, `first_stop_not_stage`,
@@ -4449,7 +4464,13 @@ Closing a row clears the flag on the stage in the same transaction; reopening
 puts it back. Neither is an edit of the stage: `gtfs_stage` has its own touch
 trigger (migration 0029) that keeps `row_version` when only `review` changes, so
 the order the screen asks for - fix the stage in a draft, then *Mark fixed*
-naming that draft - does not leave the draft conflicting with itself. A review
+naming that draft - does not leave the draft conflicting with itself. And a
+stage whose version has moved is a conflict only when the stage itself has: its
+name, description, whether it is deleted, or its stops (with their types and
+markers) differ from the snapshot the change was made against. So drafts made
+before 0029 was applied, whose stages Mark fixed or Reopen had bumped, submit
+without being made again; a stage somebody really changed under a draft still
+stops it. A review
 whose stages have all gone (merged or deleted) is still closed the same way, and
 a commit closes most of those itself (below).
 

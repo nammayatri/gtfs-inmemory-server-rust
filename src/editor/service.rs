@@ -1506,6 +1506,69 @@ async fn live_stage_version(
     .transpose()?)
 }
 
+/// What a stage is, for telling an edit of it from a version that moved
+/// without one: its name, description, whether it is deleted, and its stops in
+/// order with what a stage edit writes of each. Its review flag, version and
+/// timestamps, and the routes using it, are not the stage. `s` is a stage as
+/// [`super::stages::stage_snapshot`] shows it.
+fn stage_content(s: &Value) -> Value {
+    const ROW: [&str; 7] = [
+        "stop_id",
+        "stop_type",
+        "marker_id",
+        "marker_lat",
+        "marker_lon",
+        "marker_name",
+        "stop_name_override",
+    ];
+    let rows: Vec<Value> = s["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| ROW.iter().map(|k| (k.to_string(), r[*k].clone())).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "name": s["name"],
+        "description": s["description"],
+        "deleted": s["deleted"],
+        "rows": rows,
+    })
+}
+
+/// Whether the stage is still what the change's snapshot of it (`before`)
+/// shows ([`stage_content`]). A set is evaluated without its snapshots, so it
+/// is read here, for the few changes whose version moved. A change without a
+/// snapshot is never unchanged.
+async fn stage_unchanged(
+    conn: &mut PgConnection,
+    g: &str,
+    sk: &super::stages::StageKey,
+    c: &ChangeRow,
+) -> EditorResult<bool> {
+    let before: Value = if c.before.is_object() {
+        c.before.clone()
+    } else {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT before::text FROM gtfs_change WHERE change_id = $1",
+        )
+        .bind(c.change_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
+    };
+    if !before.is_object() || before["rows"].is_null() {
+        return Ok(false);
+    }
+    Ok(match super::stages::stage_snapshot(conn, g, sk).await? {
+        Some((live, _)) => stage_content(&live) == stage_content(&before),
+        None => false,
+    })
+}
+
 fn version_conflict(
     c: &ChangeRow,
     key: &str,
@@ -1612,7 +1675,15 @@ async fn conflict_for(
             // that is not there, so the key is read back before it is used.
             let sk = super::stages::key_of_change(conn, g, key).await;
             let live = live_stage_version(conn, g, &sk).await?;
-            out.extend(version_conflict(c, key, live, c.base_row_version));
+            if let Some(found) = version_conflict(c, key, live, c.base_row_version) {
+                // A version that moved while the stage stayed what the edit was
+                // made against is nothing to rebase onto. Before migration 0029
+                // closing or reopening its review moved it, and every draft
+                // fixing a stage and then marking it fixed was stuck.
+                if live.is_none() || !stage_unchanged(conn, g, &sk, c).await? {
+                    out.push(found);
+                }
+            }
         }
         // a temporary route's change is based on the list it names: the one it
         // switches to, or the one it edits. A list this set has already written
