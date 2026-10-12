@@ -2027,11 +2027,43 @@ async fn trip_references(
     Ok(out)
 }
 
+/// The served stops of a pattern in the route's own rows, `gtfs_route_stop`,
+/// whichever way the feed serves its routes. On a feed served from its stages
+/// these are the rows its profiles were imported against, which the stages need
+/// not match.
+async fn own_served_ids(
+    conn: &mut PgConnection,
+    g: &str,
+    route_id: &str,
+    pattern_key: i16,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT stop_id FROM gtfs_route_stop \
+         WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 AND stop_id IS NOT NULL \
+           AND stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
+         ORDER BY sequence",
+    )
+    .bind(g)
+    .bind(route_id)
+    .bind(pattern_key)
+    .fetch_all(&mut *conn)
+    .await
+}
+
 /// Carry every stored profile of a pattern over onto its new stop list, inside
 /// the change that altered it; `old_ids` are the pattern's served stops before.
 /// A warning `timing_interpolated` says how many profiles and stops had to be
 /// estimated. Trips on the default timing need nothing: the formula follows
 /// the list.
+///
+/// A profile that does not time `old_ids` was made for another list: a feed
+/// switched to its stages kept the profiles it imported against the route's
+/// own rows. It is carried over from those rows when it times them, and
+/// otherwise spread over the new stops keeping its running time
+/// ([`gtfs_timing::spread_over`]); a warning `timing_rebuilt` says so. Either
+/// is better than the profile it replaces, which times no list the route
+/// serves, and refusing the change left a stage edit blocked by timings the
+/// person making it never touched.
 pub(super) async fn carry_over_profiles(
     conn: &mut PgConnection,
     g: &str,
@@ -2058,8 +2090,30 @@ pub(super) async fn carry_over_profiles(
     }
     let positions: Vec<(f64, f64)> = stops.iter().map(|(_, p)| *p).collect();
     let (mut carried, mut estimated_profiles, mut estimated_stops) = (0, 0, 0);
+    let (mut from_own, mut spread) = (0, 0);
+    let mut own: Option<Vec<String>> = None;
     for p in &profiles {
-        let Some(c) = gtfs_timing::carry_over(old_ids, &p.offsets, &new_ids, &positions) else {
+        let mut rebuilt = false;
+        let mut c = gtfs_timing::carry_over(old_ids, &p.offsets, &new_ids, &positions);
+        if c.is_none() {
+            if own.is_none() {
+                own = Some(own_served_ids(conn, g, route_id, pattern_key).await?);
+            }
+            c = gtfs_timing::carry_over(
+                own.as_deref().unwrap_or_default(),
+                &p.offsets,
+                &new_ids,
+                &positions,
+            );
+            if c.is_some() {
+                from_own += 1;
+            } else {
+                c = gtfs_timing::spread_over(&p.offsets, &positions);
+                rebuilt = c.is_some();
+                spread += usize::from(rebuilt);
+            }
+        }
+        let Some(c) = c else {
             return Err(fail(
                 "profile_length_mismatch",
                 format!(
@@ -2079,7 +2133,7 @@ pub(super) async fn carry_over_profiles(
         .bind(p.profile_key)
         .bind(&c.offsets.arrival)
         .bind(&c.offsets.departure)
-        .bind(c.estimated > 0)
+        .bind(c.estimated > 0 || rebuilt)
         .bind(actor)
         .execute(&mut *conn)
         .await?;
@@ -2089,16 +2143,34 @@ pub(super) async fn carry_over_profiles(
             estimated_stops += c.estimated;
         }
     }
-    if estimated_stops == 0 {
-        return Ok(vec![]);
+    let mut out = Vec::new();
+    if from_own + spread > 0 {
+        let how = match (from_own, spread) {
+            (_, 0) => "carried over from the route's own stop list, which they time".to_string(),
+            (0, _) => "spread over the new stops, keeping each one's running time".to_string(),
+            _ => format!(
+                "{from_own} carried over from the route's own stop list, {spread} spread over the new stops keeping their running time"
+            ),
+        };
+        out.push(Finding::warning(
+            "timing_rebuilt",
+            format!("{route_id}|{pattern_key}"),
+            format!(
+                "pattern {pattern_key} of route {route_id}: {} timing profile(s) did not time the stops the route served (they were made for another stop list, such as the one imported before the feed was served from its stages); {how} - check the times in the preview",
+                from_own + spread
+            ),
+        ));
     }
-    Ok(vec![Finding::warning(
-        "timing_interpolated",
-        format!("{route_id}|{pattern_key}"),
-        format!(
-            "pattern {pattern_key} of route {route_id}: {carried} timing profile(s) carried over to the new stop list; in {estimated_profiles} of them {estimated_stops} stop time(s) are estimated - check the times in the preview"
-        ),
-    )])
+    if estimated_stops > 0 {
+        out.push(Finding::warning(
+            "timing_interpolated",
+            format!("{route_id}|{pattern_key}"),
+            format!(
+                "pattern {pattern_key} of route {route_id}: {carried} timing profile(s) carried over to the new stop list; in {estimated_profiles} of them {estimated_stops} stop time(s) are estimated - check the times in the preview"
+            ),
+        ));
+    }
+    Ok(out)
 }
 
 fn days_values(m: &Map<String, Value>) -> Option<Vec<bool>> {

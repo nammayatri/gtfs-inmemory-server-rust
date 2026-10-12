@@ -800,7 +800,8 @@ pub(super) async fn stage_update(
             f.key = format!("{route_id}|{}", f.key);
             route_findings.push(f);
         }
-        write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?;
+        // the route's timings follow it, and say so when they had to be estimated
+        route_findings.extend(write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?);
     }
     if blocks_apply(&route_findings) {
         return Err(ApplyError::Findings(route_findings));
@@ -988,7 +989,7 @@ pub(super) async fn stage_merge(
             f.key = format!("{route_id}|{}", f.key);
             findings.push(f);
         }
-        write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?;
+        findings.extend(write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?);
     }
     if blocks_apply(&findings) {
         return Err(ApplyError::Findings(findings));
@@ -1155,7 +1156,7 @@ pub(super) async fn stage_split(
             f.key = format!("{route_id}|{}", f.key);
             findings.push(f);
         }
-        write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?;
+        findings.extend(write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?);
     }
     if blocks_apply(&findings) {
         return Err(ApplyError::Findings(findings));
@@ -1337,7 +1338,7 @@ pub(super) async fn route_stages_replace(
     // a diverted route keeps serving its diversion: the normal list it is not
     // wearing changes underneath, and takes effect when it goes back to normal
     if worn.is_none() {
-        write_route_rows(conn, g, route_id, &rows, &live, actor).await?;
+        findings.extend(write_route_rows(conn, g, route_id, &rows, &live, actor).await?);
     }
     Ok(findings)
 }

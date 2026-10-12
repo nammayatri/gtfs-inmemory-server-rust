@@ -2168,3 +2168,262 @@ async fn a_stage_merged_away_leaves_the_queue_with_it() {
     exec(&pool, &clear_feed(GONE_FEED)).await;
     std::fs::remove_dir_all(dir).ok();
 }
+
+// ---------------------------------------------------------------- what master's drafts ran into
+
+const STALE_FEED: &str = "editor_stage_review_stale_feed";
+const STALE_ADMIN: &str = "admin@editor-stage-review-stale-test.invalid";
+const STALE_EDITOR: &str = "editor@editor-stage-review-stale-test.invalid";
+
+/// Two things that left master's chennai_bus drafts unable to submit:
+///
+///   - a stage's version moved with nothing about the stage changing (before
+///     migration 0029, by Mark fixed and Reopen). That is no conflict; a real
+///     change of the stage under the draft still is;
+///   - the feed's timing profiles were imported against each route's own
+///     stop list, and once the feed was served from its stages they timed no
+///     list the route served, so every stage edit touching such a route was
+///     refused. A profile is now carried over from the route's own list when
+///     it times that, and otherwise spread over the new stops.
+#[actix_web::test]
+async fn a_draft_is_not_stuck_on_a_moved_version_or_imported_timings() {
+    let Some(pool) = local_pool().await else {
+        return;
+    };
+    let mut seed = seed_for(STALE_FEED, &[STALE_ADMIN, STALE_EDITOR]);
+    // R1's own rows are MTC's list, A B C D; its stage serves A C D
+    seed.push(format!(
+        "DELETE FROM gtfs_route_stop WHERE gtfs_id = '{STALE_FEED}' AND route_id = 'R1'"
+    ));
+    seed.push(format!(
+        "INSERT INTO gtfs_route_stop (gtfs_id, route_id, sequence, stop_id, stop_type, stage_no, stage_name, provider_id) VALUES \
+         ('{STALE_FEED}', 'R1', 1, 'A', 'NEW STOP', 1, 'SAIDAPET', '11'), \
+         ('{STALE_FEED}', 'R1', 2, 'B', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11'), \
+         ('{STALE_FEED}', 'R1', 3, 'C', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11'), \
+         ('{STALE_FEED}', 'R1', 4, 'D', 'INTERMEDIATE STOP', 1, 'SAIDAPET', '11')"
+    ));
+    // profile 1 was imported for those four; profile 2 times five stops, a
+    // list nobody has any more
+    seed.push(format!(
+        "INSERT INTO gtfs_timing_profile (gtfs_id, route_id, pattern_key, profile_key, arrival_s, departure_s, source) VALUES \
+         ('{STALE_FEED}', 'R1', 1, 1, '{{0,100,200,300}}', '{{10,110,210,300}}', 'import'), \
+         ('{STALE_FEED}', 'R1', 1, 2, '{{0,100,200,300,400}}', '{{10,110,210,310,400}}', 'import')"
+    ));
+    exec(&pool, &seed).await;
+    let signer = TestSigner::generate("stage-review-stale-test-key");
+    let (st, dir) = state(&pool, &signer, STALE_ADMIN);
+    let app =
+        test::init_service(App::new().configure(|cfg| editor::configure(cfg, Some(Arc::new(st)))))
+            .await;
+    let mut admin = Caller {
+        signer: &signer,
+        email: STALE_ADMIN.into(),
+        session: None,
+    };
+    let mut ed = Caller {
+        signer: &signer,
+        email: STALE_EDITOR.into(),
+        session: None,
+    };
+    let (s, b, _) = call!(&app, admin.req("POST", "/auth/totp/enroll"));
+    assert_eq!(s, 200, "{b}");
+    let secret = crypto::base32_decode(b["secret_base32"].as_str().unwrap()).unwrap();
+    let (s, b, cookie) = call!(
+        &app,
+        admin
+            .req("POST", "/auth/totp/confirm")
+            .set_json(json!({"code": crypto::totp_now(&secret, now())}))
+    );
+    assert_eq!(s, 200, "{b}");
+    admin.session = cookie;
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("POST", "/users")
+            .set_json(json!({"email": STALE_EDITOR, "role": "editor"}))
+    );
+    assert!(s == 201 || code_of(&b) == "user_exists", "{s} {b}");
+    let (_, users, _) = call!(&app, admin.req("GET", "/users"));
+    let uid = users["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["email"] == STALE_EDITOR)
+        .unwrap()["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("PATCH", &format!("/users/{uid}"))
+            .set_json(json!({"role": "editor", "status": "active"}))
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = call!(
+        &app,
+        admin
+            .req("PUT", &format!("/users/{uid}/feeds/{STALE_FEED}"))
+            .set_json(json!({"role": "editor"}))
+    );
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = call!(&app, ed.req("POST", "/auth/totp/enroll"));
+    assert_eq!(s, 200, "{b}");
+    let secret = crypto::base32_decode(b["secret_base32"].as_str().unwrap()).unwrap();
+    let (s, b, cookie) = call!(
+        &app,
+        ed.req("POST", "/auth/totp/confirm")
+            .set_json(json!({"code": crypto::totp_now(&secret, now())}))
+    );
+    assert_eq!(s, 200, "{b}");
+    ed.session = cookie;
+
+    // ---- SAIDAPET runs on to E, in a draft
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/feeds/{STALE_FEED}/change-sets"))
+            .set_json(json!({"title": "SAIDAPET runs on to E"}))
+    );
+    assert_eq!(s, 201, "{b}");
+    let set = b["change_set_id"].as_str().unwrap().to_string();
+    let (s, b, _) = call!(
+        &app,
+        ed.req("POST", &format!("/change-sets/{set}/changes"))
+            .set_json(json!({
+                "entity": "stage", "op": "update", "entity_key": "stg_one|up",
+                "after": {"name": "SAIDAPET", "direction": "up", "rows": [
+                    {"stop_id": "A", "stop_type": "NEW STOP"},
+                    {"stop_id": "C", "stop_type": "INTERMEDIATE STOP"},
+                    {"stop_id": "D", "stop_type": "INTERMEDIATE STOP"},
+                    {"stop_id": "E", "stop_type": "INTERMEDIATE STOP"},
+                ]}
+            }))
+    );
+    assert_eq!(s, 201, "the imported timings do not refuse the edit: {b}");
+    assert!(errors(&b).is_empty(), "{b}");
+    let rebuilt: Vec<&Value> = b["validation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "timing_rebuilt")
+        .collect();
+    assert_eq!(rebuilt.len(), 1, "{b}");
+    let said = rebuilt[0]["message"].as_str().unwrap();
+    assert!(
+        said.contains("1 carried over from the route's own stop list")
+            && said.contains("1 spread over the new stops"),
+        "{said}"
+    );
+
+    let conflicts = |b: &Value| b["conflicts"].as_array().cloned().unwrap_or_default();
+    let set_now = || {
+        let path = format!("/change-sets/{set}");
+        let req = ed.req("GET", &path);
+        async { call!(&app, req) }
+    };
+
+    // ---- the stage's version moves and nothing else about it does
+    exec(
+        &pool,
+        &[format!(
+            "UPDATE gtfs_stage SET updated_by = 'a touch' \
+             WHERE gtfs_id = '{STALE_FEED}' AND stage_id = 'stg_one' AND direction = 'up'"
+        )],
+    )
+    .await;
+    let (s, b, _) = set_now().await;
+    assert_eq!(s, 200, "{b}");
+    assert!(conflicts(&b).is_empty(), "a moved version alone: {b}");
+    assert_eq!(b["can_submit"], true, "{b}");
+
+    // ---- somebody really renames it: that is a conflict
+    exec(
+        &pool,
+        &[format!(
+            "UPDATE gtfs_stage SET name = 'SAIDAPET WEST' \
+             WHERE gtfs_id = '{STALE_FEED}' AND stage_id = 'stg_one' AND direction = 'up'"
+        )],
+    )
+    .await;
+    let (_, b, _) = set_now().await;
+    let found = conflicts(&b);
+    assert_eq!(found.len(), 1, "{b}");
+    assert_eq!(found[0]["entity_key"], "stg_one|up");
+    assert_eq!(found[0]["reason"], "changed");
+    // ...and so is a stop of it changed under the draft
+    exec(
+        &pool,
+        &[
+            format!(
+                "UPDATE gtfs_stage SET name = 'SAIDAPET' \
+                 WHERE gtfs_id = '{STALE_FEED}' AND stage_id = 'stg_one' AND direction = 'up'"
+            ),
+            format!(
+                "UPDATE gtfs_stage_stop SET stop_type = 'HIDDEN STOP' \
+                 WHERE gtfs_id = '{STALE_FEED}' AND stage_id = 'stg_one' AND direction = 'up' AND stop_id = 'C'"
+            ),
+        ],
+    )
+    .await;
+    let (_, b, _) = set_now().await;
+    assert_eq!(conflicts(&b).len(), 1, "a stop changed under it: {b}");
+    // put back as it was, the draft applies again
+    exec(
+        &pool,
+        &[format!(
+            "UPDATE gtfs_stage_stop SET stop_type = 'INTERMEDIATE STOP' \
+             WHERE gtfs_id = '{STALE_FEED}' AND stage_id = 'stg_one' AND direction = 'up' AND stop_id = 'C'"
+        )],
+    )
+    .await;
+    let (_, b, _) = set_now().await;
+    assert!(conflicts(&b).is_empty(), "{b}");
+
+    // ---- it submits and commits, and the profiles follow the stage
+    let (s, b, _) = call!(&app, ed.req("POST", &format!("/change-sets/{set}/submit")));
+    assert_eq!(s, 200, "submit: {b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{set}/approve"))
+    );
+    assert_eq!(s, 200, "approve: {b}");
+    let (s, b, _) = call!(
+        &app,
+        admin.req("POST", &format!("/change-sets/{set}/commit"))
+    );
+    assert_eq!(s, 200, "commit: {b}");
+    let profile = |key: i32| {
+        let pool = pool.clone();
+        async move {
+            let r = sqlx::query(&format!(
+                "SELECT arrival_s, departure_s, source FROM gtfs_timing_profile \
+                 WHERE gtfs_id = '{STALE_FEED}' AND route_id = 'R1' AND pattern_key = 1 \
+                   AND profile_key = {key}"
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            (
+                r.get::<Vec<i32>, _>("arrival_s"),
+                r.get::<Vec<i32>, _>("departure_s"),
+                r.get::<String, _>("source"),
+            )
+        }
+    };
+    // carried from A B C D: A, C and D keep their times, E is estimated
+    let (arrival, departure, source) = profile(1).await;
+    assert_eq!(arrival.len(), 4);
+    assert_eq!(&arrival[..3], &[0, 200, 300]);
+    assert_eq!(&departure[..2], &[10, 210]);
+    assert!(arrival[3] > 300, "{arrival:?}");
+    assert_eq!(source, "interpolated");
+    // spread: the first stop and the 400 s run kept, the rest estimated
+    let (arrival, departure, source) = profile(2).await;
+    assert_eq!(arrival.len(), 4);
+    assert_eq!((arrival[0], departure[0], arrival[3]), (0, 10, 400));
+    assert!(arrival.windows(2).all(|w| w[0] <= w[1]), "{arrival:?}");
+    assert_eq!(source, "interpolated");
+
+    exec(&pool, &clear_feed(STALE_FEED)).await;
+    std::fs::remove_dir_all(dir).ok();
+}
