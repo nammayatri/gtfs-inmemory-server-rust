@@ -19,6 +19,7 @@ pub mod feed_io;
 pub mod feed_lock;
 pub mod geofence;
 pub mod gps_line;
+pub mod gps_polyline_sync;
 pub mod handlers;
 pub mod import_jobs;
 pub mod jwt;
@@ -60,6 +61,8 @@ pub struct EditorState {
     pub webhook_policy: crate::services::webhook::LivePolicy,
     /// Map lines from GPS (docs section 17); None when not configured.
     pub gps_line: Option<Arc<gps_line::GpsLine>>,
+    /// Weekly drafts of map lines from GPS (docs section 19); None when not configured.
+    pub gps_polyline_sync: Option<Arc<gps_polyline_sync::SyncSettings>>,
     /// For the OSRM calls.
     pub http: reqwest::Client,
     /// Release to Nandi targets master Nandi, not prod (dhall `is_master`).
@@ -104,6 +107,7 @@ impl EditorState {
             osrm_url: s.osrm_url,
             webhook_policy: s.webhook_policy,
             gps_line: None,
+            gps_polyline_sync: None,
             is_master: false,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -187,6 +191,23 @@ impl EditorState {
                         Err(e) => error!(
                             "GTFS editor GPS config is invalid: {e}; map lines from GPS disabled"
                         ),
+                    }
+                }
+                if let Some(c) = &config.gtfs_gps_polyline_sync {
+                    match gps_polyline_sync::SyncSettings::from_config(c) {
+                        Ok(_) if state.gps_line.is_none() => {
+                            error!("GPS polyline sync needs gtfs_gps; weekly sync disabled")
+                        }
+                        Ok(s) => {
+                            info!(
+                                "GTFS editor: GPS polyline sync for {:?}, run by the CronJob",
+                                s.feeds
+                            );
+                            state.gps_polyline_sync = Some(Arc::new(s));
+                        }
+                        Err(e) => {
+                            error!("GPS polyline sync config is invalid: {e}; weekly sync disabled")
+                        }
                     }
                 }
                 Some(Arc::new(state))
@@ -341,6 +362,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/polyline:gps",
                 web::post().to(h::polyline_gps),
+            )
+            .route(
+                "/feeds/{gtfs_id}/gps-polyline-sync",
+                web::post().to(h::gps_polyline_sync),
             )
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}/gps-trips",
