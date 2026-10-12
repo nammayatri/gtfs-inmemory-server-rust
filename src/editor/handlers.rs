@@ -8,6 +8,7 @@ use super::error::{EditorError, EditorResult};
 use super::feed_io;
 use super::feed_lock;
 use super::gps_line::{self, GpsFailure};
+use super::gps_polyline_sync;
 use super::import_jobs;
 use super::position_reviews;
 use super::proposals;
@@ -1251,8 +1252,39 @@ pub async fn polyline_gps(
     };
     match gps.suggest(st.osrm_url.as_deref(), asked).await {
         Ok(v) => ok(v),
-        Err(f) => Err(gps_error(f, &short_name)),
+        Err(f) => Err(gps_error(f, &route_id)),
     }
+}
+
+pub async fn gps_polyline_sync(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    auth::require_admin(&req, &st).await?;
+    let Some(settings) = st.gps_polyline_sync.clone() else {
+        return Err(EditorError::bad_request(
+            "gps_polyline_sync_off",
+            "the weekly GPS polyline sync is not configured",
+        ));
+    };
+    if !settings.feeds.contains(&g) {
+        return Err(EditorError::bad_request(
+            "gps_polyline_sync_feed",
+            format!("the weekly GPS polyline sync does not cover {g}"),
+        ));
+    }
+    let state = st.into_inner();
+    actix_web::rt::spawn(async move {
+        let run =
+            gps_polyline_sync::run_once(&state, &settings, &g, gps_polyline_sync::Trigger::Manual);
+        match run.await {
+            Ok(outcome) => tracing::info!("gps polyline sync {g} (manual): {outcome:?}"),
+            Err(e) => tracing::error!("gps polyline sync {g} (manual): {e:?}"),
+        }
+    });
+    Ok(HttpResponse::Accepted().json(json!({"started": true})))
 }
 
 /// A map line from GPS as a background job (section 17.10): `202 {job_id}` at
@@ -1369,7 +1401,7 @@ pub async fn route_gps_trips(
     };
     match gps.trips_on(asked, date).await {
         Ok(v) => ok(v),
-        Err(f) => Err(gps_error(f, &short_name)),
+        Err(f) => Err(gps_error(f, &route_id)),
     }
 }
 
@@ -1389,12 +1421,12 @@ fn gps_for(st: &Data, g: &str) -> EditorResult<std::sync::Arc<gps_line::GpsLine>
 }
 
 /// What a reading of the GPS that gave nothing answers.
-fn gps_error(failure: GpsFailure, short_name: &str) -> EditorError {
+fn gps_error(failure: GpsFailure, route_id: &str) -> EditorError {
     match failure {
-        GpsFailure::NoRouteNumber => EditorError::new(
+        GpsFailure::BadRouteId => EditorError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "gps_no_route_number",
-            "this route has no route number to find its buses by",
+            "gps_bad_route_id",
+            "this route's id cannot be used to find its buses",
         ),
         GpsFailure::NotEnoughStops(n) => EditorError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1408,9 +1440,9 @@ fn gps_error(failure: GpsFailure, short_name: &str) -> EditorError {
             let need = counts["min_runs"].as_u64().unwrap_or(0);
             let days = counts["days_read"].as_u64().unwrap_or(0);
             let mut message = format!(
-                "in the last {days} day(s) {used} of {seen} bus runs labelled {} passed this route's \
+                "in the last {days} day(s) {used} of {seen} bus runs on route id {} passed its \
                  stops in order; a line needs at least {need}",
-                short_name.trim()
+                route_id.trim()
             );
             if counts["stopped"] == "budget" {
                 message.push_str(
