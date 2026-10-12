@@ -41,6 +41,7 @@ use gtfs_routes_service::editor::{
 };
 use gtfs_routes_service::services::clickhouse_reader::ClickHouseSettings;
 use gtfs_routes_service::services::osrm::{self, Planar};
+use hex;
 use regex::Regex;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -439,9 +440,14 @@ async fn fake_clickhouse(
         .captures(req.query_string())
         .map(|c| c[1].parse().unwrap())
         .unwrap_or(30);
-    let label = if body.contains("'t21g'") {
+    let label = if body.to_lowercase().contains("t21g")
+        || body.contains("R_FWD")
+        || body.contains("R_BACK")
+        || body.contains("R_VAR")
+        || body.contains("R_NOBODY")
+    {
         "t21g"
-    } else if body.contains("'slow'") {
+    } else if body.to_lowercase().contains("slow") || body.contains("R_SLOW") {
         // a cold read that takes 6 s: stopped at its limit, as ClickHouse does
         if allowed < 6 {
             actix_web::rt::time::sleep(Duration::from_secs(allowed)).await;
@@ -454,7 +460,7 @@ async fn fake_clickhouse(
                 ));
         }
         "slow"
-    } else if body.contains("'stuck'") {
+    } else if body.to_lowercase().contains("stuck") || body.contains("R_STUCK") {
         // a server that does not stop at its limit
         actix_web::rt::time::sleep(Duration::from_secs(8)).await;
         "stuck"
@@ -466,12 +472,51 @@ async fn fake_clickhouse(
         .captures_iter(&body)
         .map(|c| c[1].parse().unwrap())
         .collect();
-    if label.is_empty() || times.len() < 2 {
+    if times.len() < 2 {
         return HttpResponse::Ok().body("");
     }
     let (from, to) = (times[0], times[1]);
     let mut out = String::new();
-    if body.contains("arrayStringConcat") {
+    if body.contains("cityHash64") {
+        // Step 1: batch index query - return packed hex(route_id),hex(device),n,first,last|...
+        // dev-1/dev-2 run R_FWD (forward) and R_BACK (backward) alternately; dev-v runs R_VAR.
+        let (start, _) = ist_day(from);
+        assert!(to - from <= 86_400, "one day per index query: {body}");
+        let device_routes = [
+            ("dev-1", &["R_FWD", "R_BACK"] as &[&str]),
+            ("dev-2", &["R_FWD", "R_BACK"]),
+            ("dev-v", &["R_VAR"]),
+        ];
+        // Accumulate per (route, device) first/last/n from the pings of that day.
+        let mut entries: Vec<String> = Vec::new();
+        for (device, routes) in device_routes {
+            let pings: Vec<i64> = bus_pings(device, start)
+                .into_iter()
+                .map(|p| p.0)
+                .filter(|t| *t >= from && *t < to)
+                .collect();
+            if pings.is_empty() {
+                continue;
+            }
+            let (first, last) = (*pings.first().unwrap(), *pings.last().unwrap());
+            let n_per = (pings.len() / routes.len()).max(1) as u64;
+            for route in routes {
+                entries.push(format!(
+                    "{},{},{},{},{}",
+                    hex::encode(route),
+                    hex::encode(device),
+                    n_per,
+                    first,
+                    last
+                ));
+            }
+        }
+        if !entries.is_empty() {
+            // All packed into bucket 0, one row.
+            out.push_str(&format!("0\t{}\t{}\n", entries.len(), entries.join("|")));
+        }
+    } else if body.contains("arrayStringConcat") {
+        // Step 3: track query for specific devices - return per-hour rows of pings.
         let list = Regex::new(r"IN \(([^)]*)\)")
             .unwrap()
             .captures(&body)
@@ -489,7 +534,7 @@ async fn fake_clickhouse(
                     hours
                         .entry(t / 3600)
                         .or_default()
-                        .push(format!("{t},{la:.6},{lo:.6}"));
+                        .push(format!("{t},{la:.6},{lo:.6},"));
                 }
             }
             for (h, pts) in hours {
@@ -501,8 +546,8 @@ async fn fake_clickhouse(
                 ));
             }
         }
-    } else {
-        // step 1 asks about one day at a time
+    } else if !label.is_empty() {
+        // Old-style per-route index query (legacy path, kept for safety).
         let (start, _) = ist_day(from);
         assert!(to - from <= 86_400, "one day per bus-day query: {body}");
         for device in ["dev-1", "dev-2", "dev-v"] {
@@ -955,7 +1000,8 @@ async fn a_map_line_from_gps_end_to_end() {
     assert_eq!(b["error"]["details"]["bus_days"], 0);
     let (s, b, _, _) = call!(&app, gps_of("R_NONUM"));
     assert_eq!(s, 422, "{b}");
-    assert_eq!(code_of(&b), "gps_no_route_number");
+    assert_eq!(code_of(&b), "gps_not_enough_runs");
+    assert_eq!(b["error"]["details"]["bus_days"], 0);
 
     // ---- with change_set: the route as the draft has it
     let (s, set, _, _) = call!(
@@ -1189,7 +1235,7 @@ async fn a_map_line_from_gps_end_to_end() {
             r.body
         );
         assert!(
-            r.body.contains("routeNumber IN (")
+            r.body.contains("route_id IN (")
                 && (r.body.contains("GROUP BY device HAVING") || r.body.contains("deviceId IN (")),
             "entity bound: {}",
             r.body
