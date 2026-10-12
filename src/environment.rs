@@ -357,7 +357,6 @@ pub struct AppState {
     /// [`crate::services::service_hopper`].
     pub service_hopper: Arc<ArcSwap<HashMap<String, Arc<FeedHoppers>>>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
-    pub fleet_tag_list: Arc<HashMap<String, HashMap<String, String>>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
 }
 
@@ -597,7 +596,6 @@ impl AppState {
             metro_graphs,
             service_hopper,
             depot_manager_details,
-            fleet_tag_list: Arc::new(Self::load_fleet_tag_list().await?),
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
@@ -614,60 +612,6 @@ impl AppState {
     pub fn rebuild_service_hopper(&self) {
         let indexes = load_service_hopper(&self.config.preprocessed_data_dir);
         self.service_hopper.store(Arc::new(indexes));
-    }
-
-    async fn load_fleet_tag_list() -> Result<HashMap<String, HashMap<String, String>>> {
-        let file_path = "./assets/fleet_tag_list.csv";
-
-        let mut file = match File::open(file_path).await {
-            Ok(file) => file,
-            Err(_) => {
-                info!("fleet_tag_list.csv file not found, proceeding without fleet tag list data");
-                return Ok(HashMap::new());
-            }
-        };
-
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read fleet_tag_list.csv: {}", e))?;
-
-        let mut reader = ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(contents.as_bytes());
-
-        // gtfs_id -> vehicle_no -> tag_number
-        let mut fleet_map: HashMap<String, HashMap<String, String>> = HashMap::new();
-
-        for result in reader.records() {
-            match result {
-                Ok(record) => {
-                    // Expected columns: gtfs_id, vehicle_no, tag_number
-                    let (Some(gtfs_id), Some(vehicle_no), Some(tag_number)) =
-                        (record.get(0), record.get(1), record.get(2))
-                    else {
-                        continue;
-                    };
-
-                    if tag_number.is_empty() {
-                        continue;
-                    }
-
-                    let by_gtfs = fleet_map
-                        .entry(gtfs_id.trim().to_string())
-                        .or_insert_with(HashMap::new);
-
-                    by_gtfs.insert(vehicle_no.trim().to_string(), tag_number.trim().to_string());
-                }
-                Err(e) => {
-                    error!("Error parsing fleet_tag_list CSV row: {}", e);
-                }
-            }
-        }
-
-        info!("Loaded fleet tag list for {} GTFS feeds", fleet_map.len());
-
-        Ok(fleet_map)
     }
 
     async fn load_fleet_list() -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
