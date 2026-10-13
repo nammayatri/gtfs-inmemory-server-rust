@@ -511,7 +511,7 @@ pub async fn stop_detail(
 const ROUTE_COLS: &str =
     "route_id, short_name, long_name, route_type, agency_id, color, text_color, \
      encoded_polyline, polyline_source, service_type, provenance::text AS provenance, deleted, \
-     row_version, updated_at, updated_by, schedule_source, active";
+     row_version, updated_at, updated_by, schedule_source, active, route_tag";
 
 fn route_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -533,6 +533,8 @@ fn route_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "schedule_source": r.try_get::<String, _>("schedule_source")?,
         // false: kept, and answered by its id, but in no list GIMS gives
         "active": r.try_get::<bool, _>("active")?,
+        // the fare classification GIMS reports as routeTag (section 18.18)
+        "route_tag": r.try_get::<Option<String>, _>("route_tag")?,
     }))
 }
 
@@ -2719,10 +2721,15 @@ async fn route_update(
     let (has_schedule, schedule) = field(m, "schedule_source");
     // in GIMS's lists or out of them (section 18.17); never null
     let active = m.get("active").and_then(Value::as_bool);
+    // the fare classification (section 18.18): a blank tag clears it, same as
+    // a merged route silently losing its tag would -- see the "unconditional"
+    // comment on enrich_routes_from_route_internal.
+    let (has_tag, tag) = text_field(m, "route_tag");
     sqlx::query(
         "UPDATE gtfs_route SET \
             schedule_source = CASE WHEN $16 THEN $17 ELSE schedule_source END, \
             active = COALESCE($18, active), \
+            route_tag = CASE WHEN $19 THEN $20 ELSE route_tag END, \
             short_name = CASE WHEN $3 THEN $4 ELSE short_name END, \
             long_name = CASE WHEN $5 THEN $6 ELSE long_name END, \
             color = CASE WHEN $7 THEN upper($8) ELSE color END, \
@@ -2752,6 +2759,8 @@ async fn route_update(
     .bind(has_schedule)
     .bind(schedule)
     .bind(active)
+    .bind(has_tag)
+    .bind(tag)
     .execute(&mut *conn)
     .await?;
     route_gtfs_fields(conn, g, id, m, &before).await

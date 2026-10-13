@@ -1067,7 +1067,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const createChange = created ? createdChange("route", route.route_id) : null;
   const prior = existingChange("route", route.route_id);
   const base = createChange ? createChange.after : route;
-  const start = { short_name: base.short_name || "", long_name: base.long_name || "", color: base.color || "", active: base.active !== false, ...(prior && !createChange ? prior.after : {}) };
+  const start = { short_name: base.short_name || "", long_name: base.long_name || "", color: base.color || "", active: base.active !== false, route_tag: base.route_tag || "", ...(prior && !createChange ? prior.after : {}) };
   let proposed = prior && prior.after.encoded_polyline ? { encoded_polyline: prior.after.encoded_polyline, polyline_source: prior.after.polyline_source } : null;
   // GIMS keeps an inactive route out of its lists only for a feed it serves
   // from these tables (docs section 18.17): the nightly build has no such thing
@@ -1080,6 +1080,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
     color: h("input", { type: "text", id: "route-color", value: start.color || "", placeholder: "#0B6660", maxlength: "7" }),
     active: h("input", { type: "checkbox", id: "route-active", checked: start.active !== false, "aria-describedby": "route-active-hint",
       disabled: fromBuild && start.active !== false }),
+    route_tag: h("input", { type: "text", id: "route-tag", value: start.route_tag, placeholder: "e.g. METRO_FEEDER", "aria-describedby": "route-tag-hint" }),
   };
   const swatch = h("input", { type: "color", value: /^#[0-9a-f]{6}$/i.test(start.color) ? start.color : "#14252a", "aria-label": "Pick a colour" });
   swatch.addEventListener("input", () => { f.color.value = swatch.value.toUpperCase(); unsaved.touch(); });
@@ -1089,7 +1090,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const more = gtfsSection("routes.txt", ROUTE_GTFS, createChange ? createChange.after : route.gtfs, createChange ? null : prior && prior.after, "route-gtfs",
     "Fields of routes.txt the feed may carry: a description, a web page, the order apps list routes in, continuous stopping, its network, agency and type.");
   const history = undoScope("this route");
-  history.fields([[f.short_name, "the route number"], [f.long_name, "the route name"], [f.color, "the colour"], [f.active, "whether it is active"]]);
+  history.fields([[f.short_name, "the route number"], [f.long_name, "the route name"], [f.color, "the colour"], [f.active, "whether it is active"], [f.route_tag, "the fare tag"]]);
   // a colour picked from the swatch is one step, like a typed one
   swatch.addEventListener("change", () => f.color.dispatchEvent(new Event("change", { bubbles: true })));
   const setLine = (line, label) => {
@@ -1216,6 +1217,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
         if ((color || null) !== (route.color ? route.color.toUpperCase() : null)) after.color = color || null;
         // sent back too when the draft had changed it, so ticking it again undoes that
         if (f.active.checked !== (route.active !== false) || (prior && "active" in prior.after)) after.active = f.active.checked;
+        const tag = f.route_tag.value.trim();
+        if ((tag || null) !== (route.route_tag || null) || (prior && "route_tag" in prior.after)) after.route_tag = tag || null;
         if (proposed) Object.assign(after, lineChange(proposed));
         Object.assign(after, extra.after);
         if (!Object.keys(after).length) { clear(problems, h("p.notice", "Nothing has changed yet.")); return; }
@@ -1245,6 +1248,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
         h("p.hint", { id: "route-active-hint" }, fromBuild && start.active !== false
           ? "This feed's routes are served from the nightly build, which has no inactive routes. To make a route inactive, first switch the feed to these tables in Feed settings."
           : "Untick to make the route inactive. GIMS then leaves it out of every list: the route list, route search, the routes at a stop or between two stops, and the published GTFS zip. Asked for by its id, it still answers, with its stops and trips. Nothing else about it changes."),
+        h("label.field", { for: "route-tag" }, h("span", "Fare tag (optional)"), f.route_tag),
+        h("p.hint", { id: "route-tag-hint" }, "Free text, not a fixed list: it only has to match, letter for letter once trimmed, a tag already in the city's fare grid (frfs_gtfs_stage_fare). A route with no tag is priced at the city's catch-all fare. Leave blank to clear it."),
       ],
       history.buttons(),
       more.el,

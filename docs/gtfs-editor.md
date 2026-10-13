@@ -4130,6 +4130,61 @@ zips and the reloads. Unit tests cover `feed_io::published`,
 `GTFSRouteData::without_routes`, `isActive` and `schema_behind`.
 `dev/ui_smoke.mjs --route-active` runs the dashboard flow against the mock.
 
+### 18.18 A route's fare tag - `0031_route_tag.sql`
+
+nammayatri's FRFS fare lookup already prices a route by a tag it reads off
+`routeTag` in GIMS's response (`Domain.Types.Route.routeTag`, nammayatri
+PR #17065): a route with a tag is priced against that tag's row in
+`frfs_gtfs_stage_fare`, and a route with none (`routeTag` absent/null) gets the
+city's catch-all row. Until now that tag only ever came from
+`route_internal.route_tag`, a column of the legacy bus-schedule tables
+(`enrich_routes_from_route_internal`, `gtfs_service.rs`) - fine for a route the
+old operator tooling created, but a route built straight in the editor's
+tables (a metro feeder route, say) has no `route_internal` row to carry one.
+
+**The column.** `gtfs_route.route_tag text`, nullable, no default. It changes
+through a draft like any other route field: `route/update` with
+`{"route_tag": "METRO_FEEDER"}`, or `{"route_tag": null}` (or `""`, which
+normalises to null the same way) to clear it. Anything but a string or null is
+refused. It is reviewed, committed by someone else and audited like any other
+route field; the commit bumps the feed's version so GIMS picks it up on its
+next poll. The route detail and the routes list carry `route_tag`.
+
+**GIMS.** Read with `to_jsonb`, the same defensive trick `active` uses, so a
+database without `0031` serves every route untagged instead of failing to
+load the feed. `NandiRoutesRes.route_tag` is sent as `routeTag`, omitted
+(never `null`) when absent, so an untagged route's JSON is exactly what it
+was before this column existed.
+
+`gtfs_route` is primary; `route_internal` is the fallback.
+`enrich_routes_from_route_internal` still runs after the tables are read, but
+only fills in a route's tag from its `route_internal` row when the route does
+not already have one from `gtfs_route` - it never overwrites a tag the
+editor set. This is deliberately the opposite of the first cut: `route_internal`
+is the table being retired, so a route "migrates" the moment someone tags it
+once in the editor, with no `route_internal` row to touch or delete. A route
+the editor has never tagged still gets `route_internal`'s tag exactly as
+before this column existed - nothing regresses for a route nobody has
+touched yet. The one sharp edge: `gtfs_route.route_tag = NULL` cannot
+distinguish "never tagged, defer to route_internal" from "deliberately
+cleared, no tag" - a route still known to `route_internal` reverts to its
+legacy tag either way, until that row is gone too.
+
+A DB feed's route doesn't reach `routes_by_gtfs` straight from
+`gtfs_db_source.rs`, though - both the full rebuild and the single-feed poll
+reload (`rebuild_db_feed`) pass every route through `build_routes_by_gtfs`,
+which re-derives the public `NandiRoutesRes` from scratch for every build path
+(preprocessed and DB alike). First shipped, that function dropped `route_tag`
+on the floor there - hardcoded to `None` for every route, DB-backed included,
+because it was written for the preprocessed path, which never has one.
+`gtfs_db_source.rs` could compute the right value and it would still never
+reach a response. Fixed by carrying `route.route_tag` through instead of
+discarding it (a no-op for preprocessed input, which is `None` already).
+
+Tests: `tests/editor_route_tag_flow.rs` covers the draft (set, clear, reject a
+non-string), the commit and audit row, and the tag surfacing through
+`GET /routes/{g}` and `GET /route/{g}/{id}` once GIMS reloads the feed.
+
 
 ## 19. Stages: routes built from shared fare stages (2026-09-24)
 
