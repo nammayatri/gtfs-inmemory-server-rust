@@ -512,7 +512,7 @@ export async function showRoute(routeId, { preview } = {}) {
         h("p", drafted ? "You are looking at this route with your draft applied. It is not live: rows the draft adds, moves or changes are marked, and what is live is marked “live”." : "This is what is live now, without your draft."),
         drafted ? h("ul", [
           o.gone ? h("li", "The draft deletes this route.") : null,
-          o.changed.size ? h("li", `Changes its ${[...o.changed].filter((k) => k !== "polyline_source").map((k) => ({ short_name: "route number", long_name: "name", color: "colour", text_color: "text colour", encoded_polyline: "map line", active: "status (active or inactive)" }[k] || k)).join(", ")}.`) : null,
+          o.changed.size ? h("li", `Changes its ${[...o.changed].filter((k) => k !== "polyline_source").map((k) => ({ short_name: "route number", long_name: "name", color: "colour", text_color: "text colour", encoded_polyline: "map line", active: "status (active or inactive)", route_tag: "fare tag" }[k] || k)).join(", ")}.`) : null,
           o.stops.length ? h("li", `Replaces its stop list: ${plural(diff.filter((d) => d.kind === "added").length, "stop")} added, ${removed.length} removed, ${diff.filter((d) => d.kind === "moved" || d.kind === "changed").length} moved or changed.`) : null,
           stagesChanged ? h("li", `Changes its stages: ${plural(diff.filter((d) => d.kind === "added").length, "stop")} added, ${removed.length} removed, ${diff.filter((d) => d.kind === "moved" || d.kind === "changed").length} moved or changed.`) : null,
           !o.stops.length && !stagesChanged && diff.some((d) => d.kind !== "same") ? h("li", "A merge in the draft switches some of its rows to the stop that stays.") : null,
@@ -529,6 +529,7 @@ export async function showRoute(routeId, { preview } = {}) {
              drafted && o.changed.has("encoded_polyline") ? h("span.live-value", " ", h("span.live-tag", "live: "), live.encoded_polyline ? `saved (${live.polyline_source || "source unknown"}), dashed grey on the map` : "none") : null]
           : "None yet. The map joins the stops with straight dashed lines."),
         r.color ? [h("dt", "Colour"), h("dd", h("span", { style: `display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin-right:6px;background:${r.color}` }), field("color"))] : null,
+        r.route_tag || (drafted && o.changed.has("route_tag")) ? [h("dt", "Fare tag"), h("dd", field("route_tag") || "none")] : null,
         live ? [h("dt", "Trips"), h("dd", `${fmtCount(live.trip_count || 0)} live on ${plural((live.patterns || []).length || 1, "stop order")}`)] : null,
       ),
       live ? h("div.btn-row", h("a.btn.secondary.small", { href: `#/trips/${enc(routeId)}` }, "Trips and timing")) : null,
