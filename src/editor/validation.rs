@@ -1679,6 +1679,7 @@ pub fn check_payload(
                 "agency_id",
                 "route_type",
                 "active",
+                "route_tag",
             ];
             // the rest of routes.txt, by its GTFS names (section 18)
             allowed.extend(super::records::ROUTE_GTFS_FIELDS);
@@ -1710,6 +1711,7 @@ pub fn check_payload(
                 "text_color",
                 "encoded_polyline",
                 "polyline_source",
+                "route_tag",
             ] {
                 opt_string(m, k, what)?;
             }
@@ -2716,6 +2718,17 @@ mod tests {
                 "{bad}"
             );
         }
+        // the fare classification (section 18.18): a string, null to clear, nothing else
+        assert!(check_payload(
+            "route",
+            "update",
+            "R",
+            &json!({"route_tag": "METRO_FEEDER"})
+        )
+        .is_ok());
+        assert!(check_payload("route", "update", "R", &json!({"route_tag": null})).is_ok());
+        assert!(check_payload("route", "update", "R", &json!({"route_tag": 123})).is_err());
+        assert!(check_payload("route", "update", "R", &json!({"route_tag": true})).is_err());
         assert!(check_payload(
             "route_stops",
             "replace",
