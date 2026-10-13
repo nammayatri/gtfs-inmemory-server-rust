@@ -1,7 +1,7 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can, usesStages } from "./state.js";
-import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords, routeStatusTag } from "./util.js";
+import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords, routeStatusTag, decodePolyline, lineDeviation, deviationText } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
@@ -428,45 +428,63 @@ export async function showStop(stopId) {
 }
 
 // ------------------------------------------------------------------ route
+const ROUTE_FIELDS = ["short_name", "long_name", "color", "text_color", "encoded_polyline", "polyline_source"];
+
 // `preview`: true shows the route with the draft applied, false what is live;
-// left out, the draft is applied whenever it touches the route.
-export async function showRoute(routeId, { preview } = {}) {
+// left out, the draft is applied whenever it touches the route. `draftId`: a
+// change set other than the open draft (a link from its page), shown read-only.
+export async function showRoute(routeId, { preview, draftId } = {}) {
   map.endModes();
   map.clearRoute("gpsTrips");
   clear(panel(), h("section.section", h("p.empty", "Loading route…")));
-  const created = createdChange("route", routeId);
+  const viewed = draftId && !(state.draft && state.draft.change_set_id === draftId) ? draftId : null;
+  const created = viewed ? null : createdChange("route", routeId);
   let live = null;
   try {
     if (!created) live = await get(`feeds/${enc(state.feedId)}/routes/${enc(routeId)}`);
   } catch (e) {
-    return clear(panel(), h("section.section", h("a.crumb", { href: "#/" }, "Back to search"), h("p.notice.error", e.message)));
+    if (!viewed) return clear(panel(), h("section.section", h("a.crumb", { href: "#/" }, "Back to search"), h("p.notice.error", e.message)));
+  }
+  let viewedSet = null;
+  if (viewed) {
+    try { viewedSet = await get(`change-sets/${enc(viewed)}`); } catch { viewedSet = null; }
   }
   // the draft touches a route through its details, its stop list, a merge that
   // switches its rows to another stop, or a stop of it that moves or is renamed
-  const movedStops = live ? touchedStops(live.rows.filter((x) => x.stop_id)) : new Map();
-  const touched = !!state.draft && (!!created || routesTouched(routeId) || movedStops.size > 0);
+  const movedStops = live && !viewed ? touchedStops(live.rows.filter((x) => x.stop_id)) : new Map();
+  const touched = viewed ? !!viewedSet : !!state.draft && (!!created || routesTouched(routeId) || movedStops.size > 0);
   const usePreview = touched && (created || preview !== false);
+  const draftTitle = viewed ? (viewedSet && viewedSet.title) || "the draft" : state.draft ? state.draft.title : "";
+  const draftHref = `#/drafts/${enc(viewed || (state.draft && state.draft.change_set_id) || "")}`;
   let r = live;
   if (usePreview) {
     try {
-      r = await get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(routeId)}`);
+      r = await get(`change-sets/${enc(viewed || state.draft.change_set_id)}/preview/routes/${enc(routeId)}`);
     } catch (e) {
       if (!live) return clear(panel(), h("section.section", h("a.crumb", { href: "#/" }, "Back to search"), h("p.notice.error", e.message)));
       toast(e.message, "error");
     }
   }
+  // neither live nor in a draft that could be read: a route made in a draft gone since
+  if (!r) return clear(panel(), h("section.section", h("a.crumb", { href: "#/" }, "Back to search"), h("p.notice.error", "This route could not be loaded: it is not live, and its draft could not be read.")));
   const drafted = usePreview && r !== live;
   // the draft gives the route new stages, or changes a stage it uses
   const stagesChanged = !!state.draft && state.draft.changes.some((c) => (c.entity === "route_stages" && c.entity_key === routeId)
     || (c.entity === "stage" && ((c.before && c.before.routes) || []).some((x) => x.route_id === routeId))
     || (c.entity === "stage" && c.op === "split" && ((c.after && c.after.routes) || []).includes(routeId)));
-  const o = live ? applyToRoute(live) : { changed: new Set(), actions: [], stops: [], gone: null };
+  const o = live && !viewed ? applyToRoute(live)
+    : live && r !== live ? { changed: new Set(ROUTE_FIELDS.filter((k) => (live[k] || "") !== (r[k] || ""))), actions: [], stops: [], gone: null }
+      : { changed: new Set(), actions: [], stops: [], gone: null };
   nameHere(r.short_name || `Route ${r.route_id}`);
   map.clearFocus();
   map.showRoute(r);
   // under the drafted line, where the route runs live
   if (drafted && live && (o.changed.has("encoded_polyline") || o.stops.length || movedStops.size)) {
     map.showRoute(live, { layer: "proposal", fit: false, dashed: true, color: "#536569", weight: 3, markers: false });
+  }
+  let deviation = null;
+  if (drafted && live && o.changed.has("encoded_polyline") && live.encoded_polyline && r.encoded_polyline) {
+    try { deviation = lineDeviation(decodePolyline(live.encoded_polyline), decodePolyline(r.encoded_polyline)); } catch { deviation = null; }
   }
 
   const served = r.rows.filter((x) => x.stop_type !== "ROUTE CORRECTION");
@@ -507,9 +525,10 @@ export async function showRoute(routeId, { preview } = {}) {
         h("p", h("strong", `New route in your draft "${state.draft.title}".`)),
         h("p", "It is saved when the draft is approved by someone else and committed. Passengers see it only after the nightly GTFS build gives it trips from the MTC schedule.")) : null,
       touched && !created ? h("div.notice.draft.pending",
-        h("p", h("strong", drafted ? `Pending in draft “${state.draft.title}”, not live.` : `Your draft “${state.draft.title}” changes this route.`), " ",
-          h("a", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft")),
-        h("p", drafted ? "You are looking at this route with your draft applied. It is not live: rows the draft adds, moves or changes are marked, and what is live is marked “live”." : "This is what is live now, without your draft."),
+        h("p", h("strong", drafted ? `Pending in draft “${draftTitle}”, not live.` : `${viewed ? "Draft" : "Your draft"} “${draftTitle}” changes this route.`), " ",
+          h("a", { href: draftHref }, "Open the draft")),
+        viewed ? h("p", "This is not your open draft: shown read-only. To edit it, choose “Edit in this draft” on its page.") : null,
+        h("p", drafted ? "You are looking at this route with the draft applied. It is not live: rows the draft adds, moves or changes are marked, and what is live is marked “live”." : "This is what is live now, without your draft."),
         drafted ? h("ul", [
           o.gone ? h("li", "The draft deletes this route.") : null,
           o.changed.size ? h("li", `Changes its ${[...o.changed].filter((k) => k !== "polyline_source").map((k) => ({ short_name: "route number", long_name: "name", color: "colour", text_color: "text colour", encoded_polyline: "map line", active: "status (active or inactive)" }[k] || k)).join(", ")}.`) : null,
@@ -519,14 +538,15 @@ export async function showRoute(routeId, { preview } = {}) {
           movedStops.size ? h("li", `${plural(movedStops.size, "stop")} on it ${movedStops.size === 1 ? "is" : "are"} moved, renamed or removed in the draft.`) : null].filter(Boolean)) : null,
         h("div.btn-row",
           drafted
-            ? h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: false }) } }, "Show what is live now")
-            : h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: true }) } }, "Show it with my draft"))) : null,
+            ? h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: false, draftId }) } }, "Show what is live now")
+            : h("button.btn.secondary.small", { type: "button", on: { click: () => showRoute(routeId, { preview: true, draftId }) } }, viewed ? "Show it with the draft" : "Show it with my draft"))) : null,
       !created && notInFeed ? h("p.notice", "This route is not in the published GTFS feed yet, so passengers do not see it. It appears in the live apps once the nightly GTFS build gives it trips from the MTC schedule.") : null,
       !created ? inactiveNotice(r, drafted && o.changed.has("active") ? live : null) : null,
       h("dl.facts",
         h("dt", "Map line"), h("dd", r.encoded_polyline
           ? [drafted && o.changed.has("encoded_polyline") ? h("span.drafted-value", `New in the draft (${r.polyline_source || "source unknown"})`) : `Saved (${r.polyline_source || "source unknown"})`,
-             drafted && o.changed.has("encoded_polyline") ? h("span.live-value", " ", h("span.live-tag", "live: "), live.encoded_polyline ? `saved (${live.polyline_source || "source unknown"}), dashed grey on the map` : "none") : null]
+             drafted && o.changed.has("encoded_polyline") ? h("span.live-value", " ", h("span.live-tag", "live: "), live.encoded_polyline ? `saved (${live.polyline_source || "source unknown"}), dashed grey on the map` : "none") : null,
+             deviation ? h("div.hint", deviationText(deviation)) : null]
           : "None yet. The map joins the stops with straight dashed lines."),
         r.color ? [h("dt", "Colour"), h("dd", h("span", { style: `display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin-right:6px;background:${r.color}` }), field("color"))] : null,
         live ? [h("dt", "Trips"), h("dd", `${fmtCount(live.trip_count || 0)} live on ${plural((live.patterns || []).length || 1, "stop order")}`)] : null,
@@ -576,7 +596,7 @@ const clock = (t) => new Date(t * 1000).toLocaleTimeString("en-GB", { timeZone: 
 // the map each in its own colour and listed with its times. Reading only.
 function gpsTripsSection(route) {
   const gps = (state.feeds.find((f) => f.gtfs_id === state.feedId) || {}).gps;
-  if (!gps || !(route.short_name || "").trim()) return null;
+  if (!gps) return null;
   const date = h("input", { type: "date", id: "gps-trips-date", value: serviceDay(), min: serviceDay(gps.trips_days - 1), max: serviceDay() });
   const out = h("div", { "aria-live": "polite" });
   const names = new Map(route.rows.filter((r) => r.stop_id).map((r) => [r.stop_id, r.stop_name || r.stop_id]));
@@ -600,8 +620,8 @@ function gpsTripsSection(route) {
       ? h("p.notice.warning", "Reading stopped to answer in time, so some buses may be missing. Show the trips again to read the rest.") : null;
     if (!trips.length) {
       return clear(out, h("p.empty", { "data-gps-trips": "0" }, ev.buses
-        ? `${plural(ev.buses, "bus", "buses")} carried route number ${answer.route_number} near these stops on ${answer.date}, but none passed them in order.`
-        : `No bus carrying route number ${answer.route_number} was seen near these stops on ${answer.date}.`), partial);
+        ? `${plural(ev.buses, "bus", "buses")} ran route id ${answer.route_id} near these stops on ${answer.date}, but none passed them in order.`
+        : `No bus on route id ${answer.route_id} was seen near these stops on ${answer.date}.`), partial);
     }
     clear(out,
       h("p", { "data-gps-trips": String(trips.length) }, h("strong", `${plural(trips.length, "trip")} on ${answer.date}`),
@@ -624,7 +644,7 @@ function gpsTripsSection(route) {
     if (asking) return;
     asking = true;
     button.disabled = true;
-    clear(out, h("p.hint", `Reading where the buses of route ${route.short_name} drove on ${date.value}… this can take up to 25 seconds.`));
+    clear(out, h("p.hint", `Reading where the buses on route id ${route.route_id} drove on ${date.value}… this can take up to 25 seconds.`));
     try {
       answer = await get(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/gps-trips?date=${enc(date.value)}`);
       trips = answer.trips || [];
@@ -643,7 +663,7 @@ function gpsTripsSection(route) {
   const button = h("button.btn.secondary.small", { type: "button", id: "gps-trips-show", on: { click: show } }, "Show trips");
   return h("section.section.gps-trips",
     h("h2", "Trips from GPS"),
-    h("p.hint", `Where the buses carrying route number ${route.short_name} drove on a day: each run that passed this route's stops in order. The last ${gps.trips_days} days can be read.`),
+    h("p.hint", `Where the buses on trips assigned to route id ${route.route_id} drove on a day: each run that passed this route's stops in order. The last ${gps.trips_days} days can be read.`),
     h("div.field-row",
       h("label.field", { for: "gps-trips-date" }, h("span", "Day"), date),
       h("div.btn-row", button)),

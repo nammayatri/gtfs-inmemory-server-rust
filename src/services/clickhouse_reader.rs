@@ -308,6 +308,9 @@ impl ClickHouseReader {
                 // our share of a shared cluster stays modest
                 ("max_threads", "2"),
                 ("priority", "10"),
+                // answers gzipped (reqwest asks for and unpacks it): the same
+                // rows, a fraction of the bytes
+                ("enable_http_compression", "1"),
             ])
             .basic_auth(&self.settings.user, self.settings.password.as_deref())
             .timeout(Duration::from_secs(ceiling + HTTP_GRACE_S))
@@ -609,6 +612,11 @@ mod tests {
         assert!(first.contains("readonly=2"), "{first}");
         assert!(first.contains("max_execution_time=7"), "{first}");
         assert!(first.contains("max_threads=2"), "{first}");
+        assert!(first.contains("enable_http_compression=1"), "{first}");
+        assert!(
+            req.to_ascii_lowercase().contains("accept-encoding: gzip"),
+            "{req}"
+        );
         assert!(
             !first.contains("pw"),
             "the password is not in the URL: {first}"
