@@ -1412,7 +1412,10 @@ impl GTFSService {
                 end_point: route.end_point,
                 service_tier_type,
                 encoded_polyline: None,
-                route_tag: None,
+                // Preprocessed input never carries one (None here already); a DB
+                // feed's gtfs_route.route_tag (set by GtfsDbSource::load_feed)
+                // flows through instead of being discarded (section 18.18).
+                route_tag: route.route_tag,
                 is_active: route.is_active,
             };
             routes_by_gtfs
@@ -1428,6 +1431,12 @@ impl GTFSService {
     /// rebuilds routes calls this -- JSON build, snapshot, and both single-feed rebuilds -- so a
     /// field added here cannot go missing on one of them the way `service_tier_type` once did.
     ///
+    /// `route_tag` is the one field with two possible sources (section 18.18): `gtfs_route` is
+    /// primary -- a route the editor has given a tag keeps it, `route_internal` left unconsulted
+    /// -- and `route_internal` only fills in a route the editor has never tagged. That is on
+    /// purpose: `route_internal` is the one being retired, so a route "migrates" simply by being
+    /// tagged in the editor once, no `route_internal` row to touch or delete.
+    ///
     /// A failed lookup leaves existing values alone rather than clearing them: a stale tag is
     /// recoverable, every route silently losing its tag and repricing a city is not.
     async fn enrich_routes_from_route_internal(
@@ -1438,6 +1447,9 @@ impl GTFSService {
             return;
         };
         for (gtfs_id, routes) in routes_by_gtfs.iter_mut() {
+            // gtfs_route's own count, before route_internal gets a say (section 18.18):
+            // how many of this feed's routes are already on the primary source.
+            let already_tagged = routes.values().filter(|r| r.route_tag.is_some()).count();
             let rows = match op_svc.get_routes_list(gtfs_id).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1456,21 +1468,23 @@ impl GTFSService {
                 if row.encoded_polyline.is_some() {
                     route.encoded_polyline = row.encoded_polyline;
                 }
-                // Unconditional so a cleared column clears the tag; blank normalises to None.
-                route.route_tag = row
-                    .route_tag
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string);
-                if route.route_tag.is_some() {
-                    tagged += 1;
+                // gtfs_route already set one (built before this runs, section 18.18): leave it.
+                if route.route_tag.is_none() {
+                    route.route_tag = row
+                        .route_tag
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string);
+                    if route.route_tag.is_some() {
+                        tagged += 1;
+                    }
                 }
             }
-            if tagged > 0 {
+            if already_tagged > 0 || tagged > 0 {
                 info!(
-                    "enrich_routes_from_route_internal({}): {} routes tagged",
-                    gtfs_id, tagged
+                    "enrich_routes_from_route_internal({}): {} routes already tagged from gtfs_route (primary), {} filled in from route_internal (fallback)",
+                    gtfs_id, already_tagged, tagged
                 );
             }
         }
