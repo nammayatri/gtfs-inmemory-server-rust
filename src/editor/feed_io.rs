@@ -182,7 +182,7 @@ pub async fn load_model(
     g: &str,
 ) -> EditorResult<(FeedModel, Vec<Finding>)> {
     let feed = sqlx::query(
-        "SELECT headsign_source, default_run_s, default_dwell_s FROM gtfs_feed WHERE gtfs_id = $1",
+        "SELECT headsign_source, default_run_s, default_dwell_s, use_stages FROM gtfs_feed WHERE gtfs_id = $1",
     )
     .bind(g)
     .fetch_optional(&mut *conn)
@@ -196,6 +196,7 @@ pub async fn load_model(
     })?;
     let headsign_source =
         HeadsignSource::from_column(&feed.try_get::<String, _>("headsign_source")?);
+    let route_stops = super::stages::route_stops_source(feed.try_get("use_stages")?);
     let mut m = FeedModel {
         gtfs_id: g.to_string(),
         default_timing: (
@@ -263,20 +264,31 @@ pub async fn load_model(
         });
     }
 
+    // A row of a deleted route is left out here, against the routes just read,
+    // and not by a join with gtfs_route: an import reads its rows back in the
+    // transaction that wrote them, where the planner's statistics have not
+    // seen them and take the feed for one route of one row - and a nested loop
+    // over the two then reads every row of the feed once per route.
+    let live: HashSet<String> = m.routes.iter().map(|r| r.route_id.clone()).collect();
+
     // ---- stop orders: the served rows of every stop order of a live route
     let times_spec = file("stop_times.txt");
     let mut patterns: BTreeMap<(String, i16), Pattern> = BTreeMap::new();
     for r in rows(
         conn,
-        "SELECT to_jsonb(rs)::text FROM gtfs_route_stop_effective_all rs \
-         JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted \
-         WHERE rs.gtfs_id = $1 AND rs.stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
-         ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
+        &format!(
+            "SELECT to_jsonb(rs)::text FROM {route_stops} rs \
+             WHERE rs.gtfs_id = $1 AND rs.stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
+             ORDER BY rs.route_id, rs.pattern_key, rs.sequence"
+        ),
         g,
     )
     .await?
     {
         let route_id = text(&r, "route_id");
+        if !live.contains(&route_id) {
+            continue;
+        }
         let pattern_key = int(&r, "pattern_key").unwrap_or(1) as i16;
         let key = format!("{route_id} stop order {pattern_key}");
         let mut values = Row::new();
@@ -320,12 +332,14 @@ pub async fn load_model(
     for p in rows(
         conn,
         "SELECT to_jsonb(p)::text FROM gtfs_timing_profile p \
-         JOIN gtfs_route r ON r.gtfs_id = p.gtfs_id AND r.route_id = p.route_id AND NOT r.deleted \
          WHERE p.gtfs_id = $1 ORDER BY p.route_id, p.pattern_key, p.profile_key",
         g,
     )
     .await?
     {
+        if !live.contains(p["route_id"].as_str().unwrap_or_default()) {
+            continue;
+        }
         let ints = |k: &str| -> Vec<i32> {
             p[k].as_array()
                 .map(|a| a.iter().map(|x| x.as_i64().unwrap_or(0) as i32).collect())
@@ -360,12 +374,14 @@ pub async fn load_model(
     for t in rows(
         conn,
         "SELECT to_jsonb(t)::text FROM gtfs_trip t \
-         JOIN gtfs_route r ON r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted \
          WHERE t.gtfs_id = $1 ORDER BY t.sort_key, t.trip_id",
         g,
     )
     .await?
     {
+        if !live.contains(t["route_id"].as_str().unwrap_or_default()) {
+            continue;
+        }
         let trip_id = text(&t, "trip_id");
         let values = fields_of(trips_spec, &t, TRIP_COLUMNS, &trip_id, &mut findings);
         m.trips.push(Trip {

@@ -27,6 +27,7 @@
 //! preprocessor computes, the trips in `sort_key` order and the first one's
 //! times; and `/trip/{id}` is answered from the tables ([`DbTrips`]).
 
+use crate::editor::stages::route_stops_source;
 use crate::editor::validation::{is_stage_boundary, SERVED_STOP_TYPES};
 use crate::models::{GTFSStop, LatLong, NandiPatternDetails, NandiRoutesRes, NandiStop, NandiTrip};
 use crate::services::gtfs_timing::{self, Offsets};
@@ -763,7 +764,7 @@ impl GtfsDbSource {
         let started = std::time::Instant::now();
         let feed = sqlx::query(
             "SELECT version, agency_name, headsign_source, trips_source, default_run_s, default_dwell_s, \
-                    stops_scope \
+                    stops_scope, use_stages \
              FROM gtfs_feed WHERE gtfs_id = $1",
         )
         .bind(gtfs_id)
@@ -818,15 +819,19 @@ impl GtfsDbSource {
         .map_err(db_err)?;
 
         // a feed that takes its trips from the preprocessed data has one stop
-        // order a route, pattern 1; one whose trips are in the tables, all of them
-        let served = sqlx::query(
+        // order a route, pattern 1; one whose trips are in the tables, all of them.
+        // A deleted route's rows are left out below, against `route_rows`, not by
+        // a join with gtfs_route: a feed just seeded is read before its
+        // statistics count it, and a nested loop of the two then reads the
+        // whole feed once per route.
+        let route_stops = route_stops_source(feed.try_get("use_stages").map_err(db_err)?);
+        let served = sqlx::query(&format!(
             "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no,
                     rs.stop_headsign, rs.stop_sequence
-             FROM gtfs_route_stop_effective_all rs
-             JOIN gtfs_route r ON r.gtfs_id = rs.gtfs_id AND r.route_id = rs.route_id AND NOT r.deleted
+             FROM {route_stops} rs
              WHERE rs.gtfs_id = $1 AND (rs.pattern_key = 1 OR $3) AND rs.stop_type = ANY($2)
-             ORDER BY rs.route_id, rs.pattern_key, rs.sequence",
-        )
+             ORDER BY rs.route_id, rs.pattern_key, rs.sequence"
+        ))
         .bind(gtfs_id)
         .bind(&SERVED_STOP_TYPES[..])
         .bind(trips_source == TripsSource::Db)
@@ -882,8 +887,16 @@ impl GtfsDbSource {
         // (route_id, pattern) -> its served rows in sequence order; BTreeMap
         // keeps the output order independent of hashing.
         let mut rows_by_pattern: BTreeMap<(String, i16), Vec<ServedRow>> = BTreeMap::new();
+        let live = route_rows
+            .iter()
+            .map(|r| r.try_get::<String, _>("route_id"))
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(db_err)?;
         for r in &served {
             let route_id: String = r.try_get("route_id").map_err(db_err)?;
+            if !live.contains(&route_id) {
+                continue;
+            }
             let pattern: i16 = r.try_get("pattern_key").map_err(db_err)?;
             let stop_id: Option<String> = r.try_get("stop_id").map_err(db_err)?;
             let Some(stop_id) = stop_id else { continue };
@@ -1166,11 +1179,12 @@ impl GtfsDbSource {
             direction: Option<i16>,
             ref_s: i32,
         }
+        // every trip, a deleted route's too: they are looked up below by the
+        // live routes alone, and no join with gtfs_route (see `served`)
         let mut trips_by_route: HashMap<String, Vec<Trip>> = HashMap::new();
         for r in sqlx::query(
             "SELECT t.trip_id, t.route_id, t.pattern_key, t.profile_key, t.direction_id, t.ref_s
              FROM gtfs_trip t
-             JOIN gtfs_route r ON r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted
              WHERE t.gtfs_id = $1
              ORDER BY t.route_id, t.sort_key, t.trip_id",
         )
