@@ -131,6 +131,20 @@ pub async fn feed_uses_stages(conn: &mut PgConnection, g: &str) -> Result<bool, 
     )
 }
 
+/// Where a read of every stop order of a feed reads them: for a feed served
+/// from its stages, `gtfs_route_stop_effective_all`, which flattens them; for
+/// any other, `gtfs_route_stop` itself. The view holds the same rows for a feed
+/// without stages, but reading it makes that feed pay for the stage branch and
+/// an anti-join on every row, and hides the table's `(gtfs_id, route_id)` index
+/// from the planner. Stages are chennai_bus's; no other feed reads through them.
+pub fn route_stops_source(uses_stages: bool) -> &'static str {
+    if uses_stages {
+        "gtfs_route_stop_effective_all"
+    } else {
+        "gtfs_route_stop"
+    }
+}
+
 /// Refuse a stage change on a feed that does not use stages. Said once here so
 /// every stage write gives the same answer.
 pub(super) async fn require_stages(conn: &mut PgConnection, g: &str) -> Result<(), ApplyError> {

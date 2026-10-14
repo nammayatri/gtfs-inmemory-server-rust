@@ -4335,6 +4335,19 @@ They hold the same rows. The split is speed only: numbering the rows costs
 127 ms to answer "which routes call at this stop" on chennai_bus, against 6 ms
 counted; counting costs 1.4 s to read the whole feed, against 250 ms numbered.
 
+A read of the whole feed goes through `_all` only for a feed that uses stages
+(`stages::route_stops_source`). Any other feed's whole-feed read is
+`gtfs_route_stop` itself, which holds the same rows for it. Stages are
+chennai_bus's, and no other feed should pay for them: the view makes a feed
+without stages run the stage branch and an anti-join on every row, and hides
+the table's `(gtfs_id, route_id)` index. The same reads leave a deleted route
+out in code, against the routes they have just read, not by joining
+`gtfs_route`. An import reads its rows back in the transaction that wrote them,
+where the planner's statistics count none of them. It takes the feed for one
+route of one row, and a nested loop of the two then reads the whole feed once
+per route. A dry-run reload of an 89k-row feed sat in that read-back for over
+half an hour; the same zip now takes 18 s.
+
 The setting is changed in **Feed settings** and goes through a draft like any
 other `feed_config` change, because it changes what passengers are served. Off
 again, every route is its own stop list once more; the stages are kept, not

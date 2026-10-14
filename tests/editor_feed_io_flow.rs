@@ -23,9 +23,11 @@ use gtfs_routes_service::editor::{
     self, crypto, feed_io, jwt::testing::TestSigner, EditorSettings, EditorState,
 };
 use gtfs_routes_service::gtfs::{compare, read, spec, write};
+use gtfs_routes_service::services::gtfs_db_source::GtfsDbSource;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[path = "support/gtfs_fixture.rs"]
@@ -40,6 +42,7 @@ const NEW_FEED: &str = "editor_feed_io_new_test_feed";
 const BG_FEED: &str = "editor_feed_io_background_test_feed";
 const STAGE_FEED: &str = "editor_feed_io_fare_stage_test_feed";
 const RELOAD_FEED: &str = "editor_feed_io_reload_test_feed";
+const DELETED_ROUTE_FEED: &str = "editor_feed_io_deleted_route_test_feed";
 /// An admin of its own: two tests signing one account in at once race its
 /// last used code.
 const RELOAD_ADMIN: &str = "reload-admin@editor-feed-io-test.invalid";
@@ -380,6 +383,70 @@ async fn a_feed_is_seeded_from_its_zip_and_exports_it_back() {
     );
 
     clear_feed(&pool, FEED).await;
+}
+
+/// A deleted route is left out of a whole-feed read - its stop orders, timings
+/// and trips - by the export and by the loader alike. They read the feed's rows
+/// without joining gtfs_route (a feed read back in the transaction that wrote
+/// it is planned without statistics), so it is the code that leaves it out.
+#[actix_web::test]
+async fn a_deleted_routes_rows_are_left_out_of_a_whole_feed_read() {
+    let Some(pool) = local_pool().await else {
+        return;
+    };
+    clear_feed(&pool, DELETED_ROUTE_FEED).await;
+    let who = feed_io::Importer {
+        user_id: None,
+        email: None,
+        label: "editor_feed_io_flow".into(),
+    };
+    let report = feed_io::import_zip(&pool, &fixture(DELETED_ROUTE_FEED), None, false, &who)
+        .await
+        .unwrap();
+    assert!(report.seeded, "{report:#?}");
+    sqlx::query("UPDATE gtfs_route SET deleted = true WHERE gtfs_id = $1 AND route_id = 'R1'")
+        .bind(DELETED_ROUTE_FEED)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // served from its tables, trips and all, so the loader reads every row
+    sqlx::query("UPDATE gtfs_feed SET data_source = 'db', trips_source = 'db' WHERE gtfs_id = $1")
+        .bind(DELETED_ROUTE_FEED)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let (m, _) = feed_io::load_model(&mut conn, DELETED_ROUTE_FEED)
+        .await
+        .unwrap();
+    drop(conn);
+    let routes: Vec<&str> = m.routes.iter().map(|r| r.route_id.as_str()).collect();
+    assert_eq!(routes, ["R2", "R3"]);
+    let mut trips: Vec<&str> = m.trips.iter().map(|t| t.trip_id.as_str()).collect();
+    trips.sort();
+    assert_eq!(trips, ["T5", "T6"], "R1's trips T1-T4 are gone with it");
+    assert!(m.patterns.iter().all(|p| p.route_id != "R1"));
+    assert!(m.profiles.iter().all(|p| p.route_id != "R1"));
+    assert!(
+        m.patterns.iter().any(|p| p.route_id == "R2"),
+        "a live route keeps its stops"
+    );
+
+    let loaded = GtfsDbSource::new(pool.clone(), vec![])
+        .load_feed(DELETED_ROUTE_FEED, &HashMap::new())
+        .await
+        .unwrap();
+    let r1 = format!("{DELETED_ROUTE_FEED}:R1");
+    assert!(loaded.routes.iter().all(|r| r.id != r1));
+    assert!(loaded.patterns.iter().all(|p| p.route_id != r1));
+    assert!(!loaded.polylines.contains_key("R1"));
+    assert!(loaded
+        .routes
+        .iter()
+        .any(|r| r.id == format!("{DELETED_ROUTE_FEED}:R2")));
+
+    clear_feed(&pool, DELETED_ROUTE_FEED).await;
 }
 
 fn state(pool: &PgPool, signer: &TestSigner) -> EditorState {

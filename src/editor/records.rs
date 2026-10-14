@@ -1135,6 +1135,15 @@ pub(super) fn referenced_stops(fspec: &FileSpec, after: &Value) -> Vec<String> {
 /// Every file of the reference, with how the editor keeps it and how many rows
 /// feed `g` has in it.
 pub async fn list_files(conn: &mut PgConnection, g: &str) -> EditorResult<Value> {
+    let route_stops =
+        super::stages::route_stops_source(super::stages::feed_uses_stages(&mut *conn, g).await?);
+    let stop_times = format!(
+        "SELECT coalesce(sum(n), 0)::bigint FROM gtfs_trip t JOIN (SELECT gtfs_id, route_id, pattern_key, count(*) n \
+         FROM {route_stops} WHERE gtfs_id = $1 AND stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
+         GROUP BY 1, 2, 3) p ON p.gtfs_id = t.gtfs_id AND p.route_id = t.route_id AND p.pattern_key = t.pattern_key \
+         JOIN gtfs_route r ON r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted \
+         WHERE t.gtfs_id = $1"
+    );
     let count = |sql: &'static str| sql;
     let bespoke: [(&str, &str); 7] = [
         ("stops.txt", count("SELECT count(*) FROM gtfs_stop WHERE gtfs_id = $1 AND NOT deleted")),
@@ -1146,16 +1155,7 @@ pub async fn list_files(conn: &mut PgConnection, g: &str) -> EditorResult<Value>
                  WHERE r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted)",
             ),
         ),
-        (
-            "stop_times.txt",
-            count(
-                "SELECT coalesce(sum(n), 0)::bigint FROM gtfs_trip t JOIN (SELECT gtfs_id, route_id, pattern_key, count(*) n \
-                 FROM gtfs_route_stop_effective_all WHERE gtfs_id = $1 AND stop_type IN ('NEW STOP', 'INTERMEDIATE STOP') \
-                 GROUP BY 1, 2, 3) p ON p.gtfs_id = t.gtfs_id AND p.route_id = t.route_id AND p.pattern_key = t.pattern_key \
-                 JOIN gtfs_route r ON r.gtfs_id = t.gtfs_id AND r.route_id = t.route_id AND NOT r.deleted \
-                 WHERE t.gtfs_id = $1",
-            ),
-        ),
+        ("stop_times.txt", stop_times.as_str()),
         ("calendar.txt", count("SELECT count(*) FROM gtfs_service WHERE gtfs_id = $1 AND start_date IS NOT NULL")),
         ("calendar_dates.txt", count("SELECT count(*) FROM gtfs_service_date WHERE gtfs_id = $1")),
         ("frequencies.txt", count("SELECT count(*) FROM gtfs_frequency WHERE gtfs_id = $1")),
