@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use utoipa::ToSchema;
 
 use chrono::Timelike;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -24,12 +24,15 @@ use tracing::{error, info, warn};
 use crate::environment::AppState;
 use crate::graphql::TripQueryParams;
 use crate::models::{
-    BusScheduleDetail, BusScheduleDetails, GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee,
-    NandiRoutesRes, RepeatWalkEntry, RouteStopMapping, ScheduleTripRepeatConfig,
-    StopCodeFromProviderStopCodeResponse, TripDetails, UpdateWaybillDetailsBody, VehicleData,
-    VehicleMetadataResponse, VehicleOperationData, VehicleProperties, VehicleServiceTypeResponse,
+    BusScheduleDetail, BusScheduleDetails, DepotInfo, DepotVehicleInfo, FleetOperationInfo,
+    GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee, NandiRoutesRes, RepeatWalkEntry,
+    RouteStopMapping, ScheduleTripRepeatConfig, StopCodeFromProviderStopCodeResponse, TripDetails,
+    UpdateWaybillDetailsBody, VehicleData, VehicleMetadataResponse, VehicleOperationData,
+    VehicleProperties, VehicleServiceTypeResponse,
 };
-use crate::services::db_vehicle_reader::{chalo_gtfs_ids, is_chalo_gtfs_id};
+use crate::services::db_vehicle_reader::{
+    chalo_gtfs_ids, filter_vehicles_by_status, is_chalo_gtfs_id,
+};
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -39,7 +42,7 @@ use futures::StreamExt;
 
 use crate::{
     models::LatLong,
-    tools::error::{AppError, AppResult},
+    tools::error::{error_codes, AppError, AppResult},
 };
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +359,18 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
             .route(
                 "/getDepotNameById/{depot_id}",
                 actix_web::web::get().to(get_depot_name_by_id),
+            )
+            // v2 depot/fleet APIs: every one carries the gtfs_id, so a feed whose depots live
+            // in the internal DB (kolkata_bus) or in both (chennai_bus) resolves correctly.
+            .service(
+                web::scope("/v2/{gtfs_id}")
+                    .route("/fleet/{fleet_no}", web::get().to(get_fleet_operation_v2))
+                    .route("/depots", web::get().to(get_depots_v2))
+                    .route("/depots/{depot_id}", web::get().to(get_depot_by_id_v2))
+                    .route(
+                        "/depots/{depot_id}/vehicles",
+                        web::get().to(get_depot_vehicles_v2),
+                    ),
             )
             .route(
                 "/depotDataCache/clear",
@@ -681,10 +696,396 @@ pub async fn get_depot_name_by_id(
     responses((status = 200, description = "Depot cache cleared"))
 )]
 pub async fn clear_depot_cache(app_state: Data<AppState>) -> AppResult<HttpResponse> {
-    app_state.db_vehicle_reader.clear_depot_cache().await?;
+    // Both run regardless: a failure in one must not leave the other stale.
+    let external = app_state.db_vehicle_reader.clear_depot_cache().await;
+    let internal = app_state
+        .db_vehicle_reader_internal
+        .clear_depot_cache()
+        .await;
+    external.and(internal)?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "message": "Depot cache cleared successfully"
     })))
+}
+
+// ── Depot v2: gtfs_id-scoped ─────────────────────────────────────────────────
+// v1 always read the external DB, so it only ever answered for chennai_bus. v2 reads the stores
+// backing the requested feed. A bus known to vehicles_internal is served from there, as in every
+// other vehicle endpoint; otherwise the replica answers. Depot listings union both stores.
+
+/// Depot stores backing a feed, as (external `mtc_replica`, internal `mtc_internal`).
+/// chennai_bus reads both (external first); kolkata_bus is internal-only.
+fn depot_feed_sources(gtfs_id: &str) -> (bool, bool) {
+    (
+        !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id),
+        !EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id),
+    )
+}
+
+/// 404 + FEED_NOT_FOUND for an unknown feed. v1's `check_gtfs_id` answers 400 and is kept as-is
+/// for the ~30 existing operator endpoints that already return it.
+fn check_feed_v2(gtfs_id: &str) -> AppResult<()> {
+    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+        Ok(())
+    } else {
+        Err(AppError::NotFoundCoded(
+            error_codes::FEED_NOT_FOUND,
+            format!(
+                "gtfs_id '{}' is not a known operator feed. Known: {:?}",
+                gtfs_id, SUPPORTED_OPERATOR_GTFS_IDS
+            ),
+        ))
+    }
+}
+
+async fn resolve_depot(
+    app_state: &AppState,
+    gtfs_id: &str,
+    depot_id: &str,
+) -> AppResult<Option<DepotInfo>> {
+    let (use_external, use_internal) = depot_feed_sources(gtfs_id);
+
+    let mut deferred: Option<AppError> = None;
+
+    if use_external {
+        match app_state.db_vehicle_reader.get_depot_by_id(depot_id).await {
+            Ok(Some(depot)) => return Ok(Some(depot)),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "resolve_depot: external store failed for {}: {}",
+                    depot_id, e
+                );
+                deferred = Some(e);
+            }
+        }
+    }
+
+    if use_internal {
+        match app_state
+            .db_vehicle_reader_internal
+            .get_depot_by_id(depot_id, gtfs_id)
+            .await
+        {
+            Ok(Some(depot)) => return Ok(Some(depot)),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "resolve_depot: internal store failed for {}: {}",
+                    depot_id, e
+                );
+                deferred.get_or_insert(e);
+            }
+        }
+    }
+
+    // A failed store must not read as "no such depot", nor stop the other one from answering.
+    match deferred {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// Union of both stores, deduped on `fleet_no`. The internal row wins a collision, matching the
+/// authority rule every other vehicle endpoint applies, so an operator's edit is not shadowed.
+fn merge_depot_vehicles(
+    external: Vec<DepotVehicleInfo>,
+    internal: Vec<DepotVehicleInfo>,
+) -> Vec<DepotVehicleInfo> {
+    let mut seen: HashSet<String> = HashSet::with_capacity(external.len() + internal.len());
+    let mut merged: Vec<DepotVehicleInfo> = internal
+        .into_iter()
+        .chain(external)
+        .filter(|v| seen.insert(v.fleet_no.clone()))
+        .collect();
+    merged.sort_by(|a, b| a.fleet_no.cmp(&b.fleet_no));
+    merged
+}
+
+fn depot_not_found(depot_id: &str, gtfs_id: &str) -> AppError {
+    AppError::NotFoundCoded(
+        error_codes::DEPOT_NOT_FOUND,
+        format!("Depot '{}' not found for gtfs_id '{}'", depot_id, gtfs_id),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DepotVehicleQuery {
+    /// Case-insensitive exact match on the vehicle's status (e.g. `Active`).
+    status: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/fleet/{fleet_no}",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("fleet_no" = String, Path, description = "Fleet number"),
+    ),
+    responses(
+        (status = 200, description = "Fleet operation data: the v1 /vehicle-operation-data fields plus service_type. Waybill fields are null when the bus has no open waybill", body = FleetOperationInfo),
+        (status = 404, description = "FEED_NOT_FOUND or FLEET_NOT_FOUND"),
+    )
+)]
+pub async fn get_fleet_operation_v2(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, fleet_no) = path.into_inner();
+    let gtfs_id = strip_surrounding_quotes(&gtfs_id);
+    let fleet_no = strip_surrounding_quotes(&fleet_no);
+    check_feed_v2(&gtfs_id)?;
+    let (use_external, use_internal) = depot_feed_sources(&gtfs_id);
+
+    // Same authority rule as /vehicle/{gtfs_id}/{vehicle_no}/info and the service-type lookup:
+    // a bus present in vehicles_internal is served from the internal store, which is where this
+    // service writes, so an operator's own waybill is not shadowed by the replica's vehicle row.
+    let internal_is_authoritative = use_internal
+        && app_state
+            .db_vehicle_reader_internal
+            .is_vehicle_in_internal(&fleet_no, &gtfs_id)
+            .await;
+
+    let mut stores: Vec<bool> = Vec::with_capacity(2);
+    if internal_is_authoritative {
+        stores.push(true);
+        if use_external {
+            stores.push(false);
+        }
+    } else {
+        if use_external {
+            stores.push(false);
+        }
+        if use_internal {
+            stores.push(true);
+        }
+    }
+
+    let mut deferred: Option<AppError> = None;
+    // A store answers with the vehicle's own row when it finds no open waybill, so that answer
+    // must not end the search: an open duty in the other store outranks it. The authoritative
+    // store still wins when neither has one, because its row is kept first.
+    let mut no_waybill: Option<FleetOperationInfo> = None;
+
+    for internal in stores {
+        let found = if internal {
+            app_state
+                .db_vehicle_reader_internal
+                .get_fleet_operation(&fleet_no, &gtfs_id)
+                .await
+        } else {
+            app_state
+                .db_vehicle_reader
+                .get_fleet_operation(&fleet_no)
+                .await
+        };
+        match found {
+            Ok(Some(op)) if op.waybill_id.is_some() => return Ok(HttpResponse::Ok().json(op)),
+            Ok(Some(op)) => {
+                no_waybill.get_or_insert(op);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let store = if internal { "internal" } else { "external" };
+                warn!("fleet v2: {} store failed for {}: {}", store, fleet_no, e);
+                deferred.get_or_insert(e);
+            }
+        }
+    }
+
+    if let Some(op) = no_waybill {
+        return Ok(HttpResponse::Ok().json(op));
+    }
+
+    if let Some(e) = deferred {
+        return Err(e);
+    }
+
+    // A fleet with no waybill is a 200 with nulls; reaching here means the fleet is unknown.
+    Err(AppError::NotFoundCoded(
+        error_codes::FLEET_NOT_FOUND,
+        format!("Fleet '{}' not found for gtfs_id '{}'", fleet_no, gtfs_id),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots",
+    tag = "Vehicle",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses(
+        (status = 200, description = "Every depot for the feed, including those with no vehicles", body = Vec<DepotInfo>),
+        (status = 404, description = "FEED_NOT_FOUND"),
+    )
+)]
+pub async fn get_depots_v2(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = strip_surrounding_quotes(&path.into_inner());
+    check_feed_v2(&gtfs_id)?;
+    let (use_external, use_internal) = depot_feed_sources(&gtfs_id);
+
+    let mut answered: Option<Vec<DepotInfo>> = None;
+    let mut deferred: Option<AppError> = None;
+
+    if use_external {
+        match app_state.db_vehicle_reader.get_depots().await {
+            Ok(rows) => answered = Some(rows),
+            Err(e) => {
+                warn!("depots v2: external store failed for {}: {}", gtfs_id, e);
+                deferred = Some(e);
+            }
+        }
+    }
+
+    if answered.as_ref().is_none_or(Vec::is_empty) && use_internal {
+        match app_state
+            .db_vehicle_reader_internal
+            .get_depots(&gtfs_id)
+            .await
+        {
+            Ok(rows) => answered = Some(rows),
+            Err(e) => {
+                warn!("depots v2: internal store failed for {}: {}", gtfs_id, e);
+                deferred.get_or_insert(e);
+            }
+        }
+    }
+
+    // An empty list is only trustworthy when nothing failed; otherwise the failure is what the
+    // caller needs to see, not "this feed has no depots".
+    match (answered, deferred) {
+        (Some(depots), None) => Ok(HttpResponse::Ok().json(depots)),
+        (Some(depots), Some(_)) if !depots.is_empty() => Ok(HttpResponse::Ok().json(depots)),
+        (_, Some(e)) => Err(e),
+        (None, None) => Ok(HttpResponse::Ok().json(Vec::<DepotInfo>::new())),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots/{depot_id}",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("depot_id" = String, Path, description = "Depot (entity) ID"),
+    ),
+    responses(
+        (status = 200, description = "Depot", body = DepotInfo),
+        (status = 404, description = "FEED_NOT_FOUND or DEPOT_NOT_FOUND"),
+    )
+)]
+pub async fn get_depot_by_id_v2(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, depot_id) = path.into_inner();
+    let gtfs_id = strip_surrounding_quotes(&gtfs_id);
+    let depot_id = strip_surrounding_quotes(&depot_id);
+    check_feed_v2(&gtfs_id)?;
+
+    match resolve_depot(&app_state, &gtfs_id, &depot_id).await? {
+        Some(depot) => Ok(HttpResponse::Ok().json(depot)),
+        None => Err(depot_not_found(&depot_id, &gtfs_id)),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots/{depot_id}/vehicles",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("depot_id" = String, Path, description = "Depot (entity) ID"),
+        ("status" = Option<String>, Query, description = "Case-insensitive exact match on vehicle status, e.g. Active"),
+    ),
+    responses(
+        (status = 200, description = "Vehicles in the depot; empty when the depot has none", body = Vec<DepotVehicleInfo>),
+        (status = 404, description = "FEED_NOT_FOUND or DEPOT_NOT_FOUND"),
+    )
+)]
+pub async fn get_depot_vehicles_v2(
+    app_state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DepotVehicleQuery>,
+) -> AppResult<HttpResponse> {
+    let (gtfs_id, depot_id) = path.into_inner();
+    let gtfs_id = strip_surrounding_quotes(&gtfs_id);
+    let depot_id = strip_surrounding_quotes(&depot_id);
+    check_feed_v2(&gtfs_id)?;
+
+    let status = query
+        .status
+        .as_deref()
+        .map(strip_surrounding_quotes)
+        .filter(|s| !s.is_empty());
+
+    // Resolved first so an unknown depot (404) stays distinct from an empty one (200 []).
+    // Depot records are mirrored across the stores; the vehicles are not, so both are read.
+    let depot = resolve_depot(&app_state, &gtfs_id, &depot_id)
+        .await?
+        .ok_or_else(|| depot_not_found(&depot_id, &gtfs_id))?;
+    let (use_external, use_internal) = depot_feed_sources(&gtfs_id);
+
+    let (external, internal) = tokio::join!(
+        async {
+            if !use_external {
+                return Ok(Vec::new());
+            }
+            app_state
+                .db_vehicle_reader
+                .get_depot_vehicles(&depot.depot_id)
+                .await
+        },
+        async {
+            if !use_internal {
+                return Ok(Vec::new());
+            }
+            app_state
+                .db_vehicle_reader_internal
+                .get_depot_vehicles(&depot.depot_id, &gtfs_id)
+                .await
+        }
+    );
+
+    let mut deferred: Option<AppError> = None;
+    let external = external.unwrap_or_else(|e| {
+        warn!(
+            "depot vehicles v2: external store failed for depot {}: {}",
+            depot.depot_id, e
+        );
+        deferred = Some(e);
+        Vec::new()
+    });
+    let internal = internal.unwrap_or_else(|e| {
+        warn!(
+            "depot vehicles v2: internal store failed for depot {}: {}",
+            depot.depot_id, e
+        );
+        deferred.get_or_insert(e);
+        Vec::new()
+    });
+
+    // Any store failing makes the union incomplete, and a short list reads as "that bus is not
+    // in this depot" — worse than an error.
+    if let Some(e) = deferred {
+        return Err(e);
+    }
+
+    // Filter after the merge: a bus present in both stores has one authoritative row, and
+    // filtering per store would let it match two contradictory status values.
+    let vehicles =
+        filter_vehicles_by_status(merge_depot_vehicles(external, internal), status.as_deref());
+    info!(
+        "depot vehicles v2: gtfs_id={} depot_id={} status={:?} rows={}",
+        gtfs_id,
+        depot.depot_id,
+        status,
+        vehicles.len()
+    );
+    Ok(HttpResponse::Ok().json(vehicles))
 }
 
 #[utoipa::path(
@@ -3899,6 +4300,10 @@ pub async fn delete_one_row(
         .operator_service
         .delete_one_row(&table, &gtfs_id, body.into_inner())
         .await?;
+    app_state
+        .db_vehicle_reader_internal
+        .clear_caches_after_write()
+        .await;
 
     Ok(HttpResponse::Ok().json(json!({
         "message": "Row deleted successfully",
@@ -3945,6 +4350,10 @@ pub async fn upsert_one_row(
         .operator_service
         .upsert_one_row(&table, &gtfs_id, body_value, to_regen)
         .await?;
+    app_state
+        .db_vehicle_reader_internal
+        .clear_caches_after_write()
+        .await;
 
     Ok(HttpResponse::Ok().json(result))
 }
@@ -4010,6 +4419,10 @@ pub async fn upsert_vehicles(
         .operator_service
         .upsert_vehicles(&gtfs_id, items)
         .await?;
+    app_state
+        .db_vehicle_reader_internal
+        .clear_caches_after_write()
+        .await;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -4090,6 +4503,10 @@ pub async fn delete_vehicle(
         .operator_service
         .delete_vehicle_by_id(&gtfs_id, &vehicle_id)
         .await?;
+    app_state
+        .db_vehicle_reader_internal
+        .clear_caches_after_write()
+        .await;
 
     if rows_affected == 0 {
         return Ok(HttpResponse::NotFound().json(json!({
@@ -5421,4 +5838,82 @@ async fn metro_graph_info(
         "routes": route_info,
         "availableStops": graph.nodes.len(),
     })))
+}
+
+#[cfg(test)]
+mod depot_v2_tests {
+    use super::*;
+    use crate::tools::error::AppError;
+
+    #[test]
+    fn chennai_reads_both_stores_kolkata_only_internal() {
+        assert_eq!(depot_feed_sources("chennai_bus"), (true, true));
+        assert_eq!(depot_feed_sources("kolkata_bus"), (false, true));
+    }
+
+    #[test]
+    fn unknown_feed_is_a_coded_404_not_a_400() {
+        match check_feed_v2("__nope__") {
+            Err(AppError::NotFoundCoded(code, _)) => {
+                assert_eq!(code, error_codes::FEED_NOT_FOUND)
+            }
+            other => panic!("expected FEED_NOT_FOUND, got {:?}", other.map(|_| ())),
+        }
+        assert!(check_feed_v2("chennai_bus").is_ok());
+        assert!(check_feed_v2("kolkata_bus").is_ok());
+    }
+
+    fn dv(fleet_no: &str, status: &str) -> DepotVehicleInfo {
+        DepotVehicleInfo {
+            fleet_no: fleet_no.to_string(),
+            vehicle_no: Some(format!("TN01{}", fleet_no)),
+            status: Some(status.to_string()),
+            service_type: None,
+        }
+    }
+
+    #[test]
+    fn depot_vehicles_union_keeps_internal_only_buses() {
+        let merged = merge_depot_vehicles(vec![dv("K1", "Active")], vec![dv("K2", "Active")]);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|v| v.fleet_no.as_str())
+                .collect::<Vec<_>>(),
+            vec!["K1", "K2"]
+        );
+    }
+
+    #[test]
+    fn depot_vehicles_union_dedupes_with_internal_winning() {
+        let merged = merge_depot_vehicles(
+            vec![dv("K1", "Active")],
+            vec![dv("K1", "InActive"), dv("K2", "Active")],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].status.as_deref(), Some("InActive"));
+    }
+
+    #[test]
+    fn depot_vehicles_union_of_one_empty_store_is_the_other() {
+        let merged = merge_depot_vehicles(Vec::new(), vec![dv("K9", "Active")]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].fleet_no, "K9");
+    }
+
+    #[test]
+    fn unknown_depot_carries_its_own_code() {
+        match depot_not_found("999", "chennai_bus") {
+            AppError::NotFoundCoded(code, _) => assert_eq!(code, error_codes::DEPOT_NOT_FOUND),
+            other => panic!("expected DEPOT_NOT_FOUND, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn coded_404_serialises_error_code_alongside_the_numeric_code() {
+        use actix_web::ResponseError;
+        let err = AppError::NotFoundCoded(error_codes::FLEET_NOT_FOUND, "nope".to_string());
+        let resp = err.error_response();
+        assert_eq!(resp.status().as_u16(), 404);
+    }
 }

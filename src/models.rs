@@ -297,7 +297,38 @@ pub struct VehicleDataWithRouteId {
     pub waybill_status: Option<WaybillStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+/// Depot identity as the dispatcher APIs expose it. `depot_id` (GIMS's entity id) is the stable
+/// key — `depot_code` is the display short code, which is nullable and not unique across depots.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct DepotInfo {
+    pub depot_id: String,
+    pub depot_code: Option<String>,
+    pub depot_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct DepotVehicleInfo {
+    pub fleet_no: String,
+    pub vehicle_no: Option<String>,
+    pub status: Option<String>,
+    pub service_type: Option<String>,
+}
+
+/// A fleet's current operating state: the v1 `/vehicle-operation-data` fields plus `service_type`.
+/// The waybill fields are null when the bus has no open waybill — a normal business state.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct FleetOperationInfo {
+    pub waybill_id: Option<String>,
+    pub waybill_no: Option<String>,
+    pub depot_id: Option<String>,
+    pub conductor_code: Option<String>,
+    pub driver_code: Option<String>,
+    pub schedule_no: Option<String>,
+    pub depot_name: Option<String>,
+    pub service_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct DepotVehicleSummary {
     pub fleet_no: String,
     pub status: Option<String>,
