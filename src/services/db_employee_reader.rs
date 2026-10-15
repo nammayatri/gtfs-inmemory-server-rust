@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::debug;
 
+const EMPLOYEE_MISS_CACHE_SECS: u64 = 300;
+const EMPLOYEE_MISS_CACHE_MAX_ENTRIES: usize = 10000;
+
 #[async_trait]
 pub trait EmployeeReader: Send + Sync {
     async fn get_employee_by_phone(&self, phone: &str) -> AppResult<Option<MinimalEmployee>>;
@@ -42,6 +45,7 @@ pub struct DBEmployeeReader {
     internal_pool: Option<PgPool>,
     cache: Arc<RwLock<HashMap<String, (MinimalEmployee, SystemTime)>>>,
     cache_duration: Duration,
+    miss_cache: Arc<RwLock<HashMap<String, SystemTime>>>,
 }
 
 impl DBEmployeeReader {
@@ -51,7 +55,31 @@ impl DBEmployeeReader {
             internal_pool,
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_duration: Duration::from_secs(config.cache_duration),
+            miss_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    async fn is_cached_miss(&self, phone: &str) -> bool {
+        let miss_cache = self.miss_cache.read().await;
+        miss_cache
+            .get(phone)
+            .map(|t| {
+                t.elapsed().unwrap_or_default() < Duration::from_secs(EMPLOYEE_MISS_CACHE_SECS)
+            })
+            .unwrap_or(false)
+    }
+
+    async fn cache_miss(&self, phone: &str) {
+        let mut miss_cache = self.miss_cache.write().await;
+        if miss_cache.len() >= EMPLOYEE_MISS_CACHE_MAX_ENTRIES && !miss_cache.contains_key(phone) {
+            miss_cache.retain(|_, t| {
+                t.elapsed().unwrap_or_default() < Duration::from_secs(EMPLOYEE_MISS_CACHE_SECS)
+            });
+            if miss_cache.len() >= EMPLOYEE_MISS_CACHE_MAX_ENTRIES {
+                miss_cache.clear();
+            }
+        }
+        miss_cache.insert(phone.to_string(), SystemTime::now());
     }
 
     async fn get_cached_employee(&self, phone: &str) -> Option<MinimalEmployee> {
@@ -77,6 +105,10 @@ impl EmployeeReader for DBEmployeeReader {
     async fn get_employee_by_phone(&self, phone: &str) -> AppResult<Option<MinimalEmployee>> {
         if let Some(cached_employee) = self.get_cached_employee(phone).await {
             return Ok(Some(cached_employee));
+        }
+        if self.is_cached_miss(phone).await {
+            debug!("Miss cache HIT for employee with phone {}", phone);
+            return Ok(None);
         }
 
         // Primary lookup in employees table
@@ -111,7 +143,10 @@ impl EmployeeReader for DBEmployeeReader {
         // Fallback lookup in employees_internal table
         let internal_pool = match &self.internal_pool {
             Some(p) => p,
-            None => return Ok(None),
+            None => {
+                self.cache_miss(phone).await;
+                return Ok(None);
+            }
         };
 
         let internal_query = r#"
@@ -141,7 +176,10 @@ impl EmployeeReader for DBEmployeeReader {
                 self.cache_employee_data(&emp, phone).await;
                 Ok(Some(emp))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                self.cache_miss(phone).await;
+                Ok(None)
+            }
             Err(e) => Err(AppError::Internal(format!(
                 "DB query error (internal): {}",
                 e
