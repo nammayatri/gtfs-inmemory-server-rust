@@ -30,12 +30,25 @@ pub enum AppError {
 
     #[error("Invalid request: {0}")]
     BadRequest(String),
+
+    /// 404 carrying a machine-readable discriminator (FEED_NOT_FOUND, DEPOT_NOT_FOUND, ...) so a
+    /// caller can tell an unknown feed from an unknown depot; a plain NotFound collapses both.
+    #[error("{1}")]
+    NotFoundCoded(&'static str, String),
+}
+
+/// Discriminators emitted alongside a 404 in the `errorCode` field.
+pub mod error_codes {
+    pub const FEED_NOT_FOUND: &str = "FEED_NOT_FOUND";
+    pub const DEPOT_NOT_FOUND: &str = "DEPOT_NOT_FOUND";
+    pub const FLEET_NOT_FOUND: &str = "FLEET_NOT_FOUND";
 }
 
 impl ResponseError for AppError {
     fn error_response(&self) -> HttpResponse {
         let error_message = match self {
             AppError::NotFound(msg) => msg.clone(),
+            AppError::NotFoundCoded(_, msg) => msg.clone(),
             AppError::Internal(msg) => msg.clone(),
             AppError::DbError(msg) => format!("Database error: {}", msg),
             AppError::NotReady(msg) => msg.clone(),
@@ -48,6 +61,7 @@ impl ResponseError for AppError {
 
         let status_code = match self {
             AppError::NotFound(_) => actix_web::http::StatusCode::NOT_FOUND,
+            AppError::NotFoundCoded(..) => actix_web::http::StatusCode::NOT_FOUND,
             AppError::Internal(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             AppError::DbError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             AppError::NotReady(_) => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -58,10 +72,14 @@ impl ResponseError for AppError {
             AppError::Configuration(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        HttpResponse::build(status_code).json(json!({
+        let mut body = json!({
             "error": error_message,
             "code": status_code.as_u16()
-        }))
+        });
+        if let AppError::NotFoundCoded(code, _) = self {
+            body["errorCode"] = json!(code);
+        }
+        HttpResponse::build(status_code).json(body)
     }
 }
 
