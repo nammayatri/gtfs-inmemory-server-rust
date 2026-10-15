@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use sqlx::PgPool;
 use tracing::{debug, error, info, warn};
@@ -15,7 +15,7 @@ use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
 pub trait VehicleDataReaderInternal: Send + Sync {
-    async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool;
+    async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> AppResult<bool>;
     async fn get_vehicle_data(
         &self,
         vehicle_no: &str,
@@ -83,8 +83,8 @@ impl Default for MockDBVehicleReaderInternal {
 
 #[async_trait]
 impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
-    async fn is_vehicle_in_internal(&self, _vehicle_no: &str, _gtfs_id: &str) -> bool {
-        false
+    async fn is_vehicle_in_internal(&self, _vehicle_no: &str, _gtfs_id: &str) -> AppResult<bool> {
+        Ok(false)
     }
 
     async fn get_vehicle_data(
@@ -160,30 +160,106 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
     }
 }
 
+struct VehicleRegistry {
+    fleet: HashSet<(String, String)>,
+    properties: HashMap<(String, String), VehicleProperties>,
+    loaded_at: SystemTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct RouteSnapshotRow {
+    route_id: Option<String>,
+    waybill_no: Option<String>,
+    service_type: Option<String>,
+    vehicle_no: Option<String>,
+    duty_date: Option<String>,
+    status: Option<String>,
+    db_start_time: Option<String>,
+    start_time_epoch: Option<String>,
+    trip_number: Option<i32>,
+    is_active_trip: Option<bool>,
+    is_completed: Option<bool>,
+}
+
+struct SlimRouteRow {
+    waybill_no: String,
+    service_type: String,
+    vehicle_no: String,
+    duty_date: Option<String>,
+    status: Option<String>,
+    db_start_time: Option<String>,
+    start_time_epoch: Option<String>,
+    trip_number: Option<i32>,
+    is_active_trip: Option<bool>,
+    is_completed: Option<bool>,
+}
+
+impl SlimRouteRow {
+    fn matches(&self, vehicle_number: Option<&str>, max_duty_date: Option<&str>) -> bool {
+        let vehicle_ok = vehicle_number.map_or(true, |vn| self.vehicle_no == vn);
+        let duty_ok = self.status.as_deref() == Some("online")
+            || match max_duty_date {
+                None => true,
+                Some(max) => self.duty_date.as_deref().is_some_and(|d| d <= max),
+            };
+        vehicle_ok && duty_ok
+    }
+
+    fn to_vehicle_data(&self) -> VehicleData {
+        VehicleData {
+            waybill_id: String::new(),
+            waybill_no: self.waybill_no.clone(),
+            service_type: self.service_type.clone(),
+            vehicle_no: self.vehicle_no.clone(),
+            schedule_no: String::new(),
+            last_updated: None,
+            duty_date: self.duty_date.clone(),
+            schedule_trip_id: None,
+            entity_remark: None,
+            driver_code: None,
+            conductor_code: None,
+            deleted: None,
+            status: self.status.clone(),
+            is_flexi: None,
+            db_start_time: self.db_start_time.clone(),
+            start_time_epoch: self.start_time_epoch.clone(),
+            trip_number: self.trip_number,
+            is_active_trip: self.is_active_trip,
+            is_completed: self.is_completed,
+        }
+    }
+}
+
+struct RouteSnapshot {
+    by_route: HashMap<String, Arc<Vec<SlimRouteRow>>>,
+    loaded_at: SystemTime,
+}
+
 #[allow(clippy::type_complexity)]
 pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
-    waybills_by_route_cache: Arc<RwLock<HashMap<String, (Vec<VehicleData>, SystemTime)>>>,
+    route_snapshots: Arc<RwLock<HashMap<String, Arc<RouteSnapshot>>>>,
+    route_snapshot_refresh: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<Option<SystemTime>>>>>>,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
-    vehicle_properties_cache:
-        Arc<RwLock<HashMap<(String, String), (VehicleProperties, SystemTime)>>>,
+    vehicle_registry: Arc<RwLock<Option<Arc<VehicleRegistry>>>>,
+    vehicle_registry_refresh: Arc<Mutex<Option<SystemTime>>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 30; // short TTL so bus swaps are reflected quickly
+const ROUTE_SNAPSHOT_RETRY_SECS: u64 = 5;
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
-                                              // 12 hours — these columns rarely change. Not invalidated on write: the cache is in-process, so an
-                                              // operator edit (tag/variant) is served stale by every pod until its own entry expires.
-const VEHICLE_PROPS_CACHE_DURATION: u64 = 43200;
-const VEHICLE_PROPS_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
-const VEHICLE_PROPS_CACHE_MAX_ENTRIES: usize = 4000;
+const VEHICLE_REGISTRY_REFRESH_SECS: u64 = 300;
+const VEHICLE_REGISTRY_RETRY_SECS: u64 = 10;
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool: Some(pool),
-            waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
+            route_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            route_snapshot_refresh: Arc::new(std::sync::Mutex::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
-            vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
+            vehicle_registry: Arc::new(RwLock::new(None)),
+            vehicle_registry_refresh: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -192,9 +268,11 @@ impl DBVehicleReaderInternal {
     pub fn new_disconnected() -> Self {
         Self {
             pool: None,
-            waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
+            route_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            route_snapshot_refresh: Arc::new(std::sync::Mutex::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
-            vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
+            vehicle_registry: Arc::new(RwLock::new(None)),
+            vehicle_registry_refresh: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -204,36 +282,119 @@ impl DBVehicleReaderInternal {
         })
     }
 
-    fn is_waybills_by_route_cache_expired(&self, timestamp: SystemTime) -> bool {
-        let elapsed = timestamp.elapsed().unwrap_or_default();
-        elapsed >= Duration::from_secs(WAYBILL_ROUTE_CACHE_DURATION)
-    }
-
     fn is_station_eta_cache_expired(&self, timestamp: SystemTime) -> bool {
         let elapsed = timestamp.elapsed().unwrap_or_default();
         elapsed >= Duration::from_secs(STATION_ETA_CACHE_DURATION)
-    }
-
-    fn get_waybills_by_route_cache_key(
-        &self,
-        gtfs_id: &str,
-        route_id: &str,
-        max_duty_date: Option<&str>,
-    ) -> String {
-        format!("{}_{}_{}", gtfs_id, route_id, max_duty_date.unwrap_or("*"))
     }
 
     fn get_station_eta_cache_key(&self, gtfs_id: &str) -> String {
         format!("eta_map_{}", gtfs_id)
     }
 
-    /// Returns true if vehicle_no exists in vehicles_internal for the given gtfs_id.
-    /// Any DB error is treated as "not found" so the caller falls back gracefully.
-    async fn is_vehicle_in_internal_impl(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
+    fn is_vehicle_registry_fresh(registry: &VehicleRegistry) -> bool {
+        registry.loaded_at.elapsed().unwrap_or_default()
+            < Duration::from_secs(VEHICLE_REGISTRY_REFRESH_SECS)
+    }
+
+    async fn get_vehicle_registry(&self) -> Option<Arc<VehicleRegistry>> {
+        let pool = self.pool.as_ref()?;
+
+        let current = self.vehicle_registry.read().await.clone();
+        if current
+            .as_deref()
+            .is_some_and(Self::is_vehicle_registry_fresh)
+        {
+            return current;
+        }
+
+        let mut last_failure = if current.is_some() {
+            match self.vehicle_registry_refresh.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return current,
+            }
+        } else {
+            self.vehicle_registry_refresh.lock().await
+        };
+
+        let latest = self.vehicle_registry.read().await.clone();
+        if latest
+            .as_deref()
+            .is_some_and(Self::is_vehicle_registry_fresh)
+        {
+            return latest;
+        }
+        if let Some(failed_at) = *last_failure {
+            if failed_at.elapsed().unwrap_or_default()
+                < Duration::from_secs(VEHICLE_REGISTRY_RETRY_SECS)
+            {
+                return latest;
+            }
+        }
+
+        let query = r#"
+            SELECT fleet_no, gtfs_id, tag_number, vehicle_variant
+            FROM vehicles_internal
+            WHERE deleted = false
+              AND fleet_no IS NOT NULL
+        "#;
+
+        match sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(query)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                fn non_blank(v: Option<String>) -> Option<String> {
+                    v.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
+                }
+                let mut fleet = HashSet::with_capacity(rows.len());
+                let mut properties = HashMap::new();
+                for (fleet_no, gtfs_id, tag_number, vehicle_variant) in rows {
+                    let props = VehicleProperties {
+                        tag_number: non_blank(tag_number),
+                        variant: non_blank(vehicle_variant),
+                    };
+                    if props.tag_number.is_some() || props.variant.is_some() {
+                        properties.insert((fleet_no.clone(), gtfs_id.clone()), props);
+                    }
+                    fleet.insert((fleet_no, gtfs_id));
+                }
+                info!(
+                    "vehicles_internal registry loaded: {} vehicles, {} with tag or variant",
+                    fleet.len(),
+                    properties.len()
+                );
+                let registry = Arc::new(VehicleRegistry {
+                    fleet,
+                    properties,
+                    loaded_at: SystemTime::now(),
+                });
+                *self.vehicle_registry.write().await = Some(registry.clone());
+                *last_failure = None;
+                Some(registry)
+            }
+            Err(e) => {
+                error!("vehicles_internal registry load failed: {}", e);
+                *last_failure = Some(SystemTime::now());
+                latest
+            }
+        }
+    }
+
+    async fn is_vehicle_in_internal_impl(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<bool> {
         let pool = match &self.pool {
             Some(p) => p,
-            None => return false,
+            None => return Ok(false),
         };
+
+        if let Some(registry) = self.get_vehicle_registry().await {
+            return Ok(registry
+                .fleet
+                .contains(&(vehicle_no.to_string(), gtfs_id.to_string())));
+        }
 
         let query = r#"
             SELECT 1
@@ -244,28 +405,19 @@ impl DBVehicleReaderInternal {
             LIMIT 1
         "#;
 
-        match sqlx::query_scalar::<_, i32>(query)
+        sqlx::query_scalar::<_, i32>(query)
             .bind(vehicle_no)
             .bind(gtfs_id)
             .fetch_optional(pool)
             .await
-        {
-            Ok(Some(_)) => {
-                info!(
-                    "vehicle_no={} found in vehicles_internal for gtfs_id={}",
-                    vehicle_no, gtfs_id
-                );
-                true
-            }
-            Ok(None) => false,
-            Err(e) => {
+            .map(|found| found.is_some())
+            .map_err(|e| {
                 error!(
                     "is_vehicle_in_internal query failed for vehicle_no={} gtfs_id={}: {}",
                     vehicle_no, gtfs_id, e
                 );
-                false
-            }
-        }
+                AppError::DbError(e.to_string())
+            })
     }
 
     pub async fn get_station_etas_impl(
@@ -544,7 +696,7 @@ impl DBVehicleReaderInternal {
                     "Online waybill_internal query failed for vehicle_no={} gtfs_id={}: {}",
                     vehicle_no, gtfs_id, e
                 );
-                Ok(None)
+                Err(AppError::DbError(e.to_string()))
             }
         }
     }
@@ -598,7 +750,7 @@ impl DBVehicleReaderInternal {
                     "Processed/New waybill_internal query failed for vehicle_no={} gtfs_id={}: {}",
                     vehicle_no, gtfs_id, e
                 );
-                Ok(None)
+                Err(AppError::DbError(e.to_string()))
             }
         }
     }
@@ -756,7 +908,7 @@ impl DBVehicleReaderInternal {
                     "Flexi_internal query failed for waybill_id {}: {}",
                     waybill_data.waybill_id, e
                 );
-                Vec::new()
+                return Err(AppError::DbError(e.to_string()));
             }
         };
 
@@ -826,7 +978,9 @@ impl DBVehicleReaderInternal {
                              AND is_active_trip = true
                              AND trip_type != 'dead-trip'
                              AND deleted = false
-                             AND LOWER(COALESCE(status, 'active')) <> 'inactive'),
+                             AND LOWER(COALESCE(status, 'active')) <> 'inactive'
+                           ORDER BY trip_number ASC
+                           LIMIT 1),
                           1))
                   AND trip_type != 'dead-trip'
                   AND deleted = false
@@ -848,7 +1002,7 @@ impl DBVehicleReaderInternal {
                     "Detail_internal query failed for schedule_trip_id {:?}: {}",
                     waybill_data.schedule_trip_id, e
                 );
-                Vec::new()
+                return Err(AppError::DbError(e.to_string()));
             }
         };
 
@@ -992,6 +1146,184 @@ impl DBVehicleReaderInternal {
         Ok(())
     }
 
+    fn is_route_snapshot_fresh(snapshot: &RouteSnapshot) -> bool {
+        snapshot.loaded_at.elapsed().unwrap_or_default()
+            < Duration::from_secs(WAYBILL_ROUTE_CACHE_DURATION)
+    }
+
+    fn route_snapshot_refresh_lock(&self, gtfs_id: &str) -> Arc<Mutex<Option<SystemTime>>> {
+        let mut locks = self
+            .route_snapshot_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(gtfs_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    }
+
+    async fn get_route_snapshot(&self, pool: &PgPool, gtfs_id: &str) -> Option<Arc<RouteSnapshot>> {
+        let current = self.route_snapshots.read().await.get(gtfs_id).cloned();
+        if current
+            .as_deref()
+            .is_some_and(Self::is_route_snapshot_fresh)
+        {
+            return current;
+        }
+
+        let refresh_lock = self.route_snapshot_refresh_lock(gtfs_id);
+        let mut last_failure = if current.is_some() {
+            match refresh_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return current,
+            }
+        } else {
+            refresh_lock.lock().await
+        };
+
+        let latest = self.route_snapshots.read().await.get(gtfs_id).cloned();
+        if latest.as_deref().is_some_and(Self::is_route_snapshot_fresh) {
+            return latest;
+        }
+        if let Some(failed_at) = *last_failure {
+            if failed_at.elapsed().unwrap_or_default()
+                < Duration::from_secs(ROUTE_SNAPSHOT_RETRY_SECS)
+            {
+                return latest;
+            }
+        }
+
+        let query = r#"
+            WITH base AS (
+                SELECT
+                    CASE
+                        WHEN w.is_flexi THEN bstf.route_number_id::text
+                        ELSE bstd.route_number_id::text
+                    END AS route_id,
+                    w.waybill_no::text AS waybill_no,
+                    w.service_type,
+                    w.vehicle_no,
+                    w.duty_date,
+                    w.status,
+                    CASE
+                        WHEN w.is_flexi THEN bstf.start_time
+                        ELSE bstd.start_time
+                    END AS db_start_time,
+                    CASE
+                        WHEN w.is_flexi THEN bstf.trip_start_time::text
+                        ELSE bstd.trip_start_time::text
+                    END AS start_time_epoch,
+                    CASE
+                        WHEN w.is_flexi THEN bstf.trip_number::int
+                        ELSE bstd.trip_number::int
+                    END AS trip_number,
+                    CASE
+                        WHEN w.status <> 'online' THEN false
+                        WHEN w.is_flexi THEN bstf.is_active_trip
+                        ELSE bstd.is_active_trip
+                    END AS is_active_trip,
+                    CASE
+                        WHEN w.is_flexi THEN NULL
+                        ELSE bstd.is_completed
+                    END AS is_completed
+                FROM waybills_internal w
+                LEFT JOIN bus_schedule_trip_flexi_internal bstf
+                    ON w.is_flexi = true
+                    AND bstf.waybill_id = w.waybill_id
+                    AND bstf.gtfs_id = $1
+                    AND bstf.trip_type <> 'dead-trip'
+                    AND bstf.deleted = false
+                LEFT JOIN bus_schedule_trip_detail_internal bstd
+                    ON w.is_flexi = false
+                    AND bstd.schedule_trip_id = w.schedule_trip_id
+                    AND bstd.gtfs_id = $1
+                    AND bstd.trip_type <> 'dead-trip'
+                    AND bstd.deleted = false
+                    AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
+                WHERE
+                    w.status IN ('online', 'upcoming')
+                    AND w.deleted = false
+                    AND w.gtfs_id = $1
+                    AND (
+                        (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
+                        OR
+                        (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
+                    )
+            )
+            SELECT * FROM base
+            WHERE (status <> 'online' OR is_completed IS NOT TRUE)
+            ORDER BY route_id, waybill_no, trip_number
+        "#;
+
+        match sqlx::query_as::<_, RouteSnapshotRow>(query)
+            .bind(gtfs_id)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                let total = rows.len();
+                let mut grouped: HashMap<String, Vec<SlimRouteRow>> = HashMap::new();
+                for row in rows {
+                    let (Some(route_id), Some(waybill_no), Some(service_type), Some(vehicle_no)) = (
+                        row.route_id,
+                        row.waybill_no,
+                        row.service_type,
+                        row.vehicle_no,
+                    ) else {
+                        continue;
+                    };
+                    grouped.entry(route_id).or_default().push(SlimRouteRow {
+                        waybill_no,
+                        service_type,
+                        vehicle_no,
+                        duty_date: row.duty_date,
+                        status: row.status,
+                        db_start_time: row.db_start_time,
+                        start_time_epoch: row.start_time_epoch,
+                        trip_number: row.trip_number,
+                        is_active_trip: row.is_active_trip,
+                        is_completed: row.is_completed,
+                    });
+                }
+                let kept: usize = grouped.values().map(Vec::len).sum();
+                if kept < total {
+                    warn!(
+                        "internal route snapshot for gtfs_id={} skipped {} rows with missing route/waybill/vehicle/service_type",
+                        gtfs_id,
+                        total - kept
+                    );
+                }
+                info!(
+                    "internal route snapshot loaded for gtfs_id={}: {} rows across {} routes",
+                    gtfs_id,
+                    kept,
+                    grouped.len()
+                );
+                let snapshot = Arc::new(RouteSnapshot {
+                    by_route: grouped
+                        .into_iter()
+                        .map(|(route_id, rows)| (route_id, Arc::new(rows)))
+                        .collect(),
+                    loaded_at: SystemTime::now(),
+                });
+                self.route_snapshots
+                    .write()
+                    .await
+                    .insert(gtfs_id.to_string(), snapshot.clone());
+                *last_failure = None;
+                Some(snapshot)
+            }
+            Err(e) => {
+                error!(
+                    "internal route snapshot load failed for gtfs_id={}: {}",
+                    gtfs_id, e
+                );
+                *last_failure = Some(SystemTime::now());
+                latest
+            }
+        }
+    }
+
     async fn get_waybills_by_route_id_impl(
         &self,
         route_id: &str,
@@ -1006,216 +1338,29 @@ impl DBVehicleReaderInternal {
             }
         };
 
-        // Normalize: trim and convert empty string to None
         let vehicle_number = vehicle_number.map(|v| v.trim()).filter(|v| !v.is_empty());
 
-        let is_filtered = vehicle_number.is_some();
-
-        // Only cache unfiltered results to prevent unbounded cache growth
-        let cache_key = (!is_filtered)
-            .then(|| self.get_waybills_by_route_cache_key(gtfs_id, route_id, max_duty_date));
-
-        // Check cache first (only for unfiltered queries)
-        if let Some(ref key) = cache_key {
-            let cache = self.waybills_by_route_cache.read().await;
-            if let Some((data, ts)) = cache.get(key) {
-                if !self.is_waybills_by_route_cache_expired(*ts) {
-                    info!(
-                        "internal get_waybills_by_route_id cache HIT for route_id={}",
-                        route_id
-                    );
-                    return Ok(data.clone());
-                }
+        let snapshot = match self.get_route_snapshot(pool, gtfs_id).await {
+            Some(snapshot) => snapshot,
+            None => {
+                warn!(
+                    "internal route snapshot unavailable for gtfs_id={}; returning no internal waybills for route_id={}",
+                    gtfs_id, route_id
+                );
+                return Ok(Vec::new());
             }
-        }
-
-        // Use separate queries for better index utilization
-        let (query, bound_vehicle): (&str, Option<&str>) = if let Some(vn) = vehicle_number {
-            (
-                r#"
-                WITH base AS (
-                    SELECT
-                        w.waybill_id::text,
-                        w.waybill_no::text,
-                        w.service_type,
-                        w.vehicle_no,
-                        w.schedule_no,
-                        w.updated_at::timestamptz AS last_updated,
-                        w.duty_date,
-                        w.schedule_trip_id::text,
-                        e.entity_remark::text,
-                        w.driver_token_no::text AS driver_code,
-                        w.conductor_token_no::text AS conductor_code,
-                        w.deleted,
-                        w.status,
-                        w.is_flexi,
-                        CASE
-                            WHEN w.is_flexi THEN bstf.start_time
-                            ELSE bstd.start_time
-                        END AS db_start_time,
-                        CASE
-                            WHEN w.is_flexi THEN bstf.trip_start_time::text
-                            ELSE bstd.trip_start_time::text
-                        END AS start_time_epoch,
-                        CASE
-                            WHEN w.is_flexi THEN bstf.trip_number::int
-                            ELSE bstd.trip_number::int
-                        END AS trip_number,
-                        CASE
-                            WHEN w.status <> 'online' THEN false
-                            WHEN w.is_flexi THEN bstf.is_active_trip
-                            ELSE bstd.is_active_trip
-                        END AS is_active_trip,
-                        CASE
-                            WHEN w.is_flexi THEN NULL
-                            ELSE bstd.is_completed
-                        END AS is_completed
-                    FROM waybills_internal w
-                    LEFT JOIN entities_internal e
-                        ON e.entity_id = w.entity_id
-                        AND e.gtfs_id = $2
-                    LEFT JOIN bus_schedule_trip_flexi_internal bstf
-                        ON w.is_flexi = true
-                        AND bstf.waybill_id = w.waybill_id
-                        AND bstf.route_number_id::text = $1
-                        AND bstf.gtfs_id = $2
-                        AND bstf.trip_type <> 'dead-trip'
-                        AND bstf.deleted = false
-                    LEFT JOIN bus_schedule_trip_detail_internal bstd
-                        ON w.is_flexi = false
-                        AND bstd.schedule_trip_id = w.schedule_trip_id
-                        AND bstd.route_number_id::text = $1
-                        AND bstd.gtfs_id = $2
-                        AND bstd.trip_type <> 'dead-trip'
-                        AND bstd.deleted = false
-                        AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
-                    WHERE
-                        w.status in ('online', 'upcoming')
-                        AND w.deleted = false
-                        AND w.gtfs_id = $2
-                        AND w.vehicle_no = $3
-                        AND (w.status = 'online' OR $4::text IS NULL OR w.duty_date <= $4)
-                        AND (
-                            (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
-                            OR
-                            (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
-                        )
-                )
-                SELECT * FROM base WHERE (status <> 'online' OR is_completed IS NOT TRUE) ORDER BY waybill_no, trip_number;
-                "#,
-                Some(vn),
-            )
-        } else {
-            (
-                r#"
-                WITH base AS (
-                    SELECT
-                        w.waybill_id::text,
-                        w.waybill_no::text,
-                        w.service_type,
-                        w.vehicle_no,
-                        w.schedule_no,
-                        w.updated_at::timestamptz AS last_updated,
-                        w.duty_date,
-                        w.schedule_trip_id::text,
-                        e.entity_remark::text,
-                        w.driver_token_no::text AS driver_code,
-                        w.conductor_token_no::text AS conductor_code,
-                        w.deleted,
-                        w.status,
-                        w.is_flexi,
-                        CASE
-                            WHEN w.is_flexi THEN bstf.start_time
-                            ELSE bstd.start_time
-                        END AS db_start_time,
-                        CASE
-                            WHEN w.is_flexi THEN bstf.trip_start_time::text
-                            ELSE bstd.trip_start_time::text
-                        END AS start_time_epoch,
-                        CASE
-                            WHEN w.is_flexi THEN bstf.trip_number::int
-                            ELSE bstd.trip_number::int
-                        END AS trip_number,
-                        CASE
-                            WHEN w.status <> 'online' THEN false
-                            WHEN w.is_flexi THEN bstf.is_active_trip
-                            ELSE bstd.is_active_trip
-                        END AS is_active_trip,
-                        CASE
-                            WHEN w.is_flexi THEN NULL
-                            ELSE bstd.is_completed
-                        END AS is_completed
-                    FROM waybills_internal w
-                    LEFT JOIN entities_internal e
-                        ON e.entity_id = w.entity_id
-                        AND e.gtfs_id = $2
-                    LEFT JOIN bus_schedule_trip_flexi_internal bstf
-                        ON w.is_flexi = true
-                        AND bstf.waybill_id = w.waybill_id
-                        AND bstf.route_number_id::text = $1
-                        AND bstf.gtfs_id = $2
-                        AND bstf.trip_type <> 'dead-trip'
-                        AND bstf.deleted = false
-                    LEFT JOIN bus_schedule_trip_detail_internal bstd
-                        ON w.is_flexi = false
-                        AND bstd.schedule_trip_id = w.schedule_trip_id
-                        AND bstd.route_number_id::text = $1
-                        AND bstd.gtfs_id = $2
-                        AND bstd.trip_type <> 'dead-trip'
-                        AND bstd.deleted = false
-                        AND (w.status <> 'online' OR LOWER(COALESCE(bstd.status, 'active')) <> 'inactive')
-                    WHERE
-                        w.status in ('online', 'upcoming')
-                        AND w.deleted = false
-                        AND w.gtfs_id = $2
-                        AND (w.status = 'online' OR $3::text IS NULL OR w.duty_date <= $3)
-                        AND (
-                            (w.is_flexi = true AND bstf.waybill_id IS NOT NULL)
-                            OR
-                            (w.is_flexi = false AND bstd.schedule_trip_id IS NOT NULL)
-                        )
-                )
-                SELECT * FROM base WHERE (status <> 'online' OR is_completed IS NOT TRUE) ORDER BY waybill_no, trip_number;
-                "#,
-                None::<&str>,
-            )
         };
 
-        let query_builder = sqlx::query_as::<_, VehicleData>(query)
-            .bind(route_id)
-            .bind(gtfs_id);
-        let query_builder = if let Some(vn) = bound_vehicle {
-            query_builder.bind(vn)
-        } else {
-            query_builder
-        };
-        let query_builder = query_builder.bind(max_duty_date);
-
-        match query_builder.fetch_all(pool).await {
-            Ok(rows) => {
-                info!(
-                    "Chennai internal direct query: found {} waybills for route_id={}",
-                    rows.len(),
-                    route_id
-                );
-
-                // Update cache only for unfiltered queries
-                if let Some(key) = cache_key {
-                    let mut cache = self.waybills_by_route_cache.write().await;
-                    cache.insert(key, (rows.clone(), SystemTime::now()));
-                }
-
-                Ok(rows)
-            }
-            Err(e) => {
-                error!(
-                    "Internal get_waybills_by_route_id failed for route_id={}: {}",
-                    route_id, e
-                );
-                // Fail gracefully so we just don't append internal records
-                Ok(Vec::new())
-            }
-        }
+        Ok(snapshot
+            .by_route
+            .get(route_id)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| row.matches(vehicle_number, max_duty_date))
+                    .map(SlimRouteRow::to_vehicle_data)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn get_waybill_by_waybill_and_trip_impl(
@@ -1367,7 +1512,7 @@ impl DBVehicleReaderInternal {
         // Invalidate cache
         {
             let mut cache = self.station_eta_cache.write().await;
-            cache.remove(gtfs_id);
+            cache.remove(&self.get_station_eta_cache_key(gtfs_id));
         }
 
         info!(
@@ -1381,7 +1526,7 @@ impl DBVehicleReaderInternal {
 
 #[async_trait]
 impl VehicleDataReaderInternal for DBVehicleReaderInternal {
-    async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
+    async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> AppResult<bool> {
         self.is_vehicle_in_internal_impl(vehicle_no, gtfs_id).await
     }
 
@@ -1458,83 +1603,20 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         fleet_no: &str,
         gtfs_id: &str,
     ) -> AppResult<VehicleProperties> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(VehicleProperties::default()),
-        };
-
-        let cache_key = (fleet_no.to_string(), gtfs_id.to_string());
-        {
-            let cache = self.vehicle_properties_cache.read().await;
-            if let Some((props, fetched_at)) = cache.get(&cache_key) {
-                let ttl = if props.tag_number.is_some() || props.variant.is_some() {
-                    VEHICLE_PROPS_CACHE_DURATION
-                } else {
-                    VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
-                };
-                if fetched_at.elapsed().unwrap_or_default() < Duration::from_secs(ttl) {
-                    return Ok(props.clone());
-                }
-            }
+        if self.pool.is_none() {
+            return Ok(VehicleProperties::default());
         }
 
-        let db_result = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT tag_number, vehicle_variant FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
-        )
-        .bind(fleet_no)
-        .bind(gtfs_id)
-        .fetch_optional(pool)
-        .await;
-
-        fn non_blank(v: Option<String>) -> Option<String> {
-            v.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
+        match self.get_vehicle_registry().await {
+            Some(registry) => Ok(registry
+                .properties
+                .get(&(fleet_no.to_string(), gtfs_id.to_string()))
+                .cloned()
+                .unwrap_or_default()),
+            None => Err(AppError::DbError(
+                "vehicles_internal registry is unavailable".to_string(),
+            )),
         }
-
-        let props = match db_result {
-            Ok(row) => {
-                let (tag, variant) = row.unwrap_or((None, None));
-                VehicleProperties {
-                    tag_number: non_blank(tag),
-                    variant: non_blank(variant),
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "get_vehicle_properties: DB failure for ({}, {}): {}; caching negative for {}s",
-                    gtfs_id, fleet_no, e, VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
-                );
-                VehicleProperties::default()
-            }
-        };
-
-        {
-            let mut cache = self.vehicle_properties_cache.write().await;
-            if cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
-                cache.retain(|_, (p, stamp)| {
-                    let ttl = if p.tag_number.is_some() || p.variant.is_some() {
-                        VEHICLE_PROPS_CACHE_DURATION
-                    } else {
-                        VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
-                    };
-                    stamp.elapsed().unwrap_or_default() < Duration::from_secs(ttl)
-                });
-                while cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
-                    let oldest = cache
-                        .iter()
-                        .min_by_key(|(_, (_, stamp))| *stamp)
-                        .map(|(key, _)| key.clone());
-                    match oldest {
-                        Some(key) => {
-                            cache.remove(&key);
-                        }
-                        None => break,
-                    }
-                }
-            }
-            cache.insert(cache_key, (props.clone(), SystemTime::now()));
-        }
-
-        Ok(props)
     }
 }
 

@@ -317,6 +317,8 @@ async fn create_database_pool(config: &AppConfig) -> Result<PgPool, AppError> {
     create_pool_from_url(db_url, config).await
 }
 
+const DB_STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = '30s'";
+
 async fn create_pool_from_url(db_url: &str, config: &AppConfig) -> Result<PgPool, AppError> {
     let pool = PgPoolOptions::new()
         .max_connections(config.db_max_connections)
@@ -324,6 +326,12 @@ async fn create_pool_from_url(db_url: &str, config: &AppConfig) -> Result<PgPool
         .acquire_timeout(Duration::from_secs(config.db_acquire_timeout))
         .idle_timeout(Duration::from_secs(config.db_idle_timeout))
         .max_lifetime(Duration::from_secs(config.db_max_lifetime))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(DB_STATEMENT_TIMEOUT_SQL).execute(conn).await?;
+                Ok(())
+            })
+        })
         .connect(db_url)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;

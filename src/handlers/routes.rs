@@ -42,6 +42,11 @@ use crate::{
     tools::error::{AppError, AppResult},
 };
 
+const MTC_GTFS_ID: &str = "chennai_bus";
+const SERVICE_TYPE_CACHE_SECS: u64 = 3600;
+const SERVICE_TYPE_NEGATIVE_CACHE_SECS: u64 = 600;
+const SERVICE_TYPE_CACHE_MAX_ENTRIES: usize = 20000;
+
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
     limit: Option<i32>,
@@ -1758,36 +1763,34 @@ async fn get_vehicle_service_type_with_optional_internal_cache(
     gtfs_id: &str,
     vehicle_no: &str,
 ) -> AppResult<Option<String>> {
-    if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+    if is_chalo_gtfs_id(gtfs_id) {
         return fetch_vehicle_service_type(app_state, gtfs_id, vehicle_no).await;
     }
 
     let cache_key = format!("{}:{}", gtfs_id, vehicle_no);
-    let now = Instant::now();
     {
         let cache = app_state.chennai_service_type_cache.read().await;
         if let Some((expires_at, cached)) = cache.get(&cache_key) {
-            if *expires_at > now {
+            if *expires_at > Instant::now() {
                 return Ok(cached.clone());
             }
         }
     }
-    {
-        let mut cache = app_state.chennai_service_type_cache.write().await;
-        if let Some((expires_at, _)) = cache.get(&cache_key) {
-            if *expires_at <= now {
-                cache.remove(&cache_key);
-            }
+    let computed = fetch_vehicle_service_type(app_state, gtfs_id, vehicle_no).await?;
+    let ttl = if computed.is_some() {
+        Duration::from_secs(SERVICE_TYPE_CACHE_SECS)
+    } else {
+        Duration::from_secs(SERVICE_TYPE_NEGATIVE_CACHE_SECS)
+    };
+    let now = Instant::now();
+    let mut cache = app_state.chennai_service_type_cache.write().await;
+    if cache.len() >= SERVICE_TYPE_CACHE_MAX_ENTRIES && !cache.contains_key(&cache_key) {
+        cache.retain(|_, (expires_at, _)| *expires_at > now);
+        if cache.len() >= SERVICE_TYPE_CACHE_MAX_ENTRIES {
+            cache.clear();
         }
     }
-    let computed = fetch_vehicle_service_type(app_state, gtfs_id, vehicle_no).await?;
-    if computed.is_some() {
-        let mut cache = app_state.chennai_service_type_cache.write().await;
-        cache.insert(
-            cache_key,
-            (now + Duration::from_secs(60 * 60), computed.clone()),
-        );
-    }
+    cache.insert(cache_key, (now + ttl, computed.clone()));
     Ok(computed)
 }
 
@@ -1824,7 +1827,7 @@ async fn fetch_vehicle_service_type(
     if app_state
         .db_vehicle_reader_internal
         .is_vehicle_in_internal(vehicle_no, gtfs_id)
-        .await
+        .await?
     {
         // Service type only — no trip/schedule queries (those serve /service-type).
         let service_type = app_state
@@ -1841,12 +1844,14 @@ async fn fetch_vehicle_service_type(
     }
 
     // Standard DB path
-    let service_type = app_state
-        .db_vehicle_reader
-        .get_vehicle_service_type(vehicle_no)
-        .await?;
-    if service_type.is_some() {
-        return Ok(service_type);
+    if gtfs_id == MTC_GTFS_ID {
+        let service_type = app_state
+            .db_vehicle_reader
+            .get_vehicle_service_type(vehicle_no)
+            .await?;
+        if service_type.is_some() {
+            return Ok(service_type);
+        }
     }
     Ok(app_state
         .gtfs_service
@@ -2149,7 +2154,7 @@ async fn get_service_type_by_vehicle_impl(
     let bus_vehicle_variant = props.variant;
 
     // Get vehicle verification if requested
-    let is_valid = if pass_verify_req {
+    let is_valid = if pass_verify_req && gtfs_id == MTC_GTFS_ID {
         app_state
             .db_vehicle_reader
             .verify_vehicle(vehicle_no)
@@ -2324,7 +2329,7 @@ async fn get_service_type_by_vehicle_impl(
     if app_state
         .db_vehicle_reader_internal
         .is_vehicle_in_internal(vehicle_no, gtfs_id)
-        .await
+        .await?
     {
         info!(
             "vehicle_no={} found in vehicles_internal, using internal reader (gtfs_id={})",
@@ -2523,10 +2528,14 @@ async fn get_service_type_by_vehicle_impl(
     }
 
     // For other gtfs_id, use the existing DB logic
-    let mut vehicle_data = app_state
-        .db_vehicle_reader
-        .get_vehicle_data(vehicle_no, params.trip_number)
-        .await?;
+    let mut vehicle_data = if gtfs_id == MTC_GTFS_ID {
+        app_state
+            .db_vehicle_reader
+            .get_vehicle_data(vehicle_no, params.trip_number)
+            .await?
+    } else {
+        crate::models::VehicleDataWithRouteId::without_waybill(vehicle_no.to_string(), None)
+    };
 
     // Populate stops_count for each route in remaining_trip_details using its own route_number
     if let Some(ref mut details) = vehicle_data.remaining_trip_details {
@@ -2743,13 +2752,17 @@ pub async fn get_vehicle_info(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
 ) -> AppResult<HttpResponse> {
-    let (_gtfs_id, vehicle_no) = path.into_inner();
+    let (gtfs_id, vehicle_no) = path.into_inner();
     let vehicle_no = vehicle_no.replace("\"", "");
 
-    let vehicle_data = app_state
-        .db_vehicle_reader
-        .get_vehicle_data(&vehicle_no, None)
-        .await?;
+    let vehicle_data = if gtfs_id.replace("\"", "") == MTC_GTFS_ID {
+        app_state
+            .db_vehicle_reader
+            .get_vehicle_data(&vehicle_no, None)
+            .await?
+    } else {
+        crate::models::VehicleDataWithRouteId::without_waybill(vehicle_no.clone(), None)
+    };
 
     let depot_name = vehicle_data.entity_remark.or(vehicle_data.depot);
 
@@ -3397,76 +3410,11 @@ pub async fn get_bus_route_schedule(
         .await
         .unwrap_or_default();
 
+    let bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
+
     for waybill in waybills {
-        // Get trip details for this waybill
-        let vehicle_data = app_state
-            .db_vehicle_reader
-            .get_vehicle_data(&waybill.vehicle_no, None)
-            .await;
-
-        let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
-
-        // Find the trip that matches the required route_id
-        if let Ok(vehicle_data) = vehicle_data {
-            // First, try to find trip in remaining_trip_details that matches route_id
-            let matching_trip =
-                vehicle_data
-                    .remaining_trip_details
-                    .as_ref()
-                    .and_then(|trip_details| {
-                        trip_details.iter().find(|trip| trip.route_id == route_id)
-                    });
-
-            // If not found in remaining_trip_details, check schedule_details
-            let matching_trip = matching_trip.or_else(|| {
-                vehicle_data.schedule_details.as_ref().and_then(|details| {
-                    details
-                        .values()
-                        .flatten()
-                        .find(|trip| trip.route_id == route_id)
-                })
-            });
-
-            // Get trip start time from the matching trip
-            let trip_start_time: Option<i64> = matching_trip.and_then(|trip| {
-                // Try to construct time from db_start_time and waybill duty_date
-                if let (Some(db_start_time), Some(duty_date)) =
-                    (&trip.db_start_time, &vehicle_data.duty_date)
-                {
-                    // Parse duty_date (YYYY-MM-DD)
-                    let date = chrono::NaiveDate::parse_from_str(duty_date, "%Y-%m-%d").ok();
-
-                    // Parse db_start_time (HH:MM)
-                    let time = chrono::NaiveTime::parse_from_str(db_start_time, "%H:%M").ok();
-
-                    if let (Some(date), Some(time)) = (date, time) {
-                        let dt = chrono::NaiveDateTime::new(date, time);
-                        // Assume IST (UTC+5:30)
-                        if let Some(offset) = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60) {
-                            use chrono::TimeZone;
-                            if let Some(dt_with_tz) = offset.from_local_datetime(&dt).single() {
-                                return Some(dt_with_tz.timestamp_millis());
-                            }
-                        }
-                    }
-                }
-
-                // Fallback to existing start_time logic
-                trip.start_time.as_ref().and_then(|s| s.parse::<i64>().ok())
-            });
-
-            // Calculate ETAs using haversine distance function
-            bus_stop_etas =
-                calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
-        }
-
-        // If no trip details, calculate ETAs using haversine distance without start time
-        if bus_stop_etas.is_empty() {
-            bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
-        }
-
         schedule_details.push(crate::models::BusScheduleDetail {
-            eta: bus_stop_etas,
+            eta: bus_stop_etas.clone(),
             vehicle_no: waybill.vehicle_no.clone(),
             service_tier: waybill.service_type.clone(),
             trip_number: None,

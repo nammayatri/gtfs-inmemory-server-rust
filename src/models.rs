@@ -297,6 +297,36 @@ pub struct VehicleDataWithRouteId {
     pub waybill_status: Option<WaybillStatus>,
 }
 
+impl VehicleDataWithRouteId {
+    pub fn without_waybill(vehicle_no: String, service_type: Option<String>) -> Self {
+        Self {
+            waybill_id: None,
+            waybill_no: None,
+            service_type,
+            vehicle_no,
+            schedule_no: None,
+            last_updated: None,
+            duty_date: None,
+            route_id: None,
+            route_number: None,
+            depot: None,
+            trip_number: None,
+            is_active_trip: false,
+            remaining_trip_details: None,
+            entity_remark: None,
+            driver_code: None,
+            conductor_code: None,
+            deleted: None,
+            status: None,
+            schedule_details: None,
+            db_start_time: None,
+            db_end_time: None,
+            seat_layout_id: None,
+            waybill_status: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DepotVehicleSummary {
     pub fleet_no: String,
