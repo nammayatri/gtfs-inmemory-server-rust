@@ -1,8 +1,8 @@
 //! Service Hopper — precomputed metro interchange index.
 //!
 //! Answers "how do I get from stop A to stop B" for a metro feed, as an ordered
-//! list of legs, where each leg is one seated ride on a single route and the
-//! boundaries between legs are interchanges.
+//! list of minimum-degree paths, each split into seated rides (legs). Paths
+//! are sorted by total stops by the preprocessor; degree is the number of legs.
 //!
 //! # Where the answers come from
 //!
@@ -21,11 +21,12 @@
 //!
 //! # What is left here
 //!
-//! Loading, day-type selection, and O(1) lookup. Journeys are stored as CSR
-//! over a dense `N×N` grid: `offsets[src*n + dest]` bounds a slice of `chains`
-//! holding just the *interchange station ids* for that pair (typically 0–2
-//! entries). Legs are rebuilt at query time from `edges`, so route code lists
-//! are stored once and shared by every journey traversing them.
+//! Loading, day-type selection, and a hash-map lookup of all stored paths for
+//! an ordered station pair. `edges` is a list of seated rides, one per distinct
+//! station sequence, so two rides between the same stations over different
+//! stops (Alandur→Central on Blue and on Green) are two edges. A path is a list
+//! of edge indices; an absent pair has no path. Route code lists are stored
+//! once per ride and shared by every journey that uses it.
 //!
 //! # Directionality
 //!
@@ -48,7 +49,10 @@ use tracing::{error, info, warn};
 /// plan for; `MAX_STATIONS` keeps us far below the limit regardless.
 pub type StopId = u16;
 
-/// Refuse to load above this many stations. Guards the `N²` materialisation:
+/// Index into one day type's ride list. Delhi has ~8,400 rides per day type.
+pub type EdgeId = u32;
+
+/// Refuse to load above this many stations. Guards the all-pairs materialisation:
 /// a bus feed would be catastrophic here (chennai_bus has 9,776 stops → 95.6M
 /// pairs). Metro feeds are two orders of magnitude below this.
 pub const MAX_STATIONS: usize = 1_000;
@@ -108,7 +112,7 @@ pub struct HopLeg {
     /// Line short name, e.g. "Blue". Display only — never used for routing.
     pub line_name: String,
     /// Stops traversed on this leg.
-    pub num_stops: u16,
+    pub total_no_of_stops: u16,
     /// Other routes serving this exact leg with the same stop count, on the
     /// same line. Maps onto `RouteDetails.alternateRouteIds` in the backend,
     /// which uses it to track live vehicles across every serving route.
@@ -128,8 +132,7 @@ pub enum HopLookup {
     /// Both stops exist but no service connects them on this day type.
     NoPath,
     Found {
-        total_stops: u32,
-        legs: Vec<HopLeg>,
+        legs: Vec<Vec<HopLeg>>,
     },
 }
 
@@ -152,7 +155,7 @@ pub struct ArtifactFeed {
     /// the artifact that is actually loaded. Serde ignores unknown keys, so
     /// they stay in the file and stay inspectable.
     pub generated_at: String,
-    /// Index position is the dense `StopId` used in `edges` / `chains` keys.
+    /// Index position is the dense `StopId` used by `edges` and `chains` keys.
     pub stops: Vec<ArtifactStop>,
     /// `calendar_dates.txt` overrides: `"YYYYMMDD"` → day type. Consulted
     /// before the weekday, so a public holiday running a Sunday timetable
@@ -176,17 +179,23 @@ pub struct ArtifactDayType {
     /// Routes that survived the calendar filter on that date.
     #[serde(default)]
     pub routes: u32,
-    /// `"src:dest"` → the one seated ride between them.
-    pub edges: HashMap<String, ArtifactEdge>,
-    /// `"src:dest"` → interchange ids only. Empty array = direct ride.
-    /// Absence = no path.
-    pub chains: HashMap<String, Vec<StopId>>,
+    /// Every distinct seated ride. Position is the `EdgeId` used in `chains`.
+    pub edges: Vec<ArtifactEdge>,
+    /// `"src:dest"` → all minimum-degree paths, each a list of `EdgeId`s,
+    /// sorted by total stops. Absence means no path.
+    pub chains: HashMap<String, Vec<Vec<EdgeId>>>,
 }
 
-/// A resolved direct connection. Field names are abbreviated because this is
-/// the bulk of the artifact — ~1,100 edges per day type, three day types.
+/// One seated ride. Field names are abbreviated because this is the bulk of
+/// the artifact — ~1,100 edges per day type, three day types. The planner also
+/// writes `stops`, the full station sequence; it is not needed to serve a
+/// lookup, so it is left undeserialised.
 #[derive(Debug, Deserialize)]
 pub struct ArtifactEdge {
+    /// Boarding station.
+    pub src: StopId,
+    /// Alighting station.
+    pub dst: StopId,
     /// Stops traversed.
     pub n: u16,
     /// Line short name.
@@ -204,9 +213,11 @@ pub struct ArtifactEdge {
     pub dp: Option<String>,
 }
 
-/// A direct connection, interned. One entry of the planner's edge table.
+/// A seated ride, interned. One entry of the planner's edge table.
 #[derive(Debug, Clone)]
 struct DirectLeg {
+    src: StopId,
+    dest: StopId,
     num_stops: u16,
     line: Arc<str>,
     primary_route: Arc<str>,
@@ -226,8 +237,11 @@ pub enum HopperLoadError {
     TooManyStations(usize),
     /// The artifact declares no day types.
     NoDayTypes,
-    /// A `"src:dest"` key was malformed or referenced a station out of range.
+    /// A `"src:dest"` key was malformed or referenced a station out of range,
+    /// or its paths did not join `src` to `dest` through known edges.
     BadKey(String),
+    /// An edge referenced a station out of range or went nowhere.
+    BadEdge(usize),
 }
 
 impl std::fmt::Display for HopperLoadError {
@@ -243,6 +257,7 @@ impl std::fmt::Display for HopperLoadError {
             ),
             Self::NoDayTypes => write!(f, "artifact declares no day types"),
             Self::BadKey(k) => write!(f, "malformed or out-of-range pair key: {:?}", k),
+            Self::BadEdge(i) => write!(f, "edge {} has an out-of-range or looping station", i),
         }
     }
 }
@@ -273,13 +288,10 @@ pub struct HopperIndex {
     ids: HashMap<Arc<str>, StopId>,
     codes: Vec<Arc<str>>,
     names: Vec<Arc<str>>,
-    edges: HashMap<(StopId, StopId), DirectLeg>,
-    /// `n*n + 1` entries.
-    offsets: Vec<u32>,
-    chains: Vec<StopId>,
-    /// `n*n` entries. Distinguishes "direct ride, empty chain" from "no path,
-    /// also empty chain" — the two are otherwise identical in CSR.
-    reachable: Vec<bool>,
+    edges: Vec<DirectLeg>,
+    /// Ordered station pair → minimum-degree paths as edge ids, sorted by
+    /// total stops.
+    chains: HashMap<(StopId, StopId), Vec<Vec<EdgeId>>>,
 }
 
 impl HopperIndex {
@@ -305,14 +317,29 @@ impl HopperIndex {
 
     /// Number of ordered pairs with a journey stored.
     pub fn journey_count(&self) -> usize {
-        self.reachable.iter().filter(|r| **r).count()
+        self.chains.len()
     }
 
-    /// Approximate heap footprint of the CSR tables, for startup logging.
-    pub fn csr_bytes(&self) -> usize {
-        self.offsets.len() * std::mem::size_of::<u32>()
-            + self.chains.len() * std::mem::size_of::<StopId>()
-            + self.reachable.len()
+    /// Number of paths stored across all ordered pairs.
+    pub fn path_count(&self) -> usize {
+        self.chains.values().map(Vec::len).sum()
+    }
+
+    /// Approximate heap footprint of the chain map, excluding allocator and
+    /// hash-table control overhead, for startup logging.
+    pub fn chain_bytes(&self) -> usize {
+        self.chains.capacity() * std::mem::size_of::<((StopId, StopId), Vec<Vec<EdgeId>>)>()
+            + self
+                .chains
+                .values()
+                .map(|paths| {
+                    paths.capacity() * std::mem::size_of::<Vec<StopId>>()
+                        + paths
+                            .iter()
+                            .map(|chain| chain.capacity() * std::mem::size_of::<EdgeId>())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// Every stop code in the index, for diagnostics.
@@ -322,7 +349,7 @@ impl HopperIndex {
 
     // ── Load ───────────────────────────────────────────────────────────
 
-    /// Materialise one day type's graph into CSR.
+    /// Load one day type's edge and chain maps.
     ///
     /// The station list is shared across day types, so it is passed in already
     /// interned rather than rebuilt three times.
@@ -348,48 +375,46 @@ impl HopperIndex {
         };
 
         let mut pool = Pool::default();
-        let mut edges: HashMap<(StopId, StopId), DirectLeg> =
-            HashMap::with_capacity(dt.edges.len());
-        for (key, e) in &dt.edges {
-            let pair = parse_pair(key)?;
-            edges.insert(
-                pair,
-                DirectLeg {
-                    num_stops: e.n,
-                    line: pool.intern(&e.line),
-                    primary_route: pool.intern(&e.route),
-                    alt_routes: e.alt.iter().map(|r| pool.intern(r)).collect(),
-                    src_platform: e.sp.as_deref().map(|p| pool.intern(p)),
-                    dest_platform: e.dp.as_deref().map(|p| pool.intern(p)),
-                },
-            );
+        let mut edges: Vec<DirectLeg> = Vec::with_capacity(dt.edges.len());
+        for (i, e) in dt.edges.iter().enumerate() {
+            if e.src as usize >= n || e.dst as usize >= n || e.src == e.dst {
+                return Err(HopperLoadError::BadEdge(i));
+            }
+            edges.push(DirectLeg {
+                src: e.src,
+                dest: e.dst,
+                num_stops: e.n,
+                line: pool.intern(&e.line),
+                primary_route: pool.intern(&e.route),
+                alt_routes: e.alt.iter().map(|r| pool.intern(r)).collect(),
+                src_platform: e.sp.as_deref().map(|p| pool.intern(p)),
+                dest_platform: e.dp.as_deref().map(|p| pool.intern(p)),
+            });
         }
 
-        // Resolve every key first, then fill CSR in cell order. Walking the
-        // HashMap directly would not produce monotonic offsets.
-        let mut by_cell: Vec<Option<&Vec<StopId>>> = vec![None; n * n];
-        for (key, chain) in &dt.chains {
-            let (a, b) = parse_pair(key)?;
-            if a == b {
+        // Validate every path once here so `lookup` can index without checks:
+        // non-empty, known edges only, and legs that join src to dest.
+        let joins = |src: StopId, dest: StopId, path: &[EdgeId]| -> bool {
+            let mut at = src;
+            for &e in path {
+                match edges.get(e as usize) {
+                    Some(edge) if edge.src == at => at = edge.dest,
+                    _ => return false,
+                }
+            }
+            !path.is_empty() && at == dest
+        };
+        let mut chains = HashMap::with_capacity(dt.chains.len());
+        for (key, paths) in &dt.chains {
+            let (src, dest) = parse_pair(key)?;
+            if src == dest {
                 continue;
             }
-            if chain.iter().any(|&via| via as usize >= n) {
+            if paths.is_empty() || !paths.iter().all(|p| joins(src, dest, p)) {
                 return Err(HopperLoadError::BadKey(key.to_string()));
             }
-            by_cell[a as usize * n + b as usize] = Some(chain);
+            chains.insert((src, dest), paths.clone());
         }
-
-        let mut offsets = vec![0u32; n * n + 1];
-        let mut chains: Vec<StopId> = Vec::new();
-        let mut reachable = vec![false; n * n];
-        for cell in 0..n * n {
-            offsets[cell] = chains.len() as u32;
-            if let Some(chain) = by_cell[cell] {
-                reachable[cell] = true;
-                chains.extend_from_slice(chain);
-            }
-        }
-        offsets[n * n] = chains.len() as u32;
 
         Ok(Self {
             gtfs_id: gtfs_id.to_string(),
@@ -400,15 +425,13 @@ impl HopperIndex {
             codes: codes.to_vec(),
             names: names.to_vec(),
             edges,
-            offsets,
             chains,
-            reachable,
         })
     }
 
     // ── Query ──────────────────────────────────────────────────────────
 
-    /// Look up the stored journey between two stop codes.
+    /// Reconstruct all stored paths between two stop codes in planner order.
     pub fn lookup(&self, from: &str, to: &str) -> HopLookup {
         let Some(&src) = self.ids.get(from) else {
             return HopLookup::UnknownStop(from.to_string());
@@ -420,61 +443,42 @@ impl HopperIndex {
             return HopLookup::SameStop;
         }
 
-        let cell = src as usize * self.n + dest as usize;
-        if !self.reachable[cell] {
+        let Some(chains) = self.chains.get(&(src, dest)) else {
             return HopLookup::NoPath;
+        };
+
+        let mut paths = Vec::with_capacity(chains.len());
+        for chain in chains {
+            let mut legs = Vec::with_capacity(chain.len());
+            let mut prev_line: Option<Arc<str>> = None;
+            for &e in chain {
+                let edge = &self.edges[e as usize];
+                let (a, b) = (edge.src, edge.dest);
+                let interchange_type = prev_line.as_ref().map(|prev| {
+                    if *prev == edge.line {
+                        InterchangeType::SameLineChange
+                    } else {
+                        InterchangeType::LineChange
+                    }
+                });
+                prev_line = Some(edge.line.clone());
+                legs.push(HopLeg {
+                    src_stop_code: self.codes[a as usize].to_string(),
+                    src_stop_name: self.names[a as usize].to_string(),
+                    src_platform: edge.src_platform.as_deref().map(str::to_string),
+                    dest_stop_code: self.codes[b as usize].to_string(),
+                    dest_stop_name: self.names[b as usize].to_string(),
+                    dest_platform: edge.dest_platform.as_deref().map(str::to_string),
+                    route_code: edge.primary_route.to_string(),
+                    line_name: edge.line.to_string(),
+                    total_no_of_stops: edge.num_stops,
+                    alternate_route_codes: edge.alt_routes.iter().map(|r| r.to_string()).collect(),
+                    interchange_type,
+                });
+            }
+            paths.push(legs);
         }
-
-        let chain = &self.chains[self.offsets[cell] as usize..self.offsets[cell + 1] as usize];
-
-        let mut nodes = Vec::with_capacity(chain.len() + 2);
-        nodes.push(src);
-        nodes.extend_from_slice(chain);
-        nodes.push(dest);
-
-        let mut legs = Vec::with_capacity(nodes.len() - 1);
-        let mut total_stops = 0u32;
-        let mut prev_line: Option<Arc<str>> = None;
-
-        for w in nodes.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            let Some(edge) = self.edges.get(&(a, b)) else {
-                // Only reachable if the chain and edge tables disagree, which
-                // would be a planner bug rather than a data condition.
-                warn!(
-                    gtfs_id = %self.gtfs_id, day_type = %self.day_type,
-                    "service hopper: chain references edge {}:{}, which the artifact does not define",
-                    a, b
-                );
-                return HopLookup::NoPath;
-            };
-            total_stops += edge.num_stops as u32;
-
-            let interchange_type = prev_line.as_ref().map(|prev| {
-                if *prev == edge.line {
-                    InterchangeType::SameLineChange
-                } else {
-                    InterchangeType::LineChange
-                }
-            });
-            prev_line = Some(edge.line.clone());
-
-            legs.push(HopLeg {
-                src_stop_code: self.codes[a as usize].to_string(),
-                src_stop_name: self.names[a as usize].to_string(),
-                src_platform: edge.src_platform.as_deref().map(str::to_string),
-                dest_stop_code: self.codes[b as usize].to_string(),
-                dest_stop_name: self.names[b as usize].to_string(),
-                dest_platform: edge.dest_platform.as_deref().map(str::to_string),
-                route_code: edge.primary_route.to_string(),
-                line_name: edge.line.to_string(),
-                num_stops: edge.num_stops,
-                alternate_route_codes: edge.alt_routes.iter().map(|r| r.to_string()).collect(),
-                interchange_type,
-            });
-        }
-
-        HopLookup::Found { total_stops, legs }
+        HopLookup::Found { legs: paths }
     }
 }
 
@@ -644,15 +648,16 @@ pub fn load_all(preprocessed_data_dir: &str) -> HashMap<String, Arc<FeedHoppers>
                     .filter_map(|dt| hoppers.by_day_type.get(*dt))
                     .map(|i| {
                         format!(
-                            "{} {}: {} legs, {} journeys",
+                            "{} {}: {} edges, {} pairs, {} paths",
                             i.day_type(),
                             i.service_date(),
                             i.edge_count(),
-                            i.journey_count()
+                            i.journey_count(),
+                            i.path_count()
                         )
                     })
                     .collect();
-                let bytes: usize = hoppers.by_day_type.values().map(|i| i.csr_bytes()).sum();
+                let bytes: usize = hoppers.by_day_type.values().map(|i| i.chain_bytes()).sum();
                 let stations = hoppers
                     .by_day_type
                     .values()
@@ -711,21 +716,21 @@ mod tests {
               "WD": {
                 "date": "20260831",
                 "routes": 2,
-                "edges": {
-                  "0:1": {"n": 1, "line": "Blue",  "route": "r1", "alt": ["r1b"], "sp": "1", "dp": "2"},
-                  "1:2": {"n": 1, "line": "Green", "route": "r2", "alt": [],      "sp": "3", "dp": "4"},
-                  "0:2": {"n": 2, "line": "Blue",  "route": "r3", "alt": [],      "sp": "1", "dp": "5"}
-                },
-                "chains": {"0:1": [], "1:2": [], "0:2": []}
+                "edges": [
+                  {"src": 0, "dst": 1, "n": 1, "line": "Blue",  "route": "r1", "alt": ["r1b"], "sp": "1", "dp": "2", "stops": [0, 1]},
+                  {"src": 1, "dst": 2, "n": 1, "line": "Green", "route": "r2", "alt": [],      "sp": "3", "dp": "4", "stops": [1, 2]},
+                  {"src": 0, "dst": 2, "n": 2, "line": "Blue",  "route": "r3", "alt": [],      "sp": "1", "dp": "5", "stops": [0, 1, 2]}
+                ],
+                "chains": {"0:1": [[0]], "1:2": [[1]], "0:2": [[2]]}
               },
               "SUN": {
                 "date": "20260830",
                 "routes": 2,
-                "edges": {
-                  "0:1": {"n": 1, "line": "Blue",  "route": "r1", "alt": [], "sp": "1", "dp": "2"},
-                  "1:2": {"n": 1, "line": "Green", "route": "r2", "alt": [], "sp": "3", "dp": "4"}
-                },
-                "chains": {"0:1": [], "1:2": [], "0:2": [1]}
+                "edges": [
+                  {"src": 0, "dst": 1, "n": 1, "line": "Blue",  "route": "r1", "alt": [], "sp": "1", "dp": "2"},
+                  {"src": 1, "dst": 2, "n": 1, "line": "Green", "route": "r2", "alt": [], "sp": "3", "dp": "4"}
+                ],
+                "chains": {"0:1": [[0]], "1:2": [[1]], "0:2": [[0, 1]]}
               }
             }
           }
@@ -743,7 +748,7 @@ mod tests {
 
     fn legs(idx: &HopperIndex, from: &str, to: &str) -> Vec<HopLeg> {
         match idx.lookup(from, to) {
-            HopLookup::Found { legs, .. } => legs,
+            HopLookup::Found { mut legs } => legs.remove(0),
             other => panic!("expected a journey {}→{}, got {:?}", from, to, other),
         }
     }
@@ -797,7 +802,7 @@ mod tests {
         let l = legs(idx, "A", "C");
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].route_code, "r3");
-        assert_eq!(l[0].num_stops, 2);
+        assert_eq!(l[0].total_no_of_stops, 2);
         assert!(l[0].interchange_type.is_none());
     }
 
@@ -816,11 +821,17 @@ mod tests {
     }
 
     #[test]
-    fn total_stops_sums_the_legs() {
+    fn stop_counts_are_available_on_each_leg() {
         let f = load();
         let sun = f.index_for(day(2026, 8, 30)).unwrap();
         match sun.lookup("A", "C") {
-            HopLookup::Found { total_stops, .. } => assert_eq!(total_stops, 2),
+            HopLookup::Found { legs } => assert_eq!(
+                legs[0]
+                    .iter()
+                    .map(|leg| leg.total_no_of_stops as u32)
+                    .sum::<u32>(),
+                2
+            ),
             other => panic!("expected a journey, got {:?}", other),
         }
     }
@@ -874,8 +885,7 @@ mod tests {
     fn reachability_is_not_inferred_from_an_empty_chain() {
         let f = load();
         let wd = f.index_for(day(2026, 8, 31)).unwrap();
-        // "0:2" has an empty chain (direct) and "2:0" has no entry at all. Both
-        // look identical in CSR, so only `reachable` tells them apart.
+        // "0:2" has one direct path; "2:0" has no map entry.
         assert!(matches!(wd.lookup("A", "C"), HopLookup::Found { .. }));
         assert!(matches!(wd.lookup("C", "A"), HopLookup::NoPath));
         assert_eq!(wd.journey_count(), 3);
@@ -889,7 +899,7 @@ mod tests {
         let json = format!(
             r#"{{"big":{{"generatedAt":"2026-08-29T04:00:00Z","feedVersion":null,
                 "minDailyTrips":1,"stops":[{}],"calendarDates":{{}},
-                "dayTypes":{{"WD":{{"date":"20260831","routes":0,"edges":{{}},"chains":{{}}}}}}}}}}"#,
+                "dayTypes":{{"WD":{{"date":"20260831","routes":0,"edges":[],"chains":{{}}}}}}}}}}"#,
             stops.join(",")
         );
         let artifact: Artifact = serde_json::from_str(&json).unwrap();
@@ -900,20 +910,143 @@ mod tests {
         }
     }
 
+    fn two_station_artifact(edge: &str, chains: &str) -> Artifact {
+        let json = format!(
+            r#"{{"bad":{{"generatedAt":"2026-08-29T04:00:00Z","feedVersion":null,
+              "minDailyTrips":1,
+              "stops":[{{"code":"A","name":"A"}},{{"code":"B","name":"B"}}],
+              "calendarDates":{{}},
+              "dayTypes":{{"WD":{{"date":"20260831","routes":1,
+                "edges":[{}],"chains":{}}}}}}}}}"#,
+            edge, chains
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn an_out_of_range_edge_is_rejected_not_ignored() {
+        for edge in [
+            r#"{"src":0,"dst":9,"n":1,"line":"Blue","route":"r1"}"#,
+            r#"{"src":1,"dst":1,"n":1,"line":"Blue","route":"r1"}"#,
+        ] {
+            let artifact = two_station_artifact(edge, "{}");
+            assert!(matches!(
+                FeedHoppers::from_artifact("bad", &artifact["bad"]),
+                Err(HopperLoadError::BadEdge(0))
+            ));
+        }
+    }
+
     #[test]
     fn a_malformed_pair_key_is_rejected_not_ignored() {
-        let json = r#"{"bad":{"generatedAt":"2026-08-29T04:00:00Z","feedVersion":null,
-          "minDailyTrips":1,
-          "stops":[{"code":"A","name":"A"},{"code":"B","name":"B"}],
-          "calendarDates":{},
-          "dayTypes":{"WD":{"date":"20260831","routes":1,
-            "edges":{"0:9":{"n":1,"line":"Blue","route":"r1","alt":[],"sp":null,"dp":null}},
-            "chains":{}}}}}"#;
-        let artifact: Artifact = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            FeedHoppers::from_artifact("bad", &artifact["bad"]),
-            Err(HopperLoadError::BadKey(_))
-        ));
+        let edge = r#"{"src":0,"dst":1,"n":1,"line":"Blue","route":"r1"}"#;
+        for chains in [r#"{"0:9":[[0]]}"#, r#"{"0-1":[[0]]}"#] {
+            let artifact = two_station_artifact(edge, chains);
+            assert!(matches!(
+                FeedHoppers::from_artifact("bad", &artifact["bad"]),
+                Err(HopperLoadError::BadKey(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn two_direct_rides_between_one_pair_are_both_served() {
+        let mut artifact: Artifact = serde_json::from_str(fixture()).unwrap();
+        let feed = artifact.get_mut("toy").unwrap();
+        let dt = feed.day_types.get_mut("WD").unwrap();
+        dt.edges.push(ArtifactEdge {
+            src: 0,
+            dst: 2,
+            n: 3,
+            line: "Green".into(),
+            route: "r4".into(),
+            alt: vec![],
+            sp: None,
+            dp: None,
+        });
+        dt.chains.insert("0:2".into(), vec![vec![2], vec![3]]);
+        let hoppers = FeedHoppers::from_artifact("toy", feed).unwrap();
+        let idx = hoppers.index_for(day(2026, 8, 31)).unwrap();
+        let HopLookup::Found { legs: paths } = idx.lookup("A", "C") else {
+            panic!("expected paths");
+        };
+        let summary: Vec<(usize, &str, u16)> = paths
+            .iter()
+            .map(|legs| {
+                (
+                    legs.len(),
+                    legs[0].line_name.as_str(),
+                    legs[0].total_no_of_stops,
+                )
+            })
+            .collect();
+        assert_eq!(summary, vec![(1, "Blue", 2), (1, "Green", 3)]);
+    }
+
+    #[test]
+    fn multiple_paths_preserve_planner_order_and_reset_interchange_type() {
+        let mut artifact: Artifact = serde_json::from_str(fixture()).unwrap();
+        let feed = artifact.get_mut("toy").unwrap();
+        feed.stops.push(ArtifactStop {
+            code: "D".into(),
+            name: "Delta".into(),
+        });
+        let dt = feed.day_types.get_mut("SUN").unwrap();
+        for (src, dst, stops) in [(0, 3, 2), (3, 2, 3)] {
+            dt.edges.push(ArtifactEdge {
+                src,
+                dst,
+                n: stops,
+                line: "Blue".into(),
+                route: format!("{}:{}", src, dst),
+                alt: vec![],
+                sp: None,
+                dp: None,
+            });
+        }
+        dt.chains.insert("0:2".into(), vec![vec![0, 1], vec![2, 3]]);
+        let hoppers = FeedHoppers::from_artifact("toy", feed).unwrap();
+        let idx = hoppers.index_for(day(2026, 8, 30)).unwrap();
+        let HopLookup::Found { legs: paths } = idx.lookup("A", "C") else {
+            panic!("expected paths");
+        };
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0][0].dest_stop_code, "B");
+        assert_eq!(paths[1][0].dest_stop_code, "D");
+        assert!(paths
+            .iter()
+            .all(|legs| legs.len() == 2 && legs[0].interchange_type.is_none()));
+        assert_eq!(
+            paths[1][1].interchange_type,
+            Some(InterchangeType::SameLineChange)
+        );
+        assert_eq!(idx.path_count(), 4);
+        let json = serde_json::to_value(&paths).unwrap();
+        assert_eq!(json[1][0]["totalNoOfStops"], 2);
+        assert!(json[1][0].get("numStops").is_none());
+    }
+
+    #[test]
+    fn paths_that_are_empty_unknown_or_do_not_join_are_rejected() {
+        for paths in [
+            vec![],
+            vec![vec![]],
+            vec![vec![9]],
+            vec![vec![0]],
+            vec![vec![1, 0]],
+        ] {
+            let mut artifact: Artifact = serde_json::from_str(fixture()).unwrap();
+            let feed = artifact.get_mut("toy").unwrap();
+            feed.day_types
+                .get_mut("SUN")
+                .unwrap()
+                .chains
+                .insert("0:2".into(), paths);
+            assert!(matches!(
+                FeedHoppers::from_artifact("toy", feed),
+                Err(HopperLoadError::BadKey(_))
+            ));
+        }
     }
 
     /// Exercise the artifact the preprocessor actually wrote, when one is
@@ -950,22 +1083,64 @@ mod tests {
                         if a == b {
                             continue;
                         }
-                        let HopLookup::Found { total_stops, legs } = idx.lookup(a, b) else {
+                        let HopLookup::Found { legs: paths } = idx.lookup(a, b) else {
                             continue;
                         };
                         found += 1;
-                        assert!(!legs.is_empty());
-                        assert_eq!(&legs[0].src_stop_code, a);
-                        assert_eq!(&legs[legs.len() - 1].dest_stop_code, b);
-                        assert_eq!(
-                            total_stops,
-                            legs.iter().map(|l| l.num_stops as u32).sum::<u32>()
-                        );
-                        for w in legs.windows(2) {
-                            assert_eq!(w[0].dest_stop_code, w[1].src_stop_code);
+                        assert!(!paths.is_empty());
+                        if gtfs_id == "chennai_metro" && a == "SMM|0233" && b == "SAP|0133" {
+                            assert_eq!(
+                                paths.len(),
+                                1,
+                                "Airport transfer detours must be deduplicated"
+                            );
+                            assert_eq!(paths[0].len(), 2);
+                            assert_eq!(paths[0][0].dest_stop_code, "SAL|0231");
                         }
-                        assert!(legs[0].interchange_type.is_none());
-                        assert!(legs[1..].iter().all(|l| l.interchange_type.is_some()));
+                        let degree = paths[0].len();
+                        let mut previous_total = 0;
+                        if gtfs_id == "chennai_metro" && a == "SAL|0231" && b == "SCC|0201" {
+                            let summary: Vec<(usize, &str, u16)> = paths
+                                .iter()
+                                .map(|legs| {
+                                    (
+                                        legs.len(),
+                                        legs[0].line_name.as_str(),
+                                        legs[0].total_no_of_stops,
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(summary, vec![(1, "Blue", 10), (1, "Green", 15)]);
+                        }
+                        let mut rides = std::collections::HashSet::new();
+                        for legs in paths {
+                            assert!(rides.insert(
+                                legs.iter()
+                                    .map(|leg| {
+                                        (
+                                            leg.src_stop_code.clone(),
+                                            leg.dest_stop_code.clone(),
+                                            leg.route_code.clone(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            ));
+                            assert_eq!(legs.len(), degree);
+                            assert!(!legs.is_empty());
+                            assert_eq!(&legs[0].src_stop_code, a);
+                            assert_eq!(&legs[legs.len() - 1].dest_stop_code, b);
+                            let total = legs
+                                .iter()
+                                .map(|leg| leg.total_no_of_stops as u32)
+                                .sum::<u32>();
+                            assert!(total >= previous_total);
+                            previous_total = total;
+                            for w in legs.windows(2) {
+                                assert_eq!(w[0].dest_stop_code, w[1].src_stop_code);
+                            }
+                            assert!(legs[0].interchange_type.is_none());
+                            assert!(legs[1..].iter().all(|l| l.interchange_type.is_some()));
+                        }
                     }
                 }
                 assert_eq!(found, idx.journey_count(), "{} {}", gtfs_id, dt);
