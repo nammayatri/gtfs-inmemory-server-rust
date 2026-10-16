@@ -5625,32 +5625,32 @@ pub struct MetroHopResponse {
     /// Representative service date the planner built this graph from,
     /// `YYYYMMDD`. Makes it obvious which timetable produced the answer.
     pub service_date: String,
-    pub total_stops: u32,
-    pub num_interchanges: usize,
-    /// `null` when both stops exist but nothing connects them — distinct from a
-    /// 404, which means a stop code is unknown to this feed.
-    pub legs: Option<Vec<crate::services::service_hopper::HopLeg>>,
+    /// All minimum-degree paths, ordered by total stops. Each inner array is
+    /// one path; each leg carries its own `totalNoOfStops`.
+    /// `null` means both stops exist but nothing connects them.
+    pub legs: Option<Vec<Vec<crate::services::service_hopper::HopLeg>>>,
 }
 
 /// GET /metro/hop/{gtfs_id}?from={stop_code}&to={stop_code}
 ///
-/// Returns the precomputed minimum-stop journey between two metro stations,
-/// split into one leg per seated ride with an interchange at each boundary.
+/// Returns every precomputed minimum-degree path between two metro stations,
+/// sorted by total stops. Degree is the number of legs, so a direct ride
+/// suppresses interchange alternatives. Each inner leg array is one path.
 ///
 /// The answer is day-type specific: the Nandi planner builds one graph per
 /// `WD` / `SAT` / `SUN` from the feed's service calendar, so a pair joined by a
 /// weekday-only through-service correctly needs an interchange on a Sunday.
 /// `date` selects the day type; it defaults to today in IST.
 ///
-/// O(1): a dense array index into the graph loaded at startup from
-/// `metro_hops.json`. No search happens at request time.
+/// Looks up the chains loaded at startup from `metro_hops.json` and rebuilds
+/// their legs. No path search happens at request time.
 ///
 /// Status codes are deliberately distinct — the backend needs to tell these
 /// apart:
 /// * `404` — unknown `gtfs_id`, or a stop code this feed does not contain
 /// * `400` — `date` is not `YYYYMMDD`
 /// * `200` with `legs: null` — both stops exist, nothing connects them
-/// * `200` with `legs: []` — source and destination are the same station
+/// * `200` with `legs: [[]]` — one zero-leg path for the same station
 async fn metro_hop(
     app_state: Data<AppState>,
     path: Path<String>,
@@ -5685,20 +5685,13 @@ async fn metro_hop(
         ))
     })?;
 
-    let respond = |total_stops: u32, legs: Option<Vec<HopLeg>>| {
-        // Legs are joined by interchanges, so N legs means N-1 changes.
-        let num_interchanges = legs
-            .as_ref()
-            .map(|l| l.len().saturating_sub(1))
-            .unwrap_or(0);
+    let respond = |legs: Option<Vec<Vec<HopLeg>>>| {
         HttpResponse::Ok().json(MetroHopResponse {
             gtfs_id: gtfs_id.clone(),
             src_stop_code: params.from.clone(),
             dest_stop_code: params.to.clone(),
             day_type: index.day_type().to_string(),
             service_date: index.service_date().to_string(),
-            total_stops,
-            num_interchanges,
             legs,
         })
     };
@@ -5712,9 +5705,9 @@ async fn metro_hop(
         }
         // A real, zero-length journey — neither an error nor a missing path,
         // so an empty leg list rather than null.
-        HopLookup::SameStop => respond(0, Some(Vec::new())),
-        HopLookup::NoPath => respond(0, None),
-        HopLookup::Found { total_stops, legs } => respond(total_stops, Some(legs)),
+        HopLookup::SameStop => respond(Some(vec![Vec::new()])),
+        HopLookup::NoPath => respond(None),
+        HopLookup::Found { legs } => respond(Some(legs)),
     })
 }
 
