@@ -8,8 +8,9 @@ use sqlx::PgPool;
 use tracing::{debug, error, info, warn};
 
 use crate::models::{
-    BusSchedule, VehicleData, VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse,
-    WaybillStatus, WaybillTripInfo,
+    BusSchedule, DepotInfo, DepotVehicleInfo, FleetOperationInfo, VehicleData,
+    VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse, WaybillStatus,
+    WaybillTripInfo,
 };
 use crate::tools::error::{AppError, AppResult};
 
@@ -64,6 +65,31 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         vehicle_no: &str,
         gtfs_id: &str,
     ) -> AppResult<Option<String>>;
+
+    // ── Depots (entities_internal / vehicles_internal) ──────────────────
+    // Feed-scoped mirrors of the external reader's depot calls, same `Option`/empty contract.
+
+    async fn get_depots(&self, gtfs_id: &str) -> AppResult<Vec<DepotInfo>>;
+
+    async fn get_depot_by_id(&self, depot_id: &str, gtfs_id: &str) -> AppResult<Option<DepotInfo>>;
+
+    async fn get_depot_vehicles(
+        &self,
+        depot_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<DepotVehicleInfo>>;
+
+    async fn get_fleet_operation(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<FleetOperationInfo>>;
+
+    async fn clear_depot_cache(&self) -> AppResult<()>;
+
+    /// Drops the depot read caches after this service writes to the internal DB, so an
+    /// operator's own edit is not hidden behind the TTL. Best-effort, hence no error.
+    async fn clear_caches_after_write(&self);
 }
 
 // Mock implementation for local testing without a database
@@ -158,6 +184,49 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
             "Database is not connected in local testing mode.".to_string(),
         ))
     }
+
+    async fn get_depots(&self, _gtfs_id: &str) -> AppResult<Vec<DepotInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_depot_by_id(
+        &self,
+        _depot_id: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Option<DepotInfo>> {
+        Ok(None)
+    }
+
+    async fn get_depot_vehicles(
+        &self,
+        _depot_id: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Vec<DepotVehicleInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_fleet_operation(
+        &self,
+        _fleet_no: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<Option<FleetOperationInfo>> {
+        Ok(None)
+    }
+
+    async fn clear_depot_cache(&self) -> AppResult<()> {
+        Ok(())
+    }
+
+    async fn clear_caches_after_write(&self) {}
+}
+
+/// Feed-scoped depot lookups. Keys carry the gtfs_id because `entities_internal` is shared
+/// across feeds, unlike the external reader's single-tenant `entities` table.
+#[derive(Default)]
+struct InternalDepotCache {
+    depots: HashMap<String, (Vec<DepotInfo>, SystemTime)>,
+    depot_by_id: HashMap<(String, String), (DepotInfo, SystemTime)>,
+    depot_vehicles: HashMap<(String, String), (Vec<DepotVehicleInfo>, SystemTime)>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -167,6 +236,7 @@ pub struct DBVehicleReaderInternal {
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
     vehicle_properties_cache:
         Arc<RwLock<HashMap<(String, String), (VehicleProperties, SystemTime)>>>,
+    depot_cache: Arc<RwLock<InternalDepotCache>>,
 }
 
 const WAYBILL_ROUTE_CACHE_DURATION: u64 = 30; // short TTL so bus swaps are reflected quickly
@@ -176,6 +246,9 @@ const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 const VEHICLE_PROPS_CACHE_DURATION: u64 = 43200;
 const VEHICLE_PROPS_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
 const VEHICLE_PROPS_CACHE_MAX_ENTRIES: usize = 4000;
+// 5 minutes. This service's own writes drop the cache (see clear_caches_after_write); the TTL
+// only bounds staleness from writes made by another pod.
+const DEPOT_CACHE_DURATION: u64 = 300;
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
@@ -184,6 +257,7 @@ impl DBVehicleReaderInternal {
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
+            depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
         }
     }
 
@@ -195,6 +269,7 @@ impl DBVehicleReaderInternal {
             waybills_by_route_cache: Arc::new(RwLock::new(HashMap::new())),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
+            depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
         }
     }
 
@@ -212,6 +287,11 @@ impl DBVehicleReaderInternal {
     fn is_station_eta_cache_expired(&self, timestamp: SystemTime) -> bool {
         let elapsed = timestamp.elapsed().unwrap_or_default();
         elapsed >= Duration::from_secs(STATION_ETA_CACHE_DURATION)
+    }
+
+    fn is_depot_cache_expired(&self, timestamp: SystemTime) -> bool {
+        let elapsed = timestamp.elapsed().unwrap_or_default();
+        elapsed >= Duration::from_secs(DEPOT_CACHE_DURATION)
     }
 
     fn get_waybills_by_route_cache_key(
@@ -1453,6 +1533,41 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
     }
 
+    async fn get_depots(&self, gtfs_id: &str) -> AppResult<Vec<DepotInfo>> {
+        self.get_depots_impl(gtfs_id).await
+    }
+
+    async fn get_depot_by_id(&self, depot_id: &str, gtfs_id: &str) -> AppResult<Option<DepotInfo>> {
+        self.get_depot_by_id_impl(depot_id, gtfs_id).await
+    }
+
+    async fn get_depot_vehicles(
+        &self,
+        depot_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<DepotVehicleInfo>> {
+        self.get_depot_vehicles_impl(depot_id, gtfs_id).await
+    }
+
+    async fn get_fleet_operation(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<FleetOperationInfo>> {
+        self.get_fleet_operation_impl(fleet_no, gtfs_id).await
+    }
+
+    async fn clear_depot_cache(&self) -> AppResult<()> {
+        self.clear_depot_cache_impl().await
+    }
+
+    async fn clear_caches_after_write(&self) {
+        // Only the depot caches: vehicle_properties_cache is a hot 12h cache whose
+        // write-staleness predates this change, and dropping it pod-locally would not make it
+        // consistent anyway.
+        *self.depot_cache.write().await = InternalDepotCache::default();
+    }
+
     async fn get_vehicle_properties(
         &self,
         fleet_no: &str,
@@ -1603,5 +1718,289 @@ impl DBVehicleReaderInternal {
         };
 
         Ok(response)
+    }
+
+    // ── Depots (entities_internal / vehicles_internal) ───────────────────
+    // Failures surface rather than being swallowed: an outage must never reach the caller as
+    // "no such depot". entity_remark is the short code — nullable, so entity_id stays the key.
+
+    async fn get_depots_impl(&self, gtfs_id: &str) -> AppResult<Vec<DepotInfo>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((depots, timestamp)) = cache.depots.get(gtfs_id) {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!("internal depot cache HIT for depots gtfs_id={}", gtfs_id);
+                    return Ok(depots.clone());
+                }
+            }
+        }
+
+        // No join to vehicles: a depot with no buses must still be listed.
+        let query = r#"
+            SELECT entity_id::text AS depot_id,
+                   entity_remark AS depot_code,
+                   entity_name AS depot_name
+            FROM entities_internal
+            WHERE gtfs_id = $1 AND deleted = false
+            ORDER BY entity_name
+        "#;
+
+        match sqlx::query_as::<_, DepotInfo>(query)
+            .bind(gtfs_id)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                info!(
+                    "internal get_depots gtfs_id={} rows={}",
+                    gtfs_id,
+                    rows.len()
+                );
+                let mut cache = self.depot_cache.write().await;
+                cache
+                    .depots
+                    .insert(gtfs_id.to_string(), (rows.clone(), SystemTime::now()));
+                Ok(rows)
+            }
+            Err(e) => Err(AppError::DbError(format!(
+                "get_depots(gtfs_id={}): {}",
+                gtfs_id, e
+            ))),
+        }
+    }
+
+    async fn get_depot_by_id_impl(
+        &self,
+        depot_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<DepotInfo>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let cache_key = (gtfs_id.to_string(), depot_id.to_string());
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((depot, timestamp)) = cache.depot_by_id.get(&cache_key) {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    return Ok(Some(depot.clone()));
+                }
+            }
+        }
+
+        // `::text` cast so the predicate works whether entity_id is bigint or text.
+        let query = r#"
+            SELECT entity_id::text AS depot_id,
+                   entity_remark AS depot_code,
+                   entity_name AS depot_name
+            FROM entities_internal
+            WHERE entity_id::text = $1 AND gtfs_id = $2 AND deleted = false
+            LIMIT 1
+        "#;
+
+        match sqlx::query_as::<_, DepotInfo>(query)
+            .bind(depot_id)
+            .bind(gtfs_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => {
+                // Only hits are cached: unknown ids are caller-supplied and would grow this
+                // map without bound.
+                if let Some(depot) = &row {
+                    let mut cache = self.depot_cache.write().await;
+                    cache
+                        .depot_by_id
+                        .insert(cache_key, (depot.clone(), SystemTime::now()));
+                }
+                Ok(row)
+            }
+            Err(e) => Err(AppError::DbError(format!(
+                "get_depot_by_id(depot_id={}, gtfs_id={}): {}",
+                depot_id, gtfs_id, e
+            ))),
+        }
+    }
+
+    async fn get_depot_vehicles_impl(
+        &self,
+        depot_id: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<DepotVehicleInfo>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+
+        let cache_key = (gtfs_id.to_string(), depot_id.to_string());
+        {
+            let cache = self.depot_cache.read().await;
+            if let Some((vehicles, timestamp)) = cache.depot_vehicles.get(&cache_key) {
+                if !self.is_depot_cache_expired(*timestamp) {
+                    debug!(
+                        "internal depot cache HIT for depot_id={} gtfs_id={}",
+                        depot_id, gtfs_id
+                    );
+                    return Ok(vehicles.clone());
+                }
+            }
+        }
+
+        let query = r#"
+            SELECT v.fleet_no AS fleet_no,
+                   v.vehicle_no AS vehicle_no,
+                   v.status AS status,
+                   st.service_type_name AS service_type
+            FROM vehicles_internal v
+            LEFT JOIN service_type_internal st
+                   ON st.service_type_id = v.bus_service_type_id
+                  AND st.gtfs_id = v.gtfs_id
+                  AND st.deleted = false
+            WHERE v.entity_id::text = $1
+              AND v.gtfs_id = $2
+              AND v.deleted = false
+              AND v.fleet_no <> ''
+            ORDER BY v.fleet_no
+            LIMIT 1048575
+        "#;
+
+        match sqlx::query_as::<_, DepotVehicleInfo>(query)
+            .bind(depot_id)
+            .bind(gtfs_id)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                info!(
+                    "internal get_depot_vehicles gtfs_id={} depot_id={} rows={}",
+                    gtfs_id,
+                    depot_id,
+                    rows.len()
+                );
+                let mut cache = self.depot_cache.write().await;
+                cache
+                    .depot_vehicles
+                    .insert(cache_key, (rows.clone(), SystemTime::now()));
+                Ok(rows)
+            }
+            Err(e) => Err(AppError::DbError(format!(
+                "get_depot_vehicles(depot_id={}, gtfs_id={}): {}",
+                depot_id, gtfs_id, e
+            ))),
+        }
+    }
+
+    async fn get_fleet_operation_impl(
+        &self,
+        fleet_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<Option<FleetOperationInfo>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Online waybill first, anchored on waybills so a bus with a duty but no vehicle row
+        // still resolves; a flexi waybill takes its schedule number from the active trip.
+        let online_query = r#"
+            SELECT
+                w.waybill_id::text AS waybill_id,
+                w.waybill_no::text AS waybill_no,
+                w.entity_id::text AS depot_id,
+                NULLIF(w.conductor_token_no, '') AS conductor_code,
+                NULLIF(w.driver_token_no, '') AS driver_code,
+                CASE
+                    WHEN w.is_flexi THEN COALESCE((
+                        SELECT f.schedule_number
+                        FROM bus_schedule_trip_flexi_internal f
+                        WHERE f.waybill_id = w.waybill_id
+                          AND f.gtfs_id = w.gtfs_id
+                          AND f.deleted = false
+                        ORDER BY f.is_active_trip DESC NULLS LAST, f.updated_at DESC NULLS LAST
+                        LIMIT 1
+                    ), w.schedule_no)
+                    ELSE w.schedule_no
+                END AS schedule_no,
+                e.entity_name AS depot_name,
+                w.service_type AS service_type
+            FROM waybills_internal w
+            LEFT JOIN entities_internal e
+                   ON e.entity_id = w.entity_id
+                  AND e.gtfs_id = w.gtfs_id
+                  AND e.deleted = false
+            WHERE w.vehicle_no = $1
+              AND w.gtfs_id = $2
+              AND w.status = 'online'
+              AND w.deleted = false
+            ORDER BY w.updated_at DESC NULLS LAST, w.waybill_id DESC
+            LIMIT 1
+        "#;
+
+        match sqlx::query_as::<_, FleetOperationInfo>(online_query)
+            .bind(fleet_no)
+            .bind(gtfs_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(row)) => return Ok(Some(row)),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(AppError::DbError(format!(
+                    "get_fleet_operation(online, fleet_no={}, gtfs_id={}): {}",
+                    fleet_no, gtfs_id, e
+                )))
+            }
+        }
+
+        // No open waybill: the vehicle's own depot and configured service type.
+        let vehicle_query = r#"
+            SELECT
+                NULL::text AS waybill_id,
+                NULL::text AS waybill_no,
+                v.entity_id::text AS depot_id,
+                NULL::text AS conductor_code,
+                NULL::text AS driver_code,
+                NULL::text AS schedule_no,
+                e.entity_name AS depot_name,
+                st.service_type_name AS service_type
+            FROM vehicles_internal v
+            LEFT JOIN entities_internal e
+                   ON e.entity_id = v.entity_id
+                  AND e.gtfs_id = v.gtfs_id
+                  AND e.deleted = false
+            LEFT JOIN service_type_internal st
+                   ON st.service_type_id = v.bus_service_type_id
+                  AND st.gtfs_id = v.gtfs_id
+                  AND st.deleted = false
+            WHERE v.fleet_no = $1
+              AND v.gtfs_id = $2
+              AND v.deleted = false
+            LIMIT 1
+        "#;
+
+        sqlx::query_as::<_, FleetOperationInfo>(vehicle_query)
+            .bind(fleet_no)
+            .bind(gtfs_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                AppError::DbError(format!(
+                    "get_fleet_operation(vehicle, fleet_no={}, gtfs_id={}): {}",
+                    fleet_no, gtfs_id, e
+                ))
+            })
+    }
+
+    async fn clear_depot_cache_impl(&self) -> AppResult<()> {
+        let mut cache = self.depot_cache.write().await;
+        *cache = InternalDepotCache::default();
+        info!("Internal depot cache cleared successfully");
+        Ok(())
     }
 }
