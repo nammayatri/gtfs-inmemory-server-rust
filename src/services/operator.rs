@@ -874,6 +874,18 @@ pub struct FleetRow {
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vehicle_variant: Option<String>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub bus_service_type_id: Option<IdValue>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub entity_id: Option<IdValue>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub organization_id: Option<IdValue>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -1150,7 +1162,7 @@ pub struct VehiclesInternal {
     pub gtfs_id: String,
 }
 
-/// Upsert body: `vehicle_no` is the natural identity (conflict key) and is required. `fleet_no` is required when creating a new vehicle; on update, `None` preserves the existing value. `tag_number` and `status` are always optional; `None` preserves existing on UPDATE.
+/// Upsert body: `vehicle_no` is the natural identity (conflict key) and is required. `fleet_no` is required when creating a new vehicle; on update, `None` preserves the existing value. `tag_number`, `status`, `vehicle_variant`, `bus_service_type_id`, `entity_id` and `organization_id` are always optional; `None` preserves existing on UPDATE.
 #[derive(Debug, serde::Deserialize, Clone, utoipa::ToSchema)]
 pub struct VehicleUpsertRequest {
     pub vehicle_no: String,
@@ -1158,6 +1170,13 @@ pub struct VehicleUpsertRequest {
     pub tag_number: Option<String>,
     pub status: Option<String>,
     pub vehicle_variant: Option<VehicleVariant>,
+    // The three id columns accept a JSON number or string either way: they are mid bigint->text migration, so a caller may send "5" or 5 for the same parent.
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub bus_service_type_id: Option<IdValue>,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub entity_id: Option<IdValue>,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub organization_id: Option<IdValue>,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct WaybillDeviceInternal {
@@ -3212,7 +3231,7 @@ impl OperatorService for DBOperatorService {
         }
 
         let sql = format!(
-            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no, vehicle_variant \
+            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no, vehicle_variant, bus_service_type_id, entity_id, organization_id \
              FROM public.vehicles_internal \
              WHERE {} \
              ORDER BY created_at DESC NULLS LAST, vehicle_id DESC \
@@ -3253,6 +3272,22 @@ impl OperatorService for DBOperatorService {
                 MAX_UPSERT_BATCH_SIZE
             )));
         }
+
+        // Only the Text form needs canonicalising; a JSON number arrives already exact.
+        let norm_id = |i: usize, field: &str, slot: &mut Option<IdValue>| -> AppResult<()> {
+            let trimmed = match slot.as_ref() {
+                Some(IdValue::Text(s)) => s.trim().to_string(),
+                _ => return Ok(()),
+            };
+            if trimmed.is_empty() {
+                return Err(AppError::BadRequest(format!(
+                    "upsertVehicles: items[{}].{}, when provided, must be non-empty",
+                    i, field
+                )));
+            }
+            *slot = Some(IdValue::Text(trimmed));
+            Ok(())
+        };
 
         let mut seen_vehicle_no: HashMap<String, usize> = HashMap::with_capacity(items.len());
         let mut seen_fleet: HashMap<String, usize> = HashMap::new();
@@ -3328,6 +3363,10 @@ impl OperatorService for DBOperatorService {
                 v.status = Some(st);
             }
 
+            norm_id(i, "bus_service_type_id", &mut v.bus_service_type_id)?;
+            norm_id(i, "entity_id", &mut v.entity_id)?;
+            norm_id(i, "organization_id", &mut v.organization_id)?;
+
             if let Some(prev_i) = seen_vehicle_no.insert(vehicle_no.clone(), i) {
                 return Err(AppError::BadRequest(format!(
                     "upsertVehicles: duplicate vehicle_no '{}' at items[{}] and items[{}]",
@@ -3344,13 +3383,16 @@ impl OperatorService for DBOperatorService {
                 v.tag_number.is_some(),
                 v.status.is_some(),
                 v.vehicle_variant.is_some(),
+                v.bus_service_type_id.is_some(),
+                v.entity_id.is_some(),
+                v.organization_id.is_some(),
             )
         };
         let shape0 = shape(&items[0]);
         for (i, item) in items.iter().enumerate().skip(1) {
             if shape(item) != shape0 {
                 return Err(AppError::BadRequest(format!(
-                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status/vehicle_variant as items[0]",
+                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status/vehicle_variant/bus_service_type_id/entity_id/organization_id as items[0]",
                     i
                 )));
             }
@@ -3369,6 +3411,15 @@ impl OperatorService for DBOperatorService {
         }
         if shape0.3 {
             cols.push("vehicle_variant");
+        }
+        if shape0.4 {
+            cols.push("bus_service_type_id");
+        }
+        if shape0.5 {
+            cols.push("entity_id");
+        }
+        if shape0.6 {
+            cols.push("organization_id");
         }
         cols.push("gtfs_id");
 
@@ -3400,7 +3451,7 @@ impl OperatorService for DBOperatorService {
             "INSERT INTO public.vehicles_internal ({}) VALUES {} \
              ON CONFLICT (gtfs_id, vehicle_no) WHERE deleted = false \
              DO UPDATE SET {} \
-             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant",
+             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant, bus_service_type_id, entity_id, organization_id",
             cols.join(", "),
             placeholders.join(", "),
             update_set
@@ -3423,16 +3474,26 @@ impl OperatorService for DBOperatorService {
             if cols.contains(&"vehicle_variant") {
                 q = q.bind(item.vehicle_variant.map(|v| v.as_str()));
             }
+            // Bound as text like vehicle_id above: these columns were carried to text by the same id migration, so Int(5) and Text("5") must land identically.
+            if cols.contains(&"bus_service_type_id") {
+                q = q.bind(item.bus_service_type_id.as_ref().map(|v| v.to_string()));
+            }
+            if cols.contains(&"entity_id") {
+                q = q.bind(item.entity_id.as_ref().map(|v| v.to_string()));
+            }
+            if cols.contains(&"organization_id") {
+                q = q.bind(item.organization_id.as_ref().map(|v| v.to_string()));
+            }
         }
         q = q.bind(gtfs_id);
 
-        // 23505 (unique_violation), 23502 (not_null_violation), 42P10 (undefined_object — the (gtfs_id, vehicle_no) unique index is missing or INVALID after a failed CONCURRENTLY build). Rewrite all three as 400 so ops sees an actionable message rather than a 500.
+        // 23505 (unique_violation), 23502 (not_null_violation), 42P10 (undefined_object — the (gtfs_id, vehicle_no) unique index is missing or INVALID after a failed CONCURRENTLY build), 42804 (datatype_mismatch — an id column not yet migrated off bigint). Rewrite all four as 400 so ops sees an actionable message rather than a 500.
         let returned = match q.fetch_all(&self.pool).await {
             Ok(rows) => rows,
             Err(sqlx::Error::Database(db_err))
                 if matches!(
                     db_err.code().as_deref(),
-                    Some("23505") | Some("23502") | Some("42P10")
+                    Some("23505") | Some("23502") | Some("42P10") | Some("42804")
                 ) =>
             {
                 return Err(AppError::BadRequest(format!(
@@ -3542,7 +3603,7 @@ impl OperatorService for DBOperatorService {
         offset: Option<i64>,
     ) -> AppResult<Vec<FleetRow>> {
         let mut sql = String::from(
-            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant \
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant, bus_service_type_id, entity_id, organization_id \
              FROM public.vehicles_internal \
              WHERE deleted = false AND gtfs_id = $1 \
              ORDER BY vehicle_no",
