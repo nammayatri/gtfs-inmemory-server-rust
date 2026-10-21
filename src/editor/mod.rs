@@ -17,6 +17,7 @@ pub mod draft_import;
 pub mod error;
 pub mod feed_io;
 pub mod feed_lock;
+pub mod geofence;
 pub mod gps_line;
 pub mod handlers;
 pub mod import_jobs;
@@ -358,6 +359,7 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::get().to(h::route_trips),
             )
             .route("/feeds/{gtfs_id}/services", web::get().to(h::services))
+            .route("/feeds/{gtfs_id}/geofences", web::get().to(h::geofences))
             .route("/feeds/{gtfs_id}/audit", web::get().to(h::audit))
             // drafts
             .route(

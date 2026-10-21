@@ -4,7 +4,7 @@ import { state, can, usesStages } from "./state.js";
 import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords, routeStatusTag, idKind } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
-import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
+import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation, editGeofence, deleteGeofence } from "./editors.js";
 import { showDraftStop, showDraftStation } from "./create.js";
 import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, routesTouched, draftTitle, stationMergeMembers } from "./overlay.js";
 import { stationNames, foldedList, platformsNote, stopContext, routeContext } from "./context.js";
@@ -307,6 +307,13 @@ export async function showStop(stopId) {
   const isStation = s.location_type === 1;
   const what = isStation ? "station" : "stop";
   const editor = can("editor") && !live.deleted;
+  // No per-stop geofence read yet (docs section 24) — filter the feed's list
+  // client-side. Fails soft: a geofence lookup failure shouldn't block the
+  // rest of the stop page from showing.
+  const geofence = isStation ? null : await get(`feeds/${enc(state.feedId)}/geofences`)
+    .then((r) => (r.items || []).find((g) => g.stop_id === s.stop_id) || null)
+    .catch(() => null);
+  map.showGeofence(geofence);
   const names = new Map();        // station names, looked up once for this panel
   const shown = (k, fmt = (v) => v) => (o.changed.has(k) ? withLive(fmt(s[k]) || "none", fmt(live[k]) || "none") : fmt(s[k]));
 
@@ -325,6 +332,8 @@ export async function showStop(stopId) {
       : [h("button.btn", { type: "button", on: { click: () => editStop(live) } }, "Edit stop"),
          h("a.btn.secondary", { href: `#/merge/${enc(live.stop_id)}` }, "Merge with a duplicate…"),
          live.parent_station ? null : h("button.btn.secondary", { type: "button", on: { click: () => editStation(null, [live]) } }, "Club into a station"),
+         h("button.btn.secondary", { type: "button", on: { click: () => editGeofence(live, geofence) } }, geofence ? "Edit geofence" : "Add geofence"),
+         geofence ? h("button.btn.danger", { type: "button", on: { click: () => deleteGeofence(live, geofence) } }, "Delete geofence") : null,
          live.route_count === 0 ? h("button.btn.danger", { type: "button", on: { click: () => deleteStop(live) } }, "Delete stop") : null],
     download,
   ) : h("div.btn-row", download);
@@ -380,12 +389,21 @@ export async function showStop(stopId) {
               : " — buses call there again from the next build, with the times they had before.",
             o.changed.has("unserviceable") ? h("span.live-value", h("span.live-tag", "live: "), live.unserviceable ? "out of use" : "in use") : null)
         : null,
+      // depot flag: independent of whether a geofence is surveyed yet (docs section 24)
+      !isStation && (s.is_depot || o.changed.has("is_depot"))
+        ? h("p.notice", { role: "status" },
+            h("strong", s.is_depot ? "Depot" : "Not a depot"),
+            o.changed.has("is_depot") ? h("span.live-value", h("span.live-tag", "live: "), live.is_depot ? "depot" : "not a depot") : null)
+        : null,
       stationLine(),
       h("dl.facts",
         h("dt", "Position"), h("dd", o.moved
           ? [withLive(`${fmtCoord(s.lat)}, ${fmtCoord(s.lon)}`, `${fmtCoord(live.lat)}, ${fmtCoord(live.lon)}`), h("span.hint", ` moved ${map.apart(live, s)}`)]
           : `${fmtCoord(s.lat)}, ${fmtCoord(s.lon)}`),
         s.position_source ? [h("dt", "Position from"), h("dd", s.position_source)] : null,
+        geofence ? [h("dt", "Geofence"), h("dd", geofence.shape === "polygon"
+          ? `Custom shape, ${geofence.polygon.length} points`
+          : `${fmtCoord(geofence.lat)}, ${fmtCoord(geofence.lon)}, ${geofence.radius_m} m radius`)] : null,
         s.cluster_id || o.changed.has("cluster_id") ? [h("dt", "Cluster"), h("dd", shown("cluster_id"))] : null,
         s.regional_name || o.changed.has("regional_name") ? [h("dt", "Tamil name"), h("dd", shown("regional_name"))] : null,
       ),

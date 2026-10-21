@@ -1049,6 +1049,7 @@ pub fn create_id_field(entity: &str, op: &str) -> Option<&'static str> {
         ("station", "create") => Some("station_id"),
         ("service", "create") => Some("service_id"),
         ("stage", "create") => Some("stage_id"),
+        ("geofence", "create") => Some("stop_id"),
         // a record file keyed by an id field of its own (section 18)
         _ => super::records::create_key_field(entity, op),
     }
@@ -1115,6 +1116,8 @@ pub fn check_payload(
                 "position_review_id",
                 // out of use for a while, the stops.txt row staying (section 21)
                 "unserviceable",
+                // a depot's own geofence lives in gtfs_geofence (section 24)
+                "is_depot",
             ];
             // the rest of stops.txt, by its GTFS names (section 18)
             allowed.extend(super::records::STOP_GTFS_FIELDS);
@@ -1135,6 +1138,13 @@ pub fn check_payload(
                     "invalid_payload",
                     "unserviceable",
                     format!("{what}: unserviceable is true or false"),
+                ));
+            }
+            if m.get("is_depot").is_some_and(|v| !v.is_boolean()) {
+                return Err(Finding::error(
+                    "invalid_payload",
+                    "is_depot",
+                    format!("{what}: is_depot is true or false"),
                 ));
             }
             if m.contains_key("lat") != m.contains_key("lon") {
@@ -1869,6 +1879,9 @@ pub fn check_payload(
         ("route_trips", "replace") => super::trips::check_route_trips_payload(after),
         ("service", "create" | "update" | "delete") => {
             super::trips::check_service_payload(op, entity_key, after)
+        }
+        ("geofence", "create" | "update" | "delete") => {
+            super::geofence::check_geofence_payload(op, entity_key, after)
         }
         ("station", "merge") => {
             let m = obj(after, what)?;

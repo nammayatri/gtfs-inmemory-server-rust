@@ -552,9 +552,13 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
   // a merge made in a coordinate review (the stop goes into a same-named stop)
   const reviewMerge = ch.entity === "stop" && ch.op === "merge" && a.position_review_id != null;
   const feedConfig = ch.entity === "feed_config";
+  const geofence = ch.entity === "geofence";
   let title;
-  const record = !ENTITY_LABEL[ch.entity];
+  // not a GTFS record file - excluded here, or its generic key-dump table and
+  // broken "open the record" link would stand in for the geofence's own
+  const record = !ENTITY_LABEL[ch.entity] && !geofence;
   if (feedConfig) title = `Settings of feed ${ch.entity_key}`;
+  else if (geofence) title = `Geofence of stop ${ch.entity_key}`;
   else if (record) title = `${(recordFiles.get(ch.entity) || {}).file || ch.entity} ${ch.entity_key || "(new row)"}`;
   else if (TIMETABLE.has(ch.entity) || ch.entity === "service") title = `${ENTITY_LABEL[ch.entity]} ${ch.entity_key}`;
   else if (ch.entity === "stop" && ch.op === "merge") title = `Stop ${(b.from && b.from.name) || ch.entity_key} merged`;
@@ -603,6 +607,7 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
       h("p", `Takes the place of ${split.from.name || split.from.stop_id} (${split.from.stop_id}) on ${plural(split.routeIds.length, "route")}: ${split.routeIds.join(", ")}. The other routes stay on ${split.from.stop_id}.`),
       stopDiff(ch));
   } else if (ch.entity === "stop") body = stopDiff(ch);
+  else if (geofence) body = geofenceDiff(ch);
   else if (ch.entity === "route" && ch.op === "create") body = routeCreateDiff(ch, cs);
   else if (ch.entity === "route" && ch.op === "delete") body = h("p", `Route ${b.short_name || ch.entity_key} is deleted: it no longer appears in the feed.`);
   else if (ch.entity === "route") body = routeDiff(ch);
@@ -707,6 +712,12 @@ function stopDiff(ch) {
         ? `${b ? b.name : ch.entity_key} goes out of use: it stays in the feed and in the app, and no bus calls there, so journeys are routed around it.`
         : `${b ? b.name : ch.entity_key} is in use again: buses call there from the next build, with the times they had before.`)
     : null;
+  // worth a sentence, not a true/false row (docs section 24), same as unserviceable above
+  const depotChanged = a && "is_depot" in a
+    ? h("p.notice", a.is_depot
+        ? `${b ? b.name : ch.entity_key} becomes a depot.`
+        : `${b ? b.name : ch.entity_key} is no longer marked a depot.`)
+    : null;
   const rows = fieldRows(b, a, [
     ["name", "Name"], ["platform_code", "Platform"], ["description", "Description"], ["regional_name", "Tamil name"], ["cluster_id", "Cluster"],
   ]).concat(gtfsRows(b, a, STOP_GTFS_DIFF));
@@ -717,11 +728,36 @@ function stopDiff(ch) {
   const table = rows.length
     ? h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows))
     : null;
-  if (!movedPos) return outOfUse ? h("div", outOfUse, table) : table;
-  return h("div", outOfUse, h("div.change-grid", table, insetEl({
+  if (!movedPos) return (outOfUse || depotChanged) ? h("div", outOfUse, depotChanged, table) : table;
+  return h("div", outOfUse, depotChanged, h("div.change-grid", table, insetEl({
     points: [{ lat: b.lat, lon: b.lon, kind: "before" }, { lat: a.lat, lon: a.lon, kind: "after" }],
     lines: [{ pts: [[b.lat, b.lon], [a.lat, a.lon]], color: "#0b6660", dashed: true, weight: 2 }],
   })));
+}
+
+// How a geofence row reads, from whichever of (before, after) actually has
+// the shape's defining field - `{...b, ...a}` for "what it is after this
+// change", `b` alone for "what it was".
+function geofenceDescribe(row) {
+  if (!row) return "";
+  return row.shape === "polygon" ? `custom shape, ${plural((row.polygon || []).length, "point")}` : `circle, ${row.radius_m} m radius`;
+}
+
+function geofenceDiff(ch) {
+  const b = ch.before, a = ch.after || {};
+  if (ch.op === "delete") return h("p", `The geofence of stop ${ch.entity_key} is removed.`);
+  if (ch.op === "create") return h("p", `${a.shape === "polygon" ? "Custom shape" : "Circle"} at ${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}: ${geofenceDescribe(a)}.`);
+  const shapeRow = "shape" in a || "radius_m" in a || "polygon" in a
+    ? h("tr", h("th", "Shape"), h("td.before", geofenceDescribe(b)), h("td.after", geofenceDescribe({ ...b, ...a })))
+    : null;
+  const moved = a.lat != null && b && (a.lat !== b.lat || a.lon !== b.lon);
+  const posRow = moved
+    ? h("tr", h("th", "Position"), h("td.before", `${fmtCoord(b.lat)}, ${fmtCoord(b.lon)}`), h("td.after", `${fmtCoord(a.lat)}, ${fmtCoord(a.lon)}`))
+    : null;
+  const rows = [shapeRow, posRow].filter(Boolean);
+  return rows.length
+    ? h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows))
+    : h("p.hint", "Nothing changed.");
 }
 
 const routeLabel = (r) => (r.short_name && r.short_name !== r.route_id ? `${r.short_name} (${r.route_id})` : r.route_id);
