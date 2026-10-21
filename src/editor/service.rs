@@ -221,7 +221,7 @@ fn stop_json_counted(r: &PgRow) -> Result<Value, sqlx::Error> {
 const STOP_COLS: &str = "stop_id, stop_code, name, lat, lon, location_type, parent_station, \
      platform_code, description, cluster_id, regional_name, hindi_name, \
      info_json::text AS info_json, position_source, provenance::text AS provenance, deleted, \
-     unserviceable, row_version, updated_at, updated_by";
+     unserviceable, is_depot, row_version, updated_at, updated_by";
 
 fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
     Ok(json!({
@@ -243,6 +243,8 @@ fn stop_json(r: &PgRow) -> Result<Value, sqlx::Error> {
         "deleted": r.try_get::<bool, _>("deleted")?,
         // out of use for a while: the row stays, no trip calls there (section 21)
         "unserviceable": r.try_get::<bool, _>("unserviceable")?,
+        // a depot's own geofence lives in gtfs_geofence, not here (section 24)
+        "is_depot": r.try_get::<bool, _>("is_depot")?,
         "row_version": r.try_get::<i32, _>("row_version")?,
         "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?,
         "updated_by": r.try_get::<Option<String>, _>("updated_by")?,
@@ -1440,6 +1442,7 @@ fn conflict_on(c: &ChangeRow, key: &str, reason: &str, expected: Value, actual: 
         ),
         "route_trips" => format!("The trips of route {key}"),
         "service" => format!("Service {key}"),
+        "geofence" => format!("The geofence of stop {key}"),
         "stage" => format!("Stage {key}"),
         "route_stages" => format!("The stages of route {key}"),
         // the change is the route's; which of its lists is in the payload
@@ -1595,6 +1598,7 @@ fn created_by(c: &ChangeRow) -> Vec<(&'static str, String)> {
             ("route", key),
         ],
         ("service", "create") => vec![("service", key)],
+        ("geofence", "create") => vec![("geofence", key)],
         // named by its id alone, with the direction in `after`; recorded as the
         // pair, so making `143|down` cannot hide a conflict on the live `143|up`
         ("stage", "create" | "split") => vec![(
@@ -1746,11 +1750,12 @@ async fn conflict_for(
                 }
             }
         }
-        ("stop" | "station" | "route" | "service" | "stage", "create") => {
+        ("stop" | "station" | "route" | "service" | "stage" | "geofence", "create") => {
             let (table, id_col) = match c.entity.as_str() {
                 "route" => ("gtfs_route", "route_id"),
                 "service" => ("gtfs_service", "service_id"),
                 "stage" => ("gtfs_stage", "stage_id"),
+                "geofence" => ("gtfs_geofence", "stop_id"),
                 _ => ("gtfs_stop", "stop_id"),
             };
             let exists = live_row_version(conn, table, id_col, g, key).await?;
@@ -1760,6 +1765,10 @@ async fn conflict_for(
         }
         ("service", "update" | "delete") if !in_draft("service", key) => {
             let live = live_row_version(conn, "gtfs_service", "service_id", g, key).await?;
+            out.extend(version_conflict(c, key, live, c.base_row_version));
+        }
+        ("geofence", "update" | "delete") if !in_draft("geofence", key) => {
+            let live = live_row_version(conn, "gtfs_geofence", "stop_id", g, key).await?;
             out.extend(version_conflict(c, key, live, c.base_row_version));
         }
         ("feed_config", "update") => {
@@ -2170,6 +2179,11 @@ async fn apply_change(
         ("service", "create") => super::trips::service_create(conn, g, &c.after, actor).await,
         ("service", "update") => super::trips::service_update(conn, g, key, &c.after, actor).await,
         ("service", "delete") => super::trips::service_delete(conn, g, key).await,
+        ("geofence", "create") => super::geofence::geofence_create(conn, g, &c.after, actor).await,
+        ("geofence", "update") => {
+            super::geofence::geofence_update(conn, g, key, &c.after, actor).await
+        }
+        ("geofence", "delete") => super::geofence::geofence_delete(conn, g, key).await,
         (e, _) if super::records::spec_for(e).is_some() => {
             let fspec = super::records::spec_for(e).expect("a record file");
             super::records::apply(conn, g, fspec, c, actor).await
@@ -2279,6 +2293,8 @@ async fn stop_update(
     if let Some(flag) = unserviceable {
         warnings.extend(unserviceable_findings(conn, g, id, flag, live.unserviceable).await?);
     }
+    // a depot's own geofence lives in gtfs_geofence, not here (section 24)
+    let is_depot = m.get("is_depot").and_then(Value::as_bool);
     sqlx::query(
         "UPDATE gtfs_stop SET \
             name = CASE WHEN $3 THEN $4 ELSE name END, \
@@ -2293,6 +2309,7 @@ async fn stop_update(
             hindi_name = CASE WHEN $14 THEN $15 ELSE hindi_name END, \
             description = CASE WHEN $17 THEN $18 ELSE description END, \
             unserviceable = CASE WHEN $19 THEN $20 ELSE unserviceable END, \
+            is_depot = CASE WHEN $21 THEN $22 ELSE is_depot END, \
             updated_by = $16 \
          WHERE gtfs_id = $1 AND stop_id = $2",
     )
@@ -2316,6 +2333,8 @@ async fn stop_update(
     .bind(description)
     .bind(unserviceable.is_some())
     .bind(unserviceable.unwrap_or(false))
+    .bind(is_depot.is_some())
+    .bind(is_depot.unwrap_or(false))
     .execute(&mut *conn)
     .await?;
     warnings.extend(stop_gtfs_fields(conn, g, id, m, &before, live.location_type).await?);
@@ -4927,6 +4946,21 @@ pub(super) async fn snapshot(
                 .await?
                 .ok_or_else(|| {
                     EditorError::not_found("entity_not_found", format!("no service {key}"))
+                })?;
+            Ok((created, None))
+        }
+        ("geofence", "update" | "delete") => {
+            if let Some(row) = super::geofence::geofence_json(conn, g, key).await? {
+                let version = row["row_version"].as_i64().map(|v| v as i32);
+                return Ok((row, version));
+            }
+            let created = super::geofence::geofence_created_in_set(conn, change_set_id, key)
+                .await?
+                .ok_or_else(|| {
+                    EditorError::not_found(
+                        "entity_not_found",
+                        format!("stop {key} has no geofence"),
+                    )
                 })?;
             Ok((created, None))
         }

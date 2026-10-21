@@ -363,6 +363,9 @@ table.people .feed-col { white-space: nowrap; }
 .crumb { font-size: var(--fs-s); }
 .title-block { display: grid; gap: 4px; }
 .ids { color: var(--muted); font-size: var(--fs-s); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.plain-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.plain-list li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--rule); }
 .platform-line { font-size: var(--fs-s); font-weight: 700; }
 .platform-line .label-tag { font-weight: 400; color: var(--muted); }
 .stop-description { font-size: var(--fs-s); white-space: pre-line; overflow-wrap: anywhere; }
@@ -724,6 +727,8 @@ dialog::backdrop { background: rgba(20, 37, 42, .38); }
 .suggest-pin { width: 14px; height: 14px; border-radius: 50%; background: #1f5fbf; border: 3px solid #fff; box-shadow: 0 0 0 2px #1f5fbf; }
 .map.placing, .map.placing .leaflet-interactive { cursor: crosshair; }
 .station-pin { width: 18px; height: 18px; border-radius: 4px; background: var(--ink); border: 3px solid #fff; box-shadow: 0 0 0 2px var(--ink); }
+.geofence-handle { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 3px solid var(--action); box-shadow: 0 0 0 1px var(--action); cursor: ew-resize; }
+.geofence-vertex { width: 14px; height: 14px; border-radius: 2px; background: var(--action); border: 2px solid #fff; box-shadow: 0 0 0 1px var(--action); cursor: move; }
 .marker-pin { width: 10px; height: 10px; transform: rotate(45deg); background: #fff; border: 2px solid var(--muted); }
 .leaflet-container { font-family: var(--font); }
 .leaflet-tooltip { font-family: var(--font); font-size: var(--fs-xs); }

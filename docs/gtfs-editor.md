@@ -3956,7 +3956,6 @@ that fails with the seed's `feed_not_empty`, a drafts job, a viewer, a job that
 does not exist); `editor-ui/dev/ui_e2e.mjs --only feed,newfeed`, both through
 jobs; the chennai_bus drafts check through the page as a 27 s job.
 
-<<<<<<< HEAD
 ### 18.16 Reloading a feed fresh, confirmed twice (2026-10-05)
 
 A seed loads only an empty feed (18.4), and a draft import never writes stops,
@@ -5219,3 +5218,112 @@ taken. Unit tests in `src/editor/migration.rs` (the file read back and a damaged
 one refused, merge chains, field and hash comparisons, prod's history, the
 plans). The dashboard: `node dev/ui_smoke.mjs --migration` against the mock,
 which plays master or prod (`--environment`, or `/__dev/environment`).
+
+## 24. Stop, terminal and depot geofencing (2026-10-17)
+
+Delhi DTC's BMS tender (RFP section 4.8) asks for stoppage, terminal and depot
+geofencing, plus route fencing, as business rules the vendor formalizes.
+Detection - a vehicle entering, dwelling at and leaving a geofence - runs in
+gps-processor against its own proven hysteresis state machine
+(`observe_terminus_turnaround()`); this section is only the editor-owned data
+those checks read. Route fencing is unrelated to a point geofence (it is the
+route's polyline plus a deviation buffer, already working in gps-processor as
+`distance_to_polyline` against `route_fit_gate_m`) and is not part of this
+section.
+
+Three concepts, two of them stored and one derived:
+
+```
+gtfs_stop.is_depot ──▶ this stop is a depot; independent of whether its
+                        geofence has been surveyed yet
+gtfs_geofence       ──▶ the stop's surveyed boundary, if any: a circle by
+                        default, or a custom-drawn shape
+"terminal"          ──▶ not stored: a stop is the terminal of a route
+                        whenever it is first or last in that route's stop
+                        sequence (section 16's patterns), read fresh each time
+```
+
+A terminal gets no column and no table. Storing it would duplicate what the
+route's own stop order already says and could drift from it the moment a
+pattern changes; a reader asking "is this stop route 42's terminal" asks the
+pattern, the same way everything else about a route's ends already does.
+
+A depot is a property of the stop, not of its geofence: a stop can be marked a
+depot before anyone has surveyed its boundary, and a geofence can exist for an
+ordinary stop that is not a depot at all (most are). The two facts are
+independent, so they live on different rows.
+
+Schema: `db/gtfs_editor/0033_stop_is_depot.sql`, `0034_geofence.sql` and
+`0035_geofence_polygon.sql` (all safe to run twice). `is_depot` is one boolean
+on `gtfs_stop`, additive like `unserviceable` (section 21). `gtfs_geofence` is
+a new table, one row per stop - `PRIMARY KEY (gtfs_id, stop_id)`, like
+`gtfs_service` is keyed by `service_id` rather than a surrogate id, because a
+stop has at most one surveyed boundary at a time. The row simply does not exist
+until the field survey happens.
+
+`shape` says which of two the row carries - `"circle"` (the default; what most
+stops need) or `"polygon"` (a depot fence or a footprint a disc does not fit,
+traced on the map). Exactly one of `radius_m` or the `polygon_*` pair is set,
+enforced in Postgres by `gtfs_geofence_shape_check` rather than left to the
+application:
+
+| column | |
+|---|---|
+| `stop_id` | the stop surveyed, FK to `gtfs_stop` |
+| `lat`, `lon` | a circle's centre; a polygon's reference point (its vertices' centroid, for map centring only - not used for containment) |
+| `shape` | `"circle"` or `"polygon"` |
+| `radius_m` | the circle's radius, metres, `> 0`; `NULL` for a polygon |
+| `polygon_lat`, `polygon_lon` | parallel arrays of the shape's vertices, `>= 3` points, same convention as `gtfs_shape.shape_pt_lat/lon` (section on GTFS shapes); both `NULL` for a circle |
+| `row_version`, `created_at`, `created_by`, `updated_at`, `updated_by` | as every other editor row |
+
+### Changes
+
+| entity / op | `after` | validation |
+|---|---|---|
+| `stop` / `update` | adds `is_depot` | boolean |
+| `geofence` / `create` | `{stop_id, lat, lon, shape?, radius_m, polygon}` | `shape` defaults to `"circle"`, which then needs `radius_m`; `"polygon"` needs `polygon` (`>= 3` points) instead, never both; `entity_key` must equal `stop_id`; the stop must exist and not be deleted; error `geofence_exists` if the stop already has one |
+| `geofence` / `update` | any of `{lat, lon, shape, radius_m, polygon}`; `lat` and `lon` given together | a field not given keeps its live value *for the row's current shape*; `radius_m` or `polygon` given for the other shape is refused; switching `shape` needs the new shape's defining field in the same change, and clears the old shape's field; error `geofence_not_found` if the stop has none |
+| `geofence` / `delete` | `null` | error `geofence_not_found` if the stop has none |
+
+A geofence conflict reads "The geofence of stop `{key}`", the same `conflict_on`
+machinery every other entity uses (section 3, "Commit").
+
+`GET /feeds/{gtfs_id}/geofences` lists every stop's geofence (`stop_id,
+stop_name, lat, lon, shape, radius_m, polygon, row_version, created_at,
+created_by, updated_at, updated_by` - `polygon` as `[{lat, lon}, ...]`, matching
+how a shape's own points already read; `null` when the shape is a circle), the
+same `{items, next_cursor}` shape as `/feeds/{gtfs_id}/services`. A stop read is
+not yet widened to carry its own geofence inline - this is the one the
+dashboard's **Depots & geofences** page would use first.
+
+The editor UI (`editGeofence` in `editor-ui/js/editors.js`) draws the shape on
+the map rather than asking for numbers blind: a circle gets a draggable centre
+pin and a resize handle; a polygon gets draggable vertex markers, a click on
+the map to add one, a double-click to remove one (`>= 3` enforced client-side
+too). Switching shape mid-edit converts the current one into a starting point
+for the other (a circle into an octagon, a polygon into its centroid and mean
+vertex distance) rather than discarding it. Viewing a stop (`showStop` in
+`explore.js`) draws its existing geofence read-only, via `map.showGeofence`.
+
+### Not yet
+
+- **Nothing reads this from GIMS yet.** gps-processor's stop sync
+  (`spawn_stop_refresh_task`, a periodic fingerprinted pull of GIMS's
+  `/stops/{gtfs_id}` and `/routes/{gtfs_id}`, not a Redis hot-swap) would need
+  `is_depot` and the geofence added to that response and to its `StopDetails`,
+  and `observe_terminus_turnaround()` generalized from one hardcoded terminus
+  per route to an arbitrary `device_id:geofence_id` lookup. Both are
+  gps-processor work, not GIMS's.
+- **Route fencing's threshold is not DTC-editable.** `route_fit_gate_m` is a
+  fixed startup value in gps-processor (`config.route_fit_gate_meters`), not
+  synced from here or any other DTC-editable config, and today it only drives
+  an observation-only shadow signal, not an enforced alert. RFP 4.7 and 4.8 both
+  ask for DTC-editable thresholds ("to be defined by User"); this is a real gap,
+  not a wiring detail, and is unaddressed by this section.
+- The depot in/out-shed event-recording pipeline (comparing an arrival against
+  a waybill's scheduled time, early/late relaxation) is not built. This section
+  is the geofence data it would read, nothing more.
+- No dedicated flow test yet (compare `tests/editor_unserviceable_flow.rs`):
+  worth adding once the dashboard page using this exists, to cover the create /
+  update / delete findings above against a real database the way every other
+  section's tests do.

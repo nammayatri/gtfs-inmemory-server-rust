@@ -7,6 +7,7 @@ use super::crypto::{self, TotpCheck};
 use super::error::{EditorError, EditorResult};
 use super::feed_io;
 use super::feed_lock;
+use super::geofence;
 use super::gps_line::{self, GpsFailure};
 use super::import_jobs;
 use super::position_reviews;
@@ -2021,6 +2022,16 @@ pub async fn services(
     auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(trips::list_services(&mut conn, &path).await?)
+}
+
+pub async fn geofences(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let mut conn = st.pool.acquire().await?;
+    ok(geofence::list_geofences(&mut conn, &path).await?)
 }
 
 pub async fn change_set_preview_pattern(
