@@ -33,6 +33,7 @@ use crate::models::{
 use crate::services::db_vehicle_reader::{
     chalo_gtfs_ids, filter_vehicles_by_status, is_chalo_gtfs_id,
 };
+use crate::services::db_vehicle_reader_internal::AssignmentRequest;
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -370,6 +371,19 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                     .route(
                         "/depots/{depot_id}/vehicles",
                         web::get().to(get_depot_vehicles_v2),
+                    )
+                    .route(
+                        "/depots/{depot_id}/waybills",
+                        web::get().to(get_depot_waybills_v2),
+                    )
+                    .route(
+                        "/depots/{depot_id}/routes",
+                        web::get().to(get_depot_routes_v2),
+                    )
+                    .route("/depots/{depot_id}/crew", web::get().to(get_depot_crew_v2))
+                    .route(
+                        "/depots/{depot_id}/overview",
+                        web::get().to(get_depot_overview_v2),
                     ),
             )
             .route(
@@ -5916,4 +5930,82 @@ mod depot_v2_tests {
         let resp = err.error_response();
         assert_eq!(resp.status().as_u16(), 404);
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssignmentQuery {
+    service_date: String,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    q: Option<String>,
+}
+/// v2 depot-day request: same feed/depot checks as the other v2 depot APIs (404 for an unknown depot).
+async fn depot_day_request(
+    state: &AppState,
+    path: web::Path<(String, String)>,
+    query: &AssignmentQuery,
+) -> AppResult<AssignmentRequest> {
+    let (gtfs_id, depot_id) = path.into_inner();
+    let gtfs_id = strip_surrounding_quotes(&gtfs_id);
+    let depot_id = strip_surrounding_quotes(&depot_id);
+    check_feed_v2(&gtfs_id)?;
+    resolve_depot(state, &gtfs_id, &depot_id)
+        .await?
+        .ok_or_else(|| depot_not_found(&depot_id, &gtfs_id))?;
+    AssignmentRequest::new(
+        &gtfs_id,
+        &depot_id,
+        &query.service_date,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(50),
+        query.q.as_deref().unwrap_or(""),
+    )
+}
+
+pub async fn get_depot_waybills_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(
+        state
+            .db_vehicle_reader
+            .monitoring_assignments(&request)
+            .await?,
+    ))
+}
+
+pub async fn get_depot_routes_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.monitoring_routes(&request).await?))
+}
+
+pub async fn get_depot_crew_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.monitoring_crew(&request).await?))
+}
+
+/// Whole depot-day counts; page and q are accepted but ignored.
+pub async fn get_depot_overview_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(
+        state
+            .db_vehicle_reader
+            .monitoring_overview(&request)
+            .await?,
+    ))
 }

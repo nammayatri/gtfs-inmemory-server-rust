@@ -12,6 +12,10 @@ use crate::models::{
     MinimalVehicleData, RouteLastScheduleTime, VehicleData, VehicleDataWithRouteId,
     VehicleOperationData, WaybillStatus,
 };
+use crate::services::db_vehicle_reader_internal::{
+    read_assignments, read_crew, read_overview, read_routes, AssignmentPage, AssignmentRequest,
+    CrewPage, DepotOverview, MonitoringSource, RoutePage,
+};
 use crate::tools::error::{AppError, AppResult};
 
 pub use crate::services::chalo_vehicle_cache::{chalo_gtfs_ids, is_chalo_gtfs_id};
@@ -100,6 +104,24 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicles_by_depot_id(&self, depot_id: &str)
         -> AppResult<Vec<DepotVehicleSummary>>;
     async fn get_depot_names(&self) -> AppResult<Vec<String>>;
+    /// Chennai depot monitoring over the MTC replica. Unconfigured/mock readers report unavailable.
+    async fn monitoring_assignments(
+        &self,
+        _request: &AssignmentRequest,
+    ) -> AppResult<AssignmentPage> {
+        Err(AppError::NotReady(
+            "Monitoring assignments source unavailable".into(),
+        ))
+    }
+    async fn monitoring_routes(&self, _request: &AssignmentRequest) -> AppResult<RoutePage> {
+        Err(AppError::NotReady("Monitoring source unavailable".into()))
+    }
+    async fn monitoring_crew(&self, _request: &AssignmentRequest) -> AppResult<CrewPage> {
+        Err(AppError::NotReady("Monitoring source unavailable".into()))
+    }
+    async fn monitoring_overview(&self, _request: &AssignmentRequest) -> AppResult<DepotOverview> {
+        Err(AppError::NotReady("Monitoring source unavailable".into()))
+    }
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
     async fn clear_depot_cache(&self) -> AppResult<()>;
@@ -1548,6 +1570,21 @@ impl DBVehicleReader {
 
 #[async_trait]
 impl VehicleDataReader for DBVehicleReader {
+    async fn monitoring_assignments(
+        &self,
+        request: &AssignmentRequest,
+    ) -> AppResult<AssignmentPage> {
+        read_assignments(&self.pool, request, MonitoringSource::Replica).await
+    }
+    async fn monitoring_routes(&self, request: &AssignmentRequest) -> AppResult<RoutePage> {
+        read_routes(&self.pool, request, MonitoringSource::Replica).await
+    }
+    async fn monitoring_crew(&self, request: &AssignmentRequest) -> AppResult<CrewPage> {
+        read_crew(&self.pool, request, MonitoringSource::Replica).await
+    }
+    async fn monitoring_overview(&self, request: &AssignmentRequest) -> AppResult<DepotOverview> {
+        read_overview(&self.pool, request, MonitoringSource::Replica).await
+    }
     async fn get_vehicle_service_type(&self, vehicle_no: &str) -> AppResult<Option<String>> {
         self.get_vehicle_service_type_impl(vehicle_no).await
     }
@@ -2063,7 +2100,7 @@ impl VehicleDataReader for DBVehicleReader {
             .map_err(|_| AppError::BadRequest(format!("Invalid depot_id: {}", depot_id)))?;
 
         // Keep columns and aliasing the same as get_vehicles_by_depot_name
-        let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles WHERE vehicles.entity_id = $1 AND fleet_no <> '' LIMIT 1048575"#;
+        let query: &str = r#"SELECT vehicles.fleet_no AS fleet_no, vehicles.status AS status, vehicles.vehicle_no AS vehicle_no FROM vehicles WHERE vehicles.entity_id = $1 AND vehicles.deleted = false AND fleet_no <> '' ORDER BY vehicles.vehicle_id LIMIT 1048575"#;
         info!("get_vehicles_by_depot_id query: {}", query);
         match sqlx::query_as::<_, DepotVehicleSummary>(query)
             .bind(depot_id_int)
@@ -2081,7 +2118,9 @@ impl VehicleDataReader for DBVehicleReader {
             }
             Err(e) => {
                 error!("get_vehicles_by_depot_id query failed: {}", e);
-                Ok(Vec::new())
+                Err(AppError::NotReady(
+                    "Depot vehicle source unavailable".into(),
+                ))
             }
         }
     }
