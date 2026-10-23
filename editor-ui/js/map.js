@@ -23,6 +23,7 @@ let picking = null;           // while picking one stop: the mode and banner to 
 let bannerNow = [null, null];
 let selection = null;         // Set of stop ids highlighted for station selection
 let placeCleanup = null;
+let geofenceCleanup = null;   // off()s the map click listener a polygon edit adds, if any
 let lastStops = [];
 let draftStops = [];
 let draftKey = "";
@@ -70,7 +71,7 @@ export function initMap() {
   lines = L.canvas({ pane: "lines", padding: 0.3 });
   dots = L.canvas({ pane: "dots", padding: 0.3 });
   L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
-  for (const name of ["links", "route", "proposal", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "labels"]) {
+  for (const name of ["links", "route", "proposal", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "geofence", "labels"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
   initLayerControl();
@@ -705,12 +706,133 @@ export function endModes() {
   linkStation = null;
   if (placeCleanup) placeCleanup();
   placeCleanup = null;
-  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal"]) layers[name].clearLayers();
+  if (geofenceCleanup) geofenceCleanup();
+  geofenceCleanup = null;
+  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal", "geofence"]) layers[name].clearLayers();
   map.closePopup();
   quietIds = new Set();
   reserved = [];
   banner(null);
   drawStops();
+}
+
+// ---------------------------------------------------------- geofence shapes
+
+const GEOFENCE_HANDLE = L.divIcon({ className: "", html: '<div class="geofence-handle"></div>', iconSize: [12, 12] });
+const GEOFENCE_VERTEX = L.divIcon({ className: "", html: '<div class="geofence-vertex"></div>', iconSize: [14, 14] });
+
+export function destPoint(lat, lon, distM, bearingDeg) {
+  const R = 6371000, br = (bearingDeg * Math.PI) / 180;
+  const la1 = (lat * Math.PI) / 180, lo1 = (lon * Math.PI) / 180;
+  const d = distM / R;
+  const la2 = Math.asin(Math.sin(la1) * Math.cos(d) + Math.cos(la1) * Math.sin(d) * Math.cos(br));
+  const lo2 = lo1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(la1), Math.cos(d) - Math.sin(la1) * Math.sin(la2));
+  return { lat: (la2 * 180) / Math.PI, lon: (((lo2 * 180) / Math.PI + 540) % 360) - 180 };
+}
+
+// A stop's geofence, read-only: the circle or polygon it already has, drawn
+// for context while browsing. Cleared by the next endModes() (a new stop, a
+// route shown, an edit started), same as every other contextual overlay.
+export function showGeofence(geofence) {
+  layers.geofence.clearLayers();
+  if (!geofence) return;
+  if (geofence.shape === "polygon" && geofence.polygon) {
+    L.polygon(geofence.polygon.map((p) => [p.lat, p.lon]), { renderer: lines, color: ACTION, weight: 2, fillColor: ACTION, fillOpacity: 0.08, interactive: false })
+      .addTo(layers.geofence);
+  } else if (geofence.radius_m) {
+    L.circle([geofence.lat, geofence.lon], { renderer: lines, radius: geofence.radius_m, color: ACTION, weight: 2, fillColor: ACTION, fillOpacity: 0.08, interactive: false })
+      .addTo(layers.geofence);
+  }
+}
+
+// Edit a circular geofence: drag the centre pin to move it, drag the small
+// handle to resize. onChange({lat, lon, radius_m}) fires on every drag.
+// Returns set(lat, lon, radius_m) so typed values move the shapes too.
+export function editGeofenceCircle(center, radiusM, onChange) {
+  endModes();
+  const circle = L.circle([center.lat, center.lon], { renderer: lines, radius: radiusM, color: ACTION, weight: 2, fillColor: ACTION, fillOpacity: 0.12 }).addTo(layers.geofence);
+  const centerPin = L.marker([center.lat, center.lon], {
+    draggable: true, autoPan: true,
+    icon: L.divIcon({ className: "", html: '<div class="stop-pin"></div>', iconSize: [16, 16] }),
+    title: "Drag to move the centre",
+  }).addTo(layers.geofence);
+  const edge = destPoint(center.lat, center.lon, radiusM, 90);
+  const handle = L.marker([edge.lat, edge.lon], {
+    draggable: true, autoPan: true, icon: GEOFENCE_HANDLE, title: "Drag to resize the radius",
+  }).addTo(layers.geofence);
+  const fire = () => {
+    const c = centerPin.getLatLng();
+    onChange({ lat: c.lat, lon: c.lng, radius_m: Math.round(circle.getRadius()) });
+  };
+  let lastCenter = centerPin.getLatLng();
+  centerPin.on("drag", () => {
+    const c = centerPin.getLatLng();
+    circle.setLatLng(c);
+    // Move the handle by the same offset as the centre, so it keeps pointing
+    // the same way and the radius (their distance apart) does not change.
+    const h = handle.getLatLng();
+    handle.setLatLng([h.lat + (c.lat - lastCenter.lat), h.lng + (c.lng - lastCenter.lng)]);
+    lastCenter = c;
+    fire();
+  });
+  handle.on("drag", () => {
+    const c = circle.getLatLng();
+    const r = Math.max(1, c.distanceTo(handle.getLatLng()));
+    circle.setRadius(r);
+    fire();
+  });
+  banner("Drag the centre pin to move the geofence, or the small handle to resize it.", null);
+  return (lat, lon, radius_m) => {
+    circle.setLatLng([lat, lon]);
+    circle.setRadius(radius_m);
+    centerPin.setLatLng([lat, lon]);
+    lastCenter = L.latLng(lat, lon);
+    const e = destPoint(lat, lon, radius_m, 90);
+    handle.setLatLng([e.lat, e.lon]);
+  };
+}
+
+// Edit a custom-shape geofence: click the map to add a point, drag a point to
+// move it, double-click a point to remove it (at least 3 must remain).
+// onChange([{lat, lon}, ...]) fires on every change. Returns
+// replace([{lat, lon}, ...]) so a shape switch or typed edit redraws it.
+export function editGeofencePolygon(points, onChange) {
+  endModes();
+  let pts = points.map((p) => ({ lat: p.lat, lon: p.lon }));
+  const poly = L.polygon(pts.map((p) => [p.lat, p.lon]), { renderer: lines, color: ACTION, weight: 2, fillColor: ACTION, fillOpacity: 0.12 }).addTo(layers.geofence);
+  let handles = [];
+  const redraw = () => poly.setLatLngs(pts.map((p) => [p.lat, p.lon]));
+  const fire = () => onChange(pts.map((p) => ({ ...p })));
+  function rebuildHandles() {
+    handles.forEach((m) => layers.geofence.removeLayer(m));
+    handles = pts.map((p, i) => {
+      const m = L.marker([p.lat, p.lon], { draggable: true, autoPan: true, icon: GEOFENCE_VERTEX, title: "Drag to move, double-click to remove" }).addTo(layers.geofence);
+      m.on("drag", () => { const ll = m.getLatLng(); pts[i] = { lat: ll.lat, lon: ll.lng }; redraw(); fire(); });
+      m.on("dblclick", () => {
+        if (pts.length <= 3) { banner("A custom shape needs at least 3 points.", null); return; }
+        pts.splice(i, 1);
+        redraw();
+        rebuildHandles();
+        fire();
+      });
+      return m;
+    });
+  }
+  rebuildHandles();
+  const onMapClick = (ev) => {
+    pts.push({ lat: ev.latlng.lat, lon: ev.latlng.lng });
+    redraw();
+    rebuildHandles();
+    fire();
+  };
+  map.on("click", onMapClick);
+  geofenceCleanup = () => map.off("click", onMapClick);
+  banner("Click the map to add a point, drag a point to move it, double-click a point to remove it.", null);
+  return (newPoints) => {
+    pts = newPoints.map((p) => ({ lat: p.lat, lon: p.lon }));
+    redraw();
+    rebuildHandles();
+  };
 }
 
 // Drag a stop to a new place. onMove(lat, lon) fires as it moves, onDone(lat,

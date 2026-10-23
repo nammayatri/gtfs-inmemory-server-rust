@@ -93,7 +93,7 @@ const ROUTE_GTFS = ["route_desc", "route_url", "route_sort_order", "continuous_p
 export async function editStop(stop) {
   if (!(await requireDraft())) return;
   const prior = existingChange("stop", stop.stop_id);
-  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", unserviceable: !!stop.unserviceable, ...(prior ? prior.after : {}) };
+  const start = { name: stop.name, lat: stop.lat, lon: stop.lon, platform_code: stop.platform_code || "", description: stop.description || "", regional_name: stop.regional_name || "", unserviceable: !!stop.unserviceable, is_depot: !!stop.is_depot, ...(prior ? prior.after : {}) };
   const description = descriptionField("stop-description", start.description);
   const f = {
     name: h("input", { type: "text", id: "stop-name", value: start.name }),
@@ -101,6 +101,7 @@ export async function editStop(stop) {
     lon: h("input", { type: "number", id: "stop-lon", step: "any", value: String(start.lon) }),
     platform_code: h("input", { type: "text", id: "stop-platform", value: start.platform_code || "", maxlength: "120", placeholder: PLATFORM_PLACEHOLDER }),
     unserviceable: h("input", { type: "checkbox", id: "stop-unserviceable", checked: !!start.unserviceable }),
+    is_depot: h("input", { type: "checkbox", id: "stop-is-depot", checked: !!start.is_depot }),
     description: description.input,
     regional_name: h("input", { type: "text", id: "stop-regional", value: start.regional_name || "", lang: "ta" }),
   };
@@ -201,6 +202,10 @@ export async function editStop(stop) {
     const wasOut = prior && prior.after && "unserviceable" in prior.after
       ? !!prior.after.unserviceable : !!stop.unserviceable;
     if (f.unserviceable.checked !== wasOut) after.unserviceable = f.unserviceable.checked;
+    // depot is a flag too, independent of whether a geofence exists for it yet (docs section 23)
+    const wasDepot = prior && prior.after && "is_depot" in prior.after
+      ? !!prior.after.is_depot : !!stop.is_depot;
+    if (f.is_depot.checked !== wasDepot) after.is_depot = f.is_depot.checked;
     const extra = more.read();
     if (extra.errors) { clear(problems, h("div.notice.error", h("ul", extra.errors.map((e) => h("li", e))))); return; }
     Object.assign(after, extra.after);
@@ -240,6 +245,10 @@ export async function editStop(stop) {
         f.unserviceable,
         h("span", "Out of use for now"),
         h("span.hint", "The stop stays in the feed and in the app, and no bus calls there until this is cleared, so journeys are routed around it. Its times come back exactly as they were.")),
+      h("label.field.inline", { for: "stop-is-depot" },
+        f.is_depot,
+        h("span", "This stop is a depot"),
+        h("span.hint", "Independent of whether a geofence boundary has been surveyed for it yet — you can flag this now and add the geofence later from the stop page.")),
       description.el,
       more.el,
       problems),
@@ -256,6 +265,175 @@ export async function deleteStop(stop) {
   if (!ok) return;
   try {
     await addChange({ entity: "stop", op: "delete", entity_key: stop.stop_id, after: null, base_row_version: stop.row_version }, { merge: false });
+    showStop(stop.stop_id);
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+// ------------------------------------------------------------------ geofence (docs section 23)
+// A stop's surveyed circular boundary. `existing` is the live geofence row for
+// this stop if one exists, or null/undefined for a brand-new one — same
+// create-vs-update split every other editor here uses, keyed by stop_id since
+// a stop has at most one geofence (0034_geofence.sql).
+function geofenceCentroid(points) {
+  const n = points.length;
+  return { lat: points.reduce((s, p) => s + p.lat, 0) / n, lon: points.reduce((s, p) => s + p.lon, 0) / n };
+}
+
+// A default shape to start dragging from when switching between the two -
+// not a projection either preserves exactly, just a reasonable place to begin.
+function circleToPolygon(lat, lon, radius_m, n = 8) {
+  return Array.from({ length: n }, (_, i) => map.destPoint(lat, lon, radius_m, (360 / n) * i));
+}
+function polygonToCircle(points) {
+  const c = geofenceCentroid(points);
+  const radius_m = Math.round(points.reduce((s, p) => s + haversine(c.lat, c.lon, p.lat, p.lon), 0) / points.length);
+  return { lat: c.lat, lon: c.lon, radius_m: Math.max(1, radius_m) };
+}
+
+// A stop's geofence: a circle by default (centre + radius, the common case -
+// gps-processor's own detection is radius-based, docs section 23), or a
+// custom shape traced on the map for a depot fence or a footprint a disc
+// does not fit. Switching between the two while editing converts the current
+// shape into a starting point for the other, rather than losing it.
+export async function editGeofence(stop, existing) {
+  if (!(await requireDraft())) return;
+  const prior = existingChange("geofence", stop.stop_id);
+  const draftAfter = prior ? prior.after : {};
+  const base = existing || { shape: "circle", lat: stop.lat, lon: stop.lon, radius_m: 100, polygon: null };
+  let shape = draftAfter.shape || base.shape || "circle";
+  let circleState = {
+    lat: draftAfter.lat ?? (base.shape === "circle" ? base.lat : stop.lat),
+    lon: draftAfter.lon ?? (base.shape === "circle" ? base.lon : stop.lon),
+    radius_m: draftAfter.radius_m ?? (base.shape === "circle" ? base.radius_m : 100),
+  };
+  let polygonState = draftAfter.polygon || (base.shape === "polygon" ? base.polygon : null)
+    || circleToPolygon(circleState.lat, circleState.lon, circleState.radius_m);
+
+  const unsaved = guard(`Your changes to ${stop.name}’s geofence are not in the draft yet.`);
+  const problems = h("div");
+  const cancel = () => { unsaved.done(); map.endModes(); showStop(stop.stop_id); };
+
+  const save = async (ev) => {
+    ev.preventDefault();
+    let after;
+    if (shape === "circle") {
+      const { lat, lon, radius_m } = circleState;
+      if (!Number.isFinite(lat) || lat < -90 || lat > 90) { clear(problems, h("p.notice.error", "Latitude must be a number between -90 and 90.")); return; }
+      if (!Number.isFinite(lon) || lon < -180 || lon > 180) { clear(problems, h("p.notice.error", "Longitude must be a number between -180 and 180.")); return; }
+      if (!Number.isFinite(radius_m) || radius_m <= 0) { clear(problems, h("p.notice.error", "Radius must be a whole number of metres greater than zero.")); return; }
+      after = { lat, lon, shape: "circle", radius_m: Math.round(radius_m) };
+    } else {
+      if (polygonState.length < 3) { clear(problems, h("p.notice.error", "A custom shape needs at least 3 points.")); return; }
+      const c = geofenceCentroid(polygonState);
+      after = { lat: c.lat, lon: c.lon, shape: "polygon", polygon: polygonState };
+    }
+    try {
+      // A geofence's key is the stop's own id, never freshly minted, so unlike
+      // a new stop or route, re-submitting this form before the draft commits
+      // must update the one pending "create" rather than stack another.
+      const res = existing
+        ? await addChange({ entity: "geofence", op: "update", entity_key: stop.stop_id, after, base_row_version: existing.row_version })
+        : await addChange({ entity: "geofence", op: "create", entity_key: stop.stop_id, after: { stop_id: stop.stop_id, ...after } }, { sameAs: () => true });
+      if (!res) return;
+      unsaved.done();
+      map.endModes();
+      if (res.problems.some((p) => p.level === "error")) { clear(problems, problemList(res.problems)); return; }
+      showStop(stop.stop_id);
+    } catch (e) {
+      clear(problems, h("p.notice.error", e.message));
+    }
+  };
+
+  // A shape switch rebuilds the whole panel (different fields, a different
+  // map mode). A drag, a typed value or a point add/remove must not: tearing
+  // the Leaflet layer down mid-drag would cut the gesture off, so those only
+  // update this shape's own small pieces in place.
+  function buildCircleFields() {
+    const f = {
+      lat: h("input", { type: "number", id: "geofence-lat", step: "any", value: String(circleState.lat) }),
+      lon: h("input", { type: "number", id: "geofence-lon", step: "any", value: String(circleState.lon) }),
+      radius_m: h("input", { type: "number", id: "geofence-radius", step: "1", min: "1", value: String(Math.round(circleState.radius_m)) }),
+    };
+    const setShapes = map.editGeofenceCircle(circleState, circleState.radius_m, (c) => {
+      circleState = c;
+      f.lat.value = c.lat.toFixed(7);
+      f.lon.value = c.lon.toFixed(7);
+      f.radius_m.value = String(c.radius_m);
+      unsaved.touch();
+    });
+    const typed = debounce(() => {
+      const lat = Number(f.lat.value), lon = Number(f.lon.value), radius_m = Number(f.radius_m.value);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(radius_m) || radius_m <= 0) return;
+      circleState = { lat, lon, radius_m };
+      setShapes(lat, lon, radius_m);
+      unsaved.touch();
+    }, 300);
+    f.lat.addEventListener("input", typed);
+    f.lon.addEventListener("input", typed);
+    f.radius_m.addEventListener("input", typed);
+    return h("div",
+      h("div.field-row",
+        h("label.field", { for: "geofence-lat" }, h("span", "Latitude"), f.lat),
+        h("label.field", { for: "geofence-lon" }, h("span", "Longitude"), f.lon)),
+      h("label.field", { for: "geofence-radius" }, h("span", "Radius (metres)"), f.radius_m),
+      h("p.hint", "Drag the pin on the map to move it, or the small handle to resize the radius - or type exact values here."));
+  }
+
+  function buildPolygonFields() {
+    const hint = h("p.hint");
+    const list = h("ul.plain-list");
+    const refresh = () => {
+      hint.textContent = `${polygonState.length} points. Click the map to add one, drag a point to move it, double-click a point to remove it.`;
+      clear(list, ...polygonState.map((p, i) => h("li",
+        h("span.mono", `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}`),
+        polygonState.length > 3 ? h("button.btn.quiet.small", {
+          type: "button",
+          on: { click: () => { polygonState = polygonState.filter((_, j) => j !== i); setShapes(polygonState); refresh(); unsaved.touch(); } },
+        }, "Remove") : null,
+      )));
+    };
+    const setShapes = map.editGeofencePolygon(polygonState, (pts) => { polygonState = pts; refresh(); unsaved.touch(); });
+    refresh();
+    return h("div", hint, list);
+  }
+
+  const switchTo = (newShape) => {
+    if (newShape === shape) return;
+    if (newShape === "polygon") polygonState = circleToPolygon(circleState.lat, circleState.lon, circleState.radius_m);
+    else circleState = polygonToCircle(polygonState);
+    shape = newShape;
+    unsaved.touch();
+    renderAll();
+  };
+
+  function renderAll() {
+    clear(panel(), h("form", { novalidate: true, on: { submit: save } },
+      h("section.section",
+        h("button.btn.quiet.small", { type: "button", style: "justify-self:start", on: { click: cancel } }, "Back to the stop"),
+        h("h1", existing ? `Edit geofence for ${stop.name}` : `Add geofence for ${stop.name}`),
+        h("p.ids", `Stop ${stop.stop_id}. Changes go into draft "${state.draft.title}".`),
+        h("p.hint", "The boundary gps-processor checks a vehicle against to detect arrival, dwell and departure here. A circle fits most stops; draw a custom shape for a depot fence or a footprint a disc does not fit."),
+        h("div.btn-row",
+          h("button.btn" + (shape === "circle" ? "" : ".secondary"), { type: "button", "aria-pressed": String(shape === "circle"), on: { click: () => switchTo("circle") } }, "Circle"),
+          h("button.btn" + (shape === "polygon" ? "" : ".secondary"), { type: "button", "aria-pressed": String(shape === "polygon"), on: { click: () => switchTo("polygon") } }, "Custom shape")),
+        shape === "circle" ? buildCircleFields() : buildPolygonFields(),
+        problems),
+      h("div.sticky-actions", h("div.btn-row",
+        h("button.btn", { type: "submit" }, existing ? "Update in draft" : "Add to draft"),
+        h("button.btn.secondary", { type: "button", on: { click: cancel } }, "Cancel"))),
+    ));
+  }
+  renderAll();
+}
+
+export async function deleteGeofence(stop, existing) {
+  if (!(await requireDraft())) return;
+  const ok = await confirmDialog("Delete this geofence?", `Removes the surveyed boundary for ${stop.name}. The stop itself, and its depot flag if set, are not affected.`, { confirm: "Add deletion to draft", danger: true });
+  if (!ok) return;
+  try {
+    await addChange({ entity: "geofence", op: "delete", entity_key: stop.stop_id, after: null, base_row_version: existing.row_version }, { merge: false });
     showStop(stop.stop_id);
   } catch (e) {
     toast(e.message, "error");
