@@ -98,6 +98,11 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
     ) -> AppResult<Vec<DepotVehicleInfo>>;
 
+    /// Every registered bus of the feed (fleet-wide live map). Unconfigured readers have none.
+    async fn get_fleet_vehicles(&self, _gtfs_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
+        Ok(Vec::new())
+    }
+
     async fn get_fleet_operation(
         &self,
         fleet_no: &str,
@@ -1582,6 +1587,33 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         gtfs_id: &str,
     ) -> AppResult<Vec<DepotVehicleInfo>> {
         self.get_depot_vehicles_impl(depot_id, gtfs_id).await
+    }
+
+    async fn get_fleet_vehicles(&self, gtfs_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
+        let Some(pool) = &self.pool else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_as::<_, DepotVehicleInfo>(
+            r#"
+            SELECT v.fleet_no AS fleet_no,
+                   v.vehicle_no AS vehicle_no,
+                   v.status AS status,
+                   st.service_type_name AS service_type
+            FROM vehicles_internal v
+            LEFT JOIN service_type_internal st
+                   ON st.service_type_id = v.bus_service_type_id
+                  AND st.gtfs_id = v.gtfs_id
+                  AND st.deleted = false
+            WHERE v.gtfs_id = $1
+              AND v.deleted = false
+              AND v.fleet_no <> ''
+            ORDER BY v.fleet_no
+            "#,
+        )
+        .bind(gtfs_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_fleet_vehicles(gtfs_id={}): {}", gtfs_id, e)))
     }
 
     async fn get_fleet_operation(

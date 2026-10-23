@@ -151,6 +151,11 @@ pub trait VehicleDataReader: Send + Sync {
 
     async fn get_depot_vehicles(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleInfo>>;
 
+    /// Every registered bus of the feed (fleet-wide live map). Unconfigured readers have none.
+    async fn get_fleet_vehicles(&self) -> AppResult<Vec<DepotVehicleInfo>> {
+        Ok(Vec::new())
+    }
+
     async fn get_fleet_operation(&self, fleet_no: &str) -> AppResult<Option<FleetOperationInfo>>;
 }
 
@@ -2325,6 +2330,27 @@ impl VehicleDataReader for DBVehicleReader {
                 depot_id, e
             ))),
         }
+    }
+
+    async fn get_fleet_vehicles(&self) -> AppResult<Vec<DepotVehicleInfo>> {
+        sqlx::query_as::<_, DepotVehicleInfo>(
+            r#"
+            SELECT v.fleet_no AS fleet_no,
+                   v.vehicle_no AS vehicle_no,
+                   v.status AS status,
+                   bst.service_type_name AS service_type
+            FROM vehicles v
+            LEFT JOIN bus_service_type bst
+                   ON bst.service_type_id = v.bus_service_type_id
+                  AND bst.deleted = false
+            WHERE v.deleted = false
+              AND v.fleet_no <> ''
+            ORDER BY v.fleet_no
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_fleet_vehicles: {}", e)))
     }
 
     async fn get_depot_vehicles(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
