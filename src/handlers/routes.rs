@@ -33,6 +33,7 @@ use crate::models::{
 use crate::services::db_vehicle_reader::{
     chalo_gtfs_ids, filter_vehicles_by_status, is_chalo_gtfs_id,
 };
+use crate::services::db_vehicle_reader_internal::AssignmentRequest;
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -366,10 +367,24 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 web::scope("/v2/{gtfs_id}")
                     .route("/fleet/{fleet_no}", web::get().to(get_fleet_operation_v2))
                     .route("/depots", web::get().to(get_depots_v2))
+                    .route("/vehicles", web::get().to(get_fleet_vehicles_v2))
                     .route("/depots/{depot_id}", web::get().to(get_depot_by_id_v2))
                     .route(
                         "/depots/{depot_id}/vehicles",
                         web::get().to(get_depot_vehicles_v2),
+                    )
+                    .route(
+                        "/depots/{depot_id}/waybills",
+                        web::get().to(get_depot_waybills_v2),
+                    )
+                    .route(
+                        "/depots/{depot_id}/routes",
+                        web::get().to(get_depot_routes_v2),
+                    )
+                    .route("/depots/{depot_id}/crew", web::get().to(get_depot_crew_v2))
+                    .route(
+                        "/depots/{depot_id}/overview",
+                        web::get().to(get_depot_overview_v2),
                     ),
             )
             .route(
@@ -1082,6 +1097,65 @@ pub async fn get_depot_vehicles_v2(
         "depot vehicles v2: gtfs_id={} depot_id={} status={:?} rows={}",
         gtfs_id,
         depot.depot_id,
+        status,
+        vehicles.len()
+    );
+    Ok(HttpResponse::Ok().json(vehicles))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/vehicles",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("status" = Option<String>, Query, description = "Case-insensitive exact match on vehicle status, e.g. Active"),
+    ),
+    responses(
+        (status = 200, description = "Every registered bus of the feed, both stores merged", body = Vec<DepotVehicleInfo>),
+        (status = 404, description = "FEED_NOT_FOUND"),
+    )
+)]
+pub async fn get_fleet_vehicles_v2(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<DepotVehicleQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = strip_surrounding_quotes(&path.into_inner());
+    check_feed_v2(&gtfs_id)?;
+    let status = query
+        .status
+        .as_deref()
+        .map(strip_surrounding_quotes)
+        .filter(|s| !s.is_empty());
+    let (use_external, use_internal) = depot_feed_sources(&gtfs_id);
+    let (external, internal) = tokio::join!(
+        async {
+            if use_external {
+                app_state.db_vehicle_reader.get_fleet_vehicles().await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        async {
+            if use_internal {
+                app_state
+                    .db_vehicle_reader_internal
+                    .get_fleet_vehicles(&gtfs_id)
+                    .await
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    );
+    // As with depot vehicles: a failing store is an error, never a silently short fleet.
+    let vehicles = filter_vehicles_by_status(
+        merge_depot_vehicles(external?, internal?),
+        status.as_deref(),
+    );
+    info!(
+        "fleet vehicles v2: gtfs_id={} status={:?} rows={}",
+        gtfs_id,
         status,
         vehicles.len()
     );
@@ -5909,4 +5983,82 @@ mod depot_v2_tests {
         let resp = err.error_response();
         assert_eq!(resp.status().as_u16(), 404);
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssignmentQuery {
+    service_date: String,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    q: Option<String>,
+}
+/// v2 depot-day request: same feed/depot checks as the other v2 depot APIs (404 for an unknown depot).
+async fn depot_day_request(
+    state: &AppState,
+    path: web::Path<(String, String)>,
+    query: &AssignmentQuery,
+) -> AppResult<AssignmentRequest> {
+    let (gtfs_id, depot_id) = path.into_inner();
+    let gtfs_id = strip_surrounding_quotes(&gtfs_id);
+    let depot_id = strip_surrounding_quotes(&depot_id);
+    check_feed_v2(&gtfs_id)?;
+    resolve_depot(state, &gtfs_id, &depot_id)
+        .await?
+        .ok_or_else(|| depot_not_found(&depot_id, &gtfs_id))?;
+    AssignmentRequest::new(
+        &gtfs_id,
+        &depot_id,
+        &query.service_date,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(50),
+        query.q.as_deref().unwrap_or(""),
+    )
+}
+
+pub async fn get_depot_waybills_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(
+        state
+            .db_vehicle_reader
+            .monitoring_assignments(&request)
+            .await?,
+    ))
+}
+
+pub async fn get_depot_routes_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.monitoring_routes(&request).await?))
+}
+
+pub async fn get_depot_crew_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.monitoring_crew(&request).await?))
+}
+
+/// Whole depot-day counts; page and q are accepted but ignored.
+pub async fn get_depot_overview_v2(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    query: web::Query<AssignmentQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(
+        state
+            .db_vehicle_reader
+            .monitoring_overview(&request)
+            .await?,
+    ))
 }

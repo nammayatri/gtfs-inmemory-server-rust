@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
-use sqlx::PgPool;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sqlx::{FromRow, PgPool};
 use tracing::{debug, error, info, warn};
 
 use crate::models::{
@@ -16,6 +18,23 @@ use crate::tools::error::{AppError, AppResult};
 
 #[async_trait]
 pub trait VehicleDataReaderInternal: Send + Sync {
+    async fn monitoring_assignments(
+        &self,
+        _request: &AssignmentRequest,
+    ) -> AppResult<AssignmentPage> {
+        Err(AppError::NotReady(
+            "Monitoring assignments source unavailable".into(),
+        ))
+    }
+    async fn monitoring_routes(&self, _request: &AssignmentRequest) -> AppResult<RoutePage> {
+        Err(AppError::NotReady("Monitoring source unavailable".into()))
+    }
+    async fn monitoring_crew(&self, _request: &AssignmentRequest) -> AppResult<CrewPage> {
+        Err(AppError::NotReady("Monitoring source unavailable".into()))
+    }
+    async fn monitoring_overview(&self, _request: &AssignmentRequest) -> AppResult<DepotOverview> {
+        Err(AppError::NotReady("Monitoring source unavailable".into()))
+    }
     async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool;
     async fn get_vehicle_data(
         &self,
@@ -78,6 +97,11 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         depot_id: &str,
         gtfs_id: &str,
     ) -> AppResult<Vec<DepotVehicleInfo>>;
+
+    /// Every registered bus of the feed (fleet-wide live map). Unconfigured readers have none.
+    async fn get_fleet_vehicles(&self, _gtfs_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
+        Ok(Vec::new())
+    }
 
     async fn get_fleet_operation(
         &self,
@@ -1461,6 +1485,22 @@ impl DBVehicleReaderInternal {
 
 #[async_trait]
 impl VehicleDataReaderInternal for DBVehicleReaderInternal {
+    async fn monitoring_assignments(
+        &self,
+        request: &AssignmentRequest,
+    ) -> AppResult<AssignmentPage> {
+        read_assignments(self.pool()?, request, MonitoringSource::Internal).await
+    }
+    async fn monitoring_routes(&self, request: &AssignmentRequest) -> AppResult<RoutePage> {
+        read_routes(self.pool()?, request, MonitoringSource::Internal).await
+    }
+    async fn monitoring_crew(&self, request: &AssignmentRequest) -> AppResult<CrewPage> {
+        read_crew(self.pool()?, request, MonitoringSource::Internal).await
+    }
+    async fn monitoring_overview(&self, request: &AssignmentRequest) -> AppResult<DepotOverview> {
+        read_overview(self.pool()?, request, MonitoringSource::Internal).await
+    }
+
     async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
         self.is_vehicle_in_internal_impl(vehicle_no, gtfs_id).await
     }
@@ -1547,6 +1587,33 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         gtfs_id: &str,
     ) -> AppResult<Vec<DepotVehicleInfo>> {
         self.get_depot_vehicles_impl(depot_id, gtfs_id).await
+    }
+
+    async fn get_fleet_vehicles(&self, gtfs_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
+        let Some(pool) = &self.pool else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_as::<_, DepotVehicleInfo>(
+            r#"
+            SELECT v.fleet_no AS fleet_no,
+                   v.vehicle_no AS vehicle_no,
+                   v.status AS status,
+                   st.service_type_name AS service_type
+            FROM vehicles_internal v
+            LEFT JOIN service_type_internal st
+                   ON st.service_type_id = v.bus_service_type_id
+                  AND st.gtfs_id = v.gtfs_id
+                  AND st.deleted = false
+            WHERE v.gtfs_id = $1
+              AND v.deleted = false
+              AND v.fleet_no <> ''
+            ORDER BY v.fleet_no
+            "#,
+        )
+        .bind(gtfs_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_fleet_vehicles(gtfs_id={}): {}", gtfs_id, e)))
     }
 
     async fn get_fleet_operation(
@@ -2003,4 +2070,693 @@ impl DBVehicleReaderInternal {
         info!("Internal depot cache cleared successfully");
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub struct InventoryRequest {
+    gtfs_id: String,
+    depot_id: String,
+    page: i64,
+    page_size: i64,
+    search: String,
+}
+
+impl InventoryRequest {
+    pub fn new(
+        gtfs_id: &str,
+        depot_id: &str,
+        page: i64,
+        page_size: i64,
+        search: &str,
+    ) -> AppResult<Self> {
+        let canonical_id = !depot_id.is_empty()
+            && depot_id.len() <= 100
+            && depot_id.bytes().all(|byte| byte.is_ascii_digit())
+            && !depot_id.starts_with('0');
+        if gtfs_id != "chennai_bus"
+            || !canonical_id
+            || !(1..=100000).contains(&page)
+            || !(1..=200).contains(&page_size)
+            || search.chars().count() > 100
+        {
+            return Err(AppError::BadRequest(
+                "Invalid monitoring scope or pagination".into(),
+            ));
+        }
+        Ok(Self {
+            gtfs_id: gtfs_id.to_owned(),
+            depot_id: depot_id.to_owned(),
+            page,
+            page_size,
+            search: search.trim().to_owned(),
+        })
+    }
+}
+
+/// Which MTC tables a monitoring read uses. The replica is MTC's own ERP copy (Chennai only, bigint ids,
+/// no gtfs_id); the internal tables are GIMS-owned, text ids, keyed by gtfs_id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitoringSource {
+    Internal,
+    Replica,
+}
+
+impl MonitoringSource {
+    fn table(self, base: &str) -> String {
+        match (self, base) {
+            (Self::Internal, "bus_route") => "route_internal".into(),
+            (Self::Internal, _) => format!("{base}_internal"),
+            (Self::Replica, _) => base.into(),
+        }
+    }
+    /// $1 is the feed. The replica holds only Chennai, so it matches the feed key instead of a column.
+    fn feed(self, alias: &str) -> String {
+        match self {
+            Self::Internal => format!("{alias}.gtfs_id = $1"),
+            Self::Replica => "$1 = 'chennai_bus'".into(),
+        }
+    }
+    fn same_feed(self, a: &str, b: &str) -> String {
+        match self {
+            Self::Internal => format!(" AND {a}.gtfs_id = {b}.gtfs_id"),
+            Self::Replica => String::new(),
+        }
+    }
+    /// $2 is the depot id; compared as bigint on the replica so its entity_id indexes stay usable.
+    fn depot(self, col: &str, op: &str) -> String {
+        match self {
+            Self::Internal => format!("{col}::text {op} $2"),
+            Self::Replica => format!("{col} {op} $2::bigint"),
+        }
+    }
+    fn completed(self, alias: &str) -> String {
+        match self {
+            Self::Internal => format!("{alias}.is_completed"),
+            Self::Replica => "NULL::boolean".into(),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Internal => "mtc_internal",
+            Self::Replica => "mtc_replica",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AssignmentRequest {
+    inventory: InventoryRequest,
+    service_date: String,
+}
+impl AssignmentRequest {
+    pub fn new(
+        gtfs_id: &str,
+        depot_id: &str,
+        service_date: &str,
+        page: i64,
+        page_size: i64,
+        search: &str,
+    ) -> AppResult<Self> {
+        let date = chrono::NaiveDate::parse_from_str(service_date, "%Y-%m-%d").map_err(|_| {
+            AppError::BadRequest("Invalid service date; expected YYYY-MM-DD".into())
+        })?;
+        if date.format("%Y-%m-%d").to_string() != service_date {
+            return Err(AppError::BadRequest(
+                "Invalid service date; expected YYYY-MM-DD".into(),
+            ));
+        }
+        Ok(Self {
+            inventory: InventoryRequest::new(gtfs_id, depot_id, page, page_size, search)?,
+            service_date: service_date.into(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignmentTrip {
+    pub trip_id: String,
+    pub route_id: Option<String>,
+    pub route_number: Option<String>,
+    pub route_name: Option<String>,
+    pub direction: Option<String>,
+    pub trip_number: i32,
+    pub trip_order: i32,
+    pub trip_type: Option<String>,
+    pub scheduled_start: Option<String>,
+    pub scheduled_end: Option<String>,
+    pub recorded_active: bool,
+    pub recorded_completed: Option<bool>,
+    /// Recorded start/end epoch (text), only when it falls on the service day in IST.
+    pub actual_start: Option<String>,
+    pub actual_end: Option<String>,
+    /// Scheduled trip distance in km.
+    pub planned_km: Option<f64>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringAssignment {
+    pub waybill_id: String,
+    pub waybill_no: Option<String>,
+    pub depot_id: String,
+    pub service_date: String,
+    /// Raw waybill vehicle identifier; no unverified fleet/registration join.
+    pub vehicle_identifier: Option<String>,
+    pub driver_token: Option<String>,
+    pub conductor_token: Option<String>,
+    pub schedule_no: Option<String>,
+    pub status: Option<String>,
+    pub is_flexi: bool,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub trips: sqlx::types::Json<Vec<AssignmentTrip>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringPage<T> {
+    pub depot_id: String,
+    pub service_date: String,
+    pub source: &'static str,
+    pub observed_at: DateTime<Utc>,
+    pub data_through: Option<DateTime<Utc>>,
+    pub rows: Vec<T>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+pub type AssignmentPage = MonitoringPage<MonitoringAssignment>;
+pub type RoutePage = MonitoringPage<MonitoringRoute>;
+pub type CrewPage = MonitoringPage<MonitoringCrew>;
+
+impl<T> MonitoringPage<T> {
+    fn new(request: &AssignmentRequest, rows: Vec<T>, total: i64, src: MonitoringSource) -> Self {
+        let scope = &request.inventory;
+        Self {
+            depot_id: scope.depot_id.clone(),
+            service_date: request.service_date.clone(),
+            source: src.label(),
+            observed_at: Utc::now(),
+            data_through: None,
+            rows,
+            total,
+            page: scope.page,
+            page_size: scope.page_size,
+        }
+    }
+}
+
+/// Waybills of one depot and stored duty date ($1 feed, $2 depot, $3 date).
+fn day_waybills(src: MonitoringSource) -> String {
+    format!(
+        "SELECT * FROM {} w WHERE {} AND {} AND w.deleted = false AND w.duty_date = $3",
+        src.table("waybills"),
+        src.feed("w"),
+        src.depot("w.entity_id", "=")
+    )
+}
+
+/// Recorded trip time (epoch ms or s, as text), kept only when it falls on the service date ($3) in IST.
+/// Regular trips share their schedule's row, so every later run overwrites these columns.
+fn recorded_time(col: &str) -> String {
+    format!(
+        "(SELECT v FROM (SELECT btrim({col}::text) AS v) r WHERE v ~ '^[0-9]{{10}}([0-9]{{3}})?$' \
+         AND (to_timestamp(CASE WHEN length(v) = 13 THEN v::numeric / 1000 ELSE v::numeric END) AT TIME ZONE 'Asia/Kolkata')::date = $3::date)"
+    )
+}
+
+/// Trip rows of one waybill `w`: regular trips by schedule_trip_id, flexi trips by waybill_id.
+fn waybill_trips(src: MonitoringSource, columns_regular: &str, columns_flexi: &str) -> String {
+    format!(
+        "SELECT {columns_regular} FROM {detail} d
+         WHERE NOT w.is_flexi{feed_d} AND d.schedule_trip_id = w.schedule_trip_id AND d.deleted = false
+         UNION ALL
+         SELECT {columns_flexi} FROM {flexi} f
+         WHERE w.is_flexi{feed_f} AND f.waybill_id = w.waybill_id AND f.deleted = false",
+        detail = src.table("bus_schedule_trip_detail"),
+        flexi = src.table("bus_schedule_trip_flexi"),
+        feed_d = src.same_feed("d", "w"),
+        feed_f = src.same_feed("f", "w"),
+    )
+}
+
+pub async fn read_assignments(
+    pool: &PgPool,
+    request: &AssignmentRequest,
+    src: MonitoringSource,
+) -> AppResult<AssignmentPage> {
+    let scope = &request.inventory;
+    let mut tx = pool.begin().await.map_err(assignment_db_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(assignment_db_error)?;
+    // Retain all recorded statuses and all shifts on this day. A waybill count is not a bus count.
+    let predicate = format!(
+        "FROM ({}) w WHERE ($4 = '' OR position(lower($4) in lower(concat_ws(' ', w.vehicle_no, w.waybill_no, w.schedule_no, w.driver_token_no, w.conductor_token_no))) > 0)",
+        day_waybills(src)
+    );
+    let total: i64 = sqlx::query_scalar(&format!("SELECT count(*) {predicate}"))
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .bind(&scope.search)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(assignment_db_error)?;
+    let trips = waybill_trips(
+        src,
+        &format!(
+            "d.schedule_trip_detail_id::text AS trip_id, d.route_number_id::text AS route_id, d.trip_number, d.trip_order, d.trip_type, d.start_time, d.end_time, d.is_active_trip, {} AS is_completed, {} AS actual_start, {} AS actual_end, round(d.distance::numeric, 2)::float8 AS planned_km",
+            src.completed("d"), recorded_time("d.trip_start_time"), recorded_time("d.trip_end_time")
+        ),
+        &format!(
+            "f.schedule_trip_flexi_id::text, f.route_number_id::text, f.trip_number, f.trip_order, f.trip_type, f.start_time, f.end_time, f.is_active_trip, NULL::boolean, {}, {}, round(f.distance::numeric, 2)::float8",
+            recorded_time("f.trip_start_time"), recorded_time("f.trip_end_time")
+        ),
+    );
+    let query = format!(
+        r#"
+        WITH selected AS (SELECT w.* {predicate} ORDER BY w.waybill_id LIMIT $5 OFFSET $6)
+        SELECT w.waybill_id::text, w.waybill_no, w.entity_id::text AS depot_id,
+               w.duty_date AS service_date, w.vehicle_no AS vehicle_identifier,
+               NULLIF(w.driver_token_no, '') AS driver_token, NULLIF(w.conductor_token_no, '') AS conductor_token,
+               w.schedule_no, w.status, w.is_flexi, w.updated_at::timestamptz,
+               COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                   'tripId', t.trip_id, 'routeId', t.route_id, 'routeNumber', r.route_number,
+                   'routeName', r.route_name, 'direction', r.route_direction,
+                   'tripNumber', t.trip_number, 'tripOrder', t.trip_order, 'tripType', t.trip_type,
+                   'scheduledStart', t.start_time, 'scheduledEnd', t.end_time,
+                   'recordedActive', t.is_active_trip, 'recordedCompleted', t.is_completed,
+                   'actualStart', t.actual_start, 'actualEnd', t.actual_end, 'plannedKm', t.planned_km
+               ) ORDER BY t.trip_order, t.trip_id)
+               FROM ({trips}) t LEFT JOIN {route} r ON r.route_id::text = t.route_id{route_feed} AND r.deleted = false
+               ), '[]'::jsonb) AS trips
+        FROM selected w ORDER BY w.waybill_id
+    "#,
+        route = src.table("bus_route"),
+        route_feed = src.same_feed("r", "w"),
+    );
+    let rows = sqlx::query_as::<_, MonitoringAssignment>(&query)
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .bind(&scope.search)
+        .bind(scope.page_size)
+        .bind((scope.page - 1) * scope.page_size)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(assignment_db_error)?;
+    tx.commit().await.map_err(assignment_db_error)?;
+    Ok(MonitoringPage::new(request, rows, total, src))
+}
+fn assignment_db_error(error: sqlx::Error) -> AppError {
+    tracing::error!(%error, "Monitoring assignments query failed");
+    AppError::NotReady("Monitoring assignments source unavailable".into())
+}
+
+fn monitoring_db_error(error: sqlx::Error) -> AppError {
+    tracing::error!(%error, "Monitoring query failed");
+    AppError::NotReady("Monitoring source unavailable".into())
+}
+
+async fn read_only_tx(pool: &PgPool) -> AppResult<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = pool.begin().await.map_err(monitoring_db_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    Ok(tx)
+}
+
+/// Routes run by the depot's schedules effective on the day, plus routes on that day's waybills.
+fn route_scope_sql(src: MonitoringSource) -> String {
+    format!(
+        r#"
+        WITH day_w AS ({day_w}),
+        sched AS (
+            SELECT DISTINCT st.schedule_id, d.route_number_id::text AS route_id
+            FROM {schedule} s
+            JOIN {schedule_trip} st ON st.schedule_id = s.schedule_id{feed_st} AND st.deleted = false
+                AND (st.effective_start_date IS NULL OR st.effective_start_date::date <= $3::date)
+                AND (st.effective_end_date IS NULL OR st.effective_end_date::date >= $3::date)
+            JOIN {detail} d ON d.schedule_trip_id = st.schedule_trip_id{feed_d} AND d.deleted = false
+            WHERE {feed_s} AND {depot_s} AND s.deleted = false
+                AND (s.effective_from IS NULL OR s.effective_from::date <= $3::date)
+                AND (s.effective_till IS NULL OR s.effective_till::date >= $3::date)
+        ),
+        alloc AS (
+            SELECT t.route_id, w.waybill_id, w.vehicle_no
+            FROM day_w w
+            CROSS JOIN LATERAL ({trips}) t
+        ),
+        routes AS (
+            SELECT ids.route_id, r.route_number, r.route_name, r.route_direction AS direction,
+                (SELECT count(DISTINCT schedule_id) FROM sched WHERE sched.route_id = ids.route_id) AS scheduled_schedules,
+                (SELECT count(DISTINCT waybill_id) FROM alloc WHERE alloc.route_id = ids.route_id) AS allocated_waybills,
+                (SELECT count(DISTINCT vehicle_no) FROM alloc WHERE alloc.route_id = ids.route_id) AS allocated_vehicles
+            FROM (SELECT route_id FROM sched UNION SELECT route_id FROM alloc) ids
+            LEFT JOIN {route} r ON r.route_id::text = ids.route_id AND {feed_r} AND r.deleted = false
+            WHERE $4 = '' OR position(lower($4) in lower(concat_ws(' ', r.route_number, r.route_name))) > 0
+        )"#,
+        day_w = day_waybills(src),
+        schedule = src.table("bus_schedule"),
+        schedule_trip = src.table("bus_schedule_trip"),
+        detail = src.table("bus_schedule_trip_detail"),
+        route = src.table("bus_route"),
+        feed_st = src.same_feed("st", "s"),
+        feed_d = src.same_feed("d", "st"),
+        feed_s = src.feed("s"),
+        depot_s = src.depot("s.entity_id", "="),
+        feed_r = src.feed("r"),
+        trips = waybill_trips(
+            src,
+            "d.route_number_id::text AS route_id",
+            "f.route_number_id::text"
+        ),
+    )
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringRoute {
+    pub route_id: String,
+    pub route_number: Option<String>,
+    pub route_name: Option<String>,
+    pub direction: Option<String>,
+    /// Depot schedules effective on the day that run this route; 0 = only seen on a waybill.
+    pub scheduled_schedules: i64,
+    /// 0 = scheduled but nothing allocated that day.
+    pub allocated_waybills: i64,
+    /// Distinct raw waybill vehicle identifiers.
+    pub allocated_vehicles: i64,
+}
+
+pub async fn read_routes(
+    pool: &PgPool,
+    request: &AssignmentRequest,
+    src: MonitoringSource,
+) -> AppResult<RoutePage> {
+    let scope = &request.inventory;
+    let cte = route_scope_sql(src);
+    let mut tx = read_only_tx(pool).await?;
+    let total: i64 = sqlx::query_scalar(&format!("{cte} SELECT count(*) FROM routes"))
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .bind(&scope.search)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    let rows = sqlx::query_as::<_, MonitoringRoute>(&format!(
+        "{cte} SELECT * FROM routes ORDER BY route_number NULLS LAST, route_id LIMIT $5 OFFSET $6"
+    ))
+    .bind(&scope.gtfs_id)
+    .bind(&scope.depot_id)
+    .bind(&request.service_date)
+    .bind(&scope.search)
+    .bind(scope.page_size)
+    .bind((scope.page - 1) * scope.page_size)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(monitoring_db_error)?;
+    tx.commit().await.map_err(monitoring_db_error)?;
+    Ok(MonitoringPage::new(request, rows, total, src))
+}
+
+/// Depot roster with that day's waybill assignments. No names or contacts.
+fn crew_scope_sql(src: MonitoringSource) -> String {
+    format!(
+        r#"
+        WITH day_w AS ({day_w}),
+        assigned AS (
+            -- The source records an absent crew member as '' rather than NULL.
+            SELECT driver_token_no AS token, 'driver' AS role FROM day_w WHERE NULLIF(driver_token_no, '') IS NOT NULL
+            UNION ALL
+            SELECT conductor_token_no, 'conductor' FROM day_w WHERE NULLIF(conductor_token_no, '') IS NOT NULL
+        ),
+        crew AS (
+            SELECT e.emp_id::text AS employee_id, e.token_no AS token, dsg.designation_name AS designation,
+                   e.status AS master_status, count(a.token) AS assigned_waybills,
+                   array_remove(array_agg(DISTINCT a.role), NULL) AS assigned_roles
+            FROM {employees} e
+            LEFT JOIN {designations} dsg ON dsg.designation_id = e.designation_id{feed_dsg} AND dsg.deleted = false
+            LEFT JOIN assigned a ON a.token = e.token_no
+            WHERE {feed_e} AND {depot_e} AND e.deleted = false
+              AND ($4 = '' OR position(lower($4) in lower(concat_ws(' ', e.token_no, dsg.designation_name))) > 0)
+            GROUP BY e.emp_id, e.token_no, dsg.designation_name, e.status
+        )"#,
+        day_w = day_waybills(src),
+        employees = src.table("employees"),
+        designations = src.table("designations"),
+        feed_dsg = src.same_feed("dsg", "e"),
+        feed_e = src.feed("e"),
+        depot_e = src.depot("e.entity_id", "="),
+    )
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringCrew {
+    pub employee_id: String,
+    pub token: Option<String>,
+    /// Source designation name (e.g. driver/conductor), not a hardcoded role.
+    pub designation: Option<String>,
+    pub master_status: Option<String>,
+    /// Waybills on the day naming this token; roster assignment, not attendance.
+    pub assigned_waybills: i64,
+    pub assigned_roles: Vec<String>,
+}
+
+pub async fn read_crew(
+    pool: &PgPool,
+    request: &AssignmentRequest,
+    src: MonitoringSource,
+) -> AppResult<CrewPage> {
+    let scope = &request.inventory;
+    let cte = crew_scope_sql(src);
+    let mut tx = read_only_tx(pool).await?;
+    let total: i64 = sqlx::query_scalar(&format!("{cte} SELECT count(*) FROM crew"))
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .bind(&scope.search)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    let rows = sqlx::query_as::<_, MonitoringCrew>(&format!(
+        "{cte} SELECT * FROM crew ORDER BY assigned_waybills DESC, token NULLS LAST, employee_id LIMIT $5 OFFSET $6"
+    ))
+    .bind(&scope.gtfs_id)
+    .bind(&scope.depot_id)
+    .bind(&request.service_date)
+    .bind(&scope.search)
+    .bind(scope.page_size)
+    .bind((scope.page - 1) * scope.page_size)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(monitoring_db_error)?;
+    tx.commit().await.map_err(monitoring_db_error)?;
+    Ok(MonitoringPage::new(request, rows, total, src))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewCounts {
+    pub registered_vehicles: i64,
+    pub waybills: i64,
+    /// Distinct raw vehicle identifiers on the day's waybills.
+    pub allocated_vehicle_identifiers: i64,
+    /// Registry vehicles whose fleet_no or vehicle_no appears on a waybill.
+    pub matched_vehicles: i64,
+    /// Waybill buses registered under another depot (home depot differs from the duty's depot).
+    pub other_depot_vehicles: i64,
+    /// Waybill identifiers not in any registry of this feed.
+    pub unmatched_vehicle_identifiers: i64,
+    pub rostered_crew: i64,
+    pub assigned_crew_tokens: i64,
+    /// Assigned tokens not on this depot's roster (visiting or unknown crew).
+    pub unrostered_crew_tokens: i64,
+    pub waybills_by_status: sqlx::types::Json<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteCounts {
+    pub scheduled_routes: i64,
+    pub allocated_routes: i64,
+}
+
+/// Trips on the day's waybills. Regular trips share their schedule's rows, so recorded
+/// start/end on a past day can belong to a later run of the same schedule.
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct TripCounts {
+    pub planned_trips: i64,
+    pub started_trips: i64,
+    pub completed_trips: i64,
+    pub active_trips: i64,
+    /// Planned start passed (IST) with no recorded start; null unless the service date is today.
+    pub overdue_unstarted_trips: Option<i64>,
+}
+
+/// Trips by planned start hour (IST, 0-23) on the day's waybills.
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct TripHour {
+    pub hour: i32,
+    pub planned: i64,
+    pub started: i64,
+    pub completed: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepotOverview {
+    pub depot_id: String,
+    pub service_date: String,
+    pub source: &'static str,
+    pub observed_at: DateTime<Utc>,
+    pub data_through: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    pub counts: OverviewCounts,
+    #[serde(flatten)]
+    pub routes: RouteCounts,
+    #[serde(flatten)]
+    pub trips: TripCounts,
+    pub trips_by_hour: Vec<TripHour>,
+}
+
+/// Counts over the whole depot-day, independent of any page. Page/search on the request are ignored.
+pub async fn read_overview(
+    pool: &PgPool,
+    request: &AssignmentRequest,
+    src: MonitoringSource,
+) -> AppResult<DepotOverview> {
+    let scope = &request.inventory;
+    let vehicles = src.table("vehicles");
+    let employees = src.table("employees");
+    let counts_sql = format!(
+        r#"
+        WITH day_w AS ({day_w}),
+        veh AS (SELECT vehicle_id, fleet_no, vehicle_no FROM {vehicles} v WHERE {feed_v} AND {depot_v} AND deleted = false),
+        -- One row per alias (fleet or registration), so waybill matching is a plain equality join Postgres can hash.
+        veh_alias AS (SELECT vehicle_id, unnest(ARRAY[fleet_no, vehicle_no]) AS alias FROM veh),
+        roster AS (SELECT DISTINCT token_no FROM {employees} e WHERE {feed_e} AND {depot_e} AND deleted = false AND NULLIF(token_no, '') IS NOT NULL),
+        feed_alias AS (SELECT unnest(ARRAY[fleet_no, vehicle_no]) AS alias FROM {vehicles} v WHERE {feed_v} AND {other_v} AND deleted = false),
+        tokens AS (
+            SELECT driver_token_no AS token FROM day_w WHERE NULLIF(driver_token_no, '') IS NOT NULL
+            UNION SELECT conductor_token_no FROM day_w WHERE NULLIF(conductor_token_no, '') IS NOT NULL
+        )
+        SELECT
+            (SELECT count(*) FROM veh) AS registered_vehicles,
+            (SELECT count(*) FROM day_w) AS waybills,
+            (SELECT count(DISTINCT vehicle_no) FROM day_w WHERE NULLIF(vehicle_no, '') IS NOT NULL) AS allocated_vehicle_identifiers,
+            (SELECT count(DISTINCT va.vehicle_id) FROM veh_alias va JOIN day_w w ON w.vehicle_no = va.alias) AS matched_vehicles,
+            (SELECT count(DISTINCT w.vehicle_no) FROM day_w w WHERE NULLIF(w.vehicle_no, '') IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM veh_alias va WHERE va.alias = w.vehicle_no)
+                AND EXISTS (SELECT 1 FROM feed_alias f WHERE f.alias = w.vehicle_no)) AS other_depot_vehicles,
+            (SELECT count(DISTINCT w.vehicle_no) FROM day_w w WHERE NULLIF(w.vehicle_no, '') IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM veh_alias va WHERE va.alias = w.vehicle_no)
+                AND NOT EXISTS (SELECT 1 FROM feed_alias f WHERE f.alias = w.vehicle_no)) AS unmatched_vehicle_identifiers,
+            (SELECT count(*) FROM roster) AS rostered_crew,
+            (SELECT count(*) FROM tokens) AS assigned_crew_tokens,
+            (SELECT count(*) FROM tokens t WHERE NOT EXISTS (SELECT 1 FROM roster r WHERE r.token_no = t.token)) AS unrostered_crew_tokens,
+            (SELECT coalesce(jsonb_object_agg(coalesce(status, ''), n), '{{}}'::jsonb)
+               FROM (SELECT status, count(*) AS n FROM day_w GROUP BY status) s) AS waybills_by_status
+        "#,
+        day_w = day_waybills(src),
+        feed_v = src.feed("v"),
+        depot_v = src.depot("v.entity_id", "="),
+        other_v = src.depot("v.entity_id", "<>"),
+        feed_e = src.feed("e"),
+        depot_e = src.depot("e.entity_id", "="),
+    );
+    let route_sql = format!(
+        "{} SELECT count(*) FILTER (WHERE scheduled_schedules > 0) AS scheduled_routes, count(*) FILTER (WHERE allocated_waybills > 0) AS allocated_routes FROM routes",
+        route_scope_sql(src)
+    );
+    let day_trips = format!(
+        "WITH day_w AS ({day_w}), t AS (SELECT t.* FROM day_w w CROSS JOIN LATERAL ({trips}) t)",
+        day_w = day_waybills(src),
+        trips = waybill_trips(
+            src,
+            &format!(
+                "d.start_time, d.is_active_trip, {} AS actual_start, {} AS actual_end",
+                recorded_time("d.trip_start_time"),
+                recorded_time("d.trip_end_time")
+            ),
+            &format!(
+                "f.start_time, f.is_active_trip, {}, {}",
+                recorded_time("f.trip_start_time"),
+                recorded_time("f.trip_end_time")
+            ),
+        ),
+    );
+    let hours_sql = format!(
+        r#"{day_trips}
+        SELECT h AS hour, count(*) AS planned,
+               count(*) FILTER (WHERE actual_start IS NOT NULL) AS started,
+               count(*) FILTER (WHERE actual_end IS NOT NULL) AS completed
+        FROM (SELECT t.*, CASE WHEN start_time ~ '^\s*[0-9]{{1,2}}:[0-9]{{2}}'
+                               THEN substring(start_time from '^\s*([0-9]{{1,2}})')::int END AS h FROM t) x
+        WHERE h BETWEEN 0 AND 23 GROUP BY h ORDER BY h"#
+    );
+    let trip_sql = format!(
+        r#"{day_trips},
+        ist AS (SELECT (now() AT TIME ZONE 'Asia/Kolkata') AS now)
+        SELECT count(*) AS planned_trips,
+               count(*) FILTER (WHERE actual_start IS NOT NULL) AS started_trips,
+               count(*) FILTER (WHERE actual_end IS NOT NULL) AS completed_trips,
+               count(*) FILTER (WHERE is_active_trip IS TRUE) AS active_trips,
+               CASE WHEN $3::date = (SELECT now::date FROM ist) THEN
+                   count(*) FILTER (WHERE actual_start IS NULL AND
+                       (CASE WHEN start_time ~ '^\s*[0-9]{{1,2}}:[0-9]{{2}}'
+                             THEN substring(start_time from '[0-9]{{1,2}}:[0-9]{{2}}')::time END) < (SELECT now::time FROM ist))
+               END AS overdue_unstarted_trips
+        FROM t"#
+    );
+    let mut tx = read_only_tx(pool).await?;
+    let counts = sqlx::query_as::<_, OverviewCounts>(&counts_sql)
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    let routes = sqlx::query_as::<_, RouteCounts>(&route_sql)
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .bind("")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    let trips = sqlx::query_as::<_, TripCounts>(&trip_sql)
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    let trips_by_hour = sqlx::query_as::<_, TripHour>(&hours_sql)
+        .bind(&scope.gtfs_id)
+        .bind(&scope.depot_id)
+        .bind(&request.service_date)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(monitoring_db_error)?;
+    tx.commit().await.map_err(monitoring_db_error)?;
+    Ok(DepotOverview {
+        depot_id: scope.depot_id.clone(),
+        service_date: request.service_date.clone(),
+        source: src.label(),
+        observed_at: Utc::now(),
+        data_through: None,
+        counts,
+        routes,
+        trips,
+        trips_by_hour,
+    })
 }

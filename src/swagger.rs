@@ -47,6 +47,7 @@ use crate::services::operator::QueryBody;
         routes::get_depots_v2,
         routes::get_depot_by_id_v2,
         routes::get_depot_vehicles_v2,
+        routes::get_fleet_vehicles_v2,
         // Bus Schedule
         routes::get_bus_route_schedule,
         routes::get_bus_trip_schedule,
