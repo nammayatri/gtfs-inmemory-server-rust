@@ -32,6 +32,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // The weekly GPS polyline sync as its own process (the Kubernetes CronJob)
+    if env::args().any(|a| a == "--gps-polyline-sync") {
+        gtfs_routes_service::editor::gps_polyline_sync::run_job(&app_config)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        return Ok(());
+    }
+
     // Create application state
     let port = app_config.port;
     let polling_enabled = app_config.polling_enabled;

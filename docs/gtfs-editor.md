@@ -4994,3 +4994,220 @@ real run writing nothing; bulk changes identical to single adds; a commit after
 which the loader's alias map answers each retired id with its survivor and the
 route calls at the stop kept; the same upload again adding nothing); bulk unit
 tests for the kind's columns.
+
+## 20. Weekly map lines from GPS (2026-10-07)
+
+Once a week GIMS rebuilds every route's map line from its buses' pings and
+puts the routes whose line changed, or had none, into drafts of up to 100
+routes. A person checks and submits each, someone else approves and commits it;
+nothing goes live on its own. Code: `src/editor/gps_polyline_sync.rs`, the read in
+`src/editor/gps_line/batch.rs`.
+
+```dhall
+gtfs_gps_polyline_sync = Some
+  { author_email = "gps-polyline-sync@…"   -- required: the account the drafts are made as
+  , feeds = Some [ "chennai_bus" ]         -- default chennai_bus
+  , draft_size = None Natural              -- routes per draft, default 100
+  , bus_days_per_route = None Natural     -- bus-days read per route, default 16
+  , groups = None Natural                  -- routes read and built in this many groups, default 8
+  , osrm_parallel = None Natural           -- routes built and snapped at once, default 4
+  , run_budget_minutes = None Natural      -- the whole run, default 360
+  , route_ids = None (List Text)           -- only these route ids (testing); default every route
+  , min_runs = None Natural, max_missed_stops = None Natural
+  , clickhouse_min_gap_ms = None Natural   -- the run's reader: ms between query starts, default 100
+  , clickhouse_max_concurrent = None Natural -- its queries at once, default 3
+  , page_rows = None Natural               -- bus-hours per answer, default 1000
+  }
+```
+
+It needs `gtfs_gps`. `author_email` is an ordinary editor account an admin
+creates once (Users page); no grant is needed, and nobody signs in with it. It
+only authors the draft: a person opens it, checks the lines and submits it, and
+someone else approves it (section 3, maker-checker).
+
+**When and where.** A Kubernetes CronJob runs it as a process of its own: once
+a week it starts a pod from the GIMS image running `./gtfs-routes-service
+--gps-polyline-sync` (`src/main.rs`, like `--build-snapshot`). That process reads the same dhall
+config, sets up only the editor's state (`EditorState::init`: the database pool,
+the ClickHouse reader, OSRM) - no HTTP server, no GTFS feed loaded - runs every
+feed in `feeds` once (`run_job`) and exits: 0 when each feed drafted, found
+nothing, was already done this week or was running elsewhere; 1 (the Job shows
+as failed) when the sync is not configured or a feed's run failed. So the
+reading and building use only that pod's memory and CPU; the GIMS pods serving
+traffic take no part. A run started with a measured 20 MB before any reading
+(2026-10-06); size the pod from a full run's peak (`/usr/bin/time -l`, "maximum
+resident set size").
+
+It is this week's scheduled run: its drafts are titled `GPS polylines 2026-W41`
+(or `… (k/n)`, below), and a second run the same week finds them and stops
+(`AlreadyDone`). One run at a time:
+`pg_try_advisory_lock(hashtext('gps-polyline-sync:{gtfs_id}'))` (another is
+`Busy`). An admin can run it at once from the editor's API, `POST
+/internal/gtfs-editor/feeds/{g}/gps-polyline-sync` (SSO, admin) → 202; that run
+goes on in the GIMS pod that took the call, its titles carry `(manual …)`, and
+it is not limited to one a week. GIMS pods never start it on their own: the
+schedule is the CronJob's.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gims-gps-polyline-sync
+spec:
+  schedule: "30 21 * * 6"            # Sun 03:00 IST (Sat 21:30 UTC)
+  concurrencyPolicy: Forbid          # never two at once
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1                # one retry; a retry the same week stops at AlreadyDone
+      activeDeadlineSeconds: 25200   # 7 h: run_budget_minutes (360) and slack
+      ttlSecondsAfterFinished: 86400 # the finished Job and pod are removed a day later
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: gps-polyline-sync
+              image: <the GIMS image:tag the deployment runs>
+              command: ["./gtfs-routes-service"]   # WORKDIR is /app
+              args: ["--gps-polyline-sync"]
+              env:                     # as the GIMS deployment: DHALL_CONFIG and its secrets
+                - name: DHALL_CONFIG
+                  value: <the deployment's mounted dhall path>
+              # volumeMounts / envFrom: the same config and secrets as the deployment
+              # no readiness or liveness probes: the job serves no HTTP
+              resources:
+                requests: { cpu: 500m, memory: 1Gi }
+                limits:   { cpu: "2",  memory: 2Gi }
+```
+
+The image needs no change: the mode is in the same `gtfs-routes-service`
+binary. Its last line is `CMD ["./gtfs-routes-service"]`, not an `ENTRYPOINT`,
+so a container's `args` replace the whole command: `args:
+["--gps-polyline-sync"]` alone would try to run a program of that name and the
+pod would not start - hence `command` above. `DHALL_CONFIG` must be the
+deployment's mounted config: the image's default (`build_snapshot.dhall`) has no
+editor or GPS settings, and the job exits 1 ("the GTFS editor is not enabled").
+The image's `HEALTHCHECK` is Docker's and Kubernetes ignores it. If the
+deployment runs the binary through a wrapper (a pipe into
+`/usr/sbin/log-processor`), the job's `command` is that wrapper with
+`--gps-polyline-sync` added to the binary in it. To run it at once:
+`kubectl create job --from=cronjob/gims-gps-polyline-sync gps-sync-manual-$(date +%s)`
+- the same separate pod, this week's title.
+
+It needs what the run reads and writes, as the deployment does: the MTC
+internal database (`internal_database_url`), ClickHouse (`gtfs_gps`,
+`gtfs_gps_clickhouse_password`), OSRM (`osrm_url`), and the editor settings
+`EditorState::init` checks (`gtfs_editor_enabled`, its JWKS url, audience and
+TOTP key, though nobody signs in).
+
+**Which routes.** Every route, every week (only those whose id is in
+`route_ids` when set), except hand-drawn lines (`polyline_source` `manual`
+or `upload`) and routes in this account's submitted or approved sets until
+those are reviewed; routes in its earlier drafts are checked again.
+
+**Reading** (`gps_line::batch`), once for the whole feed rather than per
+route. Per-route reading (section 17) scans every day once per route: about
+14 queries a route, ~77,000 a week for ~5,500 routes. Here:
+
+Pings are taken by the GTFS **`route_id`** each trip was assigned (the
+`route_id` column, filled from the trip assignment, as the control center shows
+trips), not by the route number on the pings (`routeNumber`, which gps-processor
+looks up from its own route tables). That number covers every variant at once
+and can be another route's: on 2026-10-04 the Tambaram trips of 104A (route
+1987) carried `104ACT`, and a
+per-number read built 1987's line from Avadi ⇄ Kilambakkam trips (route 1983)
+that share 19 of its 24 stops. That day 74% of pings (78% of buses) carried a
+`route_id`; the rest are outside an assigned trip (depot runs, waiting).
+
+1. *Index*: one query per day for the whole fleet (`index_sql`): every
+   (route id, bus) with its pings and first and last ping of that route,
+   packed one row per bucket of route ids (32 rows). Seven queries for a week.
+2. *Choose*: per route id, its busiest bus-days, newest day first and spread
+   over the week, at least 120 pings each, `bus_days_per_route` in all.
+3. *Groups*: route ids hashed into `groups` groups. Per group, the chosen
+   buses' pings over the hours they ran a route (45 min each side), in answers
+   of at most `page_rows` bus-hours (the sync's own, below), averaged to 20 s, each point with
+   the route id it carried (`group_tracks_sql`). A bus-day keeps the points
+   carrying its route id or none, in its span (`attribute`). The points are
+   held in memory only while the group is built.
+4. *Stops*: the group's stop lists in one query
+   (`service::load_patterns_read_rows`, first stop order, both primary keys),
+   the route page's rows through `served_stops`; no per-route `route_detail`
+   (which also reads the timetable).
+5. *Build*: per route of the group, section 17's steps 3 and 4
+   (`build_line`, off the async thread) on its route id's tracks, then OSRM
+   (`finish`), `osrm_parallel` routes at a time; then the rules below.
+
+The table is `ORDER BY timestamp`, partitioned by week, with no index on
+`deviceId` (`SHOW CREATE TABLE`, 2026-10-03): a query skips data only by time,
+so each window reads its whole hour whichever buses it names. Scans are hours
+x (buses that hour / `page_rows`); groups only bound memory.
+
+The CronJob reads through a ClickHouse reader of its own (`run_job`,
+`SyncSettings::read_settings`), not the editor's: its own gap between query
+starts (`clickhouse_min_gap_ms`, 100), queries at once
+(`clickhouse_max_concurrent`, 3) and `page_rows` (1000; the editor keeps
+`gtfs_gps.page_rows`, 100, and 350 ms). Every answer is gzipped
+(`enable_http_compression=1`; the same rows, fewer bytes). Why, from
+`system.query_log` (2026-10-05, W41, `page_rows` 100 and 350 ms): 5,816 track
+queries, each ~92 ms on the server (p95 320 ms), reading one whole hour (~1 M
+rows, 23 MB) to return ~85 bus-hours (~800 KB) with ~9 MB of memory. The
+server worked ~9 min; the read took ~35 min, because the reader starts one
+query per 350 ms whatever the concurrency (5,816 x 0.35 s = 34 min). And each
+hour was scanned ~37 times (5.9 B rows, ~134 GB). With 1000 bus-hours an
+answer a group's buses of a day (~600) fit one query per hour: each hour is
+scanned once per group, ~1,000 queries a run instead of ~5,800. A manual run
+(the API) uses the editor's reader.
+
+A query that fails is asked twice. A day of the index still unread stops the
+run with an error; a window still unread marks `stopped: "budget"` on only the
+routes whose buses it held, and those routes are skipped. On 2026-10-01 a
+full day was 22.5 M pings from 4,587 buses, and scanning it took 0.4 s.
+
+**Per route**, on what was read:
+
+- *Evidence*: at least 3 runs (`min_runs`), however many buses made them,
+  matched `osrm`/`partial` over at least 0.90 of the length, not truncated,
+  not stopped by the budget. Otherwise skipped (`low_evidence: …`).
+  `gps_line`'s own floor is also 3 runs (else `not_enough_runs`).
+- *Change*: both lines cut to the stretch between where the first and last
+  served stops fall on them (a depot or terminus approach is not the route;
+  the whole line for a loop), resampled every 10 m; each point's distance to
+  the other line, both ways. Changed when the longest stretch more than 50 m
+  away is at least 300 m, or the 95th percentile distance is at least 50 m, or
+  the length differs by 5% or more. Both rules ask only whether a point is
+  more than 50 m away, so a distance is measured exactly up to there (a grid
+  of 50 m cells: each point against the other line's segments in the cells
+  around it, O(n + m)) and anything farther counts as off; the logged
+  distances read `inf` past ~100 m.
+- *Stops*: a changed line is proposed when it misses (more than 30 m away) at
+  most 5 served stops (`max_missed_stops`), or no more than the live line
+  misses; failing both, `misses_stops: N of M (live K)`. A stop no line
+  reaches (a wrong position) does not block a route. No live line: proposed
+  whatever its stops; the draft's note says how many it passes.
+
+**The drafts.** A week's proposals go into drafts of at most `draft_size` (100)
+routes: changed lines first, then routes without a line, never both in one
+draft, each kind in route id order (`batches`). One draft keeps the plain title;
+more are `GPS polylines 2026-W41 (1/22)`, `(2/22)`, …. Each gets a
+`route/update` of `{encoded_polyline, polyline_source: "gps"}` per route and is
+left as a draft; its description is one line (the days read, which draft of how
+many, how many routes and of which kind, and the week's total). A route
+proposed again is taken out of this account's earlier drafts (one left empty is
+discarded); everything else in earlier drafts stays. No proposals, no draft.
+Every route's decision and distances are logged.
+
+**Checking it.** On the draft page each route's inset map, and on the route
+page opened from the draft (its link carries `?draft=<change set id>`, shown
+read-only when it is not the viewer's open draft), the live line is dashed grey
+and the new one solid, with a line saying how far apart they run: the length of
+each more than 50 m from the other, the longest such stretch, the 95th
+percentile distance and the length difference (`lineDeviation` in
+`editor-ui/js/util.js`, the same resampling as above; whole lines, not cut at
+the end stops).
+
+Tests: `editor::gps_polyline_sync::tests` (the comparison, the decision, the
+drafts' batches and titles, the config) and `editor::gps_line::batch::tests` (the statements pass
+the read-only guard, route ids with stray spaces merge, the choice of bus-days, groups, points
+attributed to a bus-day, and a week of a fake fleet read and built).

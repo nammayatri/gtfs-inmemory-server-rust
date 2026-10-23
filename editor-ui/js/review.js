@@ -6,7 +6,7 @@ import { get, post, del, enc, ApiError } from "./api.js";
 import { state, can, isAdmin } from "./state.js";
 import {
   h, clear, toast, modal, confirmDialog, fmtDate, fmtCoord, fmtMetres, fmtCount, plural, haversine, decodePolyline,
-  STATUS_LABEL, STOP_TYPE_LABEL, diffRows,
+  STATUS_LABEL, STOP_TYPE_LABEL, diffRows, lineDeviation, deviationText,
 } from "./util.js";
 import * as map from "./map.js";
 import { useDraft, refreshDraft, chooseDraft } from "./drafts.js";
@@ -289,7 +289,7 @@ const kindText = (key, n) => {
 let recordFiles = new Map();
 
 // what the page shows, kept while the same draft is open
-const pageState = { id: null, page: 1, filter: "all" };
+const pageState = { id: null, page: 1, filter: "all", q: "", typing: false };
 let openInsets = [];
 // observers for insets not yet made (still waiting to scroll into view): drop
 // these too, or one can still fire and build a map on an element the very same
@@ -306,7 +306,7 @@ function dropInsets() {
 
 export async function showDraft(id, { conflicts = null } = {}) {
   dropInsets();
-  if (pageState.id !== id) Object.assign(pageState, { id, page: 1, filter: "all" });
+  if (pageState.id !== id) Object.assign(pageState, { id, page: 1, filter: "all", q: "" });
   clear(page(), h("div.page-inner", h("p.empty", "Loading draft…")));
   let cs;
   try {
@@ -462,7 +462,11 @@ export async function showDraft(id, { conflicts = null } = {}) {
   function renderChanges() {
     dropInsets();
     const filter = pageState.filter;
-    const filtered = cs.changes.filter((c) => filter === "all" || (filter === "problems" ? withProblems.has(c.change_id) : kindOf(c) === filter));
+    const q = pageState.q.trim().toLowerCase();
+    // a route's id, or its number, contains what was typed
+    const matches = (c) => !q || [c.entity_key, (c.after || {}).short_name, (c.before || {}).short_name]
+      .some((v) => typeof v === "string" && v.toLowerCase().includes(q));
+    const filtered = cs.changes.filter((c) => (filter === "all" || (filter === "problems" ? withProblems.has(c.change_id) : kindOf(c) === filter)) && matches(c));
     const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
     pageState.page = Math.min(Math.max(1, pageState.page), pages);
     const from = (pageState.page - 1) * PAGE_SIZE;
@@ -472,10 +476,16 @@ export async function showDraft(id, { conflicts = null } = {}) {
       h("option", { value: "all", selected: filter === "all" }, `All changes (${fmtCount(n)})`),
       withProblems.size ? h("option", { value: "problems", selected: filter === "problems" }, `With problems (${fmtCount(withProblems.size)})`) : null,
       [...kinds.entries()].map(([key, count]) => h("option", { value: key, selected: filter === key }, kindText(key, count))));
+    const search = h("input", {
+      id: "change-search", type: "search", placeholder: "Route id or number", value: pageState.q,
+      on: { input: (ev) => { pageState.q = ev.target.value; pageState.page = 1; pageState.typing = true; renderChanges(); pageState.typing = false; } },
+    });
     clear(changesBox,
       h("div.changes-head",
         h("h2", plural(n, "change")),
+        n ? h("label.field.inline-field", { for: "change-search" }, h("span", "Search"), search) : null,
         n ? h("label.field.inline-field", { for: "change-filter" }, h("span", "Show"), select) : null),
+      q ? h("p.hint", `${plural(filtered.length, "change")} for “${pageState.q.trim()}”.`) : null,
       n > 1 ? h("p.hint", [...kinds.entries()].map(([key, count]) => kindText(key, count)).join(", ") + ".") : null,
       filtered.length > PAGE_SIZE ? h("p.hint", `Showing ${fmtCount(from + 1)} to ${fmtCount(from + slice.length)} of ${fmtCount(filtered.length)}.`) : null,
       pages > 1 ? pager(pageState.page, pages, go) : null,
@@ -483,6 +493,12 @@ export async function showDraft(id, { conflicts = null } = {}) {
         : h("p.empty", "No change matches."))
         : h("p.empty", "This draft has no changes yet. Open a stop or route and choose Edit, or use New."),
       pages > 1 ? pager(pageState.page, pages, go) : null);
+    // re-rendered on each keystroke: keep typing where it was
+    const box = document.getElementById("change-search");
+    if (box && document.activeElement !== box && pageState.typing) {
+      box.focus();
+      box.setSelectionRange(box.value.length, box.value.length);
+    }
   }
 
   clear(page(), h("div.page-inner",
@@ -563,7 +579,7 @@ function changeView(cs, ch, problems, conflict, canRemove, names) {
       : TIMETABLE.has(ch.entity) ? `#/trips/${enc(ch.entity_key)}`
         : ch.entity === "service" ? "#/calendar"
           : ch.entity === "stage" ? `#/stage/${enc(ch.entity_key)}`
-            : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${cs.status === "draft" ? "?draft=1" : ""}`
+            : ch.entity.startsWith("route") ? `#/route/${enc(ch.entity_key)}${["draft", "submitted", "approved"].includes(cs.status) ? `?draft=${enc(cs.change_set_id)}` : ""}`
     : ch.op === "merge" ? `#/stop/${enc(a.into_station_id || a.into_stop_id || ch.entity_key)}` : `#/stop/${enc(ch.entity_key)}`;
   const fromProposal = ch.entity === "station" && a.proposal_id;
   const remove = async () => {
@@ -657,29 +673,34 @@ function fieldRows(before, after, fields) {
     h("tr", h("th", label), h("td.before", before ? String(fmt(before[k])) : ""), h("td.after", String(fmt(after[k])))));
 }
 
-// A map for one change, made only when it scrolls into view and removed when the
-// page of changes is replaced.
-function insetEl(spec) {
-  const el = h("div.inset");
-  const make = () => {
+// Run `fn` once, when `el` scrolls into view (dropped with the page of changes).
+function whenVisible(el, fn) {
+  const run = () => {
     if (el.dataset.made || !document.body.contains(el)) return;
     el.dataset.made = "1";
-    openInsets.push(map.inset(el, spec));
+    fn();
   };
   if ("IntersectionObserver" in window) {
     const io = new IntersectionObserver((entries) => {
       if (entries.some((e) => e.isIntersecting)) {
         io.disconnect();
         pendingInsets = pendingInsets.filter((x) => x !== io);
-        make();
+        run();
       }
     }, { rootMargin: "200px" });
     pendingInsets.push(io);
     requestAnimationFrame(() => io.observe(el));
   } else {
-    requestAnimationFrame(make);
+    requestAnimationFrame(run);
   }
   return el;
+}
+
+// A map for one change, made only when it scrolls into view and removed when the
+// page of changes is replaced.
+function insetEl(spec) {
+  const el = h("div.inset");
+  return whenVisible(el, () => openInsets.push(map.inset(el, spec)));
 }
 
 function stopDiff(ch) {
@@ -808,11 +829,25 @@ function routeDiff(ch) {
   const rows = fieldRows(b, a, [["short_name", "Route number"], ["long_name", "Route name"], ["color", "Colour"], ["active", "Status", status]]).concat(gtfsRows(b, a, ROUTE_GTFS_DIFF));
   const lineChanged = a.encoded_polyline && a.encoded_polyline !== b.encoded_polyline;
   if (lineChanged) rows.push(h("tr", h("th", "Map line"), h("td.before", b.encoded_polyline ? "saved line" : "none"), h("td.after", `new line (${a.polyline_source || "source unknown"})`)));
+  let before = null, after = null;
+  if (lineChanged) {
+    try { before = b.encoded_polyline ? decodePolyline(b.encoded_polyline) : null; } catch { /* skip */ }
+    try { after = decodePolyline(a.encoded_polyline); } catch { /* skip */ }
+  }
+  if (before && after) {
+    // measured when the card scrolls into view: a draft can hold thousands of lines
+    const cell = h("td", { colspan: 2 }, "…");
+    whenVisible(cell, () => {
+      const dev = lineDeviation(before, after);
+      cell.textContent = dev ? deviationText(dev) : "";
+    });
+    rows.push(h("tr", h("th", "Where they differ"), cell));
+  }
   const table = h("table.diff-table", h("thead", h("tr", h("th", ""), h("th", "Before"), h("th", "After"))), h("tbody", rows));
   if (!lineChanged) return table;
   const lines = [];
-  try { if (b.encoded_polyline) lines.push({ pts: decodePolyline(b.encoded_polyline), color: "#9fb3b0", weight: 5 }); } catch { /* skip */ }
-  try { lines.push({ pts: decodePolyline(a.encoded_polyline), color: "#0b6660", weight: 3 }); } catch { /* skip */ }
+  if (before) lines.push({ pts: before, color: "#536569", weight: 3, dashed: true });
+  if (after) lines.push({ pts: after, color: "#14252a", weight: 3 });
   return h("div.change-grid", table, insetEl({ lines }));
 }
 
