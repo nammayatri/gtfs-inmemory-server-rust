@@ -13,6 +13,7 @@ pub mod metro_graph;
 pub mod operator;
 pub mod osrm;
 pub mod osrtc_station_cache;
+pub mod schedule_snapshot;
 pub mod service_hopper;
 pub mod trip_service;
 pub mod webhook;
