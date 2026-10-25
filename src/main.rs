@@ -42,6 +42,21 @@ async fn main() -> anyhow::Result<()> {
     let editor_state = gtfs_routes_service::editor::EditorState::init(&app_config).await;
     let app_state = environment::AppState::new(app_config).await?;
 
+    let warm = async {
+        tokio::join!(
+            app_state.db_vehicle_reader.warm_schedule_snapshot(),
+            app_state
+                .db_vehicle_reader_internal
+                .warm_schedule_snapshots(),
+        )
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(10), warm)
+        .await
+        .is_err()
+    {
+        error!("schedule snapshots not warmed within 10s, they load on first request");
+    }
+
     // Start background polling task if enabled
     if polling_enabled {
         let gtfs_service_clone = app_state.gtfs_service.clone();
