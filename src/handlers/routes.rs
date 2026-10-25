@@ -3095,6 +3095,22 @@ pub struct BusRouteScheduleQuery {
     pub max_duty_date: Option<String>,
 }
 
+async fn station_etas_for(
+    app_state: &AppState,
+    gtfs_id: &str,
+    needed: bool,
+) -> Option<HashMap<(String, String), i32>> {
+    if !needed {
+        return None;
+    }
+    app_state
+        .db_vehicle_reader_internal
+        .get_station_etas(gtfs_id)
+        .await
+        .ok()
+        .filter(|etas| !etas.is_empty())
+}
+
 #[utoipa::path(
     get,
     path = "/bus-trip-schedule/{gtfs_id}/{waybill_no}/{trip_number}/{route_id}",
@@ -3148,6 +3164,7 @@ pub async fn get_bus_trip_schedule(
         .chain(internal_rows.into_iter())
         .collect();
 
+    let db_etas = station_etas_for(&app_state, &gtfs_id, !all.is_empty()).await;
     let mut schedule_details: BusScheduleDetails = Vec::new();
     for row in all {
         let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
@@ -3177,15 +3194,9 @@ pub async fn get_bus_trip_schedule(
 
         // Calculate ETAs
 
-        let bus_stop_etas = match app_state
-            .db_vehicle_reader_internal
-            .get_station_etas(&gtfs_id)
-            .await
-        {
-            Ok(db_etas) if !db_etas.is_empty() => {
-                calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
-            }
-            _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
+        let bus_stop_etas = match &db_etas {
+            Some(db_etas) => calculate_eta_from_db(&route_stop_mappings, trip_start_time, db_etas),
+            None => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
         };
 
         schedule_details.push(crate::models::BusScheduleDetail {
@@ -3268,6 +3279,7 @@ pub async fn get_bus_route_schedule(
             all_rows.append(&mut int_rows);
         }
 
+        let db_etas = station_etas_for(&app_state, &gtfs_id, !all_rows.is_empty()).await;
         let mut schedule_details: BusScheduleDetails = Vec::new();
         for row in all_rows {
             // Resolve trip start time from (db_start_time HH:MM + duty_date) or
@@ -3297,15 +3309,13 @@ pub async fn get_bus_route_schedule(
                     .and_then(|s| s.parse::<i64>().ok())
             };
 
-            let bus_stop_etas = match app_state
-                .db_vehicle_reader_internal
-                .get_station_etas(&gtfs_id)
-                .await
-            {
-                Ok(db_etas) if !db_etas.is_empty() => {
-                    calculate_eta_from_db(&route_stop_mappings, trip_start_time, &db_etas)
+            let bus_stop_etas = match &db_etas {
+                Some(db_etas) => {
+                    calculate_eta_from_db(&route_stop_mappings, trip_start_time, db_etas)
                 }
-                _ => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
+                None => {
+                    calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time)
+                }
             };
 
             let is_upcoming = row
