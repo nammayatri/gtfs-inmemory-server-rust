@@ -3554,7 +3554,7 @@ pub async fn get_bus_trip_schedule(
         )
     };
 
-    let all: Vec<crate::models::VehicleData> = external_rows
+    let all: Vec<crate::services::schedule_snapshot::ScheduledTrip> = external_rows
         .into_iter()
         .chain(internal_rows.into_iter())
         .collect();
