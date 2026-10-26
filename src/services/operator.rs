@@ -854,9 +854,7 @@ pub struct ScheduleNumberRow {
 /// `#[sqlx(default)]` on the trailing fields lets narrower SELECTs still decode; `skip_serializing_if` drops NULL columns from the JSON so the /fleets response stays additive vs its pre-merge shape.
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone, utoipa::ToSchema)]
 pub struct FleetRow {
-    // vehicle_id serialises as a JSON number when the value fits an i64, otherwise as a string — expose it to OpenAPI as the untyped Value so clients don't fail on the number case.
-    #[schema(value_type = serde_json::Value)]
-    pub vehicle_id: IdValue,
+    pub vehicle_id: String,
     pub vehicle_no: Option<String>,
     pub fleet_no: Option<String>,
     #[sqlx(default)]
