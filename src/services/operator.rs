@@ -875,15 +875,15 @@ pub struct FleetRow {
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<serde_json::Value>)]
-    pub bus_service_type_id: Option<IdValue>,
+    pub bus_service_type_id: Option<String>,
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<serde_json::Value>)]
-    pub entity_id: Option<IdValue>,
+    pub entity_id: Option<String>,
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<serde_json::Value>)]
-    pub organization_id: Option<IdValue>,
+    pub organization_id: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
