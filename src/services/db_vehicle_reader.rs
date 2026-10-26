@@ -109,11 +109,6 @@ struct DepotV2Cache {
     depot_vehicles: HashMap<String, (Vec<DepotVehicleInfo>, SystemTime)>,
 }
 
-// Vehicle pool cache structure
-struct VehiclePoolCache {
-    all_vehicles: Option<(std::collections::HashSet<String>, SystemTime)>,
-}
-
 // Routes served today cache structure (30 min TTL)
 struct RoutesServedTodayCache {
     data: Option<(Vec<RouteLastScheduleTime>, SystemTime)>,
@@ -369,8 +364,6 @@ pub struct DBVehicleReader {
     depot_cache: Arc<RwLock<DepotCache>>,
     depot_cache_duration: Duration,
     depot_v2_cache: Arc<RwLock<DepotV2Cache>>,
-    vehicle_pool_cache: Arc<RwLock<VehiclePoolCache>>,
-    vehicle_pool_cache_duration: Duration,
     schedule_snapshot: ScheduleSnapshotCache,
     routes_served_today_cache: Arc<RwLock<RoutesServedTodayCache>>,
     routes_served_today_cache_duration: Duration,
@@ -392,8 +385,6 @@ impl DBVehicleReader {
             })),
             depot_cache_duration: Duration::from_secs(7200), // 2 hours TTL
             depot_v2_cache: Arc::new(RwLock::new(DepotV2Cache::default())),
-            vehicle_pool_cache: Arc::new(RwLock::new(VehiclePoolCache { all_vehicles: None })),
-            vehicle_pool_cache_duration: Duration::from_secs(10800), // 3 hours TTL
             schedule_snapshot: ScheduleSnapshotCache::new(SCHEDULE_SNAPSHOT_TTL),
             routes_served_today_cache: Arc::new(RwLock::new(RoutesServedTodayCache { data: None })),
             routes_served_today_cache_duration: Duration::from_secs(1800), // 30 minutes TTL
@@ -410,11 +401,6 @@ impl DBVehicleReader {
         elapsed >= Duration::from_secs(DEPOT_V2_CACHE_DURATION)
     }
 
-    fn is_vehicle_pool_cache_expired(&self, timestamp: SystemTime) -> bool {
-        let elapsed = timestamp.elapsed().unwrap_or_default();
-        elapsed >= self.vehicle_pool_cache_duration
-    }
-
     async fn schedule_snapshot(&self) -> AppResult<Arc<ScheduleSnapshot>> {
         let pool = self.pool.clone();
         self.schedule_snapshot
@@ -428,68 +414,6 @@ impl DBVehicleReader {
                     })
             })
             .await
-    }
-
-    async fn get_all_vehicles_pool(&self) -> AppResult<std::collections::HashSet<String>> {
-        // Check cache first
-        {
-            let cache = self.vehicle_pool_cache.read().await;
-            if let Some((vehicles, timestamp)) = &cache.all_vehicles {
-                if !self.is_vehicle_pool_cache_expired(*timestamp) {
-                    info!("All vehicles pool cache HIT");
-                    return Ok(vehicles.clone());
-                }
-            }
-        }
-
-        info!("All vehicles pool cache MISS");
-        let waybill_query = r#"
-            SELECT DISTINCT ON (vehicle_no)
-                vehicle_no
-            FROM public.waybills
-            ORDER BY vehicle_no;
-        "#;
-
-        let fleet_query = r#"
-            SELECT fleet_no from vehicles
-        "#;
-
-        let mut all_vehicles = std::collections::HashSet::new();
-
-        // Get vehicles from waybills
-        match sqlx::query_as::<_, (String,)>(waybill_query)
-            .fetch_all(&self.pool)
-            .await
-        {
-            Ok(rows) => {
-                for (vehicle_no,) in rows {
-                    all_vehicles.insert(vehicle_no);
-                }
-            }
-            Err(e) => {
-                error!("All vehicles pool query failed: {}", e);
-            }
-        }
-
-        // Get vehicles from fleet
-        match sqlx::query_as::<_, (String,)>(fleet_query)
-            .fetch_all(&self.pool)
-            .await
-        {
-            Ok(rows) => {
-                for (fleet_no,) in rows {
-                    all_vehicles.insert(fleet_no);
-                }
-            }
-            Err(e) => {
-                error!("Fleet vehicles query failed: {}", e);
-            }
-        }
-
-        // Update cache
-        let mut cache = self.vehicle_pool_cache.write().await;
-        cache.all_vehicles = Some((all_vehicles.clone(), SystemTime::now()));
-        Ok(all_vehicles)
     }
 
     async fn get_cached_vehicle_data(
@@ -2553,15 +2477,26 @@ impl VehicleDataReader for DBVehicleReader {
     }
 
     async fn verify_vehicle(&self, vehicle_no: &str) -> AppResult<bool> {
-        let all_pool = self.get_all_vehicles_pool().await?;
+        let query = r#"
+            SELECT EXISTS (SELECT 1 FROM waybills WHERE vehicle_no = $1)
+                OR EXISTS (SELECT 1 FROM vehicles WHERE fleet_no = $1)
+        "#;
 
-        let is_valid = all_pool.contains(vehicle_no);
+        let is_valid = match sqlx::query_scalar::<_, bool>(query)
+            .bind(vehicle_no)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                error!("verify_vehicle query failed for {}: {}", vehicle_no, e);
+                false
+            }
+        };
 
         info!(
-            "Vehicle verification for {}: is_valid={}, all_pool_size={}",
-            vehicle_no,
-            is_valid,
-            all_pool.len()
+            "Vehicle verification for {}: is_valid={}",
+            vehicle_no, is_valid
         );
 
         Ok(is_valid)
