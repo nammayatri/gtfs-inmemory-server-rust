@@ -1055,15 +1055,25 @@ impl DBVehicleReader {
                 w.conductor_token_no::text AS conductor_code,
                 w.deleted AS deleted,
                 w.status AS status
-            FROM waybills w
+            FROM (
+                (SELECT 1 AS priority, * FROM waybills
+                 WHERE vehicle_no = $1 AND status = 'Processed' AND deleted = false
+                 ORDER BY updated_at DESC LIMIT 1)
+                UNION ALL
+                (SELECT 2, * FROM waybills
+                 WHERE vehicle_no = $1 AND status = 'New' AND deleted = false
+                 ORDER BY updated_at DESC LIMIT 1)
+                UNION ALL
+                (SELECT 3, * FROM waybills
+                 WHERE vehicle_no = $1 AND status = 'Closed' AND deleted = false
+                 ORDER BY updated_at DESC LIMIT 1)
+                UNION ALL
+                (SELECT 4, * FROM waybills
+                 WHERE vehicle_no = $1 AND status = 'Audited' AND deleted = false
+                 ORDER BY updated_at DESC LIMIT 1)
+            ) w
             LEFT JOIN entities e ON e.entity_id = w.entity_id
-            WHERE w.vehicle_no = $1 AND w.status IN ('Processed', 'New', 'Closed', 'Audited') AND w.deleted = false
-            ORDER BY CASE
-                WHEN w.status = 'Processed' THEN 1
-                WHEN w.status = 'New'       THEN 2
-                WHEN w.status = 'Closed'    THEN 3
-                WHEN w.status = 'Audited'   THEN 4
-            END, w.updated_at DESC
+            ORDER BY w.priority
             LIMIT 1
         "#;
 
@@ -2594,23 +2604,24 @@ impl VehicleDataReader for DBVehicleReader {
         );
 
         let query = r#"
+            WITH today AS MATERIALIZED (
+                SELECT waybill_id, schedule_trip_id, is_flexi
+                FROM waybills
+                WHERE duty_date = $1 AND deleted = false
+            )
             SELECT
                 route_number_id::text AS route_id,
                 MAX(end_time) AS last_schedule_time
             FROM (
                 SELECT bstd.route_number_id, bstd.end_time
-                FROM bus_schedule_trip_detail bstd
-                INNER JOIN waybills w ON w.schedule_trip_id::bigint = bstd.schedule_trip_id
-                WHERE w.duty_date = $1
-                    AND w.deleted = false
-                    AND bstd.trip_type != 'dead-trip'
+                FROM today t
+                JOIN bus_schedule_trip_detail bstd ON bstd.schedule_trip_id = t.schedule_trip_id
+                WHERE bstd.trip_type <> 'dead-trip'
                 UNION ALL
                 SELECT bstf.route_number_id, bstf.end_time
-                FROM bus_schedule_trip_flexi bstf
-                INNER JOIN waybills w ON w.schedule_trip_id::bigint = bstf.schedule_trip_id
-                WHERE w.duty_date = $1
-                    AND w.deleted = false
-                    AND bstf.trip_type != 'dead-trip'
+                FROM today t
+                JOIN bus_schedule_trip_flexi bstf ON bstf.waybill_id = t.waybill_id
+                WHERE t.is_flexi AND bstf.trip_type <> 'dead-trip'
             ) combined
             GROUP BY route_number_id
             ORDER BY route_number_id
