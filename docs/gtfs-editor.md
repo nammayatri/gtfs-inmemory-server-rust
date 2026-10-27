@@ -4229,12 +4229,28 @@ Settled while implementing:
   route: "changing stage ALPHA (stg_…) changes the stop list of 2 routes: 21G
   (2614) and 23C (118)". The reviewer sees each route the edit changes; the
   change's `before` is the stage detail, including `routes`.
-- **`route_out_of_sync`**: before rewriting a route, a `stage/update` checks that
-  the route's rows are still what its stages make (ignoring `provider_id`). A
-  route whose rows were written some other way - a reseed, a hand edit in SQL -
-  is an error naming it, so the edit never silently undoes that. Setting that
-  route's stages again (`route_stages/replace`, earlier in the same draft or an
-  earlier draft) puts it back; on that replace the same code is a warning.
+- **`route_out_of_sync`**: before rewriting a route, a `stage/update` checked that
+  the route's rows were still what its stages make (ignoring `provider_id`), so
+  an edit never silently undid rows written some other way - a reseed, a hand
+  edit in SQL. Since migration 0027 a route served from its stages is *read*
+  from them, so it cannot differ from them, and the check went (2026-10-27)
+  from `stage/update`, `stage/merge` and `stage/split`, where it read and
+  rebuilt every route the change reached. A `route_stages/replace` still warns
+  with the code when a route's rows and stages differ.
+- **What a stage change costs.** A stage change rewrites every route that runs
+  the stage, and since chennai_bus's stages were unified (2026-10-26) the busy
+  ones carry a hundred routes and more. The routes are read, rebuilt from their
+  stages, graded and their timings carried over in a handful of queries for all
+  of them, however many there are: one query each for what they served, their
+  temporary routes, their new stops, their timing profiles and their served
+  stops, and one statement writing every profile. Each route on its own took
+  about ten queries, so a draft of 15 stage edits reaching 1,303 routes ran
+  some 13,000 statements on every replay - about 30 s, past what the load
+  balancer in front of the editor waits, while holding the feed's lock - and
+  every submit, approve, commit and page of every chennai_bus draft queued
+  behind it (502s on master, 2026-10-27). `tests/editor_stage_edit_cost_flow.rs`
+  edits one stage shared by 120 routes through a whole draft: one replay is
+  some 30 statements, where it was 1,105.
 - **Conflicts at commit:** `stage/update` and `stage/delete` against the stage's
   `row_version`; `route_stages/replace` against `base_stages_hash`, the sha256 of
   the route's `[{stage_id, stage_no}]` list - a route without stages hashes like
@@ -4650,8 +4666,10 @@ named, and rewrites each of their stop lists from their new stages, all in the
 apply of that one row. An earlier version of this did a `stage/create` followed by
 a `route_stages/replace` per route — 95 requests for a stage 47 routes run, and a
 half-finished split was a real outcome. A route named in the payload that does not
-run the stage is `route_not_on_stage`; one whose stop list was changed outside its
-stages is `route_out_of_sync`, as for a merge; at most 500 routes in one split.
+run the stage is `route_not_on_stage`; at most 500 routes in one split. (A route
+whose stop list was changed outside its stages was `route_out_of_sync`, as for a
+merge, until that check went: a route served from its stages cannot differ from
+them - section 19, "What a stage change costs".)
 
 ### 19.2 Routes to review: our route is not MTC's route (2026-09-29)
 

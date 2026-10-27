@@ -15,7 +15,7 @@ use super::error::{EditorError, EditorResult};
 use super::feed_lock::{lock_feed, retry_transient};
 use super::service::{
     self as svc, blocks_apply, check_stops_usable, fail, json_col, like_pattern, load_route_rows,
-    write_route_rows, ApplyError, Page,
+    load_routes_rows, write_route_rows, write_routes_rows, ApplyError, Page,
 };
 use super::validation::{
     check_route_rows, check_stage_rows, flatten_stages, grade_against_live, mint_stage_id as mint,
@@ -400,6 +400,25 @@ pub async fn active_variant(
     }))
 }
 
+/// [`active_variant`] for many routes, in one query. A route that is not there
+/// is absent.
+pub async fn active_variants(
+    conn: &mut PgConnection,
+    g: &str,
+    routes: &[String],
+) -> Result<HashMap<String, Option<String>>, sqlx::Error> {
+    sqlx::query(
+        "SELECT route_id, active_variant_id FROM gtfs_route WHERE gtfs_id = $1 AND route_id = ANY($2)",
+    )
+    .bind(g)
+    .bind(routes)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| Ok((r.try_get("route_id")?, r.try_get("active_variant_id")?)))
+    .collect()
+}
+
 /// A route's stages in order, as `route_stages/replace` sends them. `variant` is
 /// the list to read: `None` is the route's normal one.
 pub async fn route_links(
@@ -483,23 +502,113 @@ pub async fn flatten_route(
     .fetch_all(&mut *conn)
     .await?
     .iter()
-    .map(|r| {
-        Ok(RouteRow {
-            stop_id: r.try_get("stop_id")?,
-            stop_type: r.try_get("stop_type")?,
-            stage_no: r.try_get("stage_no")?,
-            stage_name: r.try_get("stage_name")?,
-            marker_id: r.try_get("marker_id")?,
-            marker_name: r.try_get("marker_name")?,
-            marker_lat: r.try_get("marker_lat")?,
-            marker_lon: r.try_get("marker_lon")?,
-            stop_name_override: r.try_get("stop_name_override")?,
-            provider_id: None,
-            // a stage's stops carry no per-row GTFS fields of their own
-            ..Default::default()
-        })
-    })
+    .map(flattened_row)
     .collect()
+}
+
+/// A route row as a stage list makes it.
+fn flattened_row(r: &PgRow) -> Result<RouteRow, sqlx::Error> {
+    Ok(RouteRow {
+        stop_id: r.try_get("stop_id")?,
+        stop_type: r.try_get("stop_type")?,
+        stage_no: r.try_get("stage_no")?,
+        stage_name: r.try_get("stage_name")?,
+        marker_id: r.try_get("marker_id")?,
+        marker_name: r.try_get("marker_name")?,
+        marker_lat: r.try_get("marker_lat")?,
+        marker_lon: r.try_get("marker_lon")?,
+        stop_name_override: r.try_get("stop_name_override")?,
+        provider_id: None,
+        // a stage's stops carry no per-row GTFS fields of their own
+        ..Default::default()
+    })
+}
+
+/// [`flatten_route`] for many routes in one query, each with the list it names
+/// (`None`: its normal list). A route whose list has no stages is absent.
+pub async fn flatten_routes(
+    conn: &mut PgConnection,
+    g: &str,
+    lists: &[(String, Option<String>)],
+) -> Result<HashMap<String, Vec<RouteRow>>, sqlx::Error> {
+    let mut out: HashMap<String, Vec<RouteRow>> = HashMap::new();
+    if lists.is_empty() {
+        return Ok(out);
+    }
+    let routes: Vec<&str> = lists.iter().map(|(r, _)| r.as_str()).collect();
+    let variants: Vec<Option<&str>> = lists.iter().map(|(_, v)| v.as_deref()).collect();
+    for r in sqlx::query(
+        "SELECT rs.route_id, rs.stage_no, st.name AS stage_name, ss.stop_id, ss.stop_type, \
+                ss.marker_id, ss.marker_name, ss.marker_lat, ss.marker_lon, ss.stop_name_override \
+         FROM UNNEST($2::text[], $3::text[]) AS w(route_id, variant_id) \
+         JOIN gtfs_route_stage rs ON rs.gtfs_id = $1 AND rs.route_id = w.route_id \
+                                 AND rs.variant_id IS NOT DISTINCT FROM w.variant_id \
+         JOIN gtfs_stage st ON st.gtfs_id = rs.gtfs_id AND st.stage_id = rs.stage_id \
+                           AND st.direction = rs.direction \
+         JOIN gtfs_stage_stop ss ON ss.gtfs_id = rs.gtfs_id AND ss.stage_id = rs.stage_id \
+                                AND ss.direction = rs.direction \
+         ORDER BY rs.route_id, rs.position, ss.position",
+    )
+    .bind(g)
+    .bind(&routes)
+    .bind(&variants)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    {
+        out.entry(r.try_get("route_id")?)
+            .or_default()
+            .push(flattened_row(r)?);
+    }
+    Ok(out)
+}
+
+/// What a stage change does to the routes it reaches, once the stages are
+/// written: each route as its stages now make it, graded against what it
+/// served `before`, with `label` naming it in a finding, and its timings
+/// carried over. For all of them in a handful of queries: a stage shared by a
+/// hundred routes is one edit, and reading and rewriting each route on its own
+/// took about ten queries a route - a thousand for one such edit, every time
+/// the draft holding it was replayed.
+async fn rewrite_routes(
+    conn: &mut PgConnection,
+    g: &str,
+    routes: &[(String, Option<String>)],
+    before: &HashMap<String, Vec<RouteRow>>,
+    label: impl Fn(&str, &Option<String>) -> String,
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
+    let ids: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let worn = active_variants(conn, g, &ids).await?;
+    let lists: Vec<(String, Option<String>)> = ids
+        .iter()
+        .map(|r| (r.clone(), worn.get(r).cloned().flatten()))
+        .collect();
+    let after = flatten_routes(conn, g, &lists).await?;
+    let none: Vec<RouteRow> = Vec::new();
+    let mut findings = Vec::new();
+    for (route_id, short) in routes {
+        let rows = after.get(route_id).unwrap_or(&none);
+        let live = before.get(route_id).unwrap_or(&none);
+        let name = label(route_id, short);
+        for mut f in grade_against_live(check_route_rows(rows), &check_route_rows(live)) {
+            f.message = format!("route {name}: {}", f.message);
+            f.key = format!("{route_id}|{}", f.key);
+            findings.push(f);
+        }
+    }
+    let written: Vec<(&str, &[RouteRow], &[RouteRow])> = routes
+        .iter()
+        .map(|(route_id, _)| {
+            (
+                route_id.as_str(),
+                after.get(route_id).map(Vec::as_slice).unwrap_or(&[]),
+                before.get(route_id).map(Vec::as_slice).unwrap_or(&[]),
+            )
+        })
+        .collect();
+    findings.extend(write_routes_rows(conn, g, &written, actor).await?);
+    Ok(findings)
 }
 
 /// Whether two stop lists are the same but for the provider id, which is the
@@ -844,37 +953,14 @@ pub(super) async fn stage_update(
         return Err(ApplyError::Findings(findings));
     }
 
-    // Every route using the stage must be what its stages say before the change,
-    // or rewriting it from them would undo an edit made some other way. On a
-    // feed not served from its stages nothing is rewritten, so there is nothing
-    // to undo.
+    // What every route using the stage serves before the change, read in one go.
+    // A route served from its stages is read from them (migration 0027), so it
+    // cannot be out of step with them, and there is no edit made some other
+    // way for this one to undo; on a feed not served from its stages nothing
+    // is rewritten at all.
     let routes = routes_using(conn, g, &sk).await?;
-    let served = feed_uses_stages(conn, g).await?;
-    let mut before: Vec<Vec<RouteRow>> = Vec::with_capacity(routes.len());
-    let mut stale = Vec::new();
-    for (route_id, short) in &routes {
-        let live_rows = load_route_rows(conn, g, route_id).await?;
-        let worn = active_variant(conn, g, route_id).await?;
-        if served
-            && !same_rows(
-                &flatten_route(conn, g, route_id, worn.as_deref()).await?,
-                &live_rows,
-            )
-        {
-            stale.push((route_id.clone(), short.clone()));
-        }
-        before.push(live_rows);
-    }
-    if !stale.is_empty() {
-        return Err(ApplyError::Findings(vec![Finding::error(
-            "route_out_of_sync",
-            key,
-            format!(
-                "the stop list of {} was changed outside its stages, so changing stage {key} would undo that; set that route's stages again first (a route_stages change), in this draft or an earlier one",
-                route_names(&stale)
-            ),
-        )]));
-    }
+    let ids: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let before = load_routes_rows(conn, g, &ids).await?;
 
     sqlx::query(
         "UPDATE gtfs_stage SET name = $4, description = $5, updated_by = $6 \
@@ -890,19 +976,17 @@ pub(super) async fn stage_update(
     .await?;
     write_stage_rows(conn, g, &sk, &rows).await?;
 
-    let mut route_findings = Vec::new();
-    for ((route_id, short), live_rows) in routes.iter().zip(&before) {
-        let worn = active_variant(conn, g, route_id).await?;
-        let rows = flatten_route(conn, g, route_id, worn.as_deref()).await?;
-        let label = route_names(&[(route_id.clone(), short.clone())]);
-        for mut f in grade_against_live(check_route_rows(&rows), &check_route_rows(live_rows)) {
-            f.message = format!("route {label}: {}", f.message);
-            f.key = format!("{route_id}|{}", f.key);
-            route_findings.push(f);
-        }
-        // the route's timings follow it, and say so when they had to be estimated
-        route_findings.extend(write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?);
-    }
+    // every route as the stage now makes it; their timings follow, and say so
+    // when they had to be estimated
+    let route_findings = rewrite_routes(
+        conn,
+        g,
+        &routes,
+        &before,
+        |id, short| route_names(&[(id.to_string(), short.clone())]),
+        actor,
+    )
+    .await?;
     if blocks_apply(&route_findings) {
         return Err(ApplyError::Findings(route_findings));
     }
@@ -1026,37 +1110,13 @@ pub(super) async fn stage_merge(
         ));
     }
 
-    // Every route using either stage must match its stages before the change,
-    // or rewriting it from them would undo an edit made some other way - on a
-    // feed served from its stages; anywhere else nothing is rewritten.
+    // What every route using the stage that goes serves before the change, read
+    // in one go. A route served from its stages is read from them (migration
+    // 0027), so there is no edit made some other way for the merge to undo; on
+    // a feed not served from its stages nothing is rewritten at all.
     let routes = routes_using(conn, g, &gone).await?;
-    let served = feed_uses_stages(conn, g).await?;
-    let mut before: Vec<Vec<RouteRow>> = Vec::with_capacity(routes.len());
-    let mut stale = Vec::new();
-    for (route_id, short) in &routes {
-        let live_rows = load_route_rows(conn, g, route_id).await?;
-        let worn = active_variant(conn, g, route_id).await?;
-        if served
-            && !same_rows(
-                &flatten_route(conn, g, route_id, worn.as_deref()).await?,
-                &live_rows,
-            )
-        {
-            stale.push((route_id.clone(), short.clone()));
-        }
-        before.push(live_rows);
-    }
-    if !stale.is_empty() {
-        return Err(fail(
-            "route_out_of_sync",
-            format!(
-                "the stop list of {} was changed outside its stages, so merging \
-                 stage {} would undo that; set that route's stages again first",
-                route_names(&stale),
-                gone.label()
-            ),
-        ));
-    }
+    let ids: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let before = load_routes_rows(conn, g, &ids).await?;
 
     sqlx::query(
         "UPDATE gtfs_route_stage SET stage_id = $4, direction = $5, updated_by = $6 \
@@ -1083,18 +1143,15 @@ pub(super) async fn stage_merge(
 
     // Each route now calls at the kept stage's stops where it called at the
     // merged one's: say what that changed, and write it.
-    let mut findings = Vec::new();
-    for ((route_id, short), live_rows) in routes.iter().zip(&before) {
-        let worn = active_variant(conn, g, route_id).await?;
-        let rows = flatten_route(conn, g, route_id, worn.as_deref()).await?;
-        let label = route_names(&[(route_id.clone(), short.clone())]);
-        for mut f in grade_against_live(check_route_rows(&rows), &check_route_rows(live_rows)) {
-            f.message = format!("route {label}: {}", f.message);
-            f.key = format!("{route_id}|{}", f.key);
-            findings.push(f);
-        }
-        findings.extend(write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?);
-    }
+    let mut findings = rewrite_routes(
+        conn,
+        g,
+        &routes,
+        &before,
+        |id, short| route_names(&[(id.to_string(), short.clone())]),
+        actor,
+    )
+    .await?;
     if blocks_apply(&findings) {
         return Err(ApplyError::Findings(findings));
     }
@@ -1198,35 +1255,11 @@ pub(super) async fn stage_split(
             ),
         ));
     }
-    // and none of them may have been edited outside its stages, or rewriting it
-    // from them would undo that (on a feed served from its stages: anywhere
-    // else nothing is rewritten)
-    let served = feed_uses_stages(conn, g).await?;
-    let mut before: Vec<Vec<RouteRow>> = Vec::with_capacity(routes.len());
-    let mut stale = Vec::new();
-    for route_id in &routes {
-        let live_rows = load_route_rows(conn, g, route_id).await?;
-        let worn = active_variant(conn, g, route_id).await?;
-        if served
-            && !same_rows(
-                &flatten_route(conn, g, route_id, worn.as_deref()).await?,
-                &live_rows,
-            )
-        {
-            stale.push((route_id.clone(), None));
-        }
-        before.push(live_rows);
-    }
-    if !stale.is_empty() {
-        return Err(fail(
-            "route_out_of_sync",
-            format!(
-                "the stop list of {} was changed outside its stages, so moving it \
-                 would undo that; set that route's stages again first",
-                route_names(&stale)
-            ),
-        ));
-    }
+    // what each of them serves before the move, read in one go; a route served
+    // from its stages is read from them (migration 0027), so there is no edit
+    // made some other way for the move to undo, and on a feed not served from
+    // its stages nothing is rewritten at all
+    let before = load_routes_rows(conn, g, &routes).await?;
 
     // the new stage: its own key, the direction it is asked for, or the one the
     // stage it comes off runs
@@ -1256,16 +1289,8 @@ pub(super) async fn stage_split(
     // each moved route now calls at the new stage's stops: say what that
     // changed, and write it
     let mut findings = findings;
-    for (route_id, live_rows) in routes.iter().zip(&before) {
-        let worn = active_variant(conn, g, route_id).await?;
-        let rows = flatten_route(conn, g, route_id, worn.as_deref()).await?;
-        for mut f in grade_against_live(check_route_rows(&rows), &check_route_rows(live_rows)) {
-            f.message = format!("route {route_id}: {}", f.message);
-            f.key = format!("{route_id}|{}", f.key);
-            findings.push(f);
-        }
-        findings.extend(write_route_rows(conn, g, route_id, &rows, live_rows, actor).await?);
-    }
+    let moved: Vec<(String, Option<String>)> = routes.iter().map(|r| (r.clone(), None)).collect();
+    findings.extend(rewrite_routes(conn, g, &moved, &before, |id, _| id.to_string(), actor).await?);
     if blocks_apply(&findings) {
         return Err(ApplyError::Findings(findings));
     }
@@ -2127,7 +2152,7 @@ fn served_stops(rows: &[Value]) -> Vec<(String, String, Option<f64>, Option<f64>
 
 /// What merging stage `gone` into `into` would do, asked before it is put in a
 /// draft: the server's answer to the merge itself (`problems`, the findings the
-/// draft would show - `stage_repeated`, `route_out_of_sync` and the rest), how
+/// draft would show - `stage_repeated`, a fare rule a route breaks, and the rest), how
 /// far apart the two start, the routes that would change, and the stops those
 /// routes stop calling at and start calling at. These are fare stages: a stop
 /// lost is a stop the bus no longer serves on those routes, and one gained is a
