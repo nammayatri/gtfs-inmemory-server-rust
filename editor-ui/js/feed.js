@@ -3,12 +3,14 @@
 // and - for an admin - bringing a GTFS zip in: a seed for a feed with no rows,
 // change sets for one that has them, or a fresh reload that replaces all of
 // it (confirmed twice with the authenticator), always checked first without
-// writing; and a new feed made from its zip.
-import { get, postBytes, enc, ApiError } from "./api.js";
+// writing; and a new feed made from its zip. Also an admin's: moving master's
+// work to prod as a file (section 23, migration.js).
+import { get, enc, ApiError, runImport } from "./api.js";
 import { API_BASE } from "./config.js";
 import { state, isAdmin } from "./state.js";
 import { h, clear, fmtCount, plural, errorText, toast, modal } from "./util.js";
 import { nameHere } from "./trail.js";
+import { migrationSection } from "./migration.js";
 
 const page = () => document.getElementById("page");
 
@@ -58,7 +60,8 @@ export async function showFeed() {
       h("p.hint", "What the feed breaks of the GTFS reference: missing files and fields, references to rows that do not exist, stations and pathways, times that go backwards, calendars, and what nothing uses."),
       h("div.btn-row", h("button.btn.secondary", { type: "button", id: "check-feed", on: { click: check } }, "Check the feed")),
       reportBox),
-    isAdmin() ? h("section.feed-section", h("h2", "Import a GTFS zip"), importBox) : null);
+    isAdmin() ? h("section.feed-section", h("h2", "Import a GTFS zip"), importBox) : null,
+    migrationSection());
   if (isAdmin()) importForm(importBox);
 }
 
@@ -253,26 +256,6 @@ function reactivatedView(ids) {
 function replacedView(replaced) {
   return h("p.notice.warning", h("strong", "A reload deletes what the feed holds now: "), replacedWords(replaced),
     ". The zip's rows below take their place.");
-}
-
-// An import in the background (docs section 18.15): the request is answered
-// at once with a job, and its report polled for, so an import may take longer
-// than the 30 s the load balancer and Pomerium in front of the editor wait.
-// `waiting(seconds)` hears how long it has been running; `headers` go with the
-// zip (a reload's code).
-async function runImport(path, bytes, waiting, headers = {}) {
-  const { job_id } = await postBytes(`${path}${path.includes("?") ? "&" : "?"}background=true`, bytes, "application/zip", headers);
-  const started = Date.now();
-  for (;;) {
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    const job = await get(`import-jobs/${enc(job_id)}`);
-    if (job.status === "done") return job.report;
-    if (job.status !== "running") {
-      const e = job.error || {};
-      throw new ApiError(e.status || 500, e.code || "import_failed", e.message || "The import failed.");
-    }
-    if (waiting) waiting(Math.round((Date.now() - started) / 1000));
-  }
 }
 
 // A new feed from its GTFS zip (docs section 18.14): the feed the zip's

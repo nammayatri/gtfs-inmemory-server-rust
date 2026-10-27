@@ -178,6 +178,8 @@ async fn draft_import(args: &[String]) -> ExitCode {
         dry_run: !args.iter().any(|a| a == "--write"),
         user_id,
         email,
+        exclude_routes: Default::default(),
+        title: None,
     };
     let started = std::time::Instant::now();
     match draft_import::draft_import(&pool, &bytes, arg(args, "--gtfs-id").as_deref(), &opts).await

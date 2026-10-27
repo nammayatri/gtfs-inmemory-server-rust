@@ -121,6 +121,8 @@ pub async fn me(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
         "totp_enabled": user.totp_enabled,
         "session": session,
         "sign_in_locked_seconds": locked,
+        // which side of a migration this editor is (section 23)
+        "environment": if st.is_master { "master" } else { "prod" },
     }))
 }
 
@@ -588,6 +590,8 @@ pub async fn feed_import(
                 dry_run: q.dry_run.unwrap_or(true),
                 user_id: ctx.user.user_id,
                 email: ctx.user.email.clone(),
+                exclude_routes: Default::default(),
+                title: None,
             };
             if !background {
                 let report =
@@ -671,6 +675,117 @@ async fn seed_import(
 /// `202`: the import runs in the background as job `job_id`.
 fn accepted(job_id: Uuid) -> EditorResult<HttpResponse> {
     Ok(HttpResponse::Accepted().json(json!({"job_id": job_id, "status": "running"})))
+}
+
+// ---------------------------------------------------------------- migrations (section 23)
+
+fn download(file: super::migration::ExportFile) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/zip")
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", file.name),
+        ))
+        .body(file.bytes)
+}
+
+/// A committed draft as a migration file, for prod to read in. Admin.
+pub async fn change_set_migration(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<Uuid>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_admin(&req, &st).await?;
+    let file = super::migration::export_change_set(&st, &ctx, path.into_inner()).await?;
+    Ok(download(file))
+}
+
+#[derive(Deserialize)]
+pub struct MigrationExportQuery {
+    /// Comma separated, of stops, routes, stages and timetables; all if none.
+    pub scopes: Option<String>,
+}
+
+/// The whole feed as a migration file, for prod to read in. Admin.
+pub async fn feed_migration(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<MigrationExportQuery>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    let ctx = auth::require_admin(&req, &st).await?;
+    let scopes = super::migration::parse_scopes(q.scopes.as_deref())?;
+    let file = super::migration::export_feed(&st, &ctx, &g, &scopes).await?;
+    Ok(download(file))
+}
+
+#[derive(Deserialize)]
+pub struct MigrationImportQuery {
+    /// `false` drafts; a dry run otherwise.
+    pub dry_run: Option<bool>,
+    /// A full migration: from which prod version on prod's changes are its own.
+    pub since_version: Option<i64>,
+    /// Conflicts to take master's side of, by id, comma separated; `all` for
+    /// every one.
+    pub take: Option<String>,
+    /// `true`: answer at once with a job to poll (section 18.15).
+    pub background: Option<bool>,
+}
+
+/// Read a migration file from master into feed `g` (the body): its report, and
+/// with `dry_run=false` the prod drafts it makes. Admin, and never on master.
+pub async fn migration_import(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<MigrationImportQuery>,
+    body: web::Bytes,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    let ctx = auth::require_admin(&req, &st).await?;
+    let take: Vec<String> = q
+        .take
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let opts = super::migration::ImportOpts {
+        dry_run: q.dry_run.unwrap_or(true),
+        since_version: q.since_version,
+        take_all: take.iter().any(|t| t == "all"),
+        take: take.into_iter().collect(),
+    };
+    let is_master = st.is_master;
+    if !q.background.unwrap_or(false) {
+        let report = super::migration::import(&st.pool, is_master, &ctx, &g, &body, &opts).await?;
+        return ok(json!(report));
+    }
+    let (user_id, dry_run, job_g) = (ctx.user.user_id, opts.dry_run, g.clone());
+    let work: import_jobs::Work = Box::new(move |pool| {
+        Box::pin(async move {
+            let report =
+                super::migration::import(&pool, is_master, &ctx, &job_g, &body, &opts).await?;
+            Ok(json!(report))
+        })
+    });
+    let job_id =
+        import_jobs::start(&st.pool, Some(&g), "migration", dry_run, user_id, work).await?;
+    accepted(job_id)
+}
+
+/// The migrations read into feed `g`, newest first. Admin.
+pub async fn migration_imports(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    let ctx = auth::require_admin(&req, &st).await?;
+    ok(super::migration::list_imports(&st.pool, &ctx, &g).await?)
 }
 
 /// The header a reload's authenticator code comes in: the body is the zip.

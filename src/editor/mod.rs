@@ -21,6 +21,7 @@ pub mod gps_line;
 pub mod handlers;
 pub mod import_jobs;
 pub mod jwt;
+pub mod migration;
 pub mod position_reviews;
 pub mod proposals;
 pub mod records;
@@ -273,6 +274,18 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                     .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
                     .route(web::post().to(h::feed_reload)),
             )
+            // master's work moved to prod as a file (section 23): written on
+            // master, read in on prod - the file is the body, up to 64 MB
+            .route(
+                "/feeds/{gtfs_id}/migration",
+                web::get().to(h::feed_migration),
+            )
+            .service(
+                web::resource("/feeds/{gtfs_id}/migrations")
+                    .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+                    .route(web::get().to(h::migration_imports))
+                    .route(web::post().to(h::migration_import)),
+            )
             .route("/import-jobs/{job_id}", web::get().to(h::import_job))
             .route("/feeds/{gtfs_id}/config", web::get().to(h::feed_config))
             .route("/feeds/{gtfs_id}/stops", web::get().to(h::stops))
@@ -368,6 +381,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::post().to(h::change_sets_commit),
             )
             .route("/change-sets/{id}", web::get().to(h::change_set))
+            .route(
+                "/change-sets/{id}/migration",
+                web::get().to(h::change_set_migration),
+            )
             .route("/change-sets/{id}/changes", web::post().to(h::change_add))
             .route(
                 "/change-sets/{id}/changes/{change_id}",

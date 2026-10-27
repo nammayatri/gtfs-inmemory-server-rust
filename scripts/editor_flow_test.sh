@@ -14,9 +14,11 @@
 # tests/editor_draft_import_flow.rs, tests/editor_fast_writes_flow.rs,
 # tests/editor_stages_flow.rs, tests/editor_variants_flow.rs,
 # tests/editor_batch_commit_flow.rs,
-# tests/editor_unserviceable_flow.rs, tests/editor_stage_review_flow.rs and
+# tests/editor_unserviceable_flow.rs, tests/editor_stage_review_flow.rs,
 # tests/editor_gps_line_flow.rs (which also starts a fake ClickHouse and a fake
-# OSRM on localhost), which use
+# OSRM on localhost) and tests/editor_migration_flow.rs (master to prod, section
+# 23: it needs a second local database with the editor schema as prod,
+# EDITOR_TEST_PROD_DATABASE_URL, and skips itself without one), which use
 # their own feeds and accounts, then proves the chennai_bus rows were not touched
 # - reseeding them from nandi if they were - and that its station proposals, its
 # position reviews and its feed row (data source and version) were not touched
@@ -24,6 +26,7 @@
 #
 #   scripts/editor_flow_test.sh
 #   EDITOR_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55432/mtc_internal_master scripts/editor_flow_test.sh
+#   EDITOR_TEST_PROD_DATABASE_URL=postgres://postgres@127.0.0.1:55432/editor_prod_twin scripts/editor_flow_test.sh
 set -euo pipefail
 
 DB_URL="${EDITOR_TEST_DATABASE_URL:-postgres://postgres@127.0.0.1:55432/mtc_internal_master}"
@@ -34,6 +37,10 @@ PYTHON="${PYTHON:-python3}"
 case "$DB_URL" in
   *@127.0.0.1*|*@localhost*) ;;
   *) echo "refusing to run against a non-local database" >&2; exit 2 ;;
+esac
+case "${EDITOR_TEST_PROD_DATABASE_URL:-@127.0.0.1}" in
+  *@127.0.0.1*|*@localhost*) ;;
+  *) echo "refusing to run against a non-local prod twin database" >&2; exit 2 ;;
 esac
 
 fingerprint() {
@@ -84,6 +91,7 @@ EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow \
   --test editor_variants_flow --test editor_batch_commit_flow \
   --test editor_unserviceable_flow \
   --test editor_stage_review_flow \
+  --test editor_migration_flow \
   -- --nocapture || status=$?
 
 proposals_after="$(proposals)"

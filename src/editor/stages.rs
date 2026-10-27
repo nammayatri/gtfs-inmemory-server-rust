@@ -145,8 +145,89 @@ pub fn route_stops_source(uses_stages: bool) -> &'static str {
     }
 }
 
-/// Refuse a stage change on a feed that does not use stages. Said once here so
-/// every stage write gives the same answer.
+/// What turning `use_stages` on finds, checked inside the change that turns it
+/// on, so stage lists set earlier in the same draft count (section 23). A live,
+/// active route with no stages would serve no stops from that commit, so any
+/// such route is an error; an inactive one is a warning. The warning
+/// `stages_take_over` says how many routes start serving their stages' stops.
+pub(super) async fn switch_findings(
+    conn: &mut PgConnection,
+    g: &str,
+) -> Result<Vec<Finding>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT r.route_id, r.short_name, r.active, \
+                EXISTS (SELECT 1 FROM gtfs_route_stage rs \
+                         WHERE rs.gtfs_id = r.gtfs_id AND rs.route_id = r.route_id \
+                           AND rs.variant_id IS NULL) AS has_stages \
+         FROM gtfs_route r WHERE r.gtfs_id = $1 AND NOT r.deleted ORDER BY r.route_id",
+    )
+    .bind(g)
+    .fetch_all(&mut *conn)
+    .await?;
+    let (mut active, mut inactive, mut with) = (Vec::new(), Vec::new(), 0usize);
+    for r in &rows {
+        if r.try_get::<bool, _>("has_stages")? {
+            with += 1;
+            continue;
+        }
+        let name = (r.try_get("route_id")?, r.try_get("short_name")?);
+        if r.try_get::<bool, _>("active")? {
+            active.push(name);
+        } else {
+            inactive.push(name);
+        }
+    }
+    let routes_have = |n: usize, kind: &str| match n {
+        1 => format!("1 {kind} route has"),
+        n => format!("{n} {kind} routes have"),
+    };
+    let mut out = Vec::new();
+    if !active.is_empty() {
+        out.push(Finding::error(
+            "routes_without_stages",
+            g,
+            format!(
+                "{} no stages, so {} no stops once feed {g} is served from its stages: {}. \
+                 Give each a list of stages (a route_stages change), or make it inactive, first",
+                routes_have(active.len(), "active"),
+                if active.len() == 1 {
+                    "it would serve"
+                } else {
+                    "they would serve"
+                },
+                route_names(&active)
+            ),
+        ));
+    }
+    if !inactive.is_empty() {
+        out.push(Finding::warning(
+            "inactive_routes_without_stages",
+            g,
+            format!(
+                "{} no stages and no stops while inactive: {}",
+                routes_have(inactive.len(), "inactive"),
+                route_names(&inactive)
+            ),
+        ));
+    }
+    out.push(Finding::warning(
+        "stages_take_over",
+        g,
+        if with == 1 {
+            "from this commit 1 route serves the stops of its stages instead of its own stop list"
+                .to_string()
+        } else {
+            format!(
+                "from this commit {with} routes serve the stops of their stages instead of their own stop lists"
+            )
+        },
+    ));
+    Ok(out)
+}
+
+/// Refuse a temporary route on a feed that does not use stages. Said once here
+/// so every such write gives the same answer. Stages themselves may be built on
+/// such a feed (section 23), where they change nothing it serves.
 pub(super) async fn require_stages(conn: &mut PgConnection, g: &str) -> Result<(), ApplyError> {
     if feed_uses_stages(conn, g).await? {
         return Ok(());
@@ -764,17 +845,22 @@ pub(super) async fn stage_update(
     }
 
     // Every route using the stage must be what its stages say before the change,
-    // or rewriting it from them would undo an edit made some other way.
+    // or rewriting it from them would undo an edit made some other way. On a
+    // feed not served from its stages nothing is rewritten, so there is nothing
+    // to undo.
     let routes = routes_using(conn, g, &sk).await?;
+    let served = feed_uses_stages(conn, g).await?;
     let mut before: Vec<Vec<RouteRow>> = Vec::with_capacity(routes.len());
     let mut stale = Vec::new();
     for (route_id, short) in &routes {
         let live_rows = load_route_rows(conn, g, route_id).await?;
         let worn = active_variant(conn, g, route_id).await?;
-        if !same_rows(
-            &flatten_route(conn, g, route_id, worn.as_deref()).await?,
-            &live_rows,
-        ) {
+        if served
+            && !same_rows(
+                &flatten_route(conn, g, route_id, worn.as_deref()).await?,
+                &live_rows,
+            )
+        {
             stale.push((route_id.clone(), short.clone()));
         }
         before.push(live_rows);
@@ -941,17 +1027,21 @@ pub(super) async fn stage_merge(
     }
 
     // Every route using either stage must match its stages before the change,
-    // or rewriting it from them would undo an edit made some other way.
+    // or rewriting it from them would undo an edit made some other way - on a
+    // feed served from its stages; anywhere else nothing is rewritten.
     let routes = routes_using(conn, g, &gone).await?;
+    let served = feed_uses_stages(conn, g).await?;
     let mut before: Vec<Vec<RouteRow>> = Vec::with_capacity(routes.len());
     let mut stale = Vec::new();
     for (route_id, short) in &routes {
         let live_rows = load_route_rows(conn, g, route_id).await?;
         let worn = active_variant(conn, g, route_id).await?;
-        if !same_rows(
-            &flatten_route(conn, g, route_id, worn.as_deref()).await?,
-            &live_rows,
-        ) {
+        if served
+            && !same_rows(
+                &flatten_route(conn, g, route_id, worn.as_deref()).await?,
+                &live_rows,
+            )
+        {
             stale.push((route_id.clone(), short.clone()));
         }
         before.push(live_rows);
@@ -1109,16 +1199,20 @@ pub(super) async fn stage_split(
         ));
     }
     // and none of them may have been edited outside its stages, or rewriting it
-    // from them would undo that
+    // from them would undo that (on a feed served from its stages: anywhere
+    // else nothing is rewritten)
+    let served = feed_uses_stages(conn, g).await?;
     let mut before: Vec<Vec<RouteRow>> = Vec::with_capacity(routes.len());
     let mut stale = Vec::new();
     for route_id in &routes {
         let live_rows = load_route_rows(conn, g, route_id).await?;
         let worn = active_variant(conn, g, route_id).await?;
-        if !same_rows(
-            &flatten_route(conn, g, route_id, worn.as_deref()).await?,
-            &live_rows,
-        ) {
+        if served
+            && !same_rows(
+                &flatten_route(conn, g, route_id, worn.as_deref()).await?,
+                &live_rows,
+            )
+        {
             stale.push((route_id.clone(), None));
         }
         before.push(live_rows);

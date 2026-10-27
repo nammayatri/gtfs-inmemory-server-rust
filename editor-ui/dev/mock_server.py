@@ -28,6 +28,7 @@ import base64
 import gzip
 import hashlib
 import hmac
+import io
 import json
 import math
 import mimetypes
@@ -38,6 +39,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -194,6 +196,36 @@ class ApiError(Exception):
     def __init__(self, status, code, message, details=None):
         super().__init__(message)
         self.status, self.code, self.message, self.details = status, code, message, details or {}
+
+
+class MockFile:
+    """A file an endpoint answers with instead of JSON: a migration (section 23)."""
+
+    def __init__(self, data, name):
+        self.data, self.name = data, name
+
+
+MIGRATION_FORMAT = "gtfs-editor-migration/1"
+
+
+def migration_zip(manifest):
+    """A migration file as the editor writes it: its manifest, and nothing the
+    mock's report needs besides."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest))
+    return buf.getvalue()
+
+
+def migration_manifest(raw):
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            manifest = json.loads(z.read("manifest.json"))
+    except (zipfile.BadZipFile, KeyError, ValueError) as e:
+        raise ApiError(400, "invalid_migration", f"not a migration file ({e})")
+    if manifest.get("format") != MIGRATION_FORMAT:
+        raise ApiError(400, "invalid_migration", f"the file is {manifest.get('format')!r}, not {MIGRATION_FORMAT}")
+    return manifest
 
 
 # ------------------------------------------------------------------ store
@@ -1196,6 +1228,10 @@ class Handler(BaseHTTPRequestHandler):
             headers = [("Set-Cookie", c) for c in self.set_cookies]
             if status == 204:
                 return self._send(204, None, headers)
+            if isinstance(body, MockFile):
+                return self._send(status, body.data,
+                                  headers + [("Content-Disposition", f'attachment; filename="{body.name}"')],
+                                  "application/zip")
             self._send(status, body, headers)
         except ApiError as e:
             self._send(e.status, {"error": {"code": e.code, "message": e.message, "details": e.details}},
@@ -1233,6 +1269,13 @@ class Handler(BaseHTTPRequestHandler):
                                     "round5": getattr(s, "round5", None),
                                     "station_merge": getattr(s, "station_merge", None),
                                     "feed_access": getattr(s, "feed_access", None)})
+        if path == "/__dev/environment" and method == "POST":
+            # which side of a migration this mock plays (section 23)
+            env = self._body().get("environment")
+            if env not in ("master", "prod"):
+                raise ApiError(400, "invalid_environment", "environment is master or prod")
+            s.environment = env
+            return self._send(200, {"environment": env})
         if path == "/__dev/as" and method == "POST":
             email = self._body().get("email") or ""
             return self._send(200, {"ok": True}, [
@@ -1434,6 +1477,153 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(401, "invalid_code", "That code is not right. Check the time on your phone and try again.",
                        {"attempts_left": left})
 
+    # ---- moving master's work to prod (docs section 23). The mock writes the
+    # file's manifest and nothing else, and reads one in with a report shaped
+    # as the editor's: a dry run, or one draft (empty here) and a history row.
+    def migration(self, method, parts, q, u):
+        s = self.store
+        env = getattr(s, "environment", "prod")
+
+        def admin():
+            if u["role"] != "admin":
+                raise ApiError(403, "admin_required", "Only an admin moves work between master and prod.")
+
+        def source():
+            return {"env": env, "version": s.feeds[g]["version"], "use_stages": True,
+                    "exported_at": iso(now()), "exported_by": u["email"]}
+
+        if len(parts) == 3 and parts[0] == "change-sets" and parts[2] == "migration" and method == "GET":
+            admin()
+            cs = s.change_sets.get(parts[1])
+            if not cs:
+                raise ApiError(404, "change_set_not_found", "No such draft.")
+            if cs["status"] != "committed":
+                raise ApiError(409, "not_committed", f"draft {parts[1]} is {cs['status']}; only a committed draft moves to prod")
+            g = cs["gtfs_id"]
+            manifest = {"format": MIGRATION_FORMAT, "kind": "change_set", "gtfs_id": g, "source": source(),
+                        "change_set": {"change_set_id": cs["change_set_id"], "title": cs["title"],
+                                       "committed_version": cs["committed_version"], "changes": len(cs["changes"])},
+                        "files": {}}
+            return 200, MockFile(migration_zip(manifest),
+                                 f"{g}-draft-{cs['change_set_id'][:8]}-v{cs['committed_version'] or 0}.migration.zip")
+        if len(parts) == 2 and parts[0] == "import-jobs" and method == "GET":
+            job = getattr(s, "migration_jobs", {}).get(parts[1])
+            if not job:
+                raise ApiError(404, "job_not_found", "No such import job.")
+            ready = time.time() >= job["ready_at"]
+            return 200, {"job_id": parts[1], "kind": "migration", "status": "done" if ready else "running",
+                         "report": job["report"] if ready else None}
+        if len(parts) != 3 or parts[0] != "feeds" or parts[2] not in ("migration", "migrations"):
+            return None
+        g = parts[1]
+        if g not in s.feeds:
+            raise ApiError(404, "unknown_feed", f"There is no feed called {g}.")
+        admin()
+        if parts[2] == "migration" and method == "GET":
+            scopes = [x for x in (q.get("scopes", [""])[0] or "stops,routes,stages,timetables").split(",") if x]
+            manifest = {"format": MIGRATION_FORMAT, "kind": "full", "gtfs_id": g, "source": source(),
+                        "scopes": scopes, "files": {}}
+            return 200, MockFile(migration_zip(manifest), f"{g}-full-v{s.feeds[g]['version']}.migration.zip")
+        if method == "GET":
+            items = []
+            for m in reversed(getattr(s, "migrations", [])):
+                sets = [{"change_set_id": i, "title": s.change_sets[i]["title"], "status": s.change_sets[i]["status"]}
+                        for i in m["change_set_ids"] if i in s.change_sets]
+                items.append({k: v for k, v in m.items() if k != "change_set_ids"} | {"change_sets": sets})
+            return 200, {"gtfs_id": g, "items": items}
+        if method != "POST":
+            return None
+        if env == "master":
+            raise ApiError(400, "import_on_master", "this is master: a migration from master is read in on prod")
+        n = int(self.headers.get("Content-Length") or 0)
+        manifest = migration_manifest(self.rfile.read(n) if n else b"")
+        if (manifest.get("source") or {}).get("env") != "master":
+            raise ApiError(400, "not_from_master", "only a file from master is read in")
+        if manifest.get("gtfs_id") != g:
+            raise ApiError(400, "feed_mismatch", f"this file is feed {manifest.get('gtfs_id')}'s, not feed {g}'s")
+        report = self.migration_report(g, manifest, q, u)
+        s.last_migration_query = {k: v[0] for k, v in q.items()}
+        if q.get("background", [""])[0] != "true":
+            return 200, report
+        if not hasattr(s, "migration_jobs"):
+            s.migration_jobs = {}
+        job_id = str(uuid.uuid4())
+        s.migration_jobs[job_id] = {"report": report, "ready_at": time.time() + 1.0}
+        return 202, {"job_id": job_id, "status": "running"}
+
+    def migration_report(self, g, manifest, q, u):
+        s = self.store
+        dry = q.get("dry_run", ["true"])[0] != "false"
+        take = {t for t in q.get("take", [""])[0].split(",") if t}
+        src = manifest.get("source") or {}
+        report = {"import_id": None, "gtfs_id": g, "kind": manifest["kind"], "dry_run": dry, "file_sha256": "mock",
+                  "source": src, "change_sets": [], "counts": {}, "conflicts": [], "dropped": [], "notes": [],
+                  "problems": [], "warnings": 0, "next": None}
+        if manifest["kind"] == "change_set":
+            cs = manifest.get("change_set") or {}
+            report["change_set"] = cs
+            conflicts = [{"id": "change:1", "what": {"position": 1, "entity": "stop", "op": "update", "entity_key": "B"},
+                          "reason": "changed_on_prod", "prod": {"name": "STOP B PROD"}, "master": {"name": "STOP B"}}]
+            title, planned, step = f"From master: {cs.get('title', '')}", 1, None
+        else:
+            since = q.get("since_version", [None])[0] or getattr(s, "migration_since", None)
+            if since is None:
+                raise ApiError(400, "since_version_required",
+                               f"this is feed {g}'s first full migration: say from which prod version on what prod "
+                               f"changed is its own (since_version). Prod is at version {s.feeds[g]['version']}.")
+            if not dry:
+                s.migration_since = since
+            report["since_version"] = int(since)
+            conflicts = [
+                {"id": "stop:C", "what": {"entity": "stop", "key": "C", "name": "STOP C"}, "reason": "changed_on_prod",
+                 "prod_version": int(since) + 1, "message": f"prod changed this itself at version {int(since) + 1}, after {since}; prod's is kept"},
+                {"id": "route_list:R2", "what": {"entity": "route_stages", "key": "R2", "stages": 2}, "reason": "changed_on_prod",
+                 "prod_version": int(since) + 1, "message": f"prod changed this itself at version {int(since) + 1}, after {since}; prod's is kept"},
+            ]
+            title, planned, step = f"From master v{src.get('version')}: Stops, stations and routes", 2, "stops_routes"
+            report["step"] = step
+            waiting = "after the stops_routes drafts are committed"
+            report["steps"] = [
+                {"step": "stops_routes", "title": "Stops, stations and routes", "planned": {"stop/create": 1, "stop/update": 1},
+                 "conflicts": 1, "drafted": True, "dropped": 0},
+                {"step": "stages", "title": "Stages", "planned": {"stage/create": 3}, "conflicts": 0, "drafted": False,
+                 "dropped": 0, "waiting": waiting},
+                {"step": "route_stages", "title": "The routes' stage lists", "planned": {"route_stages/replace": 1},
+                 "conflicts": 1, "drafted": False, "dropped": 0, "waiting": waiting},
+                {"step": "switch", "title": "Serve the feed from its stages", "planned": {"feed_config/update": 1},
+                 "conflicts": 0, "drafted": False, "dropped": 0, "waiting": waiting},
+                {"step": "timetables", "title": "Timetables", "planned": {}, "conflicts": 0, "drafted": False, "dropped": 0},
+            ]
+            report["notes"] = [{"code": "prod_only_stops", "count": 1, "message": "stops only prod has stay as they are"}]
+        kept = [c for c in conflicts if not ("all" in take or c["id"] in take)]
+        taken = len(conflicts) - len(kept)
+        added = planned + taken
+        report["conflicts"] = kept
+        report["counts"] = {"added": added, "conflicts": len(kept), "taken": taken, "dropped": 0, "done": 0}
+        set_id = None
+        if not dry:
+            set_id, t = str(uuid.uuid4()), iso(now())
+            s.change_sets[set_id] = {
+                "change_set_id": set_id, "gtfs_id": g, "title": title,
+                "description": "Brought from master by a migration (mock): docs/gtfs-editor.md section 23.",
+                "status": "draft", "created_by": u["user_id"], "created_at": t, "updated_at": t,
+                "submitted_by": None, "submitted_at": None, "reviewed_by": None, "reviewed_at": None,
+                "review_comment": None, "committed_by": None, "committed_at": None,
+                "base_version": s.feeds[g]["version"], "committed_version": None, "changes": []}
+            import_id = str(uuid.uuid4())
+            report["import_id"] = import_id
+            report["next"] = "review the draft on prod; a second person approves and commits it"
+            if not hasattr(s, "migrations"):
+                s.migrations = []
+            s.migrations.append({
+                "import_id": import_id, "kind": manifest["kind"], "step": step,
+                "source": {"source": src, "change_set": manifest.get("change_set"), "scopes": manifest.get("scopes", [])},
+                "file_sha256": "mock", "since_version": report.get("since_version"),
+                "report": {"counts": report["counts"]}, "imported_at": t, "imported_by": u["email"],
+                "change_set_ids": [set_id]})
+        report["change_sets"] = [{"change_set_id": set_id, "title": title, "changes": added}]
+        return report
+
     # ---- API
     def _api(self, method, path, q):
         s = self.store
@@ -1449,7 +1639,8 @@ class Handler(BaseHTTPRequestHandler):
                 valid = bool(sess and sess["user_id"] == u["user_id"] and sess["expires_at"] > now())
                 return 200, {"user_id": u["user_id"], "email": u["email"], "display_name": u["display_name"],
                              "role": u["role"], "status": u["status"], "totp_enabled": u["totp_enabled"],
-                             "session": valid, "sign_in_locked_seconds": 0}
+                             "session": valid, "sign_in_locked_seconds": 0,
+                             "environment": getattr(s, "environment", "prod")}
             if parts == ["auth", "totp", "enroll"] and method == "POST":
                 if u["totp_enabled"]:
                     raise ApiError(409, "totp_already_enabled", "Two-step sign-in is already set up.")
@@ -1486,6 +1677,10 @@ class Handler(BaseHTTPRequestHandler):
         u = self.session_user()
         self.require_mutation(method)
 
+        found = self.migration(method, parts, q, u)
+        if found is not None:
+            return found
+
         if parts == ["feeds"] and method == "GET":
             return 200, {"items": [{k: f.get(k) for k in ("gtfs_id", "display_name", "version", "data_source",
                                                           "released_version")} for f in s.feeds.values()],
@@ -1499,6 +1694,13 @@ class Handler(BaseHTTPRequestHandler):
             if rest == ["config"] and method == "GET":
                 return 200, {"gtfs_id": g, "data_source": s.feeds[g].get("data_source", "preprocessed"),
                              "version": s.feeds[g]["version"]}
+            # the Feed page's counts (section 18): the sample's stops and
+            # routes, and no timetable
+            if rest == ["files"] and method == "GET":
+                count = lambda table: sum(1 for (gid, _), row in table.items() if gid == g and not row.get("deleted"))
+                return 200, {"gtfs_id": g, "items": [
+                    {"file": "stops.txt", "rows": count(s.stops)}, {"file": "routes.txt", "rows": count(s.routes)},
+                    {"file": "trips.txt", "rows": 0}, {"file": "calendar.txt", "rows": 0}]}
             if rest == ["stops"] and method == "GET":
                 return 200, self.list_stops(g, q)
             if len(rest) == 2 and rest[0] == "stops" and method == "GET":
@@ -4269,9 +4471,10 @@ class FeedAccessHandler(WebhookHandler):
             self.require_mutation(method)
             self.feed = g
             self.require_role(u, "viewer")
-            # a change set named in a query or a body answers for its own feed
+            # a change set named in a query or a body answers for its own feed;
+            # a migration's body is its file, not JSON (section 23)
             named = (q.get("change_set") or [None])[0]
-            if not named and method in ("POST", "PUT", "PATCH"):
+            if not named and method in ("POST", "PUT", "PATCH") and parts[2:] != ["migrations"]:
                 named = self._body().get("change_set_id")
             other = s.change_sets.get(named) if isinstance(named, str) else None
             if other and not self.feed_role(u, other["gtfs_id"]):
@@ -4399,6 +4602,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--sample", default=str(HERE / "sample.json.gz"))
+    # which side of a migration the mock plays (section 23); the DEV bar's
+    # /__dev/environment switches it while it runs
+    ap.add_argument("--environment", choices=["master", "prod"], default="prod")
     args = ap.parse_args()
     if not Path(args.sample).exists():
         raise SystemExit(f"{args.sample} is missing. Run dev/export_sample.py against the local Postgres first.")
@@ -4409,8 +4615,19 @@ def main():
     seed_webhooks(Handler.store)
     seed_station_merge(Handler.store)
     seed_feed_access(Handler.store)
+    Handler.store.environment = args.environment
     print(f"GTFS editor mock on http://127.0.0.1:{args.port}{UI}/")
-    ThreadingHTTPServer(("127.0.0.1", args.port), FeedAccessHandler).serve_forever()
+    MockServer(("127.0.0.1", args.port), FeedAccessHandler).serve_forever()
+
+
+class MockServer(ThreadingHTTPServer):
+    # Every module of a page load is a connection of its own (HTTP/1.0), some
+    # forty at once. The standard backlog of 5 overflowed under them, the
+    # system dropped the connections it had no room for, and the browser only
+    # tried them again seconds later: a reload stalled half-loaded, and a
+    # smoke step timed out now and then.
+    request_queue_size = 128
+    daemon_threads = True
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@
 //   node dev/ui_smoke.mjs --feed-access      # only who may work on which feed
 //   node dev/ui_smoke.mjs --gps-trips        # only a route's trips from GPS on a day
 //   node dev/ui_smoke.mjs --route-active     # only making a route inactive and active again
+//   node dev/ui_smoke.mjs --migration        # only moving work from master to prod (section 23)
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -1691,6 +1692,104 @@ async function routeActiveFlow() {
     .find((c) => c.entity === "route" && c.entity_key === route.route_id);
   check(!!again && again.after.active === true, `the new draft makes it active (${JSON.stringify(again && again.after)})`);
   await waitFor(`!!document.querySelector('#panel .notice[data-route-active="true"]')`, "the pending notice for active again");
+}
+
+// ---- moving master's work to prod (docs section 23). The mock plays master,
+// then prod (/__dev/environment): master's Feed page downloads the feed as a
+// migration file, a committed draft downloads its own, and prod's Feed page
+// reads the file in - checked first, then drafted with a conflict taken.
+async function migrationFlow() {
+  const setEnv = (env) => evaluate(`fetch("/__dev/environment", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ environment: ${JSON.stringify(env)} }) }).then((r) => r.ok)`);
+  const reload = async () => {
+    await load(UI);
+    await waitFor(`!document.getElementById("app").hidden`, "the app after a reload");
+  };
+
+  // ---- master: the whole feed as a file
+  check(await setEnv("master"), "the mock plays master");
+  await reload();
+  await go("#/feed");
+  await waitFor(`document.querySelector("#migration h2")?.textContent === "Move to prod"`, "Move to prod on master's Feed page");
+  const href = () => evaluate(`document.getElementById("download-migration").getAttribute("href")`);
+  check((await href()).endsWith("feeds/chennai_bus/migration?scopes=stops,routes,stages,timetables"), `every scope by default (${await href()})`);
+  await clickSel("#scope-timetables", "leave the timetables out");
+  check((await href()).endsWith("migration?scopes=stops,routes,stages"), `the link follows the scopes (${await href()})`);
+  const file = await evaluate(`fetch(document.getElementById("download-migration").href, { credentials: "same-origin" })
+    .then(async (r) => ({ status: r.status, type: r.headers.get("content-type"), bytes: Array.from(new Uint8Array(await r.arrayBuffer())) }))`);
+  check(file.status === 200 && file.type === "application/zip" && file.bytes.length > 0, `the feed downloads as a zip (${file.status} ${file.type})`);
+  check(!(await has("#migration-file")), "master reads no migration in");
+  await evaluate(`document.getElementById("migration").scrollIntoView(); true`);
+  await shot("migration-01-master");
+  // a committed draft downloads its own file
+  const committed = (await api("feeds/chennai_bus/change-sets?status=committed&limit=1")).items || [];
+  if (committed.length) {
+    const id = committed[0].change_set_id;
+    await go(`#/drafts/${id}`);
+    await waitFor(`!!document.getElementById("draft-to-prod")`, "Download for prod on a committed draft");
+    check((await evaluate(`document.getElementById("draft-to-prod").getAttribute("href")`)).endsWith(`change-sets/${id}/migration`),
+      "the draft's file is its own");
+  } else {
+    console.log("     (no committed draft in the mock: the draft download is not checked)");
+  }
+
+  // ---- prod: the file read in
+  check(await setEnv("prod"), "the mock plays prod");
+  await reload();
+  await go("#/feed");
+  await waitFor(`document.querySelector("#migration h2")?.textContent === "Bring from master"`, "Bring from master on prod's Feed page");
+  check(!(await has("#download-migration")), "prod writes no migration file");
+  await evaluate(`(() => { const input = document.getElementById("migration-file"); const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array(${JSON.stringify(file.bytes)})], "chennai_bus-full.migration.zip", { type: "application/zip" }));
+    input.files = dt.files; input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  await sleep(300);
+  // the first whole-feed migration says from when prod's own edits count
+  await clickSel("#migration-check", "Check");
+  await waitFor(`document.querySelector("#migration .notice.error")?.textContent.includes("since_version")`, "since_version asked for");
+  await type("#migration-since", "120");
+  await clickSel("#migration-check", "Check again");
+  await waitFor(`!!document.querySelector(".migration-report")`, "the dry run's report");
+  check((await text(".migration-report")).includes("Would draft:"), "a dry run says what it would draft");
+  check(await evaluate(`document.querySelectorAll(".migration-steps tbody tr").length`) === 5, "every step is listed");
+  check(await evaluate(`document.querySelectorAll(".migration-conflicts tbody tr").length`) === 2, "prod's own edits are listed");
+  await evaluate(`document.querySelector(".migration-report").scrollIntoView(); true`);
+  await shot("migration-02-prod-check");
+  await clickSel("#take-route_list\\:R2", "take master's list of R2");
+  await clickSel("#migration-write", "Make the drafts");
+  await waitFor(`(document.querySelector(".migration-report")?.textContent || "").includes("Drafted:")`, "the drafts made");
+  const report = await text(".migration-report");
+  check(report.includes("1 taken from master"), "the conflict ticked is taken");
+  check(await evaluate(`document.querySelectorAll(".migration-conflicts tbody tr").length`) === 1, "the other conflict stays prod's");
+  await waitFor(`document.querySelectorAll(".migration-history tbody tr").length === 1`, "the read-in in the history");
+  await evaluate(`document.querySelector(".migration-report").scrollIntoView(); true`);
+  await shot("migration-03-prod-drafted");
+  await clickSel(".migration-sets a", "the draft made");
+  await waitFor(`(document.querySelector("#page h1")?.textContent || "").startsWith("From master v")`, "the migration's draft page");
+  check(await setEnv("prod"), "the mock back to prod");
+}
+
+// ---- only moving work from master to prod
+if (process.argv.includes("--migration")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("admin@nammayatri.in");
+    await migrationFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
 }
 
 // ---- only making a route inactive

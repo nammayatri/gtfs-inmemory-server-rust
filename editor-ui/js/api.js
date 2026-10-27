@@ -90,3 +90,24 @@ export const postBytes = (path, bytes, type = "application/zip", headers = {}) =
   request("POST", path, undefined, { bytes, type, headers });
 
 export const enc = encodeURIComponent;
+
+// An import in the background (docs section 18.15): the request is answered
+// at once with a job, and its report polled for, so an import may take longer
+// than the 30 s the load balancer and Pomerium in front of the editor wait.
+// `waiting(seconds)` hears how long it has been running; `headers` go with the
+// file (a reload's code). The Feed page's zips and migrations (section 23) both
+// come in this way.
+export async function runImport(path, bytes, waiting, headers = {}) {
+  const { job_id } = await postBytes(`${path}${path.includes("?") ? "&" : "?"}background=true`, bytes, "application/zip", headers);
+  const started = Date.now();
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const job = await get(`import-jobs/${enc(job_id)}`);
+    if (job.status === "done") return job.report;
+    if (job.status !== "running") {
+      const e = job.error || {};
+      throw new ApiError(e.status || 500, e.code || "import_failed", e.message || "The import failed.");
+    }
+    if (waiting) waiting(Math.round((Date.now() - started) / 1000));
+  }
+}

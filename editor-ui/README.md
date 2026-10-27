@@ -97,6 +97,7 @@ seeded from the editor tables of a **local** Postgres:
 ```sh
 python dev/export_sample.py      # once; reads 127.0.0.1:55432/mtc_internal_master into dev/sample.json.gz
 python dev/mock_server.py        # http://127.0.0.1:8765/internal/gtfs-editor/ui/
+python dev/mock_server.py --environment master   # plays master's side of a migration (section 23); prod by default
 node dev/ui_smoke.mjs            # drives headless Chrome through every flow, screenshots to $TMPDIR/gtfs-editor-shots
 node --test dev/csv_test.mjs     # unit tests of the CSV reader
 ```

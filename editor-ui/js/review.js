@@ -14,6 +14,7 @@ import { pager } from "./importer.js";
 import { DATA_SOURCE_LABEL, OVERRIDE_CHIP_STYLE } from "./admin.js";
 import { loadSpec, cellText } from "./gtfs.js";
 import { daysText } from "./trips.js";
+import { draftDownload } from "./migration.js";
 
 const page = () => document.getElementById("page");
 const TABS = [
@@ -437,6 +438,9 @@ export async function showDraft(id, { conflicts = null } = {}) {
         }
       } }));
   }
+  // on master, a committed draft goes to prod as a file (section 23)
+  const toProd = draftDownload(cs);
+  if (toProd) actions.push(toProd);
 
   const timeline = [
     `Started by ${cs.created_by_email} on ${fmtDate(cs.created_at)}, from feed version ${cs.base_version}.`,
