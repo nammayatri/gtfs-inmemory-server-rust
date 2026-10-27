@@ -55,7 +55,8 @@ function exportSection() {
   const link = h("a.btn.secondary", { id: "download-migration", download: "" }, "Download for prod");
   const none = h("p.hint", { hidden: true }, "Choose at least one.");
   const sync = () => {
-    const picked = inputs.filter((i) => i.checked).map((i) => i.value);
+    // the scopes from the page's own list, never read back from the DOM
+    const picked = SCOPES.filter((_, i) => inputs[i].checked).map(([k]) => enc(k));
     link.href = `${API_BASE}feeds/${g}/migration?scopes=${picked.join(",")}`;
     link.hidden = !picked.length;
     none.hidden = !!picked.length;
@@ -157,10 +158,12 @@ function reportView(r, written, onWrite) {
     ? `Master's draft "${r.change_set ? r.change_set.title : ""}", committed as master version ${r.change_set ? r.change_set.committed_version : "?"}; written ${fmtDate(src.exported_at)} by ${src.exported_by}.`
     : `Master's feed ${r.gtfs_id} at version ${src.version}; written ${fmtDate(src.exported_at)} by ${src.exported_by}.${r.since_version !== undefined ? ` Prod's own edits count from version ${r.since_version}.` : ""}`;
 
+  // each Take box with the conflict id from the report, kept here rather than
+  // read back from the box
   const takes = [];
   const conflictRows = (r.conflicts || []).map((c) => {
-    const box = c.id ? h("input", { type: "checkbox", value: c.id, id: `take-${c.id}`, "aria-label": `Take master's version of ${c.id}` }) : null;
-    if (box) takes.push(box);
+    const box = c.id ? h("input", { type: "checkbox", id: `take-${c.id}`, "aria-label": `Take master's version of ${c.id}` }) : null;
+    if (box) takes.push({ box, id: c.id });
     return h("tr",
       h("td", box),
       h("td", h("code", c.id || ""), h("div.hint", what(c.what))),
@@ -187,7 +190,7 @@ function reportView(r, written, onWrite) {
 
   const canWrite = !written && (r.change_sets.length || takes.length) && !(r.problems || []).length;
   const write = canWrite ? h("button.btn", { type: "button", id: "migration-write", on: { click: () => {
-    onWrite(takes.filter((b) => b.checked).map((b) => b.value));
+    onWrite(takes.filter((t) => t.box.checked).map((t) => t.id));
   } } }, "Make the drafts") : null;
 
   return h("div.migration-report",
