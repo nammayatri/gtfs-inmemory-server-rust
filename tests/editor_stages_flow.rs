@@ -1225,14 +1225,22 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
     );
     assert_eq!(rs["has_stages"], false, "{rs}");
     assert_eq!(rs["stages"].as_array().unwrap().len(), 0, "{rs}");
-    // a stage change is refused outright...
+    // a stage change goes in, and changes nothing the feed serves: its routes
+    // are their own rows until use_stages is on again (section 23, where a
+    // migration builds prod's stages before the switch)...
     let d12 = draft!("a stage on a feed without stages");
     let b = added!(
         d12,
-        json!({"entity": "stage", "op": "update", "entity_key": "stg_gamma", "after": {"name": "NOPE"}})
+        json!({"entity": "stage", "op": "update", "entity_key": "stg_gamma", "after": {"name": "RENAMED OFF"}})
     );
-    assert!(has_code(&findings(&b, "error"), "stages_off"), "{b}");
-    call!(&app, ed.req("POST", &format!("/change-sets/{d12}/discard")));
+    assert!(findings(&b, "error").is_empty(), "{b}");
+    let (s, b) = ship!(d12);
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(
+        route_rows(&pool, "R1").await,
+        original,
+        "off, a stage edit changes no route's rows"
+    );
     // ...and the stop list is editable again, where a staged route refused it
     let d13 = draft!("edit the stop list directly");
     let (_, live, _) = call!(&app, ed.req("GET", &format!("/feeds/{FEED}/routes/R1")));

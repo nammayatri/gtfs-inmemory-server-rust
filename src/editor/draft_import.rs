@@ -66,6 +66,12 @@ pub struct DraftImport {
     /// Who the change sets are drafted by.
     pub user_id: Uuid,
     pub email: String,
+    /// Routes whose stop orders, timings and trips stay as the feed has them,
+    /// whatever the zip says: a migration's routes that prod timetabled itself
+    /// (section 23). Reported in `stop_orders.routes_kept`.
+    pub exclude_routes: HashSet<String>,
+    /// What the change sets' titles start with; "GTFS import <sha>" if none.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -115,6 +121,8 @@ pub struct StopOrders {
     pub routes_left_sample: Vec<String>,
     /// Routes with trips in the feed and none in the zip: left as they are.
     pub routes_not_in_zip: usize,
+    /// Routes the import was asked to leave as they are ([`DraftImport::exclude_routes`]).
+    pub routes_kept: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,9 +274,22 @@ pub async fn draft_import(
     } else {
         Mapping::default()
     };
+    // routes the caller keeps as the feed has them: no split, timing or trip
+    // of theirs is drafted, and nothing is said about them
+    let kept = |route: &str| opts.exclude_routes.contains(route);
+    mapping
+        .route_stop_rows
+        .retain(|r| !kept(r["route_id"].as_str().unwrap_or("")));
+    mapping
+        .profile_rows
+        .retain(|r| !kept(r["route_id"].as_str().unwrap_or("")));
+    mapping.left.retain(|r| !kept(r));
+    mapping.moved.retain(|r| !kept(r));
+    mapping.kept = opts.exclude_routes.clone();
     report.stop_orders = StopOrders {
         routes_left: mapping.left.len(),
         routes_left_sample: mapping.left.iter().take(20).cloned().collect(),
+        routes_kept: opts.exclude_routes.len(),
         ..std::mem::take(&mut mapping.report)
     };
     for route in &mapping.moved {
@@ -297,12 +318,15 @@ pub async fn draft_import(
         || !service_rows.is_empty()
         || !mapping.route_stop_rows.is_empty()
         || !mapping.profile_rows.is_empty();
-    let tag = &report.zip_sha256[..8];
+    let head = opts
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("GTFS import {}", &report.zip_sha256[..8]));
     let who = (opts.user_id, opts.email.as_str());
 
     if step1 {
         report.step = "records";
-        let title = format!("GTFS import {tag}: records, calendars and stop orders");
+        let title = format!("{head}: records, calendars and stop orders");
         let set = new_set(&mut tx, &g, opts.user_id, &title, bytes.len()).await?;
         let mut changes = service::insert_changes(&mut tx, set, opts.user_id, &record_changes)
             .await?
@@ -344,7 +368,7 @@ pub async fn draft_import(
             report.step = "trips";
             let trips: usize = group.iter().map(|(_, rows)| rows.len()).sum();
             let title = format!(
-                "GTFS import {tag}: trips {} of {n} ({} routes, {trips} trips)",
+                "{head}: trips {} of {n} ({} routes, {trips} trips)",
                 k + 1,
                 group.len()
             );
@@ -749,6 +773,8 @@ struct Mapping {
     profile_rows: Vec<Value>,
     /// Routes whose trips stay as the feed has them.
     left: BTreeSet<String>,
+    /// Routes the caller keeps as the feed has them ([`DraftImport::exclude_routes`]).
+    kept: HashSet<String>,
     /// Routes whose trips move onto the feed's first stop order.
     moved: BTreeSet<String>,
     report: StopOrders,
@@ -989,7 +1015,7 @@ fn trip_rows(zip: &FeedModel, live: &FeedModel, m: &Mapping) -> (Vec<(String, Ve
 
     let mut out = Vec::new();
     for (route, trips) in theirs {
-        if m.left.contains(route) {
+        if m.left.contains(route) || m.kept.contains(route) {
             continue;
         }
         let mapped = |t: &Trip| -> Option<(i16, Option<i32>)> {

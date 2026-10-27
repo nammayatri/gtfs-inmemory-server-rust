@@ -2113,13 +2113,13 @@ async fn apply_change(
         return Err(ApplyError::Findings(gone));
     }
     let key = c.entity_key.as_str();
-    // Stages, and the temporary routes built out of them, exist only on a feed
-    // that uses them. Anywhere else a change to one is refused here, in one
-    // place, so no stage can come to be on a feed whose routes are stop lists.
-    if matches!(
-        c.entity.as_str(),
-        "stage" | "route_stages" | "route_variant"
-    ) {
+    // A temporary route exists only on a feed served from its stages, and a
+    // change to one anywhere else is refused here, in one place. Stages and a
+    // route's list of them may be built on a feed that is not served from them
+    // yet - a migration from master does (section 23) - where they change
+    // nothing it serves: its routes stay their stop lists until a feed_config
+    // change turns use_stages on.
+    if c.entity == "route_variant" {
         super::stages::require_stages(conn, g).await?;
     }
     match (c.entity.as_str(), c.op.as_str()) {
@@ -3583,7 +3583,13 @@ pub(super) async fn write_route_rows(
         )
         .await;
     }
-    write_pattern_rows(conn, g, route_id, FIRST_PATTERN, rows, live, actor).await
+    // A feed not served from its stages serves each route's own stop list, and
+    // stages built on it (a migration from master, section 23) leave that list
+    // and its timings alone: they take over when use_stages is turned on, not
+    // stage by stage before it. Temporary routes, the other writer, exist only
+    // on a feed served from its stages.
+    let _ = (rows, live, actor);
+    Ok(Vec::new())
 }
 
 /// Put `members` under `station`, setting the platform label of each member
@@ -4181,6 +4187,15 @@ async fn feed_config_update(
             .find(|(k, _, _)| *k == f)
             .map(|(_, _, to)| to)
     };
+    // turning stages on: every active route must have some first, or it would
+    // serve no stops from this commit (section 23)
+    if set("use_stages").and_then(Value::as_bool) == Some(true) {
+        let found = super::stages::switch_findings(conn, g).await?;
+        if found.iter().any(|f| f.level == Level::Error) {
+            return Err(ApplyError::Findings(found));
+        }
+        warnings.extend(found);
+    }
     sqlx::query(
         "UPDATE gtfs_feed SET data_source = coalesce($2, data_source), \
             trips_source = coalesce($3, trips_source), default_run_s = coalesce($4, default_run_s), \
@@ -4632,8 +4647,9 @@ async fn stop_or_created(
 /// Snapshot of what a change replaces, and the version it is based on. Rows an
 /// earlier change in the same set creates count as existing (with no version).
 /// May fill in `after` what the change leaves to the live data (a merge's
-/// `into_row_version`).
-async fn snapshot(
+/// `into_row_version`). A migration from master reads prod's side with it, to
+/// set beside the `before` master took the same way (section 23).
+pub(super) async fn snapshot(
     conn: &mut PgConnection,
     change_set_id: Uuid,
     g: &str,

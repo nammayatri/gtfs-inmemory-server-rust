@@ -40,7 +40,8 @@ button's (section 12.6), `0023` holds every other file and field of the GTFS
 reference (section 18), `0024` is where a background import's report waits
 
 (section 18.15), `0025` lets a map line from GPS run as a background job
-(section 17.10), `0026` marks a route inactive (section 18.17). All are safe to
+(section 17.10), `0026` marks a route inactive (section 18.17), `0031` records
+what a migration from master brought (section 23). All are safe to
 run twice. **`0012`, `0017` and `0023`
 
 (section 18.15), and `0025` adds stages, temporary routes and stops out of use
@@ -51,7 +52,8 @@ fails to load (and serves its preprocessed data) on a database without them.
 `0024` too, or the dashboard's imports fail; GIMS itself serves without it.
 `0025` too, or every map line from GPS fails with a 500. `0026` too, or the
 dashboard's route screens fail with `schema_behind`; GIMS serves without it,
-every route active.)
+every route active. `0031` too, or reading a migration in fails; nothing else
+needs it.)
 
 ## 1. Data source per feed (GIMS loader)
 
@@ -475,7 +477,7 @@ below). Every list is
 
 | method | path | body → response |
 |---|---|---|
-| GET | `/auth/me` | → `{user_id, email, display_name, role, status, totp_enabled, session: bool, sign_in_locked_seconds}` (needs only the Pomerium JWT) |
+| GET | `/auth/me` | → `{user_id, email, display_name, role, status, totp_enabled, session: bool, sign_in_locked_seconds, environment}` (needs only the Pomerium JWT); `environment` is `master` or `prod`, the side of a migration this editor is (section 23) |
 | POST | `/auth/totp/enroll` | → `{otpauth_uri, secret_base32}` — only while `totp_enabled = false` |
 | POST | `/auth/totp/confirm` | `{code}` → `{totp_enabled: true, expires_at}` and starts a session |
 | POST | `/auth/session` | `{code}` → sets cookie, `{expires_at}` |
@@ -4312,7 +4314,7 @@ Stages are a property of the feed and they are opt-in (migration 0027):
 
 | `use_stages` | what a route is | what is offered |
 |---|---|---|
-| `false` (every feed by default) | its rows in `gtfs_route_stop` | the stop-list editor, and nothing about stages: no Stages, Diversions or Routes to review in the menu, no Stages section on a route, no stages in search. A `stage`, `route_stages` or `route_variant` change is refused `stages_off` |
+| `false` (every feed by default) | its rows in `gtfs_route_stop` | the stop-list editor, and nothing about stages: no Stages, Diversions or Routes to review in the menu, no Stages section on a route, no stages in search. A `route_variant` change is refused `stages_off`. A `stage` or `route_stages` change goes in and changes nothing the feed serves: no route's stop list or timings are rewritten, and no route is checked against its stages (`route_out_of_sync`) - this is how a migration builds prod's stages before the switch (section 23) |
 | `true` | what its stages say, and nothing else | everything in this section. A route with no stages has **no stops** until it is given some: its rows in `gtfs_route_stop`, if it has any, are not read. A `route_stops` change is refused (`route_has_stages` for a route with stages, `route_needs_stages` for one without) |
 
 On a feed that uses stages there is **no copy**. A route built from stages used
@@ -4351,7 +4353,11 @@ half an hour; the same zip now takes 18 s.
 The setting is changed in **Feed settings** and goes through a draft like any
 other `feed_config` change, because it changes what passengers are served. Off
 again, every route is its own stop list once more; the stages are kept, not
-deleted.
+deleted. Turning it on is refused while a live, active route has no stages - it
+would serve no stops from that commit (`routes_without_stages`, naming them; an
+inactive one is a warning) - and the change says how many routes take their stops
+from their stages (`stages_take_over`). Stage lists set earlier in the same draft
+count.
 
 **Editing a route's stop list on a feed that uses stages.** The stop-list editor
 and the *Route stop lists* upload both still work, and both write *stages*: the
@@ -5005,3 +5011,193 @@ real run writing nothing; bulk changes identical to single adds; a commit after
 which the loader's alias map answers each retired id with its survivor and the
 route calls at the stop kept; the same upload again adding nothing); bulk unit
 tests for the kind's columns.
+
+## 23. Moving master's work to prod (2026-10-27)
+
+Master and prod each have their own editor database (section 18.12), and
+nothing done on one reaches the other. Ops prepare and check work on master; a
+**migration** carries it to prod as a file. Master writes the file, an admin on
+prod reads it in, and what it brings becomes **ordinary prod drafts**, which a
+second person approves and commits on prod like any other. No connection or
+credential joins the two environments: the file is the only thing that moves,
+and prod's tables are written only by its own committed drafts.
+
+Two kinds of file:
+
+- **One draft** (`change_set`): a committed master draft, change by change.
+- **The whole feed** (`full`): master's stops and stations, routes, stages, the
+  routes' stage lists and its timetable, set beside prod's.
+
+Which side an editor is comes from the dhall `is_master` (section 12.6), and
+`GET /auth/me` says it as `environment`: `master` or `prod`. Master writes
+files and refuses to read one in (`import_on_master`); prod reads only a file
+written on master (`not_from_master`), and only into the feed it names
+(`feed_mismatch`).
+
+### The file
+
+A zip (`<feed>-draft-<id>-v<version>.migration.zip`,
+`<feed>-full-v<version>.migration.zip`) holding `manifest.json` and its files,
+each listed in the manifest with its sha256; a file whose content does not match
+is refused (`file_damaged`), as is anything that is not one (`invalid_migration`).
+The manifest says `format` (`gtfs-editor-migration/1`), `kind`, `gtfs_id`, and
+`source`: `env`, the feed's `version` and `use_stages` on master, when and by
+whom it was written. A draft's file adds `change_set` (its id, title, committed
+version and author) and `changes.json`: each change as master stored it -
+`position`, `entity`, `op`, `entity_key`, `before`, `after`. The whole feed's
+adds `scopes` and one file per scope: `stops.json` (every row, deleted ones too,
+with `merged_into` where a merge retired it), `routes.json`, `stages.json` (with
+their rows) and `route_stages.json` (each route's normal list), and `gtfs.zip`
+(the feed's own download, for the timetable). The whole feed is read in one
+repeatable-read snapshot, so its files agree with each other.
+
+### One draft
+
+Each change is set beside prod as it stands, with the changes before it in the
+draft counting as there (a stop the draft makes can be edited by a later
+change):
+
+- **In** when prod still has what master had when the change was made: the hash
+  a stop list, stage list, route's trips or timing profile change carries
+  (`base_rows_hash`, `base_stages_hash`, `base_trips_hash`, `base_hash`) equals
+  prod's; or, for any other change, prod's row has in every field the change
+  sets what master's `before` had there (taken the way `before` is - the same
+  snapshot - and compared on those fields only, a stage's rows without what is
+  read from their stops). A row version is each database's own, so it is never
+  compared; the change takes prod's when it is added.
+- **Done**, and left out, when prod already has what the change makes.
+- A **conflict** otherwise: left out, and listed with what prod has and what
+  master had. The admin may take master's side of any (`take=change:<position>`,
+  or `take=all`); taken, a hashed change is based on prod's hash instead, so it
+  commits over prod's.
+
+A create of a stop, station, route or stage prod already has is done when prod's
+row has what it sets, and a conflict otherwise; a delete of something prod has
+taken out is done. A merge is in when both rows are live on prod, done when prod
+already merged them. What only master's database means is taken out of a change:
+a coordinate review's or station proposal's id, the version of the stop a merge
+keeps. Feed settings never move (`notes`): each environment keeps its own.
+
+The draft is titled `From master: <title>`, and its description names the master
+draft. A master draft read in once is refused again (`already_imported`, 409,
+with the earlier import) while the prod draft it made is not discarded.
+
+### The whole feed
+
+What differs between master and prod becomes changes, in **steps**, each
+needing the one before it committed on prod:
+
+| step | what | drafts |
+|---|---|---|
+| `stops_routes` | stops created, changed, merged (a merge chain on master lands on the stop that survives it) or deleted; stations made or changed, their platforms with them; routes created, changed or deleted | one |
+| `stages` | stages created or changed | one per 1,000 |
+| `route_stages` | each route's list of stages; then the stages master took out | one per 250 routes (every read of a draft's page replays it) |
+| `switch` | `use_stages` turned on, when master serves the feed from its stages and prod does not | one |
+| `timetables` | calendars and trips, through section 18.8's draft import of master's `gtfs.zip` (its two steps) | as 18.8 |
+
+Each read-in drafts the first step with anything to do and stops: commit its
+drafts, then read the **same file** in again for the next. A step whose every
+change prod refuses drafts nothing, and the next one is tried. The report lists
+every step with what it would change now (`steps[].planned`), and a read-in
+while migration drafts of the feed are still open is refused
+(`migration_open`), because it plans against what is committed.
+
+What prod has that master does not stays: a stop, route or stage only prod has,
+a stage list only prod has (`notes`). Nothing prod took out is brought back
+(`deleted_on_prod`). A stop's code is set when it is made, so a code that
+differs is reported (`stop_code_differs`) and left. A station master has with
+fewer than two platforms stays on master.
+
+**Prod's own edits are kept.** A full migration cannot set prod's row beside a
+`before` - master never saw prod's edits - so it reads prod's history instead:
+a stop, route, stage list, stage or route's timetable that a committed prod
+draft of prod's own changed after `since_version`, and after the last migration
+that set it, is a conflict: left as prod has it and listed (`changed_on_prod`,
+with the version). The admin may take master's side of any (`take=<kind>:<key>`:
+`stop:C`, `route:21G`, `route_list:2614`, `stage:143|down`, `timetable:2614`).
+A migration's own drafts are told apart by `gtfs_migration_import`. The first
+full migration of a feed must say `since_version`: the prod version up to which
+master already has what prod changed (for chennai_bus's stage work, the prod
+version its plan read). Later ones default to the one it named.
+
+**The switch.** Stage changes go into a feed whose stages are off (section
+19.00), where they change nothing it serves: its routes go on serving their own
+stop lists, and their timings stay. So `stages` and `route_stages` build prod's
+stages in drafts reviewed one by one, and `switch` - one `feed_config` change -
+makes them what prod serves, in one commit; the same change the other way
+undoes it. The switch is refused while a live, active route has no stages
+(`routes_without_stages`, naming them), and says how many routes take their
+stops from their stages from that commit (`stages_take_over`). A route left out
+as prod's own blocks it until its list is taken from master or given on prod.
+The timetable waits for the switch: master's trips run on stop orders prod
+serves only once both serve the same stages. A route whose timetable prod
+changed itself is kept out of it (draft import's `exclude_routes`); prod's own
+MTC sync keeps most timetables, so expect many.
+
+### Changes prod refuses
+
+Every change goes in through the single-change path (section 22) and the draft
+is replayed. A change the replay finds an error or a conflict in - a stop still
+in use, a fare rule a stage list would break, a stage that is not there - is
+taken out and listed (`dropped`, with what was found), and the draft is replayed
+again without it, until it replays clean: the draft keeps the rest. An error
+that is no change's stops the read-in (`problems`), and nothing is written.
+
+### API
+
+| method | path | |
+|---|---|---|
+| GET | `/change-sets/{id}/migration` | a committed draft as a migration file (409 `not_committed` otherwise). Admin |
+| GET | `/feeds/{g}/migration?scopes=` | the whole feed as a migration file; `scopes` of `stops,routes,stages,timetables`, all if left out (`invalid_scope`). Admin |
+| POST | `/feeds/{g}/migrations?dry_run=&since_version=&take=&background=` | read a migration file in: the body, up to 64 MB. A dry run unless `dry_run=false`; `take` is conflict ids, comma separated, or `all`; `background=true` answers 202 with a job (section 18.15, kind `migration`). Admin, never on master |
+| GET | `/feeds/{g}/migrations` | what was read in, newest first, with each read-in's drafts and their status. Admin |
+
+The report: `kind`, `dry_run`, `source`, `change_set` (one draft) or `step`,
+`steps` and `since_version` (the whole feed), `change_sets` (`change_set_id`
+null on a dry run), `counts` (`added`, `done`, `conflicts`, `taken`, `dropped`,
+`not_migrated`), `conflicts`, `dropped`, `notes`, `problems`, `timetable` (the
+draft import's report), `next`, and `import_id` once something is drafted. Each
+read-in that drafts something is recorded in `gtfs_migration_import`
+(`db/gtfs_editor/0031_migration_imports.sql`: the manifest, the file's sha256,
+`since_version`, the drafts, the report) and audited `migration_imported`;
+writing a file is audited `migration_exported`.
+
+### Dashboard
+
+On master, the Feed page's **Move to prod** (admin): what the file carries, and
+**Download for prod**; a committed draft's page has **Download for prod** too.
+On prod, the Feed page's **Bring from master** (admin): the file, "Prod's own
+edits count from version" for the first whole-feed migration, **Check** (a dry
+run in the background), the report - each step, the drafts it would make, prod's
+own edits with a **Take** box each, what prod refused, notes - and **Make the
+drafts**, with the boxes ticked; then the history of read-ins with their drafts.
+
+### Runbook: chennai_bus onto stages on prod
+
+1. `0025`..`0031` on prod's database, then the image (the stage tables must be
+   there; the feed stays `use_stages = false`).
+2. On master: every stage draft committed, the ladder and MTC checks done. The
+   Feed page's **Download for prod** with stops, routes and stages.
+3. On prod: **Bring from master**, with `since_version` the prod version the
+   stage plan read. Read the report - prod's own edits, what prod refuses - and
+   **Make the drafts**; a second person commits them. Again for `stages`, again
+   for `route_stages`; take master's side of prod's own stage lists only where
+   that is right, or give those routes stages on prod.
+4. Again: the `switch` draft. Its warnings say how many routes change; commit it
+   at a quiet hour. Turning it back off is the same change the other way.
+5. With timetables in the file: again, for the two timetable steps.
+6. From then on, a master draft moves to prod by its own **Download for prod**.
+
+Tests: `tests/editor_migration_flow.rs`, registered in
+`scripts/editor_flow_test.sh` (it needs a second local database with the editor
+schema as prod, `EDITOR_TEST_PROD_DATABASE_URL`): master builds its routes from
+stages while prod serves its own stop lists and edits a stop and a route itself;
+the whole feed moves a step at a time, each a prod draft a second person
+commits, the stages changing nothing prod serves until the switch, prod's own
+edits kept and listed until one is taken, the switch refused while an active
+route has no stages; then a single draft that goes in, the same one refused
+again, and one that conflicts with prod's own edit until its master side is
+taken. Unit tests in `src/editor/migration.rs` (the file read back and a damaged
+one refused, merge chains, field and hash comparisons, prod's history, the
+plans). The dashboard: `node dev/ui_smoke.mjs --migration` against the mock,
+which plays master or prod (`--environment`, or `/__dev/environment`).

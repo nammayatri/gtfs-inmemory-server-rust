@@ -353,6 +353,8 @@ async fn a_zip_comes_into_a_feed_with_rows_through_drafts() {
         dry_run,
         user_id: editor_id.unwrap(),
         email: EDITOR.into(),
+        exclude_routes: Default::default(),
+        title: None,
     };
     let text = |sql: String| {
         let pool = pool.clone();
