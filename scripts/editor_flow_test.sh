@@ -15,6 +15,7 @@
 # tests/editor_stages_flow.rs, tests/editor_variants_flow.rs,
 # tests/editor_batch_commit_flow.rs,
 # tests/editor_unserviceable_flow.rs, tests/editor_stage_review_flow.rs,
+# tests/editor_stage_edit_cost_flow.rs,
 # tests/editor_gps_line_flow.rs (which also starts a fake ClickHouse and a fake
 # OSRM on localhost) and tests/editor_migration_flow.rs (master to prod, section
 # 23: it needs a second local database with the editor schema as prod,
@@ -91,6 +92,7 @@ EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow \
   --test editor_variants_flow --test editor_batch_commit_flow \
   --test editor_unserviceable_flow \
   --test editor_stage_review_flow \
+  --test editor_stage_edit_cost_flow \
   --test editor_migration_flow \
   -- --nocapture || status=$?
 

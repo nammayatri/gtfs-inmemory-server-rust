@@ -3564,31 +3564,37 @@ pub(super) async fn write_route_rows(
     live: &[RouteRow],
     actor: &str,
 ) -> Result<Vec<Finding>, ApplyError> {
+    write_routes_rows(conn, g, &[(route_id, rows, live)], actor).await
+}
+
+/// [`write_route_rows`] for every route a stage change reaches, as
+/// `(route, rows, live)`, in one go.
+pub(super) async fn write_routes_rows(
+    conn: &mut PgConnection,
+    g: &str,
+    routes: &[(&str, &[RouteRow], &[RouteRow])],
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
     // On a feed served from its stages there is nothing to write: the route's
     // stops are read from its stages (gtfs_route_stop_effective), so the stage
     // change that brought us here has already changed the route. Writing a copy
     // into gtfs_route_stop is what made the two able to disagree, and for
     // chennai_bus that table is MTC's own data and is not ours to overwrite.
-    // The stored timings still follow the route's new stops.
+    // The stored timings still follow the routes' new stops, for every route in
+    // a handful of queries.
     if super::stages::feed_uses_stages(conn, g).await? {
-        let _ = rows;
-        let old_ids = super::trips::served_ids(live);
-        return super::trips::carry_over_profiles(
-            conn,
-            g,
-            route_id,
-            FIRST_PATTERN,
-            &old_ids,
-            actor,
-        )
-        .await;
+        let old: Vec<(String, Vec<String>)> = routes
+            .iter()
+            .map(|(route_id, _, live)| (route_id.to_string(), super::trips::served_ids(live)))
+            .collect();
+        return super::trips::carry_over_profiles_many(conn, g, FIRST_PATTERN, &old, actor).await;
     }
     // A feed not served from its stages serves each route's own stop list, and
     // stages built on it (a migration from master, section 23) leave that list
     // and its timings alone: they take over when use_stages is turned on, not
     // stage by stage before it. Temporary routes, the other writer, exist only
     // on a feed served from its stages.
-    let _ = (rows, live, actor);
+    let _ = (routes, actor);
     Ok(Vec::new())
 }
 

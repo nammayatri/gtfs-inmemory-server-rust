@@ -2027,29 +2027,6 @@ async fn trip_references(
     Ok(out)
 }
 
-/// The served stops of a pattern in the route's own rows, `gtfs_route_stop`,
-/// whichever way the feed serves its routes. On a feed served from its stages
-/// these are the rows its profiles were imported against, which the stages need
-/// not match.
-async fn own_served_ids(
-    conn: &mut PgConnection,
-    g: &str,
-    route_id: &str,
-    pattern_key: i16,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT stop_id FROM gtfs_route_stop \
-         WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 AND stop_id IS NOT NULL \
-           AND stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
-         ORDER BY sequence",
-    )
-    .bind(g)
-    .bind(route_id)
-    .bind(pattern_key)
-    .fetch_all(&mut *conn)
-    .await
-}
-
 /// Carry every stored profile of a pattern over onto its new stop list, inside
 /// the change that altered it; `old_ids` are the pattern's served stops before.
 /// A warning `timing_interpolated` says how many profiles and stops had to be
@@ -2072,103 +2049,304 @@ pub(super) async fn carry_over_profiles(
     old_ids: &[String],
     actor: &str,
 ) -> Result<Vec<Finding>, ApplyError> {
-    let profiles = load_profiles(conn, g, route_id, Some(pattern_key)).await?;
+    carry_over_profiles_many(
+        conn,
+        g,
+        pattern_key,
+        &[(route_id.to_string(), old_ids.to_vec())],
+        actor,
+    )
+    .await
+}
+
+/// [`carry_over_profiles`] for many routes at once: `routes` is each route and
+/// its pattern's served stops before. However many routes there are, this reads
+/// their profiles, their new stops and - only when a profile needs them - their
+/// own rows in one query each, and writes every profile in one statement. A
+/// stage shared by a hundred routes rewrites all of them in one change, and a
+/// query per route made each replay of such a draft run for seconds.
+pub(super) async fn carry_over_profiles_many(
+    conn: &mut PgConnection,
+    g: &str,
+    pattern_key: i16,
+    routes: &[(String, Vec<String>)],
+    actor: &str,
+) -> Result<Vec<Finding>, ApplyError> {
+    let ids: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let mut profiles = profiles_of(conn, g, &ids, pattern_key).await?;
     if profiles.is_empty() {
         return Ok(vec![]);
     }
-    let stops = served_stops(conn, g, route_id, pattern_key).await?;
-    let new_ids: Vec<&str> = stops.iter().map(|(id, _)| id.as_str()).collect();
-    // a stop list too short to time is an error of its own, which blocks the
-    // draft; the profiles are left as they are until it is fixed
-    if new_ids.len() < 2
-        || new_ids
-            .iter()
-            .copied()
-            .eq(old_ids.iter().map(String::as_str))
-    {
-        return Ok(vec![]);
+    let timed: Vec<String> = ids
+        .iter()
+        .filter(|r| profiles.contains_key(*r))
+        .cloned()
+        .collect();
+    let stops = served_stops_of(conn, g, &timed, pattern_key).await?;
+    let none: Vec<(String, (f64, f64))> = Vec::new();
+
+    // what each profile becomes from the list it was based on; a route with a
+    // profile that does not time that list needs its own rows, read for all such
+    // routes at once
+    struct Route<'a> {
+        id: &'a str,
+        new_ids: Vec<&'a str>,
+        positions: Vec<(f64, f64)>,
+        profiles: Vec<(StoredProfile, Option<gtfs_timing::CarriedOver>)>,
     }
-    let positions: Vec<(f64, f64)> = stops.iter().map(|(_, p)| *p).collect();
-    let (mut carried, mut estimated_profiles, mut estimated_stops) = (0, 0, 0);
-    let (mut from_own, mut spread) = (0, 0);
-    let mut own: Option<Vec<String>> = None;
-    for p in &profiles {
-        let mut rebuilt = false;
-        let mut c = gtfs_timing::carry_over(old_ids, &p.offsets, &new_ids, &positions);
-        if c.is_none() {
-            if own.is_none() {
-                own = Some(own_served_ids(conn, g, route_id, pattern_key).await?);
-            }
-            c = gtfs_timing::carry_over(
-                own.as_deref().unwrap_or_default(),
-                &p.offsets,
-                &new_ids,
-                &positions,
-            );
-            if c.is_some() {
-                from_own += 1;
-            } else {
-                c = gtfs_timing::spread_over(&p.offsets, &positions);
-                rebuilt = c.is_some();
-                spread += usize::from(rebuilt);
-            }
+    let mut work = Vec::new();
+    let mut need_own = Vec::new();
+    for (route_id, old_ids) in routes {
+        let Some(list) = profiles.remove(route_id) else {
+            continue;
+        };
+        let served = stops.get(route_id).unwrap_or(&none);
+        let new_ids: Vec<&str> = served.iter().map(|(id, _)| id.as_str()).collect();
+        // a stop list too short to time is an error of its own, which blocks the
+        // draft; the profiles are left as they are until it is fixed
+        if new_ids.len() < 2
+            || new_ids
+                .iter()
+                .copied()
+                .eq(old_ids.iter().map(String::as_str))
+        {
+            continue;
         }
-        let Some(c) = c else {
-            return Err(fail(
-                "profile_length_mismatch",
+        let positions: Vec<(f64, f64)> = served.iter().map(|(_, p)| *p).collect();
+        let list: Vec<_> = list
+            .into_iter()
+            .map(|p| {
+                let c = gtfs_timing::carry_over(old_ids, &p.offsets, &new_ids, &positions);
+                (p, c)
+            })
+            .collect();
+        if list.iter().any(|(_, c)| c.is_none()) {
+            need_own.push(route_id.clone());
+        }
+        work.push(Route {
+            id: route_id,
+            new_ids,
+            positions,
+            profiles: list,
+        });
+    }
+    let own = if need_own.is_empty() {
+        HashMap::new()
+    } else {
+        own_served_ids_of(conn, g, &need_own, pattern_key).await?
+    };
+
+    let mut out = Vec::new();
+    let mut writes: Vec<(String, i32, gtfs_timing::CarriedOver, bool)> = Vec::new();
+    for w in work {
+        let route_id = w.id;
+        let (mut carried, mut estimated_profiles, mut estimated_stops) = (0, 0, 0);
+        let (mut from_own, mut spread) = (0, 0);
+        for (p, first) in w.profiles {
+            let mut rebuilt = false;
+            let mut c = first;
+            if c.is_none() {
+                c = gtfs_timing::carry_over(
+                    own.get(route_id).map(Vec::as_slice).unwrap_or_default(),
+                    &p.offsets,
+                    &w.new_ids,
+                    &w.positions,
+                );
+                if c.is_some() {
+                    from_own += 1;
+                } else {
+                    c = gtfs_timing::spread_over(&p.offsets, &w.positions);
+                    rebuilt = c.is_some();
+                    spread += usize::from(rebuilt);
+                }
+            }
+            let Some(c) = c else {
+                return Err(fail(
+                    "profile_length_mismatch",
+                    format!(
+                        "profile {} of pattern {pattern_key} of route {route_id} does not time the stops the pattern served; fix it before changing the stop list",
+                        p.profile_key
+                    ),
+                ));
+            };
+            carried += 1;
+            if c.estimated > 0 {
+                estimated_profiles += 1;
+                estimated_stops += c.estimated;
+            }
+            let interpolated = c.estimated > 0 || rebuilt;
+            writes.push((route_id.to_string(), p.profile_key, c, interpolated));
+        }
+        if from_own + spread > 0 {
+            let how = match (from_own, spread) {
+                (_, 0) => {
+                    "carried over from the route's own stop list, which they time".to_string()
+                }
+                (0, _) => {
+                    "spread over the new stops, keeping each one's running time".to_string()
+                }
+                _ => format!(
+                    "{from_own} carried over from the route's own stop list, {spread} spread over the new stops keeping their running time"
+                ),
+            };
+            out.push(Finding::warning(
+                "timing_rebuilt",
+                format!("{route_id}|{pattern_key}"),
                 format!(
-                    "profile {} of pattern {pattern_key} of route {route_id} does not time the stops the pattern served; fix it before changing the stop list",
-                    p.profile_key
+                    "pattern {pattern_key} of route {route_id}: {} timing profile(s) did not time the stops the route served (they were made for another stop list, such as the one imported before the feed was served from its stages); {how} - check the times in the preview",
+                    from_own + spread
                 ),
             ));
-        };
-        sqlx::query(
-            "UPDATE gtfs_timing_profile SET arrival_s = $5, departure_s = $6, \
-                source = CASE WHEN $7 THEN 'interpolated' ELSE source END, updated_by = $8 \
-             WHERE gtfs_id = $1 AND route_id = $2 AND pattern_key = $3 AND profile_key = $4",
-        )
-        .bind(g)
-        .bind(route_id)
-        .bind(pattern_key)
-        .bind(p.profile_key)
-        .bind(&c.offsets.arrival)
-        .bind(&c.offsets.departure)
-        .bind(c.estimated > 0 || rebuilt)
-        .bind(actor)
-        .execute(&mut *conn)
-        .await?;
-        carried += 1;
-        if c.estimated > 0 {
-            estimated_profiles += 1;
-            estimated_stops += c.estimated;
+        }
+        if estimated_stops > 0 {
+            out.push(Finding::warning(
+                "timing_interpolated",
+                format!("{route_id}|{pattern_key}"),
+                format!(
+                    "pattern {pattern_key} of route {route_id}: {carried} timing profile(s) carried over to the new stop list; in {estimated_profiles} of them {estimated_stops} stop time(s) are estimated - check the times in the preview"
+                ),
+            ));
         }
     }
-    let mut out = Vec::new();
-    if from_own + spread > 0 {
-        let how = match (from_own, spread) {
-            (_, 0) => "carried over from the route's own stop list, which they time".to_string(),
-            (0, _) => "spread over the new stops, keeping each one's running time".to_string(),
-            _ => format!(
-                "{from_own} carried over from the route's own stop list, {spread} spread over the new stops keeping their running time"
-            ),
-        };
-        out.push(Finding::warning(
-            "timing_rebuilt",
-            format!("{route_id}|{pattern_key}"),
-            format!(
-                "pattern {pattern_key} of route {route_id}: {} timing profile(s) did not time the stops the route served (they were made for another stop list, such as the one imported before the feed was served from its stages); {how} - check the times in the preview",
-                from_own + spread
-            ),
+    if writes.is_empty() {
+        return Ok(out);
+    }
+    // every profile in one statement; an array crosses as its text, `{0,60,…}`
+    let text = |v: &[i32]| {
+        format!(
+            "{{{}}}",
+            v.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+        )
+    };
+    sqlx::query(
+        "UPDATE gtfs_timing_profile p SET arrival_s = u.arrival::int[], departure_s = u.departure::int[], \
+            source = CASE WHEN u.interpolated THEN 'interpolated' ELSE p.source END, updated_by = $3 \
+         FROM UNNEST($4::text[], $5::int4[], $6::text[], $7::text[], $8::bool[]) \
+              AS u(route_id, profile_key, arrival, departure, interpolated) \
+         WHERE p.gtfs_id = $1 AND p.pattern_key = $2 \
+           AND p.route_id = u.route_id AND p.profile_key = u.profile_key",
+    )
+    .bind(g)
+    .bind(pattern_key)
+    .bind(actor)
+    .bind(writes.iter().map(|w| w.0.clone()).collect::<Vec<_>>())
+    .bind(writes.iter().map(|w| w.1).collect::<Vec<_>>())
+    .bind(
+        writes
+            .iter()
+            .map(|w| text(&w.2.offsets.arrival))
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        writes
+            .iter()
+            .map(|w| text(&w.2.offsets.departure))
+            .collect::<Vec<_>>(),
+    )
+    .bind(writes.iter().map(|w| w.3).collect::<Vec<_>>())
+    .execute(&mut *conn)
+    .await?;
+    Ok(out)
+}
+
+/// The profiles of one pattern of each of `routes`, in key order, in one query.
+async fn profiles_of(
+    conn: &mut PgConnection,
+    g: &str,
+    routes: &[String],
+    pattern_key: i16,
+) -> Result<HashMap<String, Vec<StoredProfile>>, sqlx::Error> {
+    let mut out: HashMap<String, Vec<StoredProfile>> = HashMap::new();
+    if routes.is_empty() {
+        return Ok(out);
+    }
+    for r in sqlx::query(
+        "SELECT route_id, pattern_key, profile_key, arrival_s, departure_s, label, source, row_version \
+         FROM gtfs_timing_profile \
+         WHERE gtfs_id = $1 AND route_id = ANY($2) AND pattern_key = $3 \
+         ORDER BY route_id, profile_key",
+    )
+    .bind(g)
+    .bind(routes)
+    .bind(pattern_key)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        out.entry(r.try_get("route_id")?)
+            .or_default()
+            .push(StoredProfile {
+                pattern_key: r.try_get("pattern_key")?,
+                profile_key: r.try_get("profile_key")?,
+                offsets: Offsets {
+                    arrival: r.try_get("arrival_s")?,
+                    departure: r.try_get("departure_s")?,
+                },
+                label: r.try_get("label")?,
+                source: r.try_get("source")?,
+                row_version: r.try_get("row_version")?,
+            });
+    }
+    Ok(out)
+}
+
+/// [`served_stops`] for many routes, in one query.
+async fn served_stops_of(
+    conn: &mut PgConnection,
+    g: &str,
+    routes: &[String],
+    pattern_key: i16,
+) -> Result<HashMap<String, Vec<(String, (f64, f64))>>, sqlx::Error> {
+    let mut out: HashMap<String, Vec<(String, (f64, f64))>> = HashMap::new();
+    if routes.is_empty() {
+        return Ok(out);
+    }
+    for r in sqlx::query(
+        "SELECT rs.route_id, rs.stop_id, s.lat, s.lon FROM gtfs_route_stop_effective rs \
+         JOIN gtfs_stop s ON s.gtfs_id = rs.gtfs_id AND s.stop_id = rs.stop_id \
+         WHERE rs.gtfs_id = $1 AND rs.route_id = ANY($2) AND rs.pattern_key = $3 \
+           AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
+         ORDER BY rs.route_id, rs.sequence",
+    )
+    .bind(g)
+    .bind(routes)
+    .bind(pattern_key)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        out.entry(r.try_get("route_id")?).or_default().push((
+            r.try_get("stop_id")?,
+            (r.try_get("lat")?, r.try_get("lon")?),
         ));
     }
-    if estimated_stops > 0 {
-        out.push(Finding::warning(
-            "timing_interpolated",
-            format!("{route_id}|{pattern_key}"),
-            format!(
-                "pattern {pattern_key} of route {route_id}: {carried} timing profile(s) carried over to the new stop list; in {estimated_profiles} of them {estimated_stops} stop time(s) are estimated - check the times in the preview"
-            ),
-        ));
+    Ok(out)
+}
+
+/// The served stops of a pattern of each route in the route's own rows,
+/// `gtfs_route_stop`, whichever way the feed serves its routes, in one query.
+/// On a feed served from its stages these are the rows its profiles were
+/// imported against, which the stages need not match.
+async fn own_served_ids_of(
+    conn: &mut PgConnection,
+    g: &str,
+    routes: &[String],
+    pattern_key: i16,
+) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for r in sqlx::query(
+        "SELECT route_id, stop_id FROM gtfs_route_stop \
+         WHERE gtfs_id = $1 AND route_id = ANY($2) AND pattern_key = $3 AND stop_id IS NOT NULL \
+           AND stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP') \
+         ORDER BY route_id, sequence",
+    )
+    .bind(g)
+    .bind(routes)
+    .bind(pattern_key)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        out.entry(r.try_get("route_id")?)
+            .or_default()
+            .push(r.try_get("stop_id")?);
     }
     Ok(out)
 }
