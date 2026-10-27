@@ -171,6 +171,25 @@ export function routeStatusTag(r, { both = false } = {}) {
   return both ? h("span.chip.route-active", { "data-route-active": "true", title: "Active: listed for passengers" }, "Active") : null;
 }
 
+/// Ids the editor or the backfill made up, said plainly wherever one is shown.
+/// Nobody should have to know a prefix to tell a real id from a stand-in: `nm_`
+/// is a stage the backfill could not match to MTC's own fare stage, `stg_` one
+/// somebody made here, `ed_` a stop made here, and anything else is MTC's.
+export function idKind(id) {
+  if (typeof id !== "string") return null;
+  if (id.startsWith("nm_")) {
+    return h("a.chip.warn", {
+      href: "#/route-issues",
+      title: "The backfill could not line this route up with MTC's own route, so "
+        + "the stage was named after itself instead of being given MTC's stop id. "
+        + "The same fare stage may also exist under MTC's id. Open Routes to review.",
+    }, "name-based id");
+  }
+  if (id.startsWith("stg_")) return h("span.chip", { title: "Made in the editor, not one of MTC's fare-stage stops." }, "made here");
+  if (id.startsWith("ed_")) return h("span.chip", { title: "A stop created in the editor, not one from MTC's data." }, "made here");
+  return null;
+}
+
 export const STOP_TYPE_LABEL = {
   "NEW STOP": "Stage stop",
   "INTERMEDIATE STOP": "Intermediate stop",

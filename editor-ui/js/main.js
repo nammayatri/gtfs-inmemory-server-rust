@@ -11,7 +11,6 @@ import { showPeople, showHistory, showFeedSettings } from "./admin.js";
 import { showDelivery, leaveWebhooks } from "./webhooks.js";
 import { showStationsList, showProposal, refreshStationCount, leaveStations } from "./stations.js";
 import { showCoordinatesList, showCoordinateReview, refreshCoordinateCount, leaveCoordinates } from "./coordinates.js";
-import { showStageReviewsList, showStageReview, refreshStageReviewCount, leaveStageReviews } from "./stage_reviews.js";
 import { showRouteIssuesList, showRouteIssue, refreshRouteIssueCount } from "./route_issues.js";
 import { newStop, newRoute } from "./create.js";
 import { editStation } from "./editors.js";
@@ -49,7 +48,7 @@ function applyMe(me) {
 
 // Pages that exist only on a feed served from its stages. Off, they are not in
 // the menu and their addresses lead back to the map.
-const STAGE_PAGES = ["stages", "diversions", "stage-reviews", "route-issues"];
+const STAGE_PAGES = ["stages", "diversions", "route-issues"];
 
 // What this person may do on the chosen feed: the role badge, the admin pages,
 // the New menu. Everything else asks can() when it draws.
@@ -86,7 +85,6 @@ async function switchFeed(feedId, hash = "#/") {
   map.refreshStops();
   refreshStationCount();
   refreshCoordinateCount();
-  refreshStageReviewCount();
   refreshRouteIssueCount();
   setLeaveGuard(null);
   resetTrail();
@@ -122,7 +120,6 @@ async function boot() {
   initSearch();
   refreshStationCount();
   refreshCoordinateCount();
-  refreshStageReviewCount();
   refreshRouteIssueCount();
   window.addEventListener("hashchange", onHashChange);
   window.addEventListener("beforeunload", (ev) => {
@@ -216,7 +213,6 @@ function route() {
   currentHash = location.hash || "#/";
   leaveStations();
   leaveCoordinates();
-  leaveStageReviews();
   leaveWebhooks();
   // a route's trips from GPS belong to its page
   map.clearRoute("gpsTrips");
@@ -282,10 +278,6 @@ function route() {
     markNav("route-issues"); showWorkspace(true); showRouteIssue(parts[1]);
   } else if (parts[0] === "route-issues") {
     markNav("route-issues"); showWorkspace(true); showRouteIssuesList();
-  } else if (parts[0] === "stage-reviews" && parts[1]) {
-    markNav("stage-reviews"); showWorkspace(true); showStageReview(parts[1]);
-  } else if (parts[0] === "stage-reviews") {
-    markNav("stage-reviews"); showWorkspace(true); showStageReviewsList({ q: params.get("q") });
   } else if (parts[0] === "coordinates" && parts[1]) {
     markNav("coordinates"); showWorkspace(true); showCoordinateReview(parts[1]);
   } else if (parts[0] === "coordinates") {

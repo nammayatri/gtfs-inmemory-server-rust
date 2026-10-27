@@ -5,11 +5,10 @@
 // using it. A route not built from stages yet keeps the stop-by-stop editor.
 import { get, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
-import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERVED_EXCLUDE } from "./util.js";
+import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERVED_EXCLUDE, idKind } from "./util.js";
 import * as map from "./map.js";
 import { addChange, updateChange, existingChange, createdChange, createdStages, requireDraft, stageKey, stageChanges, sameStageKey } from "./drafts.js";
 import { stopPicker } from "./picker.js";
-import { idKind } from "./stage_reviews.js";
 import { stagesLike, draftMerges, finalStage, stageBrief, undoChange } from "./stage_like.js";
 import { showRoute } from "./explore.js";
 
@@ -42,17 +41,6 @@ export function draftTouchesStages() {
 }
 
 const directionWord = (d) => (d ? `direction: ${d}` : null);
-// Why somebody still has to look at this stage: the routes that share its name
-// do not agree about it (section 19.1). Cleared when the review is closed.
-const REVIEW_TEXT = {
-  head_differs: "routes start it at different stops",
-  head_duplicate_stops: "routes start it at duplicate stops",
-  stretch_differs: "routes disagree about its stops",
-  spelled_differently: "spelled more than one way",
-};
-const reviewChip = (s) => (s.review
-  ? h("span.chip.warn", { title: `${REVIEW_TEXT[s.review] || s.review}. Open “Stages to review” to settle it.` }, "to review")
-  : null);
 const stageLine = (s) => [
   plural(s.stop_count ?? 0, "stop"),
   directionWord(s.direction),
@@ -60,7 +48,6 @@ const stageLine = (s) => [
   `used by ${plural(s.route_count ?? 0, "route")}`,
   // a stage keeps a stop nobody can board at; the list says so (section 21)
   s.out_of_use ? `${plural(s.out_of_use, "stop")} out of use` : null,
-  s.review ? REVIEW_TEXT[s.review] || s.review : null,
 ].filter(Boolean).join(" · ");
 
 const rowName = (r) => (r.stop_type === "ROUTE CORRECTION" ? `Map shaping point: ${r.marker_name || r.marker_id}` : r.stop_name || r.stop_id);
@@ -459,7 +446,7 @@ export async function showStage(stageId) {
     h("section.section",
       h("a.crumb", { href: "#/stages" }, "All stages"),
       h("div.title-block",
-        h("h1", s.name, reviewChip(s), idKind(s.stage_id)),
+        h("h1", s.name, idKind(s.stage_id)),
         s.description ? h("p", s.description) : null,
         h("p.ids", `Stage id ${s.stage_id}, ${plural(s.stop_count, "stop")}${s.direction ? `, direction: ${s.direction}` : ""}, used by ${plural(s.route_count, "route")}`)),
       // a stand-in id is said here, not left for somebody to notice
@@ -484,11 +471,6 @@ export async function showStage(stageId) {
             on: { click: async () => { if (await undoChange(replacedBy, `Replacing ${s.name} with ${replacement.name}`)) showStage(stageKey(s)); } },
           }, "Undo the replacement") : null))
         : s.deleted ? h("p.notice.error", "This stage is deleted.") : null,
-      s.review ? h("div.notice",
-        h("p", h("strong", "The routes using this name do not agree about it: "),
-          `${REVIEW_TEXT[s.review] || s.review}.`),
-        h("p", h("a", { href: `#/stage-reviews?q=${encodeURIComponent(s.name)}` },
-          "See it beside the other stages of this name"))) : null,
       drafted ? h("div.notice.draft.pending",
         h("p", h("strong", created ? `New in your draft “${state.draft.title}”.` : `Pending in draft “${state.draft.title}”, not live.`), " ",
           h("a", { href: `#/drafts/${enc(state.draft.change_set_id)}` }, "Open the draft")),

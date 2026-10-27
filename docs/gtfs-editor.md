@@ -4312,7 +4312,7 @@ Stages are a property of the feed and they are opt-in (migration 0027):
 
 | `use_stages` | what a route is | what is offered |
 |---|---|---|
-| `false` (every feed by default) | its rows in `gtfs_route_stop` | the stop-list editor, and nothing about stages: no Stages, Diversions, Stages to review or Routes to review in the menu, no Stages section on a route, no stages in search. A `stage`, `route_stages` or `route_variant` change is refused `stages_off` |
+| `false` (every feed by default) | its rows in `gtfs_route_stop` | the stop-list editor, and nothing about stages: no Stages, Diversions or Routes to review in the menu, no Stages section on a route, no stages in search. A `stage`, `route_stages` or `route_variant` change is refused `stages_off` |
 | `true` | what its stages say, and nothing else | everything in this section. A route with no stages has **no stops** until it is given some: its rows in `gtfs_route_stop`, if it has any, are not read. A `route_stops` change is refused (`route_has_stages` for a route with stages, `route_needs_stages` for one without) |
 
 On a feed that uses stages there is **no copy**. A route built from stages used
@@ -4433,6 +4433,17 @@ would take to make the stages the only source, and nothing needs it yet: on
 chennai_bus all ten are empty.
 
 ### 19.1 Stages to review: the routes do not agree about a name (2026-09-29)
+
+> **2026-10-26: the *Stages to review* page is gone from the dashboard.** The
+> menu item and its count, the page, and the "to review" chip and notice on a
+> stage were removed. Stage stop lists are now planned outside the editor
+> (nandi's `scripts/chennai-bus/editor/stages_unify.py`: one stop list per MTC
+> fare stage and next stage, shared by every route going that way) and arrive as
+> ordinary `stage` and `route_stages` drafts. The `gtfs_stage_review` table, the
+> `review` flag on a stage and the API below stay - for scripts, and as the
+> record of the decisions taken - so the screen descriptions in this section are
+> history. *Stages like this one* stays on a stage's page, and *Routes to review*
+> stays, closing only route issues alongside one another.
 
 The backfill (`scripts/backfill_stages.py`, docs/stage-backfill.md) makes **one
 stage per fare-stage name and direction**. Its stops are the list **the most

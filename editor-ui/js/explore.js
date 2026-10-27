@@ -1,7 +1,7 @@
 // Browsing: the search box, the home panel, and the stop and route panels.
 import { get, enc, ApiError } from "./api.js";
 import { state, can, usesStages } from "./state.js";
-import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords, routeStatusTag } from "./util.js";
+import { h, clear, debounce, downloadCsv, fmtCoord, fmtMetres, fmtDate, fmtCount, plural, STOP_TYPE_LABEL, STATUS_LABEL, groupStages, diffRows, toast, stopDetailWords, routeStatusTag, idKind } from "./util.js";
 import * as map from "./map.js";
 import { createdChange } from "./drafts.js";
 import { editStop, editRouteRows, editRouteDetails, editStation, deleteStop, dissolveStation } from "./editors.js";
@@ -10,7 +10,6 @@ import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, route
 import { stationNames, foldedList, platformsNote, stopContext, routeContext } from "./context.js";
 import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 import { routeListsSection } from "./variants.js";
-import { idKind } from "./stage_reviews.js";
 
 const panel = () => document.getElementById("panel");
 
