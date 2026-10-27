@@ -18,9 +18,8 @@
 // apart the two start, and whether the draft would refuse it.
 import { get, post, enc } from "./api.js";
 import { state } from "./state.js";
-import { h, clear, toast, modal, debounce, fmtMetres, plural, STATUS_LABEL } from "./util.js";
+import { h, clear, toast, modal, debounce, fmtMetres, plural, STATUS_LABEL, idKind } from "./util.js";
 import { addChange, removeChange, createdChange, createdStages, requireDraft, sameStageKey, stageChanges, stageKey } from "./drafts.js";
-import { idKind } from "./stage_reviews.js";
 import { editRouteStages } from "./stages.js";
 
 const WHY = {
@@ -169,7 +168,6 @@ export async function confirmMerge({ gone, into, mode = "replace" }) {
   const intoName = `${b.name} (stage ${b.stage_id})`;
   const routes = m.routes || [];
   const temporary = routes.filter((r) => (r.temporary || []).length).length;
-  const reviews = (m.reviews && m.reviews.stage_reviews) || [];
   const issues = (m.reviews && m.reviews.route_issues) || [];
   const title = errors.length
     ? (mode === "replace" ? `${a.name} cannot be replaced with ${b.name} yet` : `${a.name} cannot be merged into ${b.name} yet`)
@@ -205,9 +203,8 @@ export async function confirmMerge({ gone, into, mode = "replace" }) {
         ? h("p.hint", `Both have the same ${plural(m.stops_kept, "stop")}: the routes call where they did.`) : null,
       routes.length && ((m.stops_lost || []).length || (m.stops_gained || []).length)
         ? h("p.hint", "These are fare stages: where a stage begins and ends sets the fare, so a stop lost or gained changes fares from it.") : null,
-      reviews.length || issues.length ? h("p.hint", "Open reviews this touches: ",
-        [...reviews.map((r) => `stage ${r.stage_id}${r.direction ? ` ${r.direction}` : ""}`),
-          ...issues.map((i) => `route ${routeLabel(i)}`)].join(", "),
+      issues.length ? h("p.hint", "Routes to review this touches: ",
+        issues.map((i) => routeLabel(i)).join(", "),
         ". Mark them fixed with the same draft once you are done.") : null,
     ]), {
     actions: errors.length
@@ -337,7 +334,6 @@ export function stagesLike(stage, { editable = false, onChange = () => {} } = {}
             why ? h("span.chip", { title: why[1] }, why[0]) : null,
             s.far ? h("span.chip.warn", { title: "Starts far enough away to be another place of this name." }, `${fmtMetres(s.distance_m)} away`) : null,
             s.draft ? h("span.chip.draft", "new in your draft") : null,
-            s.review ? h("span.chip.warn", "to review") : null,
             mergedIn ? h("span.chip.draft", "merged into this one in your draft") : null,
             replacing ? h("span.chip.draft", "replaces this one in your draft") : null,
             goesOn ? h("span.chip.draft", `replaced by ${idOf(finalStage(s.stage_key))} in your draft`) : null),
@@ -454,47 +450,27 @@ export function stagesLike(stage, { editable = false, onChange = () => {} } = {}
   return { el, redraw: draw };
 }
 
-/// The open reviews a draft's merges settle or touch, with a box each, for the
-/// page closing one review to close them too with the same draft and note.
-/// `gone`: stage keys the draft merges away, whose own reviews are settled and
-/// ticked; `kept`: stages that take their routes, whose reviews are not. The
-/// routes to review of every route that ran a gone stage are listed unticked:
-/// only somebody who has looked at a route's whole list can say it is right.
-/// `ways`: the other open reviews of the same stage ({review_id, name,
-/// stage_id, direction}) - its other direction - listed unticked.
-/// `except`: {review_id, issue_id} of the review being closed.
-export function alsoClose({ gone = [], kept = [], ways = [], except = {} }) {
+/// The other routes to review a draft's merges touch, with a box each, for the
+/// page closing one to close them too with the same draft and note. `gone`:
+/// stage keys the draft merges away; every route that ran one is listed,
+/// unticked: only somebody who has looked at a route's whole list can say it
+/// is right. `except`: {issue_id} of the one being closed.
+export function alsoClose({ gone = [], except = {} }) {
   const box = h("fieldset.also-close", { hidden: true });
   const picks = [];
-  const about = (keys) => (keys.length
-    ? get(`feeds/${enc(state.feedId)}/open-reviews?stages=${keys.map(enc).join(",")}`)
-    : Promise.resolve({ stage_reviews: [], route_issues: [] }));
-  if (gone.length || ways.length) {
-    // the kept stages' own reviews, but not their routes': those routes run
-    // the kept stage before and after, and nothing changes for them
-    Promise.all([about(gone), about(gone.length ? kept : [])]).then(([g, k]) => {
-      const seen = new Set();
-      const reviews = [...(g.stage_reviews || []), ...(k.stage_reviews || [])]
-        .filter((r) => r.review_id !== except.review_id && !seen.has(r.review_id) && seen.add(r.review_id));
-      const others = ways.filter((w) => w.review_id !== except.review_id && !seen.has(w.review_id) && seen.add(w.review_id));
+  if (gone.length) {
+    get(`feeds/${enc(state.feedId)}/open-reviews?stages=${gone.map(enc).join(",")}`).then((g) => {
       const issues = (g.route_issues || []).filter((i) => i.issue_id !== except.issue_id);
-      if (!reviews.length && !others.length && !issues.length) return;
-      const check = (id, checked, label, hint, kind) => {
-        const input = h("input", { type: "checkbox", id, checked });
-        picks.push({ input, kind, id: Number(id.split("-").pop()) });
+      if (!issues.length) return;
+      const check = (id, label, hint) => {
+        const input = h("input", { type: "checkbox", id, checked: false });
+        picks.push({ input, id: Number(id.split("-").pop()) });
         return h("label.check", { for: id }, input, h("span", label, hint ? h("span.hint", ` — ${hint}`) : null));
       };
       clear(box,
         h("legend", "Also mark these fixed, with the same draft and note"),
-        reviews.map((r) => {
-          const settled = gone.some((k) => sameStageKey(k, r.stage_key));
-          return check(`also-review-${r.review_id}`, settled, `Stage ${r.name} (${r.stage_id}${r.direction ? `, ${r.direction}` : ""})`,
-            settled ? "its stage is merged away in your draft" : "the stage that takes the routes; tick it only if that settles it too", "review");
-        }),
-        others.map((w) => check(`also-review-${w.review_id}`, false, `Stage ${w.name} (${w.stage_id}, ${w.direction || "either way"})`,
-          "the other way of this stage; tick it only if the draft fixed that way too", "review")),
-        issues.map((i) => check(`also-issue-${i.issue_id}`, false, `Route to review ${routeLabel(i)}`,
-          `ran a stage your draft replaces; tick it only once the route's whole list is right`, "issue")));
+        issues.map((i) => check(`also-issue-${i.issue_id}`, `Route to review ${routeLabel(i)}`,
+          "ran a stage your draft replaces; tick it only once the route's whole list is right")));
       box.hidden = false;
     }).catch(() => {});
   }
@@ -507,7 +483,7 @@ export function alsoClose({ gone = [], kept = [], ways = [], except = {} }) {
       const failed = [];
       for (const p of picks.filter((x) => x.input.checked)) {
         try {
-          await post(p.kind === "review" ? `stage-reviews/${p.id}/close` : `route-issues/${p.id}/close`, body);
+          await post(`route-issues/${p.id}/close`, body);
           closed += 1;
         } catch (e) {
           failed.push(e.message);

@@ -397,7 +397,6 @@ export async function showRouteIssue(id) {
   const also = editable && replaced.length
     ? alsoClose({
         gone: replaced.map((st) => st.stage_key),
-        kept: [...new Set(replaced.map((st) => finalStage(st.stage_key)))],
         except: { issue_id: r.issue_id },
       })
     : null;
