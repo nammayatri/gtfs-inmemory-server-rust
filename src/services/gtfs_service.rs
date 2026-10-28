@@ -7,12 +7,13 @@ use crate::models::{
     StaticFleetInfo, StaticFleetInfoRecord, StopGeojson, StopGeojsonRecord, StopRegionalNameRecord,
     SuburbanStopInfo, SuburbanStopInfoRecord,
 };
-use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
+use crate::models::{GTFSAlternateStopData, PrecomputedStops, TripDetails, TripStopDetail};
 use crate::services::gtfs_db_source::{
     is_fare_stage_dict, overlays_from_patterns, parse_headsign_stage, plan_feed_actions, DbTrip,
     DbTrips, FeedAction, GtfsDbSource, TripOverlay,
 };
 use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
+use crate::services::stop_fuzzy::StopSearchIndex;
 use crate::services::webhook;
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
@@ -2056,7 +2057,7 @@ impl GTFSService {
         route_data_by_gtfs: &HashMap<String, GTFSRouteData>,
         stop_regional_names_by_gtfs: &HashMap<String, HashMap<String, StopRegionalNameRecord>>,
         stops_by_gtfs: &HashMap<String, GTFSStopData>,
-    ) -> HashMap<String, Vec<Arc<RouteStopMapping>>> {
+    ) -> HashMap<String, PrecomputedStops> {
         let mut result = HashMap::new();
         for (gtfs_id, route_data) in route_data_by_gtfs {
             let regional_names = stop_regional_names_by_gtfs.get(gtfs_id);
@@ -2122,7 +2123,8 @@ impl GTFSService {
                 }
             }
 
-            result.insert(gtfs_id.clone(), stops);
+            let search = Arc::new(StopSearchIndex::build(&stops));
+            result.insert(gtfs_id.clone(), PrecomputedStops { stops, search });
         }
         result
     }
@@ -3271,7 +3273,17 @@ impl GTFSService {
 
         data.pre_computed_stops_by_gtfs
             .get(&gtfs_id)
-            .cloned()
+            .map(|p| p.stops.clone())
+            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+    }
+
+    pub async fn get_stop_search(&self, gtfs_id: &str) -> AppResult<Arc<StopSearchIndex>> {
+        let data = self.data.load_full();
+        let gtfs_id = clean_identifier(gtfs_id);
+
+        data.pre_computed_stops_by_gtfs
+            .get(&gtfs_id)
+            .map(|p| p.search.clone())
             .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
     }
 
@@ -4104,7 +4116,7 @@ impl GTFSService {
         let total_pre_computed_stops: usize = data
             .pre_computed_stops_by_gtfs
             .values()
-            .map(|s| s.len())
+            .map(|s| s.stops.len())
             .sum();
 
         let mem = data.memory_usage_bytes();
