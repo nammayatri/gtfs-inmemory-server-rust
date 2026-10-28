@@ -33,6 +33,7 @@ use crate::models::{
 use crate::services::db_vehicle_reader::{
     chalo_gtfs_ids, filter_vehicles_by_status, is_chalo_gtfs_id,
 };
+use crate::services::depot_monitoring::DepotDayRequest;
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -366,10 +367,24 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 web::scope("/v2/{gtfs_id}")
                     .route("/fleet/{fleet_no}", web::get().to(get_fleet_operation_v2))
                     .route("/depots", web::get().to(get_depots_v2))
+                    .route("/vehicles", web::get().to(get_fleet_vehicles_v2))
                     .route("/depots/{depot_id}", web::get().to(get_depot_by_id_v2))
                     .route(
                         "/depots/{depot_id}/vehicles",
                         web::get().to(get_depot_vehicles_v2),
+                    )
+                    .route(
+                        "/depots/{depot_id}/waybills",
+                        web::get().to(get_depot_waybills_v2),
+                    )
+                    .route(
+                        "/depots/{depot_id}/routes",
+                        web::get().to(get_depot_routes_v2),
+                    )
+                    .route("/depots/{depot_id}/crew", web::get().to(get_depot_crew_v2))
+                    .route(
+                        "/depots/{depot_id}/overview",
+                        web::get().to(get_depot_overview_v2),
                     ),
             )
             .route(
@@ -1086,6 +1101,212 @@ pub async fn get_depot_vehicles_v2(
         vehicles.len()
     );
     Ok(HttpResponse::Ok().json(vehicles))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/vehicles",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("status" = Option<String>, Query, description = "Case-insensitive exact match on vehicle status, e.g. Active"),
+    ),
+    responses(
+        (status = 200, description = "Every registered bus of the feed, both stores merged", body = Vec<DepotVehicleInfo>),
+        (status = 404, description = "FEED_NOT_FOUND"),
+    )
+)]
+pub async fn get_fleet_vehicles_v2(
+    app_state: Data<AppState>,
+    path: Path<String>,
+    query: Query<DepotVehicleQuery>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = strip_surrounding_quotes(&path.into_inner());
+    check_feed_v2(&gtfs_id)?;
+    let status = query
+        .status
+        .as_deref()
+        .map(strip_surrounding_quotes)
+        .filter(|s| !s.is_empty());
+    let (use_external, use_internal) = depot_feed_sources(&gtfs_id);
+    let (external, internal) = tokio::join!(
+        async {
+            if use_external {
+                app_state.db_vehicle_reader.get_fleet_vehicles().await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        async {
+            if use_internal {
+                app_state
+                    .db_vehicle_reader_internal
+                    .get_fleet_vehicles(&gtfs_id)
+                    .await
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    );
+    // As with depot vehicles: a failing store is an error, never a silently short fleet.
+    let vehicles = filter_vehicles_by_status(
+        merge_depot_vehicles(external?, internal?),
+        status.as_deref(),
+    );
+    info!(
+        "fleet vehicles v2: gtfs_id={} status={:?} rows={}",
+        gtfs_id,
+        status,
+        vehicles.len()
+    );
+    Ok(HttpResponse::Ok().json(vehicles))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepotDayQuery {
+    service_date: chrono::NaiveDate,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    q: Option<String>,
+}
+
+/// v2 depot-day request: same feed/depot checks as the other v2 depot APIs (404 for an unknown depot).
+async fn depot_day_request(
+    state: &AppState,
+    path: Path<(String, String)>,
+    query: &DepotDayQuery,
+) -> AppResult<DepotDayRequest> {
+    let (gtfs_id, depot_id) = path.into_inner();
+    let gtfs_id = strip_surrounding_quotes(&gtfs_id);
+    let depot_id = strip_surrounding_quotes(&depot_id);
+    check_feed_v2(&gtfs_id)?;
+    // Depot-day data is read from the external MTC replica, which has no gtfs_id column.
+    if !depot_feed_sources(&gtfs_id).0 {
+        return Err(AppError::NotFoundCoded(
+            error_codes::FEED_NOT_FOUND,
+            format!("gtfs_id '{}' has no depot-day data", gtfs_id),
+        ));
+    }
+    resolve_depot(state, &gtfs_id, &depot_id)
+        .await?
+        .ok_or_else(|| depot_not_found(&depot_id, &gtfs_id))?;
+    DepotDayRequest::new(
+        &depot_id,
+        query.service_date,
+        query.page,
+        query.page_size,
+        query.q.as_deref(),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots/{depot_id}/waybills",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("depot_id" = String, Path, description = "Depot (entity) ID"),
+        ("serviceDate" = String, Query, description = "Service day, YYYY-MM-DD"),
+        ("page" = Option<i64>, Query, description = "1-based page, default 1"),
+        ("pageSize" = Option<i64>, Query, description = "Rows per page, 1-200, default 50"),
+        ("q" = Option<String>, Query, description = "Case-insensitive substring search"),
+    ),
+    responses(
+        (status = 200, description = "The day's waybills with their trips"),
+        (status = 400, description = "Invalid depot_id or q"),
+        (status = 404, description = "FEED_NOT_FOUND or DEPOT_NOT_FOUND"),
+        (status = 503, description = "Depot monitoring source unavailable"),
+    )
+)]
+pub async fn get_depot_waybills_v2(
+    state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DepotDayQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.depot_waybills(&request).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots/{depot_id}/routes",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("depot_id" = String, Path, description = "Depot (entity) ID"),
+        ("serviceDate" = String, Query, description = "Service day, YYYY-MM-DD"),
+        ("page" = Option<i64>, Query, description = "1-based page, default 1"),
+        ("pageSize" = Option<i64>, Query, description = "Rows per page, 1-200, default 50"),
+        ("q" = Option<String>, Query, description = "Case-insensitive substring search"),
+    ),
+    responses(
+        (status = 200, description = "Routes scheduled for or run by the depot that day"),
+        (status = 400, description = "Invalid depot_id or q"),
+        (status = 404, description = "FEED_NOT_FOUND or DEPOT_NOT_FOUND"),
+        (status = 503, description = "Depot monitoring source unavailable"),
+    )
+)]
+pub async fn get_depot_routes_v2(
+    state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DepotDayQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.depot_routes(&request).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots/{depot_id}/crew",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("depot_id" = String, Path, description = "Depot (entity) ID"),
+        ("serviceDate" = String, Query, description = "Service day, YYYY-MM-DD"),
+        ("page" = Option<i64>, Query, description = "1-based page, default 1"),
+        ("pageSize" = Option<i64>, Query, description = "Rows per page, 1-200, default 50"),
+        ("q" = Option<String>, Query, description = "Case-insensitive substring search"),
+    ),
+    responses(
+        (status = 200, description = "Depot roster with the day's assigned waybills"),
+        (status = 400, description = "Invalid depot_id or q"),
+        (status = 404, description = "FEED_NOT_FOUND or DEPOT_NOT_FOUND"),
+        (status = 503, description = "Depot monitoring source unavailable"),
+    )
+)]
+pub async fn get_depot_crew_v2(
+    state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DepotDayQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.depot_crew(&request).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/depots/{depot_id}/overview",
+    tag = "Vehicle",
+    params(
+        ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
+        ("depot_id" = String, Path, description = "Depot (entity) ID"),
+        ("serviceDate" = String, Query, description = "Service day, YYYY-MM-DD"),
+    ),
+    responses(
+        (status = 200, description = "Whole depot-day counts"),
+        (status = 400, description = "Invalid depot_id or q"),
+        (status = 404, description = "FEED_NOT_FOUND or DEPOT_NOT_FOUND"),
+        (status = 503, description = "Depot monitoring source unavailable"),
+    )
+)]
+pub async fn get_depot_overview_v2(
+    state: Data<AppState>,
+    path: Path<(String, String)>,
+    query: Query<DepotDayQuery>,
+) -> AppResult<HttpResponse> {
+    let request = depot_day_request(&state, path, &query).await?;
+    Ok(HttpResponse::Ok().json(state.db_vehicle_reader.depot_overview(&request).await?))
 }
 
 #[utoipa::path(

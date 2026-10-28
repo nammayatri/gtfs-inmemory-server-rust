@@ -598,6 +598,7 @@ pub struct RouteRow {
     pub end_point_id: Option<IdValue>,
     pub encoded_polyline: Option<String>,
     pub route_tag: Option<String>,
+    pub route_distance: Option<f64>,
 }
 
 // ===== Stop & route management (clubber / editor) =====
@@ -3039,7 +3040,7 @@ impl OperatorService for DBOperatorService {
 
     async fn get_routes_list(&self, gtfs_id: &str) -> AppResult<Vec<RouteRow>> {
         sqlx::query_as::<_, RouteRow>(
-            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id, encoded_polyline, route_tag
+            "SELECT route_id, route_number, route_name, route_direction, start_point_id, end_point_id, encoded_polyline, route_tag, route_distance::float8 AS route_distance
              FROM public.route_internal
              WHERE deleted = false AND gtfs_id = $1
              ORDER BY route_number",
