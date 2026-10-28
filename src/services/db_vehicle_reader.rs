@@ -12,6 +12,9 @@ use crate::models::{
     MinimalVehicleData, RouteLastScheduleTime, VehicleData, VehicleDataWithRouteId,
     VehicleOperationData, WaybillStatus,
 };
+use crate::services::depot_monitoring::{
+    self, CrewPage, DepotDayRequest, DepotOverview, RoutePage, WaybillPage,
+};
 use crate::services::schedule_snapshot::{
     ScheduleSnapshot, ScheduleSnapshotCache, ScheduleTripRow, ScheduledTrip, SCHEDULE_SNAPSHOT_TTL,
 };
@@ -142,6 +145,27 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_vehicles_by_depot_id(&self, depot_id: &str)
         -> AppResult<Vec<DepotVehicleSummary>>;
     async fn get_depot_names(&self) -> AppResult<Vec<String>>;
+    /// Depot-day reads over the MTC replica. Mock readers have no replica.
+    async fn depot_waybills(&self, _request: &DepotDayRequest) -> AppResult<WaybillPage> {
+        Err(AppError::NotReady(
+            "Depot monitoring source unavailable".into(),
+        ))
+    }
+    async fn depot_routes(&self, _request: &DepotDayRequest) -> AppResult<RoutePage> {
+        Err(AppError::NotReady(
+            "Depot monitoring source unavailable".into(),
+        ))
+    }
+    async fn depot_crew(&self, _request: &DepotDayRequest) -> AppResult<CrewPage> {
+        Err(AppError::NotReady(
+            "Depot monitoring source unavailable".into(),
+        ))
+    }
+    async fn depot_overview(&self, _request: &DepotDayRequest) -> AppResult<DepotOverview> {
+        Err(AppError::NotReady(
+            "Depot monitoring source unavailable".into(),
+        ))
+    }
     async fn get_depot_ids(&self) -> AppResult<Vec<String>>;
     async fn get_depot_name_by_id(&self, depot_id: String) -> AppResult<String>;
     async fn clear_depot_cache(&self) -> AppResult<()>;
@@ -171,6 +195,9 @@ pub trait VehicleDataReader: Send + Sync {
     async fn get_depot_by_id(&self, depot_id: &str) -> AppResult<Option<DepotInfo>>;
 
     async fn get_depot_vehicles(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleInfo>>;
+
+    /// Every registered bus of the feed (fleet-wide live map).
+    async fn get_fleet_vehicles(&self) -> AppResult<Vec<DepotVehicleInfo>>;
 
     async fn get_fleet_operation(&self, fleet_no: &str) -> AppResult<Option<FleetOperationInfo>>;
 }
@@ -333,6 +360,10 @@ impl VehicleDataReader for MockDBVehicleReader {
     }
 
     async fn get_depot_vehicles(&self, _depot_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_fleet_vehicles(&self) -> AppResult<Vec<DepotVehicleInfo>> {
         Ok(Vec::new())
     }
 
@@ -1536,6 +1567,18 @@ impl VehicleDataReader for DBVehicleReader {
         let _ = self.schedule_snapshot().await;
     }
 
+    async fn depot_waybills(&self, request: &DepotDayRequest) -> AppResult<WaybillPage> {
+        depot_monitoring::read_waybills(&self.pool, request).await
+    }
+    async fn depot_routes(&self, request: &DepotDayRequest) -> AppResult<RoutePage> {
+        depot_monitoring::read_routes(&self.pool, request).await
+    }
+    async fn depot_crew(&self, request: &DepotDayRequest) -> AppResult<CrewPage> {
+        depot_monitoring::read_crew(&self.pool, request).await
+    }
+    async fn depot_overview(&self, request: &DepotDayRequest) -> AppResult<DepotOverview> {
+        depot_monitoring::read_overview(&self.pool, request).await
+    }
     async fn get_vehicle_service_type(&self, vehicle_no: &str) -> AppResult<Option<String>> {
         self.get_vehicle_service_type_impl(vehicle_no).await
     }
@@ -2274,6 +2317,26 @@ impl VehicleDataReader for DBVehicleReader {
                 depot_id, e
             ))),
         }
+    }
+
+    async fn get_fleet_vehicles(&self) -> AppResult<Vec<DepotVehicleInfo>> {
+        sqlx::query_as::<_, DepotVehicleInfo>(
+            r#"
+            SELECT v.fleet_no AS fleet_no,
+                   v.vehicle_no AS vehicle_no,
+                   v.status AS status,
+                   bst.service_type_name AS service_type
+            FROM vehicles v
+            LEFT JOIN bus_service_type bst
+                   ON bst.service_type_id = v.bus_service_type_id
+                  AND bst.deleted = false
+            WHERE v.deleted = false
+              AND v.fleet_no <> ''
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DbError(format!("get_fleet_vehicles: {}", e)))
     }
 
     async fn get_depot_vehicles(&self, depot_id: &str) -> AppResult<Vec<DepotVehicleInfo>> {
