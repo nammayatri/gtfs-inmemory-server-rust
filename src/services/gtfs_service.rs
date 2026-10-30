@@ -8,6 +8,7 @@ use crate::models::{
     SuburbanStopInfo, SuburbanStopInfoRecord,
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
+use crate::services::chalo_vehicle_cache::{chalo_gtfs_ids, ChaloVehicleCache};
 use crate::services::gtfs_db_source::{
     is_fare_stage_dict, overlays_from_patterns, parse_headsign_stage, plan_feed_actions, DbTrip,
     DbTrips, FeedAction, GtfsDbSource, TripOverlay,
@@ -1255,7 +1256,46 @@ impl GTFSService {
                 }
             }
         }
+
+        let chalo_tiers = Self::chalo_route_tiers().await;
+        for gtfs_id in chalo_gtfs_ids() {
+            let inner = route_service_tiers_by_gtfs
+                .entry(gtfs_id.to_string())
+                .or_insert_with(HashMap::new);
+            for (route_id, tier) in &chalo_tiers {
+                inner
+                    .entry(route_id.clone())
+                    .or_insert_with(|| tier.clone());
+            }
+        }
         Ok(route_service_tiers_by_gtfs)
+    }
+
+    async fn chalo_route_tiers() -> HashMap<String, ServiceTierType> {
+        let mapping = match ChaloVehicleCache::load_route_service_tier_mapping().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Chalo route tier mapping unavailable: {}", e);
+                return HashMap::new();
+            }
+        };
+        mapping
+            .into_iter()
+            .filter_map(|(route_id, tier)| {
+                match serde_json::from_value::<ServiceTierType>(serde_json::Value::String(
+                    tier.clone(),
+                )) {
+                    Ok(t) => Some((route_id, t)),
+                    Err(_) => {
+                        warn!(
+                            "Chalo route {} has unknown service tier '{}'",
+                            route_id, tier
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     async fn read_seat_layout_mapping_csv(
@@ -1496,6 +1536,17 @@ impl GTFSService {
         &self,
         routes_by_gtfs: &mut HashMap<String, HashMap<String, NandiRoutesRes>>,
     ) {
+        let chalo_tiers = Self::chalo_route_tiers().await;
+        for gtfs_id in chalo_gtfs_ids() {
+            if let Some(routes) = routes_by_gtfs.get_mut(*gtfs_id) {
+                for (route_id, route) in routes.iter_mut() {
+                    if route.service_tier_type.is_none() {
+                        route.service_tier_type = chalo_tiers.get(route_id).cloned();
+                    }
+                }
+            }
+        }
+
         let Some(op_svc) = self.operator_service.get() else {
             return;
         };
@@ -4668,6 +4719,13 @@ impl GTFSService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chalo_route_tiers_split_route_18_by_tier() {
+        let tiers = GTFSService::chalo_route_tiers().await;
+        assert_eq!(tiers.get("fSmhjvrz"), Some(&ServiceTierType::Ac));
+        assert_eq!(tiers.get("fPLgfoJH"), Some(&ServiceTierType::NonAc));
+    }
 
     // ------------------------------------------------- station -> platforms map
 

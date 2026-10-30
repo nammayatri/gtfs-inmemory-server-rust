@@ -295,9 +295,7 @@ impl ChaloVehicleCache {
         }
 
         // Load route service tier mapping
-        let route_mapping = self
-            .load_route_service_tier_mapping_internal(gtfs_id)
-            .await?;
+        let route_mapping = Self::load_route_service_tier_mapping().await?;
 
         let mut cache = self.cache.write().await;
         let city_cache = cache
@@ -362,10 +360,7 @@ impl ChaloVehicleCache {
         Ok(())
     }
 
-    async fn load_route_service_tier_mapping_internal(
-        &self,
-        _gtfs_id: &str,
-    ) -> AppResult<HashMap<String, String>> {
+    pub async fn load_route_service_tier_mapping() -> AppResult<HashMap<String, String>> {
         let file_path = "./assets/route_service_tier_mapping.csv";
         let mut file = match File::open(file_path).await {
             Ok(file) => file,
