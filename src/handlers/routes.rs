@@ -2124,26 +2124,16 @@ pub async fn get_stops_fuzzy(
     query: Query<LimitQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, query_str) = path.into_inner();
-    let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
-    let query_lower = query_str.to_lowercase();
+    let index = app_state.gtfs_service.get_stop_search(&gtfs_id).await?;
 
-    let mut unique_stops: HashMap<String, Arc<RouteStopMapping>> = HashMap::new();
+    let limit = query.limit.map(|l| l.max(0) as usize);
+    let matched: Vec<Arc<RouteStopMapping>> = index
+        .search(&query_str, limit)
+        .into_iter()
+        .map(|(stop, _)| stop)
+        .collect();
 
-    for stop in stops {
-        let matches = stop.stop_name.to_lowercase().contains(&query_lower)
-            || stop.stop_code.to_lowercase().contains(&query_lower);
-
-        if matches {
-            unique_stops.insert(stop.stop_code.to_string(), stop.clone());
-            if let Some(limit) = query.limit {
-                if unique_stops.len() >= limit as usize {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(HttpResponse::Ok().json(unique_stops.into_values().collect::<Vec<_>>()))
+    Ok(HttpResponse::Ok().json(matched))
 }
 
 #[utoipa::path(

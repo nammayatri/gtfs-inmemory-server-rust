@@ -897,6 +897,12 @@ pub struct CachedDataResponse {
     pub stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct PrecomputedStops {
+    pub stops: Vec<Arc<RouteStopMapping>>,
+    pub search: Arc<crate::services::stop_fuzzy::StopSearchIndex>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct GTFSData {
     pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
@@ -916,7 +922,7 @@ pub struct GTFSData {
     pub seat_layout_mapping_by_gtfs: HashMap<String, HashMap<String, String>>,
     /// Pre-computed unique stops list per GTFS (avoids recomputation on every /stops request)
     #[serde(skip)]
-    pub pre_computed_stops_by_gtfs: HashMap<String, Vec<Arc<RouteStopMapping>>>,
+    pub pre_computed_stops_by_gtfs: HashMap<String, PrecomputedStops>,
     /// `gtfs_feed.version` each DB-backed feed was built at. A feed missing here
     /// is serving preprocessed data (not a DB feed, or its DB load failed).
     #[serde(default)]
@@ -1014,7 +1020,8 @@ impl GTFSData {
 
         // Pre-computed stops (Arc pointers only, data shared with route_data)
         for stops in self.pre_computed_stops_by_gtfs.values() {
-            stats.pre_computed_stops_bytes += stops.len() * 8; // Arc pointers
+            stats.pre_computed_stops_bytes += stops.stops.len() * 8; // Arc pointers
+            stats.pre_computed_stops_bytes += stops.search.heap_bytes();
         }
 
         // Children mapping
