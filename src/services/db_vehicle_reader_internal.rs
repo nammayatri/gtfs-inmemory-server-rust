@@ -302,18 +302,11 @@ pub struct DBVehicleReaderInternal {
     pool: Option<PgPool>,
     schedule_snapshot: ScheduleSnapshotCache,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
-    vehicle_properties_cache:
-        Arc<RwLock<HashMap<(String, String), (VehicleProperties, SystemTime)>>>,
     depot_cache: Arc<RwLock<InternalDepotCache>>,
 }
 
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
-                                              // 10 minutes — vehicle_tags drive fare classes, so an operator edit (tag/variant) must reach
-                                              // pricing quickly. Not invalidated on write: the cache is in-process, so every pod serves its
-                                              // own entry until it expires. A miss is one lookup on the (gtfs_id, fleet_no) partial unique index.
-const VEHICLE_PROPS_CACHE_DURATION: u64 = 600;
-const VEHICLE_PROPS_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
-const VEHICLE_PROPS_CACHE_MAX_ENTRIES: usize = 4000;
+
 // 5 minutes. This service's own writes drop the cache (see clear_caches_after_write); the TTL
 // only bounds staleness from writes made by another pod.
 const DEPOT_CACHE_DURATION: u64 = 300;
@@ -324,7 +317,6 @@ impl DBVehicleReaderInternal {
             pool: Some(pool),
             schedule_snapshot: ScheduleSnapshotCache::new(SCHEDULE_SNAPSHOT_TTL),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
-            vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
             depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
         }
     }
@@ -336,7 +328,6 @@ impl DBVehicleReaderInternal {
             pool: None,
             schedule_snapshot: ScheduleSnapshotCache::new(SCHEDULE_SNAPSHOT_TTL),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
-            vehicle_properties_cache: Arc::new(RwLock::new(HashMap::new())),
             depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
         }
     }
@@ -1381,8 +1372,6 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     }
 
     async fn clear_caches_after_write(&self) {
-        // Only the depot caches: vehicle_properties_cache is bounded by its 10-minute TTL, and
-        // dropping it pod-locally would not make it consistent across pods anyway.
         *self.depot_cache.write().await = InternalDepotCache::default();
     }
 
@@ -1396,24 +1385,8 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             None => return Ok(VehicleProperties::default()),
         };
 
-        let cache_key = (fleet_no.to_string(), gtfs_id.to_string());
-        {
-            let cache = self.vehicle_properties_cache.read().await;
-            if let Some((props, fetched_at)) = cache.get(&cache_key) {
-                let ttl = if props.tag_number.is_some()
-                    || props.variant.is_some()
-                    || props.vehicle_tags.is_some()
-                {
-                    VEHICLE_PROPS_CACHE_DURATION
-                } else {
-                    VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
-                };
-                if fetched_at.elapsed().unwrap_or_default() < Duration::from_secs(ttl) {
-                    return Ok(props.clone());
-                }
-            }
-        }
-
+        // Uncached: tags and variant drive rider-app fare classes, and rider-app owns the cache (Redis, cleared on its
+        // vehicle upsert), so a read here must reflect the row as it is now. One lookup on the (gtfs_id, fleet_no) index.
         let db_result = sqlx::query_as::<_, (Option<String>, Option<String>, Option<Vec<String>>)>(
             "SELECT tag_number, vehicle_variant, vehicle_tags FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
         )
@@ -1437,42 +1410,12 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             }
             Err(e) => {
                 warn!(
-                    "get_vehicle_properties: DB failure for ({}, {}): {}; caching negative for {}s",
-                    gtfs_id, fleet_no, e, VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
+                    "get_vehicle_properties: DB failure for ({}, {}): {}; returning no properties",
+                    gtfs_id, fleet_no, e
                 );
                 VehicleProperties::default()
             }
         };
-
-        {
-            let mut cache = self.vehicle_properties_cache.write().await;
-            if cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
-                cache.retain(|_, (p, stamp)| {
-                    let ttl = if p.tag_number.is_some()
-                        || p.variant.is_some()
-                        || p.vehicle_tags.is_some()
-                    {
-                        VEHICLE_PROPS_CACHE_DURATION
-                    } else {
-                        VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
-                    };
-                    stamp.elapsed().unwrap_or_default() < Duration::from_secs(ttl)
-                });
-                while cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
-                    let oldest = cache
-                        .iter()
-                        .min_by_key(|(_, (_, stamp))| *stamp)
-                        .map(|(key, _)| key.clone());
-                    match oldest {
-                        Some(key) => {
-                            cache.remove(&key);
-                        }
-                        None => break,
-                    }
-                }
-            }
-            cache.insert(cache_key, (props.clone(), SystemTime::now()));
-        }
 
         Ok(props)
     }
