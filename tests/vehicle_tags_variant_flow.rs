@@ -237,10 +237,8 @@ async fn vehicle_tags_are_master_rows_and_variant_is_an_enum() {
     .await
     .expect("re-sending a row with its own tag is allowed");
 
-    let props = DBVehicleReaderInternal::new(pool.clone())
-        .get_vehicle_properties("TN01A1", GTFS)
-        .await
-        .unwrap();
+    let reader = DBVehicleReaderInternal::new(pool.clone());
+    let props = reader.get_vehicle_properties("TN01A1", GTFS).await.unwrap();
     assert_eq!(props.variant.as_deref(), Some("TEMPO_TRAVELLER"));
     assert_eq!(
         props.vehicle_tags,
@@ -300,13 +298,10 @@ async fn vehicle_tags_are_master_rows_and_variant_is_an_enum() {
     svc.upsert_vehicles(GTFS, vec![upsert("TN01A1", json!({ "vehicle_tags": [] }))])
         .await
         .unwrap();
-    let cleared = DBVehicleReaderInternal::new(pool.clone())
-        .get_vehicle_properties("TN01A1", GTFS)
-        .await
-        .unwrap();
+    let cleared = reader.get_vehicle_properties("TN01A1", GTFS).await.unwrap();
     assert_eq!(
         cleared.vehicle_tags, None,
-        "an empty list reads back as no tags"
+        "the same reader sees the cleared tags at once (no cache in GIMS); an empty list reads back as no tags"
     );
 
     svc.delete_one_row(
