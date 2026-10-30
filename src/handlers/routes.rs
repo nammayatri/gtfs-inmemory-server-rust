@@ -367,6 +367,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 web::scope("/v2/{gtfs_id}")
                     .route("/fleet/{fleet_no}", web::get().to(get_fleet_operation_v2))
                     .route("/depots", web::get().to(get_depots_v2))
+                    .route(
+                        "/routes-served-today",
+                        web::get().to(get_routes_served_today_v2),
+                    )
                     .route("/vehicles", web::get().to(get_fleet_vehicles_v2))
                     .route("/depots/{depot_id}", web::get().to(get_depot_by_id_v2))
                     .route(
@@ -5548,6 +5552,26 @@ pub async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<Htt
         .get_routes_served_today()
         .await?;
     Ok(HttpResponse::Ok().json(routes))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/routes-served-today",
+    tag = "Routes",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "Routes served today for the feed; empty for feeds without operator schedule data (e.g. Chalo)"))
+)]
+pub async fn get_routes_served_today_v2(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = strip_surrounding_quotes(&path.into_inner());
+    let served_by_v1 = SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str())
+        && !INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str());
+    if !served_by_v1 {
+        return Ok(HttpResponse::Ok().json(Vec::<crate::models::RouteLastScheduleTime>::new()));
+    }
+    get_routes_served_today(app_state).await
 }
 
 #[utoipa::path(
