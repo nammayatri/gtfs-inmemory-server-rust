@@ -402,6 +402,12 @@ pub struct VehicleServiceTypeResponse {
     pub bus_tag_number: Option<String>,
     #[serde(rename = "busVehicleVariant")]
     pub bus_vehicle_variant: Option<String>,
+    #[serde(
+        rename = "busVehicleTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_tags: Option<Vec<String>>,
     pub waybill_status: Option<WaybillStatus>,
     pub is_historic: bool,
     pub schedule_based_active_trip: Option<bool>,
@@ -423,6 +429,12 @@ pub struct VehicleMetadataResponse {
     pub bus_tag_number: Option<String>,
     #[serde(rename = "busVehicleVariant")]
     pub bus_vehicle_variant: Option<String>,
+    #[serde(
+        rename = "busVehicleTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_tags: Option<Vec<String>>,
     pub is_actually_valid: Option<bool>,
 }
 
@@ -441,6 +453,12 @@ pub struct WaybillMetadataResponse {
     pub bus_tag_number: Option<String>,
     #[serde(rename = "busVehicleVariant")]
     pub bus_vehicle_variant: Option<String>,
+    #[serde(
+        rename = "busVehicleTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_tags: Option<Vec<String>>,
 }
 
 /// Granular, update-only body for editing a waybill's mutable operational fields (crew, fleet, devices)
@@ -509,6 +527,7 @@ pub struct WaybillTripInfo {
 pub struct VehicleProperties {
     pub tag_number: Option<String>,
     pub variant: Option<String>,
+    pub vehicle_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -516,6 +535,8 @@ pub struct VehicleProperties {
 pub enum VehicleVariant {
     StandardBus,
     TempoTraveller,
+    AcBus,
+    AcTempoTraveller,
 }
 
 impl VehicleVariant {
@@ -523,6 +544,8 @@ impl VehicleVariant {
         match self {
             VehicleVariant::StandardBus => "STANDARD_BUS",
             VehicleVariant::TempoTraveller => "TEMPO_TRAVELLER",
+            VehicleVariant::AcBus => "AC_BUS",
+            VehicleVariant::AcTempoTraveller => "AC_TEMPO_TRAVELLER",
         }
     }
 }

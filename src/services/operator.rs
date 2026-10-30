@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -496,6 +496,14 @@ pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
             "created_at",
             "updated_at",
         ]),
+        "vehicle_tag_internal" => Some(&[
+            "vehicle_tag_id",
+            "gtfs_id",
+            "tag",
+            "deleted",
+            "created_at",
+            "updated_at",
+        ]),
         _ => None,
     }
 }
@@ -520,6 +528,7 @@ pub fn table_pk(table: &str) -> Option<&'static str> {
         "waybills_internal" => Some("waybill_id"),
         "bus_shift_type_internal" => Some("shift_type_id"),
         "bus_schedule_type_internal" => Some("schedule_type_id"),
+        "vehicle_tag_internal" => Some("vehicle_tag_id"),
         _ => None,
     }
 }
@@ -544,6 +553,7 @@ fn allowed_tables() -> &'static [&'static str] {
         "waybills_internal",
         "bus_shift_type_internal",
         "bus_schedule_type_internal",
+        "vehicle_tag_internal",
     ]
 }
 
@@ -569,6 +579,71 @@ fn validate_column_name(col: &str) -> AppResult<()> {
                 col
             )));
         }
+    }
+    Ok(())
+}
+
+/// The master table whose `tag` is stored on vehicles_internal.vehicle_tags, with its in-use predicate.
+fn vehicle_tag_master(table: &str) -> Option<&'static str> {
+    match table {
+        "vehicle_tag_internal" => Some("vehicle_tags @> ARRAY[$2]"),
+        _ => None,
+    }
+}
+
+/// The tags in `tags` that are not an active (`deleted = false`) tag of `table` for `gtfs_id`. Postgres cannot foreign-key
+/// array elements, so the vehicle upsert -- the only writer of vehicle_tags -- checks them here.
+async fn inactive_vehicle_tags(
+    pool: &PgPool,
+    table: &str,
+    gtfs_id: &str,
+    tags: &[String],
+) -> AppResult<Vec<String>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let active: HashSet<String> = sqlx::query_scalar::<_, String>(&format!(
+        "SELECT tag FROM public.{} WHERE gtfs_id = $1 AND deleted = false AND tag = ANY($2)",
+        table
+    ))
+    .bind(gtfs_id)
+    .bind(tags)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::DbError(format!("inactive_vehicle_tags {}: {}", table, e)))?
+    .into_iter()
+    .collect();
+    Ok(tags
+        .iter()
+        .filter(|t| !active.contains(*t))
+        .cloned()
+        .collect())
+}
+
+/// Refuses to drop a tag that an active vehicle still carries, so vehicles_internal never points at a dead tag.
+async fn ensure_vehicle_tag_unused(
+    pool: &PgPool,
+    table: &str,
+    gtfs_id: &str,
+    tag: &str,
+) -> AppResult<()> {
+    let Some(predicate) = vehicle_tag_master(table) else {
+        return Ok(());
+    };
+    let in_use: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM public.vehicles_internal WHERE deleted = false AND gtfs_id = $1 AND {}",
+        predicate
+    ))
+    .bind(gtfs_id)
+    .bind(tag)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::DbError(format!("ensure_vehicle_tag_unused {}: {}", table, e)))?;
+    if in_use > 0 {
+        return Err(AppError::BadRequest(format!(
+            "{}: tag '{}' is still on {} vehicle(s) of feed {}",
+            table, tag, in_use, gtfs_id
+        )));
     }
     Ok(())
 }
@@ -875,6 +950,9 @@ pub struct FleetRow {
     pub vehicle_variant: Option<String>,
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub vehicle_tags: Option<Vec<String>>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<serde_json::Value>)]
     pub bus_service_type_id: Option<String>,
     #[sqlx(default)]
@@ -1161,7 +1239,7 @@ pub struct VehiclesInternal {
     pub gtfs_id: String,
 }
 
-/// Upsert body: `vehicle_no` is the natural identity (conflict key) and is required. `fleet_no` is required when creating a new vehicle; on update, `None` preserves the existing value. `tag_number`, `status`, `vehicle_variant`, `bus_service_type_id`, `entity_id` and `organization_id` are always optional; `None` preserves existing on UPDATE.
+/// Upsert body: `vehicle_no` is the natural identity (conflict key) and is required. `fleet_no` is required when creating a new vehicle; on update, `None` preserves the existing value. `tag_number`, `status`, `vehicle_variant`, `vehicle_tags`, `bus_service_type_id`, `entity_id` and `organization_id` are always optional; `None` preserves existing on UPDATE. Each of `vehicle_tags` must be an active tag of the feed's `vehicle_tag_internal` (checked here, before the write); `vehicle_tags` is ordered, highest priority first, and `[]` clears it.
 #[derive(Debug, serde::Deserialize, Clone, utoipa::ToSchema)]
 pub struct VehicleUpsertRequest {
     pub vehicle_no: String,
@@ -1169,6 +1247,7 @@ pub struct VehicleUpsertRequest {
     pub tag_number: Option<String>,
     pub status: Option<String>,
     pub vehicle_variant: Option<VehicleVariant>,
+    pub vehicle_tags: Option<Vec<String>>,
     // The three id columns accept a JSON number or string either way: they are mid bigint->text migration, so a caller may send "5" or 5 for the same parent.
     #[schema(value_type = Option<serde_json::Value>)]
     pub bus_service_type_id: Option<IdValue>,
@@ -1267,6 +1346,16 @@ pub struct BusScheduleTypeInternal {
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct VehicleTagInternal {
+    pub vehicle_tag_id: String,
+    pub gtfs_id: String,
+    pub tag: String,
+    pub deleted: bool,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(untagged)]
 pub enum InternalRow {
@@ -1288,6 +1377,7 @@ pub enum InternalRow {
     WaybillsInternal(WaybillsInternal),
     BusShiftTypeInternal(BusShiftTypeInternal),
     BusScheduleTypeInternal(BusScheduleTypeInternal),
+    VehicleTagInternal(VehicleTagInternal),
 }
 
 /// Deserialize a raw `row_to_json` value into the correct `InternalRow` variant
@@ -1325,6 +1415,7 @@ fn row_from_value(table: &str, v: serde_json::Value) -> AppResult<InternalRow> {
         "waybills_internal" => parse!(WaybillsInternal, WaybillsInternal),
         "bus_shift_type_internal" => parse!(BusShiftTypeInternal, BusShiftTypeInternal),
         "bus_schedule_type_internal" => parse!(BusScheduleTypeInternal, BusScheduleTypeInternal),
+        "vehicle_tag_internal" => parse!(VehicleTagInternal, VehicleTagInternal),
         other => Err(AppError::Internal(format!("Unknown table: {}", other))),
     }
 }
@@ -1401,6 +1492,7 @@ pub trait OperatorService: Send + Sync {
         vehicle_no: Option<&str>,
         tag_number: Option<&str>,
         fleet_no: Option<&str>,
+        vehicle_tag: Option<&str>,
     ) -> AppResult<Vec<FleetRow>>;
 
     async fn upsert_vehicles(
@@ -1668,6 +1760,7 @@ impl OperatorService for MockOperatorService {
         _vehicle_no: Option<&str>,
         _tag_number: Option<&str>,
         _fleet_no: Option<&str>,
+        _vehicle_tag: Option<&str>,
     ) -> AppResult<Vec<FleetRow>> {
         mock_err!()
     }
@@ -2757,6 +2850,21 @@ impl OperatorService for DBOperatorService {
             }
         };
 
+        if vehicle_tag_master(table).is_some() {
+            let tag: Option<String> = sqlx::query_scalar(&format!(
+                "SELECT tag FROM public.{} WHERE {}::text = $1 AND gtfs_id = $2 AND deleted = false",
+                table, pk
+            ))
+            .bind(&id)
+            .bind(gtfs_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::DbError(format!("delete_one_row {}: {}", table, e)))?;
+            if let Some(tag) = tag {
+                ensure_vehicle_tag_unused(&self.pool, table, gtfs_id, &tag).await?;
+            }
+        }
+
         // `::text` cast so the id predicate works whether the column is still
         // `bigint` (prod) or already migrated to `text` — bind the string either way.
         let sql = format!(
@@ -2798,6 +2906,95 @@ impl OperatorService for DBOperatorService {
 
         if arr.is_empty() {
             return Err(AppError::BadRequest("Body is empty".to_string()));
+        }
+
+        // vehicles_internal stores these tags, so a tag is unique per feed, fixed once created, and a row is only
+        // dropped through /crud/{table}/delete, which checks no vehicle still carries it.
+        if vehicle_tag_master(table).is_some() {
+            let mut sent: HashMap<String, Option<String>> = HashMap::new();
+            for val in &arr {
+                let Some(Value::String(tag)) = val.as_object().and_then(|o| o.get("tag")) else {
+                    continue;
+                };
+                let id = match val.get(pk) {
+                    Some(Value::String(id)) => Some(id.clone()),
+                    _ => None,
+                };
+                if sent.insert(tag.clone(), id).is_some() {
+                    return Err(AppError::BadRequest(format!(
+                        "upsert_one_row {}: tag '{}' appears twice in the request",
+                        table, tag
+                    )));
+                }
+            }
+            if !sent.is_empty() {
+                let tags: Vec<String> = sent.keys().cloned().collect();
+                let taken: Vec<(String, String)> = sqlx::query_as(&format!(
+                    "SELECT {}, tag FROM public.{} WHERE gtfs_id = $1 AND tag = ANY($2)",
+                    pk, table
+                ))
+                .bind(gtfs_id)
+                .bind(&tags)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AppError::DbError(format!("upsert_one_row {}: {}", table, e)))?;
+                for (owner_id, tag) in taken {
+                    if sent.get(&tag).and_then(|id| id.as_ref()) != Some(&owner_id) {
+                        return Err(AppError::BadRequest(format!(
+                            "upsert_one_row {}: tag '{}' already exists ({} = {}); send that id to update it",
+                            table, tag, pk, owner_id
+                        )));
+                    }
+                }
+            }
+
+            let mut existing_ids: Vec<String> = Vec::new();
+            for val in &arr {
+                let Some(obj) = val.as_object() else {
+                    continue;
+                };
+                if obj.get("deleted").and_then(Value::as_bool) == Some(true) {
+                    return Err(AppError::BadRequest(format!(
+                        "upsert_one_row {}: delete through /crud/{}/delete, not by setting deleted",
+                        table, table
+                    )));
+                }
+                if let Some(Value::String(id)) = obj.get(pk) {
+                    existing_ids.push(id.clone());
+                }
+            }
+            if !existing_ids.is_empty() {
+                let stored: HashMap<String, String> =
+                    sqlx::query_as::<_, (String, String)>(&format!(
+                        "SELECT {}, tag FROM public.{} WHERE {} = ANY($1) AND gtfs_id = $2",
+                        pk, table, pk
+                    ))
+                    .bind(&existing_ids)
+                    .bind(gtfs_id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| AppError::DbError(format!("upsert_one_row {}: {}", table, e)))?
+                    .into_iter()
+                    .collect();
+                for val in &arr {
+                    let Some(obj) = val.as_object() else {
+                        continue;
+                    };
+                    let (Some(Value::String(id)), Some(Value::String(tag))) =
+                        (obj.get(pk), obj.get("tag"))
+                    else {
+                        continue;
+                    };
+                    if let Some(old) = stored.get(id) {
+                        if old != tag {
+                            return Err(AppError::BadRequest(format!(
+                                "upsert_one_row {}: tag '{}' cannot be changed (vehicles store it); create a new row instead",
+                                table, old
+                            )));
+                        }
+                    }
+                }
+            }
         }
 
         // Auto-inject PK with a random ID if missing or null
@@ -3206,10 +3403,15 @@ impl OperatorService for DBOperatorService {
         vehicle_no: Option<&str>,
         tag_number: Option<&str>,
         fleet_no: Option<&str>,
+        vehicle_tag: Option<&str>,
     ) -> AppResult<Vec<FleetRow>> {
-        if vehicle_no.is_none() && tag_number.is_none() && fleet_no.is_none() {
+        if vehicle_no.is_none()
+            && tag_number.is_none()
+            && fleet_no.is_none()
+            && vehicle_tag.is_none()
+        {
             return Err(AppError::BadRequest(
-                "queryVehicle: at least one of vehicle_no, tag_number, or fleet_no must be provided"
+                "queryVehicle: at least one of vehicle_no, tag_number, fleet_no, or vehicle_tag must be provided"
                     .to_string(),
             ));
         }
@@ -3227,10 +3429,14 @@ impl OperatorService for DBOperatorService {
         }
         if fleet_no.is_some() {
             where_parts.push(format!("fleet_no = ${}", param_idx));
+            param_idx += 1;
+        }
+        if vehicle_tag.is_some() {
+            where_parts.push(format!("vehicle_tags @> ARRAY[${}]::text[]", param_idx));
         }
 
         let sql = format!(
-            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no, vehicle_variant, bus_service_type_id, entity_id, organization_id \
+            "SELECT vehicle_id, created_at, fleet_no, tag_number, status, updated_at, vehicle_no, vehicle_variant, vehicle_tags, bus_service_type_id, entity_id, organization_id \
              FROM public.vehicles_internal \
              WHERE {} \
              ORDER BY created_at DESC NULLS LAST, vehicle_id DESC \
@@ -3248,6 +3454,9 @@ impl OperatorService for DBOperatorService {
         }
         if let Some(f) = fleet_no {
             q = q.bind(f);
+        }
+        if let Some(t) = vehicle_tag {
+            q = q.bind(t);
         }
         q.fetch_all(&self.pool)
             .await
@@ -3362,6 +3571,26 @@ impl OperatorService for DBOperatorService {
                 v.status = Some(st);
             }
 
+            if let Some(tags) = v.vehicle_tags.as_mut() {
+                let mut seen_tags: HashSet<String> = HashSet::with_capacity(tags.len());
+                for (j, tag) in tags.iter_mut().enumerate() {
+                    let t = tag.trim().to_string();
+                    if t.is_empty() {
+                        return Err(AppError::BadRequest(format!(
+                            "upsertVehicles: items[{}].vehicle_tags[{}] must be non-empty",
+                            i, j
+                        )));
+                    }
+                    if !seen_tags.insert(t.clone()) {
+                        return Err(AppError::BadRequest(format!(
+                            "upsertVehicles: items[{}].vehicle_tags repeats '{}'",
+                            i, t
+                        )));
+                    }
+                    *tag = t;
+                }
+            }
+
             norm_id(i, "bus_service_type_id", &mut v.bus_service_type_id)?;
             norm_id(i, "entity_id", &mut v.entity_id)?;
             norm_id(i, "organization_id", &mut v.organization_id)?;
@@ -3375,6 +3604,22 @@ impl OperatorService for DBOperatorService {
             vehicle_nos.push(vehicle_no);
         }
 
+        let tags_to_check: Vec<String> = items
+            .iter()
+            .flat_map(|v| v.vehicle_tags.iter().flatten().cloned())
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        let unknown =
+            inactive_vehicle_tags(&self.pool, "vehicle_tag_internal", gtfs_id, &tags_to_check)
+                .await?;
+        if !unknown.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "upsertVehicles: vehicle_tags {:?} not active in vehicle_tag_internal for feed {}",
+                unknown, gtfs_id
+            )));
+        }
+
         // The column list built below is shared across every row, so all items must have the same optional-field pattern — otherwise mismatched items either silently drop columns or bind NULL through a NOT NULL column.
         let shape = |v: &VehicleUpsertRequest| {
             (
@@ -3382,6 +3627,7 @@ impl OperatorService for DBOperatorService {
                 v.tag_number.is_some(),
                 v.status.is_some(),
                 v.vehicle_variant.is_some(),
+                v.vehicle_tags.is_some(),
                 v.bus_service_type_id.is_some(),
                 v.entity_id.is_some(),
                 v.organization_id.is_some(),
@@ -3391,7 +3637,7 @@ impl OperatorService for DBOperatorService {
         for (i, item) in items.iter().enumerate().skip(1) {
             if shape(item) != shape0 {
                 return Err(AppError::BadRequest(format!(
-                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status/vehicle_variant/bus_service_type_id/entity_id/organization_id as items[0]",
+                    "upsertVehicles: items[{}] must set the same combination of fleet_no/tag_number/status/vehicle_variant/vehicle_tags/bus_service_type_id/entity_id/organization_id as items[0]",
                     i
                 )));
             }
@@ -3412,12 +3658,15 @@ impl OperatorService for DBOperatorService {
             cols.push("vehicle_variant");
         }
         if shape0.4 {
-            cols.push("bus_service_type_id");
+            cols.push("vehicle_tags");
         }
         if shape0.5 {
-            cols.push("entity_id");
+            cols.push("bus_service_type_id");
         }
         if shape0.6 {
+            cols.push("entity_id");
+        }
+        if shape0.7 {
             cols.push("organization_id");
         }
         cols.push("gtfs_id");
@@ -3450,7 +3699,7 @@ impl OperatorService for DBOperatorService {
             "INSERT INTO public.vehicles_internal ({}) VALUES {} \
              ON CONFLICT (gtfs_id, vehicle_no) WHERE deleted = false \
              DO UPDATE SET {} \
-             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant, bus_service_type_id, entity_id, organization_id",
+             RETURNING vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant, vehicle_tags, bus_service_type_id, entity_id, organization_id",
             cols.join(", "),
             placeholders.join(", "),
             update_set
@@ -3473,6 +3722,9 @@ impl OperatorService for DBOperatorService {
             if cols.contains(&"vehicle_variant") {
                 q = q.bind(item.vehicle_variant.map(|v| v.as_str()));
             }
+            if cols.contains(&"vehicle_tags") {
+                q = q.bind(item.vehicle_tags.clone());
+            }
             // Bound as text like vehicle_id above: these columns were carried to text by the same id migration, so Int(5) and Text("5") must land identically.
             if cols.contains(&"bus_service_type_id") {
                 q = q.bind(item.bus_service_type_id.as_ref().map(|v| v.to_string()));
@@ -3486,13 +3738,18 @@ impl OperatorService for DBOperatorService {
         }
         q = q.bind(gtfs_id);
 
-        // 23505 (unique_violation), 23502 (not_null_violation), 42P10 (undefined_object — the (gtfs_id, vehicle_no) unique index is missing or INVALID after a failed CONCURRENTLY build), 42804 (datatype_mismatch — an id column not yet migrated off bigint). Rewrite all four as 400 so ops sees an actionable message rather than a 500.
+        // 23505 (unique_violation), 23502 (not_null_violation), 23503/23514 (foreign_key/check_violation), 42P10 (undefined_object — the (gtfs_id, vehicle_no) unique index is missing or INVALID after a failed CONCURRENTLY build), 42804 (datatype_mismatch — an id column not yet migrated off bigint). Rewrite all as 400 so ops sees an actionable message rather than a 500.
         let returned = match q.fetch_all(&self.pool).await {
             Ok(rows) => rows,
             Err(sqlx::Error::Database(db_err))
                 if matches!(
                     db_err.code().as_deref(),
-                    Some("23505") | Some("23502") | Some("42P10") | Some("42804")
+                    Some("23505")
+                        | Some("23502")
+                        | Some("23503")
+                        | Some("23514")
+                        | Some("42P10")
+                        | Some("42804")
                 ) =>
             {
                 return Err(AppError::BadRequest(format!(
@@ -3602,7 +3859,7 @@ impl OperatorService for DBOperatorService {
         offset: Option<i64>,
     ) -> AppResult<Vec<FleetRow>> {
         let mut sql = String::from(
-            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant, bus_service_type_id, entity_id, organization_id \
+            "SELECT vehicle_id, vehicle_no, fleet_no, tag_number, created_at, status, updated_at, vehicle_variant, vehicle_tags, bus_service_type_id, entity_id, organization_id \
              FROM public.vehicles_internal \
              WHERE deleted = false AND gtfs_id = $1 \
              ORDER BY vehicle_no",

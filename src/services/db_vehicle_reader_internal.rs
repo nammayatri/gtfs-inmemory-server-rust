@@ -308,9 +308,10 @@ pub struct DBVehicleReaderInternal {
 }
 
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
-                                              // 12 hours — these columns rarely change. Not invalidated on write: the cache is in-process, so an
-                                              // operator edit (tag/variant) is served stale by every pod until its own entry expires.
-const VEHICLE_PROPS_CACHE_DURATION: u64 = 43200;
+                                              // 10 minutes — vehicle_tags drive fare classes, so an operator edit (tag/variant) must reach
+                                              // pricing quickly. Not invalidated on write: the cache is in-process, so every pod serves its
+                                              // own entry until it expires. A miss is one lookup on the (gtfs_id, fleet_no) partial unique index.
+const VEHICLE_PROPS_CACHE_DURATION: u64 = 600;
 const VEHICLE_PROPS_NEGATIVE_CACHE_DURATION: u64 = 300; // 5m — CSV is the current source, so misses are hot
 const VEHICLE_PROPS_CACHE_MAX_ENTRIES: usize = 4000;
 // 5 minutes. This service's own writes drop the cache (see clear_caches_after_write); the TTL
@@ -1380,9 +1381,8 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     }
 
     async fn clear_caches_after_write(&self) {
-        // Only the depot caches: vehicle_properties_cache is a hot 12h cache whose
-        // write-staleness predates this change, and dropping it pod-locally would not make it
-        // consistent anyway.
+        // Only the depot caches: vehicle_properties_cache is bounded by its 10-minute TTL, and
+        // dropping it pod-locally would not make it consistent across pods anyway.
         *self.depot_cache.write().await = InternalDepotCache::default();
     }
 
@@ -1400,7 +1400,10 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         {
             let cache = self.vehicle_properties_cache.read().await;
             if let Some((props, fetched_at)) = cache.get(&cache_key) {
-                let ttl = if props.tag_number.is_some() || props.variant.is_some() {
+                let ttl = if props.tag_number.is_some()
+                    || props.variant.is_some()
+                    || props.vehicle_tags.is_some()
+                {
                     VEHICLE_PROPS_CACHE_DURATION
                 } else {
                     VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
@@ -1411,8 +1414,8 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             }
         }
 
-        let db_result = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT tag_number, vehicle_variant FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
+        let db_result = sqlx::query_as::<_, (Option<String>, Option<String>, Option<Vec<String>>)>(
+            "SELECT tag_number, vehicle_variant, vehicle_tags FROM vehicles_internal WHERE fleet_no = $1 AND gtfs_id = $2 AND deleted = false LIMIT 1",
         )
         .bind(fleet_no)
         .bind(gtfs_id)
@@ -1425,10 +1428,11 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
 
         let props = match db_result {
             Ok(row) => {
-                let (tag, variant) = row.unwrap_or((None, None));
+                let (tag, variant, vehicle_tags) = row.unwrap_or((None, None, None));
                 VehicleProperties {
                     tag_number: non_blank(tag),
                     variant: non_blank(variant),
+                    vehicle_tags: vehicle_tags.filter(|tags| !tags.is_empty()),
                 }
             }
             Err(e) => {
@@ -1444,7 +1448,10 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             let mut cache = self.vehicle_properties_cache.write().await;
             if cache.len() >= VEHICLE_PROPS_CACHE_MAX_ENTRIES {
                 cache.retain(|_, (p, stamp)| {
-                    let ttl = if p.tag_number.is_some() || p.variant.is_some() {
+                    let ttl = if p.tag_number.is_some()
+                        || p.variant.is_some()
+                        || p.vehicle_tags.is_some()
+                    {
                         VEHICLE_PROPS_CACHE_DURATION
                     } else {
                         VEHICLE_PROPS_NEGATIVE_CACHE_DURATION
@@ -1533,6 +1540,7 @@ impl DBVehicleReaderInternal {
             driver_mobile_number,
             bus_tag_number: None,
             bus_vehicle_variant: None,
+            vehicle_tags: None,
         };
 
         Ok(response)

@@ -2339,6 +2339,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
     let props = resolve_vehicle_properties(&app_state, &gtfs_id, &vehicle_no).await;
     let bus_tag_number = props.tag_number;
     let bus_vehicle_variant = props.variant;
+    let vehicle_tags = props.vehicle_tags;
 
     let service_sub_types = app_state
         .vehicle_service_sub_types
@@ -2371,6 +2372,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         service_sub_types,
         bus_tag_number,
         bus_vehicle_variant,
+        vehicle_tags,
         is_actually_valid,
     }))
 }
@@ -2769,6 +2771,7 @@ async fn get_service_type_by_vehicle_impl(
     let props = resolve_vehicle_properties(&app_state, gtfs_id, vehicle_no).await;
     let bus_tag_number = props.tag_number;
     let bus_vehicle_variant = props.variant;
+    let vehicle_tags = props.vehicle_tags;
 
     // Get vehicle verification if requested
     let is_valid = if pass_verify_req {
@@ -2875,6 +2878,7 @@ async fn get_service_type_by_vehicle_impl(
                 seat_layout_id,
                 bus_tag_number,
                 bus_vehicle_variant,
+                vehicle_tags,
                 waybill_status: None,
                 is_historic: false,
                 schedule_based_active_trip: None,
@@ -2925,6 +2929,7 @@ async fn get_service_type_by_vehicle_impl(
                     seat_layout_id,
                     bus_tag_number,
                     bus_vehicle_variant,
+                    vehicle_tags,
                     waybill_status: None,
                     is_historic: false,
                     schedule_based_active_trip: None,
@@ -3048,6 +3053,7 @@ async fn get_service_type_by_vehicle_impl(
             seat_layout_id,
             bus_tag_number,
             bus_vehicle_variant,
+            vehicle_tags,
             waybill_status: vehicle_data.waybill_status,
             is_historic,
             schedule_based_active_trip: None,
@@ -3247,6 +3253,7 @@ async fn get_service_type_by_vehicle_impl(
         seat_layout_id,
         bus_tag_number,
         bus_vehicle_variant,
+        vehicle_tags,
         waybill_status: vehicle_data.waybill_status,
         is_historic,
         schedule_based_active_trip: None,
@@ -3552,6 +3559,7 @@ pub async fn get_waybill_metadata(
         resolve_vehicle_properties(&app_state, &gtfs_id, &waybill_metadata.vehicle_no).await;
     waybill_metadata.bus_tag_number = props.tag_number;
     waybill_metadata.bus_vehicle_variant = props.variant;
+    waybill_metadata.vehicle_tags = props.vehicle_tags;
 
     Ok(HttpResponse::Ok().json(waybill_metadata))
 }
@@ -4662,6 +4670,7 @@ pub struct QueryVehicleParams {
     pub vehicle_no: Option<String>,
     pub tag_number: Option<String>,
     pub fleet_no: Option<String>,
+    pub vehicle_tag: Option<String>,
 }
 
 #[utoipa::path(
@@ -4673,6 +4682,7 @@ pub struct QueryVehicleParams {
         ("vehicle_no" = Option<String>, Query, description = "Exact match on vehicle_no"),
         ("tag_number" = Option<String>, Query, description = "Exact match on tag_number"),
         ("fleet_no" = Option<String>, Query, description = "Exact match on fleet_no"),
+        ("vehicle_tag" = Option<String>, Query, description = "Vehicles whose vehicle_tags contain this tag code"),
     ),
     responses(
         (status = 200, description = "Matching vehicles (equality filters, AND-combined)", body = Vec<FleetRow>),
@@ -4697,6 +4707,7 @@ pub async fn query_vehicles(
     let vehicle_no = normalize(&query.vehicle_no);
     let tag_number = normalize(&query.tag_number);
     let fleet_no = normalize(&query.fleet_no);
+    let vehicle_tag = normalize(&query.vehicle_tag);
 
     let rows = app_state
         .operator_service
@@ -4705,6 +4716,7 @@ pub async fn query_vehicles(
             vehicle_no.as_deref(),
             tag_number.as_deref(),
             fleet_no.as_deref(),
+            vehicle_tag.as_deref(),
         )
         .await?;
     Ok(HttpResponse::Ok().json(rows))
