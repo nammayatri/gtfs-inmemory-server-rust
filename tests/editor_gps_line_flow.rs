@@ -1019,6 +1019,7 @@ async fn a_map_line_from_gps_end_to_end() {
         }))
     );
     assert_eq!(s, 201, "{b}");
+    // pings are read by route id, so a draft's new route number finds no buses
     let (s, b, _, _) = call!(
         &app,
         editor_c.req(
@@ -1026,7 +1027,20 @@ async fn a_map_line_from_gps_end_to_end() {
             &format!("/feeds/{GPS_FEED}/routes/R_OLD/polyline:gps?change_set={set_id}")
         )
     );
-    assert_eq!(s, 200, "the draft's route number finds the buses: {b}");
+    assert_eq!(
+        s, 422,
+        "the draft's route number does not pick the buses: {b}"
+    );
+    assert_eq!(code_of(&b), "gps_not_enough_runs");
+    assert_eq!(b["error"]["details"]["bus_days"], 0);
+    let (s, b, _, _) = call!(
+        &app,
+        editor_c.req(
+            "POST",
+            &format!("/feeds/{GPS_FEED}/routes/R_FWD/polyline:gps?change_set={set_id}")
+        )
+    );
+    assert_eq!(s, 200, "the route as the draft has it finds its buses: {b}");
     let old_line = b["encoded_polyline"].as_str().unwrap().to_string();
 
     // ---- into the draft as a gps line, approved and committed
