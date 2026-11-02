@@ -624,9 +624,12 @@ async fn run_locked(
     let title = title_for(now, trigger);
     let author = ctx.user.user_id;
     if trigger == Trigger::Scheduled {
+        // a week whose drafts were all discarded is not done: discarding them
+        // and running again is how a week is redone
         let titles: Vec<String> = sqlx::query_scalar(
             "SELECT title FROM gtfs_change_set \
-             WHERE gtfs_id = $1 AND created_by = $2 AND starts_with(title, $3)",
+             WHERE gtfs_id = $1 AND created_by = $2 AND starts_with(title, $3) \
+             AND status <> 'discarded'",
         )
         .bind(gtfs_id)
         .bind(author)

@@ -1866,6 +1866,7 @@ impl GpsLine {
             evidence["osrm_error"] = json!(e);
         }
         evidence["osrm_detours_skipped"] = json!(matched.detours);
+        evidence["osrm_off_path_skipped"] = json!(matched.off_path);
         evidence["points"] = json!(matched.points.len());
         evidence["length_m"] = json!(osrm::length_m(&matched.points).round());
         evidence["cached"] = json!(false);
