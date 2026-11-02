@@ -3062,6 +3062,7 @@ and it goes live when someone else approves and commits the draft.
     "buses": 7, "runs_seen": 94, "runs_used": 55,
     "stop_coverage": 0.978,
     "matched": "osrm", "matched_share": 0.992, "osrm_detours_skipped": 3,
+    "osrm_off_path_skipped": 0,
     "points": 1747, "length_m": 38050, "cached": false,
     "consolidation": {"cells": 3120, "cells_kept": 2410, "samples_off_corridor": 212,
                       "degraded": false, "runs_same_direction": 31, "runs_opposite_direction": 0}
@@ -3083,6 +3084,7 @@ and it goes live when someone else approves and commits the draft.
 | `matched` | `osrm` - snapped to roads all through; `partial` - some stretches kept the GPS geometry; `none` - OSRM matched nothing or is not configured: the GPS path as recorded |
 | `matched_share` | share of the line's length OSRM matched |
 | `osrm_detours_skipped` | stretches OSRM matched with a loop the buses did not drive, where the GPS path was kept (17.3) |
+| `osrm_off_path_skipped` | stretches OSRM matched onto another road than the buses', more than 40 m from the GPS path, where the GPS path was kept (17.3) |
 | `osrm_error` | the first thing OSRM said, when something went wrong |
 | `cached` | this answer came from the cache (17.4) |
 
@@ -3167,8 +3169,24 @@ OSRM also **invents detours**: a point put on the other carriageway, then a loop
 through the next U-turn to reach it. On real 21G data a 1.9 km stretch came back
 as an 8 km matching with confidence 0. A matched stretch longer than 1.5 times
 the GPS stretch it stands for plus 60 m is therefore refused and the GPS
-geometry kept (`osrm_detours_skipped`). `matched` is `osrm` when every chunk
-answered and at least 99% of the length was matched.
+geometry kept (`osrm_detours_skipped`).
+
+The length test cannot see a **side street**: a piece OSRM puts on a road
+parallel to the buses', 50-75 m off and barely longer. 102KCT (route 22,
+2026-W45) came back with a box down Subbu Street and a zigzag up a lane beside
+Shastri Nagar 1st Main Road, with straight diagonals back across the blocks where
+the next piece was refused - 342 m of its line more than 25 m from every one of
+its 15 runs, which all drove the main road. Replaying its runs through the same
+OSRM, every single run came back with 130-950 m of such pieces. So a matched
+stretch with any point more than 40 m from the GPS stretch it stands for is
+refused too, and so is a matching's first point that far from its GPS point
+(`osrm_off_path_skipped`): OSRM moves a point at most 25 m (`radiuses`), and the
+buses' own road, either carriageway, stays well inside 40 m. Replayed, route 22's
+runs keep 0-210 m beyond 25 m, none beyond 36 m, at a matched share of 0.92
+where it was 0.94.
+
+`matched` is `osrm` when every chunk answered and at least 99% of the length was
+matched.
 
 ### 17.4 Cost, safety and the cache
 
@@ -5428,7 +5446,9 @@ resident set size").
 
 It is this week's scheduled run: its drafts are titled `GPS polylines 2026-W41`
 (or `… (k/n)`, below), and a second run the same week finds them and stops
-(`AlreadyDone`). One run at a time:
+(`AlreadyDone`) - unless every one of them was discarded: discarding the week's
+drafts and running again is how a week is redone (2026-W45 was, after the
+side-street fix in 17.3). One run at a time:
 `pg_try_advisory_lock(hashtext('gps-polyline-sync:{gtfs_id}'))` (another is
 `Busy`). An admin can run it at once from the editor's API, `POST
 /internal/gtfs-editor/feeds/{g}/gps-polyline-sync` (SSO, admin) → 202; that run

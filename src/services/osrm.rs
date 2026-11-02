@@ -433,6 +433,9 @@ pub struct Matched {
     /// Stretches OSRM matched with a detour the buses did not take, where the
     /// GPS geometry was kept.
     pub detours: usize,
+    /// Stretches OSRM matched onto another road than the buses' (more than
+    /// [`OFF_PATH_M`] from the GPS), where the GPS geometry was kept.
+    pub off_path: usize,
     /// The first thing that went wrong, when something did.
     pub error: Option<String>,
 }
@@ -535,6 +538,18 @@ fn at(line: &[(f64, f64)], (i, t): (usize, f64)) -> (f64, f64) {
 const DETOUR_FACTOR: f64 = 1.5;
 const DETOUR_SLACK_M: f64 = 60.0;
 
+/// A matched stretch with a point farther than this from the GPS stretch it
+/// stands for is a road the buses did not take, and the GPS stretch is kept
+/// instead - however short it is. The length test above cannot see these: OSRM
+/// puts a piece on a side street parallel to the bus's road, 50-75 m off and
+/// barely longer (102KCT, route 22, 2026-W45: a box down Subbu Street and a
+/// zigzag up a lane beside Shastri Nagar 1st Main Road, diagonals back across
+/// the blocks where the next piece was refused; every one of its 15 runs drove
+/// the main road). A point is moved at most `radiuses` (25 m) and a carriageway
+/// is a few metres from its centre line, so a stretch on the bus's own road
+/// stays well inside 40 m.
+const OFF_PATH_M: f64 = 40.0;
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Stitched {
     pub line: Vec<(f64, f64)>,
@@ -542,6 +557,26 @@ pub struct Stitched {
     pub unmatched_m: f64,
     /// Matched stretches refused as detours.
     pub detours: usize,
+    /// Matched stretches, or a matching's first point, refused for leaving the
+    /// GPS path by more than [`OFF_PATH_M`].
+    pub off_path: usize,
+}
+
+/// The farthest any of `points` is from the polyline `path`.
+fn farthest_from(points: &[(f64, f64)], path: &[(f64, f64)]) -> f64 {
+    if path.len() < 2 {
+        return path.first().map_or(f64::INFINITY, |&q| {
+            points.iter().map(|&p| dist(p, q)).fold(0.0, f64::max)
+        });
+    }
+    points
+        .iter()
+        .map(|&p| {
+            path.windows(2)
+                .map(|w| seg_dist(p, w[0], w[1]).0)
+                .fold(f64::INFINITY, f64::min)
+        })
+        .fold(0.0, f64::max)
 }
 
 /// Stitch the chunks' answers into one line of planar points. `path` is the
@@ -553,7 +588,7 @@ pub fn stitch(
     answers: &[Option<ChunkMatch>],
 ) -> Stitched {
     let mut out: Vec<(f64, f64)> = Vec::new();
-    let (mut matched, mut unmatched, mut detours) = (0.0, 0.0, 0);
+    let (mut matched, mut unmatched, mut detours, mut off_path) = (0.0, 0.0, 0, 0);
     let mut push = |out: &mut Vec<(f64, f64)>, p: (f64, f64), is_match: bool| {
         if let Some(&last) = out.last() {
             let d = dist(last, p);
@@ -594,8 +629,14 @@ pub fn stitch(
                         last = q;
                     }
                     let gps_m: f64 = path[pi..=i].windows(2).map(|w| dist(w[0], w[1])).sum();
-                    if piece_m > DETOUR_FACTOR * gps_m + DETOUR_SLACK_M {
-                        detours += 1;
+                    let detour = piece_m > DETOUR_FACTOR * gps_m + DETOUR_SLACK_M;
+                    let off = !detour && farthest_from(&piece, &path[pi..=i]) > OFF_PATH_M;
+                    if detour || off {
+                        if detour {
+                            detours += 1;
+                        } else {
+                            off_path += 1;
+                        }
                         for q in &path[pi + 1..=i] {
                             push(&mut out, *q, false);
                         }
@@ -613,7 +654,15 @@ pub fn stitch(
                         push(&mut out, *p, false);
                     }
                     let pos = locate(geom, *loc, (0, 0.0));
-                    push(&mut out, at(geom, pos), false);
+                    // where a matching starts off the bus's road, the line would
+                    // jump there and back in straight lines: start it at the GPS
+                    let start_at = at(geom, pos);
+                    if dist(start_at, path[i]) > OFF_PATH_M {
+                        off_path += 1;
+                        push(&mut out, path[i], false);
+                    } else {
+                        push(&mut out, start_at, false);
+                    }
                     prev = Some((i, *m, pos));
                 }
             }
@@ -628,6 +677,7 @@ pub fn stitch(
         matched_m: matched,
         unmatched_m: unmatched,
         detours,
+        off_path,
     }
 }
 
@@ -647,6 +697,7 @@ pub async fn match_path(
         chunks: 0,
         chunks_failed: 0,
         detours: 0,
+        off_path: 0,
         error,
     };
     let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) else {
@@ -715,6 +766,7 @@ pub async fn match_path(
         matched_m: matched,
         unmatched_m: unmatched,
         detours,
+        off_path,
     } = stitch(&path_xy, &plan, &answers);
     let total = matched + unmatched;
     let share = if total > 0.0 { matched / total } else { 0.0 };
@@ -730,6 +782,7 @@ pub async fn match_path(
             chunks: plan.len(),
             chunks_failed: failed,
             detours,
+            off_path,
             ..as_is(error)
         };
     }
@@ -740,6 +793,7 @@ pub async fn match_path(
         chunks: plan.len(),
         chunks_failed: failed,
         detours,
+        off_path,
         error,
     }
 }
@@ -884,6 +938,81 @@ mod tests {
             "the loop is not in the line"
         );
         assert!((st.unmatched_m - 50.0).abs() < 10.0, "{}", st.unmatched_m);
+    }
+
+    /// One matching along `pts`, `shift` metres north of them, with a box
+    /// `off` metres south between `from` and `to` (the tracepoints between
+    /// tidied away), as OSRM answers when it prefers a parallel side street.
+    fn side_street(pts: &[(f64, f64)], shift: f64, from: usize, to: usize, off: f64) -> ChunkMatch {
+        let mut geom = Vec::new();
+        let mut tracepoints = Vec::new();
+        for (i, p) in pts.iter().enumerate() {
+            if i == to {
+                let (a, b) = (pts[from].0 + 5.0, p.0 - 5.0);
+                geom.extend([(a, -off), (b, -off)]);
+            }
+            let on_road = i <= from || i >= to;
+            if on_road {
+                geom.push((p.0, p.1 + shift));
+            }
+            tracepoints.push(on_road.then_some((0, (p.0, p.1 + shift))));
+        }
+        ChunkMatch {
+            tracepoints,
+            matchings: vec![geom],
+        }
+    }
+
+    #[test]
+    fn a_match_on_a_side_street_beside_the_buses_road_is_refused() {
+        let pts: Vec<(f64, f64)> = (0..60).map(|i| (i as f64 * 50.0, 0.0)).collect();
+        let plan = chunk_plan(pts.len(), 100, 8);
+        // 55 m off for 100 m of GPS: 200 m of piece, inside the detour test's
+        // 1.5 x 100 + 60 = 210 m, so only the off-path test refuses it
+        let st = stitch(&pts, &plan, &[Some(side_street(&pts, 3.0, 29, 31, 55.0))]);
+        assert_eq!((st.detours, st.off_path), (0, 1));
+        assert!(
+            st.line.iter().all(|q| q.1 > -10.0),
+            "the side street is not in the line: {:?}",
+            st.line.iter().filter(|q| q.1 <= -10.0).collect::<Vec<_>>()
+        );
+        assert!((st.unmatched_m - 100.0).abs() < 10.0, "{}", st.unmatched_m);
+
+        // the buses' own road drawn 20 m from the GPS (the other carriageway's
+        // centre line, a GPS offset) is still the match
+        let st = stitch(&pts, &plan, &[Some(fake_answer(&pts, &[]))]);
+        assert_eq!((st.detours, st.off_path, st.unmatched_m), (0, 0, 0.0));
+        let shifted = ChunkMatch {
+            tracepoints: pts.iter().map(|p| Some((0, (p.0, p.1 + 20.0)))).collect(),
+            matchings: vec![pts.iter().map(|p| (p.0, p.1 + 20.0)).collect()],
+        };
+        let st = stitch(&pts, &plan, &[Some(shifted)]);
+        assert_eq!((st.detours, st.off_path, st.unmatched_m), (0, 0, 0.0));
+    }
+
+    #[test]
+    fn a_matching_that_starts_on_another_road_starts_at_the_gps() {
+        let pts: Vec<(f64, f64)> = (0..20).map(|i| (i as f64 * 50.0, 0.0)).collect();
+        let plan = chunk_plan(pts.len(), 100, 8);
+        // points 0-9 in one matching on the road; 10-19 in a second one OSRM
+        // put on a street 60 m south
+        let near: Vec<(f64, f64)> = pts[..10].iter().map(|p| (p.0, p.1 + 3.0)).collect();
+        let far: Vec<(f64, f64)> = pts[10..].iter().map(|p| (p.0, p.1 - 60.0)).collect();
+        let answer = ChunkMatch {
+            tracepoints: (0..20)
+                .map(|i| {
+                    Some(if i < 10 {
+                        (0, near[i])
+                    } else {
+                        (1, far[i - 10])
+                    })
+                })
+                .collect(),
+            matchings: vec![near, far],
+        };
+        let st = stitch(&pts, &plan, &[Some(answer)]);
+        assert!(st.off_path >= 10, "{st:?}");
+        assert!(st.line.iter().all(|q| q.1 > -10.0), "{:?}", st.line);
     }
 
     #[test]
