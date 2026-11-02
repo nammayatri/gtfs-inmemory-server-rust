@@ -29,6 +29,7 @@ use crate::services::operator::QueryBody;
         routes::get_station_children,
         routes::get_alternate_stops,
         routes::get_routes_served_today,
+        routes::get_routes_served_today_v2,
         // Vehicle
         routes::get_service_type_by_vehicle,
         routes::get_service_type_by_vehicle_by_gtfs_id,

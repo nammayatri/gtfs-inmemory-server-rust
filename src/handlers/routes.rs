@@ -367,6 +367,10 @@ pub fn create_routes(cfg: &mut actix_web::web::ServiceConfig) {
                 web::scope("/v2/{gtfs_id}")
                     .route("/fleet/{fleet_no}", web::get().to(get_fleet_operation_v2))
                     .route("/depots", web::get().to(get_depots_v2))
+                    .route(
+                        "/routes-served-today",
+                        web::get().to(get_routes_served_today_v2),
+                    )
                     .route("/vehicles", web::get().to(get_fleet_vehicles_v2))
                     .route("/depots/{depot_id}", web::get().to(get_depot_by_id_v2))
                     .route(
@@ -5560,6 +5564,63 @@ pub async fn get_routes_served_today(app_state: Data<AppState>) -> AppResult<Htt
         .get_routes_served_today()
         .await?;
     Ok(HttpResponse::Ok().json(routes))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/{gtfs_id}/routes-served-today",
+    tag = "Routes",
+    params(("gtfs_id" = String, Path, description = "GTFS feed identifier")),
+    responses((status = 200, description = "Routes served today: operator feeds merge the external replica (unless internal-only) and internal tables (unless external-only); Chalo feeds list routes with a live trip in the Chalo cache, lastScheduleTime 23:59; empty otherwise"))
+)]
+pub async fn get_routes_served_today_v2(
+    app_state: Data<AppState>,
+    path: Path<String>,
+) -> AppResult<HttpResponse> {
+    let gtfs_id = strip_surrounding_quotes(&path.into_inner());
+    if is_chalo_gtfs_id(&gtfs_id) {
+        let mut seen = HashSet::new();
+        let routes: Vec<crate::models::RouteLastScheduleTime> = app_state
+            .chalo_vehicle_cache
+            .get_all_vehicles_by_gtfs_id(&gtfs_id)
+            .await
+            .into_iter()
+            .filter_map(|v| v.route_id)
+            .filter(|route_id| seen.insert(route_id.clone()))
+            .map(|route_id| crate::models::RouteLastScheduleTime {
+                route_id,
+                last_schedule_time: Some("23:59".to_string()),
+            })
+            .collect();
+        return Ok(HttpResponse::Ok().json(routes));
+    }
+    if SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
+        let external = if INTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str()) {
+            Vec::new()
+        } else {
+            app_state
+                .db_vehicle_reader
+                .get_routes_served_today()
+                .await?
+        };
+        let internal = if EXTERNAL_ONLY_GTFS_IDS.contains(&gtfs_id.as_str()) {
+            Vec::new()
+        } else {
+            app_state
+                .db_vehicle_reader_internal
+                .get_routes_served_today(&gtfs_id)
+                .await?
+        };
+        // Merge by route id: external first, then internal routes not already present.
+        let mut seen = HashSet::new();
+        let merged: Vec<_> = external
+            .into_iter()
+            .chain(internal)
+            .filter(|r| seen.insert(r.route_id.clone()))
+            .collect();
+        return Ok(HttpResponse::Ok().json(merged));
+    }
+    Ok(HttpResponse::Ok().json(Vec::<crate::models::RouteLastScheduleTime>::new()))
 }
 
 #[utoipa::path(

@@ -2679,7 +2679,7 @@ impl VehicleDataReader for DBVehicleReader {
                 SELECT bstd.route_number_id, bstd.end_time
                 FROM today t
                 JOIN bus_schedule_trip_detail bstd ON bstd.schedule_trip_id = t.schedule_trip_id
-                WHERE bstd.trip_type <> 'dead-trip'
+                WHERE NOT t.is_flexi AND bstd.trip_type <> 'dead-trip'
                 UNION ALL
                 SELECT bstf.route_number_id, bstf.end_time
                 FROM today t

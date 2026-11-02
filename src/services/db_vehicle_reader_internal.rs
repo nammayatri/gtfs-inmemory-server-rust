@@ -8,8 +8,8 @@ use sqlx::PgPool;
 use tracing::{debug, error, info, warn};
 
 use crate::models::{
-    BusSchedule, DepotInfo, DepotVehicleInfo, FleetOperationInfo, VehicleData,
-    VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse, WaybillStatus,
+    BusSchedule, DepotInfo, DepotVehicleInfo, FleetOperationInfo, RouteLastScheduleTime,
+    VehicleData, VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse, WaybillStatus,
     WaybillTripInfo,
 };
 use crate::services::operator::SUPPORTED_OPERATOR_GTFS_IDS;
@@ -97,6 +97,13 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         gtfs_id: &str,
     ) -> AppResult<Vec<ScheduledTrip>>;
     async fn warm_schedule_snapshots(&self) {}
+
+    async fn get_routes_served_today(
+        &self,
+        _gtfs_id: &str,
+    ) -> AppResult<Vec<RouteLastScheduleTime>> {
+        Ok(Vec::new())
+    }
 
     async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>>;
 
@@ -303,6 +310,8 @@ pub struct DBVehicleReaderInternal {
     schedule_snapshot: ScheduleSnapshotCache,
     station_eta_cache: Arc<RwLock<HashMap<String, (HashMap<(String, String), i32>, SystemTime)>>>,
     depot_cache: Arc<RwLock<InternalDepotCache>>,
+    routes_served_today_cache:
+        Arc<RwLock<HashMap<String, (Vec<RouteLastScheduleTime>, SystemTime)>>>,
 }
 
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
@@ -310,6 +319,7 @@ const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
 // 5 minutes. This service's own writes drop the cache (see clear_caches_after_write); the TTL
 // only bounds staleness from writes made by another pod.
 const DEPOT_CACHE_DURATION: u64 = 300;
+const ROUTES_SERVED_TODAY_CACHE_DURATION: u64 = 1800; // 30 mins, same as the external reader
 
 impl DBVehicleReaderInternal {
     pub fn new(pool: PgPool) -> Self {
@@ -318,6 +328,7 @@ impl DBVehicleReaderInternal {
             schedule_snapshot: ScheduleSnapshotCache::new(SCHEDULE_SNAPSHOT_TTL),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
+            routes_served_today_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -329,6 +340,7 @@ impl DBVehicleReaderInternal {
             schedule_snapshot: ScheduleSnapshotCache::new(SCHEDULE_SNAPSHOT_TTL),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
+            routes_served_today_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1235,6 +1247,79 @@ impl DBVehicleReaderInternal {
 
 #[async_trait]
 impl VehicleDataReaderInternal for DBVehicleReaderInternal {
+    async fn get_routes_served_today(
+        &self,
+        gtfs_id: &str,
+    ) -> AppResult<Vec<RouteLastScheduleTime>> {
+        if let Some((data, ts)) = self.routes_served_today_cache.read().await.get(gtfs_id) {
+            if ts.elapsed().unwrap_or_default()
+                < Duration::from_secs(ROUTES_SERVED_TODAY_CACHE_DURATION)
+            {
+                return Ok(data.clone());
+            }
+        }
+
+        let today_ist = {
+            let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+            chrono::Utc::now()
+                .with_timezone(&ist)
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+
+        // Same shape as the external reader's query, scoped to one feed in the _internal tables.
+        let query = r#"
+            WITH today AS MATERIALIZED (
+                SELECT waybill_id, schedule_trip_id, is_flexi
+                FROM waybills_internal
+                WHERE gtfs_id = $1 AND duty_date = $2 AND deleted = false
+            )
+            SELECT
+                route_number_id::text AS route_id,
+                MAX(end_time) AS last_schedule_time
+            FROM (
+                SELECT bstd.route_number_id, bstd.end_time
+                FROM today t
+                JOIN bus_schedule_trip_detail_internal bstd
+                    ON bstd.schedule_trip_id = t.schedule_trip_id AND bstd.gtfs_id = $1
+                WHERE NOT t.is_flexi AND bstd.trip_type <> 'dead-trip' AND bstd.deleted = false
+                UNION ALL
+                SELECT bstf.route_number_id, bstf.end_time
+                FROM today t
+                JOIN bus_schedule_trip_flexi_internal bstf
+                    ON bstf.waybill_id = t.waybill_id AND bstf.gtfs_id = $1
+                WHERE t.is_flexi AND bstf.trip_type <> 'dead-trip' AND bstf.deleted = false
+            ) combined
+            GROUP BY route_number_id
+            ORDER BY route_number_id
+        "#;
+
+        let routes = sqlx::query_as::<_, RouteLastScheduleTime>(query)
+            .bind(gtfs_id)
+            .bind(&today_ist)
+            .fetch_all(self.pool()?)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to query internal routes served today for {}: {}",
+                    gtfs_id, e
+                );
+                AppError::Internal(format!("Database query failed: {}", e))
+            })?;
+        info!(
+            "Found {} internal routes served today for {} ({})",
+            routes.len(),
+            gtfs_id,
+            today_ist
+        );
+
+        self.routes_served_today_cache
+            .write()
+            .await
+            .insert(gtfs_id.to_string(), (routes.clone(), SystemTime::now()));
+        Ok(routes)
+    }
+
     async fn warm_schedule_snapshots(&self) {
         futures::future::join_all(
             SUPPORTED_OPERATOR_GTFS_IDS
