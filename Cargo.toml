@@ -101,7 +101,7 @@ csv = "1.3"
 
 # GTFS zips in and out (docs/gtfs-editor.md section 18). Already in the tree
 # through utoipa-swagger-ui, with the same features.
-zip = { version = "3.0.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 
 # CPU detection for optimal worker count
 num_cpus = "1.0"
