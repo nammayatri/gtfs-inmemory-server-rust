@@ -309,6 +309,16 @@ export function deviationText(d) {
 // ------------------------------------------------------------------ route rules
 export const SERVED_EXCLUDE = new Set(["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"]);
 
+// How many rows of its last stage a route of two or more stages keeps: those up
+// to and including the stage's stage stop (a NEW STOP, or a JUMP STOP opening
+// it). A route ends where its last fare stage starts; the stops a shared stage
+// lists after that are for the routes going on through it. The server's
+// `last_stage_len` (docs section 19).
+export function lastStageLength(rows) {
+  const i = (rows || []).findIndex((r) => r.stop_type === "NEW STOP" || r.stop_type === "JUMP STOP");
+  return i < 0 ? (rows || []).length : i + 1;
+}
+
 // Which rows open a fare stage: every stage stop, and a jump stop with a stage
 // of its own (a number other than the stage open before it). A jump stop need
 // not have one: carrying the stage it is in, it opens nothing.

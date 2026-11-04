@@ -220,7 +220,9 @@ fn seed() -> Vec<String> {
         "INSERT INTO gtfs_route (gtfs_id, route_id, short_name, long_name, agency_id) VALUES \
          ('{FEED}', 'R1', '21G', 'A To D', 'AG')"
     ));
-    // R1 runs A B | C D, two fare stages. On a feed served from its stages
+    // R1 runs A B | C D, two fare stages, and ends at C: of its last stage it
+    // calls at the stage stop, and D is that stage's for routes going on
+    // (section 19). On a feed served from its stages
     // that is what its stages say and nothing else (migration 0027); the rows
     // in gtfs_route_stop are not read as stops, only for the provider id the
     // route's rows must keep.
@@ -424,10 +426,9 @@ async fn a_route_is_diverted_and_put_back() {
         vec![
             "1:A:NEW STOP:1:21",
             "2:B:INTERMEDIATE STOP:1:21",
-            "3:C:NEW STOP:2:21",
-            "4:D:INTERMEDIATE STOP:2:21"
+            "3:C:NEW STOP:2:21"
         ],
-        "the fixture is a route of two stages"
+        "the fixture is a route of two stages, ending at the second's stage stop"
     );
 
     // ======================================================== a diversion

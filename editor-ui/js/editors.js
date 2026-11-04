@@ -5,7 +5,7 @@ import { state, setLeaveGuard, usesStages } from "./state.js";
 import {
   h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, STOP_TYPE_LABEL, SERVED_EXCLUDE,
   validateRows, renumberStages, stageOpeners, decodePolyline, plural, ID_RE, ID_RULE,
-  PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField,
+  PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField, lastStageLength,
 } from "./util.js";
 import * as map from "./map.js";
 import { addChange, existingChange, createdChange, requireDraft, updateChange } from "./drafts.js";
@@ -878,10 +878,24 @@ export async function editRouteRows(route, { created = false } = {}) {
       stop_name_override: r.stop_name_override ?? null,
     });
     const sig = (list) => JSON.stringify(list.map((r) => [r.stop_id || null, r.stop_type, r.marker_id || null, r.stop_name_override || null]));
+    // The route ends at its last stage's stage stop (docs section 19): what it
+    // shows of that stage is the rows up to there, and the stops the stage lists
+    // after it are other routes'. So that is what the edited list is set against,
+    // and a stop added after it would never be called at.
+    const lastAt = stages.length - 1;
+    const lastRun = runs[lastAt].rows;
+    if (lastAt > 0 && lastStageLength(lastRun) < lastRun.length) {
+      const extra = lastRun.slice(lastStageLength(lastRun)).filter((r) => r.stop_id);
+      toast(`Route ${label} ends at the stage stop of its last fare stage, ${stages[lastAt].name}. ${extra.length ? `Take ${plural(extra.length, "stop")} off the end (${extra.map((r) => r.stop_id).join(", ")}), or add` : "Add"} the next fare stage with Change stages to go on.`, "error");
+      return true;
+    }
     const changed = [];
     runs.forEach((run, i) => {
       const next = run.rows.map(asStage);
-      if (sig(next) !== sig(stages[i].rows || [])) changed.push({ stage: stages[i], rows: next });
+      const had = stages[i].rows || [];
+      const cut = i === lastAt && i > 0 ? lastStageLength(had) : had.length;
+      // what the stage lists past this route's end stays for the routes going on
+      if (sig(next) !== sig(had.slice(0, cut))) changed.push({ stage: stages[i], rows: next, tail: had.slice(cut).map(asStage) });
     });
     if (!changed.length) {
       toast("Nothing in the stop list changed.");
@@ -915,7 +929,7 @@ export async function editRouteRows(route, { created = false } = {}) {
       const alone = (c.stage.route_count || 0) <= 1;
       const res = alone || everyRoute
         // the stage itself changes, for every route running it
-        ? await addChange({ entity: "stage", op: "update", entity_key: key, after: { rows: c.rows } })
+        ? await addChange({ entity: "stage", op: "update", entity_key: key, after: { rows: c.rows.concat(c.tail) } })
         // this route alone moves onto a stage of its own carrying these stops
         : await addChange({
           entity: "stage", op: "split", entity_key: "",
