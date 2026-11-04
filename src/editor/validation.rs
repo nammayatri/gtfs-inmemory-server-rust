@@ -688,14 +688,40 @@ pub fn stored_stage_rows(stage_id: &str, rows: &[StageRow]) -> Vec<StageRow> {
         .collect()
 }
 
+/// How many rows of its last stage a route of two or more stages keeps: those up
+/// to and including the stage's stage stop (its NEW STOP, or a JUMP STOP that
+/// opens it). A route ends where its last fare stage starts. A stage is shared by
+/// every route running it, and the stops it lists after its stage stop are for the
+/// routes that carry on through it: route 545 ending at ADYAR DEPOT took
+/// THIRUVANMIYUR JAYANTHI THEATRE and L.B ROAD from the routes going on. A stage
+/// with no stage stop is kept whole.
+pub fn last_stage_len<'a>(stop_types: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut n = 0;
+    for t in stop_types {
+        n += 1;
+        if t == NEW_STOP || t == JUMP_STOP {
+            return n;
+        }
+    }
+    n
+}
+
 /// A route's rows from its stages, in order: every row of each stage, carrying
-/// the route's number for that stage and the stage's name. The provider id is
-/// the route's, filled in when the rows are written.
+/// the route's number for that stage and the stage's name - of the last stage
+/// only the rows up to its stage stop ([`last_stage_len`]), when there are two
+/// or more. The provider id is the route's, filled in when the rows are written.
 pub fn flatten_stages<'a>(
     stages: impl IntoIterator<Item = (i32, &'a str, &'a [StageRow])>,
 ) -> Vec<RouteRow> {
+    let stages: Vec<(i32, &str, &[StageRow])> = stages.into_iter().collect();
+    let last = stages.len().saturating_sub(1);
     let mut out = Vec::new();
-    for (stage_no, name, rows) in stages {
+    for (k, (stage_no, name, rows)) in stages.into_iter().enumerate() {
+        let rows = if k == last && k > 0 {
+            &rows[..last_stage_len(rows.iter().map(|r| r.stop_type.as_str()))]
+        } else {
+            rows
+        };
         for r in rows {
             out.push(RouteRow {
                 stop_id: r.stop_id.clone(),
@@ -2265,6 +2291,66 @@ mod tests {
         );
         // what a stage makes is a route the route rules accept
         assert!(check_route_rows(&rows).is_empty());
+    }
+
+    #[test]
+    fn a_route_ends_at_its_last_stages_stage_stop() {
+        let stops = |rows: &[RouteRow]| {
+            rows.iter()
+                .map(|r| r.stop_id.clone().unwrap_or_else(|| "rc".into()))
+                .collect::<Vec<_>>()
+        };
+        let marker = StageRow {
+            marker_lat: Some(13.0),
+            marker_lon: Some(80.2),
+            ..stage_row(None, "ROUTE CORRECTION")
+        };
+        let first = [
+            stage_row(Some("A"), "NEW STOP"),
+            stage_row(Some("B"), "INTERMEDIATE STOP"),
+        ];
+        // ADYAR DEPOT as the routes going on through it list it
+        let depot = [
+            stage_row(Some("D"), "NEW STOP"),
+            marker.clone(),
+            stage_row(Some("J"), "INTERMEDIATE STOP"),
+            stage_row(Some("L"), "INTERMEDIATE STOP"),
+        ];
+        // a route ending there stops at the depot
+        let ends = flatten_stages([(1, "ONE", &first[..]), (2, "DEPOT", &depot[..])]);
+        assert_eq!(stops(&ends), ["A", "B", "D"]);
+        assert!(check_route_rows(&ends).is_empty());
+        // a route going on through it keeps every stop it lists
+        let next = [stage_row(Some("T"), "NEW STOP")];
+        let through = flatten_stages([
+            (1, "ONE", &first[..]),
+            (2, "DEPOT", &depot[..]),
+            (3, "NEXT", &next[..]),
+        ]);
+        assert_eq!(stops(&through), ["A", "B", "D", "rc", "J", "L", "T"]);
+        // a route of one stage has no last stage apart from its first
+        let alone = flatten_stages([(1, "DEPOT", &depot[..])]);
+        assert_eq!(stops(&alone), ["D", "rc", "J", "L"]);
+        // a marker before the stage stop still draws the way into it
+        let shaped = [
+            marker.clone(),
+            stage_row(Some("D"), "NEW STOP"),
+            marker.clone(),
+        ];
+        let rows = flatten_stages([(1, "ONE", &first[..]), (2, "DEPOT", &shaped[..])]);
+        assert_eq!(stops(&rows), ["A", "B", "rc", "D"]);
+        // a jump stop opening the last stage is where the route ends
+        let jump = [
+            stage_row(Some("V"), "JUMP STOP"),
+            stage_row(Some("W"), "INTERMEDIATE STOP"),
+        ];
+        let rows = flatten_stages([(1, "ONE", &first[..]), (2, "JUMP", &jump[..])]);
+        assert_eq!(stops(&rows), ["A", "B", "V"]);
+        // a last stage with no stage stop is kept whole
+        let none = [stage_row(Some("X"), "INTERMEDIATE STOP")];
+        let rows = flatten_stages([(1, "ONE", &first[..]), (2, "NONE", &none[..])]);
+        assert_eq!(stops(&rows), ["A", "B", "X"]);
+        assert_eq!(last_stage_len([]), 0);
     }
 
     #[test]

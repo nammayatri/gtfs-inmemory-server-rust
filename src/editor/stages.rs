@@ -18,9 +18,9 @@ use super::service::{
     load_routes_rows, write_route_rows, write_routes_rows, ApplyError, Page,
 };
 use super::validation::{
-    check_route_rows, check_stage_rows, flatten_stages, grade_against_live, mint_stage_id as mint,
-    stage_numbers, stored_stage_rows, Finding, Level, RouteRow, StageLink, StageRow,
-    UNSERVED_TYPES,
+    check_route_rows, check_stage_rows, flatten_stages, grade_against_live, last_stage_len,
+    mint_stage_id as mint, stage_numbers, stored_stage_rows, Finding, Level, RouteRow, StageLink,
+    StageRow, UNSERVED_TYPES,
 };
 use super::EditorState;
 use serde_json::{json, Value};
@@ -484,9 +484,10 @@ pub async fn flatten_route(
     route_id: &str,
     variant: Option<&str>,
 ) -> Result<Vec<RouteRow>, sqlx::Error> {
-    sqlx::query(
-        "SELECT rs.stage_no, st.name AS stage_name, ss.stop_id, ss.stop_type, ss.marker_id, \
-                ss.marker_name, ss.marker_lat, ss.marker_lon, ss.stop_name_override \
+    let rows = sqlx::query(
+        "SELECT rs.position AS link_position, rs.stage_no, st.name AS stage_name, ss.stop_id, \
+                ss.stop_type, ss.marker_id, ss.marker_name, ss.marker_lat, ss.marker_lon, \
+                ss.stop_name_override \
          FROM gtfs_route_stage rs \
          JOIN gtfs_stage st ON st.gtfs_id = rs.gtfs_id AND st.stage_id = rs.stage_id \
                            AND st.direction = rs.direction \
@@ -502,8 +503,26 @@ pub async fn flatten_route(
     .fetch_all(&mut *conn)
     .await?
     .iter()
-    .map(flattened_row)
-    .collect()
+    .map(|r| Ok((r.try_get("link_position")?, flattened_row(r)?)))
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok(end_at_stage_stop(rows))
+}
+
+/// A route's rows read with the position of the stage each came from, in order,
+/// cut as [`flatten_stages`] cuts them: of the last of two or more stages, only
+/// the rows up to its stage stop.
+pub fn end_at_stage_stop(rows: Vec<(i32, RouteRow)>) -> Vec<RouteRow> {
+    let (Some(first), Some(last)) = (rows.first().map(|r| r.0), rows.last().map(|r| r.0)) else {
+        return Vec::new();
+    };
+    // rows come ordered by stage position, so the last stage's rows are the tail
+    let start = rows.iter().position(|(p, _)| *p == last).unwrap_or(0);
+    let keep = if first == last {
+        rows.len()
+    } else {
+        start + last_stage_len(rows[start..].iter().map(|(_, r)| r.stop_type.as_str()))
+    };
+    rows.into_iter().take(keep).map(|(_, r)| r).collect()
 }
 
 /// A route row as a stage list makes it.
@@ -531,15 +550,16 @@ pub async fn flatten_routes(
     g: &str,
     lists: &[(String, Option<String>)],
 ) -> Result<HashMap<String, Vec<RouteRow>>, sqlx::Error> {
-    let mut out: HashMap<String, Vec<RouteRow>> = HashMap::new();
+    let mut read: HashMap<String, Vec<(i32, RouteRow)>> = HashMap::new();
     if lists.is_empty() {
-        return Ok(out);
+        return Ok(HashMap::new());
     }
     let routes: Vec<&str> = lists.iter().map(|(r, _)| r.as_str()).collect();
     let variants: Vec<Option<&str>> = lists.iter().map(|(_, v)| v.as_deref()).collect();
     for r in sqlx::query(
-        "SELECT rs.route_id, rs.stage_no, st.name AS stage_name, ss.stop_id, ss.stop_type, \
-                ss.marker_id, ss.marker_name, ss.marker_lat, ss.marker_lon, ss.stop_name_override \
+        "SELECT rs.route_id, rs.position AS link_position, rs.stage_no, st.name AS stage_name, \
+                ss.stop_id, ss.stop_type, ss.marker_id, ss.marker_name, ss.marker_lat, \
+                ss.marker_lon, ss.stop_name_override \
          FROM UNNEST($2::text[], $3::text[]) AS w(route_id, variant_id) \
          JOIN gtfs_route_stage rs ON rs.gtfs_id = $1 AND rs.route_id = w.route_id \
                                  AND rs.variant_id IS NOT DISTINCT FROM w.variant_id \
@@ -556,11 +576,14 @@ pub async fn flatten_routes(
     .await?
     .iter()
     {
-        out.entry(r.try_get("route_id")?)
+        read.entry(r.try_get("route_id")?)
             .or_default()
-            .push(flattened_row(r)?);
+            .push((r.try_get("link_position")?, flattened_row(r)?));
     }
-    Ok(out)
+    Ok(read
+        .into_iter()
+        .map(|(route, rows)| (route, end_at_stage_stop(rows)))
+        .collect())
 }
 
 /// What a stage change does to the routes it reaches, once the stages are
@@ -2726,6 +2749,52 @@ mod tests {
             provider_id: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rows_read_by_stage_end_where_flatten_stages_ends_them() {
+        let typ = |rows: &[RouteRow]| {
+            rows.iter()
+                .map(|r| r.stop_id.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let a = row("A", "NEW STOP", 1, "ONE");
+        let b = row("B", "INTERMEDIATE STOP", 1, "ONE");
+        let d = row("D", "NEW STOP", 2, "DEPOT");
+        let j = row("J", "INTERMEDIATE STOP", 2, "DEPOT");
+        let read = |p: &[i32], r: &[&RouteRow]| -> Vec<(i32, RouteRow)> {
+            p.iter()
+                .copied()
+                .zip(r.iter().map(|x| (*x).clone()))
+                .collect()
+        };
+        // the last stage ends at its stage stop
+        let rows = end_at_stage_stop(read(&[1, 1, 2, 2], &[&a, &b, &d, &j]));
+        assert_eq!(typ(&rows), ["A", "B", "D"]);
+        // the same stage twice in a list is two stages: the second is the last
+        let twice = end_at_stage_stop(read(&[1, 1, 2, 2], &[&a, &b, &a, &b]));
+        assert_eq!(typ(&twice), ["A", "B", "A"]);
+        // one stage, or none, is left as read
+        assert_eq!(
+            typ(&end_at_stage_stop(read(&[3, 3], &[&d, &j]))),
+            ["D", "J"]
+        );
+        assert!(end_at_stage_stop(Vec::new()).is_empty());
+        // and it agrees with the rows a route_stages replace writes
+        let sr = |r: &RouteRow| StageRow {
+            stop_id: r.stop_id.clone(),
+            stop_type: r.stop_type.clone(),
+            marker_id: None,
+            marker_name: None,
+            marker_lat: None,
+            marker_lon: None,
+            stop_name_override: None,
+        };
+        let (one, depot) = ([sr(&a), sr(&b)], [sr(&d), sr(&j)]);
+        assert_eq!(
+            flatten_stages([(1, "ONE", &one[..]), (2, "DEPOT", &depot[..])]),
+            rows
+        );
     }
 
     #[test]

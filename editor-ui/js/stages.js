@@ -5,7 +5,7 @@
 // using it. A route not built from stages yet keeps the stop-by-stop editor.
 import { get, enc } from "./api.js";
 import { state, can, setLeaveGuard } from "./state.js";
-import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERVED_EXCLUDE, idKind } from "./util.js";
+import { h, clear, toast, confirmDialog, debounce, plural, STOP_TYPE_LABEL, SERVED_EXCLUDE, idKind, lastStageLength } from "./util.js";
 import * as map from "./map.js";
 import { addChange, updateChange, existingChange, createdChange, createdStages, requireDraft, stageKey, stageChanges, sameStageKey } from "./drafts.js";
 import { stopPicker } from "./picker.js";
@@ -62,9 +62,25 @@ function stopList(rows) {
     r.stop_deleted ? h("span.chip.error", "deleted stop") : null)));
 }
 
-// A route drawn from its stages: every row of each stage with the route's number.
+// A route drawn from its stages: every row of each stage with the route's
+// number - of the last of two or more stages, only the rows up to its stage stop.
 function flatten(links) {
-  return links.flatMap((l) => (l.rows || []).map((r) => ({ ...r, stage_no: l.stage_no, stage_name: l.name })));
+  return links.flatMap((l, k) => {
+    const rows = l.rows || [];
+    const kept = k > 0 && k === links.length - 1 ? rows.slice(0, lastStageLength(rows)) : rows;
+    return kept.map((r) => ({ ...r, stage_no: l.stage_no, stage_name: l.name }));
+  });
+}
+
+// Under a route's last stage, when the stage lists stops after its stage stop:
+// the route ends at the stage stop and does not call at them.
+function endsHereNote(stages, i) {
+  if (i === 0 || i !== stages.length - 1) return null;
+  const rows = stages[i].rows || [];
+  const n = lastStageLength(rows);
+  const after = rows.slice(n).filter((r) => r.stop_id);
+  if (!after.length) return null;
+  return h("span.sub", `This route ends at ${rowName(rows[n - 1])}. The ${plural(after.length, "stop")} the stage lists after it (${after.map(rowName).join(", ")}) are for routes going on.`);
 }
 
 // ------------------------------------------------------------------ on the route page
@@ -78,12 +94,13 @@ export function stageListView(stages) {
     const ops = stageChanges(stageKey(s)).map((c) => c.op);
     return ops.includes("create") || ops.includes("split") ? "create" : ops[0] || null;
   };
-  return h("ol.stage-list", (stages || []).map((s) => h("li.list-item",
+  return h("ol.stage-list", (stages || []).map((s, i) => h("li.list-item",
     h("span.key", { "aria-label": `Fare stage ${s.stage_no}` }, String(s.stage_no)),
     h("a", { href: `#/stage/${enc(s.stage_key || s.stage_id)}` }, s.name),
     h("span.item-end", draftOp(s) ? h("span.chip.draft", draftOp(s) === "create" ? "new in draft" : "changed in draft") : null,
       h("span.hint", s.route_count > 1 ? `shared by ${plural(s.route_count, "route")}` : "only this route")),
     h("span.sub", `${plural(s.stop_count, "stop")}: ${(s.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`),
+    endsHereNote(stages, i),
     (s.rows || []).some((r) => r.unserviceable)
       ? h("span.sub.out-of-use-line", `${plural((s.rows || []).filter((r) => r.unserviceable).length, "stop")} out of use: ${(s.rows || []).filter((r) => r.unserviceable).map(rowName).join(", ")}`)
       : null)));
@@ -175,7 +192,8 @@ export async function editRouteStages(route, { created = false, variant = null, 
         h("button.btn.quiet.small", { type: "button", disabled: i === 0, "aria-label": `Move ${l.name} up`, on: { click: () => { [links[i - 1], links[i]] = [links[i], links[i - 1]]; edited(); } } }, "↑"),
         h("button.btn.quiet.small", { type: "button", disabled: i === links.length - 1, "aria-label": `Move ${l.name} down`, on: { click: () => { [links[i + 1], links[i]] = [links[i], links[i + 1]]; edited(); } } }, "↓"),
         h("button.btn.quiet.small", { type: "button", "aria-label": `Take ${l.name} off the route`, on: { click: () => { links.splice(i, 1); edited(); } } }, "Remove")),
-      h("span.sub", `${l.stage_id}${l.direction ? ` (${l.direction})` : ""} · ${plural((l.rows || []).filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length, "stop")}: ${(l.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`)))
+      h("span.sub", `${l.stage_id}${l.direction ? ` (${l.direction})` : ""} · ${plural((l.rows || []).filter((r) => !SERVED_EXCLUDE.has(r.stop_type)).length, "stop")}: ${(l.rows || []).filter((r) => r.stop_id).map(rowName).join(", ")}`),
+      endsHereNote(links, i)))
       : h("li.empty-route", h("p", "No stages yet. Add the first one below; it is fare stage 1.")));
     map.showRoute({ ...route, rows }, { fit: rows.some((r) => r.lat != null) });
   };

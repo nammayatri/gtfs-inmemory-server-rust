@@ -21,8 +21,8 @@ use super::stages::StageKey;
 use super::trips::{self, check_trips, TripRules, TripSpec};
 use super::validation::{
     check_payload, check_route_rows_for, check_route_rows_labelled, check_stage_rows,
-    grade_against_live, Finding, Level, RouteRow, StageLink, StageRow, INTERMEDIATE_STOP,
-    JUMP_STOP, NEW_STOP, ROUTE_CORRECTION,
+    grade_against_live, last_stage_len, Finding, Level, RouteRow, StageLink, StageRow,
+    INTERMEDIATE_STOP, JUMP_STOP, NEW_STOP, ROUTE_CORRECTION,
 };
 use super::EditorState;
 use crate::gtfs::spec;
@@ -1643,13 +1643,71 @@ async fn through_stages(
             .collect()
     };
 
+    // A route ends at the stage stop of its last stage (section 19): of that
+    // stage it calls at the rows up to there, and the stops the stage lists after
+    // it are the routes' going on. So that is what the list is set against, and
+    // a list going on past it names stops the route would never call at.
+    let last = stages.len().saturating_sub(1);
+    let types = |list: &[Value]| -> Vec<String> {
+        list.iter()
+            .map(|r| r["stop_type"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    if last > 0 {
+        let run: Vec<Value> = runs[last].1.iter().map(|r| (*r).clone()).collect();
+        let t = types(&run);
+        let keep = last_stage_len(t.iter().map(String::as_str));
+        if keep < run.len() {
+            let extra: Vec<&str> = run[keep..]
+                .iter()
+                .filter_map(|r| r["stop_id"].as_str())
+                .collect();
+            return Ok(Err(Finding::error(
+                "route_ends_past_stage_stop",
+                route_id,
+                format!(
+                    "route {route_id} ends at the stage stop of its last fare stage, {}, and this \
+                     list goes on past it ({}). A route does not run on past where its last fare \
+                     stage starts: end the list there, or add the next fare stage to the route's \
+                     stages in the dashboard",
+                    stages[last]["name"].as_str().unwrap_or(""),
+                    if extra.is_empty() {
+                        "route corrections".to_string()
+                    } else {
+                        extra.join(", ")
+                    }
+                ),
+            )));
+        }
+    }
+
     let mut out = Vec::new();
-    for ((_, run), stage) in runs.iter().zip(&stages) {
+    for (k, ((_, run), stage)) in runs.iter().zip(&stages).enumerate() {
         let next: Vec<Value> = run.iter().map(|r| as_stage(r)).collect();
-        let was = stage["rows"].as_array().cloned().unwrap_or_default();
-        if shape(&next) == shape(&was) {
+        let had = stage["rows"].as_array().cloned().unwrap_or_default();
+        let cut = if k == last && k > 0 {
+            last_stage_len(types(&had).iter().map(String::as_str))
+        } else {
+            had.len()
+        };
+        if shape(&next) == shape(&had[..cut]) {
             continue;
         }
+        // what the stage lists past this route's end stays for the routes going on
+        let tail: Vec<Value> = had[cut..]
+            .iter()
+            .map(|r| {
+                json!({
+                    "stop_id": r["stop_id"],
+                    "stop_type": r["stop_type"],
+                    "marker_id": r["marker_id"],
+                    "marker_name": r["marker_name"],
+                    "marker_lat": r["marker_lat"],
+                    "marker_lon": r["marker_lon"],
+                    "stop_name_override": r["stop_name_override"],
+                })
+            })
+            .collect();
         let key = stage["stage_key"].as_str().unwrap_or("").to_string();
         let shared = stage["route_count"].as_i64().unwrap_or(0) > 1;
         if shared {
@@ -1675,7 +1733,7 @@ async fn through_stages(
                 entity: "stage",
                 op: "update",
                 key: Some(key),
-                after: json!({"rows": next}),
+                after: json!({"rows": next.into_iter().chain(tail).collect::<Vec<_>>()}),
                 before: stage.clone(),
                 base: stage["row_version"].as_i64().map(|v| v as i32),
             });

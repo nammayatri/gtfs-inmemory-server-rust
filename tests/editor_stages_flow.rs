@@ -1205,6 +1205,146 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
         ed.req("POST", &format!("/change-sets/{d_st2}/discard"))
     );
 
+    // ======================================================== a route ends at its last stage's stage stop
+    // its own boxed future: the flow is one async fn, and inline this step
+    // made its state too big for a test thread's stack
+    Box::pin(async {
+        // DEPOT is shared: R6 runs on through it, R5 ends there. The stops DEPOT
+        // lists after its stage stop are R6's; R5 calls at the stage stop and stops.
+        exec(
+            &pool,
+            &[format!(
+                "INSERT INTO gtfs_route (gtfs_id, route_id, short_name, long_name, agency_id) VALUES \
+                 ('{FEED}', 'R5', '5', 'A To DEPOT', 'AG'), ('{FEED}', 'R6', '6', 'A To E via DEPOT', 'AG')"
+            )],
+        )
+        .await;
+        let d16 = draft!("a route ending at a shared stage");
+        for (key, name, rows) in [
+            (
+                "stg_end_from",
+                "FROM",
+                stops(&[("A", "NEW STOP"), ("F", "INTERMEDIATE STOP")]),
+            ),
+            (
+                "stg_end_depot",
+                "DEPOT",
+                stops(&[
+                    ("C", "NEW STOP"),
+                    ("D", "INTERMEDIATE STOP"),
+                    ("X", "INTERMEDIATE STOP"),
+                ]),
+            ),
+            ("stg_end_on", "ON", stops(&[("E", "NEW STOP")])),
+        ] {
+            added!(
+                d16,
+                json!({"entity": "stage", "op": "create", "entity_key": key,
+                       "after": {"name": name, "rows": rows}})
+            );
+        }
+        let b = added!(
+            d16,
+            json!({"entity": "route_stages", "op": "replace", "entity_key": "R5", "after": {
+                "stages": [{"stage_id": "stg_end_from"}, {"stage_id": "stg_end_depot"}],
+                "base_stages_hash": EMPTY_HASH}})
+        );
+        assert!(findings(&b, "error").is_empty(), "{b}");
+        added!(
+            d16,
+            json!({"entity": "route_stages", "op": "replace", "entity_key": "R6", "after": {
+                "stages": [{"stage_id": "stg_end_from"}, {"stage_id": "stg_end_depot"},
+                           {"stage_id": "stg_end_on"}],
+                "base_stages_hash": EMPTY_HASH}})
+        );
+        // the draft shows R5 as it will be served
+        let (_, p, _) = call!(
+            &app,
+            ed.req("GET", &format!("/change-sets/{d16}/preview/routes/R5"))
+        );
+        assert_eq!(p["rows"].as_array().unwrap().len(), 3, "{p}");
+        let (s, b) = ship!(d16);
+        assert_eq!(s, 200, "commit: {b}");
+        assert_eq!(
+            route_rows(&pool, "R5").await,
+            [
+                "A/NEW STOP/1/FROM",
+                "F/INTERMEDIATE STOP/1/FROM",
+                "C/NEW STOP/2/DEPOT"
+            ],
+            "R5 ends at DEPOT's stage stop"
+        );
+        assert_eq!(
+            route_rows(&pool, "R6").await,
+            [
+                "A/NEW STOP/1/FROM",
+                "F/INTERMEDIATE STOP/1/FROM",
+                "C/NEW STOP/2/DEPOT",
+                "D/INTERMEDIATE STOP/2/DEPOT",
+                "X/INTERMEDIATE STOP/2/DEPOT",
+                "E/NEW STOP/3/ON"
+            ],
+            "R6 goes on through DEPOT and calls at all of it"
+        );
+        // the whole-feed read agrees with the one by route
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                format!("SELECT count(*) FROM gtfs_route_stop_effective_all WHERE gtfs_id = '{FEED}' AND route_id = 'R5'")
+            )
+            .await,
+            3
+        );
+        // ...and with the route as its stages are read: in sync
+        let (_, rs, _) = call!(
+            &app,
+            ed.req("GET", &format!("/feeds/{FEED}/routes/R5/stages"))
+        );
+        assert_eq!(rs["in_sync"], true, "{rs}");
+        // An uploaded list is set against what R5 calls at: taking F out changes
+        // FROM alone, not DEPOT, whose stops past C are R6's.
+        let r5_upload = |list: &[(&str, &str, i64, &str)]| -> Value {
+            json!({"kind": "route_stops", "dry_run": true, "rows": list.iter().enumerate().map(|(i, (id, t, no, name))| {
+                json!({"action": "update", "route_id": "R5", "sequence": i + 1, "stop_id": id,
+                       "stop_type": t, "stage_no": no, "stage_name": name})
+            }).collect::<Vec<_>>()})
+        };
+        let d17 = draft!("R5's stop list");
+        let (s, out, _) = call!(
+            &app,
+            ed.req("POST", &format!("/change-sets/{d17}/bulk"))
+                .set_json(r5_upload(&[
+                    ("A", "NEW STOP", 1, "FROM"),
+                    ("C", "NEW STOP", 2, "DEPOT")
+                ]))
+        );
+        assert_eq!(s, 200, "{out}");
+        let changes = out["changes_preview"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "only FROM changes: {out}");
+        assert_eq!(
+            // a stage of no direction is keyed with an empty one
+        changes[0]["after"]["from_stage_id"], "stg_end_from|",
+            "{out}"
+        );
+        // a list going on past DEPOT's stage stop names stops R5 would never call at
+        let (_, out, _) = call!(
+            &app,
+            ed.req("POST", &format!("/change-sets/{d17}/bulk"))
+                .set_json(r5_upload(&[
+                    ("A", "NEW STOP", 1, "FROM"),
+                    ("F", "INTERMEDIATE STOP", 1, "FROM"),
+                    ("C", "NEW STOP", 2, "DEPOT"),
+                    ("D", "INTERMEDIATE STOP", 2, "DEPOT")
+                ]))
+        );
+        assert_eq!(
+            out["rows"][0]["messages"][0]["code"], "route_ends_past_stage_stop",
+            "{out}"
+        );
+        call!(&app, ed.req("POST", &format!("/change-sets/{d17}/discard")));
+    })
+    .await;
+
     // ======================================================== and a feed that does not use stages has none
     exec(
         &pool,

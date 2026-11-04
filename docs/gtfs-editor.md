@@ -4244,11 +4244,42 @@ same transaction, as
 for each gtfs_route_stage of the route, by position:
   for each gtfs_stage_stop of its stage, by position:
     one gtfs_route_stop row, with the link's stage_no and the stage's name
+  - except the last of two or more stages, whose rows stop at its stage stop
 ```
 
 with the route's `provider_id` and the per-row provenance kept exactly as a
 `route_stops` replace keeps them. Nothing a reader sees changes shape, and a feed
 whose routes are not built from stages serves exactly what it served before.
+
+**A route ends at the stage stop of its last stage** (2026-11-04). Of a route's
+last stage it takes only the rows up to and including the stage's stage stop -
+its NEW STOP, or a JUMP STOP that opens it; markers before that stop are kept, so
+the way in is still drawn. A stage is shared by every route running it, and the
+stops it lists after its stage stop belong to the routes that carry on through
+it: on master v102, 294 of the 3,716 routes built from stages called at 1-8
+stops past their last stage stop (625 stop calls, from 26 stages; 5 more ended
+on route corrections) (route 545 ended at ADYAR DEPOT and
+then called at THIRUVANMIYUR JAYANTHI THEATRE and L.B ROAD, the stops of routes
+going on). A route of one stage keeps it whole, and so does a last stage with no
+stage stop. `validation::last_stage_len` is the rule, and every flattening
+applies it:
+
+- what is served on a feed that uses stages: the views
+  `gtfs_route_stop_effective` and `gtfs_route_stop_from_stages` (under
+  `gtfs_route_stop_effective_all`), redefined by
+  `db/gtfs_editor/0036_route_ends_at_stage_stop.sql`. Measured on master v102's
+  routes: both views give every route exactly the rule's rows (98,851 -> 98,211
+  rows, on 299 routes), and a read by stop, by route and of the whole feed
+  took 0.67, 0.70 and 216 ms against 0.37, 0.65 and 142 ms before;
+- `flatten_stages` (what a `route_stages` replace checks and writes) and
+  `stages::flatten_route` / `flatten_routes` (what a stage edit checks, and what
+  "in sync" is measured against);
+- the dashboard (`js/util.js` `lastStageLength`): the preview of a route's
+  stages, a note under a route's last stage naming the stops it does not call
+  at, and the stop-list editor (section 19's uploads, below).
+
+Apply 0036 with the build that has the rule: until both are in, `in_sync` reads
+false on the routes the rule shortens.
 
 ### Two kinds of route
 
@@ -4463,6 +4494,14 @@ is never assumed —
 Adding or removing a whole fare stage is not something a stop list can say and is
 refused `route_stage_count`: that is which stages the route runs, and is what
 *Change stages* is for.
+
+The last of a route's two or more stages is set against what the route calls at
+of it - the rows up to its stage stop (section 19, *A route ends at the stage
+stop of its last stage*) - so a list that leaves it alone changes nothing there,
+and one going on past that stop is refused `route_ends_past_stage_stop` (the
+dashboard says the same): those stops would never be called at. When the stage
+itself is updated (the route runs it alone, or *every route using it*), the rows
+it lists past the route's end are kept for the routes going on.
 
 **Uploads on a feed that uses stages.** The import page offers two files there
 that a stop-list feed never sees, and does not offer *Route stop lists* (the
