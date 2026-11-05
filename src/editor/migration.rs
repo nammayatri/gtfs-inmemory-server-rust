@@ -1964,6 +1964,14 @@ fn changed_fields(master: &Value, prod: &Value, fields: &[&str]) -> Map<String, 
         out.insert("lat".into(), master["lat"].clone());
         out.insert("lon".into(), master["lon"].clone());
     }
+    // A line goes with its source. A route update that sets a line and says
+    // nothing of its source marks it `manual` (service::route_update), so a GPS
+    // line master and prod both call `gps` arrived as `manual`, and the next
+    // read-in planned the source back as a change of its own, every time (143
+    // routes, master v160).
+    if out.contains_key("encoded_polyline") && master.get("polyline_source").is_some() {
+        out.insert("polyline_source".into(), master["polyline_source"].clone());
+    }
     out
 }
 
@@ -2860,6 +2868,46 @@ mod tests {
         // a route without stages hashes like []
         assert_eq!(after["base_stages_hash"], json!(stages::links_hash(&[])));
         assert_eq!(out[0].id, "route_list:21G");
+    }
+
+    #[test]
+    fn a_line_is_sent_with_its_source() {
+        let route = |line: Option<&str>, src: Option<&str>| json!({"short_name": "21G", "encoded_polyline": line, "polyline_source": src});
+        // a new GPS line where both sides already say gps: the source goes too,
+        // or prod stores the line as manual
+        let after = changed_fields(
+            &route(Some("new"), Some("gps")),
+            &route(Some("old"), Some("gps")),
+            ROUTE_UPDATE_FIELDS,
+        );
+        assert_eq!(
+            Value::Object(after),
+            json!({"encoded_polyline": "new", "polyline_source": "gps"})
+        );
+        // only the source differs: only the source
+        let after = changed_fields(
+            &route(Some("same"), Some("gps")),
+            &route(Some("same"), Some("manual")),
+            ROUTE_UPDATE_FIELDS,
+        );
+        assert_eq!(Value::Object(after), json!({"polyline_source": "gps"}));
+        // master took the line out: both go, both empty
+        let after = changed_fields(
+            &route(None, None),
+            &route(Some("old"), Some("osrm")),
+            ROUTE_UPDATE_FIELDS,
+        );
+        assert_eq!(
+            Value::Object(after),
+            json!({"encoded_polyline": null, "polyline_source": null})
+        );
+        // nothing about the line: nothing about its source
+        assert!(changed_fields(
+            &route(Some("same"), Some("gps")),
+            &route(Some("same"), Some("gps")),
+            ROUTE_UPDATE_FIELDS
+        )
+        .is_empty());
     }
 
     #[test]
