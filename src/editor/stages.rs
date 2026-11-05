@@ -810,7 +810,7 @@ pub async fn mint_stage_id(conn: &mut PgConnection, g: &str) -> EditorResult<Str
 
 /// A stage change's `description`: absent leaves it, null or blank clears it.
 /// `after.direction`: "up", "down", or null to clear it; absent leaves it.
-fn direction_in(after: &Value) -> Option<Option<String>> {
+pub(super) fn direction_in(after: &Value) -> Option<Option<String>> {
     after.get("direction").map(|d| {
         d.as_str()
             .map(str::trim)

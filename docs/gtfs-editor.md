@@ -5272,6 +5272,19 @@ taken out and listed (`dropped`, with what was found), and the draft is replayed
 again without it, until it replays clean: the draft keeps the rest. An error
 that is no change's stops the read-in (`problems`), and nothing is written.
 
+**Stages, by id and direction** (2026-11-05). A stage create is keyed by its id
+alone (`entity_key` = `stage_id`); its direction is in the payload. The commit
+check that a created row is not already live looks a stage up by id **and**
+direction, so the two directions of one stage may go in through different drafts
+in either order. Looked up by id alone, the direction committed second was
+refused as "created by another commit": the master v156 read-in split stages 935
+and 1942 across "Stages 1/2/3 of 10" and left `935|down` and `1942|up` behind.
+**A stage is compared as it is stored**: master's name and description trimmed,
+an empty description none. Compared raw, 17 master stage names with a trailing
+space (`'UMAYAL PARANCHERI '`) were planned as the same 17 updates on every
+read-in, each commit changing nothing, and the migration never reached
+`route_stages`.
+
 ### API
 
 | method | path | |

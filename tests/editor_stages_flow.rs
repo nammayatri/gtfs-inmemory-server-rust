@@ -1345,6 +1345,61 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
     })
     .await;
 
+    // ======================================================== a stage's other direction, in a later draft
+    // A stage is its id and its direction; a create is keyed by the id. The
+    // direction committed second must not read as "created by another commit".
+    Box::pin(async {
+        let d18 = draft!("one direction of a stage");
+        added!(
+            d18,
+            json!({"entity": "stage", "op": "create", "entity_key": "stg_two_ways", "after": {
+                "stage_id": "stg_two_ways", "direction": "up", "name": "TWO WAYS",
+                "rows": stops(&[("A", "NEW STOP")])}})
+        );
+        let (s, b) = ship!(d18);
+        assert_eq!(s, 200, "commit: {b}");
+        let d19 = draft!("the other direction of it");
+        let b = added!(
+            d19,
+            json!({"entity": "stage", "op": "create", "entity_key": "stg_two_ways", "after": {
+                "stage_id": "stg_two_ways", "direction": "down", "name": "TWO WAYS",
+                "rows": stops(&[("C", "NEW STOP")])}})
+        );
+        assert!(
+            b["conflicts"].as_array().map_or(true, |a| a.is_empty()),
+            "the up direction is not this stage: {b}"
+        );
+        let (s, b) = ship!(d19);
+        assert_eq!(s, 200, "commit: {b}");
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                format!("SELECT count(*) FROM gtfs_stage WHERE gtfs_id = '{FEED}' AND stage_id = 'stg_two_ways'")
+            )
+            .await,
+            2,
+            "both directions are live"
+        );
+        // the same direction again is still a stage that exists
+        let d20 = draft!("the up direction again");
+        let (s, b, _) = call!(
+            &app,
+            add(
+                &d20,
+                json!({"entity": "stage", "op": "create", "entity_key": "stg_two_ways", "after": {
+                    "stage_id": "stg_two_ways", "direction": "up", "name": "TWO WAYS",
+                    "rows": stops(&[("A", "NEW STOP")])}})
+            )
+        );
+        let refused = s != 201
+            || b["conflicts"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|c| c["reason"] == "exists"));
+        assert!(refused, "{s} {b}");
+        call!(&app, ed.req("POST", &format!("/change-sets/{d20}/discard")));
+    })
+    .await;
+
     // ======================================================== and a feed that does not use stages has none
     exec(
         &pool,

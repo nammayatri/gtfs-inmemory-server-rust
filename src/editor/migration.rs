@@ -2244,12 +2244,35 @@ fn plan_stops_routes(
     }
 }
 
+/// A master stage as a stage write stores it: its name trimmed, and its
+/// description trimmed with an empty one none. Compared and sent raw, a name
+/// master stores with an edge space ('UMAYAL PARANCHERI ', 17 stages of
+/// chennai_bus at master v156) is never what prod stores, so every read-in plans
+/// the same update again, its commit changes nothing, and the migration never
+/// gets past the stages step.
+fn stored_stage(m: &Value) -> Value {
+    let mut v = m.clone();
+    if let Some(name) = m["name"].as_str() {
+        v["name"] = json!(name.trim());
+    }
+    if m.get("description").is_some() {
+        v["description"] = m["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map_or(Value::Null, |d| json!(d));
+    }
+    v
+}
+
 /// Stages (step 1), and the routes' lists of them with the stages master took
 /// out (step 2).
 fn plan_stages(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mut Report) {
     let (ms, ps) = (&master.stages, &prod.stages);
     let mut deletes = Vec::new();
     for (k, m) in ms {
+        let stored = stored_stage(m);
+        let m = &stored;
         let sk = StageKey::parse(k);
         let what = json!({"entity": "stage", "key": k, "name": m["name"]});
         match ps.get(k) {
@@ -2837,6 +2860,40 @@ mod tests {
         // a route without stages hashes like []
         assert_eq!(after["base_stages_hash"], json!(stages::links_hash(&[])));
         assert_eq!(out[0].id, "route_list:21G");
+    }
+
+    #[test]
+    fn a_stage_name_is_compared_as_it_is_stored() {
+        let stage = |name: &str, desc: Value| {
+            json!({"stage_id": "1749", "direction": "down", "name": name, "description": desc,
+                   "deleted": false, "rows": [{"stop_id": "A", "stop_type": "NEW STOP"}]})
+        };
+        let state = |s: Value| State {
+            stages: [("1749|down".to_string(), s)].into(),
+            ..State::default()
+        };
+        // master keeps an edge space and an empty description; prod stored both
+        // trimmed: nothing to do, read in as often as you like
+        let master = state(stage("UMAYAL PARANCHERI ", json!(" ")));
+        let prod = state(stage("UMAYAL PARANCHERI", Value::Null));
+        let mut out = Vec::new();
+        plan_stages(&master, &prod, &mut out, &mut Report::default());
+        assert!(
+            out.is_empty(),
+            "{:?}",
+            out.iter().map(|p| &p.change.after).collect::<Vec<_>>()
+        );
+        // a real rename is still one, and is sent as it will be stored
+        let prod = state(stage("UMAYAL", Value::Null));
+        plan_stages(&master, &prod, &mut out, &mut Report::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].change.after, json!({"name": "UMAYAL PARANCHERI"}));
+        // and a stage prod lacks is created with the stored name
+        let mut out = Vec::new();
+        plan_stages(&master, &State::default(), &mut out, &mut Report::default());
+        assert_eq!(out[0].change.op, "create");
+        assert_eq!(out[0].change.after["name"], json!("UMAYAL PARANCHERI"));
+        assert!(out[0].change.after.get("description").is_none());
     }
 
     #[test]
