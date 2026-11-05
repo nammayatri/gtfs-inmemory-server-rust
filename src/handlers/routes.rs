@@ -2909,7 +2909,9 @@ async fn get_service_type_by_vehicle_impl(
                     .await;
 
                 return Ok(HttpResponse::Ok().json(VehicleServiceTypeResponse {
-                    vehicle_no: vehicle_no.to_string(),
+                    vehicle_no: app_state
+                        .chalo_vehicle_cache
+                        .to_short_vehicle_no(gtfs_id, vehicle_no),
                     service_type: Some(service_type),
                     waybill_id: None,
                     waybill_no: None,

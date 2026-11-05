@@ -120,6 +120,7 @@ pub fn chalo_gtfs_ids() -> &'static [&'static str] {
 pub struct ChaloVehicleCache {
     // Cache structure: HashMap<gtfs_id, HashMap<vehicle_no, CachedVehicleData>>
     cache: Arc<RwLock<HashMap<String, HashMap<String, CachedVehicleData>>>>,
+    full_to_short: HashMap<String, HashMap<String, String>>,
     city_configs: Vec<CityConfig>,
     external_auth_header: Option<String>,
     update_interval_secs: u64,
@@ -127,7 +128,11 @@ pub struct ChaloVehicleCache {
 }
 
 impl ChaloVehicleCache {
-    pub fn new(external_auth: Option<String>, gtfs_service: Arc<GTFSService>) -> AppResult<Self> {
+    pub fn new(
+        external_auth: Option<String>,
+        gtfs_service: Arc<GTFSService>,
+        bus_registration_mapping: &HashMap<String, HashMap<String, String>>,
+    ) -> AppResult<Self> {
         let cache = Arc::new(RwLock::new(HashMap::new()));
 
         let city_configs = CHALO_CITY_DEFS
@@ -141,6 +146,7 @@ impl ChaloVehicleCache {
 
         Ok(Self {
             cache,
+            full_to_short: full_to_short_mapping(bus_registration_mapping),
             city_configs,
             external_auth_header: external_auth,
             update_interval_secs: 10, // Default, will be set from config
@@ -174,15 +180,24 @@ impl ChaloVehicleCache {
         Ok(())
     }
 
+    pub fn to_short_vehicle_no(&self, gtfs_id: &str, vehicle_no: &str) -> String {
+        self.full_to_short
+            .get(gtfs_id)
+            .and_then(|m| m.get(vehicle_no))
+            .cloned()
+            .unwrap_or_else(|| vehicle_no.to_string())
+    }
+
     pub async fn get_vehicle_data(
         &self,
         gtfs_id: &str,
         vehicle_no: &str,
     ) -> Option<CachedVehicleData> {
+        let key = self.to_short_vehicle_no(gtfs_id, vehicle_no);
         let cache = self.cache.read().await;
         cache
             .get(gtfs_id)
-            .and_then(|city_cache| city_cache.get(vehicle_no))
+            .and_then(|city_cache| city_cache.get(&key))
             .cloned()
     }
 
@@ -327,8 +342,9 @@ impl ChaloVehicleCache {
             // Parse waybill - it's in format "25543126:3", extract the number part
             let waybill_no = vehicle.waybill.split(':').next().map(|s| s.to_string());
 
+            let short_vehicle_no = self.to_short_vehicle_no(gtfs_id, &vehicle.vehicle_no);
             let cached_data = CachedVehicleData {
-                vehicle_no: vehicle.vehicle_no.clone(),
+                vehicle_no: short_vehicle_no.clone(),
                 route_id: Some(vehicle.route_id.clone()),
                 route_number: vehicle.route_name.clone(),
                 waybill_no,
@@ -349,7 +365,7 @@ impl ChaloVehicleCache {
                 db_end_time: None,
             };
 
-            city_cache.insert(vehicle.vehicle_no, cached_data);
+            city_cache.insert(short_vehicle_no, cached_data);
         }
 
         info!(
@@ -412,4 +428,26 @@ impl ChaloVehicleCache {
             }
         }
     }
+}
+
+fn full_to_short_mapping(
+    short_to_full: &HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, HashMap<String, String>> {
+    short_to_full
+        .iter()
+        .map(|(gtfs_id, by_short)| {
+            let mut by_full: HashMap<String, String> = HashMap::new();
+            for (short, full) in by_short {
+                by_full
+                    .entry(full.clone())
+                    .and_modify(|current| {
+                        if short < current {
+                            *current = short.clone();
+                        }
+                    })
+                    .or_insert_with(|| short.clone());
+            }
+            (gtfs_id.clone(), by_full)
+        })
+        .collect()
 }
