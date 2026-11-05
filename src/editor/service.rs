@@ -1752,11 +1752,24 @@ async fn conflict_for(
                 }
             }
         }
-        ("stop" | "station" | "route" | "service" | "stage" | "geofence", "create") => {
+        // A stage is its id AND its direction, and a create is keyed by the id
+        // alone: looked up by id, the other direction of the same stage reads as
+        // this one, so whichever of a stage's two directions commits second is
+        // refused as overtaken. The master v156 migration split 935 and 1942
+        // across two drafts that way.
+        ("stage", "create") => {
+            let mut sk = super::stages::StageKey::parse(key);
+            if let Some(d) = super::stages::direction_in(&c.after).flatten() {
+                sk.direction = d;
+            }
+            if live_stage_version(conn, g, &sk).await?.is_some() {
+                out.push(conflict(c, "exists", Value::Null, json!(sk.entity_key())));
+            }
+        }
+        ("stop" | "station" | "route" | "service" | "geofence", "create") => {
             let (table, id_col) = match c.entity.as_str() {
                 "route" => ("gtfs_route", "route_id"),
                 "service" => ("gtfs_service", "service_id"),
-                "stage" => ("gtfs_stage", "stage_id"),
                 "geofence" => ("gtfs_geofence", "stop_id"),
                 _ => ("gtfs_stop", "stop_id"),
             };
