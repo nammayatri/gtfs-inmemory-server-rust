@@ -951,6 +951,14 @@ pub struct GTFSData {
     /// A preprocessed feed has no entry: it has no merges to know about.
     #[serde(default)]
     pub stop_aliases_by_gtfs: HashMap<String, HashMap<String, String>>,
+    /// Per DB feed, by stop code, its live stops that no served route row
+    /// references (docs/gtfs-editor.md section 1, "A live stop answers its
+    /// code"). They are in no list - stops, search, nearby, a route's or a
+    /// stop's mappings - but a lookup of one by its code answers, the way an
+    /// inactive route answers by its id. Rebuilt with the feed on every reload.
+    /// A preprocessed feed has no entry.
+    #[serde(default)]
+    pub unlisted_stops_by_gtfs: HashMap<String, HashMap<String, GTFSStop>>,
     /// Per feed, each **station** stop code (`location_type = 1`) pointing at the
     /// codes of the platforms beneath it, sorted (docs/gtfs-editor.md section 1,
     /// "A station code answers everywhere a stop code does"). Rebuilt with the

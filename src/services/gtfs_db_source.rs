@@ -175,6 +175,11 @@ pub struct DbFeed {
     pub routes: Vec<NandiRoutesRes>,
     pub patterns: Vec<NandiPatternDetails>,
     pub stops: Vec<GTFSStop>,
+    /// The live stops `stops` leaves out because no served row references
+    /// them (never a station: those are always in `stops`). In no list, but a
+    /// lookup of one by its code still answers (docs/gtfs-editor.md section 1,
+    /// "A live stop answers its code"). Empty for `stops_scope = 'all'`.
+    pub unlisted_stops: Vec<GTFSStop>,
     /// route code -> polyline (None clears whatever another source set).
     pub polylines: HashMap<String, Option<String>>,
     /// Merged-away stop code -> the code of the stop that survived the merge,
@@ -956,25 +961,34 @@ impl GtfsDbSource {
         // too: they share a station's code and would take over its name. In
         // the order the feed had them: GIMS keeps the last of several stops
         // sharing a code.
+        //
+        // A live stop left out goes to `unlisted_stops` instead: a feed whose
+        // stages call at other records than its routes' own lists (chennai_bus
+        // at its switch, 2026-11-05) still has callers holding the old ones.
         let mut referenced: HashSet<&str> = HashSet::new();
         for rows in rows_by_pattern.values() {
             for row in rows {
                 referenced.insert(row.stop_id.as_str());
             }
         }
+        let listed = |s: &StopRow| {
+            all_stops || s.location_type == 1 || referenced.contains(s.stop_id.as_str())
+        };
         let mut stop_ids: Vec<(&Option<i32>, &String)> = stops
             .values()
             .filter(|s| s.location_type <= 1)
-            .filter(|s| {
-                all_stops || s.location_type == 1 || referenced.contains(s.stop_id.as_str())
-            })
             .map(|s| (&s.sort_key, &s.stop_id))
             .collect();
         stop_ids.sort_by(|a, b| (a.0.is_none(), a.0, a.1).cmp(&(b.0.is_none(), b.0, b.1)));
         let stop_ids: Vec<&String> = stop_ids.into_iter().map(|(_, id)| id).collect();
         for id in stop_ids {
             let s = &stops[id];
-            out.stops.push(GTFSStop {
+            let into = if listed(s) {
+                &mut out.stops
+            } else {
+                &mut out.unlisted_stops
+            };
+            into.push(GTFSStop {
                 id: prefixed(&s.stop_id),
                 code: s.stop_code.clone().unwrap_or_else(|| s.stop_id.clone()),
                 name: s.name.clone(),
@@ -1015,6 +1029,7 @@ impl GtfsDbSource {
                 patterns = out.patterns.len(),
                 trips = out.trips.as_ref().map(|t| t.len()).unwrap_or(0),
                 stops = out.stops.len(),
+                unlisted_stops = out.unlisted_stops.len(),
                 routes_without_trips = dropped,
                 merged_away_stops = merged_away,
                 stop_aliases = out.aliases.len(),
@@ -1126,6 +1141,7 @@ impl GtfsDbSource {
             version,
             routes = out.routes.len(),
             stops = out.stops.len(),
+            unlisted_stops = out.unlisted_stops.len(),
             routes_without_trips = dropped_no_trips,
             merged_away_stops = merged_away,
             stop_aliases = out.aliases.len(),
