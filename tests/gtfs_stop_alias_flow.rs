@@ -481,6 +481,38 @@ async fn a_merged_away_stop_id_keeps_answering() {
     assert_eq!(s, 200, "{b}");
     assert_eq!(codes(&b), vec!["OLD"], "{b}");
 
+    // A live stop no route calls at - KEEP, until the second merge - is in no
+    // list, but a lookup of it by its code answers (docs section 1, "A live
+    // stop answers its code"). chennai_bus's stage switch left 683 stops this
+    // way while OTP legs still named them, and every one was a 404.
+    let (s, b, alias) = api!(&api, &format!("/stop/{FEED}/KEEP"));
+    assert_eq!((s, alias), (200, None), "{b}");
+    assert_eq!(b["stopCode"], "KEEP");
+    let req = test::TestRequest::post()
+        .uri("/getAllStopsByIds")
+        .set_json(json!({"gtfsId": FEED, "stopIds": ["KEEP", "VIA", "NOSUCHSTOP"]}))
+        .to_request();
+    let b: Value = test::call_and_read_body_json(&api, req).await;
+    let mut bulk: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["code"].as_str())
+        .collect();
+    bulk.sort();
+    assert_eq!(bulk, vec!["KEEP", "VIA"], "{b}");
+    // ... and nothing offers it: not the feed's stop list, and no route calls there
+    let (s, b, _) = api!(&api, &format!("/stops/{FEED}"));
+    assert_eq!(s, 200, "{b}");
+    let listed = codes(&b);
+    assert!(listed.contains(&"OLD".to_string()), "{b}");
+    assert!(
+        !listed.contains(&"KEEP".to_string()),
+        "an unlisted stop is listed: {b}"
+    );
+    let (s, _, _) = api!(&api, &format!("/route-stop-mapping/{FEED}/stop/KEEP"));
+    assert_eq!(s, 404);
+
     // ---- accounts
     let mut admin = Caller {
         signer: &signer,
@@ -663,6 +695,9 @@ async fn a_merged_away_stop_id_keeps_answering() {
     gtfs.revert_db_feed_to_preprocessed(FEED).await.unwrap();
     let (s, _, alias) = api!(&api, &format!("/stop/{FEED}/OLD"));
     assert_eq!((s, alias), (404, None));
+    // nor of stops it lists nowhere: its preprocessed data is VIA alone
+    let (s, _, _) = api!(&api, &format!("/stop/{FEED}/KEEP"));
+    assert_eq!(s, 404);
 
     exec(&pool, &clear_feed()).await;
     let _ = std::fs::remove_dir_all(&dir);

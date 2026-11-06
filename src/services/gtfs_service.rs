@@ -93,6 +93,12 @@ fn db_feed_data_hash(routes_hash: &str, version: i64) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// A DB feed's unlisted stops by stop code, the way `build_stops_by_gtfs` keys
+/// its listed ones: the last of several stops sharing a code wins.
+fn unlisted_by_code(stops: Vec<GTFSStop>) -> HashMap<String, GTFSStop> {
+    stops.into_iter().map(|s| (s.code.clone(), s)).collect()
+}
+
 /// Replace one feed's entry in a per-feed map: insert what the rebuild produced,
 /// or drop the stale entry if the rebuild produced none.
 fn replace_feed_entry<V>(
@@ -509,7 +515,7 @@ impl GTFSService {
         info!("Fetched {} patterns total", all_pattern_details.len());
 
         // DB feeds replace their preprocessed metadata before anything is indexed.
-        let (db_feed_versions, db_polylines, db_stop_aliases, db_trips) = self
+        let (db_feed_versions, db_polylines, db_stop_aliases, db_unlisted_stops, db_trips) = self
             .overlay_db_feeds(
                 &mut all_routes,
                 &mut all_pattern_details,
@@ -700,6 +706,7 @@ impl GTFSService {
         temp_data.pre_computed_stops_by_gtfs = pre_computed_stops_by_gtfs;
         temp_data.db_feed_versions = db_feed_versions;
         temp_data.stop_aliases_by_gtfs = db_stop_aliases;
+        temp_data.unlisted_stops_by_gtfs = db_unlisted_stops;
         temp_data.db_trips_by_gtfs = db_trips;
 
         let mem_stats = temp_data.memory_usage_bytes();
@@ -2209,14 +2216,16 @@ impl GTFSService {
         HashMap<String, i64>,
         HashMap<String, HashMap<String, Option<String>>>,
         HashMap<String, HashMap<String, String>>,
+        HashMap<String, HashMap<String, GTFSStop>>,
         HashMap<String, Arc<DbTrips>>,
     ) {
         let mut versions = HashMap::new();
         let mut polylines = HashMap::new();
         let mut aliases = HashMap::new();
+        let mut unlisted = HashMap::new();
         let mut trips = HashMap::new();
         let Some(db) = self.db_source.as_ref() else {
-            return (versions, polylines, aliases, trips);
+            return (versions, polylines, aliases, unlisted, trips);
         };
         for gtfs_id in db.feeds() {
             // a feed whose trips are in the tables needs nothing preprocessed
@@ -2246,6 +2255,7 @@ impl GTFSService {
                     versions.insert(gtfs_id.clone(), feed.version);
                     polylines.insert(gtfs_id.clone(), feed.polylines);
                     aliases.insert(gtfs_id.clone(), feed.aliases);
+                    unlisted.insert(gtfs_id.clone(), unlisted_by_code(feed.unlisted_stops));
                     if let Some(t) = feed.trips {
                         trips.insert(gtfs_id.clone(), t);
                     }
@@ -2256,7 +2266,7 @@ impl GTFSService {
                 ),
             }
         }
-        (versions, polylines, aliases, trips)
+        (versions, polylines, aliases, unlisted, trips)
     }
 
     fn apply_db_polylines(
@@ -2489,6 +2499,15 @@ impl GTFSService {
             [(gtfs_id.to_string(), feed.aliases)].into_iter().collect(),
             gtfs_id,
         );
+        // and a stop the feed stops listing - its stages call elsewhere -
+        // keeps answering its code from that same poll
+        replace_feed_entry(
+            &mut data.unlisted_stops_by_gtfs,
+            [(gtfs_id.to_string(), unlisted_by_code(feed.unlisted_stops))]
+                .into_iter()
+                .collect(),
+            gtfs_id,
+        );
         // and a trip committed there is served by /trip on that same poll
         replace_feed_entry(
             &mut data.db_trips_by_gtfs,
@@ -2616,6 +2635,8 @@ impl GTFSService {
         // Preprocessed data has no merges, so the feed goes back to answering
         // for live stop codes only - the behaviour it had before DB mode.
         data.stop_aliases_by_gtfs.remove(gtfs_id);
+        // nor stops it lists nowhere: preprocessed data lists every stop it has
+        data.unlisted_stops_by_gtfs.remove(gtfs_id);
         // and its /trip back to the preprocessed shards
         data.db_trips_by_gtfs.remove(gtfs_id);
         Ok((data, trip_details))
@@ -3738,11 +3759,14 @@ impl GTFSService {
         // holding the old id learns the new one.
         let stop_code = self.resolve_stop_code(&gtfs_id, stop_code);
 
-        let stops_data = data.stops_by_gtfs.get(&gtfs_id).ok_or_else(|| {
-            AppError::NotFound(format!("Stops data not found for gtfs_id: {}", gtfs_id))
-        })?;
+        if !data.stops_by_gtfs.contains_key(&gtfs_id) {
+            return Err(AppError::NotFound(format!(
+                "Stops data not found for gtfs_id: {}",
+                gtfs_id
+            )));
+        }
 
-        let mut stop = stops_data.stops.get(&stop_code).cloned().ok_or_else(|| {
+        let mut stop = Self::stop_by_code_in(&data, &gtfs_id, &stop_code).ok_or_else(|| {
             AppError::NotFound(format!(
                 "Stop not found for stop_code: {} under gtfs_id: {}",
                 stop_code, gtfs_id
@@ -3798,17 +3822,32 @@ impl GTFSService {
         let mut found_stops = Vec::new();
 
         let clean_gtfs_id = clean_identifier(gtfs_id);
-        if let Some(stops_data) = data.stops_by_gtfs.get(clean_gtfs_id.as_str()) {
+        if data.stops_by_gtfs.contains_key(clean_gtfs_id.as_str()) {
             for stop_code in stop_codes {
-                // Same redirect as the singular endpoint, per code.
+                // Same redirect and the same unlisted stops as the singular
+                // endpoint, per code.
                 let clean_stop_code = self.resolve_stop_code(&clean_gtfs_id, &stop_code);
-                if let Some(stop) = stops_data.stops.get(clean_stop_code.as_str()) {
-                    found_stops.push(stop.clone());
+                if let Some(stop) = Self::stop_by_code_in(&data, &clean_gtfs_id, &clean_stop_code) {
+                    found_stops.push(stop);
                 }
             }
         }
 
         Ok(found_stops)
+    }
+
+    /// The stop a lookup by code answers with: one of the feed's listed stops,
+    /// else - for a DB feed - a live stop no served row references (docs/
+    /// gtfs-editor.md section 1, "A live stop answers its code"). `gtfs_id` is
+    /// cleaned and `stop_code` already resolved through the alias map. Only a
+    /// read of the stop itself falls back: every list, search and route mapping
+    /// reads the listed stops alone, so an unlisted stop is offered nowhere.
+    fn stop_by_code_in(data: &GTFSData, gtfs_id: &str, stop_code: &str) -> Option<GTFSStop> {
+        data.stops_by_gtfs
+            .get(gtfs_id)
+            .and_then(|stops| stops.stops.get(stop_code))
+            .or_else(|| data.unlisted_stops_by_gtfs.get(gtfs_id)?.get(stop_code))
+            .cloned()
     }
 
     pub async fn get_route_stop_mappings_by_route_codes(
@@ -4962,5 +5001,71 @@ mod tests {
         let data = with_alias(data_with(stops), "g", "old", "p1");
         assert!(GTFSService::station_expansion_in(&data, "g", "nope").is_none());
         assert!(GTFSService::station_expansion_in(&data, "g", "old").is_none());
+    }
+
+    // ------------------------------------------------------ unlisted stops
+
+    /// A DB feed listing `listed` and leaving `unlisted` out of every list.
+    fn feed_listing(listed: Vec<GTFSStop>, unlisted: Vec<GTFSStop>) -> GTFSData {
+        let mut data = GTFSData::new();
+        let entry = data.stops_by_gtfs.entry("g".to_string()).or_default();
+        for s in listed {
+            entry.stops.insert(s.code.clone(), s);
+        }
+        data.unlisted_stops_by_gtfs
+            .insert("g".to_string(), unlisted_by_code(unlisted));
+        data
+    }
+
+    #[test]
+    fn a_stop_the_feed_lists_nowhere_still_answers_its_code() {
+        // chennai_bus at its stage switch: VELACHERY is live, but the stages
+        // call at VELACHERY B.T, so no served row references it any more.
+        let data = feed_listing(
+            vec![plain("g", "velachery_bt")],
+            vec![plain("g", "velachery")],
+        );
+        let stop = GTFSService::stop_by_code_in(&data, "g", "velachery").expect("answers");
+        assert_eq!(stop.code, "velachery");
+        assert_eq!(
+            GTFSService::stop_by_code_in(&data, "g", "velachery_bt").map(|s| s.code),
+            Some("velachery_bt".to_string())
+        );
+        // ... and is still in no list: the stops map is the listed ones alone
+        assert!(!data.stops_by_gtfs["g"].stops.contains_key("velachery"));
+    }
+
+    #[test]
+    fn a_listed_stop_wins_over_an_unlisted_one_with_its_code() {
+        let mut listed = plain("g", "shared");
+        listed.name = "LISTED".to_string();
+        let mut unlisted = plain("g", "shared");
+        unlisted.name = "UNLISTED".to_string();
+        let data = feed_listing(vec![listed], vec![unlisted]);
+        assert_eq!(
+            GTFSService::stop_by_code_in(&data, "g", "shared").map(|s| s.name),
+            Some("LISTED".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_code_or_feed_still_finds_nothing() {
+        let data = feed_listing(vec![plain("g", "a")], vec![plain("g", "b")]);
+        assert!(GTFSService::stop_by_code_in(&data, "g", "nope").is_none());
+        assert!(GTFSService::stop_by_code_in(&data, "other", "b").is_none());
+        // a preprocessed feed has no unlisted entry at all
+        let mut data = GTFSData::new();
+        data.stops_by_gtfs.entry("p".to_string()).or_default();
+        assert!(GTFSService::stop_by_code_in(&data, "p", "b").is_none());
+    }
+
+    #[test]
+    fn unlisted_stops_sharing_a_code_keep_the_last() {
+        let mut first = plain("g", "dup");
+        first.name = "FIRST".to_string();
+        let mut last = plain("g", "dup");
+        last.name = "LAST".to_string();
+        let map = unlisted_by_code(vec![first, last]);
+        assert_eq!(map["dup"].name, "LAST");
     }
 }

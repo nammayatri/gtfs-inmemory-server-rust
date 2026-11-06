@@ -287,6 +287,30 @@ Forced to a worst case - a copy of those stops with 800 rows merged away in one
 800-long chain - the query is 1.3-1.7 ms, all 800 aliases resolve to the one
 survivor, and the load time does not move.
 
+### A live stop answers its code
+
+A feed with `stops_scope = 'served'` lists only the stops a served row
+references. The others are still live, and callers still hold them. When
+chennai_bus turned stages on (v202, 2026-11-05), its stage lists called at other
+records than its routes' own lists did (VELACHERY B.T, not VELACHERY), so 683
+stops OTP's feed still used were suddenly in no served row, and
+`GET /stop/chennai_bus/{code}` answered 404 for every leg that named one: 5,168 of
+the 5,301 chennai_bus stop 404s in the ten hours the pod logs kept.
+
+So the loader keeps the live stops it does not list (never a station: those are
+always listed) as the feed's **unlisted stops**, by code, and a read of a stop by
+its code - `get_stop` and the `getAllStopsByIds` bulk read - falls back to them
+after the listed stops, once the alias map has had its say. Nothing else does:
+the stop lists, search, nearby, a stop's route-stop mappings and the routing
+reads see the listed stops alone, so an unlisted stop is offered nowhere and
+`/route-stop-mapping/{g}/stop/{code}` still 404s for it (no route calls there).
+It is the stop's counterpart of an inactive route, which answers by its id and
+is in no list.
+
+The set is rebuilt with the feed on every reload, like the alias map; a feed
+reverted to preprocessed data has none; and a listed stop always wins over an
+unlisted one sharing its code.
+
 ### A station code answers everywhere a stop code does
 
 A feed's stops are grouped into **stations**: a station row has
