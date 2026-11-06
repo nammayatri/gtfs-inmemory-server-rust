@@ -590,9 +590,11 @@ impl AppState {
 
         let trip_service = Arc::new(TripService::new(gtfs_service.clone()));
 
+        let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
         let mut chalo_vehicle_cache = ChaloVehicleCache::new(
             app_config.bhubaneswar_external_auth.clone(),
             gtfs_service.clone(),
+            &bus_registration_mapping,
         )?;
         chalo_vehicle_cache.set_update_interval(app_config.bhubaneswar_cache_update_interval);
         let chalo_vehicle_cache = Arc::new(chalo_vehicle_cache);
@@ -623,8 +625,6 @@ impl AppState {
             }
         };
 
-        // Load bus registration mapping from CSV
-        let bus_registration_mapping = Arc::new(Self::load_bus_registration_mapping().await?);
         let metro_graphs = Arc::new(Self::load_metro_graphs(&app_config));
 
         let service_hopper = Arc::new(ArcSwap::from_pointee(load_service_hopper(
@@ -751,6 +751,7 @@ impl AppState {
 
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
+            .trim(csv::Trim::All)
             .from_reader(contents.as_bytes());
 
         let mut mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
