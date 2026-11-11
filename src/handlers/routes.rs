@@ -1394,12 +1394,17 @@ pub async fn get_route_stop_mapping_by_stop(
             .get_route_stop_mapping_by_stop_with_direction(&gtfs_id, &stop_code, direction)
             .await?
     };
-    Ok(stop_expansion_response(
-        &app_state,
-        &gtfs_id,
-        &[&stop_code],
-        &mappings,
-    ))
+    // A stop the stages left out answered with the stops that stand in for it:
+    // say so the way a merge redirect does (docs/gtfs-editor.md section 1, "An
+    // unlisted stop answers a route lookup with its replacement").
+    let mut resp = stop_expansion_builder(&app_state, &gtfs_id, &[&stop_code]);
+    if let Some((old, with)) = app_state
+        .gtfs_service
+        .stop_replacement(&gtfs_id, &stop_code)
+    {
+        resp.insert_header(("X-Stop-Replaced", format!("{}={}", old, with.join(";"))));
+    }
+    Ok(resp.json(&mappings))
 }
 
 #[utoipa::path(
@@ -2013,6 +2018,16 @@ fn stop_expansion_response<T: serde::Serialize>(
     stop_codes: &[&str],
     body: &T,
 ) -> HttpResponse {
+    stop_expansion_builder(app_state, gtfs_id, stop_codes).json(body)
+}
+
+/// The 200 `stop_expansion_response` sends, before its body: for a handler
+/// that has a header of its own to add.
+fn stop_expansion_builder(
+    app_state: &AppState,
+    gtfs_id: &str,
+    stop_codes: &[&str],
+) -> actix_web::HttpResponseBuilder {
     let mut aliases = Vec::new();
     let mut expansions = Vec::new();
     for stop_code in stop_codes {
@@ -2032,7 +2047,7 @@ fn stop_expansion_response<T: serde::Serialize>(
     if !expansions.is_empty() {
         resp.insert_header(("X-Stop-Expanded", expansions.join(",")));
     }
-    resp.json(body)
+    resp
 }
 
 pub fn merge_stop_and_mapping(

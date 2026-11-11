@@ -301,15 +301,67 @@ So the loader keeps the live stops it does not list (never a station: those are
 always listed) as the feed's **unlisted stops**, by code, and a read of a stop by
 its code - `get_stop` and the `getAllStopsByIds` bulk read - falls back to them
 after the listed stops, once the alias map has had its say. Nothing else does:
-the stop lists, search, nearby, a stop's route-stop mappings and the routing
-reads see the listed stops alone, so an unlisted stop is offered nowhere and
-`/route-stop-mapping/{g}/stop/{code}` still 404s for it (no route calls there).
-It is the stop's counterpart of an inactive route, which answers by its id and
-is in no list.
+the stop lists, search, nearby and the routing reads see the listed stops alone,
+so an unlisted stop is offered nowhere. A stop's route-stop mappings answer with
+what stands in for it instead (next section). It is the stop's counterpart of an
+inactive route, which answers by its id and is in no list.
 
 The set is rebuilt with the feed on every reload, like the alias map; a feed
 reverted to preprocessed data has none; and a listed stop always wins over an
 unlisted one sharing its code.
+
+### An unlisted stop answers a route lookup with its replacement
+
+Answering `/stop/{g}/{code}` was not enough. The rider app asks
+`/route-stop-mapping/{g}/stop/{code}` which routes call at a stop - for a saved
+journey's legs (`getAllLegsInfo`, through `fetchPossibleRoutes`), for
+`routeServiceability` and for `track/stop/{code}/routes` - and for an unlisted
+stop that still answered 404, which the app turns into a 500
+`UNABLE_TO_CALL_NANDI_GET_ROUTE_STOP_MAPPING_BY_STOP_CODE_API`. On 2026-11-11,
+six days after the switch, that was ~34,000 failed requests on chennai_bus in
+the first eleven hours of the day, from 727 codes: the stops the stages left
+out, and the stations all of whose platforms they left out (`stn_CHNS03094`,
+Chennai Airport Metro). OTP stopped handing those out once it was rebuilt; saved
+journeys, recent stops and cached station lists did not.
+
+The route that used to call at the old stop now calls at another record for the
+same place, and the routes' own lists (`gtfs_route_stop`) still say which route
+called where. So, for a feed served from its stages (`use_stages`, `stops_scope =
+'served'`), the loader builds a **replacement map**:
+
+- For each own-list row (a served stop type, pattern 1 unless the feed's trips
+  are in the tables) naming an unlisted stop on a live route, the route's
+  **served** stop nearest the old one stands in for it on that route - within
+  **300 m** (`REPLACEMENT_RADIUS_M`). Further away the route no longer calls
+  anywhere near it, and nothing stands in.
+- A stop's stand-ins are ordered by how many of its routes chose each, then by
+  distance, then by code, so every pod answers the same.
+- A **station** none of whose platforms is listed gets its platforms' stand-ins.
+  A station with any listed platform already answers through it.
+
+The route-stop mappings by stop - plain, `direction`, `allowClusters` (through
+its single-stop fallback) and the `getAllRouteStopMappingsByStopCodes` bulk read -
+use the map **only for a code with no mapping of its own**, after the alias map:
+a stop any route calls at always answers for itself, and a code merged into a
+stop the stages left out lands on that stop's stand-ins. The answer is the stand-
+ins' own mapping rows - their `stopCode`, `routeCode` and `sequenceNum` - which is
+what each caller reads: the route codes, the sequence to order a leg's ends
+by, and the stop a bus's ETA is keyed by. The single-stop read carries
+`X-Stop-Replaced: <code>=<stand-in>;<stand-in>`, and each replacement is logged
+at info at most once an hour per stop. `/stop/{g}/{code}` is unchanged: it still
+answers with the stop itself.
+
+On prod chennai_bus at v209: 1,666 unlisted stops, 738 of them named by a live
+route's own list; 650 get stand-ins (590 within 150 m; per stop and route the
+nearest is a median 67 m away), on 636 distinct served stops. Of the 141 codes
+behind 85% of the 2026-11-11 404s, those that get stand-ins carry ~86% of that
+volume. The rest have no served stop within 300 m on any of their old routes
+(THIRUPORUR B.T, IIT Madras), are junk (`stn_acdb5d530a`, "Dead Kilometer"), or
+are in no feed at all, and keep answering 404.
+
+The map is rebuilt with the feed on every reload, so a stage edit moves the
+stand-ins on the same poll; a feed reverted to preprocessed data, or one not
+served from its stages, has none.
 
 ### A station code answers everywhere a stop code does
 

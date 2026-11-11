@@ -34,7 +34,7 @@ use crate::services::gtfs_timing::{self, Offsets};
 use crate::tools::error::{AppError, AppResult};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
 
@@ -180,6 +180,14 @@ pub struct DbFeed {
     /// lookup of one by its code still answers (docs/gtfs-editor.md section 1,
     /// "A live stop answers its code"). Empty for `stops_scope = 'all'`.
     pub unlisted_stops: Vec<GTFSStop>,
+    /// The code of an unlisted stop - or of a station none of whose platforms
+    /// is listed - pointing at the codes of the listed stops that stand in for
+    /// it on the routes that used to call there, best first (see
+    /// [`stage_replacements`]; docs/gtfs-editor.md section 1, "An unlisted stop
+    /// answers a route lookup with its replacement"). Built only for a feed
+    /// served from its stages, whose routes' own lists still name the stops
+    /// the stages left out.
+    pub replacements: HashMap<String, Vec<String>>,
     /// route code -> polyline (None clears whatever another source set).
     pub polylines: HashMap<String, Option<String>>,
     /// Merged-away stop code -> the code of the stop that survived the merge,
@@ -283,6 +291,85 @@ pub fn resolve_merge_chains(
         }
     }
     aliases
+}
+
+/// How far a route's stage-list stop may be from the stop its own list named
+/// there and still stand in for it. Measured on prod chennai_bus at v209
+/// (2026-11-11): of the 738 unlisted stops a live route's own list still names,
+/// 650 have a stage-list stop within 300 m on at least one of those routes, 590
+/// of them within 150 m; per (stop, route) the nearest is a median 67 m away.
+/// Further than this the route no longer calls anywhere near the old stop, and
+/// answering for it would put the rider at the wrong kerb.
+pub const REPLACEMENT_RADIUS_M: f64 = 300.0;
+
+/// For every stop a route's **own** list names but its **served** (stage) list
+/// does not, the served stops that stand in for it: on each such route, the
+/// served stop nearest the old one, within [`REPLACEMENT_RADIUS_M`].
+///
+/// When chennai_bus turned stages on (v202, 2026-11-05) its stage lists called
+/// at other records than its routes' own lists - VELACHERY B.T, not VELACHERY -
+/// and the old records stayed live but unlisted. Saved journeys, saved stops and
+/// OTP legs built before the switch keep naming them, and every
+/// `/route-stop-mapping/{g}/stop/{code}` for one answered 404. The route that
+/// used to call at the old stop now calls at its replacement, so the
+/// replacement's mapping on that route is the answer the caller wanted.
+///
+/// - `own_rows`: `(route_id, stop_id)` of the own-list rows naming an unlisted
+///   stop, on live routes.
+/// - `served_by_route`: each live route's served stop ids.
+/// - `position`: `(lat, lon)` of every stop id either names.
+///
+/// Returns unlisted stop id -> replacement stop ids, ordered by how many of its
+/// routes chose each (most first), then by distance, then by id, so the answer
+/// is the same on every pod and every reload. A stop no route has a served stop
+/// near is left out: it keeps answering 404, as it did.
+pub fn stage_replacements(
+    own_rows: &[(String, String)],
+    served_by_route: &HashMap<String, Vec<String>>,
+    position: &HashMap<String, (f64, f64)>,
+) -> BTreeMap<String, Vec<String>> {
+    // unlisted id -> replacement id -> (routes choosing it, nearest metres)
+    let mut chosen: BTreeMap<&str, BTreeMap<&str, (usize, f64)>> = BTreeMap::new();
+    let pairs: BTreeSet<(&str, &str)> = own_rows
+        .iter()
+        .map(|(route, stop)| (route.as_str(), stop.as_str()))
+        .collect();
+    for (route, stop) in pairs {
+        let (Some(&at), Some(served)) = (position.get(stop), served_by_route.get(route)) else {
+            continue;
+        };
+        let nearest = served
+            .iter()
+            .filter(|s| s.as_str() != stop)
+            .filter_map(|s| Some((gtfs_timing::haversine_m(at, *position.get(s)?), s.as_str())))
+            .filter(|(m, _)| *m <= REPLACEMENT_RADIUS_M)
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+        if let Some((m, replacement)) = nearest {
+            let entry = chosen
+                .entry(stop)
+                .or_default()
+                .entry(replacement)
+                .or_insert((0, f64::INFINITY));
+            entry.0 += 1;
+            entry.1 = entry.1.min(m);
+        }
+    }
+    chosen
+        .into_iter()
+        .map(|(stop, candidates)| {
+            let mut ranked: Vec<(&str, (usize, f64))> = candidates.into_iter().collect();
+            ranked.sort_by(|a, b| {
+                b.1 .0
+                    .cmp(&a.1 .0)
+                    .then(a.1 .1.total_cmp(&b.1 .1))
+                    .then(a.0.cmp(b.0))
+            });
+            (
+                stop.to_string(),
+                ranked.into_iter().map(|(id, _)| id.to_string()).collect(),
+            )
+        })
+        .collect()
 }
 
 /// Trip overlays for `gtfs_id`, from preprocessed patterns (JSON boot).
@@ -832,7 +919,8 @@ impl GtfsDbSource {
         // a join with gtfs_route: a feed just seeded is read before its
         // statistics count it, and a nested loop of the two then reads the
         // whole feed once per route.
-        let route_stops = route_stops_source(feed.try_get("use_stages").map_err(db_err)?);
+        let use_stages: bool = feed.try_get("use_stages").map_err(db_err)?;
+        let route_stops = route_stops_source(use_stages);
         let served = sqlx::query(&format!(
             "SELECT rs.route_id, rs.pattern_key, rs.sequence, rs.stop_id, rs.stop_type, rs.stage_no,
                     rs.stop_headsign, rs.stop_sequence
@@ -1009,6 +1097,18 @@ impl GtfsDbSource {
             });
         }
 
+        // What stands in for each unlisted stop on the routes that used to call
+        // there. Only a feed served from its stages has any: its routes' own
+        // lists still name the stops its stages left out, and they are the only
+        // record of which route called where.
+        let replacement_started = std::time::Instant::now();
+        if use_stages && !all_stops && !out.unlisted_stops.is_empty() {
+            out.replacements = self
+                .stop_replacements(gtfs_id, trips_source, &rows_by_pattern, &stops, &listed)
+                .await?;
+        }
+        let replacement_ms = replacement_started.elapsed().as_millis() as u64;
+
         if trips_source == TripsSource::Db {
             let dropped = self
                 .db_trips(
@@ -1030,6 +1130,8 @@ impl GtfsDbSource {
                 trips = out.trips.as_ref().map(|t| t.len()).unwrap_or(0),
                 stops = out.stops.len(),
                 unlisted_stops = out.unlisted_stops.len(),
+                stop_replacements = out.replacements.len(),
+                replacement_ms,
                 routes_without_trips = dropped,
                 merged_away_stops = merged_away,
                 stop_aliases = out.aliases.len(),
@@ -1142,6 +1244,8 @@ impl GtfsDbSource {
             routes = out.routes.len(),
             stops = out.stops.len(),
             unlisted_stops = out.unlisted_stops.len(),
+            stop_replacements = out.replacements.len(),
+            replacement_ms,
             routes_without_trips = dropped_no_trips,
             merged_away_stops = merged_away,
             stop_aliases = out.aliases.len(),
@@ -1150,6 +1254,108 @@ impl GtfsDbSource {
             "Loaded DB feed"
         );
         Ok(out)
+    }
+
+    /// The replacement map of a feed served from its stages, by public code
+    /// (see [`stage_replacements`] and [`DbFeed::replacements`]).
+    ///
+    /// One query, of the routes' **own** lists (`gtfs_route_stop`), for the
+    /// rows naming a stop the feed leaves unlisted - the same served stop types
+    /// and patterns the served rows were read with. A station gets an entry
+    /// only when none of its platforms is listed, and then answers with what
+    /// stands in for its platforms: a station with a listed platform already
+    /// answers through it.
+    async fn stop_replacements(
+        &self,
+        gtfs_id: &str,
+        trips_source: TripsSource,
+        rows_by_pattern: &BTreeMap<(String, i16), Vec<ServedRow>>,
+        stops: &HashMap<String, StopRow>,
+        listed: &impl Fn(&StopRow) -> bool,
+    ) -> AppResult<HashMap<String, Vec<String>>> {
+        let unlisted: Vec<&str> = stops
+            .values()
+            .filter(|s| s.location_type == 0 && !listed(s))
+            .map(|s| s.stop_id.as_str())
+            .collect();
+        let own = sqlx::query(
+            "SELECT DISTINCT route_id, stop_id
+             FROM gtfs_route_stop
+             WHERE gtfs_id = $1 AND stop_id = ANY($2) AND stop_type = ANY($3)
+               AND (pattern_key = 1 OR $4)",
+        )
+        .bind(gtfs_id)
+        .bind(&unlisted)
+        .bind(&SERVED_STOP_TYPES[..])
+        .bind(trips_source == TripsSource::Db)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // each live route's served stops; `rows_by_pattern` holds live routes only
+        let mut served_by_route: HashMap<String, Vec<String>> = HashMap::new();
+        for ((route_id, _), rows) in rows_by_pattern {
+            let served = served_by_route.entry(route_id.clone()).or_default();
+            for row in rows {
+                if !served.contains(&row.stop_id) {
+                    served.push(row.stop_id.clone());
+                }
+            }
+        }
+        let mut own_rows = Vec::with_capacity(own.len());
+        for r in &own {
+            let route_id: String = r.try_get("route_id").map_err(db_err)?;
+            if served_by_route.contains_key(&route_id) {
+                own_rows.push((route_id, r.try_get::<String, _>("stop_id").map_err(db_err)?));
+            }
+        }
+        let position: HashMap<String, (f64, f64)> = stops
+            .values()
+            .map(|s| (s.stop_id.clone(), (s.lat, s.lon)))
+            .collect();
+        let by_id = stage_replacements(&own_rows, &served_by_route, &position);
+
+        let code_of = |id: &str| {
+            stops
+                .get(id)
+                .and_then(|s| s.stop_code.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        let mut replacements: HashMap<String, Vec<String>> = by_id
+            .iter()
+            .map(|(id, with)| (code_of(id), with.iter().map(|w| code_of(w)).collect()))
+            .collect();
+
+        // a station none of whose platforms is listed: its platforms' stand-ins,
+        // platform by platform in id order, each code once
+        let mut platforms: BTreeMap<&str, Vec<&StopRow>> = BTreeMap::new();
+        for s in stops.values().filter(|s| s.location_type == 0) {
+            if let Some(station) = s.parent_station.as_deref() {
+                platforms.entry(station).or_default().push(s);
+            }
+        }
+        for (station, mut kids) in platforms {
+            let Some(station_row) = stops.get(station).filter(|s| s.location_type == 1) else {
+                continue;
+            };
+            if kids.iter().any(|k| listed(k)) {
+                continue;
+            }
+            kids.sort_by(|a, b| a.stop_id.cmp(&b.stop_id));
+            let mut with: Vec<String> = Vec::new();
+            for kid in kids {
+                for w in by_id.get(&kid.stop_id).into_iter().flatten() {
+                    let code = code_of(w);
+                    if !with.contains(&code) {
+                        with.push(code);
+                    }
+                }
+            }
+            if !with.is_empty() {
+                replacements.insert(code_of(&station_row.stop_id), with);
+            }
+        }
+        Ok(replacements)
     }
 
     /// Patterns, routes and trips from the trip tables (16.6). Every stop order
@@ -2030,5 +2236,120 @@ mod tests {
             plan_feed_actions(&live, &loaded),
             vec![("chennai_bus".to_string(), FeedAction::LoadOrReload)]
         );
+    }
+
+    // ---------------------------------------------- stage replacements
+
+    /// A point `north_m` metres north of a fixed spot in Chennai (one degree
+    /// of latitude is ~111.2 km).
+    fn at(north_m: f64) -> (f64, f64) {
+        (13.0 + north_m / 111_195.0, 80.2)
+    }
+
+    fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(r, s)| (r.to_string(), s.to_string()))
+            .collect()
+    }
+
+    fn served(routes: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        routes
+            .iter()
+            .map(|(r, stops)| (r.to_string(), stops.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    fn positions(stops: &[(&str, f64)]) -> HashMap<String, (f64, f64)> {
+        stops.iter().map(|(s, m)| (s.to_string(), at(*m))).collect()
+    }
+
+    #[test]
+    fn a_left_out_stop_is_stood_in_for_by_the_nearest_stop_its_route_calls_at() {
+        // chennai_bus at its stage switch: route 21's own list calls at
+        // VELACHERY, its stage list at VELACHERY B.T 40 m away and at a stop
+        // 900 m further on.
+        let r = stage_replacements(
+            &rows(&[("21", "velachery")]),
+            &served(&[("21", &["far", "velachery_bt"])]),
+            &positions(&[("velachery", 0.0), ("velachery_bt", 40.0), ("far", 900.0)]),
+        );
+        assert_eq!(r["velachery"], vec!["velachery_bt"]);
+    }
+
+    #[test]
+    fn nothing_stands_in_beyond_the_radius() {
+        let r = stage_replacements(
+            &rows(&[("21", "gone")]),
+            &served(&[("21", &["next"])]),
+            &positions(&[("gone", 0.0), ("next", REPLACEMENT_RADIUS_M + 5.0)]),
+        );
+        assert!(r.is_empty(), "{r:?}");
+        let r = stage_replacements(
+            &rows(&[("21", "gone")]),
+            &served(&[("21", &["next"])]),
+            &positions(&[("gone", 0.0), ("next", REPLACEMENT_RADIUS_M - 5.0)]),
+        );
+        assert_eq!(r["gone"], vec!["next"]);
+    }
+
+    #[test]
+    fn the_stand_in_most_routes_chose_comes_first_then_the_nearest() {
+        // three routes used to call at OLD: two now call at A (60 m), one at
+        // B (10 m). A serves more of OLD's routes, so it leads.
+        let r = stage_replacements(
+            &rows(&[("1", "old"), ("2", "old"), ("3", "old")]),
+            &served(&[("1", &["a"]), ("2", &["a"]), ("3", &["b"])]),
+            &positions(&[("old", 0.0), ("a", 60.0), ("b", 10.0)]),
+        );
+        assert_eq!(r["old"], vec!["a", "b"]);
+        // one route each: the nearer one leads
+        let r = stage_replacements(
+            &rows(&[("1", "old"), ("3", "old")]),
+            &served(&[("1", &["a"]), ("3", &["b"])]),
+            &positions(&[("old", 0.0), ("a", 60.0), ("b", 10.0)]),
+        );
+        assert_eq!(r["old"], vec!["b", "a"]);
+    }
+
+    #[test]
+    fn replacements_do_not_depend_on_input_order() {
+        // two stand-ins the same distance away and chosen once each: the id
+        // breaks the tie, so every pod and every reload answers the same
+        let pos = positions(&[("old", 0.0), ("x", 50.0), ("y", -50.0)]);
+        let a = stage_replacements(
+            &rows(&[("1", "old"), ("2", "old")]),
+            &served(&[("1", &["y"]), ("2", &["x"])]),
+            &pos,
+        );
+        let b = stage_replacements(
+            &rows(&[("2", "old"), ("1", "old"), ("1", "old")]),
+            &served(&[("2", &["x"]), ("1", &["y"])]),
+            &pos,
+        );
+        assert_eq!(a, b);
+        assert_eq!(a["old"], vec!["x", "y"]);
+    }
+
+    #[test]
+    fn a_route_with_no_served_stops_or_a_stop_with_no_position_stands_in_for_nothing() {
+        let r = stage_replacements(
+            &rows(&[("no_served", "old"), ("1", "nowhere")]),
+            &served(&[("1", &["a"])]),
+            &positions(&[("old", 0.0), ("a", 10.0)]),
+        );
+        assert!(r.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn a_stop_never_stands_in_for_itself() {
+        // a route whose stage list still names the stop is not evidence of a
+        // replacement (the stop is then listed and never asked about anyway)
+        let r = stage_replacements(
+            &rows(&[("1", "old")]),
+            &served(&[("1", &["old", "a"])]),
+            &positions(&[("old", 0.0), ("a", 30.0)]),
+        );
+        assert_eq!(r["old"], vec!["a"]);
     }
 }
