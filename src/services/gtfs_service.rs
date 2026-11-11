@@ -178,6 +178,9 @@ pub struct GTFSService {
     /// When each `(gtfs_id, station)` expansion was last logged, on the same
     /// terms as `alias_log_seen`.
     station_log_seen: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
+    /// When each `(gtfs_id, stop)` replacement was last logged, on the same
+    /// terms as `alias_log_seen`.
+    replacement_log_seen: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
     /// Who this pod says it is when it reports the feed versions it has loaded
     /// (`services::webhook`), so the fleet can tell when an edit is live
     /// everywhere.
@@ -224,6 +227,7 @@ impl GTFSService {
             reload_lock: tokio::sync::Mutex::new(()),
             alias_log_seen: std::sync::Mutex::new(HashMap::new()),
             station_log_seen: std::sync::Mutex::new(HashMap::new()),
+            replacement_log_seen: std::sync::Mutex::new(HashMap::new()),
             pod,
             webhook_policy,
             cache_state_warned: AtomicBool::new(false),
@@ -515,7 +519,14 @@ impl GTFSService {
         info!("Fetched {} patterns total", all_pattern_details.len());
 
         // DB feeds replace their preprocessed metadata before anything is indexed.
-        let (db_feed_versions, db_polylines, db_stop_aliases, db_unlisted_stops, db_trips) = self
+        let (
+            db_feed_versions,
+            db_polylines,
+            db_stop_aliases,
+            db_unlisted_stops,
+            db_stop_replacements,
+            db_trips,
+        ) = self
             .overlay_db_feeds(
                 &mut all_routes,
                 &mut all_pattern_details,
@@ -707,6 +718,7 @@ impl GTFSService {
         temp_data.db_feed_versions = db_feed_versions;
         temp_data.stop_aliases_by_gtfs = db_stop_aliases;
         temp_data.unlisted_stops_by_gtfs = db_unlisted_stops;
+        temp_data.stop_replacements_by_gtfs = db_stop_replacements;
         temp_data.db_trips_by_gtfs = db_trips;
 
         let mem_stats = temp_data.memory_usage_bytes();
@@ -2217,15 +2229,17 @@ impl GTFSService {
         HashMap<String, HashMap<String, Option<String>>>,
         HashMap<String, HashMap<String, String>>,
         HashMap<String, HashMap<String, GTFSStop>>,
+        HashMap<String, HashMap<String, Vec<String>>>,
         HashMap<String, Arc<DbTrips>>,
     ) {
         let mut versions = HashMap::new();
         let mut polylines = HashMap::new();
         let mut aliases = HashMap::new();
         let mut unlisted = HashMap::new();
+        let mut replacements = HashMap::new();
         let mut trips = HashMap::new();
         let Some(db) = self.db_source.as_ref() else {
-            return (versions, polylines, aliases, unlisted, trips);
+            return (versions, polylines, aliases, unlisted, replacements, trips);
         };
         for gtfs_id in db.feeds() {
             // a feed whose trips are in the tables needs nothing preprocessed
@@ -2256,6 +2270,7 @@ impl GTFSService {
                     polylines.insert(gtfs_id.clone(), feed.polylines);
                     aliases.insert(gtfs_id.clone(), feed.aliases);
                     unlisted.insert(gtfs_id.clone(), unlisted_by_code(feed.unlisted_stops));
+                    replacements.insert(gtfs_id.clone(), feed.replacements);
                     if let Some(t) = feed.trips {
                         trips.insert(gtfs_id.clone(), t);
                     }
@@ -2266,7 +2281,7 @@ impl GTFSService {
                 ),
             }
         }
-        (versions, polylines, aliases, unlisted, trips)
+        (versions, polylines, aliases, unlisted, replacements, trips)
     }
 
     fn apply_db_polylines(
@@ -2508,6 +2523,14 @@ impl GTFSService {
                 .collect(),
             gtfs_id,
         );
+        // and its route lookups answer with what the stages call at instead
+        replace_feed_entry(
+            &mut data.stop_replacements_by_gtfs,
+            [(gtfs_id.to_string(), feed.replacements)]
+                .into_iter()
+                .collect(),
+            gtfs_id,
+        );
         // and a trip committed there is served by /trip on that same poll
         replace_feed_entry(
             &mut data.db_trips_by_gtfs,
@@ -2637,6 +2660,8 @@ impl GTFSService {
         data.stop_aliases_by_gtfs.remove(gtfs_id);
         // nor stops it lists nowhere: preprocessed data lists every stop it has
         data.unlisted_stops_by_gtfs.remove(gtfs_id);
+        // so nothing stands in for one
+        data.stop_replacements_by_gtfs.remove(gtfs_id);
         // and its /trip back to the preprocessed shards
         data.db_trips_by_gtfs.remove(gtfs_id);
         Ok((data, trip_details))
@@ -3159,7 +3184,13 @@ impl GTFSService {
             // A parent station fans out to its platforms; a platform resolves to
             // itself. Collect the union of their mapping indices so the rest of
             // the function is unchanged by which kind of code arrived.
-            let codes = Self::resolve_stop_codes(&data, &gtfs_id, &stop_code);
+            let mut codes = Self::resolve_stop_codes(&data, &gtfs_id, &stop_code);
+            // A stop the stages left out - no route calls there any more -
+            // answers with the stops its old routes call at instead.
+            if let Some(with) = Self::replacement_in(&data, &gtfs_id, &stop_code) {
+                self.log_replacement(&gtfs_id, &stop_code, with);
+                codes = Self::replacement_source_codes(&data, &gtfs_id, with);
+            }
             let indices: Vec<usize> = codes
                 .iter()
                 .filter_map(|c| route_data.by_stop.get(c.as_str()))
@@ -3896,10 +3927,18 @@ impl GTFSService {
                 // that merged into one stop therefore de-duplicate to that
                 // stop's mappings, like asking for it twice.
                 let clean_stop_code = self.resolve_stop_code(&clean_gtfs_id, &stop_code);
-                // Same fan-out as the singular endpoint. De-duplicate by index:
+                // Same fan-out as the singular endpoint, and the same stand-ins
+                // for a stop the stages left out. De-duplicate by index:
                 // asking for a station and one of its platforms in the same
                 // request must not return that platform's mappings twice.
-                for code in Self::resolve_stop_codes(&data, &clean_gtfs_id, &clean_stop_code) {
+                let codes = match Self::replacement_in(&data, &clean_gtfs_id, &clean_stop_code) {
+                    Some(with) => {
+                        self.log_replacement(&clean_gtfs_id, &clean_stop_code, with);
+                        Self::replacement_source_codes(&data, &clean_gtfs_id, with)
+                    }
+                    None => Self::resolve_stop_codes(&data, &clean_gtfs_id, &clean_stop_code),
+                };
+                for code in codes {
                     if let Some(indices) = route_data.by_stop.get(code.as_str()) {
                         for &i in indices {
                             if seen.insert(i) {
@@ -4022,6 +4061,92 @@ impl GTFSService {
             .get(gtfs_id)
             .and_then(|stations| stations.get(stop_code))
             .filter(|platforms| !platforms.is_empty())
+    }
+
+    /// `(code, stand-ins)` when a stop's route-stop mappings for `stop_code`
+    /// answer with the stops that stand in for it (docs/gtfs-editor.md section
+    /// 1, "An unlisted stop answers a route lookup with its replacement"), else
+    /// `None`. `code` is the cleaned code after the alias step, so a caller can
+    /// report the redirect verbatim (`X-Stop-Replaced: code=a;b`).
+    pub fn stop_replacement(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> Option<(String, Vec<String>)> {
+        let data = self.data.load();
+        let gtfs_id = clean_identifier(gtfs_id);
+        let stop_code = Self::resolve_stop_code_in(&data, &gtfs_id, stop_code);
+        let with = Self::replacement_in(&data, &gtfs_id, &stop_code)?.clone();
+        Some((stop_code, with))
+    }
+
+    /// The listed stops that stand in for `stop_code` in its route-stop
+    /// mappings: only for a code with **no** mapping of its own - a stop no
+    /// served row references, or a station none of whose platforms is listed -
+    /// and only in a DB feed served from its stages. A stop any route calls at
+    /// always answers for itself. `gtfs_id` is cleaned and `stop_code` already
+    /// resolved through the alias map: a stop merged into one the stages left
+    /// out lands on its stand-ins too.
+    fn replacement_in<'a>(
+        data: &'a GTFSData,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> Option<&'a Vec<String>> {
+        let with = data
+            .stop_replacements_by_gtfs
+            .get(gtfs_id)?
+            .get(stop_code)
+            .filter(|with| !with.is_empty())?;
+        let route_data = data.route_data_by_gtfs.get(gtfs_id);
+        let has_own = Self::resolve_stop_codes(data, gtfs_id, stop_code)
+            .iter()
+            .any(|code| {
+                route_data
+                    .and_then(|rd| rd.by_stop.get(code.as_str()))
+                    .is_some_and(|indices| !indices.is_empty())
+            });
+        (!has_own).then_some(with)
+    }
+
+    /// The codes to read mappings for in place of a replaced stop: each
+    /// stand-in, best first, through the same station fan-out as any code, and
+    /// each code once.
+    fn replacement_source_codes(data: &GTFSData, gtfs_id: &str, with: &[String]) -> Vec<String> {
+        let mut codes: Vec<String> = Vec::new();
+        for stand_in in with {
+            for code in Self::resolve_stop_codes(data, gtfs_id, stand_in) {
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+        codes
+    }
+
+    /// Log a replacement at info, at most once an hour per stop, on the same
+    /// terms as `log_alias`: enough to see which left-out stops callers still
+    /// hold, not enough to matter on a hot path.
+    fn log_replacement(&self, gtfs_id: &str, stop_code: &str, with: &[String]) {
+        let Ok(mut seen) = self.replacement_log_seen.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let key = (gtfs_id.to_string(), stop_code.to_string());
+        let due = match seen.get(&key) {
+            Some(last) => now.duration_since(*last) >= ALIAS_LOG_EVERY,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        seen.insert(key, now);
+        // Bounded by the number of left-out stops actually asked for.
+        info!(
+            gtfs_id = %gtfs_id,
+            stop_code = %stop_code,
+            replaced_by = %with.join(";"),
+            "stop code is on no route; answering with the stops that stand in for it",
+        );
     }
 
     /// The codes a read keyed on "the stop a bus calls at" should start from:
@@ -5067,5 +5192,151 @@ mod tests {
         last.name = "LAST".to_string();
         let map = unlisted_by_code(vec![first, last]);
         assert_eq!(map["dup"].name, "LAST");
+    }
+
+    // ------------------------------------------------- stop replacements
+
+    fn mapping(route: &str, stop: &str, seq: i32) -> Arc<RouteStopMapping> {
+        Arc::new(RouteStopMapping {
+            estimated_travel_time_from_previous_stop: None,
+            provider_code: Arc::from("GTFS"),
+            route_code: Arc::from(route),
+            sequence_num: seq,
+            stop_code: Arc::from(stop),
+            stop_name: Arc::from(stop),
+            stop_point: LatLong { lat: 0.0, lon: 0.0 },
+            vehicle_type: Arc::from("BUS"),
+            geo_json: None,
+            gates: None,
+            hindi_name: None,
+            regional_name: None,
+            platform: None,
+            parent_stop_code: None,
+            location_type: "0".to_string(),
+            cluster_id: None,
+            stage_number: None,
+            is_stage_stop: None,
+        })
+    }
+
+    /// Feed "g" with `stops`, the routes calling at `calls` as `(route, stop)`
+    /// in sequence, and `replacements` as the loader built them.
+    fn feed_replacing(
+        stops: Vec<GTFSStop>,
+        calls: &[(&str, &str)],
+        replacements: &[(&str, &[&str])],
+    ) -> GTFSData {
+        let mut data = data_with(stops);
+        let mut route_data = GTFSRouteData::default();
+        for (i, (route, stop)) in calls.iter().enumerate() {
+            route_data.mappings.push(mapping(route, stop, i as i32 + 1));
+            route_data
+                .by_route
+                .entry(route.to_string())
+                .or_default()
+                .push(i);
+            route_data
+                .by_stop
+                .entry(stop.to_string())
+                .or_default()
+                .push(i);
+        }
+        data.route_data_by_gtfs.insert("g".to_string(), route_data);
+        data.stop_replacements_by_gtfs.insert(
+            "g".to_string(),
+            replacements
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+        );
+        data
+    }
+
+    #[test]
+    fn a_stop_no_route_calls_at_answers_with_its_stand_ins() {
+        // chennai_bus at its stage switch: route 21 calls at VELACHERY B.T now,
+        // and a saved journey still names VELACHERY
+        let data = feed_replacing(
+            vec![plain("g", "velachery_bt")],
+            &[("21", "velachery_bt"), ("21", "guindy")],
+            &[("velachery", &["velachery_bt"])],
+        );
+        let with = GTFSService::replacement_in(&data, "g", "velachery").expect("replaced");
+        assert_eq!(with, &vec!["velachery_bt".to_string()]);
+        assert_eq!(
+            GTFSService::replacement_source_codes(&data, "g", with),
+            vec!["velachery_bt"]
+        );
+    }
+
+    #[test]
+    fn a_stop_a_route_calls_at_is_never_replaced() {
+        // even with an entry - which the loader never builds for a listed stop
+        let data = feed_replacing(
+            vec![plain("g", "a"), plain("g", "b")],
+            &[("1", "a"), ("1", "b")],
+            &[("a", &["b"])],
+        );
+        assert!(GTFSService::replacement_in(&data, "g", "a").is_none());
+    }
+
+    #[test]
+    fn a_station_none_of_whose_platforms_is_listed_answers_with_their_stand_ins() {
+        // stn_air's platforms are both unlisted, so the station map has no
+        // platform under it and the station alone would match no route
+        let data = feed_replacing(
+            vec![station("g", "stn_air"), plain("g", "air_new")],
+            &[("A1", "air_new")],
+            &[("stn_air", &["air_new"])],
+        );
+        assert!(GTFSService::station_platforms_in(&data, "g", "stn_air").is_none());
+        assert_eq!(
+            GTFSService::replacement_in(&data, "g", "stn_air"),
+            Some(&vec!["air_new".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_station_with_a_platform_a_route_calls_at_answers_for_itself() {
+        let data = feed_replacing(
+            vec![
+                station("g", "stn"),
+                platform("g", "p1", "stn"),
+                plain("g", "x"),
+            ],
+            &[("1", "p1"), ("2", "x")],
+            &[("stn", &["x"])],
+        );
+        assert!(GTFSService::replacement_in(&data, "g", "stn").is_none());
+    }
+
+    #[test]
+    fn stand_ins_fan_out_like_any_code_and_each_code_comes_once() {
+        // a stand-in that is a station answers with its platforms, after the
+        // station itself, and a code two stand-ins share is read once
+        let data = feed_replacing(
+            vec![
+                station("g", "stn"),
+                platform("g", "p1", "stn"),
+                plain("g", "x"),
+            ],
+            &[("1", "p1"), ("2", "x")],
+            &[("old", &["x", "stn", "x"])],
+        );
+        let with = GTFSService::replacement_in(&data, "g", "old").expect("replaced");
+        assert_eq!(
+            GTFSService::replacement_source_codes(&data, "g", with),
+            vec!["x", "stn", "p1"]
+        );
+    }
+
+    #[test]
+    fn no_replacement_without_an_entry_or_in_another_feed() {
+        let data = feed_replacing(vec![plain("g", "a")], &[("1", "a")], &[("old", &["a"])]);
+        assert!(GTFSService::replacement_in(&data, "g", "unknown").is_none());
+        assert!(GTFSService::replacement_in(&data, "other", "old").is_none());
+        // an entry naming nothing replaces nothing
+        let data = feed_replacing(vec![plain("g", "a")], &[("1", "a")], &[("old", &[])]);
+        assert!(GTFSService::replacement_in(&data, "g", "old").is_none());
     }
 }

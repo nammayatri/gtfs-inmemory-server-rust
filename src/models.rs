@@ -959,6 +959,15 @@ pub struct GTFSData {
     /// A preprocessed feed has no entry.
     #[serde(default)]
     pub unlisted_stops_by_gtfs: HashMap<String, HashMap<String, GTFSStop>>,
+    /// Per DB feed served from its stages, the code of an unlisted stop - or of
+    /// a station none of whose platforms is listed - pointing at the listed
+    /// stops that stand in for it on the routes that used to call there, best
+    /// first (docs/gtfs-editor.md section 1, "An unlisted stop answers a route
+    /// lookup with its replacement"). Read only by a stop's route-stop
+    /// mappings, and only when the code has none of its own. Rebuilt with the
+    /// feed on every reload; a preprocessed feed has no entry.
+    #[serde(default)]
+    pub stop_replacements_by_gtfs: HashMap<String, HashMap<String, Vec<String>>>,
     /// Per feed, each **station** stop code (`location_type = 1`) pointing at the
     /// codes of the platforms beneath it, sorted (docs/gtfs-editor.md section 1,
     /// "A station code answers everywhere a stop code does"). Rebuilt with the
