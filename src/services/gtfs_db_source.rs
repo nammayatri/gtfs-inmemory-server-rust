@@ -11,8 +11,9 @@
 //! GTFS built out of these tables by `generate_trips_from_db.py`, so everything
 //! downstream of `fetch_and_process_data` is unchanged:
 //!
-//! - **stops**: stops a served route row references, plus stations
-//!   (`location_type = 1`), with `clusterId` carried in `infoJson`.
+//! - **stops**: stops a served route row references, plus each station
+//!   (`location_type = 1`) with a platform among them (see
+//!   [`listed_stop_ids`]), with `clusterId` carried in `infoJson`.
 //! - **patterns**: one per route that has trips. Stops are the route's served
 //!   rows (NEW STOP / INTERMEDIATE STOP) in sequence order. Times are the
 //!   example trip's own where the DB still spells the route the same way, and
@@ -175,10 +176,11 @@ pub struct DbFeed {
     pub routes: Vec<NandiRoutesRes>,
     pub patterns: Vec<NandiPatternDetails>,
     pub stops: Vec<GTFSStop>,
-    /// The live stops `stops` leaves out because no served row references
-    /// them (never a station: those are always in `stops`). In no list, but a
-    /// lookup of one by its code still answers (docs/gtfs-editor.md section 1,
-    /// "A live stop answers its code"). Empty for `stops_scope = 'all'`.
+    /// The live stops `stops` leaves out: a stop no served row references,
+    /// and a station none of whose platforms is listed (see
+    /// [`listed_stop_ids`]). In no list, but a lookup of one by its code still
+    /// answers (docs/gtfs-editor.md section 1, "A live stop answers its
+    /// code"). Empty for `stops_scope = 'all'`.
     pub unlisted_stops: Vec<GTFSStop>,
     /// The code of an unlisted stop - or of a station none of whose platforms
     /// is listed - pointing at the codes of the listed stops that stand in for
@@ -291,6 +293,50 @@ pub fn resolve_merge_chains(
         }
     }
     aliases
+}
+
+/// The ids of the live `stops` a feed lists. A feed imported whole
+/// (`all_stops`, `stops_scope = 'all'`) lists every one. Otherwise a stop is
+/// listed when a served row references it (`referenced`), and a station when
+/// it is referenced itself or at least one of its platforms is listed.
+///
+/// A station used to be listed regardless. Since chennai_bus turned stages on
+/// (v202, 2026-11-05), 89 of its 2,118 stations (at v209) had every platform
+/// left out of the stage lists. Each was still in `/stops/{g}`, the rider app's
+/// station list, with nothing under it, and picking one found no route. Such a
+/// station is unlisted now, like the stops under it: in no list, search or
+/// nearby read, but `/stop/{g}/{code}` still answers for it, and so do its
+/// route-stop mappings, through its platforms' stand-ins (see
+/// [`stage_replacements`]).
+fn listed_stop_ids<'a>(
+    stops: &'a HashMap<String, StopRow>,
+    referenced: &HashSet<&str>,
+    all_stops: bool,
+) -> HashSet<&'a str> {
+    if all_stops {
+        return stops.keys().map(String::as_str).collect();
+    }
+    let mut listed: HashSet<&'a str> = stops
+        .keys()
+        .map(String::as_str)
+        .filter(|id| referenced.contains(id))
+        .collect();
+    for s in stops.values() {
+        if s.location_type != 0 || !referenced.contains(s.stop_id.as_str()) {
+            continue;
+        }
+        let Some((station_id, station)) = s
+            .parent_station
+            .as_deref()
+            .and_then(|id| stops.get_key_value(id))
+        else {
+            continue;
+        };
+        if station.location_type == 1 {
+            listed.insert(station_id.as_str());
+        }
+    }
+    listed
 }
 
 /// How far a route's stage-list stop may be from the stop its own list named
@@ -1042,26 +1088,27 @@ impl GtfsDbSource {
         };
 
         // Stops: everything a served row references (whether or not its route
-        // runs trips - the generator writes those too), plus stations; or, for
-        // a feed imported whole (stops_scope 'all'), every stop and station, as
+        // runs trips - the generator writes those too), plus each station with
+        // a platform among them (`listed_stop_ids`); or, for a feed imported
+        // whole (stops_scope 'all'), every stop and station, as
         // the preprocessor reads them from stops.txt. Never an entrance, a
         // generic node or a boarding area, which the preprocessor leaves out
         // too: they share a station's code and would take over its name. In
         // the order the feed had them: GIMS keeps the last of several stops
         // sharing a code.
         //
-        // A live stop left out goes to `unlisted_stops` instead: a feed whose
-        // stages call at other records than its routes' own lists (chennai_bus
-        // at its switch, 2026-11-05) still has callers holding the old ones.
+        // A live stop left out - and a station with nothing listed under it -
+        // goes to `unlisted_stops` instead: a feed whose stages call at other
+        // records than its routes' own lists (chennai_bus at its switch,
+        // 2026-11-05) still has callers holding the old ones.
         let mut referenced: HashSet<&str> = HashSet::new();
         for rows in rows_by_pattern.values() {
             for row in rows {
                 referenced.insert(row.stop_id.as_str());
             }
         }
-        let listed = |s: &StopRow| {
-            all_stops || s.location_type == 1 || referenced.contains(s.stop_id.as_str())
-        };
+        let listed_ids = listed_stop_ids(&stops, &referenced, all_stops);
+        let listed = |s: &StopRow| listed_ids.contains(s.stop_id.as_str());
         let mut stop_ids: Vec<(&Option<i32>, &String)> = stops
             .values()
             .filter(|s| s.location_type <= 1)
@@ -2351,5 +2398,99 @@ mod tests {
             &positions(&[("old", 0.0), ("a", 30.0)]),
         );
         assert_eq!(r["old"], vec!["a"]);
+    }
+
+    // ---------------------------------------------- listed stops and stations
+
+    /// Live stops by id: `(id, location_type, parent_station)`.
+    fn stop_rows(spec: &[(&str, i16, Option<&str>)]) -> HashMap<String, StopRow> {
+        spec.iter()
+            .map(|(id, location_type, parent)| {
+                let row = StopRow {
+                    stop_id: id.to_string(),
+                    stop_code: None,
+                    name: id.to_string(),
+                    lat: 0.0,
+                    lon: 0.0,
+                    location_type: *location_type,
+                    parent_station: parent.map(str::to_string),
+                    platform_code: None,
+                    cluster_id: None,
+                    description: None,
+                    sort_key: None,
+                    unserviceable: false,
+                };
+                (id.to_string(), row)
+            })
+            .collect()
+    }
+
+    fn listed_sorted(
+        stops: &HashMap<String, StopRow>,
+        referenced: &[&str],
+        all_stops: bool,
+    ) -> Vec<String> {
+        let referenced: HashSet<&str> = referenced.iter().copied().collect();
+        let mut ids: Vec<String> = listed_stop_ids(stops, &referenced, all_stops)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_station_is_listed_while_any_of_its_platforms_is() {
+        let stops = stop_rows(&[
+            ("stn", 1, None),
+            ("p1", 0, Some("stn")),
+            ("p2", 0, Some("stn")),
+            ("plain", 0, None),
+        ]);
+        // one served platform keeps the station; its unserved sibling stays out
+        assert_eq!(listed_sorted(&stops, &["p1"], false), vec!["p1", "stn"]);
+    }
+
+    #[test]
+    fn a_station_none_of_whose_platforms_is_served_is_unlisted() {
+        // chennai_bus's stn_CHNS03094 (Chennai Airport Metro) at v209: both
+        // platforms left out of the stage lists
+        let stops = stop_rows(&[
+            ("stn_air", 1, None),
+            ("air_a", 0, Some("stn_air")),
+            ("air_b", 0, Some("stn_air")),
+            ("air_new", 0, None),
+        ]);
+        assert_eq!(listed_sorted(&stops, &["air_new"], false), vec!["air_new"]);
+        // and a station with no platform at all has nothing to offer either
+        let bare = stop_rows(&[("stn_bare", 1, None)]);
+        assert!(listed_sorted(&bare, &[], false).is_empty());
+    }
+
+    #[test]
+    fn a_station_a_route_calls_at_directly_is_listed() {
+        let stops = stop_rows(&[("stn", 1, None), ("p1", 0, Some("stn"))]);
+        assert_eq!(listed_sorted(&stops, &["stn"], false), vec!["stn"]);
+    }
+
+    #[test]
+    fn only_a_platform_lists_its_parent() {
+        // a served stop whose parent is not a station (a bad import pointing
+        // at a plain stop), or is not live, lists nothing besides itself
+        let stops = stop_rows(&[
+            ("host", 0, None),
+            ("child", 0, Some("host")),
+            ("orphan", 0, Some("gone")),
+        ]);
+        assert_eq!(
+            listed_sorted(&stops, &["child", "orphan"], false),
+            vec!["child", "orphan"]
+        );
+    }
+
+    #[test]
+    fn a_feed_imported_whole_lists_every_stop_and_station() {
+        let stops = stop_rows(&[("stn", 1, None), ("p1", 0, Some("stn")), ("plain", 0, None)]);
+        assert_eq!(listed_sorted(&stops, &[], true), vec!["p1", "plain", "stn"]);
     }
 }

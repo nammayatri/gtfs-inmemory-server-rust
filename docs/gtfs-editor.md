@@ -297,8 +297,8 @@ stops OTP's feed still used were suddenly in no served row, and
 `GET /stop/chennai_bus/{code}` answered 404 for every leg that named one: 5,168 of
 the 5,301 chennai_bus stop 404s in the ten hours the pod logs kept.
 
-So the loader keeps the live stops it does not list (never a station: those are
-always listed) as the feed's **unlisted stops**, by code, and a read of a stop by
+So the loader keeps the live stops it does not list as the feed's **unlisted
+stops**, by code, and a read of a stop by
 its code - `get_stop` and the `getAllStopsByIds` bulk read - falls back to them
 after the listed stops, once the alias map has had its say. Nothing else does:
 the stop lists, search, nearby and the routing reads see the listed stops alone,
@@ -309,6 +309,16 @@ inactive route, which answers by its id and is in no list.
 The set is rebuilt with the feed on every reload, like the alias map; a feed
 reverted to preprocessed data has none; and a listed stop always wins over an
 unlisted one sharing its code.
+
+A **station** is listed while any of its platforms is (or a served row names
+the station itself), and is unlisted with them otherwise. It used to be listed
+regardless, and at v209, 89 of chennai_bus's 2,118 stations had every platform
+left out of the stage lists (`stn_CHNS03094`, Chennai Airport Metro, among
+them). Each was still in `/stops/{g}`, which is the rider app's station list
+(`getStationsByGtfsId`), with nothing under it, and picking one found no route.
+Unlisted, it is offered nowhere, `/stop/{g}/{code}` still answers for it, and its
+route-stop mappings answer with its platforms' stand-ins (next section). A feed
+imported whole (`stops_scope = 'all'`) lists every stop and station, as before.
 
 ### An unlisted stop answers a route lookup with its replacement
 
@@ -2904,8 +2914,8 @@ Settled while implementing:
   A route's `stopCount` counts the distinct stop codes of its patterns, and
   `tripCount` all its trips. A stop order no trip runs is not a pattern, and a
   route with no trip is not served; the feed's stops are still every stop a
-  stop order of a live route calls at, plus stations, as for a feed whose
-  trips are preprocessed.
+  stop order of a live route calls at, plus each station with a platform among
+  them, as for a feed whose trips are preprocessed.
 - `/trip/{id}?gtfs_id=` of a DB-trips feed is computed from an index built with
   the feed (each trip's stop order, timing and reference time) - never read
   from a shard or OTP, and not cached, so an edit is answered on the poll that
