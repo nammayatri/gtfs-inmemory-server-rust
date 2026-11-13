@@ -3,7 +3,7 @@ ARG DATA_IMAGE=gtfs-data:latest
 FROM ${DATA_IMAGE} AS gtfsdata
 
 # Multi-stage build for Rust application
-FROM rust:slim as builder
+FROM rust:1.93.0-slim-trixie as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
