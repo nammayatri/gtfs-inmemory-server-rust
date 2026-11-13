@@ -111,8 +111,8 @@ regex = "1.10.3"
 # OpenAPI / Swagger
 utoipa = { version = "5", features = ["actix_extras", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["actix-web"] }
-shared = { git = "https://github.com/nammayatri/shared-kernel-rs", rev = "05af149" }
-macros = { git = "https://github.com/nammayatri/shared-kernel-rs", rev = "05af149" }
+shared = { git = "https://github.com/nammayatri/shared-kernel-rs", rev = "76323529fd7d1659e7e73171bbf4ff6601430ab2" }
+macros = { git = "https://github.com/nammayatri/shared-kernel-rs", rev = "76323529fd7d1659e7e73171bbf4ff6601430ab2" }
 
 [dev-dependencies]
 tokio-test = "0.4"

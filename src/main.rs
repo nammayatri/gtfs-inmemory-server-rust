@@ -1,7 +1,10 @@
 use actix_web::{web, App, HttpServer};
 use gtfs_routes_service::{
-    environment, handlers::routes, middleware::*, swagger::ApiDoc,
-    tools::prometheus::prometheus_metrics,
+    environment,
+    handlers::routes,
+    middleware::*,
+    swagger::ApiDoc,
+    tools::{dhall::decrypt_dhall_imports, prometheus::prometheus_metrics},
 };
 use shared::tools::logger::setup_tracing;
 use std::{env, net::Ipv4Addr};
@@ -15,6 +18,10 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration from Dhall
     let dhall_config_path = env::var("DHALL_CONFIG")
         .unwrap_or_else(|_| "./dhall-configs/dev/gtfs_in_memory_server_rust.dhall".to_string());
+    if let Err(err) = decrypt_dhall_imports(&dhall_config_path).await {
+        println!("Dhall Secrets Decryption Error: {}", err);
+        std::process::exit(1);
+    }
     let app_config = environment::read_dhall_config(&dhall_config_path).unwrap_or_else(|err| {
         println!("Dhall Config Reading Error: {}", err);
         std::process::exit(1);
