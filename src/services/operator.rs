@@ -4415,11 +4415,8 @@ impl OperatorService for DBOperatorService {
         route_id: &str,
     ) -> AppResult<RouteStopsResponse> {
         let header: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT ri.route_number, ri.route_name, \
-                COALESCE(NULLIF(gr.encoded_polyline, ''), ri.encoded_polyline) AS encoded_polyline \
-             FROM route_internal ri \
-             LEFT JOIN gtfs_route gr ON gr.gtfs_id = ri.gtfs_id AND gr.route_id = ri.route_id AND NOT gr.deleted \
-             WHERE ri.gtfs_id=$1 AND ri.route_id=$2 AND ri.deleted=false LIMIT 1",
+            "SELECT route_number, route_name, encoded_polyline FROM route_internal \
+             WHERE gtfs_id=$1 AND route_id=$2 AND deleted=false LIMIT 1",
         )
         .bind(gtfs_id)
         .bind(route_id)
