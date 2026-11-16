@@ -39,6 +39,7 @@ pub struct ScheduledTrip {
     pub trip_number: Option<i32>,
     pub is_active_trip: Option<bool>,
     pub is_completed: Option<bool>,
+    pub duty_trip_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -73,6 +74,7 @@ impl SnapshotTrip {
             trip_number: Some(self.trip_number),
             is_active_trip: self.is_active_trip,
             is_completed: self.is_completed,
+            duty_trip_id: None,
         }
     }
 }

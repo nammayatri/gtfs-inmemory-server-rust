@@ -9,10 +9,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::models::{
     BusSchedule, DepotInfo, DepotVehicleInfo, FleetOperationInfo, RouteLastScheduleTime,
-    VehicleData, VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse, WaybillStatus,
-    WaybillTripInfo,
+    VehicleData, VehicleDataWithRouteId, VehicleOwnership, VehicleProperties,
+    WaybillMetadataResponse, WaybillStatus, WaybillTripInfo,
 };
+use crate::services::gtfs_service::RouteCatalog;
 use crate::services::operator::SUPPORTED_OPERATOR_GTFS_IDS;
+use crate::services::reader_config::ReaderConfig;
 use crate::services::schedule_snapshot::{
     ScheduleSnapshot, ScheduleSnapshotCache, ScheduleTripRow, ScheduledTrip, SCHEDULE_SNAPSHOT_TTL,
 };
@@ -119,6 +121,7 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         &self,
         gtfs_id: &str,
         waybill_no: &str,
+        trip_number: Option<i32>,
     ) -> AppResult<WaybillMetadataResponse>;
 
     async fn get_vehicle_properties(
@@ -126,6 +129,12 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         fleet_no: &str,
         gtfs_id: &str,
     ) -> AppResult<VehicleProperties>;
+
+    async fn get_vehicle_ownership(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<VehicleOwnership>;
 
     /// Service type only: same waybill priority as `get_vehicle_data`, without the trip/schedule queries.
     async fn get_vehicle_service_type(
@@ -232,6 +241,7 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         &self,
         _gtfs_id: &str,
         _waybill_no: &str,
+        _trip_number: Option<i32>,
     ) -> AppResult<WaybillMetadataResponse> {
         Err(AppError::NotFound(
             "Database is not connected in local testing mode.".to_string(),
@@ -244,6 +254,14 @@ impl VehicleDataReaderInternal for MockDBVehicleReaderInternal {
         _gtfs_id: &str,
     ) -> AppResult<VehicleProperties> {
         Ok(VehicleProperties::default())
+    }
+
+    async fn get_vehicle_ownership(
+        &self,
+        _vehicle_no: &str,
+        _gtfs_id: &str,
+    ) -> AppResult<VehicleOwnership> {
+        Ok(VehicleOwnership::default())
     }
 
     async fn get_vehicle_service_type(
@@ -312,6 +330,8 @@ pub struct DBVehicleReaderInternal {
     depot_cache: Arc<RwLock<InternalDepotCache>>,
     routes_served_today_cache:
         Arc<RwLock<HashMap<String, (Vec<RouteLastScheduleTime>, SystemTime)>>>,
+    reader_config: Arc<ReaderConfig>,
+    routes: RouteCatalog,
 }
 
 const STATION_ETA_CACHE_DURATION: u64 = 1800; // 30 mins
@@ -322,13 +342,15 @@ const DEPOT_CACHE_DURATION: u64 = 300;
 const ROUTES_SERVED_TODAY_CACHE_DURATION: u64 = 1800; // 30 mins, same as the external reader
 
 impl DBVehicleReaderInternal {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, reader_config: Arc<ReaderConfig>, routes: RouteCatalog) -> Self {
         Self {
             pool: Some(pool),
             schedule_snapshot: ScheduleSnapshotCache::new(SCHEDULE_SNAPSHOT_TTL),
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
             routes_served_today_cache: Arc::new(RwLock::new(HashMap::new())),
+            reader_config,
+            routes,
         }
     }
 
@@ -341,6 +363,37 @@ impl DBVehicleReaderInternal {
             station_eta_cache: Arc::new(RwLock::new(HashMap::new())),
             depot_cache: Arc::new(RwLock::new(InternalDepotCache::default())),
             routes_served_today_cache: Arc::new(RwLock::new(HashMap::new())),
+            reader_config: Arc::new(ReaderConfig::default()),
+            routes: RouteCatalog::empty(),
+        }
+    }
+
+    fn empty_vehicle_data(vehicle_no: &str) -> VehicleDataWithRouteId {
+        VehicleDataWithRouteId {
+            waybill_id: None,
+            waybill_no: None,
+            service_type: None,
+            vehicle_no: vehicle_no.to_string(),
+            schedule_no: None,
+            last_updated: None,
+            duty_date: None,
+            route_id: None,
+            route_number: None,
+            depot: None,
+            trip_number: None,
+            is_active_trip: false,
+            remaining_trip_details: None,
+            entity_remark: None,
+            driver_code: None,
+            conductor_code: None,
+            deleted: None,
+            status: None,
+            schedule_details: None,
+            db_start_time: None,
+            db_end_time: None,
+            seat_layout_id: None,
+            waybill_status: None,
+            duty_trip_id: None,
         }
     }
 
@@ -520,6 +573,7 @@ impl DBVehicleReaderInternal {
                     db_end_time: None,
                     seat_layout_id: None,
                     waybill_status: Some(waybill_status),
+                    duty_trip_id: None,
                 };
 
                 if let Some(schedule) = schedule_result {
@@ -601,33 +655,10 @@ impl DBVehicleReaderInternal {
                         db_end_time: None,
                         seat_layout_id: None,
                         waybill_status,
+                        duty_trip_id: None,
                     }
                 } else {
-                    VehicleDataWithRouteId {
-                        waybill_id: None,
-                        waybill_no: None,
-                        service_type: None,
-                        vehicle_no: vehicle_no.to_string(),
-                        schedule_no: None,
-                        last_updated: None,
-                        duty_date: None,
-                        route_id: None,
-                        route_number: None,
-                        depot: None,
-                        trip_number: None,
-                        is_active_trip: false,
-                        remaining_trip_details: None,
-                        entity_remark: None,
-                        driver_code: None,
-                        conductor_code: None,
-                        deleted: None,
-                        status: None,
-                        schedule_details: None,
-                        db_start_time: None,
-                        db_end_time: None,
-                        seat_layout_id: None,
-                        waybill_status: None,
-                    }
+                    Self::empty_vehicle_data(vehicle_no)
                 };
 
                 Ok(out)
@@ -1085,47 +1116,12 @@ impl DBVehicleReaderInternal {
         }
     }
 
-    /// Enrich route_number on each schedule row from route_internal.
     async fn enrich_route_numbers(&self, schedules: &mut [BusSchedule]) -> AppResult<()> {
-        let route_ids: Vec<String> = schedules
-            .iter()
-            .map(|s| s.route_id.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        if route_ids.is_empty() {
-            return Ok(());
-        }
-
-        let placeholders: Vec<String> = (1..=route_ids.len()).map(|i| format!("${}", i)).collect();
-        let placeholders_str = placeholders.join(",");
-
-        let query = format!(
-            "SELECT route_id::text AS route_id, route_number FROM route_internal WHERE route_id::text IN ({})",
-            placeholders_str
-        );
-
-        let mut qb = sqlx::query_as::<_, (String, Option<String>)>(&query);
-        for id in &route_ids {
-            qb = qb.bind(id);
-        }
-
-        let mappings = match qb.fetch_all(self.pool()?).await {
-            Ok(m) => m,
-            Err(e) => {
-                error!("enrich_route_numbers (internal) failed: {}", e);
-                return Ok(());
-            }
-        };
-
-        let map: HashMap<String, Option<String>> = mappings.into_iter().collect();
         for s in schedules.iter_mut() {
-            if let Some(num) = map.get(&s.route_id) {
-                s.route_number = num.clone();
+            if let Some(n) = self.routes.names(None, &s.route_id) {
+                s.route_number = n.number;
             }
         }
-
         Ok(())
     }
 
@@ -1245,6 +1241,417 @@ impl DBVehicleReaderInternal {
     }
 }
 
+fn v2_vehicle_data_select(status: &str) -> String {
+    let vehicle_service = vehicle_service_join("dg");
+    format!(
+        r#"
+    SELECT
+        dg.id AS waybill_id,
+        dg.waybill_no,
+        COALESCE(st.service_type_name, '') AS service_type,
+        COALESCE(dg.vehicle_number, '') AS vehicle_no,
+        tg.code AS schedule_no,
+        dg.updated_at AS last_updated,
+        dg.operation_date::text AS duty_date,
+        dg.id AS schedule_trip_id,
+        e.entity_remark::text AS entity_remark,
+        COALESCE(d.driver_token_number, dg.driver_token_number) AS driver_code,
+        COALESCE(d.conductor_token_number, dg.conductor_token_number) AS conductor_code,
+        false AS deleted,
+        {status} AS status,
+        false AS is_flexi,
+        to_char(d.scheduled_start_at AT TIME ZONE COALESCE(f.timezone, '{DEFAULT_FEED_TZ}'), 'HH24:MI') AS db_start_time,
+        (EXTRACT(EPOCH FROM d.recorded_start_time) * 1000)::bigint::text AS start_time_epoch,
+        d.trip_number,
+        (d.status = 'active') AS is_active_trip,
+        (d.status = 'completed') AS is_completed,
+        dg.waybill_no || '-' || d.trip_number AS duty_trip_id
+    FROM duties d
+    JOIN duty_groups dg ON dg.id = d.duty_group_id
+    JOIN trip_groups tg ON tg.id = dg.trip_group_id
+    {vehicle_service}
+    LEFT JOIN entities_internal e
+        ON e.entity_id::text = dg.depot_id AND e.gtfs_id = dg.gtfs_id
+    LEFT JOIN gtfs_feed f ON f.gtfs_id = dg.gtfs_id
+"#
+    )
+}
+
+fn vehicle_service_join(run: &str) -> String {
+    format!(
+        "LEFT JOIN vehicles_internal v
+        ON v.fleet_no = {run}.vehicle_number AND v.gtfs_id = {run}.gtfs_id AND v.deleted = false
+    LEFT JOIN service_type_internal st
+        ON st.service_type_id::text = COALESCE({run}.service_type_id, v.bus_service_type_id::text) AND st.gtfs_id = {run}.gtfs_id"
+    )
+}
+
+fn in_live_window(column: &str, today: &str) -> String {
+    format!("{column} BETWEEN {today} - 1 AND {today}")
+}
+
+fn or_empty<T: Default>(result: Result<T, sqlx::Error>, context: &str) -> T {
+    result.unwrap_or_else(|e| {
+        debug!("{}: {}", context, e);
+        T::default()
+    })
+}
+
+const DEFAULT_FEED_TZ: &str = "Asia/Kolkata";
+
+fn feed_tz(gtfs_param: &str) -> String {
+    format!("COALESCE((SELECT tz.timezone FROM gtfs_feed tz WHERE tz.gtfs_id = {gtfs_param}), '{DEFAULT_FEED_TZ}')")
+}
+
+fn feed_today(gtfs_param: &str) -> String {
+    format!("(now() AT TIME ZONE {})::date", feed_tz(gtfs_param))
+}
+
+fn live_run_cte() -> String {
+    let window = in_live_window("dg.operation_date", &feed_today("$1"));
+    format!(
+        r#"
+            WITH run AS (
+                SELECT dg.* FROM duty_groups dg
+                WHERE dg.gtfs_id = $1 AND dg.vehicle_number = $2 AND dg.is_active AND NOT dg.deleted
+                  AND {window}
+                  AND EXISTS (SELECT 1 FROM duties d WHERE d.duty_group_id = dg.id AND NOT d.deleted
+                              AND d.status IN ('upcoming', 'active'))
+                ORDER BY EXISTS (SELECT 1 FROM duties d WHERE d.duty_group_id = dg.id
+                                 AND d.status = 'active' AND NOT d.deleted) DESC,
+                         dg.window_start_at
+                LIMIT 1
+            )
+"#
+    )
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct V2TripRow {
+    run_id: String,
+    waybill_no: String,
+    schedule_no: String,
+    vehicle_no: Option<String>,
+    service_type: Option<String>,
+    run_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    duty_date: String,
+    depot_name: Option<String>,
+    entity_remark: Option<String>,
+    driver_code: Option<String>,
+    conductor_code: Option<String>,
+    route_id: String,
+    trip_number: i32,
+    trip_order: i32,
+    is_active_trip: bool,
+    start_epoch: Option<String>,
+    end_epoch: Option<String>,
+    db_start_time: Option<String>,
+    db_end_time: Option<String>,
+}
+
+fn scheduled(rows: Vec<VehicleData>) -> Vec<ScheduledTrip> {
+    rows.into_iter()
+        .map(|v| ScheduledTrip {
+            waybill_no: v.waybill_no,
+            service_type: v.service_type,
+            vehicle_no: v.vehicle_no,
+            duty_date: v.duty_date,
+            status: v.status,
+            db_start_time: v.db_start_time,
+            start_time_epoch: v.start_time_epoch,
+            trip_number: v.trip_number,
+            is_active_trip: v.is_active_trip,
+            is_completed: v.is_completed,
+            duty_trip_id: v.duty_trip_id,
+        })
+        .collect()
+}
+
+impl V2TripRow {
+    fn duty_trip_id(&self) -> String {
+        format!("{}-{}", self.waybill_no, self.trip_number)
+    }
+
+    fn to_bus_schedule(&self) -> BusSchedule {
+        BusSchedule {
+            schedule_number: self.schedule_no.clone(),
+            route_id: self.route_id.clone(),
+            route_name: None,
+            org_name: self.depot_name.clone(),
+            trip_number: Some(self.trip_number),
+            route_number: None,
+            stops_count: None,
+            is_active_trip: Some(self.is_active_trip),
+            schedule_trip_id: Some(self.run_id.clone()),
+            start_time: self.start_epoch.clone(),
+            end_time: self.end_epoch.clone(),
+            deleted: Some(false),
+            trip_order: Some(self.trip_order),
+            db_start_time: self.db_start_time.clone(),
+            db_end_time: self.db_end_time.clone(),
+            duty_trip_id: Some(self.duty_trip_id()),
+        }
+    }
+}
+
+impl DBVehicleReaderInternal {
+    async fn v2_has_live_run(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
+        let Some(pool) = &self.pool else { return false };
+        let window = in_live_window("operation_date", &feed_today("$1"));
+        let result = sqlx::query_scalar::<_, bool>(&format!(
+            "SELECT EXISTS(SELECT 1 FROM duty_groups
+                           WHERE gtfs_id = $1 AND vehicle_number = $2 AND is_active AND NOT deleted
+                             AND {window})"
+        ))
+        .bind(gtfs_id)
+        .bind(vehicle_no)
+        .fetch_one(pool)
+        .await;
+        or_empty(result, "v2_has_live_run")
+    }
+
+    async fn v2_live_trips(&self, vehicle_no: &str, gtfs_id: &str) -> Vec<V2TripRow> {
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+        let cte = live_run_cte();
+        let tz = feed_tz("$1");
+        let vehicle_service = vehicle_service_join("run");
+        let query = format!(
+            r#"{cte}
+            SELECT
+                run.id AS run_id,
+                run.waybill_no,
+                tg.code AS schedule_no,
+                run.vehicle_number AS vehicle_no,
+                st.service_type_name AS service_type,
+                run.updated_at AS run_updated_at,
+                run.operation_date::text AS duty_date,
+                COALESCE(e.entity_name, run.depot_id) AS depot_name,
+                e.entity_remark::text AS entity_remark,
+                COALESCE(d.driver_token_number, run.driver_token_number) AS driver_code,
+                COALESCE(d.conductor_token_number, run.conductor_token_number) AS conductor_code,
+                d.route_id,
+                d.trip_number,
+                d.trip_order,
+                (d.status = 'active') AS is_active_trip,
+                (EXTRACT(EPOCH FROM d.recorded_start_time) * 1000)::bigint::text AS start_epoch,
+                (EXTRACT(EPOCH FROM d.recorded_end_time) * 1000)::bigint::text AS end_epoch,
+                to_char(d.scheduled_start_at AT TIME ZONE {tz}, 'HH24:MI') AS db_start_time,
+                to_char(d.scheduled_end_at AT TIME ZONE {tz}, 'HH24:MI') AS db_end_time
+            FROM run
+            JOIN duties d ON d.duty_group_id = run.id
+            JOIN trip_groups tg ON tg.id = run.trip_group_id
+            {vehicle_service}
+            LEFT JOIN entities_internal e
+                ON e.entity_id::text = run.depot_id AND e.gtfs_id = run.gtfs_id
+            WHERE NOT d.deleted AND d.status IN ('upcoming', 'active')
+            ORDER BY (d.status = 'active') DESC, d.scheduled_start_at, d.trip_order
+        "#
+        );
+
+        let result = sqlx::query_as::<_, V2TripRow>(&query)
+            .bind(gtfs_id)
+            .bind(vehicle_no)
+            .fetch_all(pool)
+            .await;
+        or_empty(result, "v2_live_trips")
+    }
+
+    async fn v2_vehicle_data(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+        trip_number: Option<i32>,
+    ) -> Option<VehicleDataWithRouteId> {
+        let mut rows = self.v2_live_trips(vehicle_no, gtfs_id).await;
+        if let Some(n) = trip_number {
+            rows.retain(|r| r.trip_number >= n);
+        }
+        rows.sort_by_key(|r| r.trip_order);
+        let current_idx = rows.iter().position(|r| r.is_active_trip).unwrap_or(0);
+        if current_idx >= rows.len() {
+            return None;
+        }
+        let current = rows.remove(current_idx);
+        rows.retain(|r| r.trip_order > current.trip_order);
+        let mut schedules: Vec<BusSchedule> = std::iter::once(&current)
+            .chain(rows.iter())
+            .map(V2TripRow::to_bus_schedule)
+            .collect();
+        let _ = self.enrich_route_numbers(&mut schedules).await;
+        let first = schedules.first().cloned();
+        let mut schedule_map: HashMap<String, Vec<BusSchedule>> = HashMap::new();
+        schedule_map.insert(current.run_id.clone(), schedules.clone());
+        let remaining = if schedules.len() > 1 {
+            Some(schedules.split_off(1))
+        } else {
+            None
+        };
+
+        Some(VehicleDataWithRouteId {
+            waybill_id: Some(current.run_id.clone()),
+            waybill_no: Some(current.waybill_no.clone()),
+            service_type: current.service_type.clone(),
+            vehicle_no: current
+                .vehicle_no
+                .clone()
+                .unwrap_or_else(|| vehicle_no.to_string()),
+            schedule_no: Some(current.schedule_no.clone()),
+            last_updated: current.run_updated_at,
+            duty_date: Some(current.duty_date.clone()),
+            route_id: Some(current.route_id.clone()),
+            route_number: first.as_ref().and_then(|s| s.route_number.clone()),
+            depot: current.depot_name.clone(),
+            trip_number: Some(current.trip_number),
+            is_active_trip: current.is_active_trip,
+            remaining_trip_details: remaining,
+            entity_remark: current.entity_remark.clone(),
+            driver_code: current.driver_code.clone(),
+            conductor_code: current.conductor_code.clone(),
+            deleted: Some(false),
+            status: Some("online".to_string()),
+            schedule_details: Some(schedule_map),
+            db_start_time: current.db_start_time.clone(),
+            db_end_time: current.db_end_time.clone(),
+            seat_layout_id: None,
+            waybill_status: Some(WaybillStatus::Online),
+            duty_trip_id: Some(current.duty_trip_id()),
+        })
+    }
+
+    async fn v2_route_rows(
+        &self,
+        route_id: &str,
+        gtfs_id: &str,
+        vehicle_number: Option<&str>,
+        max_duty_date: Option<&str>,
+    ) -> Vec<ScheduledTrip> {
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+        let today = feed_today("$2");
+        let select = v2_vehicle_data_select(&format!(
+            "CASE WHEN dg.operation_date > {today} THEN 'upcoming' ELSE 'online' END"
+        ));
+        let query = format!(
+            "{select}
+             WHERE d.gtfs_id = $2 AND d.route_id = $1
+               AND NOT d.deleted AND d.status IN ('upcoming', 'active')
+               AND dg.is_active AND NOT dg.deleted
+               AND dg.operation_date BETWEEN {today} - 1
+                   AND GREATEST({today}, COALESCE($4::date, {today}))
+               AND ($3::text IS NULL OR dg.vehicle_number = $3)
+             ORDER BY dg.operation_date, dg.waybill_no, d.trip_number"
+        );
+        let result = sqlx::query_as::<_, VehicleData>(&query)
+            .bind(route_id)
+            .bind(gtfs_id)
+            .bind(vehicle_number)
+            .bind(max_duty_date)
+            .fetch_all(pool)
+            .await
+            .map(scheduled);
+        or_empty(result, "v2_route_rows")
+    }
+
+    async fn v2_waybill_trip_rows(
+        &self,
+        waybill_no: &str,
+        trip_number: i32,
+        gtfs_id: &str,
+    ) -> Vec<ScheduledTrip> {
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+        let query = format!(
+            "{}
+             WHERE dg.waybill_no = $1 AND d.trip_number = $2 AND dg.gtfs_id = $3
+               AND NOT d.deleted AND NOT dg.deleted",
+            v2_vehicle_data_select("'online'::text")
+        );
+        let result = sqlx::query_as::<_, VehicleData>(&query)
+            .bind(waybill_no)
+            .bind(trip_number)
+            .bind(gtfs_id)
+            .fetch_all(pool)
+            .await
+            .map(scheduled);
+        or_empty(result, "v2_waybill_trip_rows")
+    }
+
+    async fn v2_vehicle_service_type(&self, vehicle_no: &str, gtfs_id: &str) -> Option<String> {
+        let pool = self.pool.as_ref()?;
+        let window = in_live_window("dg.operation_date", &feed_today("$1"));
+        let vehicle_service = vehicle_service_join("dg");
+        let result = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT st.service_type_name
+             FROM duty_groups dg
+             {vehicle_service}
+             WHERE dg.gtfs_id = $1 AND dg.vehicle_number = $2 AND NOT dg.deleted
+               AND st.service_type_name IS NOT NULL
+             ORDER BY (dg.is_active AND {window}) DESC,
+                      dg.operation_date DESC, dg.updated_at DESC
+             LIMIT 1"
+        ))
+        .bind(gtfs_id)
+        .bind(vehicle_no)
+        .fetch_optional(pool)
+        .await;
+        or_empty(result, "v2_vehicle_service_type")
+    }
+
+    async fn v2_waybill_metadata(
+        &self,
+        gtfs_id: &str,
+        waybill_no: &str,
+        trip_number: Option<i32>,
+    ) -> Option<WaybillTripInfo> {
+        let pool = self.pool.as_ref()?;
+        let query = format!(
+            r#"
+            SELECT
+                dg.waybill_no,
+                COALESCE(dg.vehicle_number, '') AS vehicle_no,
+                COALESCE(st.service_type_name, '') AS service_type,
+                COALESCE(cur.driver_token_number, dg.driver_token_number) AS driver_token_no,
+                dg.waybill_no || '-' || cur.trip_number AS duty_trip_id,
+                emp.first_name AS driver_first_name,
+                emp.last_name AS driver_last_name,
+                emp.mobile_no AS driver_mobile_number
+            FROM duty_groups dg
+            {vehicle_service}
+            LEFT JOIN LATERAL (
+                SELECT d.trip_number, d.driver_token_number
+                FROM duties d
+                WHERE d.duty_group_id = dg.id AND NOT d.deleted
+                  AND (($3::int IS NOT NULL AND d.trip_number = $3)
+                       OR ($3::int IS NULL AND d.status IN ('upcoming', 'active')))
+                ORDER BY (d.status = 'active') DESC, d.scheduled_start_at
+                LIMIT 1
+            ) cur ON true
+            LEFT JOIN LATERAL (
+                SELECT e.first_name, e.last_name, e.mobile_no
+                FROM employees_internal e
+                WHERE e.gtfs_id = dg.gtfs_id AND e.deleted = false
+                  AND e.token_no = COALESCE(cur.driver_token_number, dg.driver_token_number)
+                LIMIT 1
+            ) emp ON true
+            WHERE dg.waybill_no = $1 AND dg.gtfs_id = $2 AND NOT dg.deleted
+            LIMIT 1
+        "#,
+            vehicle_service = vehicle_service_join("dg")
+        );
+        let result = sqlx::query_as::<_, WaybillTripInfo>(&query)
+            .bind(waybill_no)
+            .bind(gtfs_id)
+            .bind(trip_number)
+            .fetch_optional(pool)
+            .await;
+        or_empty(result, "v2_waybill_metadata")
+    }
+}
+
 #[async_trait]
 impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     async fn get_routes_served_today(
@@ -1330,7 +1737,12 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     }
 
     async fn is_vehicle_in_internal(&self, vehicle_no: &str, gtfs_id: &str) -> bool {
-        self.is_vehicle_in_internal_impl(vehicle_no, gtfs_id).await
+        if self.reader_config.reads_v1(gtfs_id)
+            && self.is_vehicle_in_internal_impl(vehicle_no, gtfs_id).await
+        {
+            return true;
+        }
+        self.v2_has_live_run(vehicle_no, gtfs_id).await
     }
 
     async fn get_vehicle_data(
@@ -1339,8 +1751,26 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         gtfs_id: &str,
         trip_number: Option<i32>,
     ) -> AppResult<VehicleDataWithRouteId> {
-        self.get_vehicle_data_impl(vehicle_no, gtfs_id, trip_number)
-            .await
+        let reads_v1 = self.reader_config.reads_v1(gtfs_id);
+        if reads_v1
+            && self
+                .get_online_waybill(vehicle_no, gtfs_id)
+                .await?
+                .is_some()
+        {
+            return self
+                .get_vehicle_data_impl(vehicle_no, gtfs_id, trip_number)
+                .await;
+        }
+        if let Some(v2) = self.v2_vehicle_data(vehicle_no, gtfs_id, trip_number).await {
+            return Ok(v2);
+        }
+        if reads_v1 {
+            return self
+                .get_vehicle_data_impl(vehicle_no, gtfs_id, trip_number)
+                .await;
+        }
+        Ok(Self::empty_vehicle_data(vehicle_no))
     }
 
     async fn get_waybills_by_route_id(
@@ -1350,8 +1780,18 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         vehicle_number: Option<&str>,
         max_duty_date: Option<&str>,
     ) -> AppResult<Vec<ScheduledTrip>> {
-        self.get_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number, max_duty_date)
-            .await
+        let mut rows = if self.reader_config.reads_v1(gtfs_id) {
+            self.get_waybills_by_route_id_impl(route_id, gtfs_id, vehicle_number, max_duty_date)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let vehicle_number = vehicle_number.map(str::trim).filter(|v| !v.is_empty());
+        rows.extend(
+            self.v2_route_rows(route_id, gtfs_id, vehicle_number, max_duty_date)
+                .await,
+        );
+        Ok(rows)
     }
 
     async fn get_waybill_by_waybill_and_trip(
@@ -1360,8 +1800,18 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         trip_number: i32,
         gtfs_id: &str,
     ) -> AppResult<Vec<ScheduledTrip>> {
-        self.get_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id)
-            .await
+        let v2 = self
+            .v2_waybill_trip_rows(waybill_no, trip_number, gtfs_id)
+            .await;
+        if !v2.is_empty() {
+            return Ok(v2);
+        }
+        if self.reader_config.reads_v1(gtfs_id) {
+            return self
+                .get_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id)
+                .await;
+        }
+        Ok(Vec::new())
     }
 
     async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {
@@ -1389,16 +1839,31 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         vehicle_no: &str,
         gtfs_id: &str,
     ) -> AppResult<Option<String>> {
-        self.get_vehicle_service_type_impl(vehicle_no, gtfs_id)
-            .await
+        let reads_v1 = self.reader_config.reads_v1(gtfs_id);
+        if reads_v1 {
+            if let Some(w) = self.get_online_waybill(vehicle_no, gtfs_id).await? {
+                return Ok(Some(w.service_type));
+            }
+        }
+        if let Some(st) = self.v2_vehicle_service_type(vehicle_no, gtfs_id).await {
+            return Ok(Some(st));
+        }
+        if reads_v1 {
+            return self
+                .get_vehicle_service_type_impl(vehicle_no, gtfs_id)
+                .await;
+        }
+        Ok(None)
     }
 
     async fn get_waybill_metadata(
         &self,
         gtfs_id: &str,
         waybill_no: &str,
+        trip_number: Option<i32>,
     ) -> AppResult<WaybillMetadataResponse> {
-        self.get_waybill_metadata_impl(gtfs_id, waybill_no).await
+        self.get_waybill_metadata_impl(gtfs_id, waybill_no, trip_number)
+            .await
     }
 
     async fn get_depots(&self, gtfs_id: &str) -> AppResult<Vec<DepotInfo>> {
@@ -1460,6 +1925,47 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
         *self.depot_cache.write().await = InternalDepotCache::default();
     }
 
+    async fn get_vehicle_ownership(
+        &self,
+        vehicle_no: &str,
+        gtfs_id: &str,
+    ) -> AppResult<VehicleOwnership> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(VehicleOwnership::default()),
+        };
+        let cte = live_run_cte();
+        let query = format!(
+            r#"{cte}
+            SELECT COALESCE(run.depot_id, v.entity_id) AS depot_id,
+                   COALESCE(run.organization_id, v.organization_id) AS organization_id
+            FROM (SELECT 1) AS one
+            LEFT JOIN run ON true
+            LEFT JOIN LATERAL (
+                SELECT entity_id, organization_id FROM vehicles_internal
+                WHERE fleet_no = $2 AND gtfs_id = $1 AND deleted = false
+                LIMIT 1
+            ) v ON true
+        "#
+        );
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(&query)
+            .bind(gtfs_id)
+            .bind(vehicle_no)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                AppError::DbError(format!(
+                    "get_vehicle_ownership({}, {}): {}",
+                    gtfs_id, vehicle_no, e
+                ))
+            })?;
+        let (depot_id, organization_id) = row.unwrap_or((None, None));
+        Ok(VehicleOwnership {
+            depot_id,
+            organization_id,
+        })
+    }
+
     async fn get_vehicle_properties(
         &self,
         fleet_no: &str,
@@ -1469,7 +1975,6 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
             Some(p) => p,
             None => return Ok(VehicleProperties::default()),
         };
-
         // Uncached: tags and variant drive rider-app fare classes, and rider-app owns the cache (Redis, cleared on its
         // vehicle upsert), so a read here must reflect the row as it is now. One lookup on the (gtfs_id, fleet_no) index.
         let db_result = sqlx::query_as::<_, (Option<String>, Option<String>, Option<Vec<String>>)>(
@@ -1511,8 +2016,21 @@ impl DBVehicleReaderInternal {
         &self,
         gtfs_id: &str,
         waybill_no: &str,
+        trip_number: Option<i32>,
     ) -> AppResult<WaybillMetadataResponse> {
         let pool = self.pool()?;
+        if let Some(row) = self
+            .v2_waybill_metadata(gtfs_id, waybill_no, trip_number)
+            .await
+        {
+            return Ok(Self::waybill_metadata_from_row(row));
+        }
+        if !self.reader_config.reads_v1(gtfs_id) {
+            return Err(AppError::NotFound(format!(
+                "Waybill not found: {}",
+                waybill_no
+            )));
+        }
 
         let waybill_query = r#"
             SELECT
@@ -1541,6 +2059,10 @@ impl DBVehicleReaderInternal {
             .map_err(|e| AppError::DbError(format!("Waybill query failed: {}", e)))?
             .ok_or_else(|| AppError::NotFound(format!("Waybill not found: {}", waybill_no)))?;
 
+        Ok(Self::waybill_metadata_from_row(waybill_row))
+    }
+
+    fn waybill_metadata_from_row(waybill_row: WaybillTripInfo) -> WaybillMetadataResponse {
         // Build driver name
         let driver_name = match (waybill_row.driver_first_name, waybill_row.driver_last_name) {
             (Some(f), Some(l)) => {
@@ -1559,7 +2081,7 @@ impl DBVehicleReaderInternal {
             .driver_mobile_number
             .filter(|m| !m.trim().is_empty());
 
-        let response = WaybillMetadataResponse {
+        WaybillMetadataResponse {
             waybill_no: waybill_row.waybill_no,
             vehicle_no: waybill_row.vehicle_no,
             service_type: waybill_row.service_type,
@@ -1569,9 +2091,8 @@ impl DBVehicleReaderInternal {
             bus_tag_number: None,
             bus_vehicle_variant: None,
             vehicle_tags: None,
-        };
-
-        Ok(response)
+            duty_trip_id: waybill_row.duty_trip_id,
+        }
     }
 
     // ── Depots (entities_internal / vehicles_internal) ───────────────────

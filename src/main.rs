@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // Waybill repeater reconciler: safety net for the operators in
     // REPEATER_AUTOMATION_ENABLED_GTFS_IDS (empty by default). See operator.rs.
     let operator_service_clone = app_state.operator_service.clone();
+    let reader_config_clone = app_state.reader_config.clone();
     tokio::spawn(async move {
         gtfs_routes_service::services::operator::run_repeater_reconciler_tick(
             operator_service_clone,
@@ -106,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             repeater_tick_interval_secs,
             repeater_min_run_interval_secs,
             repeater_stuck_lock_timeout_secs,
+            reader_config_clone,
         )
         .await;
     });

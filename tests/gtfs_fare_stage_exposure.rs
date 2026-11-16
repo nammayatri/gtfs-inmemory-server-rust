@@ -249,6 +249,7 @@ fn app_config(dir: &Path) -> AppConfig {
         gtfs_gps: None,
         gtfs_gps_clickhouse_password: None,
         gtfs_gps_polyline_sync: None,
+        v1_v2_cutoffs: None,
     }
 }
 

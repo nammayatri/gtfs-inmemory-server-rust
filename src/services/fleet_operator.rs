@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::error;
 
+use crate::services::gtfs_service::RouteCatalog;
+use crate::services::reader_config::ReaderConfig;
 use crate::services::service_hopper::today_ist;
 use crate::tools::error::{AppError, AppResult};
 use chrono::Datelike;
@@ -314,18 +314,18 @@ impl FleetOperatorService for MockFleetOperatorService {
 
 // ─── DB implementation ─────────────────────────────────────────────────────────
 
-const ROUTE_CACHE_TTL_SECS: u64 = 6 * 3600;
-
 pub struct DBFleetOperatorService {
     pool: PgPool,
-    route_info_cache: Arc<RwLock<HashMap<String, (RouteInfo, SystemTime)>>>,
+    routes: RouteCatalog,
+    reader_config: Arc<ReaderConfig>,
 }
 
 impl DBFleetOperatorService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, reader_config: Arc<ReaderConfig>, routes: RouteCatalog) -> Self {
         Self {
             pool,
-            route_info_cache: Arc::new(RwLock::new(HashMap::new())),
+            routes,
+            reader_config,
         }
     }
 
@@ -435,7 +435,11 @@ impl DBFleetOperatorService {
             // driver's very first currentOperation call of the day (the same call their app
             // already makes before showing "start trip") silently activate their duty, with no
             // separate "start duty" step and no new endpoint.
-            None if crate::services::operator::repeater_automation_enabled(gtfs_id) => {
+            None if crate::services::operator::repeater_automation_enabled(
+                &self.reader_config,
+                gtfs_id,
+            ) =>
+            {
                 self.resolve_and_flip_upcoming_waybill(gtfs_id, anchor)
                     .await
             }
@@ -1207,7 +1211,10 @@ impl DBFleetOperatorService {
                 // (the same real/dead/inactive/deleted predicates the readers already use)
                 // instead of re-deriving "is any trip left" with a second copy of that logic.
                 // Gated on the master switch -- see REPEATER_AUTOMATION_ENABLED_GTFS_IDS.
-                if crate::services::operator::repeater_automation_enabled(gtfs_id) {
+                if crate::services::operator::repeater_automation_enabled(
+                    &self.reader_config,
+                    gtfs_id,
+                ) {
                     match self.get_trip_numbers(waybill).await {
                         Ok(trip_numbers) => {
                             if !trip_numbers.iter().any(|&n| n > i64::from(trip_number)) {
@@ -1330,75 +1337,21 @@ impl DBFleetOperatorService {
         Ok(())
     }
 
-    // ── Route info cache ─────────────────────────────────────────────────────
-
-    async fn get_route_infos(&self, route_ids: &[String]) -> AppResult<HashMap<String, RouteInfo>> {
-        if route_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let now = SystemTime::now();
-        let mut result: HashMap<String, RouteInfo> = HashMap::new();
-        let mut uncached: Vec<String> = Vec::new();
-
-        // Check cache for each route_id
-        {
-            let cache = self.route_info_cache.read().await;
-            for id in route_ids {
-                if let Some((info, ts)) = cache.get(id) {
-                    let elapsed = now.duration_since(*ts).unwrap_or_default();
-                    if elapsed < Duration::from_secs(ROUTE_CACHE_TTL_SECS) {
-                        result.insert(id.clone(), info.clone());
-                        continue;
-                    }
-                }
-                uncached.push(id.clone());
-            }
-        }
-
-        if uncached.is_empty() {
-            info!("route_info cache: all {} ids HIT", route_ids.len());
-            return Ok(result);
-        }
-
-        info!(
-            "route_info cache: {} HIT, {} MISS — querying DB",
-            result.len(),
-            uncached.len()
-        );
-
-        // Batch query for uncached ids (parameterized, no injection risk)
-        let placeholders: Vec<String> = (1..=uncached.len()).map(|i| format!("${}", i)).collect();
-        let sql = format!(
-            "SELECT route_id::TEXT, route_number, route_name FROM route_internal WHERE route_id::text IN ({})",
-            placeholders.join(",")
-        );
-
-        let mut qb = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&sql);
-        for id in &uncached {
-            qb = qb.bind(id);
-        }
-
-        let rows = match qb.fetch_all(&self.pool).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("get_route_infos DB query failed: {}", e);
-                return Ok(result);
-            }
-        };
-
-        let fetched_now = SystemTime::now();
-        let mut cache = self.route_info_cache.write().await;
-        for (route_id, route_number, route_name) in rows {
-            let info = RouteInfo {
-                route_number,
-                route_name,
-            };
-            cache.insert(route_id.clone(), (info.clone(), fetched_now));
-            result.insert(route_id, info);
-        }
-
-        Ok(result)
+    fn get_route_infos(&self, gtfs_id: &str, route_ids: &[String]) -> HashMap<String, RouteInfo> {
+        route_ids
+            .iter()
+            .filter_map(|id| {
+                self.routes.names(Some(gtfs_id), id).map(|n| {
+                    (
+                        id.clone(),
+                        RouteInfo {
+                            route_number: n.number,
+                            route_name: n.name,
+                        },
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -1459,7 +1412,7 @@ impl FleetOperatorService for DBFleetOperatorService {
             .into_iter()
             .collect();
 
-        let route_map = self.get_route_infos(&route_ids).await?;
+        let route_map = self.get_route_infos(gtfs_id, &route_ids);
 
         let mut history: Vec<TripData> = Vec::new();
         let mut current: Option<TripData> = None;
@@ -1870,7 +1823,11 @@ mod tests {
     fn lazy_service() -> DBFleetOperatorService {
         let pool = sqlx::PgPool::connect_lazy("postgres://user:pass@localhost/db")
             .expect("lazy pool construction must not attempt to connect");
-        DBFleetOperatorService::new(pool)
+        DBFleetOperatorService::new(
+            pool,
+            Arc::new(ReaderConfig::default()),
+            RouteCatalog::empty(),
+        )
     }
 
     fn assert_bad_request(err: AppError, expected_substring: &str) {

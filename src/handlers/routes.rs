@@ -28,7 +28,7 @@ use crate::models::{
     GTFSStop, IdValue, MemoryUsageStats, MinimalEmployee, NandiRoutesRes, RepeatWalkEntry,
     RouteStopMapping, ScheduleTripRepeatConfig, StopCodeFromProviderStopCodeResponse, TripDetails,
     UpdateWaybillDetailsBody, VehicleData, VehicleMetadataResponse, VehicleOperationData,
-    VehicleProperties, VehicleServiceTypeResponse,
+    VehicleOwnership, VehicleProperties, VehicleServiceTypeResponse,
 };
 use crate::services::db_vehicle_reader::{
     chalo_gtfs_ids, filter_vehicles_by_status, is_chalo_gtfs_id,
@@ -2302,6 +2302,27 @@ pub async fn get_service_type_by_vehicle_by_gtfs_id(
     .await
 }
 
+async fn resolve_vehicle_ownership(
+    app_state: &AppState,
+    gtfs_id: &str,
+    vehicle_no: &str,
+) -> VehicleOwnership {
+    if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+        return VehicleOwnership::default();
+    }
+    app_state
+        .db_vehicle_reader_internal
+        .get_vehicle_ownership(vehicle_no, gtfs_id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                "resolve_vehicle_ownership: DB lookup failed for ({}, {}): {}",
+                gtfs_id, vehicle_no, e
+            );
+            VehicleOwnership::default()
+        })
+}
+
 // DB-first with CSV fallback; gate skips guaranteed-None DB round-trip on non-operator feeds.
 async fn resolve_vehicle_properties(
     app_state: &AppState,
@@ -2356,6 +2377,7 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         .unwrap_or(path_vehicle);
 
     let props = resolve_vehicle_properties(&app_state, &gtfs_id, &vehicle_no).await;
+    let ownership = resolve_vehicle_ownership(&app_state, &gtfs_id, &vehicle_no).await;
     let bus_tag_number = props.tag_number;
     let bus_vehicle_variant = props.variant;
     let vehicle_tags = props.vehicle_tags;
@@ -2393,6 +2415,8 @@ pub async fn get_vehicle_metadata_by_gtfs_id(
         bus_vehicle_variant,
         vehicle_tags,
         is_actually_valid,
+        vehicle_depot_id: ownership.depot_id,
+        vehicle_organisation_id: ownership.organization_id,
     }))
 }
 
@@ -2570,6 +2594,7 @@ fn reconcile_active_trip_by_schedule(
                 trip_order: response.trip_number,
                 db_start_time: response.db_start_time.clone(),
                 db_end_time: response.db_end_time.clone(),
+                duty_trip_id: response.duty_trip_id.clone(),
             };
             all_trips.insert(0, current_trip);
         }
@@ -2602,6 +2627,7 @@ fn reconcile_active_trip_by_schedule(
                 trip_order: response.trip_number,
                 db_start_time: response.db_start_time.clone(),
                 db_end_time: response.db_end_time.clone(),
+                duty_trip_id: response.duty_trip_id.clone(),
             };
             all_trips.insert(0, synthetic_first_trip);
         }
@@ -2744,6 +2770,7 @@ fn reconcile_active_trip_by_schedule(
     // Update response
     response.is_active_trip = true;
     response.trip_number = active_trip.trip_number;
+    response.duty_trip_id = active_trip.duty_trip_id.clone();
     response.route_id = Some(active_trip.route_id.clone());
     response.route_number = active_trip.route_number.clone();
     response.db_start_time = active_trip.db_start_time.clone();
@@ -2788,6 +2815,7 @@ async fn get_service_type_by_vehicle_impl(
     };
 
     let props = resolve_vehicle_properties(&app_state, gtfs_id, vehicle_no).await;
+    let ownership = resolve_vehicle_ownership(&app_state, gtfs_id, vehicle_no).await;
     let bus_tag_number = props.tag_number;
     let bus_vehicle_variant = props.variant;
     let vehicle_tags = props.vehicle_tags;
@@ -2856,6 +2884,7 @@ async fn get_service_type_by_vehicle_impl(
                     trip_order: cached_data.trip_order,
                     db_start_time: cached_data.db_start_time.clone(),
                     db_end_time: cached_data.db_end_time.clone(),
+                    duty_trip_id: None,
                 }]);
             }
 
@@ -2898,11 +2927,14 @@ async fn get_service_type_by_vehicle_impl(
                 bus_tag_number,
                 bus_vehicle_variant,
                 vehicle_tags,
+                vehicle_depot_id: ownership.depot_id.clone(),
+                vehicle_organisation_id: ownership.organization_id.clone(),
                 waybill_status: None,
                 is_historic: false,
                 schedule_based_active_trip: None,
                 db_start_time: cached_data.db_start_time.clone(),
                 db_end_time: cached_data.db_end_time.clone(),
+                duty_trip_id: None,
             }));
         } else {
             // Vehicle not found in cache, try to get service type from fleet
@@ -2951,11 +2983,14 @@ async fn get_service_type_by_vehicle_impl(
                     bus_tag_number,
                     bus_vehicle_variant,
                     vehicle_tags,
+                    vehicle_depot_id: ownership.depot_id.clone(),
+                    vehicle_organisation_id: ownership.organization_id.clone(),
                     waybill_status: None,
                     is_historic: false,
                     schedule_based_active_trip: None,
                     db_start_time: None,
                     db_end_time: None,
+                    duty_trip_id: None,
                 }));
             }
             // Vehicle not found in cache and no service type from fleet, return not found
@@ -3075,11 +3110,14 @@ async fn get_service_type_by_vehicle_impl(
             bus_tag_number,
             bus_vehicle_variant,
             vehicle_tags,
+            vehicle_depot_id: ownership.depot_id.clone(),
+            vehicle_organisation_id: ownership.organization_id.clone(),
             waybill_status: vehicle_data.waybill_status,
             is_historic,
             schedule_based_active_trip: None,
             db_start_time: vehicle_data.db_start_time.clone(),
             db_end_time: vehicle_data.db_end_time.clone(),
+            duty_trip_id: vehicle_data.duty_trip_id.clone(),
         };
 
         // Apply schedule-based reconciliation if enabled in config
@@ -3126,10 +3164,12 @@ async fn get_service_type_by_vehicle_impl(
                                 trip_order: response.trip_number,
                                 db_start_time: response.db_start_time.clone(),
                                 db_end_time: response.db_end_time.clone(),
+                                duty_trip_id: response.duty_trip_id.clone(),
                             };
 
                             // Update response to use trip 1
                             response.trip_number = trip_1.trip_number;
+                            response.duty_trip_id = trip_1.duty_trip_id.clone();
                             response.route_id = Some(trip_1.route_id.clone());
                             response.route_number = trip_1.route_number.clone();
                             response.db_start_time = trip_1.db_start_time.clone();
@@ -3275,11 +3315,14 @@ async fn get_service_type_by_vehicle_impl(
         bus_tag_number,
         bus_vehicle_variant,
         vehicle_tags,
+        vehicle_depot_id: ownership.depot_id.clone(),
+        vehicle_organisation_id: ownership.organization_id.clone(),
         waybill_status: vehicle_data.waybill_status,
         is_historic,
         schedule_based_active_trip: None,
         db_start_time: vehicle_data.db_start_time.clone(),
         db_end_time: vehicle_data.db_end_time.clone(),
+        duty_trip_id: vehicle_data.duty_trip_id.clone(),
     };
 
     // Apply schedule-based reconciliation if enabled in config
@@ -3319,10 +3362,12 @@ async fn get_service_type_by_vehicle_impl(
                             trip_order: response.trip_number,
                             db_start_time: response.db_start_time.clone(),
                             db_end_time: response.db_end_time.clone(),
+                            duty_trip_id: response.duty_trip_id.clone(),
                         };
 
                         // Update response to use trip 1
                         response.trip_number = trip_1.trip_number;
+                        response.duty_trip_id = trip_1.duty_trip_id.clone();
                         response.route_id = Some(trip_1.route_id.clone());
                         response.route_number = trip_1.route_number.clone();
                         response.db_start_time = trip_1.db_start_time.clone();
@@ -3555,6 +3600,12 @@ pub async fn get_trip_data(
     Ok(HttpResponse::Ok().json(trip_data))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WaybillMetadataQuery {
+    #[serde(rename = "tripNumber")]
+    trip_number: Option<i32>,
+}
+
 #[utoipa::path(
     get,
     path = "/waybill/{gtfs_id}/metadata/{waybill_no}",
@@ -3562,18 +3613,20 @@ pub async fn get_trip_data(
     params(
         ("gtfs_id" = String, Path, description = "GTFS feed identifier"),
         ("waybill_no" = String, Path, description = "Waybill number"),
+        ("tripNumber" = Option<i32>, Query, description = "transitV2: crew of this trip of the run"),
     ),
     responses((status = 200, description = "Waybill metadata with driver details", body = crate::models::WaybillMetadataResponse))
 )]
 pub async fn get_waybill_metadata(
     app_state: Data<AppState>,
     path: Path<(String, String)>,
+    query: Query<WaybillMetadataQuery>,
 ) -> AppResult<HttpResponse> {
     let (gtfs_id, waybill_no) = path.into_inner();
 
     let mut waybill_metadata = app_state
         .db_vehicle_reader_internal
-        .get_waybill_metadata(&gtfs_id, &waybill_no)
+        .get_waybill_metadata(&gtfs_id, &waybill_no, query.trip_number)
         .await?;
 
     let props =
@@ -3868,6 +3921,7 @@ pub async fn get_bus_trip_schedule(
             is_active_trip: row.is_active_trip,
             waybill_no: Some(row.waybill_no),
             is_completed: row.is_completed,
+            duty_trip_id: row.duty_trip_id.clone(),
         });
     }
 
@@ -3996,6 +4050,7 @@ pub async fn get_bus_route_schedule(
                 },
                 waybill_no: Some(row.waybill_no),
                 is_completed: row.is_completed,
+                duty_trip_id: row.duty_trip_id.clone(),
             });
         }
 
@@ -4038,6 +4093,7 @@ pub async fn get_bus_route_schedule(
                     trip_number: None,
                     is_active_trip: None,
                     is_completed: None,
+                    duty_trip_id: None,
                 })
                 .collect()
         } else {
@@ -4134,6 +4190,7 @@ pub async fn get_bus_route_schedule(
             is_active_trip: None,
             waybill_no: None,
             is_completed: None,
+            duty_trip_id: None,
         });
     }
 

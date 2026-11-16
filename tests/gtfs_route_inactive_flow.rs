@@ -287,6 +287,7 @@ fn app_config(dir: &Path, db_url: &str) -> AppConfig {
         is_master: false,
         gtfs_gps_clickhouse_password: None,
         gtfs_gps_polyline_sync: None,
+        v1_v2_cutoffs: None,
     }
 }
 

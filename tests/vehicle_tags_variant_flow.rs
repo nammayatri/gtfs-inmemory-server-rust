@@ -237,7 +237,11 @@ async fn vehicle_tags_are_master_rows_and_variant_is_an_enum() {
     .await
     .expect("re-sending a row with its own tag is allowed");
 
-    let reader = DBVehicleReaderInternal::new(pool.clone());
+    let reader = DBVehicleReaderInternal::new(
+        pool.clone(),
+        std::sync::Arc::new(gtfs_routes_service::services::reader_config::ReaderConfig::default()),
+        gtfs_routes_service::services::gtfs_service::RouteCatalog::empty(),
+    );
     let props = reader.get_vehicle_properties("TN01A1", GTFS).await.unwrap();
     assert_eq!(props.variant.as_deref(), Some("TEMPO_TRAVELLER"));
     assert_eq!(

@@ -170,4 +170,5 @@ in {
   --     },
   gtfs_gps_polyline_sync = None GpsPolylineSync,
   gen_int_for_id = Some True,
+  v1_v2_cutoffs = None (List { gtfs_id : Text, cutoff_date : Text }),
 }
