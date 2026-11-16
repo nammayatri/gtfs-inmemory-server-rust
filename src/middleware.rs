@@ -6,7 +6,6 @@
     the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-use crate::incoming_api;
 use crate::tools::prometheus::INCOMING_API;
 use actix::fut::{ready, Ready};
 use actix_http::StatusCode;
@@ -17,6 +16,7 @@ use actix_web::{
 };
 use futures::future::LocalBoxFuture;
 use regex::Regex;
+use shared::incoming_api;
 use tokio::time::Instant;
 use tracing::Span;
 use tracing::{error, info};
