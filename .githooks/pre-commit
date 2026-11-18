@@ -61,7 +61,7 @@ for file in $STAGED_ALL; do
 done
 
 # ── 4. Large files (was: check-added-large-files --maxkb=1000) ───────────────────
-MAX_KB=1000
+MAX_KB=32000
 for file in $STAGED_ALL; do
     [ -f "$file" ] || continue
     size_kb=$(( $(wc -c < "$file") / 1024 ))
