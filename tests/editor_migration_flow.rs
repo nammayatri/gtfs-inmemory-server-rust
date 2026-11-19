@@ -33,6 +33,9 @@ const EMPTY_HASH: &str = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11
 const FEED: &str = "editor_migration_test_feed";
 const ADMIN: &str = "admin@editor-migration-test.invalid";
 const APPROVER: &str = "approver@editor-migration-test.invalid";
+/// On prod: reads in one draft's file (section 23), never the whole feed's.
+const EDITOR: &str = "editor@editor-migration-test.invalid";
+const VIEWER: &str = "viewer@editor-migration-test.invalid";
 
 // ---------------------------------------------------------------- harness
 
@@ -155,7 +158,7 @@ fn clear_feed() -> Vec<String> {
 /// The same stops and routes on both sides; prod also holds each route's own
 /// stop list, which is what it serves while its stages are off.
 fn seed(use_stages: bool) -> Vec<String> {
-    let list = [ADMIN, APPROVER]
+    let list = [ADMIN, APPROVER, EDITOR, VIEWER]
         .iter()
         .map(|e| format!("'{e}'"))
         .collect::<Vec<_>>()
@@ -359,6 +362,46 @@ async fn master_moves_to_prod_a_step_at_a_time_and_a_draft_at_a_time() {
     approver!(&master, m_admin, m_ap);
     sign_in!(&prod, p_admin);
     approver!(&prod, p_admin, p_ap);
+    // an editor and a viewer of the feed on prod
+    macro_rules! member {
+        ($app:expr, $admin:expr, $who:expr, $email:expr, $role:expr) => {{
+            let (s, b, _) = call!(
+                $app,
+                $admin
+                    .req("POST", "/users")
+                    .set_json(json!({"email": $email, "role": $role}))
+            );
+            assert!(s == 201 || code_of(&b) == "user_exists", "{s} {b}");
+            let (_, users, _) = call!($app, $admin.req("GET", "/users"));
+            let id = users["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|u| u["email"] == $email)
+                .unwrap()["user_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let (s, b, _) = call!(
+                $app,
+                $admin
+                    .req("PATCH", &format!("/users/{id}"))
+                    .set_json(json!({"role": $role, "status": "active"}))
+            );
+            assert_eq!(s, 200, "{b}");
+            let (s, b, _) = call!(
+                $app,
+                $admin
+                    .req("PUT", &format!("/users/{id}/feeds/{FEED}"))
+                    .set_json(json!({"role": $role}))
+            );
+            assert_eq!(s, 200, "{b}");
+            sign_in!($app, $who);
+        }};
+    }
+    let (mut p_ed, mut p_view) = (new_caller(EDITOR), new_caller(VIEWER));
+    member!(&prod, p_admin, p_ed, EDITOR, "editor");
+    member!(&prod, p_admin, p_view, VIEWER, "viewer");
 
     let (_, me, _) = call!(&master, m_admin.req("GET", "/auth/me"));
     assert_eq!(me["environment"], "master", "{me}");
@@ -701,11 +744,51 @@ async fn master_moves_to_prod_a_step_at_a_time_and_a_draft_at_a_time() {
             .req("POST", &format!("/feeds/{FEED}/migrations?{q}"))
             .set_payload(f.clone())
     };
-    let (s, b, _) = call!(&prod, import2("dry_run=true", &file2));
+    // one draft's file is read in by any editor of the feed; the whole feed's
+    // only by an admin, and a viewer reads in nothing
+    let import_as = |c: &Caller, q: &str, f: &Vec<u8>| {
+        c.req("POST", &format!("/feeds/{FEED}/migrations?{q}"))
+            .set_payload(f.clone())
+    };
+    let (s, b, _) = call!(&prod, import_as(&p_view, "dry_run=true", &file2));
+    assert_eq!((s, code_of(&b)), (403, "role_required"), "{b}");
+    let (s, b, _) = call!(&prod, import_as(&p_ed, "dry_run=true", &file));
+    assert_eq!((s, code_of(&b)), (403, "role_required"), "{b}");
+    assert_eq!(b["error"]["details"]["kind"], "full", "{b}");
+    let (s, b, _) = call!(
+        &prod,
+        p_view.req("GET", &format!("/feeds/{FEED}/migrations"))
+    );
+    assert_eq!((s, code_of(&b)), (403, "role_required"), "{b}");
+    let (s, b, _) = call!(&prod, import_as(&p_ed, "dry_run=true", &file2));
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["counts"]["added"], 1, "{b}");
     assert!(b["conflicts"].as_array().unwrap().is_empty(), "{b}");
-    let (s, b, _) = call!(&prod, import2("dry_run=false", &file2));
+    // as the dashboard asks: in the background, polled by whoever started it -
+    // to anyone else (an admin aside) the job is not there
+    let (s, b, _) = call!(
+        &prod,
+        import_as(&p_ed, "dry_run=true&background=true", &file2)
+    );
+    assert_eq!(s, 202, "{b}");
+    let job = b["job_id"].as_str().unwrap().to_string();
+    let mut polled = Value::Null;
+    for _ in 0..300 {
+        let (s, b, _) = call!(&prod, p_ed.req("GET", &format!("/import-jobs/{job}")));
+        assert_eq!(s, 200, "{b}");
+        polled = b;
+        if polled["status"] != "running" {
+            break;
+        }
+        actix_web::rt::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(polled["status"], "done", "{polled}");
+    assert_eq!(polled["report"]["counts"]["added"], 1, "{polled}");
+    let (s, b, _) = call!(&prod, p_view.req("GET", &format!("/import-jobs/{job}")));
+    assert_eq!((s, code_of(&b)), (404, "job_not_found"), "{b}");
+    let (s, b, _) = call!(&prod, p_admin.req("GET", &format!("/import-jobs/{job}")));
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = call!(&prod, import_as(&p_ed, "dry_run=false", &file2));
     assert_eq!(s, 200, "{b}");
     let set = b["change_sets"][0]["change_set_id"]
         .as_str()
@@ -718,7 +801,10 @@ async fn master_moves_to_prod_a_step_at_a_time_and_a_draft_at_a_time() {
             .starts_with("From master: BETA reaches G"),
         "{b}"
     );
-    ship!(&prod, p_admin, p_ap, set);
+    // the editor's own draft, which they submit and someone else approves
+    let (_, drafted, _) = call!(&prod, p_ed.req("GET", &format!("/change-sets/{set}")));
+    assert_eq!(drafted["created_by_email"], EDITOR, "{drafted}");
+    ship!(&prod, p_ed, p_ap, set);
     assert!(served(&ppool, "R1")
         .await
         .contains(&"G/INTERMEDIATE STOP/2/BETA".to_string()));
@@ -755,13 +841,17 @@ async fn master_moves_to_prod_a_step_at_a_time_and_a_draft_at_a_time() {
     assert_eq!(ids(&b["conflicts"]), vec!["change:1".to_string()], "{b}");
     assert_eq!(b["conflicts"][0]["prod"]["name"], "STOP B PROD", "{b}");
     assert_eq!(b["conflicts"][0]["master"]["name"], "STOP B MASTER", "{b}");
-    let (s, b, _) = call!(&prod, import2("dry_run=false&take=change:1", &file3));
+    // an editor takes master's side too: it is still a draft someone else approves
+    let (s, b, _) = call!(
+        &prod,
+        import_as(&p_ed, "dry_run=false&take=change:1", &file3)
+    );
     assert_eq!(s, 200, "{b}");
     let set = b["change_sets"][0]["change_set_id"]
         .as_str()
         .unwrap()
         .to_string();
-    ship!(&prod, p_admin, p_ap, set);
+    ship!(&prod, p_ed, p_ap, set);
     assert_eq!(
         scalar_text(
             &ppool,
@@ -771,11 +861,8 @@ async fn master_moves_to_prod_a_step_at_a_time_and_a_draft_at_a_time() {
         "STOP B M3"
     );
 
-    // what was read in, newest first
-    let (s, b, _) = call!(
-        &prod,
-        p_admin.req("GET", &format!("/feeds/{FEED}/migrations"))
-    );
+    // what was read in, newest first: the editor sees it too
+    let (s, b, _) = call!(&prod, p_ed.req("GET", &format!("/feeds/{FEED}/migrations")));
     assert_eq!(s, 200, "{b}");
     // the read-ins that drafted something: four steps (R2's list taken once
     // more), the switch, and two single drafts

@@ -31,6 +31,7 @@ js/review.js        drafts by status, one draft's diff (filtered and paged) and 
 js/admin.js         people (who may work on which feed, admins, two-step reset) and history
 js/overlay.js       what the active draft does to a stop, station or route, for display ("pending, not live")
 js/context.js       stations listed once instead of their platforms; the "Cleanup context" of a stop and a route
+js/history.js       a node's versions (stop, station, route, stop list, stages, stage) and restoring one into a draft
 js/undo.js          undo / redo of what is on the screen and not yet in a draft (Ctrl/Cmd+Z)
 js/trail.js         the trail of a drill-down under the top bar, with one Back control
 dev/                development only - never served by GIMS

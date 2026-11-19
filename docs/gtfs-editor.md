@@ -591,7 +591,9 @@ Audit actions: `seed`, `release`, `user_bootstrapped`, `user_created`,
 `change_set_self_approved` (an admin approved a set they submitted, section 2:
 `{submitted_by, submitted_by_email, comment}`), `change_set_rejected`,
 `change_set_reopened`, `change_set_discarded`, `change_set_committed` (detail
-`{feed_version, changes, applied, self_approved}`), and from
+`{feed_version, changes, applied, self_approved}`), `node_rolled_back` (section
+26: `{change_id, node, to_change_id, to_change_set_id, to_feed_version, side,
+fields, not_restored}`), and from
 sections 5 and 6: `bulk_imported` (`{kind, rows, changes, first_change_id,
 last_change_id}`), `stop_merged` (one per merge at commit: `{change_id, from, into,
 routes, rows, keep_name, keep_position}`), `station_merged` (one per station merge
@@ -4043,7 +4045,9 @@ hold up a web worker; its outcome goes to `gtfs_import_job`, one row a job:
 | `error` | `{status, code, message}`: the error the import answered |
 | `created_by`, `pod`, `created_at`, `finished_at` | who, where, when |
 
-`GET /import-jobs/{job_id}` (admin, as the imports are) is the row: `report`
+`GET /import-jobs/{job_id}` is the row - read by an admin, or by whoever started
+the job while they still edit its feed (an editor reading in a draft from master,
+section 23); to anyone else it is the same 404 `job_not_found` as no job: `report`
 once done, `error` once failed, and `lost` - with `job_lost` - for a job still
 running 30 minutes on, whose pod went away. It is a table and not the pod's
 memory because prod runs four pods: the poll lands on any of them. The dashboard
@@ -5231,8 +5235,8 @@ tests for the kind's columns.
 
 Master and prod each have their own editor database (section 18.12), and
 nothing done on one reaches the other. Ops prepare and check work on master; a
-**migration** carries it to prod as a file. Master writes the file, an admin on
-prod reads it in, and what it brings becomes **ordinary prod drafts**, which a
+**migration** carries it to prod as a file. Master writes the file, prod reads
+it in, and what it brings becomes **ordinary prod drafts**, which a
 second person approves and commits on prod like any other. No connection or
 credential joins the two environments: the file is the only thing that moves,
 and prod's tables are written only by its own committed drafts.
@@ -5248,6 +5252,19 @@ Which side an editor is comes from the dhall `is_master` (section 12.6), and
 files and refuses to read one in (`import_on_master`); prod reads only a file
 written on master (`not_from_master`), and only into the feed it names
 (`feed_mismatch`).
+
+**Who reads a file in (2026-11-05).** Writing a file on master stays an
+admin's. On prod, **one draft's file is read in by any editor of the feed**:
+what it brings is a prod draft of theirs, which they submit and a second person
+approves and commits, exactly as a draft they made by hand - so it gives an
+editor no power they did not have, and taking master's side of a conflict
+(`take`) is theirs too. **The whole feed's file stays an admin's**: it plans
+every step of the feed and the first one fixes `since_version` for every later
+one. An editor who sends one is refused before anything is planned: 403
+`role_required`, `details: {kind: "full", needs: "admin"}`. A viewer reads in
+nothing. Before this an editor could download nothing to read in and was
+refused reading in a draft an admin had downloaded for them; the dashboard's
+"Bring from master" section was an admin's alone.
 
 ### The file
 
@@ -5377,8 +5394,8 @@ read-in, each commit changing nothing, and the migration never reached
 |---|---|---|
 | GET | `/change-sets/{id}/migration` | a committed draft as a migration file (409 `not_committed` otherwise). Admin |
 | GET | `/feeds/{g}/migration?scopes=` | the whole feed as a migration file; `scopes` of `stops,routes,stages,timetables`, all if left out (`invalid_scope`). Admin |
-| POST | `/feeds/{g}/migrations?dry_run=&since_version=&take=&background=` | read a migration file in: the body, up to 64 MB. A dry run unless `dry_run=false`; `take` is conflict ids, comma separated, or `all`; `background=true` answers 202 with a job (section 18.15, kind `migration`). Admin, never on master |
-| GET | `/feeds/{g}/migrations` | what was read in, newest first, with each read-in's drafts and their status. Admin |
+| POST | `/feeds/{g}/migrations?dry_run=&since_version=&take=&background=` | read a migration file in: the body, up to 64 MB. A dry run unless `dry_run=false`; `take` is conflict ids, comma separated, or `all`; `background=true` answers 202 with a job (section 18.15, kind `migration`). One draft's file: editor of the feed; the whole feed's: admin. Never on master |
+| GET | `/feeds/{g}/migrations` | what was read in, newest first, with each read-in's drafts and their status. Editor of the feed |
 
 The report: `kind`, `dry_run`, `source`, `change_set` (one draft) or `step`,
 `steps` and `since_version` (the whole feed), `change_sets` (`change_set_id`
@@ -5757,3 +5774,115 @@ Tests: `editor::gps_polyline_sync::tests` (the comparison, the decision, the
 drafts' batches and titles, the config) and `editor::gps_line::batch::tests` (the statements pass
 the read-only guard, route ids with stray spaces merge, the choice of bus-days, groups, points
 attributed to a bus-day, and a week of a fake fleet read and built).
+
+## 26. A node's versions, and rolling it back (2026-11-05)
+
+Every committed draft already keeps what it changed: each `gtfs_change` holds
+`before` - the node as it was when the change was made, in read shape - and
+`after`, and its set the feed version it went live in (`committed_version`).
+Commit refuses a change whose base row version or rows hash moved, so a
+committed `before` is exactly the node just before that version, and `before`
+with `after` laid over it the node just after. A node's history is therefore
+read, not recorded anew: no table, no trigger, no migration.
+
+**A node** is one thing a draft edits: a stop, a station, a route (its name,
+colours, map line and other routes.txt fields), one of a route's stop orders
+(`route_stops`, `pattern_key` 1 unless asked), a stage (`<id>|<direction>`; a
+bare id is resolved when one stage carries it), a route's stage list
+(`route_stages`), or a row of a record file (`agency`, `fare_attribute`,
+`pathway`, ... - section 18.5).
+
+**Its versions** are the committed changes that touched it, newest first, each
+with its draft, feed version, committer and the node it left (`state`):
+
+- **Its own** (`direct: true`): an update, replace or create of that node.
+  These are versions to restore: `state` is `before` with `after` over it (a
+  create's `after`; a replace's rows or stages).
+- **In passing** (`direct: false`): a stop or station merged into it, a station
+  taking or letting go of it as a platform, a stop merge moving a route's rows
+  (`before.affected`), a stage split or merge, a diversion switched, a route's
+  stages replaced (for its stop list). Listed, so the history has no hole, but
+  no version to restore: the change records what moved, not the whole node
+  (`why_not` says what it was).
+- A delete, a merge of the node itself away, a split: listed, not restorable.
+
+`original` is the node before its first recorded edit (that edit's `before`),
+restorable like a version. `is_live` marks the version (or original) the live
+node matches. **`unrecorded_change_after`**: the node a version left differs
+from the next version's `before` (or, after the last, from the live node) with
+nothing listed between them - something this history does not see changed it:
+a seed, a script, a migration from master, or a stop merge editing the rows of
+a stage that calls at the stop. Said, never hidden: a history that skipped it
+would show a version as live that is not.
+
+**A rollback never writes the feed.** It adds **one ordinary change** to a draft
+through the same path as `POST /change-sets/{id}/changes` (`add_change_to`):
+the node's `update` (stop, station, route, stage, record) or `replace` (stop
+list, stage list), whose `after` carries the version's values of **only the
+fields that differ** from the live node. So it is shape-checked, based on the
+live row version or hash, validated - the fare rules on a stop list included,
+and as everywhere only problems it introduces block it - audited, and goes live
+only when someone else approves and commits the draft. A rollback overtaken by
+another commit of the node conflicts at submit or commit like any other change.
+
+- A position is restored whole (`lat` and `lon` together).
+- A field the old snapshot does not carry (one added to the schema after it)
+  is left as it is, never cleared.
+- A field the change type cannot set is **listed in `not_restored`**, not
+  dropped silently: a stop's `parent_station` (restore the station instead), a
+  stop's `location_type`, a stage's `direction` (part of its key).
+- A null the change type refuses (`name`, `schedule_source`, `route_type`,
+  `active`, `unserviceable`) is not sent.
+- A stop list is compared on the replace fields its old rows carry (`stop_id`,
+  `stop_type`, `stage_no`, `stage_name`, the marker's, `stop_name_override`,
+  `provider_id`), and sent with `base_rows_hash` of the live list. A stage list
+  is compared stage by stage with its numbered fare stages, and sent with
+  `base_stages_hash`; a `before` from a time a stage list did not record
+  directions sends bare ids, which resolve when one stage carries the id.
+- On a feed served from its stages a route's stop list is what its stages make;
+  restore its stages or the stages' own versions there.
+
+Refused: a version that is not the node's (404 `version_not_found`), one with no
+node to restore (409 `not_restorable`, saying why), a node deleted or merged
+away (409 `node_gone` - restoring a deleted stop is a change type the editor
+does not have yet), a draft that already changes the node (409 `node_in_draft`
+with its `change_id`: a second change would be based on the first), and a
+rollback to what the node already has (409 `nothing_to_roll_back`). A refused
+rollback that would have made a new draft leaves none behind: it is one
+transaction, under the feed lock (section 3).
+
+| method | path | |
+|---|---|---|
+| GET | `/feeds/{g}/history/{entity}/{key}?pattern_key=` | `{node, label, exists, live, versions: [{change_id, change_set_id, title, feed_version, committed_at, committed_by, entity, entity_key, op, direct, before, after, state, restorable, why_not, is_live, unrecorded_change_after}], total, truncated, original}`; the newest 200. 400 `not_a_node` for an entity that is none. Viewer of the feed |
+| POST | `/feeds/{g}/history/{entity}/{key}/rollback` | `{change_id, side?: "after" \| "before", change_set_id?, title?, pattern_key?}`: `after` (the default) is the node as that version left it, `before` as it was just before it - undoing that one version. Into the draft named, which must be a draft of the feed, or a new one titled "Roll back <node> to v<N>" (or `title`). 201 `{change_set_id, created_set, change_id, node, to_feed_version, side, fields, not_restored}`. Editor of the feed |
+
+Audit: `node_rolled_back` on the draft, beside the change's own
+`change_added`: `{change_id, node, to_change_id, to_change_set_id,
+to_feed_version, side, fields, not_restored}`.
+
+**Dashboard.** A "Versions" section, folded, at the foot of the stop and station
+panel, the route panel (a picker: name, colour and map line; stop list; and
+stages on a feed served from them) and the stage panel. Each version names its
+draft (linked), when, who committed it and what it changed ("Changed name,
+position", "Replaced the list: 14 stops → 8 stops"), marks the live one, and
+says when something it does not show changed the node afterwards. "Restore this
+version" (and "Restore this" on the original) asks where the change goes - the
+draft being edited or a new one - then opens that draft. Nothing is restored on
+a node that is gone, or to the version that is live. A server without the
+endpoint answers 404 and the section stays empty. `dev/mock_server.py` lists a
+stop's, station's, route's and stop list's own changes and rolls them back the
+same way.
+
+Tests: `editor::history::tests` (laying `after` over `before`, only what
+differs, a position whole, a field the old snapshot lacks left alone, a stop's
+station reported, stop lists compared on the old rows' fields, stage lists by
+numbered stages, a station's members) and `tests/editor_history_flow.rs` (a
+stop's two versions and its original; a viewer refused; a rollback to the first
+version as a new draft of the name alone, live only after someone else commits
+it, then the newest version; the node once per draft; nothing to roll back
+leaving no draft; to before the first edit, name and position; a stop list cut
+short and put back with the live base, through the fare check; a rollback
+overtaken by another commit conflicting at submit; a write round the drafts
+reported; every node kind's read). `tests/editor_migration_flow.rs` covers an
+editor reading in one draft's file (in the background too, polled by them and
+not by a viewer), refused the whole feed's, and taking master's side.

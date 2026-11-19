@@ -136,6 +136,23 @@ pub async fn finish(
     Ok(())
 }
 
+/// Who started job `job_id`, and on which feed: a caller who is not an admin
+/// reads only a job of their own (an editor reading in a draft from master,
+/// section 23). None for a job that does not exist.
+pub async fn owner(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> EditorResult<Option<(Option<Uuid>, Option<String>)>> {
+    let row = sqlx::query("SELECT created_by, gtfs_id FROM gtfs_import_job WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(r) => Some((r.try_get("created_by")?, r.try_get("gtfs_id")?)),
+        None => None,
+    })
+}
+
 /// A job as the page polls it: `running`, `done` with its report, `failed`
 /// with the error the import answered, or `lost`.
 pub async fn get(pool: &PgPool, job_id: Uuid) -> EditorResult<Value> {

@@ -1033,9 +1033,10 @@ async fn an_admin_imports_a_zip_and_a_viewer_downloads_it() {
         "{drafted}"
     );
     assert_eq!(drafted["report"]["change_sets"], json!([]), "{drafted}");
-    // a job is an admin's to read, and one that does not exist says so
+    // a job is read by an admin or by whoever started it: to anyone else
+    // someone else's job is the same 404 as one that does not exist
     let (s, b, _, _, _) = call!(&app, viewer.req("GET", &format!("/import-jobs/{job}")));
-    assert_eq!(s, 403, "{b}");
+    assert_eq!((s, code_of(&b)), (404, "job_not_found"), "{b}");
     let (s, b, _, _, _) = call!(
         &app,
         admin.req("GET", &format!("/import-jobs/{}", uuid::Uuid::new_v4()))

@@ -11,6 +11,7 @@ import { addChange, updateChange, existingChange, createdChange, createdStages, 
 import { stopPicker } from "./picker.js";
 import { stagesLike, draftMerges, finalStage, stageBrief, undoChange } from "./stage_like.js";
 import { showRoute } from "./explore.js";
+import { historySection, stageNodes } from "./history.js";
 
 const panel = () => document.getElementById("panel");
 // sha256 of "[]": the stage list of a route that has none
@@ -511,6 +512,7 @@ export async function showStage(stageId) {
             h("span.hint", `fare stage ${r.stage_no}`)),
           h("span.sub", `${r.long_name || ""} · route id ${r.route_id}`))))
         : h("p.empty", "No route uses this stage yet.")),
+    created ? null : historySection(stageNodes(s, stageKey(s))),
     like ? h("section.section", h("h2", "Stages like this one"),
       h("p.hint", "Going the same way and maybe the same place: the same name, a name written another way, "
         + "or one starting close by. Merge one into this stage, or, if this stage is wrong altogether, "

@@ -1,12 +1,13 @@
 // Moving master's work to prod (docs section 23). Master and prod each have
 // their own database. On master an admin downloads a committed draft, or the
-// whole feed, as a migration file; on prod an admin reads the file in -
-// checked first, nothing written - and gets ordinary prod drafts that a second
-// person approves and commits. What prod changed itself is kept and listed,
-// and can be taken from master one by one.
+// whole feed, as a migration file; on prod the file is read in - checked
+// first, nothing written - and becomes ordinary prod drafts that a second
+// person approves and commits. One draft's file is read in by any editor of
+// the feed, the whole feed's by an admin. What prod changed itself is kept and
+// listed, and can be taken from master one by one.
 import { get, enc, runImport } from "./api.js";
 import { API_BASE } from "./config.js";
-import { state, isAdmin } from "./state.js";
+import { state, isAdmin, can } from "./state.js";
 import { h, clear, fmtCount, plural, errorText, fmtDate } from "./util.js";
 
 // Which side of a migration this editor is: master writes files, prod reads them.
@@ -42,11 +43,12 @@ export function draftDownload(cs) {
     "Download for prod");
 }
 
-// The Feed page's section: on master the whole feed as a file, on prod reading
-// one in. An admin's.
+// The Feed page's section: on master the whole feed as a file (an admin's), on
+// prod reading one in (an editor's of the feed: one draft's file; an admin's
+// also the whole feed's).
 export function migrationSection() {
-  if (!isAdmin()) return null;
-  return environment() === "master" ? exportSection() : importSection();
+  if (environment() === "master") return isAdmin() ? exportSection() : null;
+  return can("editor") ? importSection() : null;
 }
 
 function exportSection() {
@@ -112,13 +114,18 @@ function importSection() {
   };
   loadHistory();
 
+  // the whole feed's file is an admin's to read in; anyone else reads in one
+  // draft's, which has no "since" to give
+  const admin = isAdmin();
   return h("section.feed-section#migration",
     h("h2", "Bring from master"),
-    h("p.hint", "Read in a file downloaded from master: one committed draft, or the whole feed. It is checked first and nothing is written; then it becomes prod drafts that a second person approves and commits. What prod changed itself is kept and listed: tick any you want master's version of. The whole feed comes a step at a time: commit each step's drafts, then read the same file in again."),
+    admin
+      ? h("p.hint", "Read in a file downloaded from master: one committed draft, or the whole feed. It is checked first and nothing is written; then it becomes prod drafts that a second person approves and commits. What prod changed itself is kept and listed: tick any you want master's version of. The whole feed comes a step at a time: commit each step's drafts, then read the same file in again.")
+      : h("p.hint", "Read in a draft downloaded from master (\"Download for prod\" on a committed draft's page). It is checked first and nothing is written; then it becomes a prod draft that a second person approves and commits. What prod changed itself is kept and listed: tick any you want master's version of. A whole-feed file is read in by an admin."),
     h("label.field", { for: "migration-file" }, h("span", "Migration file"), file),
-    h("label.field", { for: "migration-since" },
+    admin ? h("label.field", { for: "migration-since" },
       h("span", "Prod's own edits count from version"), since,
-      h("span.hint", "Needed by the feed's first whole-feed migration: what prod committed after this version is kept as prod's own. Later ones remember it.")),
+      h("span.hint", "Needed by the feed's first whole-feed migration: what prod committed after this version is kept as prod's own. Later ones remember it.")) : null,
     h("div.btn-row", h("button.btn.secondary", { type: "button", id: "migration-check", on: { click: () => run(false) } }, "Check")),
     out,
     h("h3", "Read in before"),

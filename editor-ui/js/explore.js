@@ -10,6 +10,7 @@ import { applyToStop, applyToRoute, pendingNotice, withLive, touchedStops, route
 import { stationNames, foldedList, platformsNote, stopContext, routeContext } from "./context.js";
 import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 import { routeListsSection } from "./variants.js";
+import { historySection, stopNodes, routeNodes } from "./history.js";
 
 const panel = () => document.getElementById("panel");
 
@@ -424,6 +425,7 @@ export async function showStop(stopId) {
       h("p.hint", "Two stops close together are often the two sides of the road: club them into a station. Merge them only if they are the same kerb entered twice."),
       nearbyBox),
     stopContext(live, names),
+    historySection(stopNodes(live)),
   );
 
   // a stop that is already a platform of a station is not listed beside it again
@@ -584,6 +586,7 @@ export async function showRoute(routeId, { preview, draftId } = {}) {
     h("section.section", h("h2", "Stops by fare stage"), ladderBox,
       removed.length ? h("p.pending-removed.notice.draft", `Taken off the route in the draft: ${removed.map((d) => d.before.stop_name || d.before.marker_name || d.before.stop_id).join(", ")}.`) : null),
     live ? routeContext(live, { onReviews: (m) => { reviews = m; drawLadder(); } }) : null,
+    live ? historySection(routeNodes(live, { stages: usesStages() })) : null,
   );
   drawLadder();
 }
