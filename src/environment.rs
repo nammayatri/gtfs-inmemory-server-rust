@@ -586,6 +586,8 @@ impl AppState {
         };
 
         gtfs_service.set_operator_service(operator_service.clone());
+        gtfs_service.set_vehicle_reader(db_vehicle_reader.clone());
+        gtfs_service.set_vehicle_reader_internal(db_vehicle_reader_internal.clone());
         gtfs_service.load_initial_data().await?;
 
         let trip_service = Arc::new(TripService::new(gtfs_service.clone()));

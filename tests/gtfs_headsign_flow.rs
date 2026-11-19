@@ -170,6 +170,7 @@ fn write_preprocessed(dir: &Path) {
             lon: 80.275,
         }),
         service_tier_type: None,
+        applicable_service_types: None,
         encoded_polyline: None,
         route_tag: None,
         is_active: true,

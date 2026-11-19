@@ -142,6 +142,31 @@ impl ScheduleSnapshot {
         self.indexed(self.by_route.get(route_id))
     }
 
+    pub fn applicable_service_types_by_route(&self) -> HashMap<String, Vec<String>> {
+        let mut counts: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
+        for (route_id, idxs) in &self.by_route {
+            let route_counts = counts.entry(route_id.as_str()).or_default();
+            for &i in idxs {
+                let service_type = self.trips[i].waybill.service_type.trim();
+                if !service_type.is_empty() {
+                    *route_counts.entry(service_type).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|(_, tiers)| !tiers.is_empty())
+            .map(|(route_id, tiers)| {
+                let mut ordered: Vec<(&str, usize)> = tiers.into_iter().collect();
+                ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                (
+                    route_id.to_string(),
+                    ordered.into_iter().map(|(t, _)| t.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
     pub fn waybill_trips<'a>(
         &'a self,
         waybill_no: &str,

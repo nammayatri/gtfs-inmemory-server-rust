@@ -30,7 +30,9 @@
 
 use crate::editor::stages::route_stops_source;
 use crate::editor::validation::{is_stage_boundary, SERVED_STOP_TYPES};
-use crate::models::{GTFSStop, LatLong, NandiPatternDetails, NandiRoutesRes, NandiStop, NandiTrip};
+use crate::models::{
+    GTFSStop, LatLong, NandiPatternDetails, NandiRoutesRes, NandiStop, NandiTrip, ServiceTierType,
+};
 use crate::services::gtfs_timing::{self, Offsets};
 use crate::tools::error::{AppError, AppResult};
 use sqlx::postgres::PgPool;
@@ -890,6 +892,74 @@ impl GtfsDbSource {
         )
     }
 
+    pub async fn get_route_applicable_tiers(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+    ) -> AppResult<HashMap<String, Vec<ServiceTierType>>> {
+        if route_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (String, Option<Vec<String>>)>(
+            "SELECT route_id, applicable_service_tiers FROM gtfs_route \
+             WHERE gtfs_id = $1 AND route_id = ANY($2) AND NOT deleted",
+        )
+        .bind(gtfs_id)
+        .bind(route_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("get_route_applicable_tiers: {}", e)))?;
+
+        let mut result = HashMap::with_capacity(rows.len());
+        for (route_id, names) in rows {
+            let Some(names) = names else { continue };
+            let tiers = crate::models::dedupe_service_tiers(names);
+            if !tiers.is_empty() {
+                result.insert(route_id, tiers);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Opportunistic write-back of a route's live-observed tiers into gtfs_route, so a
+    /// later off-peak read (nothing currently "Online" on it) has something to fall back
+    /// to. One round trip for the whole batch via `unnest`, each route's tier list carried
+    /// as a jsonb array rather than a 2D SQL array since routes have different tier counts
+    /// (a rectangular `text[][]` bind can't represent that). Guarded by `IS DISTINCT FROM`
+    /// so a no-op refresh never touches `row_version` -- that column feeds the editor's
+    /// draft optimistic locking (docs/gtfs-editor.md), and this write must never manufacture
+    /// a spurious conflict for a human editing the same route at the same time.
+    pub async fn set_route_applicable_tiers(
+        &self,
+        gtfs_id: &str,
+        tiers_by_route: &HashMap<String, Vec<ServiceTierType>>,
+    ) -> AppResult<()> {
+        if tiers_by_route.is_empty() {
+            return Ok(());
+        }
+        let route_ids: Vec<String> = tiers_by_route.keys().cloned().collect();
+        let tiers_json: Vec<serde_json::Value> = tiers_by_route
+            .values()
+            .map(|tiers| serde_json::to_value(tiers).unwrap_or(serde_json::Value::Array(vec![])))
+            .collect();
+
+        sqlx::query(
+            "UPDATE gtfs_route AS r \
+             SET applicable_service_tiers = ARRAY(SELECT jsonb_array_elements_text(u.tiers)) \
+             FROM unnest($2::text[], $3::jsonb[]) AS u(route_id, tiers) \
+             WHERE r.gtfs_id = $1 AND r.route_id = u.route_id AND NOT r.deleted \
+               AND r.applicable_service_tiers IS DISTINCT FROM \
+                   ARRAY(SELECT jsonb_array_elements_text(u.tiers))",
+        )
+        .bind(gtfs_id)
+        .bind(&route_ids)
+        .bind(&tiers_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("set_route_applicable_tiers: {}", e)))?;
+        Ok(())
+    }
+
     /// Build one feed from the tables. The version is read first: an edit that
     /// commits while the rows are being read bumps it past what this returns,
     /// so the next poll reloads again rather than missing the edit. `overlays`
@@ -1272,6 +1342,7 @@ impl GtfsDbSource {
                     lon: end.lon,
                 }),
                 service_tier_type: None,
+                applicable_service_types: None,
                 encoded_polyline: None,
                 route_tag: r.try_get("route_tag").map_err(db_err)?,
                 is_active: r.try_get("active").map_err(db_err)?,
@@ -1677,6 +1748,7 @@ impl GtfsDbSource {
                 start_point: Some(start),
                 end_point: Some(end),
                 service_tier_type: None,
+                applicable_service_types: None,
                 encoded_polyline: None,
                 route_tag: r.try_get("route_tag").map_err(db_err)?,
                 is_active: r.try_get("active").map_err(db_err)?,

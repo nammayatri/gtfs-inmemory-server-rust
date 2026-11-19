@@ -223,6 +223,19 @@ impl<'de> Deserialize<'de> for ServiceTierType {
     }
 }
 
+pub fn dedupe_service_tiers(names: impl IntoIterator<Item = String>) -> Vec<ServiceTierType> {
+    let mut tiers = Vec::new();
+    for name in names {
+        if let Ok(tier) = serde_json::from_value::<ServiceTierType>(serde_json::Value::String(name))
+        {
+            if !tiers.contains(&tier) {
+                tiers.push(tier);
+            }
+        }
+    }
+    tiers
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteServiceTierRecord {
     pub gtfs_id: String,
@@ -678,6 +691,12 @@ pub struct NandiRoutesRes {
     #[serde(rename = "serviceTierType")]
     pub service_tier_type: Option<ServiceTierType>,
     #[serde(
+        rename = "applicableServiceTypes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub applicable_service_types: Option<Vec<ServiceTierType>>,
+    #[serde(
         rename = "encodedPolyline",
         default,
         skip_serializing_if = "Option::is_none"
@@ -936,6 +955,8 @@ pub struct GTFSData {
     pub entity_id_name_mapping: HashMap<String, String>,
     pub alternate_stop_by_gtfs: HashMap<String, GTFSAlternateStopData>,
     pub route_service_tiers_by_gtfs: HashMap<String, HashMap<String, ServiceTierType>>,
+    #[serde(default)]
+    pub route_applicable_tiers_by_gtfs: HashMap<String, HashMap<String, Vec<ServiceTierType>>>,
     pub seat_layout_mapping_by_gtfs: HashMap<String, HashMap<String, String>>,
     /// Pre-computed unique stops list per GTFS (avoids recomputation on every /stops request)
     #[serde(skip)]
