@@ -9,11 +9,15 @@ use crate::models::{
 };
 use crate::models::{GTFSAlternateStopData, TripDetails, TripStopDetail};
 use crate::services::chalo_vehicle_cache::{chalo_gtfs_ids, ChaloVehicleCache};
+use crate::services::db_vehicle_reader::VehicleDataReader;
+use crate::services::db_vehicle_reader_internal::VehicleDataReaderInternal;
 use crate::services::gtfs_db_source::{
     is_fare_stage_dict, overlays_from_patterns, parse_headsign_stage, plan_feed_actions, DbTrip,
     DbTrips, FeedAction, GtfsDbSource, TripOverlay,
 };
-use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
+use crate::services::operator::{
+    OperatorService, INTERNAL_ONLY_GTFS_IDS, SUPPORTED_OPERATOR_GTFS_IDS,
+};
 use crate::services::webhook;
 use crate::tools::error::{AppError, AppResult};
 use arc_swap::ArcSwap;
@@ -30,7 +34,7 @@ use shared::tools::prometheus::CALL_EXTERNAL_API;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
@@ -161,6 +165,17 @@ pub struct GTFSService {
     cached_data_bytes: Arc<ArcSwap<Vec<u8>>>,
     /// Set once at startup so refreshes can enrich routes with DB-only fields (e.g. encoded_polyline).
     operator_service: std::sync::OnceLock<Arc<dyn OperatorService>>,
+    /// Set once at startup, same as `operator_service`: the external-replica live
+    /// schedule-snapshot source (see `resolve_live_applicable_tiers`).
+    vehicle_reader: std::sync::OnceLock<Arc<dyn VehicleDataReader>>,
+    /// Set once at startup: the internal-DB live schedule-snapshot source, same role as
+    /// `vehicle_reader` but for an `INTERNAL_ONLY_GTFS_IDS` feed.
+    vehicle_reader_internal: std::sync::OnceLock<Arc<dyn VehicleDataReaderInternal>>,
+    /// Resolved applicable-tiers cache: (gtfs_id, route_id) -> (tiers, resolved_at). Short
+    /// TTL (`APPLICABLE_TIER_CACHE_SECS`) so a rebuild doesn't re-hit the live snapshot or
+    /// the gtfs_route fallback for every route on every cycle.
+    applicable_tier_cache:
+        Arc<RwLock<HashMap<(String, String), (Vec<ServiceTierType>, SystemTime)>>>,
     /// Source for DB-backed feeds; `None` only when `internal_database_url` is
     /// not set. Which feeds it actually serves from the DB is decided live -
     /// see `create_db_source`'s doc comment.
@@ -219,6 +234,9 @@ impl GTFSService {
             trip_details_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_data_bytes: Arc::new(ArcSwap::from_pointee(Vec::new())),
             operator_service: std::sync::OnceLock::new(),
+            vehicle_reader: std::sync::OnceLock::new(),
+            vehicle_reader_internal: std::sync::OnceLock::new(),
+            applicable_tier_cache: Arc::new(RwLock::new(HashMap::new())),
             db_source,
             trip_overlays: Arc::new(RwLock::new(HashMap::new())),
             reload_lock: tokio::sync::Mutex::new(()),
@@ -280,6 +298,14 @@ impl GTFSService {
 
     pub fn set_operator_service(&self, op: Arc<dyn OperatorService>) {
         let _ = self.operator_service.set(op);
+    }
+
+    pub fn set_vehicle_reader(&self, reader: Arc<dyn VehicleDataReader>) {
+        let _ = self.vehicle_reader.set(reader);
+    }
+
+    pub fn set_vehicle_reader_internal(&self, reader: Arc<dyn VehicleDataReaderInternal>) {
+        let _ = self.vehicle_reader_internal.set(reader);
     }
 
     pub async fn load_initial_data(&self) -> AppResult<()> {
@@ -574,6 +600,7 @@ impl GTFSService {
             "Resolved route service tiers for {} GTFS IDs",
             route_service_tiers_by_gtfs.len()
         );
+        let route_applicable_tiers_by_gtfs = self.build_route_applicable_tiers(&all_routes).await;
 
         let seat_layout_mapping_by_gtfs = self.read_seat_layout_mapping_csv().await?;
         info!(
@@ -593,6 +620,7 @@ impl GTFSService {
             &route_trip_counts,
             &route_stop_counts,
             &route_service_tiers_by_gtfs,
+            &route_applicable_tiers_by_gtfs,
         );
 
         // Build stops data first (needed by route data for parent_stop_code lookup)
@@ -702,6 +730,7 @@ impl GTFSService {
         temp_data.route_example_trip_by_gtfs = route_example_trip_by_gtfs;
         temp_data.alternate_stop_by_gtfs = alternate_stops_by_gtfs;
         temp_data.route_service_tiers_by_gtfs = route_service_tiers_by_gtfs;
+        temp_data.route_applicable_tiers_by_gtfs = route_applicable_tiers_by_gtfs;
         temp_data.seat_layout_mapping_by_gtfs = seat_layout_mapping_by_gtfs;
         temp_data.pre_computed_stops_by_gtfs = pre_computed_stops_by_gtfs;
         temp_data.db_feed_versions = db_feed_versions;
@@ -1149,10 +1178,6 @@ impl GTFSService {
         csv_map: HashMap<String, HashMap<String, ServiceTierType>>,
         all_routes: &[NandiRoutesRes],
     ) -> HashMap<String, HashMap<String, ServiceTierType>> {
-        let Some(op_svc) = self.operator_service.get() else {
-            return csv_map;
-        };
-
         let mut routes_by_gtfs: HashMap<String, HashSet<String>> = HashMap::new();
         for route in all_routes {
             let Some((gtfs_id, route_code)) = route.id.split_once(':') else {
@@ -1167,9 +1192,10 @@ impl GTFSService {
                 .insert(route_code.to_string());
         }
 
-        // Prior snapshot's tiers — used to carry state forward on DB failure so a blip
-        // doesn't strip serviceTierType from the published data.
-        let prior = self.data.load();
+        // One framework for every SUPPORTED_OPERATOR_GTFS_IDS feed -- see
+        // resolve_live_applicable_tiers for which snapshot source and fallback it uses per
+        // gtfs_id. Its own gtfs_route fallback is the "don't blank out a known-good value on
+        // a blip" layer here; there's no separate prior-snapshot carry-forward needed on top.
         let mut merged = csv_map;
         for (gtfs_id, all_route_ids) in routes_by_gtfs {
             let uncovered: Vec<String> = match merged.get(&gtfs_id) {
@@ -1183,46 +1209,235 @@ impl GTFSService {
                 continue;
             }
 
-            match op_svc
-                .get_service_tiers_for_routes(&gtfs_id, &uncovered)
-                .await
-            {
-                Ok(db_map) => {
-                    info!(
-                        "Route service tiers for {}: DB fallback resolved {}/{} uncovered routes",
-                        gtfs_id,
-                        db_map.len(),
-                        uncovered.len()
-                    );
-                    if db_map.is_empty() {
-                        continue;
-                    }
-                    let inner = merged.entry(gtfs_id).or_default();
-                    for (route_id, tier) in db_map {
+            let live = self
+                .resolve_live_applicable_tiers(&gtfs_id, &uncovered)
+                .await;
+            info!(
+                "Route service tiers for {}: live snapshot/gtfs_route fallback resolved {}/{} uncovered routes",
+                gtfs_id,
+                live.len(),
+                uncovered.len()
+            );
+            if !live.is_empty() {
+                let inner = merged.entry(gtfs_id).or_default();
+                for (route_id, tiers) in live {
+                    if let Some(tier) = tiers.into_iter().next() {
                         inner.entry(route_id).or_insert(tier);
-                    }
-                }
-                Err(e) => {
-                    let prior_inner = prior.route_service_tiers_by_gtfs.get(&gtfs_id);
-                    let carried = prior_inner
-                        .map(|m| uncovered.iter().filter(|r| m.contains_key(*r)).count())
-                        .unwrap_or(0);
-                    warn!(
-                        "Route service tiers for {}: DB fallback failed ({}); carrying {} prior-cycle tiers forward",
-                        gtfs_id, e, carried
-                    );
-                    if let Some(prior_inner) = prior_inner {
-                        let inner = merged.entry(gtfs_id).or_default();
-                        for route_id in &uncovered {
-                            if let Some(tier) = prior_inner.get(route_id) {
-                                inner.entry(route_id.clone()).or_insert(tier.clone());
-                            }
-                        }
                     }
                 }
             }
         }
         merged
+    }
+
+    async fn build_route_applicable_tiers(
+        &self,
+        all_routes: &[NandiRoutesRes],
+    ) -> HashMap<String, HashMap<String, Vec<ServiceTierType>>> {
+        let mut routes_by_gtfs: HashMap<String, HashSet<String>> = HashMap::new();
+        for route in all_routes {
+            let Some((gtfs_id, route_code)) = route.id.split_once(':') else {
+                continue;
+            };
+            if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id) {
+                continue;
+            }
+            routes_by_gtfs
+                .entry(gtfs_id.to_string())
+                .or_default()
+                .insert(route_code.to_string());
+        }
+
+        // One framework for every SUPPORTED_OPERATOR_GTFS_IDS feed -- see
+        // resolve_live_applicable_tiers for which snapshot source and fallback it uses per
+        // gtfs_id.
+        let mut result = HashMap::new();
+        for (gtfs_id, route_ids) in routes_by_gtfs {
+            let route_ids: Vec<String> = route_ids.into_iter().collect();
+            let live = self
+                .resolve_live_applicable_tiers(&gtfs_id, &route_ids)
+                .await;
+            info!(
+                "Applicable service tiers for {}: live snapshot/gtfs_route fallback resolved {}/{} routes",
+                gtfs_id,
+                live.len(),
+                route_ids.len()
+            );
+            if !live.is_empty() {
+                result.insert(gtfs_id, live);
+            }
+        }
+        result
+    }
+
+    /// How long a resolved route's applicable tiers stay cached before the live snapshot is
+    /// re-consulted. Matches the snapshot's own freshness window (`SCHEDULE_SNAPSHOT_TTL`) --
+    /// no point caching tighter than the source itself refreshes.
+    const APPLICABLE_TIER_CACHE_SECS: u64 = 30;
+
+    /// Live-first resolution for any `SUPPORTED_OPERATOR_GTFS_IDS` feed's applicable service
+    /// tiers -- one framework for every operator gtfs_id, chennai_bus and kolkata_bus alike,
+    /// only the snapshot source differs: the external replica (`vehicle_reader`) for a feed
+    /// with its own replica, the internal DB's own schedule snapshot (`vehicle_reader_internal`)
+    /// for an `INTERNAL_ONLY_GTFS_IDS` feed. Either way: the live snapshot (currently
+    /// online/upcoming waybills) first, falling back to `gtfs_route.applicable_service_tiers`
+    /// (via `db_source`) for a route the snapshot has nothing for right now -- off-peak, depot
+    /// hours, between trips. Whatever the snapshot resolves is written back to that same
+    /// column so a later off-peak read has something to fall back to. Cached in-memory for
+    /// `APPLICABLE_TIER_CACHE_SECS` so a rebuild doesn't redo the snapshot grouping or the
+    /// editor-DB round trip every cycle. Best-effort throughout: a missing reader or
+    /// `db_source`, or either failing, just means fewer routes resolve this cycle, same "leave
+    /// it uncovered rather than error the whole batch" contract as the rest of this pipeline.
+    async fn resolve_live_applicable_tiers(
+        &self,
+        gtfs_id: &str,
+        route_ids: &[String],
+    ) -> HashMap<String, Vec<ServiceTierType>> {
+        let mut result: HashMap<String, Vec<ServiceTierType>> = HashMap::new();
+        let mut uncached: Vec<String> = Vec::new();
+
+        {
+            let cache = self.applicable_tier_cache.read().await;
+            for route_id in route_ids {
+                let key = (gtfs_id.to_string(), route_id.clone());
+                match cache.get(&key) {
+                    Some((tiers, ts))
+                        if ts.elapsed().unwrap_or_default()
+                            < Duration::from_secs(Self::APPLICABLE_TIER_CACHE_SECS) =>
+                    {
+                        if !tiers.is_empty() {
+                            result.insert(route_id.clone(), tiers.clone());
+                        }
+                    }
+                    _ => uncached.push(route_id.clone()),
+                }
+            }
+        }
+        if uncached.is_empty() {
+            return result;
+        }
+
+        let live: HashMap<String, Vec<ServiceTierType>> = if INTERNAL_ONLY_GTFS_IDS
+            .contains(&gtfs_id)
+        {
+            match self.vehicle_reader_internal.get() {
+                Some(vr) => vr
+                    .get_applicable_service_tiers_by_route(gtfs_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            "resolve_live_applicable_tiers({}): internal live snapshot failed ({}); falling back to gtfs_route for every uncached route",
+                            gtfs_id, e
+                        );
+                        HashMap::new()
+                    }),
+                None => HashMap::new(),
+            }
+        } else {
+            // vehicle_reader's snapshot carries no gtfs_id (the replica is Chennai-only by
+            // construction, see ScheduleSnapshot/db_vehicle_reader.rs) -- safe only as long as
+            // chennai_bus is the only non-INTERNAL_ONLY_GTFS_IDS entry sharing this reader. A
+            // second such feed would need the snapshot itself scoped per gtfs_id (the way
+            // vehicle_reader_internal's schedule_snapshot(gtfs_id) already is) before its
+            // routes could safely share this write-back.
+            match self.vehicle_reader.get() {
+                Some(vr) => vr
+                    .get_applicable_service_tiers_by_route()
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            "resolve_live_applicable_tiers({}): external live snapshot failed ({}); falling back to gtfs_route for every uncached route",
+                            gtfs_id, e
+                        );
+                        HashMap::new()
+                    }),
+                None => HashMap::new(),
+            }
+        };
+
+        // Write back everything the snapshot resolved, not just this call's route_ids --
+        // one batched round trip either way, and it fills gtfs_route's fallback in faster.
+        if !live.is_empty() {
+            if let Some(db_source) = &self.db_source {
+                if let Err(e) = db_source.set_route_applicable_tiers(gtfs_id, &live).await {
+                    warn!(
+                        "resolve_live_applicable_tiers({}): gtfs_route write-back failed ({}); continuing without it",
+                        gtfs_id, e
+                    );
+                }
+            }
+        }
+
+        let mut resolved_now: HashMap<String, Vec<ServiceTierType>> = HashMap::new();
+        let mut still_missing: Vec<String> = Vec::new();
+        for route_id in &uncached {
+            match live.get(route_id) {
+                Some(tiers) => {
+                    resolved_now.insert(route_id.clone(), tiers.clone());
+                }
+                None => still_missing.push(route_id.clone()),
+            }
+        }
+
+        if !still_missing.is_empty() {
+            if let Some(db_source) = &self.db_source {
+                match db_source
+                    .get_route_applicable_tiers(gtfs_id, &still_missing)
+                    .await
+                {
+                    Ok(fallback) => resolved_now.extend(fallback),
+                    Err(e) => warn!(
+                        "resolve_live_applicable_tiers({}): gtfs_route fallback read failed ({}); those routes stay uncovered this cycle",
+                        gtfs_id, e
+                    ),
+                }
+            }
+        }
+
+        // Last-resort carry-forward: if neither the live snapshot nor the gtfs_route
+        // fallback has anything for a route, don't blank out whatever the previous cycle
+        // published -- a transient failure in either source must not visibly wipe a
+        // known-good tier. Checks route_applicable_tiers_by_gtfs first (the richer shape),
+        // falling back to wrapping route_service_tiers_by_gtfs's single value.
+        let still_uncovered: Vec<&String> = uncached
+            .iter()
+            .filter(|r| !resolved_now.contains_key(*r))
+            .collect();
+        if !still_uncovered.is_empty() {
+            let prior = self.data.load();
+            let prior_applicable = prior.route_applicable_tiers_by_gtfs.get(gtfs_id);
+            let prior_single = prior.route_service_tiers_by_gtfs.get(gtfs_id);
+            let mut carried = 0;
+            for route_id in still_uncovered {
+                if let Some(tiers) = prior_applicable.and_then(|m| m.get(route_id)) {
+                    resolved_now.insert(route_id.clone(), tiers.clone());
+                    carried += 1;
+                } else if let Some(tier) = prior_single.and_then(|m| m.get(route_id)) {
+                    resolved_now.insert(route_id.clone(), vec![tier.clone()]);
+                    carried += 1;
+                }
+            }
+            if carried > 0 {
+                warn!(
+                    "resolve_live_applicable_tiers({}): carrying {} prior-cycle tiers forward for routes neither the live snapshot nor gtfs_route covered",
+                    gtfs_id, carried
+                );
+            }
+        }
+
+        let now = SystemTime::now();
+        let mut cache = self.applicable_tier_cache.write().await;
+        for route_id in &uncached {
+            let tiers = resolved_now.get(route_id).cloned().unwrap_or_default();
+            cache.insert(
+                (gtfs_id.to_string(), route_id.clone()),
+                (tiers.clone(), now),
+            );
+            if !tiers.is_empty() {
+                result.insert(route_id.clone(), tiers);
+            }
+        }
+        result
     }
 
     async fn read_route_service_tiers_csv(
@@ -1423,6 +1638,7 @@ impl GTFSService {
         trip_counts: &HashMap<String, i32>,
         stop_counts: &HashMap<String, HashMap<String, usize>>,
         route_service_tiers: &HashMap<String, HashMap<String, ServiceTierType>>,
+        route_applicable_tiers: &HashMap<String, HashMap<String, Vec<ServiceTierType>>>,
     ) -> HashMap<String, HashMap<String, NandiRoutesRes>> {
         let mut routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>> = HashMap::new();
         for route in routes {
@@ -1436,6 +1652,11 @@ impl GTFSService {
             let service_tier_type = route_service_tiers
                 .get(gtfs_id)
                 .and_then(|m| m.get(route_code))
+                .cloned();
+            let applicable_service_types = route_applicable_tiers
+                .get(gtfs_id)
+                .and_then(|m| m.get(route_code))
+                .filter(|tiers| tiers.len() > 1)
                 .cloned();
 
             let route_res = NandiRoutesRes {
@@ -1458,6 +1679,7 @@ impl GTFSService {
                 start_point: route.start_point,
                 end_point: route.end_point,
                 service_tier_type,
+                applicable_service_types,
                 encoded_polyline: None,
                 // Preprocessed input never carries one (None here already); a DB
                 // feed's gtfs_route.route_tag (set by GtfsDbSource::load_feed)
@@ -1554,41 +1776,43 @@ impl GTFSService {
             }
         }
 
-        let Some(op_svc) = self.operator_service.get() else {
-            return;
-        };
+        // One framework for every SUPPORTED_OPERATOR_GTFS_IDS feed -- see
+        // resolve_live_applicable_tiers for which snapshot source and fallback it uses per
+        // gtfs_id. One call gives both service_tier_type (first/dominant entry) and
+        // applicable_service_types (the full list). "Only touch what's uncovered, leave a
+        // failed lookup's prior value alone" -- same contract this function always had.
         for (gtfs_id, routes) in routes_by_gtfs.iter_mut() {
             if !SUPPORTED_OPERATOR_GTFS_IDS.contains(&gtfs_id.as_str()) {
                 continue;
             }
             let uncovered: Vec<String> = routes
                 .iter()
-                .filter_map(|(rid, r)| r.service_tier_type.is_none().then(|| rid.clone()))
+                .filter_map(|(rid, r)| {
+                    (r.service_tier_type.is_none() || r.applicable_service_types.is_none())
+                        .then(|| rid.clone())
+                })
                 .collect();
             if uncovered.is_empty() {
                 continue;
             }
-            match op_svc
-                .get_service_tiers_for_routes(gtfs_id, &uncovered)
-                .await
-            {
-                Ok(db_map) => {
-                    info!(
-                        "enrich_routes_with_db_service_tiers({}): resolved {}/{} uncovered routes",
-                        gtfs_id,
-                        db_map.len(),
-                        uncovered.len()
-                    );
-                    for (route_id, tier) in db_map {
-                        if let Some(route) = routes.get_mut(&route_id) {
-                            route.service_tier_type = Some(tier);
-                        }
+            let live = self
+                .resolve_live_applicable_tiers(gtfs_id, &uncovered)
+                .await;
+            info!(
+                "enrich_routes_with_db_service_tiers({}): live snapshot/gtfs_route fallback resolved {}/{} uncovered routes",
+                gtfs_id,
+                live.len(),
+                uncovered.len()
+            );
+            for (route_id, tiers) in live {
+                if let Some(route) = routes.get_mut(&route_id) {
+                    if route.service_tier_type.is_none() {
+                        route.service_tier_type = tiers.first().cloned();
+                    }
+                    if route.applicable_service_types.is_none() && tiers.len() > 1 {
+                        route.applicable_service_types = Some(tiers);
                     }
                 }
-                Err(e) => warn!(
-                    "enrich_routes_with_db_service_tiers({}): DB fallback failed ({}); leaving snapshot values as-is",
-                    gtfs_id, e
-                ),
             }
         }
     }
@@ -2442,10 +2666,16 @@ impl GTFSService {
         let tiers = self
             .build_route_service_tiers(csv_tiers, &feed.routes)
             .await;
+        let applicable_tiers = self.build_route_applicable_tiers(&feed.routes).await;
         let trip_counts = self.calculate_trip_counts(&feed.patterns);
         let stop_counts = self.calculate_stop_counts(&feed.patterns);
-        let mut routes =
-            self.build_routes_by_gtfs(feed.routes.clone(), &trip_counts, &stop_counts, &tiers);
+        let mut routes = self.build_routes_by_gtfs(
+            feed.routes.clone(),
+            &trip_counts,
+            &stop_counts,
+            &tiers,
+            &applicable_tiers,
+        );
         let stops = self.build_stops_by_gtfs(feed.stops.clone(), &data.stop_regional_names_by_gtfs);
         let alternates = self.build_alternate_stops_by_gtfs(feed.stops.clone());
         let route_data = self.build_route_data(
@@ -2480,6 +2710,11 @@ impl GTFSService {
         replace_feed_entry(&mut data.station_platforms_by_gtfs, stations, gtfs_id);
         replace_feed_entry(&mut data.route_example_trip_by_gtfs, trip_map, gtfs_id);
         replace_feed_entry(&mut data.route_service_tiers_by_gtfs, tiers, gtfs_id);
+        replace_feed_entry(
+            &mut data.route_applicable_tiers_by_gtfs,
+            applicable_tiers,
+            gtfs_id,
+        );
         replace_feed_entry(&mut data.pre_computed_stops_by_gtfs, pre_computed, gtfs_id);
         match routes_hash {
             Some(h) => {
@@ -2579,10 +2814,16 @@ impl GTFSService {
         let mut data = base.clone();
         let csv_tiers = self.read_route_service_tiers_csv().await?;
         let tiers = self.build_route_service_tiers(csv_tiers, &routes).await;
+        let applicable_tiers = self.build_route_applicable_tiers(&routes).await;
         let trip_counts = self.calculate_trip_counts(&patterns);
         let stop_counts = self.calculate_stop_counts(&patterns);
-        let mut routes_by_gtfs =
-            self.build_routes_by_gtfs(routes, &trip_counts, &stop_counts, &tiers);
+        let mut routes_by_gtfs = self.build_routes_by_gtfs(
+            routes,
+            &trip_counts,
+            &stop_counts,
+            &tiers,
+            &applicable_tiers,
+        );
         // Preprocessed routes get their polyline from route_internal, same as
         // a normal boot - unlike a DB feed, which takes it from gtfs_route.
         self.enrich_routes_from_route_internal(&mut routes_by_gtfs)
@@ -2620,6 +2861,11 @@ impl GTFSService {
         replace_feed_entry(&mut data.station_platforms_by_gtfs, stations, gtfs_id);
         replace_feed_entry(&mut data.route_example_trip_by_gtfs, trip_map, gtfs_id);
         replace_feed_entry(&mut data.route_service_tiers_by_gtfs, tiers, gtfs_id);
+        replace_feed_entry(
+            &mut data.route_applicable_tiers_by_gtfs,
+            applicable_tiers,
+            gtfs_id,
+        );
         replace_feed_entry(&mut data.pre_computed_stops_by_gtfs, pre_computed, gtfs_id);
         match routes_hash {
             // Plain routes hash, not db_feed_data_hash: a preprocessed feed's

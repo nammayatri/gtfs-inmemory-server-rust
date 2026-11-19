@@ -9,8 +9,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::models::{
     BusSchedule, DepotInfo, DepotVehicleInfo, FleetOperationInfo, RouteLastScheduleTime,
-    VehicleData, VehicleDataWithRouteId, VehicleProperties, WaybillMetadataResponse, WaybillStatus,
-    WaybillTripInfo,
+    ServiceTierType, VehicleData, VehicleDataWithRouteId, VehicleProperties,
+    WaybillMetadataResponse, WaybillStatus, WaybillTripInfo,
 };
 use crate::services::operator::SUPPORTED_OPERATOR_GTFS_IDS;
 use crate::services::schedule_snapshot::{
@@ -96,6 +96,17 @@ pub trait VehicleDataReaderInternal: Send + Sync {
         trip_number: i32,
         gtfs_id: &str,
     ) -> AppResult<Vec<ScheduledTrip>>;
+    /// A feed's applicable service tiers per route, among currently online/upcoming
+    /// waybills -- same schedule snapshot `get_waybills_by_route_id` uses. `Ok(empty)`
+    /// (not an error) both when there's genuinely nothing live right now and for a mock
+    /// reader with no internal DB -- callers fall back to gtfs_route's persisted value for
+    /// a route this doesn't cover.
+    async fn get_applicable_service_tiers_by_route(
+        &self,
+        _gtfs_id: &str,
+    ) -> AppResult<HashMap<String, Vec<ServiceTierType>>> {
+        Ok(HashMap::new())
+    }
     async fn warm_schedule_snapshots(&self) {}
 
     async fn get_routes_served_today(
@@ -1362,6 +1373,24 @@ impl VehicleDataReaderInternal for DBVehicleReaderInternal {
     ) -> AppResult<Vec<ScheduledTrip>> {
         self.get_waybill_by_waybill_and_trip_impl(waybill_no, trip_number, gtfs_id)
             .await
+    }
+
+    async fn get_applicable_service_tiers_by_route(
+        &self,
+        gtfs_id: &str,
+    ) -> AppResult<HashMap<String, Vec<ServiceTierType>>> {
+        let Some(snapshot) = self.schedule_snapshot(gtfs_id).await else {
+            return Ok(HashMap::new());
+        };
+        let by_route = snapshot.applicable_service_types_by_route();
+        let mut result = HashMap::with_capacity(by_route.len());
+        for (route_id, names) in by_route {
+            let tiers = crate::models::dedupe_service_tiers(names);
+            if !tiers.is_empty() {
+                result.insert(route_id, tiers);
+            }
+        }
+        Ok(result)
     }
 
     async fn get_station_etas(&self, gtfs_id: &str) -> AppResult<HashMap<(String, String), i32>> {

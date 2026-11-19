@@ -9,8 +9,8 @@ use tracing::{debug, error, info};
 use crate::environment::AppConfig;
 use crate::models::{
     BusSchedule, DepotInfo, DepotVehicleInfo, DepotVehicleSummary, FleetOperationInfo,
-    MinimalVehicleData, RouteLastScheduleTime, VehicleData, VehicleDataWithRouteId,
-    VehicleOperationData, WaybillStatus,
+    MinimalVehicleData, RouteLastScheduleTime, ServiceTierType, VehicleData,
+    VehicleDataWithRouteId, VehicleOperationData, WaybillStatus,
 };
 use crate::services::depot_monitoring::{
     self, CrewPage, DepotDayRequest, DepotOverview, RoutePage, WaybillPage,
@@ -181,6 +181,12 @@ pub trait VehicleDataReader: Send + Sync {
         waybill_no: &str,
         trip_number: i32,
     ) -> AppResult<Vec<ScheduledTrip>>;
+
+    async fn get_applicable_service_tiers_by_route(
+        &self,
+    ) -> AppResult<HashMap<String, Vec<ServiceTierType>>> {
+        Ok(HashMap::new())
+    }
     async fn warm_schedule_snapshot(&self) {}
     async fn get_routes_served_today(&self) -> AppResult<Vec<RouteLastScheduleTime>>;
 
@@ -2602,6 +2608,21 @@ impl VehicleDataReader for DBVehicleReader {
                 ..t.to_scheduled()
             })
             .collect())
+    }
+
+    async fn get_applicable_service_tiers_by_route(
+        &self,
+    ) -> AppResult<HashMap<String, Vec<ServiceTierType>>> {
+        let snapshot = self.schedule_snapshot().await?;
+        let by_route = snapshot.applicable_service_types_by_route();
+        let mut result = HashMap::with_capacity(by_route.len());
+        for (route_id, names) in by_route {
+            let tiers = crate::models::dedupe_service_tiers(names);
+            if !tiers.is_empty() {
+                result.insert(route_id, tiers);
+            }
+        }
+        Ok(result)
     }
 
     async fn get_vehicles_by_service_tier(
