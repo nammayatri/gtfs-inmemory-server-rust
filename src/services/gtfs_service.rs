@@ -140,6 +140,85 @@ async fn sha256_of_file(path: &std::path::Path) -> AppResult<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[derive(Debug, Clone)]
+pub struct RouteNames {
+    pub number: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct RouteCatalog {
+    data: Arc<ArcSwap<GTFSData>>,
+}
+
+impl RouteCatalog {
+    pub fn empty() -> Self {
+        Self {
+            data: Arc::new(ArcSwap::from_pointee(GTFSData::new())),
+        }
+    }
+
+    pub fn from_names(gtfs_id: &str, routes: &[(&str, Option<&str>, Option<&str>)]) -> Self {
+        let mut data = GTFSData::new();
+        let feed = data
+            .routes_by_gtfs
+            .entry(crate::models::clean_identifier(gtfs_id))
+            .or_default();
+        for (id, number, name) in routes {
+            feed.insert(
+                crate::models::clean_identifier(id),
+                NandiRoutesRes {
+                    id: id.to_string(),
+                    short_name: number.map(str::to_string),
+                    long_name: name.map(str::to_string),
+                    mode: "BUS".to_string(),
+                    agency_name: None,
+                    color: None,
+                    trip_count: None,
+                    stop_count: None,
+                    start_point: None,
+                    end_point: None,
+                    service_tier_type: None,
+                    encoded_polyline: None,
+                    route_tag: None,
+                    is_active: true,
+                },
+            );
+        }
+        Self {
+            data: Arc::new(ArcSwap::from_pointee(data)),
+        }
+    }
+
+    pub fn names(&self, gtfs_id: Option<&str>, route_id: &str) -> Option<RouteNames> {
+        let data = self.data.load();
+        let key = crate::models::clean_identifier(route_id);
+        let to_names = |r: &NandiRoutesRes| RouteNames {
+            number: r.short_name.clone(),
+            name: r.long_name.clone(),
+        };
+        match gtfs_id {
+            Some(g) => data
+                .routes_by_gtfs
+                .get(crate::models::clean_identifier(g).as_str())
+                .and_then(|routes| routes.get(&key))
+                .map(to_names),
+            None => data
+                .routes_by_gtfs
+                .values()
+                .find_map(|routes| routes.get(&key))
+                .map(to_names),
+        }
+    }
+}
+
+fn nandi_cookie() -> Option<String> {
+    std::env::var("NANDI_COOKIE")
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+}
+
 fn normalize_stop_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
@@ -198,8 +277,23 @@ pub struct GTFSService {
 const ALIAS_LOG_EVERY: Duration = Duration::from_secs(3600);
 
 impl GTFSService {
+    pub fn route_catalog(&self) -> RouteCatalog {
+        RouteCatalog {
+            data: self.data.clone(),
+        }
+    }
+
     pub async fn new(config: AppConfig) -> AppResult<Self> {
+        let mut nandi_headers = reqwest::header::HeaderMap::new();
+        if let Some(cookie) = nandi_cookie() {
+            let value = reqwest::header::HeaderValue::from_str(&cookie).map_err(|e| {
+                AppError::Internal(format!("NANDI_COOKIE is not a valid header value: {}", e))
+            })?;
+            nandi_headers.insert(reqwest::header::COOKIE, value);
+            info!("Sending NANDI_COOKIE with Nandi/OTP requests");
+        }
         let http_client = reqwest::Client::builder()
+            .default_headers(nandi_headers)
             .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(config.connection_limit)
             .pool_idle_timeout(Duration::from_secs(config.http_pool_idle_timeout))
@@ -882,6 +976,13 @@ impl GTFSService {
 
         for (name, meta) in &manifest.files {
             let file_path = dir.join(name);
+            if !file_path.exists() && name.starts_with("trip_stoptimes/") {
+                warn!(
+                    "metadata.json lists {} but it is missing on disk; /trip for that feed will not use shards",
+                    name
+                );
+                continue;
+            }
             if !file_path.exists() {
                 return Err(AppError::Internal(format!(
                     "metadata.json lists {} but it is missing on disk",
@@ -4636,11 +4737,16 @@ impl GTFSService {
             request_body["operationName"] = serde_json::Value::String(op_name);
         }
 
+        let cookie = nandi_cookie();
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(c) = cookie.as_deref() {
+            headers.push(("Cookie", c));
+        }
         call_api::<serde_json::Value, serde_json::Value>(
             Protocol::Http1,
             Method::POST,
             &url,
-            vec![("Content-Type", "application/json")],
+            headers,
             Some(request_body),
             Some("execute_graphql_query"),
         )

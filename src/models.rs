@@ -258,6 +258,9 @@ pub struct VehicleData {
     pub is_active_trip: Option<bool>,
     #[sqlx(default)]
     pub is_completed: Option<bool>,
+    #[sqlx(default)]
+    #[serde(rename = "dutyTripId")]
+    pub duty_trip_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -295,6 +298,9 @@ pub struct VehicleDataWithRouteId {
     #[sqlx(default)]
     #[serde(skip)]
     pub waybill_status: Option<WaybillStatus>,
+    #[sqlx(default)]
+    #[serde(rename = "dutyTripId")]
+    pub duty_trip_id: Option<String>,
 }
 
 /// Depot identity as the dispatcher APIs expose it. `depot_id` (GIMS's entity id) is the stable
@@ -373,6 +379,9 @@ pub struct BusSchedule {
     pub db_start_time: Option<String>,
     #[serde(rename = "dbEndTime")]
     pub db_end_time: Option<String>,
+    #[sqlx(default)]
+    #[serde(rename = "dutyTripId", default)]
+    pub duty_trip_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -417,6 +426,20 @@ pub struct VehicleServiceTypeResponse {
     /// End time of the first/active trip (for schedule-based reconciliation)
     #[serde(rename = "dbEndTime")]
     pub db_end_time: Option<String>,
+    #[serde(rename = "dutyTripId", default)]
+    pub duty_trip_id: Option<String>,
+    #[serde(
+        rename = "vehicleDepotId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_depot_id: Option<String>,
+    #[serde(
+        rename = "vehicleOrganisationId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_organisation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -436,6 +459,18 @@ pub struct VehicleMetadataResponse {
     )]
     pub vehicle_tags: Option<Vec<String>>,
     pub is_actually_valid: Option<bool>,
+    #[serde(
+        rename = "vehicleDepotId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_depot_id: Option<String>,
+    #[serde(
+        rename = "vehicleOrganisationId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vehicle_organisation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -459,6 +494,8 @@ pub struct WaybillMetadataResponse {
         skip_serializing_if = "Option::is_none"
     )]
     pub vehicle_tags: Option<Vec<String>>,
+    #[serde(rename = "dutyTripId", default)]
+    pub duty_trip_id: Option<String>,
 }
 
 /// Granular, update-only body for editing a waybill's mutable operational fields (crew, fleet, devices)
@@ -521,6 +558,14 @@ pub struct WaybillTripInfo {
     pub driver_first_name: Option<String>,
     pub driver_last_name: Option<String>,
     pub driver_mobile_number: Option<String>,
+    #[sqlx(default)]
+    pub duty_trip_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct VehicleOwnership {
+    pub depot_id: Option<String>,
+    pub organization_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -1253,6 +1298,8 @@ pub struct BusScheduleDetail {
     pub waybill_no: Option<String>,
     #[serde(rename = "is_completed", skip_serializing_if = "Option::is_none")]
     pub is_completed: Option<bool>,
+    #[serde(rename = "dutyTripId", default)]
+    pub duty_trip_id: Option<String>,
 }
 
 pub type BusScheduleDetails = Vec<BusScheduleDetail>;

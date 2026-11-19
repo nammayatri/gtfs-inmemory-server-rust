@@ -12,6 +12,7 @@ use crate::models::{
     VehicleVariant,
 };
 use crate::services::field_generator;
+use crate::services::reader_config::ReaderConfig;
 use crate::tools::error::{AppError, AppResult};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
@@ -60,8 +61,8 @@ pub const SUPPORTED_OPERATOR_GTFS_IDS: &[&str] = &["chennai_bus", "kolkata_bus"]
 /// not something meant to be toggled casually.
 pub const REPEATER_AUTOMATION_ENABLED_GTFS_IDS: &[&str] = &["kolkata_bus"];
 
-pub fn repeater_automation_enabled(gtfs_id: &str) -> bool {
-    REPEATER_AUTOMATION_ENABLED_GTFS_IDS.contains(&gtfs_id)
+pub fn repeater_automation_enabled(reader_config: &ReaderConfig, gtfs_id: &str) -> bool {
+    REPEATER_AUTOMATION_ENABLED_GTFS_IDS.contains(&gtfs_id) && reader_config.reads_v1(gtfs_id)
 }
 
 /// Background safety net for the waybill repeater: periodically fills any missing occurrence for
@@ -76,12 +77,18 @@ pub async fn run_repeater_reconciler_tick(
     tick_interval_secs: u64,
     min_run_interval_secs: i64,
     stuck_lock_timeout_secs: i64,
+    reader_config: Arc<ReaderConfig>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
     interval.tick().await; // discard the immediate first tick, matching the OSRTC cache pattern
     loop {
         interval.tick().await;
-        if REPEATER_AUTOMATION_ENABLED_GTFS_IDS.is_empty() {
+        let enabled: Vec<&str> = REPEATER_AUTOMATION_ENABLED_GTFS_IDS
+            .iter()
+            .copied()
+            .filter(|g| repeater_automation_enabled(&reader_config, g))
+            .collect();
+        if enabled.is_empty() {
             continue;
         }
         let Some(pool) = operator_service.pool() else {
@@ -121,7 +128,7 @@ pub async fn run_repeater_reconciler_tick(
 
         let today = crate::services::service_hopper::today_ist();
         let to = today + chrono::Duration::days(lookahead_days);
-        for gtfs_id in REPEATER_AUTOMATION_ENABLED_GTFS_IDS {
+        for gtfs_id in enabled {
             match operator_service
                 .generate_waybill_repeats(gtfs_id, today, to, None)
                 .await

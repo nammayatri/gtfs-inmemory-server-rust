@@ -22,6 +22,7 @@ use crate::services::{
     metro_graph::MetroGraph,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
     osrtc_station_cache::OsrtcStationCache,
+    reader_config::{ReaderConfig, V1V2Cutoff},
     service_hopper::{load_all as load_service_hopper, FeedHoppers},
     trip_service::TripService,
 };
@@ -201,6 +202,8 @@ pub struct AppConfig {
     /// Absent - the default - and nothing runs. Needs `gtfs_gps`.
     #[serde(default)]
     pub gtfs_gps_polyline_sync: Option<GpsPolylineSyncConfig>,
+    #[serde(default)]
+    pub v1_v2_cutoffs: Option<Vec<V1V2Cutoff>>,
 }
 
 /// The weekly GPS polyline sync block of [`AppConfig`]. Only `author_email` is required.
@@ -413,10 +416,16 @@ pub struct AppState {
     pub service_hopper: Arc<ArcSwap<HashMap<String, Arc<FeedHoppers>>>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
+    pub reader_config: Arc<ReaderConfig>,
 }
 
 impl AppState {
     pub async fn new(app_config: AppConfig) -> Result<AppState> {
+        let reader_config = Arc::new(ReaderConfig::from_cutoffs(
+            app_config.v1_v2_cutoffs.as_deref().unwrap_or_default(),
+        )?);
+        info!("v1/v2 cutoffs: {:?}", reader_config);
+
         // Initialize services
         let gtfs_service = Arc::new(GTFSService::new(app_config.clone()).await?);
 
@@ -465,9 +474,13 @@ impl AppState {
                                         )),
                                         Arc::new(DBVehicleReaderInternal::new(
                                             internal_pool.clone(),
+                                            reader_config.clone(),
+                                            gtfs_service.route_catalog(),
                                         )),
                                         Arc::new(DBFleetOperatorService::new(
                                             internal_pool.clone(),
+                                            reader_config.clone(),
+                                            gtfs_service.route_catalog(),
                                         )),
                                         Some(internal_pool),
                                     )
@@ -546,8 +559,16 @@ impl AppState {
                             internal_pool.clone(),
                             app_config.osrm_url.clone(),
                         )),
-                        Arc::new(DBVehicleReaderInternal::new(internal_pool.clone())),
-                        Arc::new(DBFleetOperatorService::new(internal_pool.clone())),
+                        Arc::new(DBVehicleReaderInternal::new(
+                            internal_pool.clone(),
+                            reader_config.clone(),
+                            gtfs_service.route_catalog(),
+                        )),
+                        Arc::new(DBFleetOperatorService::new(
+                            internal_pool.clone(),
+                            reader_config.clone(),
+                            gtfs_service.route_catalog(),
+                        )),
                         Some(internal_pool),
                     )
                 } else {
@@ -652,6 +673,7 @@ impl AppState {
             service_hopper,
             depot_manager_details,
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
+            reader_config,
         };
 
         Ok(app_state)
