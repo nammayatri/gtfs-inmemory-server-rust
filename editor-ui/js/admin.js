@@ -311,6 +311,7 @@ export const ACTION_LABEL = {
   change_set_committed: "Committed (live)",
   change_set_reopened: "Reopened",
   change_set_discarded: "Discarded",
+  node_rolled_back: "Put something back as an earlier version had it, in a draft",
   bulk_imported: "Imported a CSV file",
   stop_merged: "Merged a duplicate stop",
   station_merged: "Merged two stations",

@@ -1488,6 +1488,15 @@ class Handler(BaseHTTPRequestHandler):
             if u["role"] != "admin":
                 raise ApiError(403, "admin_required", "Only an admin moves work between master and prod.")
 
+        def editor_of(feed):
+            # one draft's file is read in by any editor of the feed (section 23)
+            have = self.feed_role(u, feed)
+            if have is None:
+                raise ApiError(403, "no_feed_access", f"you have no access to feed {feed}; ask an admin",
+                               {"gtfs_id": feed})
+            if ROLE_RANK[have] < ROLE_RANK["editor"]:
+                raise ApiError(403, "role_required", "this needs the editor role or higher")
+
         def source():
             return {"env": env, "version": s.feeds[g]["version"], "use_stages": True,
                     "exported_at": iso(now()), "exported_by": u["email"]}
@@ -1508,7 +1517,8 @@ class Handler(BaseHTTPRequestHandler):
                                  f"{g}-draft-{cs['change_set_id'][:8]}-v{cs['committed_version'] or 0}.migration.zip")
         if len(parts) == 2 and parts[0] == "import-jobs" and method == "GET":
             job = getattr(s, "migration_jobs", {}).get(parts[1])
-            if not job:
+            # an admin reads any job; anyone else only one they started
+            if not job or (u["role"] != "admin" and job.get("created_by") != u["user_id"]):
                 raise ApiError(404, "job_not_found", "No such import job.")
             ready = time.time() >= job["ready_at"]
             return 200, {"job_id": parts[1], "kind": "migration", "status": "done" if ready else "running",
@@ -1518,7 +1528,10 @@ class Handler(BaseHTTPRequestHandler):
         g = parts[1]
         if g not in s.feeds:
             raise ApiError(404, "unknown_feed", f"There is no feed called {g}.")
-        admin()
+        if parts[2] == "migration":
+            admin()
+        else:
+            editor_of(g)
         if parts[2] == "migration" and method == "GET":
             scopes = [x for x in (q.get("scopes", [""])[0] or "stops,routes,stages,timetables").split(",") if x]
             manifest = {"format": MIGRATION_FORMAT, "kind": "full", "gtfs_id": g, "source": source(),
@@ -1541,6 +1554,11 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "not_from_master", "only a file from master is read in")
         if manifest.get("gtfs_id") != g:
             raise ApiError(400, "feed_mismatch", f"this file is feed {manifest.get('gtfs_id')}'s, not feed {g}'s")
+        if manifest.get("kind") == "full" and u["role"] != "admin":
+            raise ApiError(403, "role_required",
+                           "this file is the whole feed, which an admin reads in; one draft's file "
+                           "(\"Download for prod\" on a committed draft) needs the editor role",
+                           {"kind": "full", "needs": "admin"})
         report = self.migration_report(g, manifest, q, u)
         s.last_migration_query = {k: v[0] for k, v in q.items()}
         if q.get("background", [""])[0] != "true":
@@ -1548,7 +1566,7 @@ class Handler(BaseHTTPRequestHandler):
         if not hasattr(s, "migration_jobs"):
             s.migration_jobs = {}
         job_id = str(uuid.uuid4())
-        s.migration_jobs[job_id] = {"report": report, "ready_at": time.time() + 1.0}
+        s.migration_jobs[job_id] = {"report": report, "ready_at": time.time() + 1.0, "created_by": u["user_id"]}
         return 202, {"job_id": job_id, "status": "running"}
 
     def migration_report(self, g, manifest, q, u):
@@ -1820,6 +1838,12 @@ class Handler(BaseHTTPRequestHandler):
             # round 4 (UX): cleanup context of a stop or a route
             if len(rest) == 3 and rest[0] in ("stops", "routes") and rest[2] == "context" and method == "GET":
                 return 200, self.entity_context(g, rest[0], rest[1])
+            # a node's versions, and a rollback into a draft (section 26)
+            if len(rest) == 3 and rest[0] == "history" and method == "GET":
+                return 200, self.node_history(g, rest[1], rest[2])
+            if len(rest) == 4 and rest[0] == "history" and rest[3] == "rollback" and method == "POST":
+                self.require_role(u, "editor")
+                return 201, self.node_rollback(u, g, rest[1], rest[2], self._body())
             raise ApiError(404, "not_found", "No such feed endpoint.")
 
         if parts[0] == "change-sets" and len(parts) >= 2:
@@ -2095,6 +2119,140 @@ class Handler(BaseHTTPRequestHandler):
         if entity == "route_stops":
             return route_detail(proj, key)["rows"] if proj.route(key) else None, None
         return None, None
+
+    # ---- a node's versions and rolling it back (docs section 26). The mock
+    # lists the committed changes of a stop, station, route or stop list of its
+    # own (no changes in passing), and a rollback puts one change into a draft
+    # through add_change, as the editor does.
+    HISTORY_ENTITIES = ("stop", "station", "route", "route_stops")
+    HISTORY_CONTROL = {"base_rows_hash", "position_review_id", "proposal_id", "pattern_key"}
+
+    def _history_versions(self, g, entity, key):
+        out = []
+        for cs in self.store.change_sets.values():
+            if cs["gtfs_id"] != g or cs["status"] != "committed":
+                continue
+            out += [(cs, c) for c in cs["changes"] if c["entity"] == entity and c["entity_key"] == key]
+        out.sort(key=lambda x: (x[0]["committed_version"] or 0, x[1]["position"]))
+        return out
+
+    def _history_states(self, entity, c):
+        before = c.get("before")
+        if entity == "route_stops":
+            b = {"rows": before} if isinstance(before, list) else None
+            a = {"rows": c["after"]["rows"]} if c["op"] == "replace" else None
+            return b, a
+        b = before if isinstance(before, dict) and c["op"] != "create" else None
+        if c["op"] == "update" and b is not None:
+            a = dict(b)
+            a.update({k: v for k, v in (c["after"] or {}).items() if k not in self.HISTORY_CONTROL})
+        elif c["op"] == "create":
+            a = dict(c["after"] or {})
+        else:
+            a = None
+        return b, a
+
+    def _history_diff(self, entity, target, live):
+        if entity == "route_stops":
+            keep = ("stop_id", "stop_type", "stage_no", "stage_name", "marker_id", "marker_name",
+                    "marker_lat", "marker_lon", "stop_name_override")
+            pick = lambda rows: [{k: r.get(k) for k in keep if r.get(k) is not None} for r in rows or []]
+            return {} if pick(target["rows"]) == pick(live["rows"]) else {"rows": pick(target["rows"])}
+        fields = {"stop": STOP_FIELDS, "station": {"name", "lat", "lon", "description", "member_stop_ids"},
+                  "route": ROUTE_FIELDS}[entity]
+        after = {f: target[f] for f in sorted(fields) if f in target and target[f] != live.get(f)}
+        if "lat" in after or "lon" in after:
+            after.update({f: target[f] for f in ("lat", "lon") if f in target})
+        return after
+
+    def _history_live(self, g, entity, key):
+        snap, _ = self.snapshot({"gtfs_id": g, "changes": []}, entity, key, "replace" if entity == "route_stops" else "update")
+        if snap is None:
+            return None
+        return {"rows": snap} if entity == "route_stops" else snap
+
+    def node_history(self, g, entity, key):
+        if entity not in self.HISTORY_ENTITIES:
+            raise ApiError(400, "not_a_node", f"{entity!r} has no versions in the mock")
+        live = self._history_live(g, entity, key)
+        listed = []
+        for cs, c in self._history_versions(g, entity, key):
+            _, made = self._history_states(entity, c)
+            is_live = made is not None and live is not None and not self._history_diff(entity, made, live)
+            listed.append({"change_id": c["change_id"], "change_set_id": cs["change_set_id"], "title": cs["title"],
+                           "feed_version": cs["committed_version"], "committed_at": cs["committed_at"],
+                           "committed_by": (self.store.users.get(cs["committed_by"]) or {}).get("email"),
+                           "entity": entity, "entity_key": key, "op": c["op"], "direct": True,
+                           "before": c.get("before"), "after": c.get("after"), "state": made,
+                           "restorable": made is not None and live is not None,
+                           "why_not": None if made is not None else f"a {c['op']} is no version to restore",
+                           "is_live": is_live, "unrecorded_change_after": False})
+        first = next(((cs, c) for cs, c in self._history_versions(g, entity, key)), None)
+        original = None
+        if first:
+            b, _ = self._history_states(entity, first[1])
+            if b is not None:
+                original = {"change_id": first[1]["change_id"], "feed_version": first[0]["committed_version"],
+                            "state": b, "restorable": live is not None,
+                            "is_live": live is not None and not self._history_diff(entity, b, live)}
+        listed.reverse()
+        noun = {"route_stops": f"route {key}'s stop list"}.get(entity, f"{entity} {key}")
+        return {"node": {"entity": entity, "entity_key": key, **({"pattern_key": 1} if entity == "route_stops" else {})},
+                "label": noun, "exists": live is not None, "live": live, "versions": listed,
+                "total": len(listed), "truncated": False, "original": original}
+
+    def node_rollback(self, u, g, entity, key, b):
+        s = self.store
+        if entity not in self.HISTORY_ENTITIES:
+            raise ApiError(400, "not_a_node", f"{entity!r} has no versions in the mock")
+        side = b.get("side") or "after"
+        found = [(cs, c) for cs, c in self._history_versions(g, entity, key) if c["change_id"] == b.get("change_id")]
+        if not found:
+            raise ApiError(404, "version_not_found", f"change {b.get('change_id')} is no committed version of {entity} {key}")
+        vcs, c = found[0]
+        before, made = self._history_states(entity, c)
+        target = before if side == "before" else made
+        if target is None:
+            raise ApiError(409, "not_restorable", f"v{vcs['committed_version']} cannot be restored")
+        live = self._history_live(g, entity, key)
+        if live is None:
+            raise ApiError(409, "node_gone", f"{entity} {key} is deleted; a rollback edits a live node")
+        after = self._history_diff(entity, target, live)
+        if not after:
+            raise ApiError(409, "nothing_to_roll_back", f"{entity} {key} already has what v{vcs['committed_version']} left it")
+        if b.get("change_set_id"):
+            cs = s.change_sets.get(b["change_set_id"])
+            if not cs or cs["gtfs_id"] != g:
+                raise ApiError(404, "change_set_not_found", "No such draft of this feed.")
+            if any(x["entity"] == entity and x["entity_key"] == key for x in cs["changes"]):
+                raise ApiError(409, "node_in_draft", f"this draft already changes {entity} {key}")
+            created = False
+        else:
+            cs_id, t = str(uuid.uuid4()), iso(now())
+            words = "to before" if side == "before" else "to"
+            cs = {"change_set_id": cs_id, "gtfs_id": g, "title": f"Roll back {entity} {key} {words} v{vcs['committed_version']}",
+                  "description": "Made from its history (mock).", "status": "draft",
+                  "created_by": u["user_id"], "created_at": t, "updated_at": t,
+                  "submitted_by": None, "submitted_at": None, "reviewed_by": None, "reviewed_at": None,
+                  "review_comment": None, "committed_by": None, "committed_at": None,
+                  "base_version": s.feeds[g]["version"], "committed_version": None, "changes": []}
+            s.change_sets[cs_id] = cs
+            s.add_audit(u, "change_set_created", g, cs_id, {"title": cs["title"]})
+            created = True
+        fields = sorted(after)
+        if entity == "route_stops":
+            proj = Projection(s, g, [])
+            after["base_rows_hash"] = rows_hash(proj.route_rows(key))
+        self.add_change(u, cs, {"entity": entity, "op": "replace" if entity == "route_stops" else "update",
+                                "entity_key": key, "after": after})
+        change_id = cs["changes"][-1]["change_id"]
+        s.add_audit(u, "node_rolled_back", g, cs["change_set_id"],
+                    {"change_id": change_id, "node": {"entity": entity, "entity_key": key},
+                     "to_change_id": c["change_id"], "to_feed_version": vcs["committed_version"], "side": side,
+                     "fields": fields, "not_restored": []})
+        return {"change_set_id": cs["change_set_id"], "created_set": created, "change_id": change_id,
+                "node": {"entity": entity, "entity_key": key}, "to_feed_version": vcs["committed_version"],
+                "side": side, "fields": fields, "not_restored": []}
 
     def append_change(self, u, cs, entity, op, key, after, before=None, base_row_version=None, audit=True):
         ch = {"change_id": self.store.next_change_id, "change_set_id": cs["change_set_id"],

@@ -31,7 +31,7 @@
 //!
 //! [`draft_import`]: super::draft_import
 
-use super::auth::{self, Ctx};
+use super::auth::{self, Ctx, Role};
 use super::draft_import;
 use super::error::{EditorError, EditorResult};
 use super::feed_lock::lock_feed;
@@ -863,7 +863,10 @@ impl Report {
 }
 
 /// Read a migration file into feed `g` (section 23): checked, then drafted as
-/// its kind says. Admin only, and only where `is_master` is false.
+/// its kind says. Only where `is_master` is false. One committed draft's file
+/// is an editor's of the feed to read in: it becomes a prod draft that a
+/// second person approves, as one made by hand would. The whole feed's is an
+/// admin's: it plans every step of the feed and remembers `since_version`.
 pub async fn import(
     pool: &PgPool,
     is_master: bool,
@@ -872,7 +875,7 @@ pub async fn import(
     bytes: &[u8],
     opts: &ImportOpts,
 ) -> EditorResult<Report> {
-    ctx.require_admin()?;
+    ctx.require_feed_role(g, Role::Editor)?;
     if is_master {
         return Err(EditorError::bad_request(
             "import_on_master",
@@ -898,6 +901,12 @@ pub async fn import(
     }
     match m.kind.as_str() {
         "change_set" => import_change_set(pool, ctx, g, &pkg, opts).await,
+        "full" if !ctx.is_admin() => Err(EditorError::forbidden(
+            "role_required",
+            "this file is the whole feed, which an admin reads in; \
+             one draft's file (\"Download for prod\" on a committed draft) needs the editor role",
+        )
+        .with_details(json!({"kind": "full", "needs": "admin"}))),
         "full" => import_full(pool, ctx, g, &pkg, opts).await,
         other => Err(invalid(format!("kind {other:?} is not change_set or full"))),
     }
@@ -2711,7 +2720,7 @@ async fn import_full(
 /// The migrations read into feed `g`, newest first, with what became of their
 /// drafts.
 pub async fn list_imports(pool: &PgPool, ctx: &Ctx, g: &str) -> EditorResult<Value> {
-    ctx.require_admin()?;
+    ctx.require_feed_role(g, Role::Editor)?;
     let rows = sqlx::query(
         "SELECT m.import_id, m.kind, m.step, m.source::text AS source, m.file_sha256, \
                 m.since_version, m.report::text AS report, m.imported_at, u.email, \

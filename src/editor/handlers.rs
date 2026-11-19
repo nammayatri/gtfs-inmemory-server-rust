@@ -736,7 +736,9 @@ pub struct MigrationImportQuery {
 }
 
 /// Read a migration file from master into feed `g` (the body): its report, and
-/// with `dry_run=false` the prod drafts it makes. Admin, and never on master.
+/// with `dry_run=false` the prod drafts it makes. Never on master. One draft's
+/// file is an editor's of the feed, as a draft made by hand is; the whole
+/// feed's an admin's (`migration::import` says which once it has the file).
 pub async fn migration_import(
     req: HttpRequest,
     st: Data,
@@ -745,7 +747,7 @@ pub async fn migration_import(
     body: web::Bytes,
 ) -> EditorResult<HttpResponse> {
     let g = path.into_inner();
-    let ctx = auth::require_admin(&req, &st).await?;
+    let ctx = auth::require_feed(&req, &st, &g, Role::Editor).await?;
     let take: Vec<String> = q
         .take
         .as_deref()
@@ -779,14 +781,15 @@ pub async fn migration_import(
     accepted(job_id)
 }
 
-/// The migrations read into feed `g`, newest first. Admin.
+/// The migrations read into feed `g`, newest first. Editor of the feed: who
+/// may read a file in sees what was read in before.
 pub async fn migration_imports(
     req: HttpRequest,
     st: Data,
     path: web::Path<String>,
 ) -> EditorResult<HttpResponse> {
     let g = path.into_inner();
-    let ctx = auth::require_admin(&req, &st).await?;
+    let ctx = auth::require_feed(&req, &st, &g, Role::Editor).await?;
     ok(super::migration::list_imports(&st.pool, &ctx, &g).await?)
 }
 
@@ -961,15 +964,32 @@ pub async fn feed_reload(
 }
 
 /// An import running in the background (section 18.15): whether it is still
-/// running, and its report once done or its error once failed. Admin only, as
-/// the imports are.
+/// running, and its report once done or its error once failed. An admin reads
+/// any; anyone else only a job they started, on a feed they still edit (an
+/// editor reading in a draft from master, section 23). Someone else's job is
+/// the same 404 as no job, so a job id says nothing to whoever guesses it.
 pub async fn import_job(
     req: HttpRequest,
     st: Data,
     path: web::Path<Uuid>,
 ) -> EditorResult<HttpResponse> {
-    auth::require_admin(&req, &st).await?;
-    ok(import_jobs::get(&st.pool, path.into_inner()).await?)
+    let ctx = auth::signed_in(&req, &st).await?;
+    let job_id = path.into_inner();
+    if !ctx.is_admin() {
+        let theirs = match import_jobs::owner(&st.pool, job_id).await? {
+            Some((Some(by), Some(g))) => {
+                by == ctx.user.user_id && ctx.require_feed_role(&g, Role::Editor).is_ok()
+            }
+            _ => false,
+        };
+        if !theirs {
+            return Err(EditorError::not_found(
+                "job_not_found",
+                format!("no job {job_id}"),
+            ));
+        }
+    }
+    ok(import_jobs::get(&st.pool, job_id).await?)
 }
 
 #[derive(Deserialize)]
@@ -1261,6 +1281,40 @@ pub async fn stop_context(
     auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
     ok(context::stop(&mut conn, &g, &id).await?)
+}
+
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    /// A stop list's stop order (section 16); 1 when left out.
+    pub pattern_key: Option<i16>,
+}
+
+/// A node's versions (section 26): the committed changes that touched it,
+/// newest first, and which of them it can be put back to. Viewer of the feed.
+pub async fn node_history(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String, String)>,
+    q: web::Query<HistoryQuery>,
+) -> EditorResult<HttpResponse> {
+    let (g, entity, key) = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Viewer).await?;
+    ok(super::history::history(&st, &g, &entity, &key, q.pattern_key).await?)
+}
+
+/// Put a node back as one of its versions had it (section 26): one change into
+/// a draft - the one named, or a new one - that a second person approves and
+/// commits like any other. Editor of the feed. `201`.
+pub async fn node_rollback(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String, String)>,
+    body: web::Json<super::history::RollbackRequest>,
+) -> EditorResult<HttpResponse> {
+    let (g, entity, key) = path.into_inner();
+    let ctx = auth::require_feed(&req, &st, &g, Role::Editor).await?;
+    let out = super::history::rollback(&st, &ctx, &g, &entity, &key, body.into_inner()).await?;
+    Ok(HttpResponse::Created().json(out))
 }
 
 pub async fn route_context(

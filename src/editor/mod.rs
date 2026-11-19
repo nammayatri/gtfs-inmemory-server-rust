@@ -21,6 +21,7 @@ pub mod geofence;
 pub mod gps_line;
 pub mod gps_polyline_sync;
 pub mod handlers;
+pub mod history;
 pub mod import_jobs;
 pub mod jwt;
 pub mod migration;
@@ -315,6 +316,15 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .route(
                 "/feeds/{gtfs_id}/stops/{stop_id}/context",
                 web::get().to(h::stop_context),
+            )
+            // a node's versions, and a rollback to one into a draft (section 26)
+            .route(
+                "/feeds/{gtfs_id}/history/{entity}/{key}",
+                web::get().to(h::node_history),
+            )
+            .route(
+                "/feeds/{gtfs_id}/history/{entity}/{key}/rollback",
+                web::post().to(h::node_rollback),
             )
             .route("/feeds/{gtfs_id}/routes", web::get().to(h::routes))
             .route(

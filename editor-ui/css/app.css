@@ -382,6 +382,8 @@ table.people .feed-col { white-space: nowrap; }
 .list-item a:hover { text-decoration: underline; }
 .list-item .item-end { display: flex; gap: 6px; align-items: center; justify-content: end; }
 .list-item .item-end .btn { min-height: 26px; }
+/* a node's versions (section 25): the restore button and a notice take the whole row */
+.list-item.version > .btn-row, .list-item.version > .notice { grid-column: 1 / -1; margin: 4px 0 0; }
 .empty { color: var(--muted); font-size: var(--fs-s); }
 
 /* ------------------------------------------------------------ the stage ladder */
