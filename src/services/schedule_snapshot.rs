@@ -89,6 +89,7 @@ impl ScheduleSnapshot {
         rows.sort_by(|a, b| {
             a.waybill_no
                 .cmp(&b.waybill_no)
+                .then_with(|| a.waybill_id.cmp(&b.waybill_id))
                 .then_with(|| a.trip_number.cmp(&b.trip_number))
         });
 
@@ -97,7 +98,9 @@ impl ScheduleSnapshot {
             trips: Vec::with_capacity(rows.len()),
             ..Self::default()
         };
-        for (i, row) in rows.into_iter().enumerate() {
+        let mut current_waybill: Option<Arc<SnapshotWaybill>> = None;
+        let mut seen_active = false;
+        for (i, row) in rows.into_iter().rev().enumerate() {
             let waybill = waybills
                 .entry(row.waybill_id)
                 .or_insert_with(|| {
@@ -110,6 +113,13 @@ impl ScheduleSnapshot {
                     })
                 })
                 .clone();
+            if !current_waybill
+                .as_ref()
+                .is_some_and(|w| Arc::ptr_eq(w, &waybill))
+            {
+                current_waybill = Some(waybill.clone());
+                seen_active = false;
+            }
             if let Some(route_id) = row.route_id {
                 snapshot.by_route.entry(route_id).or_default().push(i);
             }
@@ -124,8 +134,15 @@ impl ScheduleSnapshot {
                 start_time_epoch: row.start_time_epoch,
                 trip_number: row.trip_number,
                 is_active_trip: row.is_active_trip,
-                is_completed: row.is_completed,
+                is_completed: if seen_active {
+                    Some(true)
+                } else {
+                    row.is_completed
+                },
             });
+            if row.is_active_trip == Some(true) {
+                seen_active = true;
+            }
         }
         snapshot
     }
@@ -155,7 +172,7 @@ impl ScheduleSnapshot {
         &'a self,
         ids: Option<&'a Vec<usize>>,
     ) -> impl Iterator<Item = &'a SnapshotTrip> {
-        ids.into_iter().flatten().map(|&i| &self.trips[i])
+        ids.into_iter().flatten().rev().map(|&i| &self.trips[i])
     }
 }
 
