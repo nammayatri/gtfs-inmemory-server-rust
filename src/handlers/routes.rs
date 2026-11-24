@@ -2084,6 +2084,9 @@ pub fn merge_stop_and_mapping(
         location_type: stop.location_type.clone(),
         stage_number: None,
         is_stage_stop: None,
+        // stop-wide, so it holds here; the route's line is no route's here
+        unserviceable: mapping_ref.and_then(|m| m.unserviceable),
+        off_route_line: None,
     }
 }
 

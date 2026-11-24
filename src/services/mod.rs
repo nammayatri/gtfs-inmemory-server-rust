@@ -11,6 +11,7 @@ pub mod gtfs_db_source;
 pub mod gtfs_service;
 pub mod gtfs_timing;
 pub mod metro_graph;
+pub mod off_route_line;
 pub mod operator;
 pub mod osrm;
 pub mod osrtc_station_cache;

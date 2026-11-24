@@ -764,7 +764,33 @@ pub struct RouteStopMapping {
         skip_serializing_if = "Option::is_none"
     )]
     pub is_stage_stop: Option<bool>,
+    /// The stop is out of use for a while (docs/gtfs-editor.md section 21):
+    /// it stays on the route so an app can show it and refuse it as a boarding
+    /// or alighting stop. Stop-wide, so it is the same on every route. Absent
+    /// unless true.
+    #[serde(
+        rename = "unserviceable",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unserviceable: Option<bool>,
+    /// The route's map line passes more than [`OFF_ROUTE_LINE_M`] from this
+    /// stop (docs/gtfs-editor.md section 27): the buses whose GPS drew the line
+    /// go another way, so the bus may not stop here. Per route, so it is never
+    /// on a stop-wide answer. Absent unless true.
+    #[serde(
+        rename = "offRouteLine",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub off_route_line: Option<bool>,
 }
+
+/// How far a stop may be from its route's map line before the route is said
+/// to pass it by ([`RouteStopMapping::off_route_line`]). Stops the buses serve
+/// measure 0-35 m from a GPS-drawn line (chennai_bus, 2026-11); a stop the line
+/// never reaches is hundreds of metres off.
+pub const OFF_ROUTE_LINE_M: f64 = 100.0;
 
 /// One direct route connecting a source cluster to a destination cluster, with
 /// the specific stop_codes on that route that each cluster resolves to.
@@ -944,6 +970,13 @@ pub struct GTFSData {
     /// is serving preprocessed data (not a DB feed, or its DB load failed).
     #[serde(default)]
     pub db_feed_versions: HashMap<String, i64>,
+    /// Per DB feed, the revision of the stops off their routes' lines it serves
+    /// (`services::off_route_line`): 0 when the feed was never measured, and no
+    /// entry when they could not be read. The version poll reads them again
+    /// when the stored revision differs. Never snapshotted: a snapshot boot
+    /// rebuilds DB feeds from the tables anyway.
+    #[serde(skip)]
+    pub off_route_line_revisions: HashMap<String, i64>,
     /// Per DB feed, the stop codes the editor has merged away, each pointing at
     /// the code of the stop that survived its merge chain (docs/gtfs-editor.md
     /// section 1, "Merged-away stop ids keep answering"). Rebuilt with the feed
@@ -1348,6 +1381,8 @@ mod tests {
             location_type: default_location_type(),
             stage_number: None,
             is_stage_stop: None,
+            unserviceable: None,
+            off_route_line: None,
         })
     }
 
