@@ -2584,7 +2584,10 @@ impl VehicleDataReader for DBVehicleReader {
         let snapshot = self.schedule_snapshot().await?;
         Ok(snapshot
             .route_trips(route_id)
-            .filter(|t| vehicle_number.is_none_or(|vn| t.waybill.vehicle_no == vn))
+            .filter(|t| {
+                t.is_completed != Some(true)
+                    && vehicle_number.is_none_or(|vn| t.waybill.vehicle_no == vn)
+            })
             .map(|t| t.to_scheduled())
             .collect())
     }

@@ -5,6 +5,7 @@
   bhubaneswar_external_auth = Some "TEXT",
   phone_number_hash_key = Some "TEXT",
   enable_schedule_reconciliation = False,
+  route_schedule_drop_past_trips = True,
   osrtc_username = Some "OSRTC_USERNAME",
   osrtc_secret_key = Some "OSRTC_PASSWORD",
   clickhouse_password = Some "CLICKHOUSE_PASSWORD"

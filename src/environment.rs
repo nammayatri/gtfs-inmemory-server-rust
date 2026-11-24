@@ -134,6 +134,8 @@ pub struct AppConfig {
     /// run risks getting its claim stolen mid-flight.
     #[serde(default = "default_repeater_stuck_lock_timeout_secs")]
     pub repeater_stuck_lock_timeout_secs: i64,
+    #[serde(default = "default_route_schedule_drop_past_trips")]
+    pub route_schedule_drop_past_trips: bool,
     /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
     /// existing dhall configs still parse; the editor stays off unless enabled.
     #[serde(default)]
@@ -336,6 +338,10 @@ fn default_repeater_min_run_interval_secs() -> i64 {
 
 fn default_repeater_stuck_lock_timeout_secs() -> i64 {
     600
+}
+
+fn default_route_schedule_drop_past_trips() -> bool {
+    false
 }
 
 impl OtpConfig {
