@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Reload DB-backed feeds when an editor commit moves gtfs_feed.version
+    // (and measure their stops off their routes' lines, in the same poll)
     if app_state.gtfs_service.has_db_feeds() {
         let gtfs_service_clone = app_state.gtfs_service.clone();
         tokio::spawn(async move {

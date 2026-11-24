@@ -5116,7 +5116,11 @@ so the stage keeps its label.
 
 The stop stays on the route everywhere a person looks: the GIMS route payload
 carries it with `unserviceable: true` (`NandiStop`), which is what lets an app
-show it greyed out in place rather than have it vanish from the route.
+show it greyed out in place rather than have it vanish from the route. So does
+every `RouteStopMapping` answer (`/route-stop-mapping/...`, `/stops/{gtfs_id}`,
+`/stop/{gtfs_id}/{code}`), which is what nammayatri's rider-app reads: it passes
+the flag on as `FRFSStationAPI.unserviceable`, and the app refuses the stop as a
+boarding or alighting stop, saying it is not serviceable for now (2026-11-23).
 
 ### The change, and what it says
 
@@ -5886,3 +5890,132 @@ overtaken by another commit conflicting at submit; a write round the drafts
 reported; every node kind's read). `tests/editor_migration_flow.rs` covers an
 editor reading in one draft's file (in the background too, polled by them and
 not by a viewer), refused the whole feed's, and taking master's side.
+
+## 27. A stop the route's line passes by: "the bus may not stop here" (2026-11-23)
+
+A line drawn from GPS (sections 17 and 25) follows where the buses went. Where
+they take a flyover or a bypass past a stop on the service road, the line passes
+the stop by, and a rider waiting there may be passed by too. GIMS says so on the
+route's mapping of that stop:
+
+```
+RouteStopMapping.offRouteLine = true   -- the route's line passes more than 100 m from the stop
+```
+
+### Measured by the version poll, stored, read by every pod (2026-11-24)
+
+The flag is derived from committed rows, so it is measured once per feed version
+and stored; the pods that serve read it. There is no separate job or timer: a
+flag can only change when a feed's version does, and every pod already polls
+for that. Code: `src/services/off_route_line.rs`,
+`GTFSService::sync_off_route_line`; schema
+`db/gtfs_editor/0037_off_route_line.sql` (safe to run twice).
+
+```
+every GIMS pod, every version poll (gtfs_version_poll_seconds), after it has
+loaded the DB feed versions that moved:
+  runs(): one read of gtfs_off_route_line_run - each feed's measured version and revision
+  per DB feed the pod serves on a version no run covers
+    claim(): pg_try_advisory_xact_lock('off-route-line:{g}'), and the run read again
+             under it; taken -> Busy, covered by now -> UpToDate: measure nothing
+    measure() over the lines and stops this pod serves, off the async threads
+    Claim::store(), in the same transaction:
+      gtfs_off_route_line      (gtfs_id, route_id, stop_code, distance_m)
+      gtfs_off_route_line_run  (gtfs_id, feed_version, threshold_m, revision, ...)
+                               revision moves only when the set of flagged stops does
+  per DB feed whose stored revision is not the one the pod serves (stored by this
+  pod just now, or by another one)
+    read the flags and patch them in place: the feed's mappings and /version hash
+every pod, on a DB feed's reload (boot, snapshot boot, the version poll)
+  reads the stored flags with the feed
+```
+
+- **One measurement a version, on one pod.** A feed is measured only when the
+  version a pod serves is newer than the one its flags were measured on, or
+  they were measured at another threshold. Every pod reaches a new version
+  within a poll of the others, so the lock is taken *before* measuring: one pod
+  spends the CPU, the others find the lock taken, measure nothing, and pick up
+  what it stored on a later poll. A pod still serving an older version never
+  measures over a newer one's flags. Nothing changed, nothing is measured: the
+  poll's cost is the one small read above.
+- **No version bump.** Storing the flags does not move `gtfs_feed.version`, so
+  it reloads no feed and fires no webhook or release: the flags are derived, not
+  an edit, and never go through a draft. The tables have no `row_version` and
+  no touch trigger, so measuring cannot conflict with a draft either.
+- **A commit's flags follow it within a poll or two.** The reload a commit
+  causes serves the flags stored before it; the first pod to reload measures
+  the new version in that same poll and serves the result, and the others serve
+  it on their next poll (`gtfs_version_poll_seconds`, default 5). A stop moved
+  onto a line keeps its flag until then, and one moved off it gets the flag then.
+  The poll that measures is longer by the measurement (below), on one pod, once
+  a version.
+- **`/version` moves with the flags.** A DB feed's hash takes the revision it
+  serves (`db_feed_data_hash`), so a client that caches by it reads the routes
+  again when a flag changes. A feed never measured hashes as it did before this
+  existed.
+- **DB feeds only.** A preprocessed feed's lines are not the editor's and are
+  never measured; it carries no flag.
+- **Failures.** A pod that cannot read or write the tables (0037 not applied)
+  serves the feed unflagged, logs it once, and tries again on the next poll. A
+  measurement that fails rolls its claim back, and the next poll tries again.
+
+`gtfs_off_route_line` is also the list to review: which routes pass which stops
+by, and how far (`distance_m`), with `gtfs_off_route_line_run` saying which
+version, when, by which pod and in how long.
+
+### What is flagged
+
+`measure` takes each route's `encoded_polyline` and flags the route's stops more
+than `OFF_ROUTE_LINE_M` (100 m, `src/models.rs`) from every segment of it.
+
+- **Per route.** The same stop can be on one route's line and off another's, so
+  the flag is on the route's mapping (`/route-stop-mapping/{g}/route/{code}`,
+  `/route-stop-mapping/{g}/stop/{code}`) and never on a stop-wide answer
+  (`/stops/{g}`, `/stop/{g}/{code}`).
+- **No line, no flag.** A route without a line, or with a line of one point,
+  flags nothing: nothing says the bus goes elsewhere.
+- **Bus routes only.** A rail route (`mode` not `BUS`) flags nothing: its line
+  is drawn by hand, and a station's point can be a building well off the track.
+- **Any bus line.** A hand-drawn or uploaded line is measured the same way; a
+  line routed through the stops by OSRM passes within metres of each by
+  construction, so it flags none.
+- **Why 100 m.** On chennai_bus GPS lines (routes 2143, 2288, 543001,
+  2026-11) every stop the buses serve is 0-35 m from the line (kerb, road width,
+  snapping to the road's centre); the one stop the line never reached was 848 m
+  off. 100 m sits well clear of both. Changing it measures every feed again on
+  the next poll after the deploy (`threshold_m`).
+- **What it does not catch.** It asks only whether the line comes within 100 m:
+  a stop across a divided road, on a parallel street less than 100 m away, or
+  passed only on the other leg of a loop is not flagged.
+
+**How it measures.** The line is flattened to metres once (`Planar` around its
+first point). A stop's distance to a segment is to the nearest point on it.
+Each stop is looked for along the line from the segment the last stop was found
+near, so a route whose stops run the line's way costs about one pass of its
+line. A stop that is off costs a full pass, which also gives its distance; a
+line drawn against its stops' order costs a pass per stop. Measured with
+synthetic chennai-sized feeds (5,500 routes, 2,000-point lines, 50 stops a route,
+optimised build, one thread): ~0.1 s typically, ~0.25 s with 5,000-point lines,
+~1.15 s when every line runs against its stops - paid once per feed version, on
+one pod, off the threads that serve.
+
+It is only a hint: it does not stop a trip calling at the stop (that is
+section 21's `unserviceable`), and the stop can still be chosen. nammayatri's
+rider-app passes it on as `FRFSStationAPI.offRouteLine`, and the app shows
+"Bus may not stop here" beside the stop.
+
+Tests: `services::off_route_line::tests` (a stop off the line and how far, a kerb
+stop on it, stops out of order along the line, a rail route, a route without a
+line, a stop called at twice, applying flags per route and clearing them, and
+which runs cover a version); `services::gtfs_service::tests` (the stops list
+keeping `unserviceable` but dropping `offRouteLine`, and the hash moving with
+the revision only once there is one); `tests/gtfs_off_route_line_flow.rs`, against
+a real database with two pods on the feed: nothing flagged before a poll has
+measured it; a poll that finds the lock taken measures and stores nothing; the
+pod that measures serves the flags in that poll, and only the bus route flags
+the stop, the stop-wide answer does not, and `/version` moves; the other pod
+picks them up on its poll without measuring, with the same hash; the next poll
+stores nothing; a stop moved onto the line keeps its flag through the commit's
+reload and loses it on the poll that measures the new version; a pod still on
+the old version does not measure over it; `gtfs_feed.version` moves only with
+the commit.

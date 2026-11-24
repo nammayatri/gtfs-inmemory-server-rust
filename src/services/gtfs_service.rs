@@ -13,6 +13,7 @@ use crate::services::gtfs_db_source::{
     is_fare_stage_dict, overlays_from_patterns, parse_headsign_stage, plan_feed_actions, DbTrip,
     DbTrips, FeedAction, GtfsDbSource, TripOverlay,
 };
+use crate::services::off_route_line;
 use crate::services::operator::{OperatorService, SUPPORTED_OPERATOR_GTFS_IDS};
 use crate::services::webhook;
 use crate::tools::error::{AppError, AppResult};
@@ -85,11 +86,18 @@ type TripDetailsCache = HashMap<String, HashMap<String, TripDetails>>;
 /// `/version/{gtfs_id}` for a DB feed: the routes hash combined with the
 /// `gtfs_feed.version` it was built at, so a committed edit to stops or stop
 /// order - which the routes hash alone does not see - still moves the version.
-fn db_feed_data_hash(routes_hash: &str, version: i64) -> String {
+fn db_feed_data_hash(routes_hash: &str, version: i64, off_line_revision: Option<i64>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(routes_hash.as_bytes());
     hasher.update(b"|gtfs_feed.version=");
     hasher.update(version.to_string().as_bytes());
+    // The stops off their routes' lines change without the feed's version
+    // (services::off_route_line): a client that caches by this hash must read
+    // them again. A feed never measured hashes as it did before they existed.
+    if let Some(revision) = off_line_revision.filter(|&r| r > 0) {
+        hasher.update(b"|off_route_line=");
+        hasher.update(revision.to_string().as_bytes());
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -192,6 +200,9 @@ pub struct GTFSService {
     /// A persistent cache-state write failure is worth one line, not one every
     /// poll tick.
     cache_state_warned: AtomicBool,
+    /// So is a persistent failure to read or write the stops off their routes'
+    /// lines (most likely 0037 not applied yet).
+    off_route_line_warned: AtomicBool,
 }
 
 /// How often one `(old, new)` stop alias is logged at info.
@@ -231,6 +242,7 @@ impl GTFSService {
             pod,
             webhook_policy,
             cache_state_warned: AtomicBool::new(false),
+            off_route_line_warned: AtomicBool::new(false),
         };
 
         Ok(service)
@@ -613,7 +625,7 @@ impl GTFSService {
         let alternate_stops_by_gtfs = self.build_alternate_stops_by_gtfs(all_stops.clone());
 
         // Build route data
-        let route_data_by_gtfs = self.build_route_data(
+        let mut route_data_by_gtfs = self.build_route_data(
             &all_pattern_details,
             &routes_by_gtfs,
             &stop_geojsons_by_gtfs,
@@ -679,6 +691,16 @@ impl GTFSService {
         for (gtfs_id, polylines) in &db_polylines {
             Self::apply_db_polylines(&mut routes_by_gtfs, gtfs_id, polylines);
         }
+        // A DB feed's stops off its routes' lines, as last measured and stored.
+        let mut off_route_line_revisions = HashMap::new();
+        for gtfs_id in db_feed_versions.keys() {
+            if let Some(stored) = self.read_off_route_line(gtfs_id).await {
+                if let Some(rd) = route_data_by_gtfs.get_mut(gtfs_id) {
+                    off_route_line::apply(rd, &stored.off);
+                }
+                off_route_line_revisions.insert(gtfs_id.clone(), stored.revision);
+            }
+        }
 
         // Fetch stops and build children mapping
         let station_platforms_by_gtfs = Self::build_station_platforms(&all_stops);
@@ -688,7 +710,7 @@ impl GTFSService {
         let mut data_hash = self.compute_all_data_hashes(&routes_by_gtfs);
         for (gtfs_id, version) in &db_feed_versions {
             if let Some(h) = data_hash.get_mut(gtfs_id) {
-                *h = db_feed_data_hash(h, *version);
+                *h = db_feed_data_hash(h, *version, off_route_line_revisions.get(gtfs_id).copied());
             }
         }
 
@@ -716,6 +738,7 @@ impl GTFSService {
         temp_data.seat_layout_mapping_by_gtfs = seat_layout_mapping_by_gtfs;
         temp_data.pre_computed_stops_by_gtfs = pre_computed_stops_by_gtfs;
         temp_data.db_feed_versions = db_feed_versions;
+        temp_data.off_route_line_revisions = off_route_line_revisions;
         temp_data.stop_aliases_by_gtfs = db_stop_aliases;
         temp_data.unlisted_stops_by_gtfs = db_unlisted_stops;
         temp_data.stop_replacements_by_gtfs = db_stop_replacements;
@@ -1987,6 +2010,9 @@ impl GTFSService {
                         .and_then(|m| m.get(&stop.code))
                         .map(|r| Arc::from(r.regional_name.as_str())),
                     platform,
+                    unserviceable: stop.unserviceable.filter(|&u| u),
+                    // what was measured and stored: off_route_line::apply
+                    off_route_line: None,
                 });
                 let hash = get_sha256_hash(&mapping);
                 if !visited_mapping.insert(hash) {
@@ -2148,15 +2174,19 @@ impl GTFSService {
             for indices in route_data.by_stop.values() {
                 if let Some(&i) = indices.first() {
                     if let Some(mapping) = route_data.mappings.get(i) {
-                        // Check if we need to enrich with regional names
-                        if let Some(regional_record) =
-                            regional_names.and_then(|names| names.get(&*mapping.stop_code))
-                        {
+                        let regional_record =
+                            regional_names.and_then(|names| names.get(&*mapping.stop_code));
+                        // One route's mapping stands for the stop here, so
+                        // whether that route's line passes it is not the stop's.
+                        if regional_record.is_some() || mapping.off_route_line.is_some() {
                             let mut enriched = (**mapping).clone();
-                            enriched.hindi_name =
-                                Some(Arc::from(regional_record.hindi_name.as_str()));
-                            enriched.regional_name =
-                                Some(Arc::from(regional_record.regional_name.as_str()));
+                            if let Some(regional_record) = regional_record {
+                                enriched.hindi_name =
+                                    Some(Arc::from(regional_record.hindi_name.as_str()));
+                                enriched.regional_name =
+                                    Some(Arc::from(regional_record.regional_name.as_str()));
+                            }
+                            enriched.off_route_line = None;
                             stops.push(Arc::new(enriched));
                         } else {
                             stops.push(mapping.clone());
@@ -2202,6 +2232,8 @@ impl GTFSService {
                         parent_stop_code: None,
                         cluster_id: stop.cluster_id.as_deref().map(Arc::from),
                         location_type: stop.location_type.clone(),
+                        unserviceable: None,
+                        off_route_line: None,
                     }));
                 }
             }
@@ -2463,7 +2495,7 @@ impl GTFSService {
             self.build_routes_by_gtfs(feed.routes.clone(), &trip_counts, &stop_counts, &tiers);
         let stops = self.build_stops_by_gtfs(feed.stops.clone(), &data.stop_regional_names_by_gtfs);
         let alternates = self.build_alternate_stops_by_gtfs(feed.stops.clone());
-        let route_data = self.build_route_data(
+        let mut route_data = self.build_route_data(
             &feed.patterns,
             &routes,
             &data.stop_geojsons_by_gtfs,
@@ -2478,6 +2510,12 @@ impl GTFSService {
         // Same order as build_data: route_internal first, then the feed's own polylines win.
         self.enrich_routes_from_route_internal(&mut routes).await;
         Self::apply_db_polylines(&mut routes, gtfs_id, &feed.polylines);
+        // Its stops off their routes' lines, as last measured and stored: read
+        // with the feed, so the data swapped in already carries them.
+        let off_line = self.read_off_route_line(gtfs_id).await;
+        if let (Some(stored), Some(rd)) = (&off_line, route_data.get_mut(gtfs_id)) {
+            off_route_line::apply(rd, &stored.off);
+        }
         let stations = Self::build_station_platforms(&feed.stops);
         let children = self.build_children_mapping(feed.stops);
         let pre_computed =
@@ -2498,8 +2536,10 @@ impl GTFSService {
         replace_feed_entry(&mut data.pre_computed_stops_by_gtfs, pre_computed, gtfs_id);
         match routes_hash {
             Some(h) => {
-                data.data_hash
-                    .insert(gtfs_id.to_string(), db_feed_data_hash(&h, feed.version));
+                data.data_hash.insert(
+                    gtfs_id.to_string(),
+                    db_feed_data_hash(&h, feed.version, off_line.as_ref().map(|s| s.revision)),
+                );
             }
             None => {
                 data.data_hash.remove(gtfs_id);
@@ -2507,6 +2547,15 @@ impl GTFSService {
         }
         data.db_feed_versions
             .insert(gtfs_id.to_string(), feed.version);
+        match &off_line {
+            Some(stored) => {
+                data.off_route_line_revisions
+                    .insert(gtfs_id.to_string(), stored.revision);
+            }
+            None => {
+                data.off_route_line_revisions.remove(gtfs_id);
+            }
+        }
         // Rebuilt with the feed, so a merge committed in the editor starts
         // answering on the same poll that brings the merged rows in.
         replace_feed_entry(
@@ -2655,6 +2704,8 @@ impl GTFSService {
             }
         }
         data.db_feed_versions.remove(gtfs_id);
+        // nor off-route-line flags, which are measured for DB feeds only
+        data.off_route_line_revisions.remove(gtfs_id);
         // Preprocessed data has no merges, so the feed goes back to answering
         // for live stop codes only - the behaviour it had before DB mode.
         data.stop_aliases_by_gtfs.remove(gtfs_id);
@@ -2768,6 +2819,10 @@ impl GTFSService {
                     }
                 }
             }
+            // then measure the stops off their routes' lines of a version just
+            // loaded, if no pod has yet, and serve what any pod stored since -
+            // for a feed reloaded above as much as for one that was not
+            self.sync_off_route_line().await;
             // read every tick, never once before the loop: the policy now lives
             // in the database, so an admin turning webhooks on from the
             // dashboard - or taking a host out of the allow-list - has to reach
@@ -2818,6 +2873,192 @@ impl GTFSService {
                 self.warn_once_about_cache_state(&e.to_string());
                 return;
             }
+        }
+    }
+
+    // ------------------------------------------------- stops off their routes' lines
+
+    /// What was measured and stored for DB feed `gtfs_id`
+    /// (docs/gtfs-editor.md section 27): revision 0 and no flags when it was
+    /// never measured; `None` when it cannot be read, so the feed is served
+    /// unflagged and the next version poll tries again.
+    async fn read_off_route_line(&self, gtfs_id: &str) -> Option<off_route_line::Stored> {
+        let db = self.db_source.as_ref()?;
+        match off_route_line::read_stored(db.pool(), gtfs_id).await {
+            Ok(stored) => Some(stored.unwrap_or_default()),
+            Err(e) => {
+                self.warn_once_about_off_route_line(&e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Each version poll, once the feeds that moved are loaded: measure every DB
+    /// feed this pod serves on a version no stored run covers, and serve the
+    /// flags stored since this pod last read them - by this pod just now, or by
+    /// another. One small read when nothing moved. Every pod polls, so every pod
+    /// reaches a new version within a poll of the others; the feed's advisory
+    /// lock, taken before measuring, makes one of them spend the CPU and the
+    /// rest pick up what it stored on a later poll.
+    ///
+    /// Returns, per DB feed this pod serves, whether it measured and stored,
+    /// found the version measured already, or found another pod at it. A feed
+    /// that could not be measured or stored is logged and left out.
+    pub async fn sync_off_route_line(&self) -> BTreeMap<String, off_route_line::StoreOutcome> {
+        use off_route_line::{Claimed, StoreOutcome};
+        let mut out = BTreeMap::new();
+        let Some(db) = self.db_source.clone() else {
+            return out;
+        };
+        let runs = match off_route_line::runs(db.pool()).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.warn_once_about_off_route_line(&e.to_string());
+                return out;
+            }
+        };
+        let mut revisions: HashMap<String, i64> =
+            runs.iter().map(|(g, r)| (g.clone(), r.revision)).collect();
+        let data = self.data.load_full();
+        let mut feeds: Vec<(String, i64)> = data
+            .db_feed_versions
+            .iter()
+            .map(|(g, v)| (g.clone(), *v))
+            .collect();
+        feeds.sort();
+        for (gtfs_id, version) in feeds {
+            if runs.get(&gtfs_id).is_some_and(|r| r.covers(version)) {
+                out.insert(gtfs_id, StoreOutcome::UpToDate);
+                continue;
+            }
+            let claim = match off_route_line::claim(db.pool(), &gtfs_id, version).await {
+                Ok(Claimed::Yours(c)) => c,
+                Ok(Claimed::UpToDate) => {
+                    out.insert(gtfs_id, StoreOutcome::UpToDate);
+                    continue;
+                }
+                Ok(Claimed::Busy) => {
+                    out.insert(gtfs_id, StoreOutcome::Busy);
+                    continue;
+                }
+                Err(e) => {
+                    self.warn_once_about_off_route_line(&e.to_string());
+                    continue;
+                }
+            };
+            // on the lines and stops this pod serves, off the async threads
+            let started = std::time::Instant::now();
+            let (snapshot, g) = (data.clone(), gtfs_id.clone());
+            let measured = tokio::task::spawn_blocking(move || {
+                let none = HashMap::new();
+                match snapshot.route_data_by_gtfs.get(&g) {
+                    Some(rd) => off_route_line::measure(
+                        rd,
+                        snapshot.routes_by_gtfs.get(&g).unwrap_or(&none),
+                    ),
+                    None => off_route_line::Measured::default(),
+                }
+            })
+            .await;
+            let measured = match measured {
+                Ok(m) => m,
+                Err(e) => {
+                    // the claim drops here: rolled back, measured again next poll
+                    error!(gtfs_id = %gtfs_id, "measuring stops off their routes' lines failed: {e}");
+                    continue;
+                }
+            };
+            let took_ms = started.elapsed().as_millis() as i64;
+            match claim.store(&measured, took_ms, &self.pod.pod_id).await {
+                Ok((changed, revision)) => {
+                    info!(
+                        gtfs_id = %gtfs_id,
+                        feed_version = version,
+                        routes = measured.routes_checked,
+                        stops_flagged = measured.stops.len(),
+                        took_ms,
+                        changed,
+                        revision,
+                        "Measured stops off their routes' lines"
+                    );
+                    revisions.insert(gtfs_id.clone(), revision);
+                    out.insert(gtfs_id, StoreOutcome::Stored { changed, revision });
+                }
+                Err(e) => {
+                    self.warn_once_about_off_route_line(&e.to_string());
+                }
+            }
+        }
+        drop(data);
+        self.pick_up_off_route_line(&revisions).await;
+        out
+    }
+
+    /// Serve the stored flags of every DB feed this pod serves whose stored
+    /// revision (`stored`; absent: never measured, revision 0) is not the one it
+    /// serves: the feed's mappings and its `/version` hash change, nothing is
+    /// rebuilt.
+    async fn pick_up_off_route_line(&self, stored: &HashMap<String, i64>) {
+        let behind = |data: &GTFSData, g: &str| {
+            data.off_route_line_revisions.get(g).copied()
+                != Some(stored.get(g).copied().unwrap_or(0))
+        };
+        let mut feeds: Vec<String> = {
+            let data = self.data.load();
+            data.db_feed_versions
+                .keys()
+                .filter(|g| behind(&data, g))
+                .cloned()
+                .collect()
+        };
+        feeds.sort();
+        for gtfs_id in feeds {
+            let Some(flags) = self.read_off_route_line(&gtfs_id).await else {
+                continue;
+            };
+            let _reload = self.reload_lock.lock().await;
+            let current = self.data.load_full();
+            // reloaded or reverted while this was read: what it did stands
+            let Some(&version) = current.db_feed_versions.get(&gtfs_id) else {
+                continue;
+            };
+            if current.off_route_line_revisions.get(&gtfs_id) == Some(&flags.revision) {
+                continue;
+            }
+            let mut next = (*current).clone();
+            if let Some(rd) = next.route_data_by_gtfs.get_mut(&gtfs_id) {
+                off_route_line::apply(rd, &flags.off);
+            }
+            if let Some(routes) = next.routes_by_gtfs.get(&gtfs_id) {
+                let h = self.compute_data_hash(routes);
+                next.data_hash.insert(
+                    gtfs_id.clone(),
+                    db_feed_data_hash(&h, version, Some(flags.revision)),
+                );
+            }
+            next.off_route_line_revisions
+                .insert(gtfs_id.clone(), flags.revision);
+            self.data.store(Arc::new(next));
+            self.update_cached_data_bytes().await;
+            info!(
+                gtfs_id = %gtfs_id,
+                revision = flags.revision,
+                routes = flags.off.len(),
+                stops_flagged = flags.off.values().map(HashSet::len).sum::<usize>(),
+                "Serving stops off their routes' lines"
+            );
+        }
+    }
+
+    /// The poll runs every few seconds, so a persistent fault would fill the
+    /// log; the feed data is served either way, unflagged.
+    fn warn_once_about_off_route_line(&self, error: &str) {
+        if !self.off_route_line_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "Reading or storing stops off their routes' lines failed ({error}); routes are \
+                 served without the flag until this is fixed. Has \
+                 db/gtfs_editor/0037_off_route_line.sql been applied? This is logged once."
+            );
         }
     }
 
@@ -5216,6 +5457,8 @@ mod tests {
             cluster_id: None,
             stage_number: None,
             is_stage_stop: None,
+            unserviceable: None,
+            off_route_line: None,
         })
     }
 
@@ -5338,5 +5581,52 @@ mod tests {
         // an entry naming nothing replaces nothing
         let data = feed_replacing(vec![plain("g", "a")], &[("1", "a")], &[("old", &[])]);
         assert!(GTFSService::replacement_in(&data, "g", "old").is_none());
+    }
+
+    // ------------------------------------------------- off the route's line
+
+    #[test]
+    fn the_stops_list_keeps_out_of_use_but_not_one_routes_line() {
+        let mut far = (*mapping("R", "far", 1)).clone();
+        far.unserviceable = Some(true);
+        let mut rd = GTFSRouteData::default();
+        rd.mappings.push(Arc::new(far));
+        rd.by_route.insert("R".into(), vec![0]);
+        rd.by_stop.insert("far".into(), vec![0]);
+        let off: off_route_line::OffLineSet =
+            [("R".to_string(), ["far".to_string()].into_iter().collect())]
+                .into_iter()
+                .collect();
+        off_route_line::apply(&mut rd, &off);
+        let rd: HashMap<String, GTFSRouteData> = [("g".to_string(), rd)].into_iter().collect();
+        assert_eq!(
+            rd["g"].mappings[0].off_route_line,
+            Some(true),
+            "the route's own mapping says so"
+        );
+
+        let listed = GTFSService::pre_compute_stops(&rd, &HashMap::new(), &HashMap::new());
+        let far = &listed["g"][0];
+        assert_eq!(far.off_route_line, None, "the stop-wide list does not");
+        assert_eq!(far.unserviceable, Some(true), "a closure is the stop's own");
+        let json = serde_json::to_value(&**far).unwrap();
+        assert!(json.get("offRouteLine").is_none(), "{json}");
+        assert_eq!(json["unserviceable"], true);
+    }
+
+    #[test]
+    fn a_feeds_hash_moves_with_its_stored_flags_and_not_before_there_are_any() {
+        let before = {
+            // what db_feed_data_hash gave before the flags existed
+            let mut hasher = Sha256::new();
+            hasher.update(b"routes|gtfs_feed.version=7");
+            format!("{:x}", hasher.finalize())
+        };
+        assert_eq!(db_feed_data_hash("routes", 7, None), before);
+        assert_eq!(db_feed_data_hash("routes", 7, Some(0)), before);
+        let one = db_feed_data_hash("routes", 7, Some(1));
+        assert_ne!(one, before);
+        assert_ne!(one, db_feed_data_hash("routes", 7, Some(2)));
+        assert_eq!(one, db_feed_data_hash("routes", 7, Some(1)));
     }
 }
