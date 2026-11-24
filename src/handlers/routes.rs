@@ -3941,6 +3941,7 @@ pub async fn get_bus_route_schedule(
         }
 
         let db_etas = station_etas_for(&app_state, &gtfs_id, !all_rows.is_empty()).await;
+        let now_secs = chrono::Utc::now().timestamp();
         let mut schedule_details: BusScheduleDetails = Vec::new();
         for row in all_rows {
             // Resolve trip start time from (db_start_time HH:MM + duty_date) or
@@ -3978,6 +3979,14 @@ pub async fn get_bus_route_schedule(
                     calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time)
                 }
             };
+            let past_last_stop = app_state.config.route_schedule_drop_past_trips
+                && row.is_active_trip != Some(true)
+                && bus_stop_etas
+                    .last()
+                    .is_some_and(|last_stop| last_stop.arrival_time < now_secs);
+            if past_last_stop {
+                continue;
+            }
 
             let is_upcoming = row
                 .status

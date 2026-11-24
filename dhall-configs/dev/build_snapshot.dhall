@@ -41,6 +41,7 @@ in {
   bhubaneswar_cache_update_interval = 10,
   phone_number_hash_key = "HASH_KEY",
   enable_schedule_reconciliation = False,
+  route_schedule_drop_past_trips = True,
   osrtc_base_url = None Text,
   osrtc_username = secrets.osrtc_username,
   osrtc_secret_key = secrets.osrtc_secret_key,
