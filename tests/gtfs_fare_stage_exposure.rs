@@ -242,6 +242,7 @@ fn app_config(dir: &Path) -> AppConfig {
         gtfs_editor_totp_key: None,
         gtfs_editor_session_hours: None,
         gtfs_editor_ui_dir: None,
+        gtfs_editor_map_tiles: None,
         gtfs_webhooks_enabled: false,
         is_master: false,
         gtfs_webhook_allowed_hosts: vec![],

@@ -23,6 +23,7 @@ import { showTrips } from "./trips.js";
 import { showCalendar } from "./calendar.js";
 import { showFeed, showNewFeed } from "./feed.js";
 import { showStage, showStagesList, editStage } from "./stages.js";
+import { showRoutesMap } from "./routes_map.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
 
@@ -176,6 +177,10 @@ function markNav(name) {
   if (label) label.dataset.here = here ? here.childNodes[0].textContent.trim() : "";
 }
 
+// A page that keeps its state in its address (routes on the map) rewrites it
+// in place: what the router knows of where we are follows.
+window.addEventListener("hash:replaced", () => { currentHash = location.hash || "#/"; });
+
 // Leaving a screen with unsaved edits asks first; staying puts the address back.
 async function onHashChange() {
   const target = location.hash || "#/";
@@ -261,6 +266,8 @@ function route() {
     // ?draft=<change set id> shows that set's version, read-only when it is not the open draft
     const d = params.get("draft");
     showRoute(parts[1], { preview: d === "1" || (d && d !== "0") ? true : undefined, draftId: d && d !== "1" && d !== "0" ? d : undefined });
+  } else if (parts[0] === "routes-map") {
+    markNav("routes-map"); showWorkspace(true); showRoutesMap(location.hash);
   } else if (parts[0] === "stage" && parts[1]) {
     markNav("stages"); showWorkspace(true); showStage(parts[1]);
   } else if (parts[0] === "diversions") {

@@ -76,11 +76,13 @@ export function arrive(href) {
   render();
 }
 
-// A page names itself once it has loaded ("Luz", "45B").
+// A page names itself once it has loaded ("Luz", "45B"), and a page that
+// rewrites its own address (its query) keeps the trail's way back to it current.
 export function nameHere(label, href = location.hash || "#/") {
   const last = crumbs[crumbs.length - 1];
   if (!last || place(last.href) !== place(href) || !label) return;
   last.label = String(label);
+  last.href = href;
   save();
   render();
 }

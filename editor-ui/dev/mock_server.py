@@ -192,6 +192,11 @@ def _safe_header_value(v):
     return v
 
 
+# 1x1 light-grey PNG, stretched to a tile: the mock's "Google" tiles (section 30)
+MOCK_TILE = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGN48uIZAAVmArPcLpxmAAAAAElFTkSuQmCC")
+
+
 class ApiError(Exception):
     def __init__(self, status, code, message, details=None):
         super().__init__(message)
@@ -1307,6 +1312,18 @@ class Handler(BaseHTTPRequestHandler):
                     s.map_line_road = b["road"]
             return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok"),
                                     "road": getattr(s, "map_line_road", "ok")})
+        if path == "/__dev/map-tiles" and method == "POST":
+            # docs section 30: google ok, off (no key) or error (the session
+            # refused); default osm or google
+            b = self._body()
+            with LOCK:
+                mt = dict(getattr(s, "map_tiles", {"google": "off", "default": "osm"}))
+                mt.update({k: b[k] for k in ("google", "default") if k in b})
+                s.map_tiles = mt
+            return self._send(200, mt)
+        if path.startswith("/__dev/tile/") and method == "GET":
+            # a one-colour PNG: Google's tiles in the mock
+            return self._send(200, MOCK_TILE, [("Cache-Control", "no-store")], "image/png")
         if path == "/__dev/feed-source" and method == "POST":
             # The Delivery page only has a live version to talk about when the feed is
             # served from the DB, and the feed-config flow above deliberately leaves it
@@ -1697,6 +1714,25 @@ class Handler(BaseHTTPRequestHandler):
 
         u = self.session_user()
         self.require_mutation(method)
+
+        # the base map (docs section 30): /__dev/map-tiles sets what the server
+        # says. Google's tiles are the mock's own (/__dev/tile), so nothing is
+        # asked of Google; its copyright names the zoom asked about.
+        if parts[0] == "map-tiles" and method == "GET":
+            mt = getattr(s, "map_tiles", {"google": "off", "default": "osm"})
+            if parts == ["map-tiles"]:
+                if mt["google"] == "ok":
+                    return 200, {"default": mt["default"], "google_error": None, "google": {
+                        "url": "/__dev/tile/{z}/{x}/{y}?session=mock&key=mock", "max_zoom": 22,
+                        "expires_at": int(time.time()) + 14 * 86400}}
+                if mt["google"] == "error":
+                    return 200, {"default": "osm", "google": None,
+                                 "google_error": "Google refused the map session (HTTP 403): Map Tiles API has not been used in project 1"}
+                return 200, {"default": "osm", "google": None, "google_error": None}
+            if parts == ["map-tiles", "viewport"]:
+                if mt["google"] != "ok":
+                    return 200, {"copyright": None}
+                return 200, {"copyright": f"Map data ©2026 Google (zoom {q.get('zoom', ['?'])[0]})"}
 
         found = self.migration(method, parts, q, u)
         if found is not None:

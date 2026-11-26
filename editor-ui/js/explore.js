@@ -11,6 +11,7 @@ import { stationNames, foldedList, platformsNote, stopContext, routeContext } fr
 import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 import { routeListsSection } from "./variants.js";
 import { historySection, stopNodes, routeNodes } from "./history.js";
+import { routesMapHref, ROUTES_MAP_MAX } from "./routes_map.js";
 
 const panel = () => document.getElementById("panel");
 
@@ -171,6 +172,11 @@ export async function showHome() {
         ? h("p.hint", "To change something, open it and choose Edit. To add a stop, route or station, use New at the top. Edits collect in a draft; nothing changes for passengers until another person approves and commits it.")
         : h("p.hint", "You can look at everything. Ask an admin for the editor role to make changes."),
     ));
+  // several routes' lines at once (docs section 29)
+  p.appendChild(h("section.section",
+    h("h2", "Routes on the map"),
+    h("p", "See several routes' map lines together, each in its own colour: where they overlap, which one runs where."),
+    h("div.btn-row", h("a.btn.secondary", { href: "#/routes-map" }, "Choose routes to show"))));
   const coordinates = h("section.section", { hidden: true });
   p.appendChild(coordinates);
   get(`feeds/${enc(state.feedId)}/position-reviews/summary`).then((c) => {
@@ -237,8 +243,12 @@ function stopRoutesSection(routes) {
         on: { click: () => document.getElementById("inactive-routes-here")?.scrollIntoView({ behavior: "smooth", block: "start" }) } },
         `${plural(inactive.length, "inactive route")} below`)
     : null;
+  // each route once: one calling twice is listed twice
+  const liveIds = [...new Set(live.map((r) => r.route_id))];
   return h("section.section.stop-routes",
     h("div.section-head", h("h2", `Routes stopping here (${live.length})`), jump),
+    liveIds.length > 1 ? h("div.btn-row", h("a.btn.secondary.small#stop-routes-map", { href: routesMapHref(liveIds.slice(0, ROUTES_MAP_MAX)) },
+      liveIds.length > ROUTES_MAP_MAX ? `Show the first ${ROUTES_MAP_MAX} on the map` : "Show these routes on the map")) : null,
     live.length ? h("ul.list", live.map(row))
       : h("p.empty", inactive.length ? "No active route uses this stop: passengers see no route here." : "No route uses this stop."),
     inactive.length ? [
@@ -571,7 +581,8 @@ export async function showRoute(routeId, { preview, draftId } = {}) {
         r.route_tag || (drafted && o.changed.has("route_tag")) ? [h("dt", "Fare tag"), h("dd", field("route_tag") || "none")] : null,
         live ? [h("dt", "Trips"), h("dd", `${fmtCount(live.trip_count || 0)} live on ${plural((live.patterns || []).length || 1, "stop order")}`)] : null,
       ),
-      live ? h("div.btn-row", h("a.btn.secondary.small", { href: `#/trips/${enc(routeId)}` }, "Trips and timing")) : null,
+      live ? h("div.btn-row", h("a.btn.secondary.small", { href: `#/trips/${enc(routeId)}` }, "Trips and timing"),
+        h("a.btn.secondary.small#route-with-others", { href: routesMapHref([routeId]) }, "Show with other routes")) : null,
       // the editors start from the live route and lay the draft's change over it themselves
       can("editor") && (live || created) ? h("div.btn-row",
         // on a feed built from stages a route with no stages has no stop list

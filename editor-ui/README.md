@@ -17,8 +17,9 @@ js/api.js           fetch wrapper: cookies, X-Requested-With, error shape, auth 
 js/state.js         shared state; UI preferences in localStorage (never secrets)
 js/auth.js          sign-in gate: SSO problems, TOTP enrolment (QR), code entry, lockout
 js/main.js          boot, top bar, hash router
-js/map.js           Leaflet: stops by area, routes, drag a stop, pick a stop, station selection, insets, a map line edited by hand
+js/map.js           Leaflet: the base map (OpenStreetMap or Google), stops by area, routes, several routes at once, drag a stop, pick a stop, station selection, insets, a map line edited by hand
 js/line.js          a map line as points: encode it, snap a click to it, replace a stretch, the stops it passes by (no DOM; tested by dev/line_test.mjs)
+js/routes_map.js    several routes' map lines on the map at once, each in its own colour (#/routes-map?ids=)
 js/explore.js       search (paged), stop panel with its CSV download, route panel with the fare-stage ladder
 js/editors.js       stop, route stop list, route details and map line (suggested, or edited on the map), station editors
 js/drafts.js        the draft being edited, the draft chooser, addChange(), what the draft creates
@@ -50,6 +51,13 @@ dev/                development only - never served by GIMS
 - **Stop** (`#/stop/{id}`) - position, routes using it, station and cluster,
   stops within 60 m. Edit (drag the pin or type coordinates, rename), club into
   a station, delete when unused. A station shows its stops; edit or dissolve it.
+- **Routes on the map** (`#/routes-map?ids=`) - several routes' map lines at
+  once, each in its own colour with its number where it starts: added by
+  number or name, from a stop's routes or a route page; picked out by pointing
+  at one in the list; their stops on request. The address keeps them.
+- **Base map** - the Show box offers OpenStreetMap or Google Maps when the
+  server has a Map Tiles API key (docs section 30); the choice is kept in the
+  browser.
 - **Route** (`#/route/{id}`) - the stop list as a fare-stage ladder, the map line,
   and a toggle to see it with your draft applied. Edit the stop list: "Add stop"
   between rows and at the end, "Change stop" on every row (nearby suggestions,
