@@ -4,7 +4,7 @@ import { get, post, enc, ApiError } from "./api.js";
 import { state, setLeaveGuard, usesStages } from "./state.js";
 import {
   h, clear, toast, confirmDialog, modal, debounce, fmtMetres, haversine, myLocation, LOCATION_ROUGH_METRES, STOP_TYPE_LABEL, SERVED_EXCLUDE,
-  validateRows, renumberStages, stageOpeners, decodePolyline, plural, ID_RE, ID_RULE,
+  validateRows, renumberStages, stageOpeners, decodePolyline, plural, fmtCount, ID_RE, ID_RULE,
   PLATFORM_PLACEHOLDER, PLATFORM_HELP, descriptionField, lastStageLength,
 } from "./util.js";
 import * as map from "./map.js";
@@ -13,6 +13,7 @@ import { fileSpec, fieldsForm, cellText } from "./gtfs.js";
 import { stopPicker } from "./picker.js";
 import { showStop, showRoute } from "./explore.js";
 import { undoScope } from "./undo.js";
+import { encodePolyline, tidy, lineLength, nearestOnLine, spliceStretch, throughStops, stopsOffLine, OFF_LINE_M } from "./line.js";
 import { foldPlatforms, stationNames, platformsNote } from "./context.js";
 
 const panel = () => document.getElementById("panel");
@@ -1083,6 +1084,17 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const base = createChange ? createChange.after : route;
   const start = { short_name: base.short_name || "", long_name: base.long_name || "", color: base.color || "", active: base.active !== false, route_tag: base.route_tag || "", ...(prior && !createChange ? prior.after : {}) };
   let proposed = prior && prior.after.encoded_polyline ? { encoded_polyline: prior.after.encoded_polyline, polyline_source: prior.after.polyline_source } : null;
+  // The route's stops as the draft has them (the live ones until the preview
+  // answers): what the line is checked against, and drawn through when there
+  // is no line to start from.
+  let rows = route.rows || [];
+  // the map editor while the line is edited by hand (docs section 28)
+  let editing = null;
+  const pointsOf = (encoded) => { try { return encoded ? decodePolyline(encoded) : []; } catch { return []; } };
+  const savedPoints = () => pointsOf(route.encoded_polyline);
+  // what editing starts from, or goes back to when every edit is undone
+  const baseline = () => { const s = savedPoints(); return s.length >= 2 ? s : throughStops(rows); };
+  const shownPoints = () => (proposed ? pointsOf(proposed.encoded_polyline) : editing ? baseline() : savedPoints());
   // GIMS keeps an inactive route out of its lists only for a feed it serves
   // from these tables (docs section 18.17): the nightly build has no such thing
   const config = created ? {} : await get(`feeds/${enc(state.feedId)}/config`).catch(() => ({}));
@@ -1115,6 +1127,16 @@ export async function editRouteDetails(route, { created = false } = {}) {
   };
 
   const showProposal = () => {
+    if (editing) {
+      editing.replace(shownPoints());
+      checkStops();
+      clear(lineStatus, proposed
+        ? [h("p.notice.ok", `Map line edited by hand (${fmtMetres(lineLength(shownPoints()))}). It is saved when you add these changes to the draft.`),
+          h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line")]
+        : h("p.hint", "Not changed yet."));
+      return;
+    }
+    checkStops();
     if (!proposed) {
       map.clearRoute("proposal");
       clear(lineStatus, h("p.hint", route.encoded_polyline ? "This route has a saved map line." : "This route has no map line yet."));
@@ -1128,10 +1150,141 @@ export async function editRouteDetails(route, { created = false } = {}) {
       for (let i = 1; i < pts.length; i++) d += haversine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]);
       km = fmtMetres(d);
     } catch { /* shown as-is */ }
-    const from = proposed.polyline_source === "gps" ? "from GPS" : proposed.polyline_source === "osrm" ? "through the stops" : "";
+    const from = { gps: "from GPS", osrm: "through the stops", manual: "edited by hand" }[proposed.polyline_source] || "";
     clear(lineStatus, h("p.notice.ok", `New map line ready (${km}${from ? `, ${from}` : ""}), shown dashed in teal. It is saved when you add these changes to the draft.`),
       proposed.evidence ? gpsEvidence(proposed.evidence) : null,
       h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line"));
+  };
+
+  // ---- the stops the line passes by (docs section 27): what GIMS would flag
+  const lineCheck = h("div", { "data-line-check": "" });
+  const checkStops = () => {
+    const pts = shownPoints();
+    const off = stopsOffLine(pts, rows);
+    map.showOffLine(off);
+    if (pts.length < 2) { clear(lineCheck); return; }
+    if (!off.length) {
+      const boarded = rows.filter((r) => !SERVED_EXCLUDE.has(r.stop_type) && r.lat != null).length;
+      clear(lineCheck, h("p.hint", { "data-off-line": "0" }, `All ${plural(boarded, "stop")} of this route are within ${OFF_LINE_M} m of this line.`));
+      return;
+    }
+    const show = (s) => {
+      const at = nearestOnLine(pts, s.lat, s.lon);
+      map.fitPoints([s, at], { maxZoom: 18, pad: 0.6 });
+    };
+    clear(lineCheck, h("div.notice.warning", { "data-off-line": String(off.length) },
+      h("p", `${plural(off.length, "stop")} ${off.length === 1 ? "is" : "are"} more than ${OFF_LINE_M} m from this line (ringed in red on the map): passengers are told the bus may not stop there. If the buses do stop there, bend the line to pass them.`),
+      h("ul.off-line", off.map((s) => h("li",
+        h("button.btn.quiet.small", { type: "button", "data-off-stop": s.stop_id, on: { click: () => show(s) } }, `${s.index + 1}. ${s.name}`),
+        h("span.meta", ` ${fmtMetres(s.distM)} from the line`))))));
+  };
+  if (!created && state.draft) {
+    get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}`)
+      .then((p) => { if (p && Array.isArray(p.rows) && lineCheck.isConnected) { rows = p.rows; checkStops(); } })
+      .catch(() => { /* the live stops, then */ });
+  }
+
+  // ---- editing the line by hand (docs section 28)
+  const manualLine = (pts) => ({ encoded_polyline: encodePolyline(pts), polyline_source: "manual", evidence: null });
+  const edited = (pts, label) => {
+    const clean = tidy(pts);
+    if (clean.length < 2) { showProposal(); return; }
+    unsaved.touch();
+    setLine(manualLine(clean), label);
+  };
+  const editBox = h("div", { "data-line-edit": "" });
+  const viewHint = h("p.hint", { "aria-live": "polite" });
+  const stretchBox = h("div", { "data-stretch": "" });
+  const onView = ({ inView, shown, picking }) => {
+    viewHint.textContent = picking ? "" : inView > shown
+      ? `Zoom in to move points. ${fmtCount(inView)} of the line's points are on the map; they show once there are ${map.LINE_HANDLES_MAX} or fewer.`
+      : inView ? "" : "None of the line's points are on the map. Zoom out or move the map to reach the line.";
+  };
+  let routing = false;
+  const followRoads = async () => {
+    const st = editing && editing.stretch();
+    if (!st || routing) return;
+    routing = true;
+    stretchBox.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+    const status = stretchBox.querySelector("[data-stretch-status]");
+    if (status) clear(status, h("p.hint", "Asking the road router for the way through your points…"));
+    try {
+      const points = [[st.from.lat, st.from.lon], ...st.vias, [st.to.lat, st.to.lon]].map(([lat, lon]) => ({ lat, lon }));
+      const res = await post(`feeds/${enc(state.feedId)}/polyline:road`, { points });
+      // the line changed meanwhile (an undo, the stretch cancelled): A and B
+      // were places on the line as it was
+      if (!editing || JSON.stringify(editing.stretch()) !== JSON.stringify(st)) {
+        if (status && status.isConnected) clear(status, h("p.hint", "The stretch changed while the road router answered. Choose again."));
+        return;
+      }
+      edited(spliceStretch(editing.points(), st.from, st.to, decodePolyline(res.encoded_polyline)), "redrew a stretch along the roads");
+    } catch (e) {
+      if (status && status.isConnected) {
+        clear(status, h("p.notice.error", e.message),
+          h("p.hint", "Move or add a point so the way is on roads the router knows, or choose Straight lines."));
+        stretchBox.scrollIntoView({ block: "nearest" });
+      }
+    } finally {
+      routing = false;
+      stretchBox.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+    }
+  };
+  const straightLines = () => {
+    const st = editing && editing.stretch();
+    if (!st) return;
+    edited(spliceStretch(editing.points(), st.from, st.to, st.vias), "redrew a stretch with straight lines");
+  };
+  const cancelStretch = () => { if (editing) editing.endStretch(); drawStretch(null); };
+  const drawStretch = (s) => {
+    if (!s) { clear(stretchBox); return; }
+    const cancelBtn = h("button.btn.quiet.small", { type: "button", on: { click: cancelStretch } }, "Cancel the stretch");
+    if (s.stage !== "vias") {
+      clear(stretchBox, h("div.notice", h("p", s.stage === "start"
+        ? "Click the line on the map where the stretch to redraw starts."
+        : "Now click the line where the stretch ends. It is marked A and B, and shown in red."), cancelBtn));
+      return;
+    }
+    clear(stretchBox, h("div.notice",
+      h("p", `The stretch from A to B, in red, is replaced. ${s.vias ? `${plural(s.vias, "point")} placed. ` : ""}Click the map where the line should go instead, in order, for example along the service road. Then:`),
+      h("div.btn-row",
+        h("button.btn", { type: "button", on: { click: followRoads } }, "Follow the roads"),
+        h("button.btn.secondary", { type: "button", on: { click: straightLines } }, s.vias ? "Straight lines through my points" : "A straight line from A to B"),
+        cancelBtn),
+      h("div", { "data-stretch-status": "" })));
+    // the choice is in the panel, likely scrolled away while working on the map
+    stretchBox.scrollIntoView({ block: "nearest" });
+  };
+  const startEditing = () => {
+    if (editing || asking) return;
+    const start = shownPoints().length >= 2 ? shownPoints() : throughStops(rows);
+    if (start.length < 2) {
+      clear(editBox, h("p.notice.error", "There is no line to edit, and fewer than two of this route's stops have a position to draw one through."));
+      return;
+    }
+    suggestButtons.forEach((b) => { b.disabled = true; });
+    editButton.hidden = true;
+    editing = map.editLine(start, { onChange: edited, onView, onStretch: drawStretch });
+    clear(editBox,
+      h("p.hint", "Drag a point of the teal line to move it, or a faint point between two to bend the line there. Double-click a point to remove it. To replace a whole stretch, such as a flyover the buses do not take, redraw it."),
+      viewHint,
+      h("div.btn-row",
+        h("button.btn.secondary", { type: "button", on: { click: () => editing && editing.startStretch() } }, "Redraw a stretch"),
+        h("button.btn.secondary", { type: "button", on: { click: stopEditing } }, "Done editing")),
+      stretchBox,
+      h("p.hint", "A line edited here is kept as drawn: the weekly map line from GPS no longer replaces it. To hand the route back to it, suggest a line from GPS instead."));
+    // no line yet: the one through the stops is the first edit
+    if (!proposed && savedPoints().length < 2) edited(start, "drew a map line through the stops");
+    else showProposal();
+    editBox.scrollIntoView({ block: "nearest" });
+  };
+  const stopEditing = () => {
+    if (!editing) return;
+    editing = null;
+    map.endModes();
+    clear(editBox);
+    editButton.hidden = false;
+    suggestButtons.forEach((b) => { b.disabled = false; });
+    showProposal();
   };
 
   // one suggestion at a time: a second click while the first is out would
@@ -1141,7 +1294,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const ask = async (waiting, label, fail, fetchLine) => {
     if (asking) return;
     asking = true;
-    suggestButtons.forEach((b) => { b.disabled = true; });
+    [...suggestButtons, editButton].forEach((b) => { b.disabled = true; });
     const status = h("p.hint", { "aria-live": "polite" }, waiting);
     clear(lineStatus, status);
     try {
@@ -1153,7 +1306,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
       clear(lineStatus, ...fail(e));
     } finally {
       asking = false;
-      suggestButtons.forEach((b) => { b.disabled = false; });
+      suggestButtons.forEach((b) => { b.disabled = !!editing; });
+      editButton.disabled = false;
     }
   };
   const linePath = (path) => `feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/${path}?change_set=${enc(state.draft.change_set_id)}`;
@@ -1195,6 +1349,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
     h("button.btn.secondary", { type: "button", on: { click: suggest } }, "Route through stops"),
     h("button.btn.secondary", { type: "button", on: { click: suggestGps } }, `Suggest from GPS (last ${gpsDays} days)`),
   ];
+  const editButton = h("button.btn.secondary#edit-line", { type: "button", on: { click: startEditing } }, "Edit the line on the map");
 
   const cancel = () => { unsaved.done(); map.clearRoute("proposal"); showRoute(route.route_id, { preview: created }); };
   const save = async (ev) => {
@@ -1270,9 +1425,11 @@ export async function editRouteDetails(route, { created = false } = {}) {
     ),
     h("section.section",
       h("h2", "Map line"),
-      h("p.hint", `The map line is the road path drawn between the stops. The road router can suggest one through this route's stops, or the buses can: the path this route's buses drove in the last ${gpsDays} days, snapped to the roads.`),
+      h("p.hint", `The map line is the road path drawn between the stops. The road router can suggest one through this route's stops, or the buses can: the path this route's buses drove in the last ${gpsDays} days, snapped to the roads. Or edit it on the map by hand.`),
       lineStatus,
-      h("div.btn-row", ...suggestButtons),
+      lineCheck,
+      h("div.btn-row", ...suggestButtons, editButton),
+      editBox,
       problems),
     h("div.sticky-actions", h("div.btn-row",
       h("button.btn", { type: "submit" }, prior || createChange ? "Update in draft" : "Add to draft"),

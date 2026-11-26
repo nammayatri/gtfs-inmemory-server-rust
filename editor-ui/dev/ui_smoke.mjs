@@ -8,6 +8,7 @@
 //   node dev/ui_smoke.mjs --gps-trips        # only a route's trips from GPS on a day
 //   node dev/ui_smoke.mjs --route-active     # only making a route inactive and active again
 //   node dev/ui_smoke.mjs --migration        # only moving work from master to prod (section 23)
+//   node dev/ui_smoke.mjs --map-line-edit    # only a map line edited by hand (section 28)
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -31,7 +32,8 @@
 // that tie a station to its platforms, a description and a platform label on
 // stops and stations, and importing stop details. Then the map line flows
 // (mapLineFlows; `--map-line`): a line through the stops and from GPS, and the
-// reason when either fails. Last, who may work on which feed (feedAccessFlows;
+// reason when either fails; and one edited by hand on the map
+// (mapLineEditFlow; `--map-line-edit`). Last, who may work on which feed (feedAccessFlows;
 // `--feed-access`): a system account at the gate, the no-feeds screen, the
 // switcher, badges and buttons by the role on the chosen feed, the People grid,
 // and a grant taken away while the page is open.
@@ -1539,6 +1541,196 @@ async function mapLineFlows() {
   await setMode({ osrm: "ok", gps: "ok" });
 }
 
+// docs section 28: a route's map line edited by hand on the map - a point
+// moved, a bend added, a point removed, a stretch redrawn along the roads and
+// with straight lines, undo - with the stops it passes by listed as it changes,
+// and into the draft as polyline_source manual.
+async function mapLineEditFlow() {
+  const setMode = (m) => evaluate(`fetch("/__dev/map-line", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify(m))} }).then((r) => r.json())`);
+  // not one the draft already gives a line (mapLineFlows, earlier in a full run)
+  // (no draft yet in a fresh browser: nothing is drafted)
+  const draftId = await activeDraftId().catch(() => null);
+  const drafted = new Set(draftId ? ((await api(`change-sets/${draftId}`)).changes || []).filter((c) => c.entity === "route").map((c) => c.entity_key) : []);
+  const routes = (await api("feeds/chennai_bus/routes?q=21G&limit=30")).items
+    .filter((r) => r.route_id !== "1369" && r.stop_count >= 6 && !r.deleted && !r.has_polyline && !drafted.has(r.route_id));
+  if (!check(routes.length > 0, "a route with no map line to draw one for")) return;
+  const route = routes[0];
+  const detail = await api(`feeds/chennai_bus/routes/${route.route_id}`);
+  const boarded = detail.rows.filter((r) => !["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"].includes(r.stop_type) && r.lat != null);
+  // one point per place: stops that share a point (a stage stop and its
+  // intermediate twin) are one point of the line
+  const places = boarded.filter((r, i) => !i || Math.round(r.lat * 1e5) !== Math.round(boarded[i - 1].lat * 1e5) || Math.round(r.lon * 1e5) !== Math.round(boarded[i - 1].lon * 1e5));
+  await go(`#/route/${route.route_id}`);
+  await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
+  await click("Edit name, colour and map line");
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Map line by hand");
+  await waitFor(`!!document.querySelector("#edit-line")`, "the Edit the line on the map button");
+
+  // what the map editor has drawn, through the page's own map
+  const editLine = () => mapCall(`let pts = null; map.eachLayer((l) => { if (l.options && l.options.lineEdit) pts = l.getLatLngs().map((p) => [p.lat, p.lng]); }); return pts;`);
+  const handleAt = (kind, i) => mapCall(`let at = null; map.eachLayer((l) => { if (l.options && l.options[${JSON.stringify(kind)}] === ${i}) at = l.getLatLng(); });
+    if (!at) return null; const q = map.latLngToContainerPoint(at); const r = map.getContainer().getBoundingClientRect(); return { x: r.left + q.x, y: r.top + q.y };`);
+  const screenOf = (lat, lon) => mapCall(`const q = map.latLngToContainerPoint([${lat}, ${lon}]); const r = map.getContainer().getBoundingClientRect(); return { x: r.left + q.x, y: r.top + q.y };`);
+  const offLine = () => evaluate(`document.querySelector("[data-off-line]")?.dataset.offLine ?? null`);
+  const rings = () => mapCall(`let n = 0; map.eachLayer((l) => { if (l.options && l.options.offLine) n++; }); return n;`);
+  // a point on screen about 150 px from (lat, lon) and at least 80 px from
+  // every part of the line: a route that comes back the other way passes close
+  const clearOfLine = (lat, lon) => evaluate(`Promise.all([import(${JSON.stringify(MAPJS)}), import(${JSON.stringify(`${UI}js/line.js`)})]).then(([m, ln]) => {
+    const map = m.getMap(); let pts = null;
+    map.eachLayer((l) => { if (l.options && l.options.lineEdit) pts = l.getLatLngs().map((p) => [p.lat, p.lng]); });
+    const o = map.latLngToContainerPoint([${lat}, ${lon}]), r = map.getContainer().getBoundingClientRect();
+    for (const [dx, dy] of [[0, -150], [150, 0], [0, 150], [-150, 0], [110, -110], [-110, 110], [110, 110], [-110, -110]]) {
+      const q = o.add([dx, dy]);
+      if (q.x < 140 || q.y < 120 || q.x > r.width - 20 || q.y > r.height - 60) continue;
+      const ll = map.containerPointToLatLng(q), at = ln.nearestOnLine(pts, ll.lat, ll.lng);
+      if (map.latLngToContainerPoint([at.lat, at.lon]).distanceTo(q) > 80) return { x: r.left + q.x, y: r.top + q.y };
+    }
+    return null;
+  })`);
+  async function dblClick(x, y) {
+    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    for (const clickCount of [1, 2]) {
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount });
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount });
+    }
+    await sleep(500);
+  }
+
+  // ---- no line yet: editing starts from a straight line through the stops
+  await click("Edit the line on the map");
+  await waitFor(`document.getElementById("panel").innerText.includes("Map line edited by hand")`, "a line drawn through the stops");
+  let pts = await editLine();
+  check(pts && pts.length === places.length, `the line has a point at each of the ${places.length} places the ${boarded.length} stops are (${pts && pts.length})`);
+  check(await offLine() === "0", "every stop is on a line drawn through them");
+  check((await text("#panel")).includes("the weekly map line from GPS no longer replaces it"), "says the weekly GPS line leaves it as drawn");
+  check(await evaluate(`[...document.querySelectorAll("#panel button")].filter((b) => ["Route through stops", "Suggest from GPS (last 7 days)"].includes(b.textContent)).every((b) => b.disabled)`),
+    "the suggestions wait while the line is edited");
+  await mapCall(`map.fitBounds(${JSON.stringify(pts)}, { padding: [40, 40], animate: false }); return true;`);
+  await sleep(700);
+  check(await evaluate(`document.querySelectorAll(".line-vertex").length`) === pts.length, "a handle on every point on the map");
+  await shot("mle-01-editing");
+
+  // ---- move a stop's point 400 m east: that stop is now off the line
+  const v = await handleAt("lineVertex", 2);
+  const away = await screenOf(pts[2][0], pts[2][1] + 0.0037);
+  await mouseDrag(v.x, v.y, away.x, away.y);
+  await waitFor(`(document.querySelector("[data-off-line]")?.dataset.offLine ?? "0") !== "0"`, "a stop off the moved line");
+  pts = await editLine();
+  check(Math.abs(pts[2][1] - (places[2].lon + 0.0037)) < 0.0002, "the point moved where it was dragged");
+  const listed = await text("[data-line-check]");
+  check(listed.includes(places[2].stop_name || places[2].stop_id) && /more than 100 m from this line/.test(listed), `the stop is listed as off the line: ${listed.slice(0, 160)}`);
+  check(await rings() >= 1, "and ringed in red on the map");
+  await shot("mle-02-stop-off-line");
+
+  // ---- undo puts it back; redo moves it again
+  await click("↶ Undo");
+  await waitFor(`document.querySelector("[data-off-line]")?.dataset.offLine === "0"`, "undo: the stop on the line again");
+  check(Math.abs((await editLine())[2][1] - places[2].lon) < 1e-5, "undo: the point is back");
+  await click("↷ Redo");
+  await waitFor(`(document.querySelector("[data-off-line]")?.dataset.offLine ?? "0") !== "0"`, "redo: off the line again");
+  await click("↶ Undo");
+  await waitFor(`document.querySelector("[data-off-line]")?.dataset.offLine === "0"`, "undone again");
+
+  // ---- bend the line: drag the handle halfway along the first segment
+  const n0 = (await editLine()).length;
+  const mid = await handleAt("lineMid", 0);
+  check(!!mid, "a handle halfway along a segment");
+  await mouseDrag(mid.x, mid.y, mid.x + 30, mid.y + 40);
+  pts = await editLine();
+  check(pts.length === n0 + 1, `a bend adds a point (${n0} -> ${pts.length})`);
+
+  // ---- remove it again by double-clicking it
+  const bend = await handleAt("lineVertex", 1);
+  await dblClick(bend.x, bend.y);
+  pts = await editLine();
+  check(pts.length === n0, `double-clicking a point removes it (${pts.length})`);
+  check(await mapCall(`return map.getZoom();`) > 0, "and does not zoom the map");
+
+  // ---- redraw a stretch along the roads: from halfway along segment 1 to halfway along segment 3, through one point
+  const half = (i) => [(pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2];
+  const [a, b] = [half(1), half(3)];
+  // close enough that a click beside the line is well clear of it
+  await mapCall(`map.fitBounds(${JSON.stringify(pts.slice(1, 5))}, { padding: [80, 80], animate: false }); return true;`);
+  await sleep(700);
+  await click("Redraw a stretch");
+  check(await evaluate(`document.querySelectorAll(".line-vertex").length`) === 0, "no point handles while picking a stretch");
+  await clickMapAt(...b); // the end first: the same stretch
+  await waitFor(`document.querySelector("[data-stretch]").innerText.includes("Now click the line where the stretch ends")`, "asked for the other end");
+  // a click well off the line is not taken
+  const sa = await clearOfLine(...a);
+  check(!!sa, "a place on the map well clear of the line");
+  await mouseClick(sa.x, sa.y);
+  check((await text("#map-banner")).includes("That is not on the line"), "a click off the line is refused");
+  await clickMapAt(...a);
+  await waitFor(`document.querySelector("[data-stretch]").innerText.includes("Click the map where the line should go instead")`, "asked for the points between");
+  const s2 = await clearOfLine(...pts[2]);
+  await mouseClick(s2.x, s2.y);
+  await waitFor(`document.querySelector("[data-stretch]").innerText.includes("1 point placed")`, "one point placed");
+  // where it went (a click on a stop's dot places it on the stop)
+  const via = await mapCall(`let at = null; map.eachLayer((l) => { if (l.options && l.options.stretchVia === 0) at = l.getLatLng(); }); return at && [at.lat, at.lng];`);
+  await shot("mle-03-stretch");
+  await setMode({ road: "no_segment" });
+  await click("Follow the roads");
+  await waitFor(`document.querySelector("[data-stretch-status]")?.innerText.includes("there is no road near point 1 you placed")`, "the road router's reason");
+  check(await evaluate(`(() => { const r = document.querySelector("[data-stretch]").getBoundingClientRect();
+    const bar = document.querySelector(".sticky-actions").getBoundingClientRect(); return r.top >= 0 && r.bottom <= bar.top + 1; })()`),
+    "the stretch's choices are scrolled into view, clear of the Add to draft bar");
+  check(!(await text("[data-line-edit]")).includes("Zoom in to move points"), "no zoom hint while picking a stretch: its handles are hidden on purpose");
+  await shot("mle-03b-stretch-panel");
+  await setMode({ road: "ok" });
+  await click("Follow the roads");
+  await waitFor(`!document.querySelector("[data-stretch]").innerText.trim()`, "the stretch done");
+  const routed = await editLine();
+  const near = (p, q) => Math.abs(p[0] - q[0]) < 2e-5 && Math.abs(p[1] - q[1]) < 2e-5;
+  check(routed.some((p) => near(p, via)), "the line passes the point placed");
+  check(routed.some((p) => near(p, [via[0], a[1]])), "along the mock's roads (a corner, not a straight line)");
+  check(!routed.some((p) => near(p, pts[2]) || near(p, pts[3])), "the points of the old stretch are gone");
+  check(near(routed[0], pts[0]) && near(routed[routed.length - 1], pts[pts.length - 1]), "the rest of the line kept");
+  const off = Number(await offLine());
+  check(off >= 1, `the stops the new stretch passes by are listed (${off})`);
+
+  // ---- and back with a straight line from A to B
+  const before = routed.length;
+  const r = (i) => [(routed[i][0] + routed[i + 1][0]) / 2, (routed[i][1] + routed[i + 1][1]) / 2];
+  await mapCall(`map.fitBounds(${JSON.stringify(routed)}, { padding: [60, 60], animate: false }); return true;`);
+  await sleep(700);
+  await click("Redraw a stretch");
+  await clickMapAt(...r(0));
+  await clickMapAt(...r(routed.length - 2));
+  await waitFor(`document.querySelector("[data-stretch]").innerText.includes("A straight line from A to B")`, "a straight line offered");
+  await click("A straight line from A to B");
+  await waitFor(`!document.querySelector("[data-stretch]").innerText.trim()`, "the straight stretch done");
+  const straight = await editLine();
+  check(straight.length === 4, `the first point, A, B and the last (${before} -> ${straight.length})`);
+
+  // ---- the off-line list zooms to its stop
+  await click("↶ Undo");
+  await waitFor(`(document.querySelector("[data-off-line]")?.dataset.offLine ?? "0") !== "0"`, "undo: the routed stretch back");
+  const firstOff = await evaluate(`document.querySelector("[data-off-stop]")?.dataset.offStop`);
+  const offStop = boarded.find((s) => s.stop_id === firstOff);
+  await evaluate(`document.querySelector("[data-off-stop]").click(), true`);
+  await sleep(700);
+  check(!!offStop && await mapCall(`return map.getBounds().contains([${offStop?.lat}, ${offStop?.lon}]);`), "Show zooms the map to the stop");
+
+  // ---- done: the dashed proposal, then into the draft as manual
+  const kept = await editLine();
+  await click("Done editing");
+  await waitFor(`document.getElementById("panel").innerText.includes("New map line ready")`, "the edited line as a proposal");
+  check((await text("#panel")).includes("edited by hand"), "says it was edited by hand");
+  check(await evaluate(`!document.querySelector("#edit-line").hidden`), "Edit the line on the map is offered again");
+  await click("Add to draft", ".sticky-actions");
+  await sleep(800);
+  const set = await api(`change-sets/${await activeDraftId()}`);
+  const change = (set.changes || []).find((c) => c.entity === "route" && c.entity_key === route.route_id);
+  check(!!change && change.after.polyline_source === "manual", "the draft holds the line with polyline_source manual");
+  const saved = change ? await evaluate(`import(${JSON.stringify(`${UI}js/util.js`)}).then((u) => u.decodePolyline(${JSON.stringify(change.after.encoded_polyline)}))`) : [];
+  check(saved.length === kept.length && saved.every((p, i) => near(p, kept[i])), "exactly the line edited");
+  check(!!change && !("evidence" in change.after), "and nothing else about it");
+  await shot("mle-04-in-draft");
+}
+
 // A route's trips from GPS on a day (docs section 17.8), on the first feed
 // this person holds that has GPS.
 async function gpsTripsFlow() {
@@ -1826,6 +2018,30 @@ if (process.argv.includes("--gps-trips")) {
     await load(UI);
     await signIn("editor1@nammayatri.in");
     await gpsTripsFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+// ---- only a map line edited by hand
+if (process.argv.includes("--map-line-edit")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await mapLineEditFlow();
     check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
   } catch (e) {
     failures.push(e.message);
@@ -3118,6 +3334,8 @@ try {
 
   // ================================================================ map lines through the stops and from GPS: see mapLineFlows above
   await mapLineFlows();
+  // ================================================================ a map line edited by hand: see mapLineEditFlow above
+  await mapLineEditFlow();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

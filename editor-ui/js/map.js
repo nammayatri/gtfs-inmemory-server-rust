@@ -12,6 +12,7 @@ import { get, enc } from "./api.js";
 import { state, pref, setPref, subscribe } from "./state.js";
 import { debounce, decodePolyline, h, haversine, normName, fmtMetres, plural } from "./util.js";
 import { touchedStops, draftedParents, draftStamp, draftTitle } from "./overlay.js";
+import { nearestOnLine, compareAlong, stretchOf } from "./line.js";
 
 const L = window.L;
 let map;
@@ -24,6 +25,7 @@ let bannerNow = [null, null];
 let selection = null;         // Set of stop ids highlighted for station selection
 let placeCleanup = null;
 let geofenceCleanup = null;   // off()s the map click listener a polygon edit adds, if any
+let lineEditCleanup = null;   // off()s what editing a map line by hand listens to
 let lastStops = [];
 let draftStops = [];
 let draftKey = "";
@@ -71,7 +73,7 @@ export function initMap() {
   lines = L.canvas({ pane: "lines", padding: 0.3 });
   dots = L.canvas({ pane: "dots", padding: 0.3 });
   L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
-  for (const name of ["links", "route", "proposal", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "geofence", "labels"]) {
+  for (const name of ["links", "route", "proposal", "offLine", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "geofence", "lineEdit", "labels"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
   initLayerControl();
@@ -708,7 +710,9 @@ export function endModes() {
   placeCleanup = null;
   if (geofenceCleanup) geofenceCleanup();
   geofenceCleanup = null;
-  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal", "geofence"]) layers[name].clearLayers();
+  if (lineEditCleanup) lineEditCleanup();
+  lineEditCleanup = null;
+  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal", "offLine", "geofence", "lineEdit"]) layers[name].clearLayers();
   map.closePopup();
   quietIds = new Set();
   reserved = [];
@@ -832,6 +836,198 @@ export function editGeofencePolygon(points, onChange) {
     pts = newPoints.map((p) => ({ lat: p.lat, lon: p.lon }));
     redraw();
     rebuildHandles();
+  };
+}
+
+// ---------------------------------------------------------- a map line by hand
+// docs section 28. Stops the line passes by, ringed in red with how far.
+export function showOffLine(stops) {
+  layers.offLine.clearLayers();
+  for (const s of stops || []) {
+    L.circleMarker([s.lat, s.lon], { renderer: lines, radius: 13, color: DANGER, weight: 2.5, dashArray: "4 3", fill: false, interactive: false, offLine: s.stop_id })
+      .addTo(layers.offLine);
+  }
+}
+
+// Handles are drawn for the points on screen, up to this many: a GPS line has
+// thousands, and zooming in is how to reach one.
+export const LINE_HANDLES_MAX = 400;
+const LINE_VERTEX = L.divIcon({ className: "", html: '<div class="line-vertex"></div>', iconSize: [12, 12] });
+const LINE_MID = L.divIcon({ className: "", html: '<div class="line-mid"></div>', iconSize: [10, 10] });
+const stretchIcon = (text, cls) => L.divIcon({ className: "", html: `<div class="${cls}">${text}</div>`, iconSize: [22, 22] });
+// how near the line, on screen, a click must be to pick a place on it
+const PICK_PX = 30;
+
+// Edit a route's map line: drag a point to move it, drag the faint handle
+// halfway along a segment to bend the line there, double-click (or right-click)
+// a point to remove it. And redraw a stretch: pick where it starts and ends on
+// the line, click the points it should pass, and the panel replaces it.
+//
+// points: [[lat, lon], ...]. Callbacks:
+//   onChange(points, label)  one finished edit, one step to undo
+//   onView({inView, shown, picking})  how many of the line's points are on
+//                            screen, and how many have handles: none past
+//                            LINE_HANDLES_MAX, nor while picking a stretch
+//   onStretch(s)             the stretch being picked changed: null when none,
+//                            else {stage: "start" | "end" | "vias", vias: n}
+// Returns {replace(points), startStretch(), stretch(), endStretch()}.
+export function editLine(points, { onChange, onView = () => {}, onStretch = () => {} }) {
+  endModes();
+  let pts = points.map((p) => [p[0], p[1]]);
+  const group = layers.lineEdit;
+  const line = L.polyline(pts, { renderer: lines, color: ACTION, weight: 5, opacity: 0.9, interactive: false, lineEdit: true }).addTo(group);
+  const handles = L.layerGroup().addTo(group);
+  const marks = L.layerGroup().addTo(group);
+  let dragging = false;
+  let stretch = null;           // {stage, from, to, vias: [[lat, lon]]}
+  let cleaned = false;
+
+  const commit = (label) => onChange(pts.map((p) => [p[0], p[1]]), label);
+
+  function rebuild() {
+    if (dragging || cleaned) return;
+    handles.clearLayers();
+    const view = map.getBounds().pad(0.1);
+    const inView = [];
+    for (let i = 0; i < pts.length; i++) if (view.contains(pts[i])) inView.push(i);
+    // picking a stretch: clicks are for the stretch, not handles
+    if (stretch || inView.length > LINE_HANDLES_MAX) { onView({ inView: inView.length, shown: 0, picking: !!stretch }); return; }
+    const on = new Set(inView);
+    for (let i = 0; i < pts.length - 1; i++) {
+      if (!on.has(i) && !on.has(i + 1)) continue;
+      // room for a handle between the two: no clutter on a dense GPS line
+      if (map.latLngToContainerPoint(pts[i]).distanceTo(map.latLngToContainerPoint(pts[i + 1])) >= 28) addMid(i);
+    }
+    for (const i of inView) addVertex(i);
+    onView({ inView: inView.length, shown: inView.length });
+  }
+
+  function addVertex(i) {
+    const m = L.marker(pts[i], {
+      draggable: true, autoPan: true, icon: LINE_VERTEX, keyboard: false, lineVertex: i,
+      title: "Drag to move this point of the line. Double-click to remove it.",
+    }).addTo(handles);
+    m.on("dragstart", () => { dragging = true; });
+    m.on("drag", () => { const ll = m.getLatLng(); pts[i] = [ll.lat, ll.lng]; line.setLatLngs(pts); });
+    m.on("dragend", () => { dragging = false; commit("moved a point of the map line"); rebuild(); });
+    const remove = (ev) => {
+      if (ev && ev.originalEvent) L.DomEvent.stop(ev.originalEvent);
+      if (pts.length <= 2) { banner("A map line needs at least two points. Drag this one instead.", null); return; }
+      pts.splice(i, 1);
+      line.setLatLngs(pts);
+      commit("removed a point of the map line");
+      rebuild();
+    };
+    m.on("dblclick", remove);
+    m.on("contextmenu", remove);
+  }
+
+  function addMid(i) {
+    const mid = [(pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2];
+    const m = L.marker(mid, { draggable: true, autoPan: true, icon: LINE_MID, keyboard: false, lineMid: i, title: "Drag to bend the line here" }).addTo(handles);
+    m.on("dragstart", () => { dragging = true; pts.splice(i + 1, 0, mid.slice()); });
+    m.on("drag", () => { const ll = m.getLatLng(); pts[i + 1] = [ll.lat, ll.lng]; line.setLatLngs(pts); });
+    m.on("dragend", () => { dragging = false; commit("bent the map line"); rebuild(); });
+  }
+
+  // ---- a stretch to redraw
+  const SAY = {
+    start: "Click the teal line where the stretch to redraw starts.",
+    end: "Now click the line where the stretch ends.",
+    vias: "Click the map where the line should go instead, in order: as many points as it needs, or none. Drag a point to move it, double-click to remove it. Then choose in the panel.",
+  };
+  const told = () => (stretch ? { stage: stretch.stage, vias: stretch.vias.length } : null);
+  const cancelStretch = () => { endStretch(); onStretch(null); };
+
+  function drawStretch() {
+    marks.clearLayers();
+    if (!stretch) return;
+    const { from, to, vias } = stretch;
+    if (from && to) {
+      L.polyline(stretchOf(pts, from, to), { renderer: lines, color: DANGER, weight: 8, opacity: 0.55, interactive: false, stretchOld: true }).addTo(marks);
+      L.polyline([[from.lat, from.lon], ...vias, [to.lat, to.lon]], { renderer: lines, color: FOCUS, weight: 3, dashArray: "6 6", interactive: false, stretchNew: true }).addTo(marks);
+    }
+    if (from) L.marker([from.lat, from.lon], { icon: stretchIcon("A", "stretch-end"), interactive: false, keyboard: false }).addTo(marks);
+    if (to) L.marker([to.lat, to.lon], { icon: stretchIcon("B", "stretch-end"), interactive: false, keyboard: false }).addTo(marks);
+    vias.forEach((v, k) => {
+      const m = L.marker(v, { draggable: true, autoPan: true, keyboard: false, icon: stretchIcon(String(k + 1), "stretch-via"), stretchVia: k, title: "Drag to move, double-click to remove" }).addTo(marks);
+      m.on("dragend", () => { const ll = m.getLatLng(); vias[k] = [ll.lat, ll.lng]; drawStretch(); onStretch(told()); });
+      m.on("dblclick", (ev) => { L.DomEvent.stop(ev.originalEvent); vias.splice(k, 1); drawStretch(); onStretch(told()); });
+    });
+  }
+
+  function clicked(lat, lon) {
+    if (!stretch) return;
+    if (stretch.stage === "vias") {
+      stretch.vias.push([lat, lon]);
+    } else {
+      const at = nearestOnLine(pts, lat, lon);
+      if (!at || map.latLngToContainerPoint([at.lat, at.lon]).distanceTo(map.latLngToContainerPoint([lat, lon])) > PICK_PX) {
+        banner(`That is not on the line. ${SAY[stretch.stage]}`, cancelStretch);
+        return;
+      }
+      if (stretch.stage === "start") {
+        stretch.from = at;
+        stretch.stage = "end";
+      } else {
+        // picked the end first: the stretch is the same
+        stretch.to = at;
+        if (compareAlong(stretch.to, stretch.from) < 0) [stretch.from, stretch.to] = [stretch.to, stretch.from];
+        stretch.stage = "vias";
+      }
+    }
+    banner(SAY[stretch.stage], cancelStretch);
+    drawStretch();
+    onStretch(told());
+  }
+
+  const onMapClick = (ev) => clicked(ev.latlng.lat, ev.latlng.lng);
+  const onMoved = () => rebuild();
+  map.on("click", onMapClick);
+  map.on("moveend", onMoved);
+
+  function startStretch() {
+    stretch = { stage: "start", from: null, to: null, vias: [] };
+    // a stop's dot is a place like any other while picking
+    clickHandler = Object.assign((s) => clicked(s.lat, s.lon), { positionOnly: true });
+    // points placed in quick succession are points, not a zoom
+    map.doubleClickZoom.disable();
+    banner(SAY.start, cancelStretch);
+    drawStretch();
+    rebuild();
+    onStretch(told());
+  }
+  function endStretch() {
+    if (!stretch) return;
+    stretch = null;
+    clickHandler = null;
+    map.doubleClickZoom.enable();
+    marks.clearLayers();
+    banner(BANNER, null);
+    rebuild();
+  }
+
+  const BANNER = "Drag a point of the teal line to move it, or a faint point between two to bend it. Double-click a point to remove it.";
+  banner(BANNER, null);
+  lineEditCleanup = () => {
+    cleaned = true;
+    map.doubleClickZoom.enable();
+    map.off("click", onMapClick);
+    map.off("moveend", onMoved);
+  };
+  rebuild();
+  return {
+    replace(newPoints) {
+      pts = newPoints.map((p) => [p[0], p[1]]);
+      line.setLatLngs(pts);
+      // the places picked were on the line as it was
+      if (stretch) { endStretch(); onStretch(null); }
+      rebuild();
+    },
+    startStretch,
+    stretch: () => (stretch && stretch.from && stretch.to ? { from: stretch.from, to: stretch.to, vias: stretch.vias.map((v) => [v[0], v[1]]) } : null),
+    endStretch,
+    points: () => pts.map((p) => [p[0], p[1]]),
   };
 }
 

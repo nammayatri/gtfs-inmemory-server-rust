@@ -1296,14 +1296,17 @@ class Handler(BaseHTTPRequestHandler):
             # docs section 17: how the two map line suggestions behave. osrm: ok,
             # no_segment, no_route, timeout, unreachable. gps: ok, partial, none,
             # not_enough_runs, budget (not enough, reading cut short), unavailable,
-            # timeout.
+            # timeout. road (a stretch by road, section 28): ok, no_segment.
             b = self._body()
             with LOCK:
                 if "osrm" in b:
                     s.map_line_osrm = b["osrm"]
                 if "gps" in b:
                     s.map_line_gps = b["gps"]
-            return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok")})
+                if "road" in b:
+                    s.map_line_road = b["road"]
+            return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok"),
+                                    "road": getattr(s, "map_line_road", "ok")})
         if path == "/__dev/feed-source" and method == "POST":
             # The Delivery page only has a live version to talk about when the feed is
             # served from the DB, and the feed-config flow above deliberately leaves it
@@ -1768,6 +1771,22 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, {"job_id": rest[1], "gtfs_id": g, "kind": "gps_line", "dry_run": True, "status": status,
                              "report": job.get("report") if ready else None,
                              "error": job.get("error") if ready else None}
+            # a stretch of a line edited by hand, by road (docs section 28): the
+            # mock's roads run north-south then east-west, so each leg is an L
+            if rest == ["polyline:road"] and method == "POST":
+                self.require_role(u, "editor")
+                pts = self._body().get("points")
+                if not isinstance(pts, list) or not 2 <= len(pts) <= 25:
+                    raise ApiError(400, "invalid_payload", "points: between 2 and 25 points")
+                pts = [(float(p["lat"]), float(p["lon"])) for p in pts]
+                if getattr(s, "map_line_road", "ok") == "no_segment":
+                    raise ApiError(502, "osrm_failed", "OSRM could not route this stretch: there is no road near point 1 you placed",
+                                   {"reason": "no_segment", "osrm_code": "NoSegment", "message": "", "leg": None, "waypoint": 1})
+                line = [pts[0]]
+                for (alat, alon), (blat, blon) in zip(pts, pts[1:]):
+                    line += [(blat, alon), (blat, blon)]
+                dist = sum(haversine(*a, *b) for a, b in zip(line, line[1:]))
+                return 200, {"encoded_polyline": polyline_encode(line), "points": len(pts), "distance_m": round(dist)}
             if len(rest) == 3 and rest[0] == "routes" and rest[2] in ("polyline:osrm", "polyline:gps") and method == "POST":
                 self.require_role(u, "editor")
                 cs = s.change_sets.get(q.get("change_set", [""])[0])

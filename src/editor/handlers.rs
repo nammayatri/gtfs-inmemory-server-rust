@@ -1448,6 +1448,127 @@ pub async fn polyline_osrm(
     }))
 }
 
+/// The points a stretch of a map line is routed through: where the stretch
+/// starts and ends on the line, and the points clicked between (section 28).
+#[derive(Deserialize)]
+pub struct RoadBody {
+    points: Vec<LatLon>,
+}
+
+#[derive(Deserialize)]
+pub struct LatLon {
+    lat: f64,
+    lon: f64,
+}
+
+/// At most one OSRM request: a stretch is its two ends and a few points
+/// between, never a whole route (that is `polyline:osrm`).
+pub const ROAD_MAX_POINTS: usize = osrm::ROUTE_CHUNK;
+const ROAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// `POST /feeds/{g}/polyline:road` - a road route through the points given, in
+/// order: the dashboard's "Follow the roads" for a stretch of a line edited by
+/// hand (section 28). Nothing is read from the feed and nothing is saved; the
+/// dashboard splices the answer into its line.
+pub async fn polyline_road(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<RoadBody>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Editor).await?;
+    let pts = &body.points;
+    if pts.len() < 2 || pts.len() > ROAD_MAX_POINTS {
+        return Err(EditorError::bad_request(
+            "invalid_payload",
+            format!(
+                "points: between 2 and {ROAD_MAX_POINTS} points, the stretch's start, any points between, its end ({} given)",
+                pts.len()
+            ),
+        ));
+    }
+    if let Some(i) = pts.iter().position(|p| {
+        !(p.lat.is_finite() && p.lon.is_finite())
+            || !(-90.0..=90.0).contains(&p.lat)
+            || !(-180.0..=180.0).contains(&p.lon)
+    }) {
+        return Err(EditorError::bad_request(
+            "invalid_payload",
+            format!("points[{i}]: lat is -90 to 90 and lon -180 to 180"),
+        ));
+    }
+    let Some(base) = st.osrm_url.as_deref().filter(|u| !u.is_empty()) else {
+        return Err(EditorError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "osrm_unavailable",
+            "no OSRM server is configured",
+        ));
+    };
+    let points: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
+    // named as the person placed them: the start, "point 2", ..., the end
+    let waypoints: Vec<svc::Waypoint> = (0..points.len())
+        .map(|i| svc::Waypoint {
+            lat: points[i].0,
+            lon: points[i].1,
+            sequence: None,
+            id: None,
+            name: Some(match i {
+                0 => "the start of the stretch".to_string(),
+                i if i == points.len() - 1 => "the end of the stretch".to_string(),
+                i => format!("point {i} you placed"),
+            }),
+            marker: true,
+        })
+        .collect();
+    let line = osrm::route_through(&st.http, base, &points, ROAD_BUDGET)
+        .await
+        .map_err(|f| road_failure(&f, &waypoints))?;
+    let distance: f64 = line.legs.iter().map(|(d, _)| d).sum();
+    ok(json!({
+        "encoded_polyline": osrm::encode_polyline(&line.points),
+        "points": points.len(),
+        "distance_m": distance.round(),
+    }))
+}
+
+/// The 502 for a stretch OSRM would not route: as [`osrm_failure`], but the
+/// waypoints are points on a map, not a route's stops.
+fn road_failure(f: &osrm::RouteFailure, waypoints: &[svc::Waypoint]) -> EditorError {
+    use osrm::FailReason as R;
+    let name = |i: Option<usize>| {
+        i.and_then(|i| waypoints.get(i))
+            .and_then(|w| w.name.clone())
+            .unwrap_or_else(|| "a point".to_string())
+    };
+    let why = match f.reason {
+        R::NoSegment => format!("there is no road near {}", name(f.waypoint)),
+        R::NoRoute => match f.leg {
+            Some(l) => format!(
+                "there is no road from {} to {}",
+                name(Some(l)),
+                name(Some(l + 1))
+            ),
+            None => "there is no road route through these points".to_string(),
+        },
+        R::Timeout => "OSRM did not answer in time".to_string(),
+        R::Unreachable => "OSRM could not be reached".to_string(),
+        R::HttpError => format!("OSRM refused the request ({})", f.message),
+    };
+    EditorError::new(
+        StatusCode::BAD_GATEWAY,
+        "osrm_failed",
+        format!("OSRM could not route this stretch: {why}"),
+    )
+    .with_details(json!({
+        "reason": f.reason,
+        "osrm_code": f.osrm_code,
+        "message": f.message,
+        "leg": f.leg,
+        "waypoint": f.waypoint,
+    }))
+}
+
 /// A map line from the buses' own GPS (docs section 17): not saved, like the
 /// OSRM one - the dashboard adds it to the draft as a `route` change.
 pub async fn polyline_gps(
