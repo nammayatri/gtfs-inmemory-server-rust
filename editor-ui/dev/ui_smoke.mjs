@@ -9,6 +9,8 @@
 //   node dev/ui_smoke.mjs --route-active     # only making a route inactive and active again
 //   node dev/ui_smoke.mjs --migration        # only moving work from master to prod (section 23)
 //   node dev/ui_smoke.mjs --map-line-edit    # only a map line edited by hand (section 28)
+//   node dev/ui_smoke.mjs --routes-map       # only several routes on the map (section 29)
+//   node dev/ui_smoke.mjs --map-tiles        # only the base map, OpenStreetMap or Google (section 30)
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -32,8 +34,10 @@
 // that tie a station to its platforms, a description and a platform label on
 // stops and stations, and importing stop details. Then the map line flows
 // (mapLineFlows; `--map-line`): a line through the stops and from GPS, and the
-// reason when either fails; and one edited by hand on the map
-// (mapLineEditFlow; `--map-line-edit`). Last, who may work on which feed (feedAccessFlows;
+// reason when either fails; one edited by hand on the map (mapLineEditFlow;
+// `--map-line-edit`); several routes on the map at once (routesMapFlow;
+// `--routes-map`); and the base map, OpenStreetMap or Google (mapTilesFlow;
+// `--map-tiles`). Last, who may work on which feed (feedAccessFlows;
 // `--feed-access`): a system account at the gate, the no-feeds screen, the
 // switcher, badges and buttons by the role on the chosen feed, the People grid,
 // and a grant taken away while the page is open.
@@ -1731,6 +1735,203 @@ async function mapLineEditFlow() {
   await shot("mle-04-in-draft");
 }
 
+// docs section 29: several routes' map lines on the map at once - added by
+// search, each its own colour, one drawn as the draft has it, picked out by
+// pointing, hidden, removed; the address keeping them; from a stop's routes and
+// a route's page; at most 20.
+async function routesMapFlow() {
+  const lines = () => mapCall(`const out = []; map.eachLayer((l) => { if (l.options && l.options.multiRoute) out.push({ key: l.options.multiRoute, color: l.options.color, weight: l.options.weight, opacity: l.options.opacity, dash: l.options.dashArray || null }); }); return out;`);
+  const count = (opt) => mapCall(`let n = 0; map.eachLayer((l) => { if (l.options && l.options[${JSON.stringify(opt)}]) n++; }); return n;`);
+  const listed = () => evaluate(`[...document.querySelectorAll("[data-routes-map] [data-route]")].map((el) => el.dataset.route)`);
+  const hashIds = () => evaluate(`decodeURIComponent((location.hash.split("ids=")[1] || ""))`);
+  // b and c with no line: none the draft gives one (earlier flows of a full run)
+  const draftId = await activeDraftId().catch(() => null);
+  const drafted = new Set(draftId ? ((await api(`change-sets/${draftId}`)).changes || []).filter((x) => x.entity === "route").map((x) => x.entity_key) : []);
+  const routes = (await api("feeds/chennai_bus/routes?q=21G&limit=30")).items
+    .filter((r) => r.route_id !== "1369" && !r.deleted && r.stop_count >= 4 && !r.has_polyline && !drafted.has(r.route_id));
+  if (!check(routes.length >= 3, "three routes to show")) return;
+  const [a, b, c] = routes;
+
+  // ---- route a gets a line in a draft: the page shows it as the draft has it
+  await go(`#/route/${a.route_id}`);
+  await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
+  await click("Edit name, colour and map line");
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Routes on the map");
+  await waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Route through stops")`, "the suggestion through the stops");
+  await click("Route through stops");
+  await waitFor(`document.getElementById("panel").innerText.includes("New map line ready")`, "a line through the stops");
+  await click("Add to draft", ".sticky-actions");
+  await sleep(800);
+
+  // ---- the page, from the menu
+  check(await has(`a[data-nav="routes-map"]`), "Routes on the map is in the menu");
+  await go("#/routes-map");
+  await waitFor(`document.getElementById("panel").innerText.includes("Routes on the map")`, "the page");
+  check(await evaluate(`document.activeElement?.id === "routes-map-search"`), "the search box has the focus");
+
+  // ---- add by search: Enter takes the first, a click another
+  await type("#routes-map-search", "21G");
+  await waitFor(`!document.getElementById("routes-map-results").hidden && document.querySelectorAll(".routes-map-result").length > 2`, "routes found");
+  await evaluate(`(() => { const el = document.querySelector(".routes-map-result[data-route='${a.route_id}']");
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); return true; })()`);
+  await waitFor(`document.querySelectorAll("[data-routes-map] [data-route]").length === 1 && document.querySelector("[data-routes-map] .sub")`, "route a listed");
+  await type("#routes-map-search", "21G");
+  await waitFor(`document.querySelectorAll(".routes-map-result").length > 2`, "routes found again");
+  check((await text(`.routes-map-result[data-route="${a.route_id}"]`)).includes("on the map"), "a route already shown says so in the results");
+  await evaluate(`(() => { const el = document.querySelector(".routes-map-result[data-route='${b.route_id}']");
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); return true; })()`);
+  await waitFor(`document.querySelectorAll("[data-routes-map] .sub").length === 2`, "route b listed");
+  check(JSON.stringify(await listed()) === JSON.stringify([a.route_id, b.route_id]), "listed in the order added");
+  check(await hashIds() === `${a.route_id},${b.route_id}`, `the address keeps them: ${await hashIds()}`);
+  let drawn = await lines();
+  check(drawn.length === 2 && drawn[0].color !== drawn[1].color, `two lines, each its own colour (${drawn.map((l) => l.color)})`);
+  const la = drawn.find((l) => l.key === a.route_id), lb = drawn.find((l) => l.key === b.route_id);
+  check(!!la && la.dash === null, "route a: its drafted line, solid");
+  check(!!lb && lb.dash === "3 7", "route b, with no line: dashed through its stops");
+  const subs = await text("[data-routes-map]");
+  check(subs.includes("as in your draft") && subs.includes("no map line: dashed through its stops"), "the list says which is drafted and which has no line");
+  check(await count("routeChip") === 2, "a chip with each route's number");
+  await shot("rm-01-two-routes");
+
+  // ---- pointing at one picks it out
+  await evaluate(`document.querySelector('[data-routes-map] [data-route="${b.route_id}"]').dispatchEvent(new MouseEvent("mouseenter")), true`);
+  drawn = await lines();
+  check(drawn.find((l) => l.key === b.route_id).weight === 7 && drawn.find((l) => l.key === a.route_id).opacity < 0.5, "pointing at a route draws it thicker and fades the rest");
+  await evaluate(`document.querySelector("[data-routes-map]").dispatchEvent(new MouseEvent("mouseleave")), true`);
+  drawn = await lines();
+  check(drawn.every((l) => l.weight === 4 && l.opacity > 0.8), "and leaving the list puts them back");
+
+  // ---- their stops, hidden, the Routes switch
+  await evaluate(`document.getElementById("routes-map-stops").click(), true`);
+  await sleep(300);
+  const stopsDrawn = await count("multiStop");
+  check(stopsDrawn >= a.stop_count, `their stops drawn (${stopsDrawn})`);
+  await evaluate(`document.getElementById("routes-map-stops").click(), true`);
+  await sleep(300);
+  check(await count("multiStop") === 0, "and hidden again");
+  await evaluate(`document.querySelector('[data-routes-map] [data-route="${a.route_id}"] input[type=checkbox]').click(), true`);
+  await sleep(300);
+  drawn = await lines();
+  check(drawn.length === 1 && drawn[0].key === b.route_id, "unticking a route hides its line");
+  await evaluate(`document.querySelector('[data-routes-map] [data-route="${a.route_id}"] input[type=checkbox]').click(), true`);
+  await sleep(300);
+  await evaluate(`document.getElementById("show-routes").click(), true`);
+  await sleep(300);
+  check(await mapCall(`let n = 0; map.eachLayer((l) => { if (l.options && l.options.multiRoute) n++; }); return n;`) === 0, "Routes off: no line drawn");
+  check((await text(".layer-note")).includes("The routes are not drawn"), "and the Show box says why");
+  await evaluate(`document.getElementById("show-routes").click(), true`);
+  await sleep(300);
+  check((await lines()).length === 2, "Routes on: both again");
+
+  // ---- the address brings them back, an unknown id said, and the trail follows
+  await evaluate(`[...document.querySelectorAll('[data-routes-map] [data-route="${b.route_id}"] button')].find((x) => x.textContent === "Remove").click(), true`);
+  await sleep(300);
+  check(await hashIds() === a.route_id, "removing one takes it out of the address");
+  const trailHref = await evaluate(`JSON.parse(sessionStorage.getItem("gtfs-editor-trail") || "[]").slice(-1)[0]?.href || ""`);
+  check(trailHref.includes(`ids=${a.route_id}`) && !trailHref.includes(b.route_id), `the trail's way back is the view as it is now (${trailHref})`);
+  await go("#/");
+  await go(`#/routes-map?ids=NOPE,${a.route_id},${c.route_id}`);
+  await waitFor(`document.querySelectorAll("[data-routes-map] .sub").length === 2 && document.querySelector(".routes-map-error")`, "the routes of the address");
+  check(JSON.stringify(await listed()) === JSON.stringify(["NOPE", a.route_id, c.route_id]), "in the address's order");
+  check((await text("[data-routes-map]")).includes("No route NOPE in this feed."), "an unknown id is said, not dropped");
+  check((await lines()).length === 2, "the two real ones drawn");
+  check(await mapCall(`return map.getBounds().contains([${JSON.stringify((await api(`feeds/chennai_bus/routes/${c.route_id}`)).rows.find((r) => r.lat != null)).replace(/.*"lat":([\d.]+).*"lon":([\d.]+).*/, "$1, $2")}]);`),
+    "the map framed to show them");
+  await shot("rm-02-from-address");
+
+  // ---- from a stop's routes and from a route's page
+  const stop = (await api(`feeds/chennai_bus/routes/${a.route_id}`)).rows.find((r) => r.stop_id && r.stop_type !== "ROUTE CORRECTION");
+  const stopRoutes = [...new Set((await api(`feeds/chennai_bus/stops/${stop.stop_id}`)).routes.filter((r) => r.active !== false).map((r) => r.route_id))];
+  await go(`#/stop/${stop.stop_id}`);
+  if (stopRoutes.length > 1) {
+    await waitFor(`!!document.getElementById("stop-routes-map")`, "Show these routes on the map");
+    await evaluate(`document.getElementById("stop-routes-map").click(), true`);
+    await waitFor(`document.querySelectorAll("[data-routes-map] .sub").length === ${Math.min(stopRoutes.length, 20)}`, "the stop's routes");
+    check(JSON.stringify(await listed()) === JSON.stringify(stopRoutes.slice(0, 20)), `the stop's ${stopRoutes.length} routes, each once`);
+  } else {
+    check(!(await has("#stop-routes-map")), "a stop with one route offers no routes map");
+  }
+  await go(`#/route/${c.route_id}`);
+  await waitFor(`!!document.getElementById("route-with-others")`, "Show with other routes");
+  await evaluate(`document.getElementById("route-with-others").click(), true`);
+  await waitFor(`document.querySelectorAll("[data-routes-map] .sub").length === 1`, "the route on the page");
+  check(JSON.stringify(await listed()) === JSON.stringify([c.route_id]), "the route it came from");
+
+  // ---- at most 20
+  const many = (await api("feeds/chennai_bus/routes?q=&limit=25")).items.map((r) => r.route_id);
+  if (check(many.length >= 21, `21 routes to ask for (${many.length})`)) {
+    await go(`#/routes-map?ids=${many.slice(0, 21).map(encodeURIComponent).join(",")}`);
+    await waitFor(`document.querySelectorAll("[data-routes-map] [data-route]").length === 20 && [...document.querySelectorAll("[data-routes-map] .list-item")].every((el) => el.querySelector(".sub") || el.querySelector(".routes-map-error"))`, "twenty routes", 15000);
+    check(await evaluate(`document.getElementById("routes-map-search").disabled`), "no 21st: the search waits for one to be removed");
+    const twenty = await lines();
+    const looks = new Set(twenty.map((l) => `${l.color}|${l.dash}`));
+    check(twenty.length === 20 && looks.size === 20, `past ten, the colours come again with other dashes: every route looks different (${looks.size} of ${twenty.length})`);
+  }
+}
+
+// docs section 30: the base map - OpenStreetMap, or Google Maps when the
+// server has a key - chosen from the Show box and kept in this browser, with
+// Google's copyright for the view, and OpenStreetMap when Google fails.
+async function mapTilesFlow() {
+  const setTiles = (m) => evaluate(`fetch("/__dev/map-tiles", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify(m))} }).then((r) => r.json())`);
+  const baseLayer = () => mapCall(`let out = null; map.eachLayer((l) => { if (l.options && l.options.baseMap) out = { name: l.options.baseMap, url: l._url, n: (out ? out.n : 0) + 1 }; }); return out;`);
+  const reload = async () => {
+    await load(UI);
+    await waitFor(`!document.getElementById("app").hidden`, "the app after a reload");
+    await sleep(800);
+  };
+  const attribution = () => text(".leaflet-control-attribution");
+
+  // ---- no key: OpenStreetMap, nothing to choose
+  let b = await baseLayer();
+  check(b && b.name === "osm" && b.url.includes("openstreetmap.org"), `OpenStreetMap with no key (${b && b.url})`);
+  check(await evaluate(`document.querySelector(".base-maps").hidden`), "no choice of map offered");
+
+  // ---- a key: the choice, OpenStreetMap first, Google when chosen
+  await setTiles({ google: "ok", default: "osm" });
+  await reload();
+  check(!(await evaluate(`document.querySelector(".base-maps").hidden`)), "the Show box offers the map");
+  check(await evaluate(`document.getElementById("base-map-osm").checked`), "OpenStreetMap first: the server's default");
+  await evaluate(`document.getElementById("base-map-google").click(), true`);
+  await waitFor(`document.querySelector(".leaflet-control-attribution")?.innerText.includes("Map data ©2026 Google")`, "Google's copyright for the view");
+  b = await baseLayer();
+  check(b && b.name === "google" && b.url.includes("/__dev/tile/") && b.n === 1, `Google's tiles, one base layer (${b && b.url})`);
+  const att = await attribution();
+  check(att.includes("Google Maps") && !att.includes("OpenStreetMap"), `the attribution is Google's alone: ${att}`);
+  await mapCall(`map.setZoom(21, { animate: false }); return true;`);
+  await sleep(900);
+  check(await mapCall(`return map.getZoom();`) === 21, "Google zooms past 19");
+  check((await attribution()).includes("(zoom 21)"), "the copyright follows the view");
+  await evaluate(`document.getElementById("base-map-osm").click(), true`);
+  await sleep(500);
+  check(await mapCall(`return map.getZoom();`) === 19, "back on OpenStreetMap, the map comes back to its 19");
+  check(!(await attribution()).includes("Google"), "and Google's attribution goes with its tiles");
+  await evaluate(`document.getElementById("base-map-google").click(), true`);
+  await sleep(300);
+  await reload();
+  b = await baseLayer();
+  check(b && b.name === "google", "the choice is kept in this browser");
+  await shot("mt-01-google");
+
+  // ---- Google failing: OpenStreetMap, and why
+  await setTiles({ google: "error" });
+  await reload();
+  b = await baseLayer();
+  check(b && b.name === "osm", "Google refused: OpenStreetMap");
+  check(await evaluate(`document.getElementById("base-map-google").disabled`), "Google Maps cannot be chosen");
+  check((await text(".base-note")).includes("Google Maps is not available now: Google refused the map session (HTTP 403)"), "and the Show box says why");
+
+  // ---- the server's default for someone who has not chosen
+  await setTiles({ google: "ok", default: "google" });
+  await evaluate(`(() => { const p = JSON.parse(localStorage.getItem("gtfs-editor-prefs") || "{}"); delete p.mapTiles; localStorage.setItem("gtfs-editor-prefs", JSON.stringify(p)); return true; })()`);
+  await reload();
+  b = await baseLayer();
+  check(b && b.name === "google", "no choice yet: the server's default, Google");
+  await setTiles({ google: "off", default: "osm" });
+}
+
 // A route's trips from GPS on a day (docs section 17.8), on the first feed
 // this person holds that has GPS.
 async function gpsTripsFlow() {
@@ -2018,6 +2219,54 @@ if (process.argv.includes("--gps-trips")) {
     await load(UI);
     await signIn("editor1@nammayatri.in");
     await gpsTripsFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+// ---- only the base map
+if (process.argv.includes("--map-tiles")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await mapTilesFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+// ---- only several routes on the map
+if (process.argv.includes("--routes-map")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await routesMapFlow();
     check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
   } catch (e) {
     failures.push(e.message);
@@ -3336,6 +3585,10 @@ try {
   await mapLineFlows();
   // ================================================================ a map line edited by hand: see mapLineEditFlow above
   await mapLineEditFlow();
+  // ================================================================ several routes on the map: see routesMapFlow above
+  await routesMapFlow();
+  // ================================================================ the base map: see mapTilesFlow above (last: it reloads the page)
+  await mapTilesFlow();
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
 } catch (e) {

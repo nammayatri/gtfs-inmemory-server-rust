@@ -72,8 +72,10 @@ export function initMap() {
   map.createPane("dots").style.zIndex = "420";
   lines = L.canvas({ pane: "lines", padding: 0.3 });
   dots = L.canvas({ pane: "dots", padding: 0.3 });
-  L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY }).addTo(map);
-  for (const name of ["links", "route", "proposal", "offLine", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "geofence", "lineEdit", "labels"]) {
+  // the base map (docs section 30): OpenStreetMap at once, unless this browser
+  // chose Google, whose address (with a session) the server gives
+  if (pref("mapTiles", null) !== "google") setBase("osm");
+  for (const name of ["links", "multi", "route", "proposal", "offLine", "gpsTrips", "review", "reviewRoute", "coord", "pair", "focus", "context", "stops", "drafted", "proposals", "coordPoints", "candidates", "edit", "select", "place", "geofence", "lineEdit", "labels"]) {
     layers[name] = L.layerGroup().addTo(map);
   }
   initLayerControl();
@@ -90,8 +92,106 @@ export function initMap() {
   // altogether; keep Leaflet's idea of the map size in step with its box, or
   // tiles cover only part of the map.
   new ResizeObserver(() => map.invalidateSize()).observe(map.getContainer());
+  map.on("moveend", () => { if (baseName === "google") googleCopyright(); });
   loadStops();
+  loadBaseMaps();
   return map;
+}
+
+// ------------------------------------------------------------------ base map
+// docs section 30. OpenStreetMap, or Google Maps through the Map Tiles API when
+// the deployment has a key: GET map-tiles says which a person sees first and
+// gives Google's tile address with a session. The person's choice is kept in
+// this browser. Google's copyright for the view is asked of the server (it
+// changes with the view) and shown in full, after "Google Maps".
+let base = null;              // the tile layer under everything
+let baseName = null;          // "osm" | "google"
+let tiles = { default: "osm", google: null, google_error: null };
+let googleAttribution = null; // the attribution text now shown for Google
+let tilesRenew = null;
+
+const osmLayer = () => L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY, baseMap: "osm" });
+
+export const baseMap = () => baseName;
+export const baseMaps = () => ({ ...tiles, current: baseName });
+
+function setBase(name) {
+  if (name === "google" && !tiles.google) name = "osm";
+  if (name === baseName && base) return;
+  if (base) map.removeLayer(base);
+  showGoogleAttribution(null);
+  base = name === "google"
+    ? L.tileLayer(tiles.google.url, { maxZoom: tiles.google.max_zoom || 22, referrerPolicy: TILE_REFERRER_POLICY, baseMap: "google" })
+    : osmLayer();
+  base.addTo(map);
+  base.bringToBack();
+  baseName = name;
+  // OpenStreetMap stops at 19; Google goes on to 22
+  if (name === "osm" && map.getZoom() > 19) map.setZoom(19);
+  if (name === "google") { showGoogleAttribution(""); googleCopyright(); }
+  updateBaseChooser();
+}
+
+// Choose the base map, remembered in this browser.
+export function chooseBaseMap(name) {
+  setPref("mapTiles", name);
+  setBase(name);
+}
+
+function showGoogleAttribution(copyright) {
+  const ctl = map.attributionControl;
+  if (googleAttribution != null) ctl.removeAttribution(googleAttribution);
+  googleAttribution = null;
+  if (copyright == null) return;
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  googleAttribution = `<span class="google-mark" role="img" aria-label="Google Maps">Google Maps</span>${copyright ? ` <span class="google-copyright">${esc(copyright)}</span>` : ""}`;
+  ctl.addAttribution(googleAttribution);
+}
+
+let copyrightSeq = 0;
+const googleCopyright = debounce(async () => {
+  if (baseName !== "google") return;
+  const b = map.getBounds();
+  const mine = ++copyrightSeq;
+  try {
+    const q = `zoom=${Math.round(map.getZoom())}&north=${b.getNorth()}&south=${b.getSouth()}&east=${b.getEast()}&west=${b.getWest()}`;
+    const res = await get(`map-tiles/viewport?${q}`);
+    if (mine === copyrightSeq && baseName === "google") showGoogleAttribution(res.copyright || "");
+  } catch {
+    /* the mark stays; the copyright comes with the next move */
+  }
+}, 400);
+
+async function loadBaseMaps() {
+  try {
+    tiles = await get("map-tiles");
+  } catch {
+    tiles = { default: "osm", google: null, google_error: null };
+  }
+  const wanted = pref("mapTiles", null) || tiles.default || "osm";
+  if (baseName === "google" && tiles.google) base.setUrl(tiles.google.url);
+  else setBase(wanted);
+  updateBaseChooser();
+  // a session lasts about two weeks: a new address an hour before it ends
+  clearTimeout(tilesRenew);
+  if (tiles.google && tiles.google.expires_at) {
+    const ms = tiles.google.expires_at * 1000 - Date.now() - 3600 * 1000;
+    tilesRenew = setTimeout(loadBaseMaps, Math.min(Math.max(ms, 60 * 1000), 2 ** 31 - 1));
+  }
+}
+
+let baseChooser = null;
+function updateBaseChooser() {
+  if (!baseChooser) return;
+  const offered = !!tiles.google || !!tiles.google_error;
+  baseChooser.hidden = !offered;
+  baseChooser.querySelectorAll("input[name=base-map]").forEach((r) => {
+    r.checked = r.value === baseName;
+    if (r.value === "google") r.disabled = !tiles.google;
+  });
+  const note = baseChooser.querySelector(".base-note");
+  note.hidden = !tiles.google_error;
+  note.textContent = tiles.google_error ? `Google Maps is not available now: ${tiles.google_error}` : "";
 }
 
 export const getMap = () => map;
@@ -195,8 +295,13 @@ function initLayerControl() {
     // under the zoom buttons: the map's left edge is in view whatever the window's width
     options: { position: "topleft" },
     onAdd() {
+      const radio = (value, label) => h("label.check", { for: `base-map-${value}` },
+        h("input", { type: "radio", name: "base-map", id: `base-map-${value}`, value, on: { change: () => chooseBaseMap(value) } }), ` ${label}`);
+      // offered once the server says Google is set up (section 30)
+      baseChooser = h("div.base-maps", { role: "radiogroup", "aria-label": "Base map", hidden: true },
+        h("span.base-title", "Map"), radio("osm", "OpenStreetMap"), radio("google", "Google Maps"), h("p.base-note", { hidden: true }));
       const el = h("fieldset.layer-toggle.leaflet-bar", { "aria-label": "Show on the map" },
-        h("legend", "Show"), box("stations", "Stations"), box("routes", "Routes"), box("stops", "Stops"), box("links", "Station links"), layerNote);
+        h("legend", "Show"), box("stations", "Stations"), box("routes", "Routes"), box("stops", "Stops"), box("links", "Station links"), layerNote, baseChooser);
       L.DomEvent.disableClickPropagation(el);
       L.DomEvent.disableScrollPropagation(el);
       return el;
@@ -207,7 +312,7 @@ function initLayerControl() {
 }
 
 function applyRouteVisibility() {
-  for (const name of ["route", "reviewRoute"]) {
+  for (const name of ["route", "reviewRoute", "multi"]) {
     if (visible.routes && !map.hasLayer(layers[name])) map.addLayer(layers[name]);
     if (!visible.routes && map.hasLayer(layers[name])) map.removeLayer(layers[name]);
   }
@@ -235,6 +340,7 @@ function updateLayerNote() {
   if (!layerNote) return;
   const notes = [];
   if (!visible.routes && layers.route.getLayers().length) notes.push("The open route is not drawn: Routes is off.");
+  if (!visible.routes && layers.multi.getLayers().length) notes.push("The routes are not drawn: Routes is off.");
   if ((!visible.stops || !visible.stations) && stopsNeeded()) notes.push("Every stop is drawn while you choose one on the map.");
   else if (focusRow && !kindShown(focusRow)) notes.push(`Only the open ${focusRow.location_type === 1 ? "station" : "stop"} is drawn: ${focusRow.location_type === 1 ? "Stations" : "Stops"} is off.`);
   if (visible.links && visible.stations && !visible.stops && !stopsNeeded()) notes.push("Station links run to a station's stops: they are not drawn while Stops is off.");
@@ -663,6 +769,72 @@ export function clearRoute(layer = "route") {
   updateLayerNote();
 }
 
+// Several routes at once (docs section 29), each in its own colour:
+// [{key, route, color, dashed}]. A route's map line, or dashed through its
+// stops when it has none; a chip with its number where it starts; and, with
+// `stops`, its stops in its colour. `focus` (a key) draws that route on top,
+// thicker, and fades the rest. Cleared by endModes(), like any page's overlay.
+export function showRoutes(list, { focus = null, stops = false, fit = false } = {}) {
+  const group = layers.multi;
+  group.clearLayers();
+  const order = [...list].sort((a, b) => (a.key === focus) - (b.key === focus));
+  for (const item of order) {
+    const { route, color } = item;
+    const faded = focus != null && item.key !== focus;
+    const served = (route.rows || []).filter((r) => r.stop_type !== "ROUTE CORRECTION" && r.lat != null);
+    const line = routeLine(route);
+    const pts = line || served.map((r) => [r.lat, r.lon]);
+    if (pts.length > 1) {
+      L.polyline(pts, {
+        renderer: lines, color, weight: item.key === focus ? 7 : 4, opacity: faded ? 0.25 : 0.9,
+        // past the palette's ten colours a route is told apart by its dashes:
+        // a line solid or long-dashed, no line short-dashed or dash-dotted
+        dashArray: !line ? (item.dashed ? "10 4 2 4" : "3 7") : item.dashed ? "12 6" : null, interactive: false, multiRoute: item.key,
+      }).addTo(group);
+    }
+    if (stops) {
+      served.forEach((r) => {
+        L.circleMarker([r.lat, r.lon], {
+          renderer: dots, bubblingMouseEvents: false, radius: 4, color, weight: 2, fillColor: "#ffffff", fillOpacity: 1,
+          opacity: faded ? 0.35 : 1, multiStop: item.key,
+        })
+          .bindTooltip(text(`${route.short_name || route.route_id}: ${r.stop_name || r.stop_id}`), { direction: "top" })
+          .on("click", () => stopClicked({ stop_id: r.stop_id, name: r.stop_name, lat: r.lat, lon: r.lon, parent_station: r.parent_station, location_type: 0 }))
+          .addTo(group);
+      });
+    }
+    if (pts.length) {
+      L.marker(pts[0], {
+        icon: L.divIcon({ className: "", html: h("span.route-chip", { style: `background:${color}` }, route.short_name || route.route_id), iconSize: null }),
+        interactive: false, keyboard: false, opacity: faded ? 0.4 : 1, zIndexOffset: item.key === focus ? 1000 : 0, routeChip: item.key,
+      }).addTo(group);
+    }
+  }
+  if (fit) fitRoutes(list);
+  updateLayerNote();
+}
+
+// A route's map line as points, or null when it has none to draw.
+function routeLine(route) {
+  try {
+    const line = route.encoded_polyline ? decodePolyline(route.encoded_polyline) : null;
+    return line && line.length > 1 ? line : null;
+  } catch {
+    return null;
+  }
+}
+
+// Fit the map to the routes of a showRoutes() list: their lines, or their stops.
+export function fitRoutes(list) {
+  const all = [];
+  for (const { route } of list) {
+    const line = routeLine(route);
+    if (line) all.push(...line);
+    else (route.rows || []).forEach((r) => { if (r.lat != null && r.stop_type !== "ROUTE CORRECTION") all.push([r.lat, r.lon]); });
+  }
+  if (all.length) map.fitBounds(L.latLngBounds(all).pad(0.08), { maxZoom: 16 });
+}
+
 // A day's trips from the buses' GPS (docs section 17.8), each in its own
 // colour; the chosen one (an index into `trips`) thicker and on top, the rest
 // faded. Cleared with clearRoute("gpsTrips").
@@ -712,7 +884,7 @@ export function endModes() {
   geofenceCleanup = null;
   if (lineEditCleanup) lineEditCleanup();
   lineEditCleanup = null;
-  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal", "offLine", "geofence", "lineEdit"]) layers[name].clearLayers();
+  for (const name of ["edit", "select", "candidates", "pair", "review", "reviewRoute", "proposals", "coord", "coordPoints", "drafted", "context", "proposal", "offLine", "geofence", "lineEdit", "multi"]) layers[name].clearLayers();
   map.closePopup();
   quietIds = new Set();
   reserved = [];

@@ -24,6 +24,7 @@ pub mod handlers;
 pub mod history;
 pub mod import_jobs;
 pub mod jwt;
+pub mod map_tiles;
 pub mod migration;
 pub mod position_reviews;
 pub mod proposals;
@@ -68,6 +69,8 @@ pub struct EditorState {
     pub http: reqwest::Client,
     /// Release to Nandi targets master Nandi, not prod (dhall `is_master`).
     pub is_master: bool,
+    /// The dashboard's base map: OpenStreetMap, or Google's (section 30).
+    pub map_tiles: map_tiles::MapTiles,
 }
 
 pub struct EditorSettings {
@@ -110,6 +113,7 @@ impl EditorState {
             gps_line: None,
             gps_polyline_sync: None,
             is_master: false,
+            map_tiles: map_tiles::MapTiles::default(),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .build()
@@ -178,6 +182,12 @@ impl EditorState {
             Ok(mut state) => {
                 info!("GTFS editor enabled at /internal/gtfs-editor");
                 state.is_master = config.is_master;
+                match map_tiles::MapTiles::from_config(config.gtfs_editor_map_tiles.as_ref()) {
+                    Ok(t) => state.map_tiles = t,
+                    Err(e) => error!(
+                        "gtfs_editor_map_tiles is invalid: {e}; the dashboard uses OpenStreetMap"
+                    ),
+                }
                 if let Some(gps) = &config.gtfs_gps {
                     let settings = gps_line::settings_from_config(
                         gps,
@@ -261,6 +271,8 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             .wrap(from_fn(auth::guard))
             // auth
             .route("/auth/me", web::get().to(h::me))
+            .route("/map-tiles", web::get().to(h::map_tiles))
+            .route("/map-tiles/viewport", web::get().to(h::map_tiles_viewport))
             .route("/auth/totp/enroll", web::post().to(h::totp_enroll))
             .route("/auth/totp/confirm", web::post().to(h::totp_confirm))
             .route("/auth/session", web::post().to(h::session_create))

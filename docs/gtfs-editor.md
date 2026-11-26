@@ -564,6 +564,8 @@ below). Every list is
 | method | path | body → response |
 |---|---|---|
 | GET | `/auth/me` | → `{user_id, email, display_name, role, status, totp_enabled, session: bool, sign_in_locked_seconds, environment}` (needs only the Pomerium JWT); `environment` is `master` or `prod`, the side of a migration this editor is (section 23) |
+| GET | `/map-tiles` | anyone signed in → `{default: "osm" \| "google", google: {url, max_zoom, expires_at} \| null, google_error}` — the dashboard's base map (section 30); `google.url` is a Leaflet tile template with a live Map Tiles API session |
+| GET | `/map-tiles/viewport?zoom=&north=&south=&east=&west=` | anyone signed in → `{copyright}`: Google's copyright for that view, shown under its tiles; `null` with no Google key; 400 `invalid_query`, 502 `google_tiles_failed` (section 30) |
 | POST | `/auth/totp/enroll` | → `{otpauth_uri, secret_base32}` — only while `totp_enabled = false` |
 | POST | `/auth/totp/confirm` | `{code}` → `{totp_enabled: true, expires_at}` and starts a session |
 | POST | `/auth/session` | `{code}` → sets cookie, `{expires_at}` |
@@ -5974,3 +5976,119 @@ along the mock's roads through a point; a straight line from A to B; Show;
 into the draft as `manual`, exactly the line edited). The mock routes a
 stretch as an L along each leg, and `/__dev/map-line` with `{"road":
 "no_segment"}` makes it fail.
+
+## 29. Several routes on the map at once (2026-11-26)
+
+The map showed one route at a time: the route page's line, or a draft's
+proposal over it. Checking a corridor - where two routes share a road, which of
+a number's variants runs where, whether a new line follows the same road as its
+neighbours - meant opening the routes one after another. The dashboard now has
+a page for several at once.
+
+```
+#/routes-map?ids=1102,1104,45B        (Menu > Routes on the map)
+
+  Add a route        search by number or name (keyboard: arrows, Enter)
+  each route         its map line in its own colour, its number in a chip where
+                     it starts; no map line -> dashed through its stops
+  the list           show / hide, Zoom, Remove, open the route; pointing at one
+                     draws it thicker on top and fades the rest
+  Show their stops   each route's stops in its colour (click one to open it)
+  Fit all, Remove all
+```
+
+- **The address is the view.** The ids are in the address, in order, so a view
+  can be bookmarked or shared, and the trail's Back returns to it as it was
+  last. Adding or removing a route rewrites the address in place (no new
+  history entry); the router and the trail follow it (`hash:replaced`).
+- **At most 20 routes,** one `GET` each. An address naming more shows the first
+  20 and says so; the search waits until one is removed. Ten colours, then the
+  same ten again told apart by their dashes: a line long-dashed, no line
+  dash-dotted, so no two routes look the same.
+- **As the draft has them.** A route the person's draft touches or creates is
+  drawn from the draft's preview, and the list says "as in your draft", the
+  way the route page does. The others are live.
+- **An unknown id is said, not dropped:** "No route NOPE in this feed.", with a
+  Remove button, so a stale bookmark shows what it asked for.
+- **From where routes are.** The home panel, a route page ("Show with other
+  routes") and a stop's "Routes stopping here" ("Show these routes on the map":
+  its active routes, each once) open the page with those routes.
+- **Read only.** Nothing here writes; the Routes switch of the Show box hides
+  the lines as it hides the route page's.
+
+Code: `editor-ui/js/routes_map.js`, `map.showRoutes` and `map.fitRoutes`.
+Tests: `node dev/ui_smoke.mjs --routes-map` against `dev/mock_server.py` (two
+routes added by search, one with a drafted line drawn solid and one with none
+dashed; picked out by pointing; their stops; one hidden; the Routes switch; the
+address and the trail after a remove; an address with an unknown id; from a
+stop's routes and a route page; twenty, every one looking different).
+
+## 30. The base map: OpenStreetMap or Google Maps (2026-11-26)
+
+The dashboard's map was OpenStreetMap's tiles alone (`editor-ui/js/config.js`).
+Google's map shows lanes, flyovers and named service roads that OpenStreetMap
+lacks in places, which matters when checking a stop's kerb or a line drawn by
+hand. A deployment with a Google Maps Platform key now offers both.
+
+```
+dhall (secrets for the key):
+  gtfs_editor_map_tiles = Some
+    { default = Some "google"                     -- or "osm" (the default)
+    , google_api_key = Some secrets.google_map_tiles_key
+    , google_language = Some "en-IN"              -- optional, default en-IN
+    , google_region = Some "IN"                   -- optional, default IN
+    }
+
+dashboard: Show box > Map: ( ) OpenStreetMap  ( ) Google Maps
+  first: what this browser chose, else the server's default
+```
+
+- **Through the Map Tiles API, not Google's own tile servers.** Google's terms
+  allow its tiles in another map library only through the Map Tiles API
+  (`tile.googleapis.com`), with a session and its attribution. The well-known
+  `mt*.google.com/vt` addresses are not for that, and are not used.
+- **One session, made by GIMS.** `POST /v1/createSession` (roadmap, the
+  language and region above) is made by GIMS and shared by every signed-in
+  person until a day before it expires (sessions last about two weeks;
+  `expiry` is read, not assumed). A session that fails to renew keeps serving
+  while it has an hour left; a failure is remembered for a minute so page loads
+  do not each call Google. `GET /map-tiles` gives the dashboard the tile
+  address; the dashboard asks again an hour before the session ends.
+- **The key reaches the browser.** Each tile's address carries the session and
+  the key, as the Map Tiles API requires. `/map-tiles` answers only someone
+  signed in (Pomerium and the editor's TOTP), but the key must still be
+  **restricted in the Google Cloud console to the editor's host (HTTP
+  referrer) and to the Map Tiles API**. It is never in GIMS's logs, its Debug
+  output or a serialized config.
+- **Attribution.** Under Google's tiles the map shows "Google Maps" and
+  Google's copyright for the view, in full. The copyright changes with the
+  view, so the dashboard asks `GET /map-tiles/viewport` on every move (once the
+  map is still for 400 ms) and GIMS asks Google (`/tile/v1/viewport`): the
+  dashboard never depends on Google allowing a browser to ask. Google's policy
+  prefers its logo to the text "Google Maps" where there is room; the logo is
+  not vendored yet (`editor-ui/vendor/`), so the text is shown. Tiles are not
+  cached or prefetched by GIMS or the dashboard (the Map Tiles API policy).
+- **Fallbacks.** No key: OpenStreetMap, and no choice is shown. Google refusing
+  the session (key not enabled for the Map Tiles API, billing off) or
+  unreachable: OpenStreetMap, and the Show box says "Google Maps is not
+  available now: ..." with Google's reason. A browser that chose Google keeps
+  its choice and gets Google back on a later load, once it works.
+- **Zoom.** Google's roadmap goes to zoom 22, OpenStreetMap's to 19; switching
+  back to OpenStreetMap above 19 zooms out to it.
+- **Insets stay OpenStreetMap.** The small read-only maps beside a draft's
+  changes would each need Google's attribution and are billed per tile, so
+  they keep OpenStreetMap.
+
+Code: `src/editor/map_tiles.rs` (config, session, copyright),
+`handlers::map_tiles`, `handlers::map_tiles_viewport`, the base map section of
+`editor-ui/js/map.js`. Tests: `editor::map_tiles::tests` (what the config
+allows and refuses, the dhall record, one session shared until a day before
+it expires and then renewed, a failing renewal served by a session still
+valid then refused with Google's reason and not asked again within a minute,
+the key in no message, Debug or serialized config, the copyright through the
+same session, Google unreachable) and `node dev/ui_smoke.mjs --map-tiles`
+against `dev/mock_server.py` (no key: OpenStreetMap and no choice; a key: the
+choice, Google's tiles and copyright, zoom past 19 and back, kept across a
+reload; Google failing: OpenStreetMap and why; the server's default for a
+browser that has not chosen). `/__dev/map-tiles` sets what the mock answers;
+its "Google" tiles are its own one-colour PNG.

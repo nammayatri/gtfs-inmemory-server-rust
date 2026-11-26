@@ -155,6 +155,10 @@ pub struct AppConfig {
     /// Directory the dashboard's static files are served from.
     #[serde(default)]
     pub gtfs_editor_ui_dir: Option<String>,
+    /// The dashboard's base map (docs/gtfs-editor.md section 30): OpenStreetMap,
+    /// or Google Maps through the Map Tiles API when a key is given.
+    #[serde(default)]
+    pub gtfs_editor_map_tiles: Option<crate::editor::map_tiles::MapTilesConfig>,
     /// Outbound webhooks (docs/gtfs-editor.md section 12): GIMS calls a
     /// configured URL when something happens to a DB feed - most usefully once
     /// every pod is serving a committed edit, which is when a downstream cache

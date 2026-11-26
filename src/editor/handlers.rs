@@ -1448,6 +1448,45 @@ pub async fn polyline_osrm(
     }))
 }
 
+/// `GET /map-tiles` - the dashboard's base map (section 30): which one a person
+/// sees first, and Google's tile and viewport addresses with a live session
+/// when a key is configured, or why not. Anyone signed in: the key is in the
+/// addresses, so it goes no further than the people who use the map.
+pub async fn map_tiles(req: HttpRequest, st: Data) -> EditorResult<HttpResponse> {
+    auth::signed_in(&req, &st).await?;
+    ok(st.map_tiles.describe(&st.http).await)
+}
+
+/// `GET /map-tiles/viewport?zoom=&north=&south=&east=&west=` - Google's
+/// copyright for that view, to show under its tiles (section 30):
+/// `{copyright}`, null when Google is not configured.
+pub async fn map_tiles_viewport(
+    req: HttpRequest,
+    st: Data,
+    q: web::Query<super::map_tiles::Viewport>,
+) -> EditorResult<HttpResponse> {
+    auth::signed_in(&req, &st).await?;
+    let v = q.into_inner();
+    if v.zoom > 22
+        || ![v.north, v.south, v.east, v.west]
+            .iter()
+            .all(|x| x.is_finite())
+    {
+        return Err(EditorError::bad_request(
+            "invalid_query",
+            "zoom is 0 to 22 and north, south, east, west are numbers",
+        ));
+    }
+    match st.map_tiles.copyright(&st.http, v).await {
+        Ok(c) => ok(json!({ "copyright": c })),
+        Err(e) => Err(EditorError::new(
+            StatusCode::BAD_GATEWAY,
+            "google_tiles_failed",
+            e,
+        )),
+    }
+}
+
 /// The points a stretch of a map line is routed through: where the stretch
 /// starts and ends on the line, and the points clicked between (section 28).
 #[derive(Deserialize)]
