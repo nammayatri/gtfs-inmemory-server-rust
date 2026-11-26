@@ -1415,6 +1415,86 @@ async fn a_route_through_the_stops_says_why_it_failed() {
         "{b}"
     );
 
+    // ---- a stretch of a line edited by hand, by road (section 28): through
+    // the points given, in order, in one request; nothing about the feed read
+    let road = |points: Value| {
+        editor_c
+            .req("POST", &format!("/feeds/{OSRM_FEED}/polyline:road"))
+            .set_json(json!({ "points": points }))
+    };
+    let at = |(lat, lon): (f64, f64)| json!({"lat": lat, "lon": lon});
+    let before = osrm_state.paths.lock().unwrap().len();
+    let (s, b, _, _) = call!(
+        &app,
+        road(json!([at(long[3].1), at(long[5].1), at(long[9].1)]))
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["points"], 3);
+    let routed = osrm::decode_polyline(b["encoded_polyline"].as_str().unwrap()).unwrap();
+    assert_eq!(routed.len(), 3, "{b}");
+    for (p, q) in routed.iter().zip([long[3].1, long[5].1, long[9].1]) {
+        assert!(
+            osrm::dist(planar().xy(*p), planar().xy(q)) < 2.0,
+            "{p:?} {q:?}"
+        );
+    }
+    let hav = |a: (f64, f64), b: (f64, f64)| {
+        gtfs_routes_service::editor::validation::haversine_m(a.0, a.1, b.0, b.1)
+    };
+    let expected = hav(long[3].1, long[5].1) + hav(long[5].1, long[9].1);
+    assert!(
+        (b["distance_m"].as_f64().unwrap() - expected).abs() < 1.0,
+        "{b} vs {expected}"
+    );
+    let asked: Vec<String> = osrm_state.paths.lock().unwrap()[before..].to_vec();
+    assert_eq!(asked.len(), 1, "one request: {asked:?}");
+    assert_eq!(parse_coords(asked[0].split('?').next().unwrap()).len(), 3);
+    // the second point is out at sea: named as the person placed it
+    let (s, b, _, _) = call!(
+        &app,
+        road(json!([at(long[3].1), at((13.45, 80.40)), at(long[9].1)]))
+    );
+    assert_eq!(s, 502, "{b}");
+    assert_eq!(code_of(&b), "osrm_failed");
+    assert_eq!(b["error"]["details"]["reason"], "no_segment", "{b}");
+    assert_eq!(b["error"]["details"]["waypoint"], 1, "{b}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no road near point 1 you placed"),
+        "{b}"
+    );
+    // no road between two points: named by them
+    let (s, b, _, _) = call!(&app, road(json!([at(long[3].1), at((13.30, 80.30))])));
+    assert_eq!(s, 502, "{b}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no road from the start of the stretch to the end of the stretch"),
+        "{b}"
+    );
+    // what is not a stretch is refused before OSRM is asked
+    let before = osrm_state.paths.lock().unwrap().len();
+    for (bad, code) in [
+        (json!([at(long[3].1)]), "invalid_payload"),
+        (
+            json!((0..26).map(|i| at(long[i].1)).collect::<Vec<_>>()),
+            "invalid_payload",
+        ),
+        (
+            json!([at(long[3].1), {"lat": 91.0, "lon": 80.2}]),
+            "invalid_payload",
+        ),
+        (json!([at(long[3].1), {"lat": 13.0}]), "invalid_json"),
+    ] {
+        let (s, b, _, _) = call!(&app, road(bad.clone()));
+        assert_eq!(s, 400, "{bad} -> {b}");
+        assert_eq!(code_of(&b), code, "{b}");
+    }
+    assert_eq!(osrm_state.paths.lock().unwrap().len(), before);
+
     // ---- an OSRM that is not there
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();

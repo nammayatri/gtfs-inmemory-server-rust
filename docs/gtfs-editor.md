@@ -580,6 +580,7 @@ below). Every list is
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change. Asked of OSRM in chunks of at most 25 waypoints; a failure is 502 `osrm_failed` saying why and where (section 17.5) |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:gps?change_set=` | `{route_id, encoded_polyline, polyline_source: "gps", saved: false, evidence}` — the path this route's buses drove over the last 7 days, snapped to roads (section 17); not saved, add it as a `route` change |
+| POST | `/feeds/{g}/polyline:road` | body `{points: [{lat, lon}, ...]}`, 2 to 25 points in order → `{encoded_polyline, points, distance_m}` — a road route through exactly those points, for a stretch of a line edited by hand (section 28); nothing read from the feed, nothing saved. Editor role. One OSRM request; a failure is 502 `osrm_failed` naming the point ("point 2 you placed"), no OSRM 503 `osrm_unavailable` |
 | GET | `/feeds/{g}/routes/{route_id}/gps-trips?date=` | `{route_id, route_number, date, stops, trips: [{device, start, end, stops_matched, first_stop_id, last_stop_id, encoded_polyline}], evidence}` — the trips the buses made along the route on one day, from their GPS (section 17.8); viewer |
 | GET | `/feeds/{g}/stops/{stop_id}/context`, `/feeds/{g}/routes/{route_id}/context` | what is known about a stop or a route for cleanup: detours, coordinate reviews, same-named stops, its audit rows, the open drafts touching it — section 9 |
 | GET | `/feeds/{g}/audit?change_set=&limit=&cursor=` | newest first: `{audit_id, at, actor, actor_email, action, gtfs_id, change_set_id, detail}` |
@@ -5886,3 +5887,90 @@ overtaken by another commit conflicting at submit; a write round the drafts
 reported; every node kind's read). `tests/editor_migration_flow.rs` covers an
 editor reading in one draft's file (in the background too, polled by them and
 not by a viewer), refused the whole feed's, and taking master's side.
+
+## 28. Editing a route's map line by hand (2026-11-26)
+
+Until now the only way to change a route's map line was to replace all of it:
+a road route through the stops (`polyline:osrm`) or the path the buses drove
+(`polyline:gps`, sections 17 and 25). Neither can fix one stretch. A GPS line
+that takes a flyover past a stop on the service road (the "bus may not stop
+here" of section 27), a router that cuts through a lane the buses never use, a
+loop at a terminal drawn the wrong way round: each is a few hundred metres of a
+line that is otherwise right. The dashboard now edits the line itself.
+
+```
+Route > Edit name, colour and map line > Map line > Edit the line on the map
+
+  the line (proposed in this editor, else saved, else straight through the stops)
+  drawn in teal with a handle on each point
+    drag a point                       moves it
+    drag the faint point mid-segment   bends the line there (adds a point)
+    double-click / right-click a point removes it (two must remain)
+  Redraw a stretch
+    click the line where it starts (A), where it ends (B), either order
+    click the map where it should go instead, in order: any number of points
+      Follow the roads   POST /feeds/{g}/polyline:road  [A, points..., B]
+                         and the answer replaces A..B
+      Straight lines     A, the points, B replace A..B
+  every step is one undo (Ctrl/Cmd+Z), like the rest of the panel
+  Add to draft -> a route change {encoded_polyline, polyline_source: "manual"}
+```
+
+- **Saved as `manual`.** The line goes into the draft as any other line does,
+  with `polyline_source: "manual"`, and is reviewed and committed the same way.
+  The weekly line from GPS (section 25) skips hand-drawn lines, so an edit is
+  not undone the next Monday. The panel says so. To hand the route back to the
+  weekly sync, suggest a line from GPS and commit that.
+- **Handles only where they can be used.** A line from GPS has thousands of
+  points. Handles are drawn for the points on the map, and only while there
+  are 400 or fewer of them (`LINE_HANDLES_MAX`); past that the panel says to
+  zoom in. Mid-segment handles are drawn only where the two points are at
+  least 28 px apart on screen. No handles while a stretch is being picked: a
+  click is for the stretch then.
+- **A stretch is picked on the line.** A click is snapped to the nearest place
+  on the line, and only if that is within 30 px on screen; anything else is
+  refused with "That is not on the line". A stop's dot counts as the place it
+  is. The stretch replaced runs from A to B along the line, whichever was
+  clicked first; on a route that passes a place twice, the nearer pass is
+  taken. A and B themselves stay on the line, joined to whatever replaces the
+  stretch, so the line has no gap where the router snapped them to a road.
+- **`polyline:road` is not a route's road route.** It routes through exactly
+  the points it is given: no stops, no feed read, nothing saved, at most 25
+  points (one OSRM `/route` request, 12 s). It names a failure the way the
+  person placed the points: "there is no road near point 2 you placed", "no
+  road from the start of the stretch to point 1 you placed".
+- **Which stops the line passes by.** Under the line's status the panel lists
+  the route's boarded stops (not jump or hidden stops, not shaping markers)
+  that the line passes more than 100 m from, the same rule and distance GIMS
+  flags "the bus may not stop here" by (section 27), and rings them in red on
+  the map. It follows every edit, a suggestion and the saved line alike, and
+  uses the route's stops as the draft has them (`preview/routes`). "Show" on
+  one zooms to it and the line beside it.
+- **Starting from nothing.** A route with no line, saved or proposed, starts
+  from a straight line through its boarded stops and shaping markers in order,
+  the waypoints `polyline:osrm` would use, with stops that share a point
+  drawn once. That first line is itself the first edit, so undoing it leaves
+  nothing proposed.
+- **No new schema.** `manual` was already an accepted `polyline_source`
+  (section 3's validation table, 0021's CHECK).
+
+Code: `editor-ui/js/line.js` (encoding, snapping a click to the line,
+replacing a stretch, the stops passed by; no DOM), `map.editLine` and
+`map.showOffLine` in `editor-ui/js/map.js`, the Map line section of
+`editRouteDetails` in `editor-ui/js/editors.js`, `handlers::polyline_road`.
+
+Tests: `editor-ui/dev/line_test.mjs` (`node --test dev/line_test.mjs`: the
+encoding against Google's example, the nearest place on a line, a stretch
+replaced in either order with the rest of the line kept, a line through the
+stops, the stops more than 100 m away and a detour that takes the flag away);
+`tests/editor_gps_line_flow.rs` (`polyline:road` through three points in one
+OSRM request, a point with no road near it named as placed, a leg with no
+road, and what is not a stretch refused before OSRM is asked);
+`node dev/ui_smoke.mjs --map-line-edit` against `dev/mock_server.py` (a route
+with no line drawn through its stops; a point dragged off a stop, listed and
+ringed, undone and redone; a bend added and removed; a stretch picked end
+first, a click off the line refused, the road router's reason, then routed
+along the mock's roads through a point; a straight line from A to B; Show;
+into the draft as `manual`, exactly the line edited). The mock routes a
+stretch as an L along each leg, and `/__dev/map-line` with `{"road":
+"no_segment"}` makes it fail.

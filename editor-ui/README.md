@@ -17,9 +17,10 @@ js/api.js           fetch wrapper: cookies, X-Requested-With, error shape, auth 
 js/state.js         shared state; UI preferences in localStorage (never secrets)
 js/auth.js          sign-in gate: SSO problems, TOTP enrolment (QR), code entry, lockout
 js/main.js          boot, top bar, hash router
-js/map.js           Leaflet: stops by area, routes, drag a stop, pick a stop, station selection, insets
+js/map.js           Leaflet: stops by area, routes, drag a stop, pick a stop, station selection, insets, a map line edited by hand
+js/line.js          a map line as points: encode it, snap a click to it, replace a stretch, the stops it passes by (no DOM; tested by dev/line_test.mjs)
 js/explore.js       search (paged), stop panel with its CSV download, route panel with the fare-stage ladder
-js/editors.js       stop, route stop list, route details and map line, station editors
+js/editors.js       stop, route stop list, route details and map line (suggested, or edited on the map), station editors
 js/drafts.js        the draft being edited, the draft chooser, addChange(), what the draft creates
 js/picker.js        choosing a stop: nearby suggestions, search by name or id, or a click on the map
 js/create.js        New stop (placed on the map), New route (then its stop list), a stop new in a draft
@@ -56,7 +57,10 @@ dev/                development only - never served by GIMS
   reorder, change type; a stage stop's name is chosen from its own name or the
   route's stage names ("Other name…" only on purpose), and "Renumber stages in
   order" fixes the numbering. Fare-rule problems are marked on the row with a
-  one-click fix. Or edit the name, colour and map line.
+  one-click fix. Or edit the name, colour and map line: suggest a line through
+  the stops or from GPS, or edit it on the map (drag a point, bend it, redraw a
+  stretch along the roads or straight), with the stops it passes by more than
+  100 m listed as it changes (docs section 28).
 - **New** (top bar) - New stop (`#/new/stop`: click the map, name, optional
   platform label; the id is made by the server unless typed), New route
   (`#/new/route`: id, number, name, colour, then its stop list; it reaches

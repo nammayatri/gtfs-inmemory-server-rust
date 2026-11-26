@@ -374,6 +374,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::post().to(h::polyline_gps),
             )
             .route(
+                "/feeds/{gtfs_id}/polyline:road",
+                web::post().to(h::polyline_road),
+            )
+            .route(
                 "/feeds/{gtfs_id}/gps-polyline-sync",
                 web::post().to(h::gps_polyline_sync),
             )
