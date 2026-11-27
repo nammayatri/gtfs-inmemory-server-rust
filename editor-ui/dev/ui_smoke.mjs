@@ -1926,6 +1926,123 @@ async function lineToolkitFlow() {
   check(!!change && change.after.polyline_source === "manual", "into the draft as polyline_source manual");
 }
 
+// A stop and a route both new in one draft, on a feed not built from stages:
+// the new stop goes into the new route's stop list, the new route's stop list
+// is opened again from its page and changed, and the new stop goes into a
+// route the feed already has, which shows it the next time its list is opened.
+// The mock's feeds are built from stages, so it is switched off for this.
+async function useStages(on) {
+  await evaluate(`fetch("/__dev/use-stages", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify({ use_stages: on }))} }).then((r) => r.json())`);
+  await load(UI);
+  await waitFor(`!document.getElementById("app").hidden`, "the app after a reload");
+  await sleep(800);
+}
+async function draftNewThingsFlow() {
+  await useStages(false);
+  // ---- the stop
+  await setView(12.9725, 80.2208, 18);
+  await clickSel("#new-menu summary", "the New menu");
+  await click("New stop", "#new-menu");
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("A new stop and a new route");
+  await waitFor(`document.getElementById("panel").innerText.includes("Not placed yet")`, "new stop form");
+  const spot = await mapCall(`const c = map.getCenter(); return { lat: c.lat + 0.0002, lon: c.lng + 0.0003 };`);
+  await clickMapAt(spot.lat, spot.lon);
+  await waitFor(`document.getElementById("new-stop-lat").value !== ""`, "the clicked position in the form");
+  await type("#new-stop-name", "Same Draft Kerb");
+  await click("Add stop to draft", ".sticky-actions");
+  await waitFor(`document.getElementById("panel").innerText.includes("New stop added to your draft")`, "new stop added");
+  const kerb = (await text("#panel")).match(/ed_[0-9a-f]{10}/)?.[0];
+  if (!check(!!kerb, `the new stop's id (${kerb})`)) return;
+
+  // ---- the route, then its stops: the new stop among them
+  await clickSel("#new-menu summary", "the New menu");
+  await click("New route", "#new-menu");
+  await waitFor(`!!document.getElementById("new-route-id")`, "new route form");
+  check((await text("#panel")).includes("Next you add its stops in order"), "without stages, a new route is its stop list");
+  await type("#new-route-id", "SAME-DRAFT-R1");
+  await waitFor(`document.getElementById("new-route-id-status").innerText.includes("free")`, "a free route id");
+  await type("#new-route-short", "SD1");
+  await click("Add route, then add its stops", ".sticky-actions");
+  await waitFor(`document.getElementById("panel").innerText.includes("Stops of the new route SD1")`, "the new route's stop list");
+  const pickNamed = async (slot, q, re, what) => {
+    await clickSel(slot, `add a stop (${what})`);
+    await waitFor(`!!document.querySelector(".picker input")`, `the picker (${what})`);
+    await type(".picker input", q);
+    await waitFor(`[...document.querySelectorAll(".picker-item")].some((b) => ${re}.test(b.innerText))`, `${what} offered`);
+    await evaluate(`[...document.querySelectorAll(".picker-item")].find((b) => ${re}.test(b.innerText)).click(), true`);
+    await sleep(400);
+  };
+  await pickNamed("#add-0", "Same Draft", "/Same Draft Kerb/", "the stop new in the draft");
+  await pickNamed("#add-1", "VELACHERY", "/velachery/i", "an existing stop");
+  await click("Add to draft", ".sticky-actions");
+  await waitFor(`location.hash === "#/route/SAME-DRAFT-R1?draft=1" && document.getElementById("panel").innerText.includes("New route in your draft")`, "the new route with its stops");
+
+  // ---- the new route's stop list, opened again from its page
+  check(await has("#edit-stop-list"), "a route new in the draft offers Edit stop list");
+  await clickSel("#edit-stop-list", "Edit stop list");
+  await waitFor(`document.querySelectorAll(".ladder.editing .row").length === 2`, "its two stops, as the draft has them");
+  check((await text("#row-0")).includes("Same Draft Kerb"), "the new stop first");
+  await pickNamed("#add-2", "ADYAR", "/adyar/i", "a third stop");
+  await waitFor(`document.querySelectorAll(".ladder.editing .row").length === 3`, "three stops");
+  // "Add to draft", or "Update in draft" when the draft has the list already
+  await clickSel(".sticky-actions .btn:not(.secondary)", "the stop list into the draft");
+  await waitFor(`location.hash.startsWith("#/route/SAME-DRAFT-R1")`, "back on the new route");
+  await sleep(600);
+  let set = await api(`change-sets/${await activeDraftId()}`);
+  const mine = (key) => (set.changes || []).filter((c) => c.entity === "route_stops" && c.entity_key === key);
+  const newRoute = mine("SAME-DRAFT-R1");
+  check(newRoute.length === 1 && newRoute[0].after.rows.length === 3 && newRoute[0].after.rows[0].stop_id === kerb,
+    `one stop list change for the new route, its three stops, the new stop first (${newRoute.map((c) => c.after.rows.map((r) => r.stop_id))})`);
+  check(!(set.validation || []).some((v) => v.level === "error"), `the draft has no error: ${JSON.stringify((set.validation || []).filter((v) => v.level === "error")).slice(0, 200)}`);
+
+  // ---- the new stop into a route the feed already has
+  const existing = (await api("feeds/chennai_bus/routes?q=21G&limit=30")).items.find((r) => r.route_id !== "1369" && r.stop_count >= 4 && !r.deleted);
+  await go(`#/route/${existing.route_id}`);
+  await waitFor(`!!document.getElementById("edit-stop-list")`, "Edit stop list on an existing route");
+  await clickSel("#edit-stop-list", "Edit stop list");
+  await waitFor(`document.querySelectorAll(".ladder.editing .row").length > 0`, "its stops");
+  const before = await evaluate(`document.querySelectorAll(".ladder.editing .row").length`);
+  await pickNamed(`#add-${before}`, "Same Draft", "/Same Draft Kerb/", "the stop new in the draft, at the end");
+  // "Add to draft", or "Update in draft" when the draft has the list already
+  await clickSel(".sticky-actions .btn:not(.secondary)", "the stop list into the draft");
+  await sleep(800);
+  set = await api(`change-sets/${await activeDraftId()}`);
+  const theirs = mine(existing.route_id);
+  check(theirs.length === 1 && theirs[0].after.rows.some((r) => r.stop_id === kerb), "the existing route's stop list change has the new stop");
+  // opened again: the list as the draft has it, the new stop at the end
+  await go(`#/route/${existing.route_id}`);
+  await waitFor(`!!document.getElementById("edit-stop-list")`, "Edit stop list again");
+  await clickSel("#edit-stop-list", "Edit stop list");
+  await waitFor(`document.querySelectorAll(".ladder.editing .row").length === ${before + 1}`, "the stops as the draft has them");
+  check((await text(`#row-${before}`)).includes("Same Draft Kerb"), "the new stop is in the list when it is opened again");
+  await shot("dn-01-reopened");
+  await click("Cancel", ".sticky-actions");
+
+  // ---- a line through the stops as the draft has them: the new stop's too
+  const kerbAt = (await api(`change-sets/${await activeDraftId()}`)).changes.find((c) => c.entity === "stop" && c.entity_key === kerb).after;
+  await go(`#/route/${existing.route_id}`);
+  await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
+  await click("Edit name, colour and map line");
+  await waitFor(`[...document.querySelectorAll("#panel button")].some((b) => b.textContent === "Route through stops")`, "the suggestion through the stops");
+  await click("Route through stops");
+  await waitFor(`document.getElementById("panel").innerText.includes("New map line ready")`, "a line through the stops");
+  // the stops drawn with the suggested line are the draft's, the new one among them
+  const proposal = await mapCall(`let pts = null, stops = 0, kerb = 0; map.eachLayer((l) => {
+      if (l.options && l.options.routeLine === "proposal" && l.getLatLngs) pts = l.getLatLngs().map((p) => [p.lat, p.lng]);
+      if (l.options && l.options.routeStop === "proposal") {
+        stops += 1;
+        if (/Same Draft Kerb/.test((l.getTooltip() && l.getTooltip().getContent().textContent) || "")) kerb += 1;
+      }
+    }); return { pts, stops, dots: kerb };`);
+  const near = (p) => Math.abs(p[0] - kerbAt.lat) < 2e-5 && Math.abs(p[1] - kerbAt.lon) < 2e-5;
+  check(!!proposal.pts && proposal.pts.some(near), "the line through the stops passes the stop new in the draft");
+  check(proposal.dots === 1, `and the stops drawn with the line are the draft's, the new one among them (${proposal.dots} of ${proposal.stops})`);
+  await shot("dn-02-route-through-stops");
+  await click("Cancel", ".sticky-actions");
+  await useStages(true);
+}
+
 // docs section 29: several routes' map lines on the map at once - added by
 // search, each its own colour, one drawn as the draft has it, picked out by
 // pointing, hidden, removed; the address keeping them; from a stop's routes and
@@ -2441,6 +2558,30 @@ if (process.argv.includes("--gps-trips")) {
     await load(UI);
     await signIn("editor1@nammayatri.in");
     await gpsTripsFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+// ---- only a stop and a route new in one draft
+if (process.argv.includes("--draft-new-things")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await draftNewThingsFlow();
     check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
   } catch (e) {
     failures.push(e.message);
@@ -3028,7 +3169,9 @@ try {
   const newStopId = (await text("#panel")).match(/ed_[0-9a-f]{10}/)?.[0];
   check(!!newStopId, `the server made the new stop's id (${newStopId})`);
 
-  // ---- New route, then its stop list with the pickers
+  // ---- New route, then its stop list with the pickers: on a feed not built
+  // from stages, which the mock's are unless told otherwise
+  await useStages(false);
   await clickSel("#new-menu summary", "the New menu");
   await click("New route", "#new-menu");
   await waitFor(`!!document.getElementById("new-route-id")`, "new route form");
@@ -3071,6 +3214,7 @@ try {
   await waitFor(`location.hash === "#/route/SMOKE-R1?draft=1" && document.getElementById("panel").innerText.includes("New route in your draft")`, "the new route with its stops");
   check((await text("#panel")).includes("nightly GTFS build"), "the new route says it needs the nightly build for trips");
   await shot("12-new-route");
+  await useStages(true);
 
   // ---- New station from the menu: click its stops on the map
   const gateA = await api("feeds/chennai_bus/stops/CHNS03131");

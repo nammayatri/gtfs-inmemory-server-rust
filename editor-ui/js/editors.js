@@ -468,7 +468,10 @@ export async function editRouteRows(route, { created = false } = {}) {
   // blocked by what it introduces (the server grades the same way).
   const liveRows = created ? [] : route.rows.map(toRow);
   const liveProblems = created ? [] : validateRows(liveRows).map((p) => problemKey(p, liveRows));
-  if (prior && !created) {
+  // The list as the draft has it, not only after a stop list change: on a feed
+  // built from stages the draft changes stages, and a stop added through them
+  // (one new in the draft, too) is in the list the next time it is opened.
+  if (!created && state.draft) {
     try {
       const preview = await get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}`);
       rows = preview.rows.map(toRow);
@@ -846,10 +849,14 @@ export async function editRouteRows(route, { created = false } = {}) {
   const saveThroughStages = async (payload) => {
     // only a feed served from its stages has any; everywhere else the route is
     // its stop list and the ordinary change applies
-    if (created || !usesStages()) return false;
+    if (!usesStages()) return false;
+    // the route's stages as the draft has them: a route new in the draft has
+    // none live, and a stage the draft made or changed is the one to edit
     let info;
     try {
-      info = await get(`feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/stages`);
+      info = await get(state.draft
+        ? `change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}/stages`
+        : `feeds/${enc(state.feedId)}/routes/${enc(route.route_id)}/stages`);
     } catch {
       return false;
     }
@@ -1087,10 +1094,16 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const base = createChange ? createChange.after : route;
   const start = { short_name: base.short_name || "", long_name: base.long_name || "", color: base.color || "", active: base.active !== false, route_tag: base.route_tag || "", ...(prior && !createChange ? prior.after : {}) };
   let proposed = prior && prior.after.encoded_polyline ? { encoded_polyline: prior.after.encoded_polyline, polyline_source: prior.after.polyline_source } : null;
-  // The route's stops as the draft has them (the live ones until the preview
-  // answers): what the line is checked against, and drawn through when there
-  // is no line to start from.
+  // The route's stops as the draft has them: what a line is drawn with,
+  // checked against, and drawn through when there is none to start from.
+  // Read before the panel is built, so nothing uses the live list meanwhile.
   let rows = route.rows || [];
+  if (!created && state.draft) {
+    try {
+      const p = await get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}`);
+      if (p && Array.isArray(p.rows)) rows = p.rows;
+    } catch { /* the live stops, then */ }
+  }
   // the map editor while the line is edited by hand (docs section 28)
   let editing = null;
   const pointsOf = (encoded) => { try { return encoded ? decodePolyline(encoded) : []; } catch { return []; } };
@@ -1151,7 +1164,8 @@ export async function editRouteDetails(route, { created = false } = {}) {
       clear(lineStatus, h("p.hint", route.encoded_polyline ? "This route has a saved map line." : "This route has no map line yet."));
       return;
     }
-    map.showRoute({ ...route, encoded_polyline: proposed.encoded_polyline }, { layer: "proposal", dashed: true, color: "#0b6660", fit: true });
+    // with the stops as the draft has them: the ones the line was drawn through
+    map.showRoute({ ...route, rows, encoded_polyline: proposed.encoded_polyline }, { layer: "proposal", dashed: true, color: "#0b6660", fit: true });
     let km = "";
     try {
       const pts = decodePolyline(proposed.encoded_polyline);
@@ -1189,11 +1203,6 @@ export async function editRouteDetails(route, { created = false } = {}) {
         // the one-click fix, while the line is edited (section 31)
         editing ? h("button.btn.quiet.small", { type: "button", "data-tool": "via-stop", "data-via-stop": s.stop_id, on: { click: () => throughStop(s) } }, "Route through it") : null)))));
   };
-  if (!created && state.draft) {
-    get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}`)
-      .then((p) => { if (p && Array.isArray(p.rows) && lineCheck.isConnected) { rows = p.rows; checkStops(); } })
-      .catch(() => { /* the live stops, then */ });
-  }
 
   // ---- editing the line by hand (docs section 28)
   const manualLine = (pts) => ({ encoded_polyline: encodePolyline(pts), polyline_source: "manual", evidence: null });

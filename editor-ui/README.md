@@ -77,7 +77,8 @@ dev/                development only - never served by GIMS
 - **New** (top bar) - New stop (`#/new/stop`: click the map, name, optional
   platform label; the id is made by the server unless typed), New route
   (`#/new/route`: id, number, name, colour, then its stop list; it reaches
-  passengers only after the nightly GTFS build gives it trips), New station
+  passengers only after the nightly GTFS build gives it trips; on a feed built
+  from stages it goes on to choosing its stages instead), New station
   (`#/new/station`), and Import.
 - **Stations to review** (`#/stations`, `#/stations/{id}`) - suggested stations by
   status with counts, search and "only in the map area". One suggestion shows its

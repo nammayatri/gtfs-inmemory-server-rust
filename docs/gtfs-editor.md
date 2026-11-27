@@ -6287,3 +6287,52 @@ exact route updates drafted, a route the feed lacks not made, committed
 through review, and the downloaded zip then carrying the new line). The Feed
 page's checkbox and report are not covered by the mock's smoke test, which
 does not have the Feed page (18.10).
+
+## 33. A stop and a route new in one draft (2026-11-27)
+
+The server has always let one draft create a stop, create a route and give the
+route that stop: a draft is replayed change by change, so a stop an earlier
+change creates exists for a later one (`tests/editor_create_flow.rs`). The
+dashboard did not let it happen:
+
+- **A route new in the draft had no "Edit stop list".** The route page left the
+  button out for a created route, so its stops could be set once, right after
+  New route, and never again in that draft. It now opens the stop list editor
+  on the route as the draft has it. On a feed built from stages the button is
+  still left out until the route has stages: its stops come from them.
+- **New route always went on to choosing stages**, even on a feed that does not
+  use them, where a route is its stop list. On such a feed it goes on to the
+  stop list ("Add route, then add its stops"), as it did before stages.
+- **The stop list editor started from the live list** unless the draft had a
+  stop list change for the route. On a feed built from stages an edit is a
+  stage change, so a stop added earlier in the draft - one new in it, too - was
+  missing when the list was opened again. It now starts from the draft's
+  preview whenever a draft is open.
+- **Saving through stages read the live stages** (`GET
+  /feeds/{g}/routes/{id}/stages`), and skipped a route new in the draft, which
+  then sent a plain stop list change the server refuses for a route with stages
+  (`route_has_stages`). It now reads them with the draft applied (`GET
+  /change-sets/{id}/preview/routes/{id}/stages`) for every route, so a stage the
+  draft made or changed is the one edited.
+- **The map line editor drew a suggested line with the live stops.** "Route
+  through stops" (and from GPS) has always been asked about the route as the
+  draft has it (`?change_set=`), so the line went through the draft's stops;
+  but the stops drawn with it were the route's live ones, so a stop the draft
+  added showed only as a draft stop and one it removed was still drawn. And the
+  draft's stop list was read in the background, so the stops check, and a line
+  drawn through the stops by hand, could use the live list meanwhile. The
+  editor now reads the draft's list before it opens, and draws every suggested
+  line with it.
+
+Tests: `tests/editor_stages_flow.rs` (three stops, a route and a stage of them
+all new in one draft, the stage then edited to take another new stop, the
+draft's preview of the route and its stages, committed, and the route's stops
+live); `node dev/ui_smoke.mjs --draft-new-things` against `dev/mock_server.py`
+with stages off (`/__dev/use-stages`): a new stop and a new route in one draft,
+the new stop in the new route, its stop list opened again from its page and
+changed, the new stop added to a route the feed has and in its list when it is
+opened again, and a line through the stops drawn with the draft's stops, the
+new one among them (with the live stops instead, the check fails: none of the
+13 stops drawn is it). The full smoke run turns stages off for its New route steps the
+same way. The mock does not serve route stages, so saving through stages is not
+covered there.
