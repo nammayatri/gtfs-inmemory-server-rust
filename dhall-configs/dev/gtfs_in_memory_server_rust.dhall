@@ -136,13 +136,15 @@ in {
   osrm_url = Some "http://localhost:5050",
 
   -- The editor dashboard's base map (docs/gtfs-editor.md section 30). Left out,
-  -- it is OpenStreetMap. For Google Maps too, a Map Tiles API key (from the
-  -- secrets dhall; restrict it to the editor's host), for example:
+  -- it is OpenStreetMap. For Google Maps too, a Maps JavaScript API key (from
+  -- the secrets dhall), for example:
   --   gtfs_editor_map_tiles = Some
   --     { default = Some "google"
-  --     , google_api_key = Some secrets.google_map_tiles_key
+  --     , google_api_key = Some secrets.google_maps_js_key
   --     , google_region = Some "IN"
   --     },
+  -- Restrict the key to the Maps JavaScript API and to the editor's host
+  -- (HTTP referrer https://<gtfs_editor_audience>/*): browsers load the map.
 
   -- GPS pings for the editor's "suggest a map line from GPS". Off here: the
   -- endpoint answers 503 gps_unavailable. To turn it on, for example:

@@ -92,43 +92,55 @@ export function initMap() {
   // altogether; keep Leaflet's idea of the map size in step with its box, or
   // tiles cover only part of the map.
   new ResizeObserver(() => map.invalidateSize()).observe(map.getContainer());
-  map.on("moveend", () => { if (baseName === "google") googleCopyright(); });
+  // Google's map under Leaflet's follows it (section 30)
+  map.on("move zoomend viewreset resize", () => syncGoogle());
+  map.on("zoomanim", (ev) => syncGoogle(ev.center, ev.zoom));
   loadStops();
   loadBaseMaps();
   return map;
 }
 
 // ------------------------------------------------------------------ base map
-// docs section 30. OpenStreetMap, or Google Maps through the Map Tiles API when
-// the deployment has a key: GET map-tiles says which a person sees first and
-// gives Google's tile address with a session. The person's choice is kept in
-// this browser. Google's copyright for the view is asked of the server (it
-// changes with the view) and shown in full, after "Google Maps".
-let base = null;              // the tile layer under everything
+// docs section 30. OpenStreetMap, or Google Maps through the Maps JavaScript API
+// when the deployment has a key: GET map-tiles says which a person sees first
+// and gives the key. Google's map is a plain google.maps.Map in a box under the
+// Leaflet map - its own controls and gestures off, no tiles of ours on top -
+// that follows Leaflet's centre and zoom; Leaflet keeps every overlay and every
+// click. Google draws its own logo and copyright. One Google map per page,
+// kept when the person switches away and back: a map load is what Google bills.
+// The person's choice is kept in this browser.
+let base = null;              // OpenStreetMap's tile layer, while it is the base
 let baseName = null;          // "osm" | "google"
 let tiles = { default: "osm", google: null, google_error: null };
-let googleAttribution = null; // the attribution text now shown for Google
-let tilesRenew = null;
+let gmap = null;              // the Google map, once made
+let gbox = null;              // the box it is drawn in, under the Leaflet map
+let googleLoad = null;        // the Maps JavaScript API loading, once asked for
 
 const osmLayer = () => L.tileLayer(TILE_URL, { maxZoom: 19, attribution: TILE_ATTRIBUTION, referrerPolicy: TILE_REFERRER_POLICY, baseMap: "osm" });
+// Google's roadmap is drawn to zoom 21 almost everywhere these cities are
+const GOOGLE_MAX_ZOOM = 21;
 
 export const baseMap = () => baseName;
 export const baseMaps = () => ({ ...tiles, current: baseName });
 
 function setBase(name) {
   if (name === "google" && !tiles.google) name = "osm";
-  if (name === baseName && base) return;
-  if (base) map.removeLayer(base);
-  showGoogleAttribution(null);
-  base = name === "google"
-    ? L.tileLayer(tiles.google.url, { maxZoom: tiles.google.max_zoom || 22, referrerPolicy: TILE_REFERRER_POLICY, baseMap: "google" })
-    : osmLayer();
-  base.addTo(map);
-  base.bringToBack();
+  if (name === baseName) return;
   baseName = name;
-  // OpenStreetMap stops at 19; Google goes on to 22
-  if (name === "osm" && map.getZoom() > 19) map.setZoom(19);
-  if (name === "google") { showGoogleAttribution(""); googleCopyright(); }
+  const box = map.getContainer();
+  if (name === "osm") {
+    if (gbox) gbox.hidden = true;
+    box.classList.remove("on-google");
+    base = osmLayer().addTo(map);
+    base.bringToBack();
+    map.setMaxZoom(19);
+  } else {
+    if (base) map.removeLayer(base);
+    base = null;
+    box.classList.add("on-google");
+    map.setMaxZoom(GOOGLE_MAX_ZOOM);
+    showGoogle();
+  }
   updateBaseChooser();
 }
 
@@ -138,29 +150,72 @@ export function chooseBaseMap(name) {
   setBase(name);
 }
 
-function showGoogleAttribution(copyright) {
-  const ctl = map.attributionControl;
-  if (googleAttribution != null) ctl.removeAttribution(googleAttribution);
-  googleAttribution = null;
-  if (copyright == null) return;
-  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-  googleAttribution = `<span class="google-mark" role="img" aria-label="Google Maps">Google Maps</span>${copyright ? ` <span class="google-copyright">${esc(copyright)}</span>` : ""}`;
-  ctl.addAttribution(googleAttribution);
+// Google refused the key or its script did not load: OpenStreetMap, and why.
+function googleFailed(reason) {
+  tiles = { ...tiles, google: null, google_error: reason };
+  if (gbox) gbox.hidden = true;
+  if (baseName === "google") setBase("osm");
+  updateBaseChooser();
 }
 
-let copyrightSeq = 0;
-const googleCopyright = debounce(async () => {
-  if (baseName !== "google") return;
-  const b = map.getBounds();
-  const mine = ++copyrightSeq;
-  try {
-    const q = `zoom=${Math.round(map.getZoom())}&north=${b.getNorth()}&south=${b.getSouth()}&east=${b.getEast()}&west=${b.getWest()}`;
-    const res = await get(`map-tiles/viewport?${q}`);
-    if (mine === copyrightSeq && baseName === "google") showGoogleAttribution(res.copyright || "");
-  } catch {
-    /* the mark stays; the copyright comes with the next move */
+// The Maps JavaScript API, loaded the first time Google is shown. Google calls
+// gm_authFailure when the key is refused (not enabled for the Maps JavaScript
+// API, not allowed on this host, billing off).
+function loadGoogle(g) {
+  if (googleLoad) return googleLoad;
+  googleLoad = new Promise((resolve, reject) => {
+    window.gm_authFailure = () => googleFailed("Google refused the key for the Maps JavaScript API. Check that the API is enabled for the key's project, billing is on, and the key allows this host.");
+    window.__gimsGoogleReady = () => resolve();
+    const src = new URL(g.script_url, location.href);
+    src.searchParams.set("key", g.key);
+    src.searchParams.set("v", "weekly");
+    src.searchParams.set("loading", "async");
+    src.searchParams.set("callback", "__gimsGoogleReady");
+    if (g.language) src.searchParams.set("language", g.language);
+    if (g.region) src.searchParams.set("region", g.region);
+    const script = document.createElement("script");
+    script.src = src.toString();
+    script.async = true;
+    script.onerror = () => reject(new Error("Google's map script could not be loaded."));
+    document.head.append(script);
+  });
+  return googleLoad;
+}
+
+async function showGoogle() {
+  const g = tiles.google;
+  if (!g) return;
+  if (!gbox) {
+    gbox = h("div.map-google", { "aria-hidden": "true" });
+    map.getContainer().parentElement.insertBefore(gbox, map.getContainer());
   }
-}, 400);
+  gbox.hidden = false;
+  if (!gmap) {
+    try {
+      await loadGoogle(g);
+      const { Map } = await window.google.maps.importLibrary("maps");
+      if (gmap) return;
+      const c = map.getCenter();
+      gmap = new Map(gbox, {
+        center: { lat: c.lat, lng: c.lng }, zoom: map.getZoom(), mapTypeId: "roadmap",
+        // a picture under Leaflet: Leaflet moves it, nothing on it is clicked
+        disableDefaultUI: true, gestureHandling: "none", keyboardShortcuts: false, clickableIcons: false,
+        isFractionalZoomEnabled: false, backgroundColor: "#dfe7e5",
+      });
+    } catch (e) {
+      googleFailed(e.message || "Google's map could not be loaded.");
+      return;
+    }
+  }
+  syncGoogle();
+}
+
+// Leaflet leads: Google's camera jumps to Leaflet's view as it moves, and to
+// a zoom's end as the zoom starts, so the two arrive together.
+function syncGoogle(center = map.getCenter(), zoom = map.getZoom()) {
+  if (!gmap || baseName !== "google") return;
+  gmap.moveCamera({ center: { lat: center.lat, lng: center.lng }, zoom });
+}
 
 async function loadBaseMaps() {
   try {
@@ -168,16 +223,8 @@ async function loadBaseMaps() {
   } catch {
     tiles = { default: "osm", google: null, google_error: null };
   }
-  const wanted = pref("mapTiles", null) || tiles.default || "osm";
-  if (baseName === "google" && tiles.google) base.setUrl(tiles.google.url);
-  else setBase(wanted);
+  setBase(pref("mapTiles", null) || tiles.default || "osm");
   updateBaseChooser();
-  // a session lasts about two weeks: a new address an hour before it ends
-  clearTimeout(tilesRenew);
-  if (tiles.google && tiles.google.expires_at) {
-    const ms = tiles.google.expires_at * 1000 - Date.now() - 3600 * 1000;
-    tilesRenew = setTimeout(loadBaseMaps, Math.min(Math.max(ms, 60 * 1000), 2 ** 31 - 1));
-  }
 }
 
 let baseChooser = null;

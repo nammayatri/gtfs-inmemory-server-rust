@@ -272,7 +272,6 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
             // auth
             .route("/auth/me", web::get().to(h::me))
             .route("/map-tiles", web::get().to(h::map_tiles))
-            .route("/map-tiles/viewport", web::get().to(h::map_tiles_viewport))
             .route("/auth/totp/enroll", web::post().to(h::totp_enroll))
             .route("/auth/totp/confirm", web::post().to(h::totp_confirm))
             .route("/auth/session", web::post().to(h::session_create))
