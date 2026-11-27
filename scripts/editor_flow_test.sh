@@ -17,9 +17,10 @@
 # tests/editor_unserviceable_flow.rs, tests/editor_stage_review_flow.rs,
 # tests/editor_stage_edit_cost_flow.rs, tests/editor_route_tag_flow.rs and
 # tests/editor_gps_line_flow.rs (which also starts a fake ClickHouse and a fake
-# OSRM on localhost) and tests/editor_migration_flow.rs (master to prod, section
-# 23: it needs a second local database with the editor schema as prod,
-# EDITOR_TEST_PROD_DATABASE_URL, and skips itself without one), which use
+# OSRM on localhost) and tests/editor_migration_flow.rs and
+# tests/editor_migration_whole_feed_flow.rs (master to prod, section 23: they
+# need a second local database with the editor schema as prod,
+# EDITOR_TEST_PROD_DATABASE_URL, and skip themselves without one), which use
 # their own feeds and accounts, then proves the chennai_bus rows were not touched
 # - reseeding them from nandi if they were - and that its station proposals, its
 # position reviews and its feed row (data source and version) were not touched
@@ -96,6 +97,7 @@ EDITOR_TEST_DATABASE_URL="$DB_URL" cargo test --locked --test editor_flow \
   --test editor_stage_edit_cost_flow \
   --test editor_route_tag_flow \
   --test editor_migration_flow \
+  --test editor_migration_whole_feed_flow \
   -- --nocapture || status=$?
 
 proposals_after="$(proposals)"

@@ -181,6 +181,8 @@ async fn draft_import(args: &[String]) -> ExitCode {
         user_id,
         email,
         exclude_routes: Default::default(),
+        exclude_records: Default::default(),
+        whole_feed: false,
         title: None,
     };
     let started = std::time::Instant::now();

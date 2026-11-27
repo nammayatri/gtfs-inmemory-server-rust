@@ -602,6 +602,8 @@ pub async fn feed_import(
                 user_id: ctx.user.user_id,
                 email: ctx.user.email.clone(),
                 exclude_routes: Default::default(),
+                exclude_records: Default::default(),
+                whole_feed: false,
                 title: None,
             };
             if !background {

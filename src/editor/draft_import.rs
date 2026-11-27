@@ -82,6 +82,18 @@ pub struct DraftImport {
     /// whatever the zip says: a migration's routes that prod timetabled itself
     /// (section 23). Reported in `stop_orders.routes_kept`.
     pub exclude_routes: HashSet<String>,
+    /// Record rows that stay as the feed has them, whatever the zip says, as
+    /// `<entity>:<key>`: a migration's rows that prod changed itself (section
+    /// 23). Those the zip would have changed are listed in `records_kept`.
+    pub exclude_records: HashSet<String>,
+    /// The zip is a feed's whole GTFS (a migration's, section 23), not a part
+    /// of one: a file asked for that it does not have is a file with no rows -
+    /// the feed's rows of it are deleted, its services lose their dates - where
+    /// otherwise asking for it is `file_not_in_zip`. The GTFS writer leaves an
+    /// empty file out, so a feed with no calendar exceptions has no
+    /// `calendar_dates.txt`. The timetable's files stay as they are when
+    /// absent.
+    pub whole_feed: bool,
     /// What the change sets' titles start with; "GTFS import <sha>" if none.
     pub title: Option<String>,
 }
@@ -103,6 +115,10 @@ pub struct DraftImportReport {
     /// With `routes.txt` asked for: the routes the feed has whose details or
     /// map line the zip changes (section 32).
     pub routes: RouteUpdates,
+    /// Record changes left out because the import was asked to keep those
+    /// rows ([`DraftImport::exclude_records`]), as `<entity>:<key>`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub records_kept: Vec<String>,
     /// Which step this run drafted: `records` or `trips`; `none` when the feed
     /// already holds what the zip says.
     pub step: &'static str,
@@ -172,8 +188,14 @@ fn present(raw: &RawFeed, name: &str) -> bool {
 }
 
 /// The files the import may write: those asked for (the timetable's files go
-/// together), or every file the zip has but the editor's own.
-fn scope(raw: &RawFeed, asked: Option<&[String]>) -> EditorResult<BTreeSet<String>> {
+/// together), or every file the zip has but the editor's own. With
+/// `whole_feed`, a file asked for that the zip does not have is one with no
+/// rows, but for the timetable's.
+fn scope(
+    raw: &RawFeed,
+    asked: Option<&[String]>,
+    whole_feed: bool,
+) -> EditorResult<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     match asked {
         None => {
@@ -204,6 +226,13 @@ fn scope(raw: &RawFeed, asked: Option<&[String]>) -> EditorResult<BTreeSet<Strin
                     ));
                 }
                 if !present(raw, f.name) {
+                    if whole_feed {
+                        // a whole feed without trips has no timetable to write
+                        if !TIMETABLE.contains(&f.name) {
+                            out.insert(f.name.to_string());
+                        }
+                        continue;
+                    }
                     return Err(bad("file_not_in_zip", format!("the zip has no {}", f.name)));
                 }
                 if TIMETABLE.contains(&f.name) {
@@ -241,7 +270,7 @@ pub async fn draft_import(
             ))
         }
     };
-    let mut files = scope(&raw, opts.files.as_deref())?;
+    let mut files = scope(&raw, opts.files.as_deref(), opts.whole_feed)?;
     if opts.with_routes {
         if !present(&raw, "routes.txt") {
             return Err(bad("file_not_in_zip", "the zip has no routes.txt".into()));
@@ -263,19 +292,32 @@ pub async fn draft_import(
     lock_feed(&mut tx, &g).await?;
     let (live, more) = feed_io::load_model(&mut tx, &g).await?;
     report.findings.extend(more);
-    let (zip, more) = FeedModel::from_raw(
+    let (zip, mut more) = FeedModel::from_raw(
         &raw,
         &g,
         model::BuildOptions {
             default_timing: Some(live.default_timing),
         },
     );
+    if opts.whole_feed {
+        // a whole feed without trips, calendars or an agency has none: the
+        // writer leaves an empty file out, and a feed of stop lists alone has
+        // no timetable to write
+        more.retain(|f| f.code != "missing_file");
+    }
     report.findings.extend(more);
     report.validation = crate::gtfs::validate::summarise(
         &crate::gtfs::validate::validate(&zip, &chrono::Utc::now().date_naive().to_string()),
         5,
     );
     if crate::gtfs::has_errors(&report.findings) {
+        // nothing is planned from a zip that does not read: its errors are
+        // the findings', so a caller does not take it for one with nothing to do
+        report.errors = report
+            .findings
+            .iter()
+            .filter(|f| f.level == crate::gtfs::Level::Error)
+            .count();
         tx.rollback().await?;
         return Ok(report);
     }
@@ -299,8 +341,16 @@ pub async fn draft_import(
 
     // ---- step 1: records, calendars, stop orders, profiles
     let mut problems = Problems::default();
-    let record_changes =
-        record_changes(&mut tx, &g, &zip, &live, &files, &raw, &mut problems).await?;
+    let record_changes = record_changes(
+        &mut tx,
+        &g,
+        (&zip, &live, &raw),
+        &files,
+        opts,
+        &mut report.records_kept,
+        &mut problems,
+    )
+    .await?;
     let route_updates = if files.contains("routes.txt") {
         // a line comes in as `imported` only with the shape it is and the
         // trips that run it; on its own it is a line given by hand
@@ -625,14 +675,17 @@ fn shape_points(s: &model::Shape) -> Value {
 /// The record changes that make each record file the import writes say what
 /// the zip says: rows it adds, rows whose fields differ (a field the zip leaves
 /// out is cleared), rows it no longer has. A file with no id of its own is
-/// matched on its natural key.
+/// matched on its natural key. A file the zip does not have is one with no
+/// rows when the zip is a whole feed's ([`DraftImport::whole_feed`]); a row
+/// the caller keeps ([`DraftImport::exclude_records`]) is left as it is and
+/// named in `kept`.
 async fn record_changes(
     conn: &mut PgConnection,
     g: &str,
-    zip: &FeedModel,
-    live: &FeedModel,
+    (zip, live, raw): (&FeedModel, &FeedModel, &RawFeed),
     files: &BTreeSet<String>,
-    raw: &RawFeed,
+    opts: &DraftImport,
+    kept: &mut Vec<String>,
     problems: &mut Problems,
 ) -> EditorResult<Vec<ChangeInsert>> {
     let mut out = Vec::new();
@@ -640,7 +693,7 @@ async fn record_changes(
         let (Some(entity), Some(key)) = (fspec.entity(), fspec.key()) else {
             continue;
         };
-        if !files.contains(fspec.name) || !present(raw, fspec.name) {
+        if !files.contains(fspec.name) || !(opts.whole_feed || present(raw, fspec.name)) {
             continue;
         }
         // (op, key, after) for this file
@@ -722,6 +775,14 @@ async fn record_changes(
                 planned.push(("delete", r.key.clone(), Value::Null));
             }
         }
+        planned.retain(|(_, k, _)| {
+            let id = format!("{entity}:{k}");
+            let keep = opts.exclude_records.contains(&id);
+            if keep {
+                kept.push(id);
+            }
+            !keep
+        });
         if planned.is_empty() {
             continue;
         }
@@ -1339,22 +1400,35 @@ mod tests {
         ] {
             raw.files.insert(f.into(), Default::default());
         }
-        let all = scope(&raw, None).unwrap();
+        let all = scope(&raw, None, false).unwrap();
         assert_eq!(
             all.into_iter().collect::<Vec<_>>(),
             vec!["agency.txt", "stop_times.txt", "trips.txt"]
         );
-        let asked = scope(&raw, Some(&["trips.txt".to_string()])).unwrap();
+        let asked = scope(&raw, Some(&["trips.txt".to_string()]), false).unwrap();
         assert_eq!(
             asked.into_iter().collect::<Vec<_>>(),
             vec!["stop_times.txt", "trips.txt"]
         );
         let code = |files: &[&str]| {
             let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
-            scope(&raw, Some(&files)).unwrap_err().code
+            scope(&raw, Some(&files), false).unwrap_err().code
         };
         assert_eq!(code(&["stops.txt"]), "compared_only");
         assert_eq!(code(&["pathways.txt"]), "file_not_in_zip");
         assert_eq!(code(&["notes.txt"]), "unknown_file");
+        // a whole feed's zip: a file it lacks has no rows, but for the
+        // timetable's, which a feed without trips has none of
+        let asked: Vec<String> = ["pathways.txt", "calendar_dates.txt", "frequencies.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            scope(&raw, Some(&asked), true)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["calendar_dates.txt", "pathways.txt"]
+        );
     }
 }
