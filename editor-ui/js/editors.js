@@ -13,7 +13,10 @@ import { fileSpec, fieldsForm, cellText } from "./gtfs.js";
 import { stopPicker } from "./picker.js";
 import { showStop, showRoute } from "./explore.js";
 import { undoScope } from "./undo.js";
-import { encodePolyline, tidy, lineLength, nearestOnLine, spliceStretch, throughStops, stopsOffLine, OFF_LINE_M } from "./line.js";
+import {
+  encodePolyline, tidy, lineLength, nearestOnLine, spliceStretch, throughStops, stopsOffLine, OFF_LINE_M,
+  viaStopStretch, trimToStops, simplify, parseLineFile, toGeoJSON, toGPX, toKML,
+} from "./line.js";
 import { foldPlatforms, stationNames, platformsNote } from "./context.js";
 
 const panel = () => document.getElementById("panel");
@@ -1129,9 +1132,15 @@ export async function editRouteDetails(route, { created = false } = {}) {
   const showProposal = () => {
     if (editing) {
       editing.replace(shownPoints());
+      // drawing on: the next stretch starts where the line now ends (an undo moves it)
+      if (drawing && drawing.which !== "fresh") {
+        const pts = shownPoints();
+        drawing.from = drawing.which === "start" ? pts[0] : pts[pts.length - 1];
+        editing.setDrawFrom(drawing.from);
+      }
       checkStops();
       clear(lineStatus, proposed
-        ? [h("p.notice.ok", `Map line edited by hand (${fmtMetres(lineLength(shownPoints()))}). It is saved when you add these changes to the draft.`),
+        ? [h("p.notice.ok", { "data-line-stats": "" }, `Map line edited by hand: ${fmtMetres(lineLength(shownPoints()))}, ${plural(shownPoints().length, "point")}. It is saved when you add these changes to the draft.`),
           h("button.btn.quiet.small", { type: "button", on: { click: () => setLine(null, "discarded the new map line") } }, "Discard the new map line")]
         : h("p.hint", "Not changed yet."));
       return;
@@ -1176,7 +1185,9 @@ export async function editRouteDetails(route, { created = false } = {}) {
       h("p", `${plural(off.length, "stop")} ${off.length === 1 ? "is" : "are"} more than ${OFF_LINE_M} m from this line (ringed in red on the map): passengers are told the bus may not stop there. If the buses do stop there, bend the line to pass them.`),
       h("ul.off-line", off.map((s) => h("li",
         h("button.btn.quiet.small", { type: "button", "data-off-stop": s.stop_id, on: { click: () => show(s) } }, `${s.index + 1}. ${s.name}`),
-        h("span.meta", ` ${fmtMetres(s.distM)} from the line`))))));
+        h("span.meta", ` ${fmtMetres(s.distM)} from the line`),
+        // the one-click fix, while the line is edited (section 31)
+        editing ? h("button.btn.quiet.small", { type: "button", "data-tool": "via-stop", "data-via-stop": s.stop_id, on: { click: () => throughStop(s) } }, "Route through it") : null)))));
   };
   if (!created && state.draft) {
     get(`change-sets/${enc(state.draft.change_set_id)}/preview/routes/${enc(route.route_id)}`)
@@ -1254,6 +1265,269 @@ export async function editRouteDetails(route, { created = false } = {}) {
     // the choice is in the panel, likely scrolled away while working on the map
     stretchBox.scrollIntoView({ block: "nearest" });
   };
+  // ---- the toolkit (docs section 31)
+  const toolStatus = h("div", { "data-tool-status": "", "aria-live": "polite" });
+  const say = (...nodes) => { clear(toolStatus, ...nodes); toolStatus.scrollIntoView({ block: "nearest" }); };
+  const linePts = () => (editing ? editing.points() : shownPoints());
+  const sameLine = (a, b) => encodePolyline(a) === encodePolyline(b);
+  // one tool that waits on the server at a time
+  let toolBusy = false;
+  const busyTool = async (fn) => {
+    if (toolBusy) return;
+    toolBusy = true;
+    editBox.querySelectorAll("button[data-tool]").forEach((b) => { b.disabled = true; });
+    lineCheck.querySelectorAll("button[data-tool]").forEach((b) => { b.disabled = true; });
+    try { await fn(); } catch (e) { say(h("p.notice.error", e.message)); } finally {
+      toolBusy = false;
+      editBox.querySelectorAll("button[data-tool]").forEach((b) => { b.disabled = false; });
+      lineCheck.querySelectorAll("button[data-tool]").forEach((b) => { b.disabled = false; });
+    }
+  };
+  const roadThrough = async (points) => decodePolyline((await post(`feeds/${enc(state.feedId)}/polyline:road`,
+    { points: points.map(([lat, lon]) => ({ lat, lon })) })).encoded_polyline);
+  const firstStop = () => rows.find((r) => !SERVED_EXCLUDE.has(r.stop_type) && r.lat != null);
+
+  // Draw on: from the end, back from the start, or a new line from the first
+  // stop. Each click adds a stretch, by road or straight; one undo each.
+  let drawing = null;            // {which: "end" | "start" | "fresh", from}
+  let drawBy = "roads";
+  const drawQueue = [];
+  let drawRouting = false;
+  const drawBox = h("div", { "data-draw": "" });
+  const stopDrawing = () => {
+    if (!drawing) return;
+    drawing = null;
+    drawQueue.length = 0;
+    if (editing) editing.endDraw();
+    clear(drawBox);
+  };
+  const startDrawing = (which) => {
+    if (!editing) return;
+    stopDrawing();
+    const pts = linePts();
+    let from;
+    if (which === "fresh") {
+      const f = firstStop();
+      if (!f) { say(h("p.notice.error", "This route has no stop with a position to start from.")); return; }
+      from = [f.lat, f.lon];
+    } else {
+      from = which === "start" ? pts[0] : pts[pts.length - 1];
+    }
+    drawing = { which, from };
+    const message = which === "start"
+      ? "Click the map back along the route from the line's start. Each click adds a stretch."
+      : which === "fresh" ? "Click the map along the route from the first stop. The first click replaces the line." : "Click the map along the route from the line's end. Each click adds a stretch.";
+    editing.startDraw({ from, message, onClick: drawClick, onCancel: () => { drawing = null; drawQueue.length = 0; clear(drawBox); } });
+    clear(drawBox, h("div.notice", { "data-drawing": which },
+      h("p", `${message} ${drawBy === "roads" ? "Each stretch follows the roads." : "Each stretch is a straight line."} The dashed line shows where the next one starts.`),
+      h("div.btn-row", h("button.btn.secondary.small", { type: "button", on: { click: stopDrawing } }, "Stop drawing"))));
+    drawBox.scrollIntoView({ block: "nearest" });
+  };
+  async function drawClick(lat, lon) {
+    if (!drawing) return;
+    drawQueue.push([lat, lon]);
+    if (drawRouting) return;
+    drawRouting = true;
+    try {
+      while (drawQueue.length && drawing && editing) {
+        const to = drawQueue.shift();
+        const { which, from } = drawing;
+        const ends = which === "start" ? [to, from] : [from, to];
+        let stretch;
+        if (drawBy === "roads") {
+          say(h("p.hint", "Asking the road router for the way…"));
+          try {
+            stretch = await roadThrough(ends);
+          } catch (e) {
+            drawQueue.length = 0;
+            say(h("p.notice.error", e.message), h("p.hint", "Click nearer a road, or draw this stretch with straight lines."));
+            break;
+          }
+          clear(toolStatus);
+        } else {
+          stretch = ends;
+        }
+        if (!drawing || !editing) break;
+        const pts = linePts();
+        let next, label;
+        if (which === "fresh") {
+          next = stretch;
+          label = "started the line again from the first stop";
+          drawing.which = "end";
+        } else if (which === "start") {
+          next = [...stretch, ...pts];
+          label = "drew the line on back from its start";
+        } else {
+          next = [...pts, ...stretch];
+          label = "drew the line on from its end";
+        }
+        edited(next, label);
+      }
+    } finally {
+      drawRouting = false;
+    }
+  }
+  const drawByRadio = (value, label) => h("label.check", { for: `draw-by-${value}` },
+    h("input", { type: "radio", name: "draw-by", id: `draw-by-${value}`, value, checked: drawBy === value, on: { change: () => { drawBy = value; } } }), ` ${label}`);
+
+  // through a stop the line passes by: the stretch 150 m either side of where
+  // it passes nearest, by road through the stop
+  const throughStop = (s) => busyTool(async () => {
+    const pts = linePts();
+    const st = viaStopStretch(pts, s.lat, s.lon, 150);
+    if (!st) return;
+    say(h("p.hint", `Asking the road router for a way through ${s.name}…`));
+    let routed;
+    try {
+      routed = await roadThrough([[st.from.lat, st.from.lon], [s.lat, s.lon], [st.to.lat, st.to.lon]]);
+    } catch (e) {
+      say(h("p.notice.error", e.message), h("p.hint", "Redraw that stretch by hand instead, with straight lines if need be."));
+      return;
+    }
+    if (!editing || !sameLine(pts, linePts())) { say(h("p.hint", "The line changed while the road router answered. Try again.")); return; }
+    edited(spliceStretch(pts, st.from, st.to, routed), `took the line through ${s.name}`);
+    say(h("p.notice.ok", `The line now goes through ${s.name}.`));
+  });
+
+  const snapToRoads = () => busyTool(async () => {
+    const pts = linePts();
+    say(h("p.hint", "Fitting the line to the roads…"));
+    let res;
+    try {
+      res = await post(`feeds/${enc(state.feedId)}/polyline:snap`, { encoded_polyline: encodePolyline(pts) });
+    } catch (e) {
+      say(h("p.notice.error", e.message));
+      return;
+    }
+    if (!editing || !sameLine(pts, linePts())) { say(h("p.hint", "The line changed while the road router answered. Try again.")); return; }
+    if (res.quality === "none") {
+      say(h("p.notice.error", `The road router could not fit the line to the roads${res.error ? `: ${res.error}` : ""}. It is as it was.`));
+      return;
+    }
+    edited(decodePolyline(res.encoded_polyline), "snapped the line to the roads");
+    const kept = res.kept_as_drawn ? ` ${plural(res.kept_as_drawn, "stretch", "stretches")} the router would have moved onto another road ${res.kept_as_drawn === 1 ? "is" : "are"} kept as drawn.` : "";
+    say(h("p.notice.ok", { "data-snapped": String(res.matched_share) }, `Snapped ${Math.round((res.matched_share || 0) * 100)}% of the line to the roads.${kept} Undo puts it back.`));
+  });
+
+  const simplifyBy = h("input", { type: "number", id: "simplify-m", min: "1", max: "50", step: "1", value: "5", "aria-label": "Within how many metres" });
+  const simplifyLine = () => {
+    const pts = linePts();
+    const m = Math.max(1, Math.min(50, Number(simplifyBy.value) || 5));
+    const out = simplify(pts, m);
+    if (out.length === pts.length) { say(h("p.hint", `Nothing to take away within ${m} m.`)); return; }
+    edited(out, `simplified the line within ${m} m`);
+    say(h("p.notice.ok", `${fmtCount(pts.length)} points down to ${fmtCount(out.length)}, the line everywhere within ${m} m of where it was.`));
+  };
+
+  const trimLine = () => {
+    const pts = linePts();
+    const out = trimToStops(pts, rows);
+    if (sameLine(out, pts)) { say(h("p.hint", "The line does not run past the first or the last stop.")); return; }
+    edited(out, "trimmed the line to its first and last stops");
+    say(h("p.notice.ok", `Cut ${fmtMetres(lineLength(pts) - lineLength(out))} that ran past the first and last stops.`));
+  };
+
+  const reverseLine = () => {
+    edited([...linePts()].reverse(), "reversed the line");
+    say(h("p.notice.ok", "The line now runs the other way."));
+  };
+
+  // another route's line: its opposite direction, reversed, is often most of this one
+  const copyBox = h("div", { "data-copy": "" });
+  const openCopy = () => {
+    if (copyBox.childNodes.length) { clear(copyBox); return; }
+    const input = h("input", { type: "search", id: "copy-route-search", placeholder: "Route number or name", autocomplete: "off", "aria-label": "Route to copy the line of" });
+    const reverse = h("input", { type: "checkbox", id: "copy-reverse", checked: true });
+    const found = h("ul.list.routes-map-results", { hidden: true });
+    let seq = 0;
+    const choose = (r) => busyTool(async () => {
+      const other = await get(`feeds/${enc(state.feedId)}/routes/${enc(r.route_id)}`);
+      const pts = pointsOf(other.encoded_polyline);
+      if (pts.length < 2) { say(h("p.notice.error", `Route ${other.short_name || r.route_id} has no map line to copy.`)); return; }
+      edited(reverse.checked ? [...pts].reverse() : pts, `copied route ${other.short_name || r.route_id}'s line${reverse.checked ? ", reversed" : ""}`);
+      clear(copyBox);
+      say(h("p.notice.ok", `Copied route ${other.short_name || r.route_id}'s line (${r.route_id})${reverse.checked ? ", reversed" : ""}: ${fmtMetres(lineLength(pts))}. Undo puts this route's back.`));
+    });
+    input.addEventListener("input", debounce(async () => {
+      const q = input.value.trim();
+      if (!q) { found.hidden = true; return; }
+      const mine = ++seq;
+      const page = await get(`feeds/${enc(state.feedId)}/routes?q=${enc(q)}&limit=10`).catch(() => ({ items: [] }));
+      if (mine !== seq) return;
+      const items = (page.items || []).filter((r) => r.route_id !== route.route_id);
+      clear(found, items.length ? items.map((r) => h("li.list-item.routes-map-result", { "data-route": r.route_id },
+        h("span.key", r.short_name || r.route_id),
+        h("button.btn.quiet.small", { type: "button", disabled: !r.has_polyline, on: { click: () => choose(r) } }, r.long_name || `Route ${r.route_id}`),
+        h("span.hint", r.has_polyline ? "" : "no map line"),
+        h("span.sub", `Route id ${r.route_id}`))) : h("li.empty", `No other route matches "${q}".`));
+      found.hidden = false;
+    }, 200));
+    clear(copyBox, h("div.notice",
+      h("label.field", { for: "copy-route-search" }, h("span", "Copy the map line of route"), input),
+      h("label.check", { for: "copy-reverse" }, reverse, " Reversed: it runs the other way (the opposite direction's line)"),
+      found));
+    input.focus();
+  };
+
+  const fileInput = h("input", { type: "file", id: "line-file", accept: ".geojson,.json,.gpx,.kml,.txt,application/geo+json,application/gpx+xml,application/vnd.google-earth.kml+xml,text/plain", hidden: true });
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = "";
+    if (!file) return;
+    try {
+      if (file.size > 20 * 1024 * 1024) throw new Error("The file is over 20 MB.");
+      const { points, format } = parseLineFile(await file.text(), file.name);
+      edited(points, `imported a line from ${file.name}`);
+      say(h("p.notice.ok", `Imported the ${format} line from ${file.name}: ${fmtMetres(lineLength(points))}, ${plural(points.length, "point")}.`));
+    } catch (e) {
+      say(h("p.notice.error", `${file.name}: ${e.message}`), h("p.hint", "A line is read from GeoJSON (a LineString), GPX (a track or a route), KML (a LineString), an encoded polyline or lat,lon lines."));
+    }
+  });
+  const exportAs = (kind) => {
+    const pts = linePts();
+    const name = `Route ${route.short_name || route.route_id}`;
+    const [ext, type, text] = {
+      geojson: ["geojson", "application/geo+json", () => toGeoJSON(pts, { route_id: route.route_id, short_name: route.short_name || null })],
+      gpx: ["gpx", "application/gpx+xml", () => toGPX(pts, name)],
+      kml: ["kml", "application/vnd.google-earth.kml+xml", () => toKML(pts, name)],
+    }[kind];
+    const url = URL.createObjectURL(new Blob([text()], { type }));
+    const a = h("a", { href: url, download: `route-${route.route_id}-line.${ext}`, style: "display:none" });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
+  const tool = (id, label, onClick, title = null) => h("button.btn.secondary.small", { type: "button", "data-tool": id, title, on: { click: onClick } }, label);
+  const toolkit = () => h("div.toolkit", { "data-toolkit": "" },
+    h("div.tool-group", h("h3", "Draw"),
+      h("div.btn-row",
+        tool("draw-end", "Draw on from the end", () => startDrawing("end")),
+        tool("draw-start", "Draw back from the start", () => startDrawing("start")),
+        tool("draw-fresh", "Start again from the first stop", () => startDrawing("fresh"))),
+      h("div.btn-row", { role: "radiogroup", "aria-label": "Each stretch drawn" }, drawByRadio("roads", "Follow the roads"), drawByRadio("straight", "Straight lines")),
+      drawBox,
+      h("div.btn-row", tool("stretch", "Redraw a stretch", () => { stopDrawing(); if (editing) editing.startStretch(); }))),
+    h("div.tool-group", h("h3", "Tidy"),
+      h("div.btn-row",
+        tool("snap", "Snap to the roads", snapToRoads, "Fit a line traced by hand to the roads it follows"),
+        tool("trim", "Trim to the first and last stop", trimLine),
+        tool("reverse", "Reverse", reverseLine)),
+      h("div.btn-row",
+        tool("simplify", "Simplify", simplifyLine, "Take away points the line does not need"),
+        h("label.inline-field", { for: "simplify-m" }, "within ", simplifyBy, " m"))),
+    h("div.tool-group", h("h3", "From elsewhere"),
+      h("div.btn-row",
+        tool("copy", "Copy another route's line", openCopy),
+        tool("import", "Import a file", () => fileInput.click()),
+        fileInput),
+      copyBox,
+      h("div.btn-row", h("span.hint", "Export:"),
+        tool("export-geojson", "GeoJSON", () => exportAs("geojson")),
+        tool("export-gpx", "GPX", () => exportAs("gpx")),
+        tool("export-kml", "KML", () => exportAs("kml")))));
+
   const startEditing = () => {
     if (editing || asking) return;
     const start = shownPoints().length >= 2 ? shownPoints() : throughStops(rows);
@@ -1265,12 +1539,12 @@ export async function editRouteDetails(route, { created = false } = {}) {
     editButton.hidden = true;
     editing = map.editLine(start, { onChange: edited, onView, onStretch: drawStretch });
     clear(editBox,
-      h("p.hint", "Drag a point of the teal line to move it, or a faint point between two to bend the line there. Double-click a point to remove it. To replace a whole stretch, such as a flyover the buses do not take, redraw it."),
+      h("p.hint", "Drag a point of the teal line to move it, or a faint point between two to bend the line there. Double-click a point to remove it. Or use a tool below; every change is one undo."),
       viewHint,
-      h("div.btn-row",
-        h("button.btn.secondary", { type: "button", on: { click: () => editing && editing.startStretch() } }, "Redraw a stretch"),
-        h("button.btn.secondary", { type: "button", on: { click: stopEditing } }, "Done editing")),
+      toolkit(),
       stretchBox,
+      toolStatus,
+      h("div.btn-row", h("button.btn", { type: "button", on: { click: stopEditing } }, "Done editing")),
       h("p.hint", "A line edited here is kept as drawn: the weekly map line from GPS no longer replaces it. To hand the route back to it, suggest a line from GPS instead."));
     // no line yet: the one through the stops is the first edit
     if (!proposed && savedPoints().length < 2) edited(start, "drew a map line through the stops");
@@ -1279,6 +1553,7 @@ export async function editRouteDetails(route, { created = false } = {}) {
   };
   const stopEditing = () => {
     if (!editing) return;
+    stopDrawing();
     editing = null;
     map.endModes();
     clear(editBox);

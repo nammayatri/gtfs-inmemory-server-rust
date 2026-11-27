@@ -1495,6 +1495,54 @@ async fn a_route_through_the_stops_says_why_it_failed() {
     }
     assert_eq!(osrm_state.paths.lock().unwrap().len(), before);
 
+    // ---- a line traced by hand, snapped to the roads (section 31): the fake
+    // OSRM's road runs 2 m north of every point it is given
+    let snap = |line: &str| {
+        editor_c
+            .req("POST", &format!("/feeds/{OSRM_FEED}/polyline:snap"))
+            .set_json(json!({ "encoded_polyline": line }))
+    };
+    let traced: Vec<(f64, f64)> = long[..12].iter().map(|(_, p)| *p).collect();
+    let before = osrm_state.paths.lock().unwrap().len();
+    let (s, b, _, _) = call!(&app, snap(&osrm::encode_polyline(&traced)));
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["quality"], "osrm", "{b}");
+    assert_eq!(b["matched_share"], 1.0, "{b}");
+    assert_eq!(b["kept_as_drawn"], 0, "{b}");
+    let snapped = osrm::decode_polyline(b["encoded_polyline"].as_str().unwrap()).unwrap();
+    let pl = planar();
+    let north = |p: (f64, f64), q: (f64, f64)| pl.xy(p).1 - pl.xy(q).1;
+    // the line's start ~2 m north of where it was traced
+    assert!(
+        (north(snapped[0], traced[0]) - 2.0).abs() < 0.6,
+        "{:?} vs {:?}",
+        snapped[0],
+        traced[0]
+    );
+    let asked: Vec<String> = osrm_state.paths.lock().unwrap()[before..].to_vec();
+    assert!(
+        !asked.is_empty() && asked.iter().all(|p| p.starts_with("/match/")),
+        "{asked:?}"
+    );
+    // OSRM's matching down: the line as drawn, and why
+    osrm_state.mode.store(1, Ordering::SeqCst);
+    let (s, b, _, _) = call!(&app, snap(&osrm::encode_polyline(&traced)));
+    osrm_state.mode.store(0, Ordering::SeqCst);
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["quality"], "none", "{b}");
+    assert!(b["error"].is_string(), "{b}");
+    let kept = osrm::decode_polyline(b["encoded_polyline"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        kept,
+        osrm::decode_polyline(&osrm::encode_polyline(&traced)).unwrap()
+    );
+    // not a line
+    for bad in ["", "?"] {
+        let (s, b, _, _) = call!(&app, snap(bad));
+        assert_eq!(s, 400, "{bad:?} -> {b}");
+        assert_eq!(code_of(&b), "invalid_polyline");
+    }
+
     // ---- an OSRM that is not there
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();

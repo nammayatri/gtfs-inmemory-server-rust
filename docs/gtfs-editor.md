@@ -582,6 +582,7 @@ below). Every list is
 | POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change. Asked of OSRM in chunks of at most 25 waypoints; a failure is 502 `osrm_failed` saying why and where (section 17.5) |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:gps?change_set=` | `{route_id, encoded_polyline, polyline_source: "gps", saved: false, evidence}` — the path this route's buses drove over the last 7 days, snapped to roads (section 17); not saved, add it as a `route` change |
 | POST | `/feeds/{g}/polyline:road` | body `{points: [{lat, lon}, ...]}`, 2 to 25 points in order → `{encoded_polyline, points, distance_m}` — a road route through exactly those points, for a stretch of a line edited by hand (section 28); nothing read from the feed, nothing saved. Editor role. One OSRM request; a failure is 502 `osrm_failed` naming the point ("point 2 you placed"), no OSRM 503 `osrm_unavailable` |
+| POST | `/feeds/{g}/polyline:snap` | body `{encoded_polyline}` (at most 20,000 points and 300 km) → `{encoded_polyline, quality: "osrm" \| "partial" \| "none", matched_share, kept_as_drawn, error}` — the line fitted to the roads it follows by OSRM's map matching (section 31); what OSRM cannot match, or would move onto another road more than 40 m away, stays as drawn. Nothing read or saved. Editor role; 400 `invalid_polyline`, 503 `osrm_unavailable` |
 | GET | `/feeds/{g}/routes/{route_id}/gps-trips?date=` | `{route_id, route_number, date, stops, trips: [{device, start, end, stops_matched, first_stop_id, last_stop_id, encoded_polyline}], evidence}` — the trips the buses made along the route on one day, from their GPS (section 17.8); viewer |
 | GET | `/feeds/{g}/stops/{stop_id}/context`, `/feeds/{g}/routes/{route_id}/context` | what is known about a stop or a route for cleanup: detours, coordinate reviews, same-named stops, its audit rows, the open drafts touching it — section 9 |
 | GET | `/feeds/{g}/audit?change_set=&limit=&cursor=` | newest first: `{audit_id, at, actor, actor_email, action, gtfs_id, change_set_id, detail}` |
@@ -6112,3 +6113,86 @@ OpenStreetMap at 19 and to Google again with the same map and no second
 load, the choice kept across a reload; Google refusing the key, OpenStreetMap
 and why; the server's default for a browser that has not chosen.
 `/__dev/map-tiles` sets what the mock answers (`google`: ok, off, auth_fail).
+
+## 31. The map line toolkit (2026-11-27)
+
+Section 28 let a line be edited point by point and a stretch be redrawn. The
+editor now has a toolkit for drawing and tidying a whole line, in the same
+"Edit the line on the map" mode, grouped in the panel:
+
+```
+Draw            Draw on from the end      each click adds a stretch from the line's end
+                Draw back from the start  ... before its start
+                Start again from the first stop
+                                          the first click replaces the line
+                ( ) Follow the roads  ( ) Straight lines
+                                          each stretch by road (polyline:road) or straight
+                Redraw a stretch          (section 28)
+Tidy            Snap to the roads         POST /feeds/{g}/polyline:snap
+                Trim to the first and last stop
+                Reverse
+                Simplify within [5] m     Douglas-Peucker, in the browser
+From elsewhere  Copy another route's line (reversed: the opposite direction's)
+                Import a file             GeoJSON, GPX, KML, an encoded polyline, lat,lon lines
+                Export                    GeoJSON, GPX, KML
+Stops the line passes by (the list under the line)
+                Route through it          the stretch 150 m either side of where the line
+                                          passes the stop, by road through the stop
+```
+
+- **One undo a change,** like every edit of section 28: a stretch drawn, a
+  snap, a trim, an import. The panel says what each did ("Cut 1.2 km that ran
+  past the first and last stops", "Snapped 94% of the line to the roads",
+  "1,240 points down to 212") and the line's length and points. The line goes
+  into the draft as `polyline_source: "manual"`.
+- **Drawing.** While drawing, a dashed guide runs from where the next stretch
+  starts to the pointer, the point handles are hidden and a double-click does
+  not zoom. Clicks made while a stretch is being routed wait their turn. When
+  the router cannot find a stretch, the clicks after it are dropped and the
+  panel says so ("click nearer a road, or draw this stretch with straight
+  lines"); drawing goes on from where the line ends. An undo moves the
+  start of the next stretch back with the line. Redraw a stretch, Done
+  editing, or Cancel on the map stop drawing.
+- **Snap to the roads** sends the line to `polyline:snap`, which map-matches it
+  with OSRM (`osrm::match_path`, points every 25 m, 35 m to a road) as a line
+  from GPS is (section 17). What OSRM cannot match, or matches onto another
+  road more than 40 m from the drawn one, stays as drawn and is counted. It is
+  for a line traced roughly along the roads; a straight cut across blocks is
+  for Redraw a stretch by road. Nothing changes when OSRM matches nothing.
+- **Route through it** fixes a stop the line passes by (section 27) in one
+  click: from 150 m before to 150 m after where the line passes nearest, the
+  line is replaced by a road route through the stop.
+- **Trim** cuts the line where it passes its first and last boarded stops:
+  the run out of the depot and back that a GPS line can carry.
+- **Simplify** keeps every point the line needs to stay within the metres
+  given (1 to 50) of where it was; the ends stay. It makes a GPS line of
+  thousands of points one that can be edited by hand.
+- **Copy another route's line** reads that route's live line; "Reversed"
+  (ticked by default) is for the opposite direction of the same road.
+- **Files.** Import reads, in the browser, GeoJSON (a LineString, a
+  MultiLineString's parts in order, bare or in a Feature or FeatureCollection:
+  the longest line), GPX (a track's points, else a route's), KML (the longest
+  LineString), an encoded polyline, or "lat,lon" lines: at most 50,000 points
+  and 20 MB, every point a latitude and longitude, or it says what is wrong
+  and the line stays. Export writes the line as GeoJSON (with the route id),
+  GPX or KML, for editing in another tool and importing back.
+
+Code: the toolkit section of `editRouteDetails` in `editor-ui/js/editors.js`;
+drawing in `map.editLine` (`startDraw`, `setDrawFrom`, `endDraw`);
+`placeAt`, `distanceAlong`, `viaStopStretch`, `trimToStops`, `simplify`,
+`parseLineFile`, `toGeoJSON`, `toGPX`, `toKML` in `editor-ui/js/line.js`;
+`handlers::polyline_snap`.
+
+Tests: `editor-ui/dev/line_toolkit_test.mjs` (`node --test`: a place along
+the line and back, the stretch through a stop and the flag gone after it, the
+trim past the depot runs, simplify of a straight run, a bend and a wobble,
+GeoJSON, GPX and KML in and out, an encoded polyline and lat,lon lines, and
+what is not a line); `tests/editor_gps_line_flow.rs` (`polyline:snap` onto
+the fake OSRM's road 2 m north, the line as drawn when OSRM's matching is
+down, what is not a line refused); `node dev/ui_smoke.mjs --line-toolkit`
+against `dev/mock_server.py` (drawing on from the end by road and straight,
+undo and redo; back from the start; trim; reverse; a GeoJSON, a GPX and a KML
+file and one that is no line; simplify; snap, and the router failing; route
+through a stop; copy route 45B's line reversed; export read back; into the
+draft as manual). The mock snaps 2 m north, and `/__dev/map-line` with
+`{"snap": "none"}` makes it match nothing.
