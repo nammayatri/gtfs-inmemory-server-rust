@@ -564,8 +564,7 @@ below). Every list is
 | method | path | body → response |
 |---|---|---|
 | GET | `/auth/me` | → `{user_id, email, display_name, role, status, totp_enabled, session: bool, sign_in_locked_seconds, environment}` (needs only the Pomerium JWT); `environment` is `master` or `prod`, the side of a migration this editor is (section 23) |
-| GET | `/map-tiles` | anyone signed in → `{default: "osm" \| "google", google: {url, max_zoom, expires_at} \| null, google_error}` — the dashboard's base map (section 30); `google.url` is a Leaflet tile template with a live Map Tiles API session |
-| GET | `/map-tiles/viewport?zoom=&north=&south=&east=&west=` | anyone signed in → `{copyright}`: Google's copyright for that view, shown under its tiles; `null` with no Google key; 400 `invalid_query`, 502 `google_tiles_failed` (section 30) |
+| GET | `/map-tiles` | anyone signed in → `{default: "osm" \| "google", google: {key, script_url, language, region} \| null, google_error}` — the dashboard's base map (section 30): the Maps JavaScript API's key and loader when Google is configured. GIMS calls nothing |
 | POST | `/auth/totp/enroll` | → `{otpauth_uri, secret_base32}` — only while `totp_enabled = false` |
 | POST | `/auth/totp/confirm` | `{code}` → `{totp_enabled: true, expires_at}` and starts a session |
 | POST | `/auth/session` | `{code}` → sets cookie, `{expires_at}` |
@@ -6023,7 +6022,7 @@ dashed; picked out by pointing; their stops; one hidden; the Routes switch; the
 address and the trail after a remove; an address with an unknown id; from a
 stop's routes and a route page; twenty, every one looking different).
 
-## 30. The base map: OpenStreetMap or Google Maps (2026-11-26)
+## 30. The base map: OpenStreetMap or Google Maps (2026-11-26, Maps JavaScript API 2026-11-27)
 
 The dashboard's map was OpenStreetMap's tiles alone (`editor-ui/js/config.js`).
 Google's map shows lanes, flyovers and named service roads that OpenStreetMap
@@ -6034,61 +6033,82 @@ hand. A deployment with a Google Maps Platform key now offers both.
 dhall (secrets for the key):
   gtfs_editor_map_tiles = Some
     { default = Some "google"                     -- or "osm" (the default)
-    , google_api_key = Some secrets.google_map_tiles_key
-    , google_language = Some "en-IN"              -- optional, default en-IN
+    , google_api_key = Some secrets.google_maps_js_key
+    , google_language = None Text                 -- optional, default the browser's
     , google_region = Some "IN"                   -- optional, default IN
     }
+
+Google Cloud console, that key:
+  APIs: Maps JavaScript API (enabled on the project, and in the key's API restrictions)
+  Application restriction: HTTP referrers  https://{gtfs_editor_audience}/*
+  Billing on
 
 dashboard: Show box > Map: ( ) OpenStreetMap  ( ) Google Maps
   first: what this browser chose, else the server's default
 ```
 
-- **Through the Map Tiles API, not Google's own tile servers.** Google's terms
-  allow its tiles in another map library only through the Map Tiles API
-  (`tile.googleapis.com`), with a session and its attribution. The well-known
-  `mt*.google.com/vt` addresses are not for that, and are not used.
-- **One session, made by GIMS.** `POST /v1/createSession` (roadmap, the
-  language and region above) is made by GIMS and shared by every signed-in
-  person until a day before it expires (sessions last about two weeks;
-  `expiry` is read, not assumed). A session that fails to renew keeps serving
-  while it has an hour left; a failure is remembered for a minute so page loads
-  do not each call Google. `GET /map-tiles` gives the dashboard the tile
-  address; the dashboard asks again an hour before the session ends.
-- **The key reaches the browser.** Each tile's address carries the session and
-  the key, as the Map Tiles API requires. `/map-tiles` answers only someone
-  signed in (Pomerium and the editor's TOTP), but the key must still be
-  **restricted in the Google Cloud console to the editor's host (HTTP
-  referrer) and to the Map Tiles API**. It is never in GIMS's logs, its Debug
-  output or a serialized config.
-- **Attribution.** Under Google's tiles the map shows "Google Maps" and
-  Google's copyright for the view, in full. The copyright changes with the
-  view, so the dashboard asks `GET /map-tiles/viewport` on every move (once the
-  map is still for 400 ms) and GIMS asks Google (`/tile/v1/viewport`): the
-  dashboard never depends on Google allowing a browser to ask. Google's policy
-  prefers its logo to the text "Google Maps" where there is room; the logo is
-  not vendored yet (`editor-ui/vendor/`), so the text is shown. Tiles are not
-  cached or prefetched by GIMS or the dashboard (the Map Tiles API policy).
+- **Google's own map, under Leaflet's.** The dashboard loads the Maps
+  JavaScript API (`https://maps.googleapis.com/maps/api/js`, with the key,
+  `v=weekly`, `loading=async`, the language and region) the first time Google
+  is shown - not before - and makes one `google.maps.Map` in a box under the
+  Leaflet map, with Google's controls, gestures, keyboard and clickable places
+  off. Leaflet keeps every overlay and every click, and Google's camera follows
+  it (`moveCamera` on every move, and to a zoom's end as the zoom starts).
+  Switching to OpenStreetMap hides that map and switching back shows the same
+  one: one map load a page. Google's map has its own stacking context, so
+  nothing of Google's rises over the overlays; Leaflet's bottom controls are
+  lifted clear of Google's logo and copyright line. Zoom goes to 21 on Google,
+  19 on OpenStreetMap (switching back zooms out to it).
+- **Google draws its own logo and copyright**, as the Maps JavaScript API
+  always does. The dashboard adds nothing of Google's.
+- **GIMS calls nothing.** `GET /map-tiles` (anyone signed in) gives the default,
+  and with a key `{key, script_url, language, region}`. GIMS needs no route to
+  Google and no egress allowlist entry; browsers need `maps.googleapis.com` and
+  Google's map hosts (`maps.gstatic.com`, `*.googleapis.com`).
+- **The key reaches the browser,** as every Maps JavaScript API key does. Only
+  signed-in editor users are given it (Pomerium and the editor's TOTP), and it
+  must be restricted as above. It is never in GIMS's logs, its Debug output or
+  a serialized config.
 - **Fallbacks.** No key: OpenStreetMap, and no choice is shown. Google refusing
-  the session (key not enabled for the Map Tiles API, billing off) or
-  unreachable: OpenStreetMap, and the Show box says "Google Maps is not
-  available now: ..." with Google's reason. A browser that chose Google keeps
-  its choice and gets Google back on a later load, once it works.
-- **Zoom.** Google's roadmap goes to zoom 22, OpenStreetMap's to 19; switching
-  back to OpenStreetMap above 19 zooms out to it.
+  the key (`gm_authFailure`: the Maps JavaScript API not enabled for it, the
+  host not allowed, billing off) or its script not loading: OpenStreetMap, and
+  the Show box says "Google Maps is not available now: ...". A browser that
+  chose Google keeps the choice and gets Google back on a later load.
 - **Insets stay OpenStreetMap.** The small read-only maps beside a draft's
-  changes would each need Google's attribution and are billed per tile, so
-  they keep OpenStreetMap.
+  changes would each be a Google map load.
 
-Code: `src/editor/map_tiles.rs` (config, session, copyright),
-`handlers::map_tiles`, `handlers::map_tiles_viewport`, the base map section of
-`editor-ui/js/map.js`. Tests: `editor::map_tiles::tests` (what the config
-allows and refuses, the dhall record, one session shared until a day before
-it expires and then renewed, a failing renewal served by a session still
-valid then refused with Google's reason and not asked again within a minute,
-the key in no message, Debug or serialized config, the copyright through the
-same session, Google unreachable) and `node dev/ui_smoke.mjs --map-tiles`
-against `dev/mock_server.py` (no key: OpenStreetMap and no choice; a key: the
-choice, Google's tiles and copyright, zoom past 19 and back, kept across a
-reload; Google failing: OpenStreetMap and why; the server's default for a
-browser that has not chosen). `/__dev/map-tiles` sets what the mock answers;
-its "Google" tiles are its own one-colour PNG.
+**Why the Maps JavaScript API and not the Map Tiles API (2026-11-27).** The
+first version (2026-11-26) used the Map Tiles API: GIMS made a session and
+read Google's copyright per view, and the browser fetched Google's tiles into
+Leaflet. On master it failed with "Google refused the map session (HTTP 403):
+Permission denied on the service" - the key was not enabled for the Map Tiles
+API - and a key restricted to the editor's host could never have worked from
+GIMS, whose calls carry no Referer. Beyond that, for an editor the Map Tiles
+API is the dearer one: it bills every tile, and editing is panning and
+zooming (20-60 tiles a move), against one Dynamic Maps load a page; and it
+has a daily cap of 15,000 tile requests a project. At list prices (USD per
+1,000; India billing): Dynamic Maps 70,000 loads free a month, then $2.10;
+2D Map Tiles 700,000 tiles free, then $0.18 (globally 10,000 / $7.00 and
+100,000 / $0.60). Ten editors' month, about 440 page loads and on the order
+of 1.8 million tiles, is free with the Maps JavaScript API and about $190
+(India) or $900 (global) with the Map Tiles API, past its daily cap. The
+price of the change: the dashboard, which otherwise loads nothing from a CDN,
+loads Google's script when Google is chosen. Google's terms about using its
+services together with a non-Google map (OpenStreetMap is offered beside it)
+are for whoever holds the Google account to confirm.
+
+Code: `src/editor/map_tiles.rs` (the config and what `/map-tiles` says),
+`handlers::map_tiles`, the base map section of `editor-ui/js/map.js`. Tests:
+`editor::map_tiles::tests` (what the config allows and refuses, what
+`/map-tiles` says, the dhall record and one from the Map Tiles days, the key
+in no Debug line or serialized config) and `node dev/ui_smoke.mjs --map-tiles`
+against `dev/mock_server.py`, whose Google is a stub script
+(`/__dev/google-maps-stub.js`, recording what it is asked): no key,
+OpenStreetMap and no choice; a key, no Google script until Google is chosen,
+then the script asked with the key, region and callback, Google's controls
+off, its map in step with Leaflet's through a pan and to zoom 21 and no
+further, Leaflet clear over it and its bottom controls lifted, back to
+OpenStreetMap at 19 and to Google again with the same map and no second
+load, the choice kept across a reload; Google refusing the key, OpenStreetMap
+and why; the server's default for a browser that has not chosen.
+`/__dev/map-tiles` sets what the mock answers (`google`: ok, off, auth_fail).

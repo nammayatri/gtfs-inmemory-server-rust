@@ -192,9 +192,41 @@ def _safe_header_value(v):
     return v
 
 
-# 1x1 light-grey PNG, stretched to a tile: the mock's "Google" tiles (section 30)
-MOCK_TILE = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGN48uIZAAVmArPcLpxmAAAAAElFTkSuQmCC")
+# The Maps JavaScript API as far as the dashboard uses it (docs section 30): the
+# loader's callback, importLibrary("maps"), a Map with moveCamera. It records
+# in window.__googleStub what it was asked, draws a "logo" and a "copyright"
+# where Google's are, and in auth_fail mode calls gm_authFailure as Google does
+# for a refused key.
+GOOGLE_MAPS_STUB = """(() => {
+  const mode = "__MODE__";
+  const stub = window.__googleStub = window.__googleStub || { maps: [], scripts: 0, src: [] };
+  const me = document.currentScript;
+  stub.scripts += 1;
+  stub.src.push(me ? me.src : "");
+  const num = (v) => (typeof v === "function" ? v() : v);
+  class Map {
+    constructor(el, opts) {
+      this.el = el; this.opts = opts; this.moves = 0;
+      this.center = { lat: num(opts.center.lat), lng: num(opts.center.lng) }; this.zoom = opts.zoom;
+      stub.maps.push(this);
+      el.innerHTML = '<div class="gm-stub" style="position:absolute;inset:0;background:#efe9dc"></div>'
+        + '<div class="gm-stub-logo" style="position:absolute;left:6px;bottom:3px;font:700 13px sans-serif">Google</div>'
+        + '<div class="gm-stub-copyright" style="position:absolute;right:6px;bottom:3px;font:11px sans-serif">Map data \\u00a92026 Google</div>';
+      if (mode === "auth_fail") setTimeout(() => window.gm_authFailure && window.gm_authFailure(), 50);
+    }
+    moveCamera(c) {
+      this.moves += 1;
+      if (c.center) this.center = { lat: num(c.center.lat), lng: num(c.center.lng) };
+      if (c.zoom != null) this.zoom = c.zoom;
+    }
+    getCenter() { return this.center; }
+    getZoom() { return this.zoom; }
+  }
+  window.google = { maps: { importLibrary: async (name) => (name === "maps" ? { Map } : {}) } };
+  const cb = me ? new URL(me.src).searchParams.get("callback") : null;
+  setTimeout(() => { if (cb && window[cb]) window[cb](); }, 0);
+})();
+"""
 
 
 class ApiError(Exception):
@@ -1313,17 +1345,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok"),
                                     "road": getattr(s, "map_line_road", "ok")})
         if path == "/__dev/map-tiles" and method == "POST":
-            # docs section 30: google ok, off (no key) or error (the session
-            # refused); default osm or google
+            # docs section 30: google ok, off (no key) or auth_fail (Google
+            # refuses the key once its map is made); default osm or google
             b = self._body()
             with LOCK:
                 mt = dict(getattr(s, "map_tiles", {"google": "off", "default": "osm"}))
                 mt.update({k: b[k] for k in ("google", "default") if k in b})
                 s.map_tiles = mt
             return self._send(200, mt)
-        if path.startswith("/__dev/tile/") and method == "GET":
-            # a one-colour PNG: Google's tiles in the mock
-            return self._send(200, MOCK_TILE, [("Cache-Control", "no-store")], "image/png")
+        if path == "/__dev/google-maps-stub.js" and method == "GET":
+            # the Maps JavaScript API as far as the dashboard uses it
+            mode = getattr(s, "map_tiles", {}).get("google", "off")
+            js = GOOGLE_MAPS_STUB.replace("__MODE__", "auth_fail" if mode == "auth_fail" else "ok")
+            return self._send(200, js.encode(), [("Cache-Control", "no-store")], "text/javascript")
         if path == "/__dev/feed-source" and method == "POST":
             # The Delivery page only has a live version to talk about when the feed is
             # served from the DB, and the feed-config flow above deliberately leaves it
@@ -1716,23 +1750,14 @@ class Handler(BaseHTTPRequestHandler):
         self.require_mutation(method)
 
         # the base map (docs section 30): /__dev/map-tiles sets what the server
-        # says. Google's tiles are the mock's own (/__dev/tile), so nothing is
-        # asked of Google; its copyright names the zoom asked about.
-        if parts[0] == "map-tiles" and method == "GET":
+        # says. Google's script is the mock's own stub (/__dev/google-maps-stub.js),
+        # so nothing is asked of Google.
+        if parts == ["map-tiles"] and method == "GET":
             mt = getattr(s, "map_tiles", {"google": "off", "default": "osm"})
-            if parts == ["map-tiles"]:
-                if mt["google"] == "ok":
-                    return 200, {"default": mt["default"], "google_error": None, "google": {
-                        "url": "/__dev/tile/{z}/{x}/{y}?session=mock&key=mock", "max_zoom": 22,
-                        "expires_at": int(time.time()) + 14 * 86400}}
-                if mt["google"] == "error":
-                    return 200, {"default": "osm", "google": None,
-                                 "google_error": "Google refused the map session (HTTP 403): Map Tiles API has not been used in project 1"}
-                return 200, {"default": "osm", "google": None, "google_error": None}
-            if parts == ["map-tiles", "viewport"]:
-                if mt["google"] != "ok":
-                    return 200, {"copyright": None}
-                return 200, {"copyright": f"Map data ©2026 Google (zoom {q.get('zoom', ['?'])[0]})"}
+            if mt["google"] in ("ok", "auth_fail"):
+                return 200, {"default": mt["default"], "google_error": None, "google": {
+                    "key": "mock-key", "script_url": "/__dev/google-maps-stub.js", "language": None, "region": "IN"}}
+            return 200, {"default": "osm", "google": None, "google_error": None}
 
         found = self.migration(method, parts, q, u)
         if found is not None:

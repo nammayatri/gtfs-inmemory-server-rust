@@ -56,8 +56,9 @@ dev/                development only - never served by GIMS
   number or name, from a stop's routes or a route page; picked out by pointing
   at one in the list; their stops on request. The address keeps them.
 - **Base map** - the Show box offers OpenStreetMap or Google Maps when the
-  server has a Map Tiles API key (docs section 30); the choice is kept in the
-  browser.
+  server has a Maps JavaScript API key (docs section 30): Google's own map
+  under the Leaflet one, following it, its script loaded only once Google is
+  chosen. The choice is kept in the browser.
 - **Route** (`#/route/{id}`) - the stop list as a fare-stage ladder, the map line,
   and a toggle to see it with your draft applied. Edit the stop list: "Add stop"
   between rows and at the end, "Change stop" on every row (nearby suggestions,

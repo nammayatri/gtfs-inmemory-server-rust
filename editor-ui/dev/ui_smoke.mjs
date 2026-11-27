@@ -10,7 +10,7 @@
 //   node dev/ui_smoke.mjs --migration        # only moving work from master to prod (section 23)
 //   node dev/ui_smoke.mjs --map-line-edit    # only a map line edited by hand (section 28)
 //   node dev/ui_smoke.mjs --routes-map       # only several routes on the map (section 29)
-//   node dev/ui_smoke.mjs --map-tiles        # only the base map, OpenStreetMap or Google (section 30)
+//   node dev/ui_smoke.mjs --map-tiles        # only the base map, OpenStreetMap or Google Maps JS (section 30)
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -1870,65 +1870,96 @@ async function routesMapFlow() {
   }
 }
 
-// docs section 30: the base map - OpenStreetMap, or Google Maps when the
-// server has a key - chosen from the Show box and kept in this browser, with
-// Google's copyright for the view, and OpenStreetMap when Google fails.
+// docs section 30: the base map - OpenStreetMap, or Google Maps through the
+// Maps JavaScript API when the server has a key - chosen from the Show box and
+// kept in this browser. Google's map under Leaflet's follows it; its script is
+// loaded only once someone chooses it, and one map serves the page. Google
+// refusing the key: OpenStreetMap and why. The mock's Google is a stub script.
 async function mapTilesFlow() {
   const setTiles = (m) => evaluate(`fetch("/__dev/map-tiles", { method: "POST", credentials: "same-origin",
     headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify(m))} }).then((r) => r.json())`);
-  const baseLayer = () => mapCall(`let out = null; map.eachLayer((l) => { if (l.options && l.options.baseMap) out = { name: l.options.baseMap, url: l._url, n: (out ? out.n : 0) + 1 }; }); return out;`);
+  const osmLayers = () => mapCall(`let n = 0; map.eachLayer((l) => { if (l.options && l.options.baseMap === "osm") n++; }); return n;`);
+  const googleOn = () => evaluate(`(() => { const g = document.querySelector(".map-google"); return !!g && !g.hidden && document.getElementById("map").classList.contains("on-google"); })()`);
+  const stub = () => evaluate(`(() => { const s = window.__googleStub; if (!s) return null;
+    const m = s.maps[0]; return { scripts: s.scripts, maps: s.maps.length, src: s.src[0], center: m && m.center, zoom: m && m.zoom, opts: m && { ui: m.opts.disableDefaultUI, gestures: m.opts.gestureHandling } }; })()`);
+  const leaflet = () => mapCall(`const c = map.getCenter(); return { lat: c.lat, lng: c.lng, zoom: map.getZoom() };`);
+  const inStep = async () => {
+    const [g, l] = [await stub(), await leaflet()];
+    return !!g && Math.abs(g.center.lat - l.lat) < 1e-6 && Math.abs(g.center.lng - l.lng) < 1e-6 && g.zoom === l.zoom;
+  };
   const reload = async () => {
     await load(UI);
     await waitFor(`!document.getElementById("app").hidden`, "the app after a reload");
     await sleep(800);
   };
-  const attribution = () => text(".leaflet-control-attribution");
 
-  // ---- no key: OpenStreetMap, nothing to choose
-  let b = await baseLayer();
-  check(b && b.name === "osm" && b.url.includes("openstreetmap.org"), `OpenStreetMap with no key (${b && b.url})`);
+  // ---- no key: OpenStreetMap, nothing to choose, nothing of Google's loaded
+  check(await osmLayers() === 1 && !(await googleOn()), "OpenStreetMap with no key");
   check(await evaluate(`document.querySelector(".base-maps").hidden`), "no choice of map offered");
+  check(await stub() === null, "Google's script not loaded");
 
-  // ---- a key: the choice, OpenStreetMap first, Google when chosen
+  // ---- a key: the choice; Google's script only once it is chosen
   await setTiles({ google: "ok", default: "osm" });
   await reload();
   check(!(await evaluate(`document.querySelector(".base-maps").hidden`)), "the Show box offers the map");
   check(await evaluate(`document.getElementById("base-map-osm").checked`), "OpenStreetMap first: the server's default");
+  check(await stub() === null, "Google's script is not loaded until Google is chosen (a map load is billed)");
   await evaluate(`document.getElementById("base-map-google").click(), true`);
-  await waitFor(`document.querySelector(".leaflet-control-attribution")?.innerText.includes("Map data ©2026 Google")`, "Google's copyright for the view");
-  b = await baseLayer();
-  check(b && b.name === "google" && b.url.includes("/__dev/tile/") && b.n === 1, `Google's tiles, one base layer (${b && b.url})`);
-  const att = await attribution();
-  check(att.includes("Google Maps") && !att.includes("OpenStreetMap"), `the attribution is Google's alone: ${att}`);
-  await mapCall(`map.setZoom(21, { animate: false }); return true;`);
-  await sleep(900);
-  check(await mapCall(`return map.getZoom();`) === 21, "Google zooms past 19");
-  check((await attribution()).includes("(zoom 21)"), "the copyright follows the view");
-  await evaluate(`document.getElementById("base-map-osm").click(), true`);
-  await sleep(500);
-  check(await mapCall(`return map.getZoom();`) === 19, "back on OpenStreetMap, the map comes back to its 19");
-  check(!(await attribution()).includes("Google"), "and Google's attribution goes with its tiles");
-  await evaluate(`document.getElementById("base-map-google").click(), true`);
+  await waitFor(`(window.__googleStub?.maps.length || 0) === 1`, "Google's map made");
   await sleep(300);
-  await reload();
-  b = await baseLayer();
-  check(b && b.name === "google", "the choice is kept in this browser");
+  let g = await stub();
+  check(await googleOn() && await osmLayers() === 0, "Google's map shown under Leaflet, OpenStreetMap's tiles gone");
+  const src = new URL(g.src);
+  check(src.pathname.endsWith("/__dev/google-maps-stub.js") && src.searchParams.get("key") === "mock-key" && src.searchParams.get("region") === "IN"
+    && src.searchParams.get("callback") === "__gimsGoogleReady" && src.searchParams.get("loading") === "async", `the script asked with the key, region and callback (${g.src})`);
+  check(g.opts.ui === true && g.opts.gestures === "none", "Google's own controls and gestures off: Leaflet leads");
+  check(await inStep(), "Google's map at Leaflet's centre and zoom");
+  // the map's overlays stay Leaflet's, above Google's
+  check(await evaluate(`getComputedStyle(document.getElementById("map")).backgroundColor === "rgba(0, 0, 0, 0)"`), "Leaflet's map is clear over Google's");
+  const lifted = await evaluate(`(() => { const a = document.querySelector(".leaflet-bottom.leaflet-right").getBoundingClientRect(); const m = document.getElementById("map").getBoundingClientRect(); return Math.round(m.bottom - a.bottom); })()`);
+  check(lifted >= 20, `Leaflet's bottom controls clear of Google's logo and copyright (${lifted}px)`);
   await shot("mt-01-google");
 
-  // ---- Google failing: OpenStreetMap, and why
-  await setTiles({ google: "error" });
+  // ---- Leaflet moves, Google follows; Google zooms past 19
+  await setView(13.0827, 80.2707, 16);
+  check(await inStep(), "a pan: Google follows");
+  await mapCall(`map.setZoom(21, { animate: false }); return true;`);
+  await sleep(500);
+  check((await leaflet()).zoom === 21 && await inStep(), "zoom 21 on Google, and Google follows");
+  await mapCall(`map.setZoom(22, { animate: false }); return true;`);
+  await sleep(300);
+  check((await leaflet()).zoom === 21, "no further than Google's 21");
+
+  // ---- back to OpenStreetMap and again: one Google map for the page
+  await evaluate(`document.getElementById("base-map-osm").click(), true`);
+  await sleep(500);
+  check(!(await googleOn()) && await osmLayers() === 1, "OpenStreetMap again: Google's map hidden");
+  check((await leaflet()).zoom === 19, "and the map comes back to its 19");
+  await evaluate(`document.getElementById("base-map-google").click(), true`);
+  await sleep(500);
+  g = await stub();
+  check(await googleOn() && g.scripts === 1 && g.maps === 1, `Google again: the same map, no second load (${g.scripts} script, ${g.maps} map)`);
+  check(await inStep(), "and in step after the switch");
+
+  // ---- kept across a reload
   await reload();
-  b = await baseLayer();
-  check(b && b.name === "osm", "Google refused: OpenStreetMap");
+  await waitFor(`(window.__googleStub?.maps.length || 0) === 1`, "Google's map after the reload");
+  check(await googleOn(), "the choice is kept in this browser");
+
+  // ---- Google refusing the key: OpenStreetMap, and why
+  await setTiles({ google: "auth_fail" });
+  await reload();
+  await waitFor(`!document.querySelector(".base-note").hidden`, "the reason Google is not available");
+  check(!(await googleOn()) && await osmLayers() === 1, "Google refused the key: OpenStreetMap");
   check(await evaluate(`document.getElementById("base-map-google").disabled`), "Google Maps cannot be chosen");
-  check((await text(".base-note")).includes("Google Maps is not available now: Google refused the map session (HTTP 403)"), "and the Show box says why");
+  check((await text(".base-note")).includes("Google refused the key for the Maps JavaScript API"), "and the Show box says why");
 
   // ---- the server's default for someone who has not chosen
   await setTiles({ google: "ok", default: "google" });
   await evaluate(`(() => { const p = JSON.parse(localStorage.getItem("gtfs-editor-prefs") || "{}"); delete p.mapTiles; localStorage.setItem("gtfs-editor-prefs", JSON.stringify(p)); return true; })()`);
   await reload();
-  b = await baseLayer();
-  check(b && b.name === "google", "no choice yet: the server's default, Google");
+  await waitFor(`(window.__googleStub?.maps.length || 0) === 1`, "Google's map by default");
+  check(await googleOn(), "no choice yet: the server's default, Google");
   await setTiles({ google: "off", default: "osm" });
 }
 
