@@ -1342,6 +1342,8 @@ class Handler(BaseHTTPRequestHandler):
                     s.map_line_gps = b["gps"]
                 if "road" in b:
                     s.map_line_road = b["road"]
+                if "snap" in b:
+                    s.map_line_snap = b["snap"]
             return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok"),
                                     "road": getattr(s, "map_line_road", "ok")})
         if path == "/__dev/map-tiles" and method == "POST":
@@ -1848,6 +1850,21 @@ class Handler(BaseHTTPRequestHandler):
                     line += [(blat, alon), (blat, blon)]
                 dist = sum(haversine(*a, *b) for a, b in zip(line, line[1:]))
                 return 200, {"encoded_polyline": polyline_encode(line), "points": len(pts), "distance_m": round(dist)}
+            # a line traced by hand, fitted to the roads (docs section 31): the
+            # mock's roads run 2 m north of what is drawn
+            if rest == ["polyline:snap"] and method == "POST":
+                self.require_role(u, "editor")
+                try:
+                    pts = polyline_decode(self._body().get("encoded_polyline") or "")
+                except ValueError:
+                    pts = []
+                if len(pts) < 2:
+                    raise ApiError(400, "invalid_polyline", "encoded_polyline does not decode to at least two points")
+                if getattr(s, "map_line_snap", "ok") == "none":
+                    return 200, {"encoded_polyline": polyline_encode(pts), "quality": "none", "matched_share": 0.0,
+                                 "kept_as_drawn": 0, "error": "OSRM answered HTTP 503"}
+                return 200, {"encoded_polyline": polyline_encode([(la + 0.00002, lo) for la, lo in pts]), "quality": "osrm",
+                             "matched_share": 1.0, "kept_as_drawn": 0, "error": None}
             if len(rest) == 3 and rest[0] == "routes" and rest[2] in ("polyline:osrm", "polyline:gps") and method == "POST":
                 self.require_role(u, "editor")
                 cs = s.change_sets.get(q.get("change_set", [""])[0])
