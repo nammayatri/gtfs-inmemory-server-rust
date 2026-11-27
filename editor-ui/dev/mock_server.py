@@ -25,6 +25,7 @@ What is faked, and only here:
 """
 import argparse
 import base64
+import csv
 import gzip
 import hashlib
 import hmac
@@ -1801,6 +1802,12 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.stop_detail(g, rest[1])
             if rest == ["routes"] and method == "GET":
                 return 200, self.list_routes(g, q)
+            # the routes page (docs section 34): a clone into a draft, and the
+            # routes as the CSV files the import page reads
+            if len(rest) == 2 and rest[0] == "routes" and rest[1].endswith(":clone") and method == "POST":
+                return 201, self.clone_route(u, g, rest[1][:-len(":clone")], q, self._body())
+            if rest == ["routes:export"] and method in ("GET", "POST"):
+                return 200, self.export_routes(g, q, self._body() if method == "POST" else {})
             # stage search (docs section 19): the feeds report use_stages, so the
             # search box asks; the sample has no stages, so it finds none
             if rest == ["stages"] and method == "GET":
@@ -2119,7 +2126,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def list_routes(self, g, q):
         s = self.store
-        items = [rt for (gg, _), rt in s.routes.items() if gg == g and not rt.get("deleted")]
+        # ?change_set=: the routes as that draft makes them (docs section 34)
+        cs = s.change_sets.get((q.get("change_set") or [""])[0])
+        proj = Projection(s, g, cs["changes"]) if cs and cs["gtfs_id"] == g else None
+        routes = {rid: rt for (gg, rid), rt in s.routes.items() if gg == g}
+        if proj:
+            routes.update(proj.routes)
+        items = [rt for rt in routes.values() if not rt.get("deleted")]
         # ?active=false: only the inactive routes (docs section 18.17)
         want = (q.get("active", [""])[0] or "").strip().lower()
         if want in ("true", "false"):
@@ -2137,13 +2150,101 @@ class Handler(BaseHTTPRequestHandler):
         else:
             items.sort(key=lambda rt: (rt.get("short_name") or "", rt["route_id"]))
         page = paginate(items, q)
-        page["items"] = [{"route_id": rt["route_id"], "short_name": rt["short_name"], "long_name": rt["long_name"],
+        rows_of = (lambda rid: proj.route_rows(rid)) if proj else (lambda rid: s.rows.get((g, rid), []))
+        page["items"] = [{"route_id": rt["route_id"], "short_name": rt.get("short_name"), "long_name": rt.get("long_name"),
                           "color": rt.get("color"), "has_polyline": bool(rt.get("encoded_polyline")),
-                          "stop_count": sum(1 for r in s.rows.get((g, rt["route_id"]), [])
+                          "polyline_source": rt.get("polyline_source"), "agency_id": rt.get("agency_id"),
+                          "route_tag": rt.get("route_tag"), "pattern_count": 1, "trip_count": 0,
+                          "stop_count": sum(1 for r in rows_of(rt["route_id"])
                                             if r["stop_type"] not in SERVED_EXCLUDE),
-                          "row_version": rt["row_version"], "active": rt.get("active", True) is not False}
+                          "row_version": rt.get("row_version"), "active": rt.get("active", True) is not False}
                          for rt in page["items"]]
         return page
+
+    # ---- the routes page's tools (docs section 34)
+    def clone_route(self, u, g, from_id, q, b):
+        """A new route made from another as the draft has it: its create and its
+        stop list, added to the draft (the mock has no timetable to copy)."""
+        s = self.store
+        self.require_role(u, "editor")
+        cs = s.change_sets.get((q.get("change_set") or [""])[0])
+        if not cs:
+            raise ApiError(400, "change_set_required", "a clone is added to a draft: name it with ?change_set=")
+        self.require_draft(u, cs)
+        to = str(b.get("route_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", to):
+            raise ApiError(400, "invalid_change", f"route_id {to!r} must be 1-64 of A-Z a-z 0-9 _ - .",
+                           {"code": "invalid_id"})
+        proj = Projection(s, g, cs["changes"])
+        src = proj.route(from_id)
+        if not src or src.get("deleted"):
+            raise ApiError(404, "route_not_found", f"no route {from_id}")
+        drafted = [o["title"] for o in s.change_sets.values()
+                   if o["gtfs_id"] == g and o["status"] not in ("committed", "discarded")
+                   for c in o["changes"] if c["entity"] == "route" and c["op"] == "create" and c["entity_key"] == to]
+        if (g, to) in s.routes or drafted:
+            where = f"is already created in draft \u201c{drafted[0]}\u201d" if drafted else f"already exists in feed {g}"
+            raise ApiError(409, "route_exists", f"route {to} {where}; choose another id", {"route_id": to})
+        short = (b.get("short_name") or "").strip() or src.get("short_name")
+        long = src.get("long_name") if "long_name" not in b else ((b.get("long_name") or "").strip() or None)
+        create = {"route_id": to, "short_name": short, "long_name": long, "color": src.get("color")}
+        self.add_change(u, cs, {"entity": "route", "op": "create", "entity_key": to,
+                                "after": {k: v for k, v in create.items() if v is not None}})
+        ids = [cs["changes"][-1]["change_id"]]
+        keep = ("stop_id", "stop_type", "stage_no", "stage_name", "marker_id", "marker_name", "marker_lat",
+                "marker_lon", "stop_name_override", "provider_id")
+        rows = [{k: r.get(k) for k in keep} for r in proj.route_rows(from_id)]
+        if rows:
+            self.add_change(u, cs, {"entity": "route_stops", "op": "replace", "entity_key": to,
+                                    "after": {"rows": rows, "base_rows_hash": rows_hash([])}})
+            ids.append(cs["changes"][-1]["change_id"])
+        copied = {"patterns": 1, "stop_lists": 1 if rows else 0, "stages": 0, "profiles": 0, "trips": 0,
+                  "map_line": bool(src.get("encoded_polyline"))}
+        left_out = {"patterns": [], "profiles": 0, "trips": 0}
+        s.add_audit(u, "route_cloned", g, cs["change_set_id"],
+                    {"from": from_id, "to": to, "change_ids": ids, "copied": copied, "left_out": left_out})
+        return {"route_id": to, "from_route_id": from_id, "change_ids": ids, "copied": copied,
+                "left_out": left_out, "change_set": self.set_full(cs)}
+
+    def export_routes(self, g, q, b):
+        """Routes as the zip of CSV files the import page reads: the mock writes
+        routes.csv, route_stops.csv and a README."""
+        s = self.store
+        cs = s.change_sets.get((q.get("change_set") or [""])[0])
+        proj = Projection(s, g, cs["changes"] if cs and cs["gtfs_id"] == g else [])
+        ids = b.get("route_ids") if b.get("route_ids") is not None else (
+            [i for i in (q.get("route_ids") or [""])[0].split(",") if i.strip()] or None)
+        action = (b.get("action") or (q.get("action") or ["add"])[0] or "add").lower()
+        if action not in ("add", "update"):
+            raise ApiError(400, "invalid_query", f"action is add or update, not {action!r}")
+        if ids is None:
+            ids = sorted((rid for (gg, rid), rt in s.routes.items() if gg == g and not rt.get("deleted")))
+        missing = [i for i in ids if not proj.route(i) or proj.route(i).get("deleted")]
+        if missing:
+            raise ApiError(404, "route_not_found", f"no route {', '.join(missing)} in feed {g}", {"route_ids": missing})
+        def text(rows):
+            out = io.StringIO()
+            w = csv.writer(out, lineterminator="\r\n")
+            w.writerows(rows)
+            return "\ufeff" + out.getvalue()
+        route_cols = ["action", "route_id", "short_name", "long_name", "color"]
+        stop_cols = ["action", "route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"]
+        routes = [route_cols] + [[action, i, proj.route(i).get("short_name") or "", proj.route(i).get("long_name") or "",
+                                  proj.route(i).get("color") or ""] for i in ids]
+        stops = [stop_cols]
+        for i in ids:
+            n = 0
+            for r in proj.route_rows(i):
+                if r["stop_type"] == "ROUTE CORRECTION":
+                    continue
+                n += 1
+                stops.append([action, i, n, r["stop_id"], r["stop_type"], r["stage_no"], r["stage_name"]])
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("routes.csv", text(routes))
+            z.writestr("route_stops.csv", text(stops))
+            z.writestr("README.txt", f"{len(ids)} routes of feed {g}, exported by the mock. Rows say action {action}.\n")
+        return MockFile(buf.getvalue(), f"{g}-route-{ids[0]}.zip" if len(ids) == 1 else f"{g}-routes.zip")
 
     # ---- change sets
     def set_summary(self, cs):

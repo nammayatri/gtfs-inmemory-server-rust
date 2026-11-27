@@ -152,6 +152,12 @@ impl Kind {
                 "network_id",
                 "agency_id",
                 "route_type",
+                // what a route export carries besides routes.txt (section 34)
+                "text_color",
+                "route_tag",
+                "active",
+                "polyline_source",
+                "encoded_polyline",
             ],
             Kind::RouteStops => &[
                 "action",
@@ -834,7 +840,8 @@ async fn plan_routes(
                 continue;
             }
         };
-        let cells = ["route_id", "short_name", "long_name", "color"].map(|k| cell_text(m, k));
+        let cells =
+            ["route_id", "short_name", "long_name", "color", "text_color"].map(|k| cell_text(m, k));
         let bad: Vec<String> = cells
             .iter()
             .filter_map(|c| c.as_ref().err())
@@ -846,12 +853,13 @@ async fn plan_routes(
                 .extend(bad.into_iter().map(invalid_row));
             continue;
         }
-        let [id, short, long, color] = cells.map(|c| c.unwrap_or_default());
+        let [id, short, long, color, text_color] = cells.map(|c| c.unwrap_or_default());
         let mut fields = Map::new();
         for (k, v) in [
             ("short_name", &short),
             ("long_name", &long),
             ("color", &color),
+            ("text_color", &text_color),
         ] {
             if let Some(v) = v {
                 fields.insert(k.into(), json!(v));
@@ -864,6 +872,29 @@ async fn plan_routes(
             .chain(["agency_id", "route_type"])
             .collect();
         gtfs_cells(m, "routes.txt", &gtfs, &mut fields, &mut bad);
+        // what a route export carries that only a route/update sets (section
+        // 34): the fare tag, the status and the map line
+        let mut extra = Map::new();
+        for k in ["route_tag", "encoded_polyline", "polyline_source"] {
+            match cell_text(m, k) {
+                Ok(Some(v)) => {
+                    extra.insert(k.into(), json!(v));
+                }
+                Ok(None) => {}
+                Err(e) => bad.push(e),
+            }
+        }
+        match cell_bool(m, "active") {
+            Ok(Some(a)) => {
+                extra.insert("active".into(), json!(a));
+            }
+            Ok(None) => {}
+            Err(e) => bad.push(e),
+        }
+        // a line from a file is an imported one, unless the row says otherwise
+        if extra.contains_key("encoded_polyline") && !extra.contains_key("polyline_source") {
+            extra.insert("polyline_source".into(), json!("imported"));
+        }
         if !bad.is_empty() {
             plan.rows[i]
                 .findings
@@ -895,14 +926,34 @@ async fn plan_routes(
             plan.changes.push(Planned {
                 entity: "route",
                 op: "create",
-                key: Some(key),
+                key: Some(key.clone()),
                 after,
                 before: Value::Null,
                 base: None,
             });
             plan.rows[i].change = Some(plan.changes.len() - 1);
+            // a new route is active: only an inactive one says so again
+            if extra.get("active") == Some(&json!(true)) {
+                extra.remove("active");
+            }
+            // the rest in a route/update right after the create
+            if !extra.is_empty() {
+                let after = Value::Object(extra);
+                if let Err(f) = check_payload("route", "update", &key, &after) {
+                    plan.rows[i].findings.push(f);
+                }
+                plan.changes.push(Planned {
+                    entity: "route",
+                    op: "update",
+                    key: Some(key),
+                    after,
+                    before: Value::Null,
+                    base: None,
+                });
+            }
             continue;
         }
+        fields.extend(extra);
 
         let Some(route_id) = id else {
             plan.rows[i].findings.push(invalid_row(format!(
@@ -915,7 +966,7 @@ async fn plan_routes(
             plan.rows[i].findings.push(Finding::error(
                 "nothing_to_update",
                 route_id.as_str(),
-                format!("the row for route {route_id} gives no short_name, long_name, color or other routes.txt field"),
+                format!("the row for route {route_id} gives no short_name, long_name, color, other routes.txt field, route_tag, active or map line"),
             ));
             continue;
         }

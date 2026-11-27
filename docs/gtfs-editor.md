@@ -577,7 +577,8 @@ below). Every list is
 | GET | `/feeds` | `{items: [{gtfs_id, display_name, version, data_source, released_version, released_at, updated_at}], next_cursor: null}` |
 | GET | `/feeds/{g}/stops?q=&bbox=minLat,minLon,maxLat,maxLon&station=&limit=&cursor=` | `q` trigram on name, exact on id/code. `station=true` lists stations only; `station=<id>` lists that station's platforms. Item: the stop row (`stop_id, stop_code, name, lat, lon, location_type, parent_station, platform_code, description, cluster_id, regional_name, hindi_name, info_json, position_source, provenance, deleted, row_version, updated_at, updated_by`) + `route_count` + `platform_count` (a station's live platforms; 0 for a stop — section 11) |
 | GET | `/feeds/{g}/stops/{stop_id}` | the stop row + `route_count` + `platform_count` + `routes: [{route_id, short_name, long_name, sequence, stop_type, stage_no}]` + `children` (a station's platforms, each with `route_count`) + `nearby` (≤ 60 m, nearest first, each with `distance_m` and `route_count`) + `parent` (the station row, or null) |
-| GET | `/feeds/{g}/routes?q=&limit=&cursor=` | route row without the polyline + `has_polyline`, `stop_count` (served rows) |
+| GET | `/feeds/{g}/routes?q=&active=&limit=&cursor=&change_set=` | route row without the polyline + `has_polyline`, `stop_count` (served rows of stop order 1), `pattern_count` (its stop orders), `trip_count`. With `change_set`, the routes as that draft makes them (section 34) |
+| GET | `/feeds/{g}/routes:export?route_ids=&action=&change_set=` | viewer+ → a zip of the CSV files the bulk import reads (`routes.csv`, `route_stops.csv` or `route_stages.csv`, `timing_profiles.csv`, `services.csv`, `route_trips.csv`, `README.txt`) for routes `route_ids` (a comma list; none: every live route), every row saying `action` `add` (the default) or `update`. `POST` the same path with `{route_ids?: [...], action?}` for more ids than an address holds. Section 34 |
 | GET | `/feeds/{g}/routes/{route_id}` | route row (`route_id, short_name, long_name, route_type, agency_id, color, text_color, encoded_polyline, polyline_source, service_type, provenance, deleted, row_version, …`) + `stop_count` + `rows_hash` + `rows: [{sequence, stop_id, stop_name, lat, lon, stop_deleted, parent_station, stop_type, stage_no, stage_name, marker_id, marker_name, marker_lat, marker_lon, stop_name_override, provider_id}]`. `stop_name` is the route's own spelling when it has one (`stop_name_override`), else the stop's name |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:osrm?change_set=` | `{route_id, encoded_polyline, polyline_source: "osrm", waypoints, distance_m, saved: false}` — a proposal through the served stops and markers (of the draft, with `change_set`); not saved, add it as a `route` change. Asked of OSRM in chunks of at most 25 waypoints; a failure is 502 `osrm_failed` saying why and where (section 17.5) |
 | POST | `/feeds/{g}/routes/{route_id}/polyline:gps?change_set=` | `{route_id, encoded_polyline, polyline_source: "gps", saved: false, evidence}` — the path this route's buses drove over the last 7 days, snapped to roads (section 17); not saved, add it as a `route` change |
@@ -593,7 +594,8 @@ Audit actions: `seed`, `release`, `user_bootstrapped`, `user_created`,
 `change_updated`, `change_removed`, `change_set_submitted`, `change_set_approved`,
 `change_set_self_approved` (an admin approved a set they submitted, section 2:
 `{submitted_by, submitted_by_email, comment}`), `change_set_rejected`,
-`change_set_reopened`, `change_set_discarded`, `change_set_committed` (detail
+`change_set_reopened`, `change_set_discarded`, `route_cloned` (section 34: `{from, to,
+change_ids, copied, left_out}`), `change_set_committed` (detail
 `{feed_version, changes, applied, self_approved}`), `node_rolled_back` (section
 26: `{change_id, node, to_change_id, to_change_set_id, to_feed_version, side,
 fields, not_restored}`), and from
@@ -695,6 +697,7 @@ Settled while implementing:
 | POST | `/change-sets/{id}/discard` | not committed/discarded → discarded; its creator or an admin |
 | POST | `/feeds/{g}/change-sets/submit` | `{change_set_ids: [..]}` — several drafts of feed `g` submitted in one call and one transaction; editor+ on the feed. Each follows `/submit`'s rules. → `{submitted: [id], failed: [{change_set_id, stage: "submit", approved: false, error: {code, message, details}}]}`: a draft that cannot be submitted is rolled back to its own savepoint and reported, and the rest are submitted. At most 100 ids, duplicates dropped; none is 400 `no_change_sets`; a set of another feed fails as `change_set_not_found` |
 | POST | `/feeds/{g}/change-sets/approve` | `{change_set_ids: [..], comment?, self_approve?: bool}` — several submitted sets of feed `g` approved in one call and one transaction; approver+ on the feed. Each follows `/approve`'s rules (`self_approve` covers only the sets the caller submitted). → `{approved: [id], failed: [{change_set_id, stage: "approve", approved: false, error: {code, message, details}}]}`: a set that cannot be approved is reported and the rest are. At most 100 ids, duplicates dropped; none is 400 `no_change_sets`; a set of another feed fails as `change_set_not_found` |
+| POST | `/feeds/{g}/routes/{route_id}:clone?change_set=` | `{route_id, short_name?, long_name?}` → 201 `{route_id, from_route_id, change_ids, copied, left_out, change_set}`: a new route made from this one as the draft has it, added to the draft as the changes that build it; editor+. Section 34 |
 | POST | `/feeds/{g}/change-sets/commit` | `{change_set_ids: [..], approve?: bool, self_approve?: bool}` — several sets committed in **one transaction as one feed version**: pods reload once and every webhook (`feed_committed`, `feed_in_sync`: the Jenkins build) fires once, however many sets go live. Applied in the order given, each on top of the ones before, with `/commit`'s checks; with `approve` submitted sets are approved first in the same transaction. → `{committed: [id], failed: [{change_set_id, stage: "approve"\|"commit", approved, error}], feed_version}`: a failed set is rolled back alone and the rest go live; one approved but then not committed (`approved: true`) stays approved. `feed_version` is null, and the version does not move, when nothing committed. A serialization failure retries the whole batch |
 
 Editing a set that is not a draft is 409 `change_set_not_draft`.
@@ -1115,8 +1118,8 @@ accepts, and what the row becomes:
 | `stops` | `add` | `{action, stop_id?, name, lat, lon, platform_code?}` | one `stop/create` per row |
 | `stops` | `update` | `{action, stop_id, name?, lat?, lon?, platform_code?}` | one `stop/update` per row, with exactly the cells given (`lat` and `lon` together) |
 | `stops` | `delete` | `{action, stop_id}` | one `stop/delete` per row; any other cell filled is `invalid_row` |
-| `routes` | `add` | `{action, route_id, short_name, long_name?, color?}` | one `route/create` per row |
-| `routes` | `update` | `{action, route_id, short_name?, long_name?, color?}` | one `route/update` per row, with exactly the cells given |
+| `routes` | `add` | `{action, route_id, short_name, long_name?, color?, text_color?, route_tag?, active?, polyline_source?, encoded_polyline?}` | one `route/create` per row; a row giving a fare tag, a map line or `active` 0 is also one `route/update` right after it (section 34) |
+| `routes` | `update` | `{action, route_id, short_name?, long_name?, color?, text_color?, route_tag?, active?, polyline_source?, encoded_polyline?}` | one `route/update` per row, with exactly the cells given |
 | `routes` | `delete` | `{action, route_id}` | one `route/delete` per row; any other cell filled is `invalid_row` |
 | `route_stops` | `add` \| `update` | `{action, route_id, sequence, stop_id, stop_type, stage_no, stage_name}` | one `route_stops/replace` per route (rows sorted by `sequence`). A JUMP STOP may leave `stage_no` and `stage_name` empty: it then takes the stage open before it in the sorted rows. One given that stage's number with no name takes its name |
 | `stop_updates` | `update` | `{action, stop_id, platform_code?, description?, name?}` | one `stop/update` per row (a station: `station/update`), with exactly the cells given — section 11 |
@@ -6386,3 +6389,200 @@ new one among them (with the live stops instead, the check fails: none of the
 13 stops drawn is it). The full smoke run turns stages off for its New route steps the
 same way. The mock does not serve route stages, so saving through stages is not
 covered there.
+
+## 34. The routes page: every route, a clone, and routes as files (2026-11-27)
+
+Asked for: "an option to clone a route to create a new route, and an option to
+export and import routes; also a page to list all the routes". The three share a
+page and a module (`src/editor/route_copy.rs`, `editor-ui/js/routes.js`).
+
+### 34.1 The routes page
+
+`#/routes` (Menu > Routes) lists every route of the feed in one table: its
+number (a link to `#/route/{id}`) and id, its name, Active or Inactive, its
+agency, its served stops, its stop orders, its trips, its fare tag and where its
+map line came from (by road, from GPS, by hand, imported, or none). A text box
+finds a route by number, name, id, agency or fare tag; a select keeps the active
+or the inactive ones; a column heading sorts by it (again: the other way), route
+numbers in number order (`21G` before `102`); the table shows 100 rows a page.
+All of that happens in the browser on the whole list, which the page reads from
+`GET /feeds/{g}/routes` 500 at a time until `next_cursor` is null (chennai_bus:
+eight requests).
+
+With a draft open the page asks with `change_set`, so it lists the routes as
+the draft makes them - a route the draft adds is there, marked "new in draft",
+one it deletes is not, an edited one shows the draft's values and is marked
+"changed in draft" - and says so above the table. A viewer has no draft and
+sees the feed as it is.
+
+Ticking routes (one by one, a page at a time, or "Select all N that match")
+brings up a bar: **Export N routes**, **Show them on the map** (section 29, up
+to 20) and **Clear the selection**. **Export all** exports every route.
+**Import routes** (editors) opens the import page on the Routes file. **Clone**
+on a row (editors) clones that route, as does **Clone as a new route** on a
+route's own page.
+
+`GET /feeds/{g}/routes` items gain `pattern_count` (the route's stop orders,
+section 16) and `trip_count`. With `change_set` the draft is applied, the page
+read and the transaction rolled back, exactly as a route preview is; the caller
+needs viewer on the set's feed, and a set of another feed is 400
+`feed_mismatch`. Each page replays the draft, so the page's eight requests
+replay it eight times.
+
+### 34.2 Cloning a route
+
+`POST /feeds/{g}/routes/{route_id}:clone?change_set=<draft>`, body `{route_id,
+short_name?, long_name?}`: a new route `route_id` made from route
+`{route_id}` of the path **as the draft has it** - read with the draft applied,
+so a route the draft edits is cloned with its edits, and a route only the draft
+has can be cloned too. Editor role on the feed and the draft. `short_name` left
+out or blank is the route's own; `long_name` left out is the route's own, and
+`null` or blank is none. Everything is added to the draft in one transaction,
+each change through the same path as `POST /change-sets/{id}/changes` (shape
+checks, defaults, `before`, `change_added`), then one `route_cloned` audit row
+`{from, to, change_ids, copied, left_out}`. Answers 201:
+
+```json
+{"route_id": "570X", "from_route_id": "570", "change_ids": [101, 102, 103, 104, 105],
+ "copied": {"patterns": 1, "stop_lists": 1, "stages": 0, "profiles": 1, "trips": 42, "map_line": true},
+ "left_out": {"patterns": [], "profiles": 0, "trips": 0},
+ "change_set": {"change_set_id": "...", "changes": [...], "validation": [...], ...}}
+```
+
+`change_set` is the draft's first page, as an added change answers. The changes,
+in an order that applies:
+
+1. `route/create`: `route_type`, `agency_id`, `color`, `text_color` and every
+   other `routes.txt` field the route has (`route_desc`, `route_url`,
+   `route_sort_order`, `continuous_pickup`, `continuous_drop_off`,
+   `network_id`), with the new id and names.
+2. `route/update`, only with what applies: the map line (`encoded_polyline`,
+   and `polyline_source` - its own, `imported` when it has none), the fare tag
+   (`route_tag`), `active: false` for an inactive route, and `schedule_source:
+   "editor"` when it has trips - they are made here, and no schedule sync knows
+   the new route. None of these, no change.
+3. Its stops. On a feed built from stages, one `route_stages/replace` with the
+   route's stages (`stage_id`, `direction`, `stage_no`). On any other feed, one
+   `route_stops/replace` per stop order with rows, pattern 1 first, each the
+   whole list as stored - shaping points (ROUTE CORRECTION rows), the route's
+   own spelling of a stop and its provider id included.
+4. `pattern/update` for each stop order that has a name or a direction.
+5. `timing_profile/replace` for each timing, under its own `pattern_key` and
+   `profile_key`, so the trips find it; its label, and its `source` unless that
+   is `interpolated` (only a carry-over writes that; the copy is `manual`).
+6. One `route_trips/replace` with every trip: the same stop order, timing,
+   service, direction, start time, headsign, short name, shape, accessibility
+   and frequency windows. Each gets a new id (`{route}-ed-{8 hex}`) when the
+   change is added; its `block_id` and `source_ref` are left out, so the copy
+   shares no vehicle block with the route it came from and claims no origin.
+
+Every list is based on nothing - `base_rows_hash`, `base_stages_hash`,
+`base_hash` and `base_trips_hash` are all section 5's hash of `[]` - because the
+route is new: a later commit elsewhere cannot conflict with it.
+
+Not copied: its temporary routes (section 20) and which one it runs; the records
+that name it (fare rules, transfers, attributions, route networks); on a feed
+built from stages, a stop order other than 1 (the feed serves pattern 1 alone,
+from the stages), with its timings and trips - counted in `left_out`, the
+patterns by key; and on a feed of stop lists, the route's list of stages (a
+feed preparing to switch, section 23, keeps building those itself).
+
+| status | code | when |
+|---|---|---|
+| 400 | `change_set_required` | no `change_set` |
+| 400 | `invalid_change` (`details.code`) | the new id is not 1-64 of `A-Z a-z 0-9 _ - .`, or the new route has no number |
+| 400 | `feed_mismatch` | the draft is of another feed |
+| 403 | `role_required` | a viewer |
+| 404 | `route_not_found` | no such route, as the draft has the feed |
+| 409 | `route_deleted` | the route is deleted |
+| 409 | `route_exists` (`details.route_id`) | the new id is a route of the feed (deleted ones included), or a route an open draft of the feed creates; the message names the draft |
+| 409 | `change_set_not_draft` | the set is not a draft |
+
+The dashboard asks for the new id (checked in the browser against the id rule),
+the number and the name, both filled with the route's own; the new route's page
+opens, new in the draft, and a toast says what came with it.
+
+### 34.3 Exporting routes
+
+`GET /feeds/{g}/routes:export?route_ids=&action=&change_set=`, viewer+:
+`route_ids` a comma list (none: every live route, by number), `action` `add`
+(the default) or `update`, `change_set` a draft to read the routes as. `POST` to
+the same path takes `{route_ids?: [...], action?}` in the body, for more ids
+than an address holds; the dashboard always posts. Answers `application/zip`,
+`Content-Disposition: attachment; filename="{g}-routes.zip"` (one route:
+`{g}-route-{id}.zip`) and `X-Routes-Exported: <n>`.
+
+The zip holds a CSV file per kind of upload the import page takes (section 5),
+each with exactly that kind's columns (`bulk::Kind::columns`), a UTF-8 byte
+order mark first (Tamil names), and every row's `action` the one asked for. A
+kind with nothing in it is left out:
+
+| file | upload kind | one row per |
+|---|---|---|
+| `routes.csv` | Routes | route, with the new columns of 34.4 |
+| `route_stops.csv` | Route stop lists | stop of a stop order, `pattern_key` filled for orders after 1 (a feed of stop lists) |
+| `route_stages.csv` | Route stages | stage a route runs through, by `position` (a feed built from stages) |
+| `timing_profiles.csv` | Timings | stop of a timing, offsets in seconds |
+| `services.csv` | Services (calendar) | service the trips run on, or one per date it adds or takes away |
+| `route_trips.csv` | Trips | trip, `frequencies` and `source_ref` as JSON |
+| `README.txt` | - | what the files are, how many rows each has, and the order to import them in |
+
+A file of more than 5,000 rows (the upload's limit) is split into parts,
+`route_trips-1.csv`, `route_trips-2.csv`, ..., each route, timing or service
+whole in one part, since a group is uploaded whole. A ROUTE CORRECTION row is
+not a stop and a stop list upload takes stops only, so the stop lists leave
+shaping points out - the map line in `routes.csv` carries the shape - and the
+README says how many.
+
+| status | code | when |
+|---|---|---|
+| 400 | `invalid_query` | `action` is neither `add` nor `update` |
+| 400 | `feed_mismatch` | the draft is of another feed |
+| 404 | `route_not_found` (`details.route_ids`) | a route asked for is not live (as the draft has the feed); or the feed has none |
+
+### 34.4 Importing routes
+
+Import is the import page (section 5), one file at a time, in the README's
+order: routes, then stop lists or stages, then timings, services (only into a
+feed without them) and trips, each checked against the draft before it is
+added. Rows saying `update` replace the routes where they are; rows saying `add`
+make them in another feed, or in the same one once `route_id` is changed in
+every file and the `trip_id` column emptied. What the round trip needed:
+
+- **Bulk `routes` reads what a route carries besides `routes.txt`**:
+  `text_color`, `route_tag`, `active` (`1`/`0`/`true`/`false`),
+  `polyline_source` and `encoded_polyline`, the last four the export's. On
+  `update` they go into the row's `route/update`. On `add`, `text_color` goes
+  into the `route/create` and the rest - a fare tag, a map line, `active` 0 (1 is
+  a new route's default and says nothing) - into a `route/update` right after
+  it; the row's `change` is the create, and `summary.changes` counts both. A
+  line without a source is `imported`. A blank cell is not given, as
+  everywhere, so a fare tag is cleared on the route's page, not by a file.
+- **Routes is offered on a feed built from stages too.** The import page used
+  to offer it on feeds of stop lists only; a routes file names no stops, and
+  without it an export of chennai_bus could not be read back.
+- **A stop of a feed with no fare stages.** Such a feed numbers every stop 0
+  and names no stage; the page refused the empty `stage_name` in the browser
+  before the server saw it. It now sends it as `""` when `stage_no` is 0 (and
+  for a jump stop, as before), and the server's fare rules decide.
+
+What does not round-trip: shaping points (above), a route's own spelling of a
+stop and its provider id (an `update` keeps the spelling of a stop the route
+already calls at), stop order names, a timing's source (an upload's are
+`import`), the stages themselves (the feed imported into needs stages with
+these ids) and temporary routes.
+
+### 34.5 Tests
+
+`tests/editor_routes_tools_flow.rs` (in `scripts/editor_flow_test.sh`): the
+list's counts and `change_set`; a clone - every change, the new route's rows
+(its shaping point too), stop orders, timings and trips against the route's,
+new trip ids and no block, the line, tag, status and `routes.txt` fields, a
+route the draft renames and one only the draft has, the ids in use (live, in
+this draft, in another draft), a viewer, 404, 400s, the commit and its audit
+rows; a clone on a feed built from stages; an export - files, columns, actions,
+the left-out shaping point - read back with `update` into the same feed and
+with `add` under new ids (routes made whole, an inactive one inactive), with a
+draft, of every route, and its errors. `dev/ui_smoke.mjs --routes-page` runs
+the page against the mock: 5,567 routes paged, find, sort, tick, export, clone
+from a row and from the route's page, an id in use, and the draft's view.

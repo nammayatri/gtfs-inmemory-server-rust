@@ -40,7 +40,7 @@ async function request(method, path, body, raw) {
   const headers = { Accept: "application/json" };
   if (method !== "GET") headers["X-Requested-With"] = "gtfs-editor";
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (raw) Object.assign(headers, { "Content-Type": raw.type }, raw.headers || {});
+  if (raw && raw.bytes !== undefined) Object.assign(headers, { "Content-Type": raw.type }, raw.headers || {});
   // a code asked for again (a feed reload, section 18.16): a wrong one is
   // answered 401 without the session being gone
   const codeAsked = !!(raw && raw.headers && raw.headers["X-Editor-Code"]);
@@ -50,12 +50,17 @@ async function request(method, path, body, raw) {
       method,
       headers,
       credentials: "same-origin",
-      body: raw ? raw.bytes : body === undefined ? undefined : JSON.stringify(body),
+      body: raw && raw.bytes !== undefined ? raw.bytes : body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (e) {
     throw new ApiError(0, "network", "The editor server could not be reached. Check your VPN connection and try again.");
   }
   if (res.status === 204) return null;
+  // a file the API answers with (a routes export, section 34), and its name
+  if (raw && raw.download && res.ok) {
+    const named = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "");
+    return { blob: await res.blob(), name: named ? named[1] : "download" };
+  }
   let data = null;
   const text = await res.text();
   if (text) {
@@ -83,6 +88,10 @@ export const post = (path, body) => api("POST", path, body === undefined ? {} : 
 export const put = (path, body) => api("PUT", path, body);
 export const patch = (path, body) => api("PATCH", path, body);
 export const del = (path) => api("DELETE", path);
+
+// A file the API answers with, as {blob, name}: a routes export (section 34).
+// An error is thrown as any other call's.
+export const download = (method, path, body) => request(method, path, body, { download: true });
 
 // A file's bytes as the body (a GTFS zip to import, section 18), with any
 // `headers` it needs (a reload's authenticator code, 18.16).

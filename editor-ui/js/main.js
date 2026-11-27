@@ -24,6 +24,7 @@ import { showCalendar } from "./calendar.js";
 import { showFeed, showNewFeed } from "./feed.js";
 import { showStage, showStagesList, editStage } from "./stages.js";
 import { showRoutesMap } from "./routes_map.js";
+import { showRoutesList } from "./routes.js";
 import { initTrail, arrive, startFresh, resetTrail } from "./trail.js";
 import { resetUndo } from "./undo.js";
 
@@ -266,6 +267,8 @@ function route() {
     // ?draft=<change set id> shows that set's version, read-only when it is not the open draft
     const d = params.get("draft");
     showRoute(parts[1], { preview: d === "1" || (d && d !== "0") ? true : undefined, draftId: d && d !== "1" && d !== "0" ? d : undefined });
+  } else if (parts[0] === "routes" && !parts[1]) {
+    markNav("routes"); showWorkspace(false); showRoutesList();
   } else if (parts[0] === "routes-map") {
     markNav("routes-map"); showWorkspace(true); showRoutesMap(location.hash);
   } else if (parts[0] === "stage" && parts[1]) {

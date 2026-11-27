@@ -86,8 +86,15 @@ const ROUTE_STOP_GTFS = [
   gtfsColumn("stop_sequence", "The feed's own numbering of the stop, when it is not 1, 2, 3…"), gtfsColumn("continuous_pickup", "As routes.txt."), gtfsColumn("continuous_drop_off", "As routes.txt."),
   gtfsColumn("shape_dist_traveled", "Distance along the shape."), gtfsColumn("pickup_booking_rule_id", "A booking rule."), gtfsColumn("drop_off_booking_rule_id", "A booking rule."),
 ];
+// what a route export carries besides routes.txt (docs section 34)
+const ROUTE_EXTRA = [
+  gtfsColumn("text_color", "Optional text colour as #RRGGBB."), gtfsColumn("route_tag", "The fare tag GIMS reports as routeTag, for example METRO_FEEDER."),
+  gtfsColumn("active", "1 listed for passengers (a new route's default), 0 inactive."),
+  gtfsColumn("polyline_source", "Where the map line came from: osrm, gps, manual or imported (a line from a file, when left empty)."),
+  gtfsColumn("encoded_polyline", "The map line, as a Google encoded polyline."),
+];
 const STOP_GTFS_NAMES = STOP_GTFS.map((c) => c.name);
-const ROUTE_GTFS_NAMES = ROUTE_GTFS.map((c) => c.name);
+const ROUTE_GTFS_NAMES = [...ROUTE_GTFS, ...ROUTE_EXTRA].map((c) => c.name);
 
 const KINDS = {
   stops: {
@@ -123,10 +130,11 @@ const KINDS = {
       return problems;
     },
   },
+  // offered on either kind of feed: a route is a route, whatever its stops
+  // come from (the Routes page's export carries one of these files)
   routes: {
-    lists: true,
     label: "Routes",
-    what: "Routes to add, change or remove. Each row says which in its action column; import stop lists separately.",
+    what: "Routes to add, change or remove. Each row says which in its action column; import their stop lists (or stages) separately.",
     columns: [
       { name: "action", required: true, emptyMessage: "action is empty. Every row says add, update or delete.", read: action(ACTIONS, {}), help: "add a route, update one that exists, or delete one." },
       { name: "route_id", required: true, read: text, help: "A new, unused id to add; the route's own id to update or delete." },
@@ -134,6 +142,7 @@ const KINDS = {
       { name: "long_name", required: false, read: optional, help: "Optional route name." },
       { name: "color", required: false, read: optional, help: "Optional colour as #RRGGBB." },
       ...ROUTE_GTFS,
+      ...ROUTE_EXTRA,
     ],
     show: ["action", "route_id", "short_name", "long_name", "color"],
     rowCheck: (row) => {
@@ -207,14 +216,16 @@ const KINDS = {
       { name: "stop_type", required: true, read: stopType, help: STOP_TYPES.join(", ") },
       // the column is required; a JUMP STOP's cell may be empty (rowCheck)
       { name: "stage_no", required: false, header: true, read: whole("stage_no", { blankOk: true }), help: "Fare stage number. A JUMP STOP may leave it empty: it is then in the stage before it." },
-      { name: "stage_name", required: false, header: true, read: optional, help: "Fare stage name. A JUMP STOP in the stage before it may leave it empty." },
+      // empty is sent as "": a feed with no fare stages numbers every stop 0 and names none
+      { name: "stage_name", required: false, header: true, read: (v) => v.trim(), help: "Fare stage name. A JUMP STOP in the stage before it may leave it empty, and so may every stop of a feed with no fare stages (stage_no 0)." },
       ...ROUTE_STOP_GTFS,
     ],
     show: ["action", "route_id", "sequence", "stop_id", "stop_type", "stage_no", "stage_name"],
     rowCheck: (row) => {
       if (row.stop_type === "JUMP STOP") return [];
-      return ["stage_no", "stage_name"].filter((k) => row[k] === undefined)
-        .map((k) => `${k} is empty. Only a JUMP STOP may leave its stage empty.`);
+      if (row.stage_no === undefined) return ["stage_no is empty. Only a JUMP STOP may leave its stage empty."];
+      return row.stage_name || row.stage_no === 0 ? []
+        : ["stage_name is empty. Only a JUMP STOP may leave its stage empty, and a stop of a feed with no fare stages (stage_no 0)."];
     },
   },
   route_trips: {
@@ -472,7 +483,8 @@ export async function showImport(kind, file) {
     clear(root,
       h("div.title-block",
         h("h1", "Import from a CSV file"),
-        h("p.hint", "Add, change or remove many stops or routes, replace route stop lists, or set the platform labels and descriptions of many stops, at once. Every row says what it does in its action column: add, update or delete. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed.")),
+        h("p.hint", "Add, change or remove many stops or routes, replace route stop lists, or set the platform labels and descriptions of many stops, at once. Every row says what it does in its action column: add, update or delete. The file is checked first and nothing is added until you choose to. Added changes wait in your draft until someone else approves it and it is committed."),
+        h("p.hint", "Routes exported from the Routes page come as a zip of these files: import them one at a time, in the order its README gives.")),
       view.added ? h("div.notice.ok", { role: "status" },
         h("p", h("strong", view.added.message)),
         h("div.btn-row", h("a.btn.small", { href: `#/drafts/${enc(view.added.draftId)}` }, "Open the draft"))) : null,
