@@ -29,6 +29,7 @@ pub mod migration;
 pub mod position_reviews;
 pub mod proposals;
 pub mod records;
+pub mod route_copy;
 pub mod route_issues;
 pub mod route_lines;
 pub mod service;
@@ -339,6 +340,21 @@ pub fn configure(cfg: &mut web::ServiceConfig, state: Option<Arc<EditorState>>) 
                 web::post().to(h::node_rollback),
             )
             .route("/feeds/{gtfs_id}/routes", web::get().to(h::routes))
+            // routes as CSV files the bulk import reads (section 34): POST takes
+            // a list of ids too long for an address
+            .route(
+                "/feeds/{gtfs_id}/routes:export",
+                web::get().to(h::routes_export),
+            )
+            .route(
+                "/feeds/{gtfs_id}/routes:export",
+                web::post().to(h::routes_export_post),
+            )
+            // a new route made from this one, into a draft (section 34)
+            .route(
+                "/feeds/{gtfs_id}/routes/{route_id}:clone",
+                web::post().to(h::route_clone),
+            )
             .route(
                 "/feeds/{gtfs_id}/routes/{route_id}",
                 web::get().to(h::route),

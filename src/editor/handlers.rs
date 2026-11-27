@@ -14,6 +14,7 @@ use super::import_jobs;
 use super::position_reviews;
 use super::proposals;
 use super::records;
+use super::route_copy;
 use super::route_issues;
 use super::service::{self as svc, Page, StopQuery};
 use super::stage_reviews;
@@ -1103,6 +1104,8 @@ pub struct RoutesQuery {
     active: Option<bool>,
     limit: Option<i64>,
     cursor: Option<String>,
+    /// The routes as this draft makes the feed (section 34).
+    change_set: Option<Uuid>,
 }
 
 pub async fn routes(
@@ -1111,9 +1114,135 @@ pub async fn routes(
     path: web::Path<String>,
     q: web::Query<RoutesQuery>,
 ) -> EditorResult<HttpResponse> {
-    auth::require_feed(&req, &st, &path, Role::Viewer).await?;
+    let ctx = auth::require_feed(&req, &st, &path, Role::Viewer).await?;
     let page = Page::parse(q.limit, q.cursor.as_deref())?;
-    ok(svc::list_routes(&st, &path, q.q.as_deref(), q.active, &page).await?)
+    match q.change_set {
+        Some(id) => {
+            also_on_set(&st, &ctx, id, Role::Viewer).await?;
+            ok(route_copy::list_routes_in_draft(
+                &st,
+                &ctx,
+                id,
+                &path,
+                q.q.as_deref(),
+                q.active,
+                &page,
+            )
+            .await?)
+        }
+        None => ok(svc::list_routes(&st, &path, q.q.as_deref(), q.active, &page).await?),
+    }
+}
+
+/// `?change_set=` on a read or a write about a route: the draft it is about.
+#[derive(Deserialize)]
+pub struct DraftQuery {
+    change_set: Option<Uuid>,
+}
+
+/// `POST /feeds/{g}/routes/{route_id}:clone?change_set=` (section 34): a new
+/// route made from this one, as the draft has it, added to the draft. Editor.
+pub async fn route_clone(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<(String, String)>,
+    q: web::Query<DraftQuery>,
+    body: web::Json<route_copy::CloneRequest>,
+) -> EditorResult<HttpResponse> {
+    let (g, from) = path.into_inner();
+    let ctx = auth::require_feed(&req, &st, &g, Role::Editor).await?;
+    let Some(id) = q.change_set else {
+        return Err(EditorError::bad_request(
+            "change_set_required",
+            "a clone is added to a draft: name it with ?change_set=",
+        ));
+    };
+    also_on_set(&st, &ctx, id, Role::Editor).await?;
+    let mut out = route_copy::clone_route(&st, &ctx, id, &g, &from, body.into_inner()).await?;
+    out["change_set"] = svc::set_detail(&st, &ctx, id).await?;
+    Ok(HttpResponse::Created().json(out))
+}
+
+/// `GET /feeds/{g}/routes:export?route_ids=&action=&change_set=`.
+#[derive(Deserialize)]
+pub struct ExportQuery {
+    /// Comma separated; none: every live route of the feed.
+    route_ids: Option<String>,
+    /// `add` (the default) or `update`: what every row of the files says.
+    action: Option<String>,
+    change_set: Option<Uuid>,
+}
+
+/// The body of `POST /feeds/{g}/routes:export`, for more ids than an address
+/// holds.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportBody {
+    #[serde(default)]
+    route_ids: Option<Vec<String>>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+async fn routes_export_run(
+    req: &HttpRequest,
+    st: &Data,
+    g: &str,
+    route_ids: Option<Vec<String>>,
+    action: Option<&str>,
+    change_set: Option<Uuid>,
+) -> EditorResult<HttpResponse> {
+    let ctx = auth::require_feed(req, st, g, Role::Viewer).await?;
+    if let Some(id) = change_set {
+        also_on_set(st, &ctx, id, Role::Viewer).await?;
+    }
+    let action = route_copy::ExportAction::parse(action)?;
+    let file =
+        route_copy::export_routes(st, &ctx, g, route_ids.as_deref(), action, change_set).await?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/zip")
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", file.name),
+        ))
+        .insert_header(("X-Routes-Exported", file.routes.to_string()))
+        .body(file.bytes))
+}
+
+/// Routes as a zip of the CSV files the bulk import reads (section 34). Viewer.
+pub async fn routes_export(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<ExportQuery>,
+) -> EditorResult<HttpResponse> {
+    let ids = q.route_ids.as_deref().map(|ids| {
+        ids.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    routes_export_run(&req, &st, &path, ids, q.action.as_deref(), q.change_set).await
+}
+
+pub async fn routes_export_post(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    q: web::Query<DraftQuery>,
+    body: web::Json<ExportBody>,
+) -> EditorResult<HttpResponse> {
+    let b = body.into_inner();
+    routes_export_run(
+        &req,
+        &st,
+        &path,
+        b.route_ids,
+        b.action.as_deref(),
+        q.change_set,
+    )
+    .await
 }
 
 pub async fn route(

@@ -20,6 +20,7 @@ js/main.js          boot, top bar, hash router
 js/map.js           Leaflet: the base map (OpenStreetMap or Google), stops by area, routes, several routes at once, drag a stop, pick a stop, station selection, insets, a map line edited by hand
 js/line.js          a map line as points: encode it, snap a click to it, replace a stretch, the stops it passes by, and the toolkit's trim, simplify, files in and out (no DOM; tested by dev/line_test.mjs and dev/line_toolkit_test.mjs)
 js/routes_map.js    several routes' map lines on the map at once, each in its own colour (#/routes-map?ids=)
+js/routes.js        the routes page (#/routes): every route, found, sorted, paged; cloning a route; routes exported as CSV files
 js/explore.js       search (paged), stop panel with its CSV download, route panel with the fare-stage ladder
 js/editors.js       stop, route stop list, route details and map line (suggested, or edited on the map), station editors
 js/drafts.js        the draft being edited, the draft chooser, addChange(), what the draft creates
@@ -55,6 +56,12 @@ dev/                development only - never served by GIMS
   once, each in its own colour with its number where it starts: added by
   number or name, from a stop's routes or a route page; picked out by pointing
   at one in the list; their stops on request. The address keeps them.
+- **Routes** (`#/routes`) - every route of the feed in one table, as the open
+  draft makes them: found by number, name, id, agency or fare tag, sorted by any
+  column, 100 a page. Tick routes to export them (a zip of the CSV files the
+  import page reads, rows saying add or update) or show them on the map; Clone
+  on a row, or Clone as a new route on a route's page, makes a new route with
+  everything the route has in the draft (docs section 34).
 - **Base map** - the Show box offers OpenStreetMap or Google Maps when the
   server has a Maps JavaScript API key (docs section 30): Google's own map
   under the Leaflet one, following it, its script loaded only once Google is

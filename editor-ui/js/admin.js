@@ -313,6 +313,7 @@ export const ACTION_LABEL = {
   change_set_discarded: "Discarded",
   node_rolled_back: "Put something back as an earlier version had it, in a draft",
   bulk_imported: "Imported a CSV file",
+  route_cloned: "Cloned a route into a new one, in a draft",
   stop_merged: "Merged a duplicate stop",
   station_merged: "Merged two stations",
   station_proposals_built: "Suggested stations were built",

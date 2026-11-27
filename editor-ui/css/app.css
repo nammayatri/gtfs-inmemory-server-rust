@@ -976,3 +976,14 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
 .filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
 .change-grid ol { margin: 4px 0 0; padding-left: 22px; }
 .change-grid li.head { font-weight: 700; }
+/* the routes page (docs section 34) */
+.page-inner.routes-page { max-width: 1320px; }
+.routes-count { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 8px; }
+.routes-table th button.sort {
+  padding: 0; border: 0; background: none; cursor: pointer;
+  font: inherit; color: inherit; text-align: inherit; white-space: nowrap;
+}
+.routes-table th[aria-sort] { color: var(--ink); }
+.routes-table td .sub { display: block; color: var(--muted); font-size: var(--fs-xs); }
+.routes-table tr.selected td { background: var(--action-tint); }
+.routes-bar { margin-top: 12px; }

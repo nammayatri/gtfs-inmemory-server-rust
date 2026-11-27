@@ -562,12 +562,30 @@ pub async fn list_routes(
     active: Option<bool>,
     page: &Page,
 ) -> EditorResult<Value> {
+    let mut conn = state.pool.acquire().await?;
+    list_routes_on(&mut conn, gtfs_id, q, active, page).await
+}
+
+/// [`list_routes`] on `conn`: inside a transaction that has applied a draft,
+/// the routes as that draft makes them (section 34). Each item also counts
+/// the route's stop orders and trips.
+pub async fn list_routes_on(
+    conn: &mut PgConnection,
+    gtfs_id: &str,
+    q: Option<&str>,
+    active: Option<bool>,
+    page: &Page,
+) -> EditorResult<Value> {
     let q = q.map(str::trim).filter(|s| !s.is_empty());
     let rows = sqlx::query(&format!(
         "SELECT {ROUTE_COLS}, \
             (SELECT count(*) FROM gtfs_route_stop_effective rs WHERE rs.gtfs_id = r.gtfs_id \
                AND rs.route_id = r.route_id AND rs.pattern_key = 1 \
-               AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count \
+               AND rs.stop_type NOT IN ('ROUTE CORRECTION', 'JUMP STOP', 'HIDDEN STOP')) AS stop_count, \
+            (SELECT count(*) FROM gtfs_pattern p \
+               WHERE p.gtfs_id = r.gtfs_id AND p.route_id = r.route_id) AS pattern_count, \
+            (SELECT count(*) FROM gtfs_trip t \
+               WHERE t.gtfs_id = r.gtfs_id AND t.route_id = r.route_id) AS trip_count \
          FROM gtfs_route r \
          WHERE r.gtfs_id = $1 AND NOT r.deleted \
            AND ($2::text IS NULL OR r.route_id = $2 OR r.short_name ILIKE $3 OR r.long_name ILIKE $3) \
@@ -582,7 +600,7 @@ pub async fn list_routes(
     .bind(page.limit + 1)
     .bind(page.offset)
     .bind(active)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *conn)
     .await?;
     let items = rows
         .iter()
@@ -596,6 +614,8 @@ pub async fn list_routes(
             }
             v["has_polyline"] = json!(has);
             v["stop_count"] = json!(r.try_get::<i64, _>("stop_count")?);
+            v["pattern_count"] = json!(r.try_get::<i64, _>("pattern_count")?);
+            v["trip_count"] = json!(r.try_get::<i64, _>("trip_count")?);
             Ok(v)
         })
         .collect::<Result<Vec<_>, _>>()?;

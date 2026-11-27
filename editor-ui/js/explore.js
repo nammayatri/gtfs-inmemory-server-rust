@@ -12,6 +12,7 @@ import { nameHere, parent as trailParent, startFresh } from "./trail.js";
 import { routeListsSection } from "./variants.js";
 import { historySection, stopNodes, routeNodes } from "./history.js";
 import { routesMapHref, ROUTES_MAP_MAX } from "./routes_map.js";
+import { cloneRoute } from "./routes.js";
 
 const panel = () => document.getElementById("panel");
 
@@ -581,6 +582,8 @@ export async function showRoute(routeId, { preview, draftId } = {}) {
         r.route_tag || (drafted && o.changed.has("route_tag")) ? [h("dt", "Fare tag"), h("dd", field("route_tag") || "none")] : null,
         live ? [h("dt", "Trips"), h("dd", `${fmtCount(live.trip_count || 0)} live on ${plural((live.patterns || []).length || 1, "stop order")}`)] : null,
       ),
+      // a new route with all of this one, as the draft has it (section 34)
+      can("editor") && !viewed && !o.gone ? h("div.btn-row", h("button.btn.secondary.small#clone-route", { type: "button", on: { click: () => cloneRoute(r) } }, "Clone as a new route")) : null,
       live ? h("div.btn-row", h("a.btn.secondary.small", { href: `#/trips/${enc(routeId)}` }, "Trips and timing"),
         h("a.btn.secondary.small#route-with-others", { href: routesMapHref([routeId]) }, "Show with other routes")) : null,
       // the editors start from the live route and lay the draft's change over it themselves

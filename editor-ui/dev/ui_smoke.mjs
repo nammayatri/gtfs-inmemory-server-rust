@@ -12,6 +12,7 @@
 //   node dev/ui_smoke.mjs --line-toolkit     # only the map line toolkit (section 31)
 //   node dev/ui_smoke.mjs --routes-map       # only several routes on the map (section 29)
 //   node dev/ui_smoke.mjs --map-tiles        # only the base map, OpenStreetMap or Google Maps JS (section 30)
+//   node dev/ui_smoke.mjs --routes-page      # only the routes page: list, clone, export (section 34)
 //
 // Every flow runs through the real UI: sign-in, TOTP enrolment; the map (stop
 // labels, clicking stops while a route or stop is open, the search list above the
@@ -2183,6 +2184,90 @@ async function routesMapFlow() {
 // kept in this browser. Google's map under Leaflet's follows it; its script is
 // loaded only once someone chooses it, and one map serves the page. Google
 // refusing the key: OpenStreetMap and why. The mock's Google is a stub script.
+// The routes page (docs section 34): every route in one table - all of the
+// feed's, paged in the browser past the API's page of 500 - filtered, sorted,
+// ticked and exported; a route cloned into the draft from its row and from its
+// page, and an id in use refused.
+async function routesPageFlow() {
+  check(await navShown(`a[data-nav="routes"]`), "Routes is in the menu");
+  await go("#/routes");
+  await waitFor(`document.querySelectorAll(".routes-table tbody tr").length > 0`, "the routes table", 30000);
+  const total = Number((await text(".routes-count .hint")).replace(/[^0-9]/g, ""));
+  check(total > 500, `every route is listed, past the API's page of 500 (${total})`);
+  check(await evaluate(`document.querySelectorAll(".routes-table tbody tr").length`) === 100, "a hundred rows a page");
+  check((await text(".routes-page .pager")).includes(`of ${Math.ceil(total / 100)}`), "the rest on later pages");
+  await shot("rp-01-routes");
+  // found by its number, the filter keeping its focus
+  const pick = (await api("feeds/chennai_bus/routes?q=21G&limit=30")).items.find((r) => r.stop_count >= 3 && r.short_name && r.active !== false);
+  if (!check(!!pick, "a route to find")) return;
+  await type("#routes-q", pick.short_name);
+  await sleep(400);
+  let shown = await evaluate(`[...document.querySelectorAll(".routes-table tbody tr")].map((tr) => tr.dataset.route)`);
+  check(shown.includes(pick.route_id) && shown.length < 100, `the filter finds ${pick.short_name} and only what matches (${shown.length})`);
+  check(await evaluate(`document.activeElement && document.activeElement.id === "routes-q"`), "the search box keeps the focus");
+  // sorted by stops, most first
+  await type("#routes-q", "");
+  await clickSel('button.sort[data-sort="stop_count"]', "sort by stops");
+  await clickSel('button.sort[data-sort="stop_count"]', "sort by stops, the other way");
+  const counts = await evaluate(`[...document.querySelectorAll(".routes-table tbody tr")].slice(0, 20).map((tr) => Number(tr.children[5].innerText.replace(/,/g, "")))`);
+  check(counts.length === 20 && counts.every((c, i) => i === 0 || counts[i - 1] >= c), `sorted by stops, most first (${counts.slice(0, 5)})`);
+  check(await evaluate(`document.querySelector('th[aria-sort="descending"] button.sort')?.dataset.sort === "stop_count"`), "the column says how it is sorted");
+  // ticked and exported
+  await clickSel(".routes-table tbody tr:nth-child(1) td.tick input", "tick the first route");
+  await clickSel(".routes-table tbody tr:nth-child(2) td.tick input", "tick the second route");
+  check((await text(".routes-bar")).includes("2 routes selected"), "the bar counts the ticked routes");
+  await clickSel("#routes-export-selected", "Export 2 routes");
+  await waitFor(`!!document.querySelector("dialog #export-update")`, "the export dialog");
+  await clickSel("#export-update", "rows that update");
+  await clickSel("#export-download", "Download");
+  await waitFor(`[...document.querySelectorAll(".toast")].some((t) => t.innerText.includes("Exported 2 routes as chennai_bus-routes.zip"))`, "the export downloaded", 15000);
+  const zip = await evaluate(`fetch(${JSON.stringify(`${BASE}/internal/gtfs-editor/feeds/chennai_bus/routes:export?route_ids=`)} + encodeURIComponent(${JSON.stringify(pick.route_id)}),
+    { credentials: "same-origin" }).then(async (r) => ({ status: r.status, type: r.headers.get("Content-Type"), magic: [...new Uint8Array(await r.arrayBuffer()).slice(0, 2)] }))`);
+  check(zip.status === 200 && zip.type === "application/zip" && zip.magic[0] === 0x50 && zip.magic[1] === 0x4b, `an export is a zip (${JSON.stringify(zip)})`);
+  await clickSel(".routes-bar button.btn.quiet", "clear the selection");
+  check(!(await has(".routes-bar")), "no bar once nothing is ticked");
+
+  // ---- a clone, from the route's row
+  await type("#routes-q", pick.short_name);
+  await sleep(400);
+  await clickSel(`button[data-clone="${pick.route_id}"]`, `Clone ${pick.short_name}`);
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Clones");
+  await waitFor(`!!document.querySelector("dialog #clone-route-id")`, "the clone dialog");
+  check(await evaluate(`document.getElementById("clone-short-name").value === ${JSON.stringify(pick.short_name)}`), "the dialog starts from the route's number");
+  const newId = `${pick.route_id}-smoke-clone`;
+  await type("#clone-route-id", "not an id");
+  await clickSel("#clone-submit", "Add the clone");
+  check((await text("dialog .notice.error")).includes("64 letters"), "an id that is not one is refused in the browser");
+  await type("#clone-route-id", newId);
+  await type("#clone-short-name", `${pick.short_name}X`);
+  await clickSel("#clone-submit", "Add the clone");
+  await waitFor(`location.hash === ${JSON.stringify(`#/route/${encodeURIComponent(newId)}`)}`, "the new route's page");
+  await waitFor(`document.getElementById("panel").innerText.includes("New route in your draft")`, "the clone, new in the draft");
+  await shot("rp-02-clone");
+  const draftId = await activeDraftId();
+  const changes = ((await api(`change-sets/${draftId}`)).changes || []).filter((c) => c.entity_key === newId);
+  check(changes.some((c) => c.entity === "route" && c.op === "create" && c.after.short_name === `${pick.short_name}X`)
+    && changes.some((c) => c.entity === "route_stops"), `the draft holds the new route and its stop list (${changes.map((c) => c.entity).join(", ")})`);
+  // from the route's own page: the id is taken now
+  await go(`#/route/${pick.route_id}`);
+  await waitFor(`!!document.getElementById("clone-route")`, "Clone as a new route on the route's page");
+  await clickSel("#clone-route", "Clone as a new route");
+  await waitFor(`!!document.querySelector("dialog #clone-route-id")`, "the clone dialog again");
+  await type("#clone-route-id", newId);
+  await clickSel("#clone-submit", "Add the clone");
+  await waitFor(`(document.querySelector("dialog .notice.error")?.innerText || "").includes("already created in draft")`, "the id in use, refused");
+  await click("Cancel", "dialog");
+  // the routes page lists it, as the draft has it
+  await go("#/routes");
+  await waitFor(`document.querySelectorAll(".routes-table tbody tr").length > 0`, "the routes table with the draft");
+  await type("#routes-q", newId);
+  await sleep(400);
+  check((await text(".routes-table")).includes("new in draft"), "the clone is listed, marked new in the draft");
+  check((await text(".routes-page .notice.draft")).includes("Shown as your draft"), "the page says it shows the draft");
+  await type("#routes-q", "");
+}
+
 async function mapTilesFlow() {
   const setTiles = (m) => evaluate(`fetch("/__dev/map-tiles", { method: "POST", credentials: "same-origin",
     headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify(m))} }).then((r) => r.json())`);
@@ -2654,6 +2739,30 @@ if (process.argv.includes("--routes-map")) {
     await load(UI);
     await signIn("editor1@nammayatri.in");
     await routesMapFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+// ---- only the routes page
+if (process.argv.includes("--routes-page")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await routesPageFlow();
     check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
   } catch (e) {
     failures.push(e.message);
@@ -3979,6 +4088,8 @@ try {
   await lineToolkitFlow();
   // ================================================================ several routes on the map: see routesMapFlow above
   await routesMapFlow();
+  // ================================================================ the routes page: see routesPageFlow above
+  await routesPageFlow();
   // ================================================================ the base map: see mapTilesFlow above (last: it reloads the page)
   await mapTilesFlow();
 
