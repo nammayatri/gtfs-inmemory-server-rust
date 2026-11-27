@@ -540,6 +540,84 @@ async fn stages_build_routes_and_one_edit_changes_them_all() {
         5
     );
 
+    // ---- stops and a route all new in one draft: the route is given a stage
+    // of new stops, and that stage, edited from the route's stop list as the
+    // dashboard does on a feed built from stages, takes another new stop - all
+    // before anything is committed
+    let dn = draft!("new stops and a new route in one draft");
+    let mut kerbs = Vec::new();
+    for (name, lat) in [
+        ("NEW KERB 1", 13.07),
+        ("NEW KERB 2", 13.072),
+        ("NEW KERB 3", 13.071),
+    ] {
+        let b = added!(
+            dn,
+            json!({"entity": "stop", "op": "create", "after": {"name": name, "lat": lat, "lon": 80.2}})
+        );
+        kerbs.push(
+            b["changes"].as_array().unwrap().last().unwrap()["entity_key"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let (k1, k2, k3) = (kerbs[0].as_str(), kerbs[1].as_str(), kerbs[2].as_str());
+    added!(
+        dn,
+        json!({"entity": "route", "op": "create", "after": {"route_id": "NR", "short_name": "N"}})
+    );
+    added!(
+        dn,
+        json!({"entity": "stage", "op": "create", "entity_key": "stg_new_route", "after": {
+            "name": "NEW ROUTE STAGE", "rows": stops(&[(k1, "NEW STOP"), (k2, "INTERMEDIATE STOP")])}})
+    );
+    let b = added!(
+        dn,
+        json!({"entity": "route_stages", "op": "replace", "entity_key": "NR", "after": {
+            "stages": [{"stage_id": "stg_new_route"}], "base_stages_hash": EMPTY_HASH}})
+    );
+    assert!(findings(&b, "error").is_empty(), "{b}");
+    let b = added!(
+        dn,
+        json!({"entity": "stage", "op": "update", "entity_key": "stg_new_route", "after": {
+            "rows": stops(&[(k1, "NEW STOP"), (k3, "INTERMEDIATE STOP"), (k2, "INTERMEDIATE STOP")])}})
+    );
+    assert!(findings(&b, "error").is_empty(), "{b}");
+    assert_eq!(b["can_submit"], true, "{b}");
+    // the draft's view of the new route, as the dashboard's editors read it
+    let (s, p, _) = call!(
+        &app,
+        ed.req(
+            "GET",
+            &format!("/change-sets/{dn}/preview/routes/NR/stages")
+        )
+    );
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["has_stages"], true, "{p}");
+    let (s, p, _) = call!(
+        &app,
+        ed.req("GET", &format!("/change-sets/{dn}/preview/routes/NR"))
+    );
+    assert_eq!(s, 200, "{p}");
+    let ids: Vec<&str> = p["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["stop_id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![k1, k3, k2], "{p}");
+    let (s, b) = ship!(dn);
+    assert_eq!(s, 200, "commit: {b}");
+    assert_eq!(
+        route_rows(&pool, "NR").await,
+        [
+            format!("{k1}/NEW STOP/1/NEW ROUTE STAGE"),
+            format!("{k3}/INTERMEDIATE STOP/1/NEW ROUTE STAGE"),
+            format!("{k2}/INTERMEDIATE STOP/1/NEW ROUTE STAGE")
+        ]
+    );
+
     // ---- reads
     let (s, list, _) = call!(&app, ed.req("GET", &format!("/feeds/{FEED}/stages?q=alp")));
     assert_eq!(s, 200, "{list}");

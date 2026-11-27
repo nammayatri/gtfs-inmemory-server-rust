@@ -586,8 +586,10 @@ export async function showRoute(routeId, { preview, draftId } = {}) {
       // the editors start from the live route and lay the draft's change over it themselves
       can("editor") && (live || created) ? h("div.btn-row",
         // on a feed built from stages a route with no stages has no stop list
-        // to edit: it gets its stops by being given stages, below
-        created || (usesStages() && !(live.rows || []).length) ? null : h("button.btn.secondary#edit-stop-list", { type: "button", on: { click: () => editRouteRows(live) } }, "Edit stop list"),
+        // to edit: it gets its stops by being given stages, below. A route new
+        // in the draft is edited as the draft has it.
+        usesStages() && !((created ? r : live).rows || []).length ? null
+          : h("button.btn.secondary#edit-stop-list", { type: "button", on: { click: () => editRouteRows(created ? r : live, { created: !!created }) } }, "Edit stop list"),
         h("button.btn.secondary", { type: "button", on: { click: () => editRouteDetails(created ? r : live, { created: !!created }) } }, "Edit name, colour and map line")) : null,
     ),
     live ? gpsTripsSection(live) : null,

@@ -792,6 +792,7 @@ export function showRoute(route, { fit = true, layer = "route", dashed = false, 
       L.circleMarker([r.lat, r.lon], {
         renderer: dots,
         bubblingMouseEvents: false,
+        routeStop: layer,
         radius: isNew ? 7 : 5,
         color: r.stop_type === "JUMP STOP" ? MUTED : INK,
         weight: 2,

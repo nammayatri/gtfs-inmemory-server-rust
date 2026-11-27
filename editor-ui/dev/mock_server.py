@@ -1346,6 +1346,16 @@ class Handler(BaseHTTPRequestHandler):
                     s.map_line_snap = b["snap"]
             return self._send(200, {"osrm": getattr(s, "map_line_osrm", "ok"), "gps": getattr(s, "map_line_gps", "ok"),
                                     "road": getattr(s, "map_line_road", "ok")})
+        if path == "/__dev/use-stages" and method == "POST":
+            # whether a feed builds its routes from stages (docs section 19): the
+            # mock's feeds do unless told otherwise; {"gtfs_id", "use_stages"}
+            b = self._body()
+            g = b.get("gtfs_id") or "chennai_bus"
+            with LOCK:
+                if g not in s.feeds:
+                    raise ApiError(404, "feed_not_found", f"no feed {g}")
+                s.feeds[g]["use_stages"] = bool(b.get("use_stages", True))
+            return self._send(200, {"gtfs_id": g, "use_stages": s.feeds[g]["use_stages"]})
         if path == "/__dev/map-tiles" and method == "POST":
             # docs section 30: google ok, off (no key) or auth_fail (Google
             # refuses the key once its map is made); default osm or google
