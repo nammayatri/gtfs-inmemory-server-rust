@@ -510,6 +510,8 @@ pub async fn feed_gtfs_zip(
     } else {
         0
     };
+    // the lines drawn in the editor, as the routes' shapes (section 32)
+    let lines = feed_io::with_route_lines(&mut conn, &g, &mut m).await?;
     let bytes = gtfs_write::zip_bytes(&gtfs_write::to_raw(&m))
         .map_err(|e| EditorError::new(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", e))?;
     let name = if published {
@@ -527,6 +529,8 @@ pub async fn feed_gtfs_zip(
         .insert_header(("X-Export-Findings", findings.len().to_string()))
         // inactive routes the published zip leaves out
         .insert_header(("X-Inactive-Routes-Left-Out", left_out.to_string()))
+        // routes whose map line drawn in the editor is now their shape
+        .insert_header(("X-Map-Lines-As-Shapes", lines.routes.to_string()))
         .body(bytes))
 }
 
@@ -540,7 +544,8 @@ pub async fn feed_validation(
     let g = path.into_inner();
     auth::require_feed(&req, &st, &g, Role::Viewer).await?;
     let mut conn = st.pool.acquire().await?;
-    let (m, mut findings) = feed_io::load_model(&mut conn, &g).await?;
+    let (mut m, mut findings) = feed_io::load_model(&mut conn, &g).await?;
+    feed_io::with_route_lines(&mut conn, &g, &mut m).await?;
     let today = chrono::Utc::now().date_naive().to_string();
     findings.extend(crate::gtfs::validate::validate(&m, &today));
     ok(json!({
@@ -562,6 +567,9 @@ pub struct ImportQuery {
     pub dry_run: Option<bool>,
     /// mode `drafts`: the files it may write, comma separated.
     pub files: Option<String>,
+    /// mode `drafts`: `true` updates the routes too - their `routes.txt`
+    /// fields and map lines (section 32) - besides the files.
+    pub routes: Option<bool>,
     /// `true`: answer at once with a job to poll (section 18.15).
     pub background: Option<bool>,
 }
@@ -589,6 +597,7 @@ pub async fn feed_import(
                     .files
                     .as_deref()
                     .map(|f| f.split(',').map(str::to_string).collect()),
+                with_routes: q.routes.unwrap_or(false),
                 dry_run: q.dry_run.unwrap_or(true),
                 user_id: ctx.user.user_id,
                 email: ctx.user.email.clone(),

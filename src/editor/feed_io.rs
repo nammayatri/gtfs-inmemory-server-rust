@@ -525,6 +525,20 @@ pub async fn load_model(
     Ok((m, findings))
 }
 
+/// The zip a feed gives (downloaded, published, reported on) carries the
+/// lines drawn in the editor as its routes' shapes (section 32): call this on
+/// the model [`load_model`] read, after [`published`] when it applies. The
+/// draft import, the seed's check and a migration read the tables as they are,
+/// and do not.
+pub async fn with_route_lines(
+    conn: &mut PgConnection,
+    g: &str,
+    m: &mut FeedModel,
+) -> EditorResult<super::route_lines::LinesReport> {
+    let lines = super::route_lines::feed_lines(conn, g).await?;
+    Ok(super::route_lines::lines_into_shapes(m, &lines))
+}
+
 /// The zip a feed publishes (section 18.17): the model without its inactive
 /// routes and what only they have - their stop orders, timings and trips, the
 /// records that name one of them or one of their trips, and the shapes only
@@ -611,6 +625,8 @@ pub struct SeedReport {
     /// The stage stops read from the zip's headsigns ([`fare_stages_of`]);
     /// 0 for a feed without fare stages.
     pub stage_stops: usize,
+    /// Routes given a map line from their main shape (section 32).
+    pub map_lines: usize,
 }
 
 /// A route stop's fare stage, as a seed reads it back from its headsign.
@@ -1112,6 +1128,9 @@ pub async fn seed(
     // zip marks a route inactive (a full download's), so a zip without the
     // column loads on a database that does not have it yet.
     let any_inactive = m.routes.iter().any(|r| route_inactive(&r.values));
+    // each route's map line: its main shape (section 32), kept as imported so
+    // the zip's shapes stay what it is exported from
+    let lines = super::route_lines::lines_from_shapes(m);
     let routes: Vec<Value> = m
         .routes
         .iter()
@@ -1123,10 +1142,24 @@ pub async fn seed(
             if any_inactive {
                 pairs.push(("active", json!(!route_inactive(&r.values))));
             }
+            if let Some(line) = lines.get(&r.route_id) {
+                pairs.push((
+                    "encoded_polyline",
+                    json!(crate::services::osrm::encode_polyline(line)),
+                ));
+                pairs.push(("polyline_source", json!(super::route_lines::IMPORTED)));
+            }
             row_of(g, pairs)
         })
         .collect();
-    let mut route_extra = vec!["gtfs_id", "route_id", "sort_key", "updated_by"];
+    let mut route_extra = vec![
+        "gtfs_id",
+        "route_id",
+        "sort_key",
+        "updated_by",
+        "encoded_polyline",
+        "polyline_source",
+    ];
     if any_inactive {
         route_extra.push("active");
     }
@@ -1403,6 +1436,7 @@ pub async fn seed(
         counts: m.counts(),
         feed_version: version,
         stage_stops,
+        map_lines: lines.len(),
     })
 }
 
@@ -1438,6 +1472,8 @@ pub struct ImportReport {
     /// The fare stage stops read from the zip's headsigns (the seed's
     /// `stage_stops`): 0 for a feed without fare stages.
     pub stage_stops: usize,
+    /// Routes given a map line from their main shape in the zip (section 32).
+    pub map_lines: usize,
     /// A reload ([`reload_zip`]): the rows the feed held, by table, that the
     /// zip replaces. None for a seed.
     pub replaced: Option<BTreeMap<String, u64>>,
@@ -1566,6 +1602,7 @@ async fn load_zip(
         seeded: false,
         feed_version: None,
         stage_stops: 0,
+        map_lines: 0,
         replaced: None,
         reactivated: vec![],
         stages_turned_off: false,
@@ -1626,6 +1663,7 @@ async fn load_zip(
     }
     let seeded = seed(&mut tx, &g, &m, &who.label).await?;
     report.stage_stops = seeded.stage_stops;
+    report.map_lines = seeded.map_lines;
     let (back, export_findings) = load_model(&mut tx, &g).await?;
     report.findings.extend(export_findings);
     let diffs = compare::compare(&raw, &write::to_raw(&back), &m.dropped);
@@ -1656,6 +1694,7 @@ async fn load_zip(
             "findings": summary,
             "feed_version": seeded.feed_version,
             "stage_stops": seeded.stage_stops,
+            "map_lines": seeded.map_lines,
             "replaced": report.replaced,
             "reactivated": report.reactivated,
             "stages_turned_off": report.stages_turned_off,

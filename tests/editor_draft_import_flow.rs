@@ -350,6 +350,7 @@ async fn a_zip_comes_into_a_feed_with_rows_through_drafts() {
     }
     let import = |dry_run: bool| draft_import::DraftImport {
         files: None,
+        with_routes: false,
         dry_run,
         user_id: editor_id.unwrap(),
         email: EDITOR.into(),

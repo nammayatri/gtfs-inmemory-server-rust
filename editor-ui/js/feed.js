@@ -51,6 +51,7 @@ export async function showFeed() {
     h("section.feed-section",
       h("h2", "The feed's GTFS"),
       h("p.hint", "The zip the tables give: every file of the reference the feed has. It keeps inactive routes, marked route_active = 0, so reloading it gives them back as they were. The published zip, the one passengers' apps read, leaves them and their trips out."),
+      h("p.hint", "Each route's map line drawn in the editor goes in as its shape: the shape its trips run, or a new one they then run. A line that came in from a zip's shapes leaves them as they are."),
       h("div.btn-row",
         h("a.btn.secondary", { href: `${API_BASE}feeds/${g}/gtfs.zip`, download: `${state.feedId}.gtfs.zip`, id: "download-zip" }, "Download the GTFS zip"),
         h("a.btn.secondary", { href: `${API_BASE}feeds/${g}/gtfs.zip?as=published`, download: `${state.feedId}.published.gtfs.zip`, id: "download-published-zip" }, "Download as published"),
@@ -85,6 +86,8 @@ function importForm(box) {
     h("input", { type: "radio", name: "import-mode", id: `mode-${value}`, value, checked }),
     h("span.radio-card-body", h("span.radio-card-title", title), h("span.hint", text)));
   const files = h("input", { type: "text", id: "import-files", placeholder: "optional: agency.txt,calendar.txt,trips.txt" });
+  // section 32: the routes' details and map lines, only when asked for
+  const routes = h("input", { type: "checkbox", id: "import-routes" });
   const out = h("div", { "aria-live": "polite" });
   let bytes = null, name = null;
   file.addEventListener("change", async () => {
@@ -149,6 +152,7 @@ function importForm(box) {
       qs.set("mode", "drafts");
       qs.set("dry_run", String(!write));
       if (files.value.trim()) qs.set("files", files.value.trim());
+      if (routes.checked) qs.set("routes", "true");
     } else if (write) {
       qs.set("seed", "true");
     }
@@ -170,9 +174,11 @@ function importForm(box) {
     h("label.field", { for: "import-zip" }, h("span", "GTFS zip"), file),
     h("div.radio-cards", { role: "radiogroup", "aria-label": "How" },
       mode("seed", "Load an empty feed", "For a feed with no rows yet: the whole zip in one go, checked by exporting it again.", true),
-      mode("drafts", "Bring into drafts", "For a feed that has rows: change sets for review. Stops, routes and stop orders are compared, never written.", false),
+      mode("drafts", "Bring into drafts", "For a feed that has rows: change sets for review. Stops and stop orders are compared, never written; routes only when asked, below.", false),
       mode("reload", "Reload the feed fresh", "Deletes every stop, route, trip and file the feed has and loads the zip in their place, with no drafts. Confirmed twice with your authenticator app.", false)),
     h("label.field", { for: "import-files" }, h("span", "Only these files (drafts)"), files),
+    h("label.check", { for: "import-routes" }, routes,
+      " Also update the routes (drafts): their names, colours, types and other routes.txt fields, and their map lines from the zip's shapes. A route the feed does not have is not made."),
     h("div.btn-row", h("button.btn.secondary", { type: "button", id: "import-check", on: { click: () => run(false) } }, "Check without writing")),
     out);
 }
@@ -335,6 +341,7 @@ function seedReport(res) {
 
 function draftsReport(res) {
   const so = res.stop_orders || {};
+  const rt = res.routes || {};
   return h("div.report",
     h("p", h("strong", res.change_sets.length
       ? `${res.dry_run ? "Would draft" : "Drafted"} ${plural(res.change_sets.length, "change set")}.`
@@ -347,8 +354,15 @@ function draftsReport(res) {
       h("dt", "Stop orders the feed has"), h("dd", fmtCount(so.same)),
       h("dt", "Split off them"), h("dd", fmtCount(so.split)),
       h("dt", "Routes whose trips move onto the feed's stop order"), h("dd", fmtCount(so.moved)),
-      h("dt", "Routes left as they are"), h("dd", `${fmtCount(so.routes_left)}${(so.routes_left_sample || []).length ? ` (${so.routes_left_sample.join(", ")}…)` : ""}`)),
-    Object.keys(res.differences || {}).length ? h("details", h("summary", "How the zip differs from the feed (stops and routes are never written)"),
+      h("dt", "Routes left as they are"), h("dd", `${fmtCount(so.routes_left)}${(so.routes_left_sample || []).length ? ` (${so.routes_left_sample.join(", ")}…)` : ""}`),
+      // section 32: with the routes asked for
+      (res.files || []).includes("routes.txt") ? [
+        h("dt", "Routes updated"), h("dd", { id: "import-routes-updated" }, `${fmtCount(rt.updated)}${rt.lines ? `, ${plural(rt.lines, "map line")} among them` : ""}${(rt.updated_sample || []).length ? ` (${rt.updated_sample.join(", ")}${rt.updated > rt.updated_sample.length ? "…" : ""})` : ""}`),
+        h("dt", "Routes the feed does not have (not made)"), h("dd", `${fmtCount(rt.not_in_feed)}${(rt.not_in_feed_sample || []).length ? ` (${rt.not_in_feed_sample.join(", ")}${rt.not_in_feed > rt.not_in_feed_sample.length ? "…" : ""})` : ""}`),
+      ] : null),
+    Object.keys(res.differences || {}).length ? h("details", h("summary", (res.files || []).includes("routes.txt")
+      ? "How the zip differs from the feed (stops are never written)"
+      : "How the zip differs from the feed (stops are never written, and routes only when asked)"),
       h("ul", Object.entries(res.differences).map(([k, n]) => h("li", `${k}: ${fmtCount(n)}`)))) : null,
     res.errors ? h("div.notice.error", h("p", `${plural(res.errors, "problem")} stop the import:`), h("ul", res.problems.filter((p) => p.level !== "warning").slice(0, 50).map((p) => h("li", `${p.code}: ${p.message}`)))) : null,
     res.validation ? reportView(res.validation, "The feed report on the zip.") : null);
