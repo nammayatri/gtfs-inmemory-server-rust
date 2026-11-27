@@ -1097,8 +1097,13 @@ export function editLine(points, { onChange, onView = () => {}, onStretch = () =
   const line = L.polyline(pts, { renderer: lines, color: ACTION, weight: 5, opacity: 0.9, interactive: false, lineEdit: true }).addTo(group);
   const handles = L.layerGroup().addTo(group);
   const marks = L.layerGroup().addTo(group);
+  // drawing on (section 31): a dashed guide from where the next stretch
+  // starts to the pointer, and a ring at that start
+  const rubber = L.polyline([], { renderer: lines, color: FOCUS, weight: 2, dashArray: "4 6", interactive: false, drawGuide: true }).addTo(group);
+  const anchor = L.circleMarker([0, 0], { renderer: lines, radius: 7, color: FOCUS, weight: 3, fillColor: "#fff", fillOpacity: 1, interactive: false, drawAnchor: true });
   let dragging = false;
   let stretch = null;           // {stage, from, to, vias: [[lat, lon]]}
+  let draw = null;              // {from: [lat, lon], onClick(lat, lon)}
   let cleaned = false;
 
   const commit = (label) => onChange(pts.map((p) => [p[0], p[1]]), label);
@@ -1109,8 +1114,8 @@ export function editLine(points, { onChange, onView = () => {}, onStretch = () =
     const view = map.getBounds().pad(0.1);
     const inView = [];
     for (let i = 0; i < pts.length; i++) if (view.contains(pts[i])) inView.push(i);
-    // picking a stretch: clicks are for the stretch, not handles
-    if (stretch || inView.length > LINE_HANDLES_MAX) { onView({ inView: inView.length, shown: 0, picking: !!stretch }); return; }
+    // picking a stretch or drawing: clicks are for that, not handles
+    if (stretch || draw || inView.length > LINE_HANDLES_MAX) { onView({ inView: inView.length, shown: 0, picking: !!(stretch || draw) }); return; }
     const on = new Set(inView);
     for (let i = 0; i < pts.length - 1; i++) {
       if (!on.has(i) && !on.has(i + 1)) continue;
@@ -1176,6 +1181,7 @@ export function editLine(points, { onChange, onView = () => {}, onStretch = () =
   }
 
   function clicked(lat, lon) {
+    if (draw) { draw.onClick(lat, lon); return; }
     if (!stretch) return;
     if (stretch.stage === "vias") {
       stretch.vias.push([lat, lon]);
@@ -1202,10 +1208,44 @@ export function editLine(points, { onChange, onView = () => {}, onStretch = () =
 
   const onMapClick = (ev) => clicked(ev.latlng.lat, ev.latlng.lng);
   const onMoved = () => rebuild();
+  const onPointer = (ev) => { if (draw && draw.from) rubber.setLatLngs([draw.from, [ev.latlng.lat, ev.latlng.lng]]); };
   map.on("click", onMapClick);
   map.on("moveend", onMoved);
+  map.on("mousemove", onPointer);
+
+  // Draw on from a point (section 31): every click on the map - or a stop's
+  // dot - is handed to onClick(lat, lon), which adds the stretch to it and
+  // moves the start of the next one with setDrawFrom. Cancel or endDraw()
+  // stops. The line can change meanwhile (each stretch is an edit).
+  function startDraw({ from, message, onClick, onCancel = () => {} }) {
+    if (stretch) { endStretch(); onStretch(null); }
+    draw = { from, onClick, message };
+    clickHandler = Object.assign((s) => clicked(s.lat, s.lon), { positionOnly: true });
+    map.doubleClickZoom.disable();
+    banner(message, () => { endDraw(); onCancel(); });
+    setDrawFrom(from);
+    rebuild();
+  }
+  function setDrawFrom(from) {
+    if (!draw) return;
+    draw.from = from;
+    rubber.setLatLngs([]);
+    if (from) anchor.setLatLng(from).addTo(group);
+    else anchor.remove();
+  }
+  function endDraw() {
+    if (!draw) return;
+    draw = null;
+    clickHandler = null;
+    map.doubleClickZoom.enable();
+    rubber.setLatLngs([]);
+    anchor.remove();
+    banner(BANNER, null);
+    rebuild();
+  }
 
   function startStretch() {
+    endDraw();
     stretch = { stage: "start", from: null, to: null, vias: [] };
     // a stop's dot is a place like any other while picking
     clickHandler = Object.assign((s) => clicked(s.lat, s.lon), { positionOnly: true });
@@ -1233,6 +1273,7 @@ export function editLine(points, { onChange, onView = () => {}, onStretch = () =
     map.doubleClickZoom.enable();
     map.off("click", onMapClick);
     map.off("moveend", onMoved);
+    map.off("mousemove", onPointer);
   };
   rebuild();
   return {
@@ -1244,6 +1285,10 @@ export function editLine(points, { onChange, onView = () => {}, onStretch = () =
       rebuild();
     },
     startStretch,
+    startDraw,
+    setDrawFrom,
+    endDraw,
+    drawing: () => !!draw,
     stretch: () => (stretch && stretch.from && stretch.to ? { from: stretch.from, to: stretch.to, vias: stretch.vias.map((v) => [v[0], v[1]]) } : null),
     endStretch,
     points: () => pts.map((p) => [p[0], p[1]]),
