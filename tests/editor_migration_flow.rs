@@ -263,6 +263,14 @@ fn stops(list: &[(&str, &str)]) -> Value {
         .collect::<Vec<_>>())
 }
 
+/// A full migration report's step by its name.
+fn step<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["steps"]
+        .as_array()
+        .and_then(|a| a.iter().find(|s| s["step"] == name))
+        .unwrap_or_else(|| panic!("no step {name}: {report}"))
+}
+
 fn ids(list: &Value) -> Vec<String> {
     list.as_array()
         .map(|a| {
@@ -542,12 +550,19 @@ async fn master_moves_to_prod_a_step_at_a_time_and_a_draft_at_a_time() {
     );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["step"], "stops_routes", "{b}");
-    let steps = b["steps"].as_array().unwrap();
-    assert_eq!(steps[0]["planned"]["stop/create"], 1, "{b}");
-    assert_eq!(steps[0]["planned"]["stop/update"], 1, "{b}");
-    assert_eq!(steps[1]["planned"]["stage/create"], 3, "{b}");
-    assert_eq!(steps[2]["planned"]["route_stages/replace"], 1, "{b}");
-    assert_eq!(steps[3]["planned"]["feed_config/update"], 1, "{b}");
+    assert_eq!(step(&b, "stops_routes")["planned"]["stop/create"], 1, "{b}");
+    assert_eq!(step(&b, "stops_routes")["planned"]["stop/update"], 1, "{b}");
+    assert_eq!(step(&b, "stages")["planned"]["stage/create"], 3, "{b}");
+    assert_eq!(
+        step(&b, "route_stages")["planned"]["route_stages/replace"],
+        1,
+        "{b}"
+    );
+    assert_eq!(
+        step(&b, "switch")["planned"]["feed_config/update"],
+        1,
+        "{b}"
+    );
     let conflicts = ids(&b["conflicts"]);
     assert!(conflicts.contains(&"stop:C".to_string()), "{b}");
     assert!(conflicts.contains(&"route_list:R2".to_string()), "{b}");

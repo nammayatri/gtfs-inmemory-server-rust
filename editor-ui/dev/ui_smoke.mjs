@@ -2444,9 +2444,9 @@ async function migrationFlow() {
   await go("#/feed");
   await waitFor(`document.querySelector("#migration h2")?.textContent === "Move to prod"`, "Move to prod on master's Feed page");
   const href = () => evaluate(`document.getElementById("download-migration").getAttribute("href")`);
-  check((await href()).endsWith("feeds/chennai_bus/migration?scopes=stops,routes,stages,timetables"), `every scope by default (${await href()})`);
-  await clickSel("#scope-timetables", "leave the timetables out");
-  check((await href()).endsWith("migration?scopes=stops,routes,stages"), `the link follows the scopes (${await href()})`);
+  check((await href()).endsWith("feeds/chennai_bus/migration"), `the whole feed, every part of it (${await href()})`);
+  check(!(await has("#migration input[type=checkbox]")), "nothing to leave out");
+  check((await evaluate(`document.querySelectorAll("#migration li").length`)) === 5, "what the file carries is listed");
   const file = await evaluate(`fetch(document.getElementById("download-migration").href, { credentials: "same-origin" })
     .then(async (r) => ({ status: r.status, type: r.headers.get("content-type"), bytes: Array.from(new Uint8Array(await r.arrayBuffer())) }))`);
   check(file.status === 200 && file.type === "application/zip" && file.bytes.length > 0, `the feed downloads as a zip (${file.status} ${file.type})`);

@@ -1599,7 +1599,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             editor_of(g)
         if parts[2] == "migration" and method == "GET":
-            scopes = [x for x in (q.get("scopes", [""])[0] or "stops,routes,stages,timetables").split(",") if x]
+            scopes = [x for x in (q.get("scopes", [""])[0] or "stops,routes,stages,timetables,records").split(",") if x]
             manifest = {"format": MIGRATION_FORMAT, "kind": "full", "gtfs_id": g, "source": source(),
                         "scopes": scopes, "files": {}}
             return 200, MockFile(migration_zip(manifest), f"{g}-full-v{s.feeds[g]['version']}.migration.zip")

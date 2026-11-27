@@ -5248,8 +5248,10 @@ and prod's tables are written only by its own committed drafts.
 Two kinds of file:
 
 - **One draft** (`change_set`): a committed master draft, change by change.
-- **The whole feed** (`full`): master's stops and stations, routes, stages, the
-  routes' stage lists and its timetable, set beside prod's.
+- **The whole feed** (`full`): every row of master's feed - stops, stations
+  and their geofences, routes and their stop lists, stages, the routes' stage
+  lists and temporary routes, calendars, trips and every other GTFS file - set
+  beside prod's. Only the feed's settings stay each environment's own.
 
 Which side an editor is comes from the dhall `is_master` (section 12.6), and
 `GET /auth/me` says it as `environment`: `master` or `prod`. Master writes
@@ -5281,11 +5283,24 @@ The manifest says `format` (`gtfs-editor-migration/1`), `kind`, `gtfs_id`, and
 whom it was written. A draft's file adds `change_set` (its id, title, committed
 version and author) and `changes.json`: each change as master stored it -
 `position`, `entity`, `op`, `entity_key`, `before`, `after`. The whole feed's
-adds `scopes` and one file per scope: `stops.json` (every row, deleted ones too,
-with `merged_into` where a merge retired it), `routes.json`, `stages.json` (with
-their rows) and `route_stages.json` (each route's normal list), and `gtfs.zip`
-(the feed's own download, for the timetable). The whole feed is read in one
-repeatable-read snapshot, so its files agree with each other.
+adds `scopes` and the files of each scope:
+
+| scope | files |
+|---|---|
+| `stops` | `stops.json` (every row, deleted ones too, with `merged_into` where a merge retired it, and `is_depot`), `geofences.json` (each stop's `{stop_id, lat, lon, shape, radius_m, polygon}`) |
+| `routes` | `routes.json` (with `route_tag`), and on a feed not served from its stages `route_stops.json`: every stop order of every route - its own stop list (pattern 1) and the others its trips run - as `{route_id, pattern_key, name, direction_id, rows}`, `rows` as a `route_stops/replace` takes them. A feed served from its stages has its routes' stops in its stages |
+| `stages` | `stages.json` (with their rows), `route_stages.json` (each route's normal list), `variants.json` (each route's temporary routes and the one it wears: `{route_id, active_variant_id, variants: [{variant_id, stages}]}`) |
+| `timetables` | `gtfs.zip` (the feed's own download): its calendars and trips |
+| `records` | `gtfs.zip`: every other file of it the editor keeps as records - agency, fares, shapes, transfers, pathways, levels, areas, networks, translations, feed_info, ... |
+
+A file carries **every scope unless asked for fewer** (`scopes=`), and the
+dashboard always downloads the whole feed. The whole feed is read in one
+repeatable-read snapshot, so its files agree with each other. A file written
+before a part was carried (`geofences.json`, `route_stops.json`,
+`variants.json`, `records`; before 2026-11-27), or asked for fewer scopes, is
+read in as it is: what it lacks is unknown, not empty, so nothing of prod's is
+changed for it, and the report says so in a note (`not_in_file`, with
+`missing`) - download the feed again on master to bring it.
 
 ### One draft
 
@@ -5325,11 +5340,25 @@ needing the one before it committed on prod:
 
 | step | what | drafts |
 |---|---|---|
-| `stops_routes` | stops created, changed, merged (a merge chain on master lands on the stop that survives it) or deleted; stations made or changed, their platforms with them; routes created, changed or deleted | one |
+| `stops_routes` | stops created, changed (`is_depot` too), merged (a merge chain on master lands on the stop that survives it) or deleted; stations made or changed, their platforms with them; geofences made, changed or taken out; routes created, changed (`route_tag` too) or deleted | one |
+| `route_stops` | each stop order master has otherwise than prod, replaced whole on prod's own rows hash (`route_stops/replace`, with `pattern_key` for a route's other stop orders), then its `name` and `direction_id` (`pattern/update`). Only where neither side serves the feed from its stages | one per 250 |
 | `stages` | stages created or changed | one per 1,000 |
 | `route_stages` | each route's list of stages; then the stages master took out | one per 250 routes (every read of a draft's page replays it) |
 | `switch` | `use_stages` turned on, when master serves the feed from its stages and prod does not | one |
-| `timetables` | calendars and trips, through section 18.8's draft import of master's `gtfs.zip` (its two steps) | as 18.8 |
+| `variants` | each temporary route master has, made or given master's stages; the list each route wears (`route_variant/activate`); the temporary routes master no longer has | one per 250 |
+| `timetables` | calendars and trips, and every other GTFS file, through section 18.8's draft import of master's `gtfs.zip` (its two steps) | as 18.8 |
+
+The last step reads `gtfs.zip` as master's **whole feed**: a file it does not
+have is one with no rows (the GTFS writer leaves an empty file out), so prod's
+rows of it are taken out and its services lose their dates, where a draft
+import of a partial zip leaves such a file alone. Before 2026-11-27 the step
+asked the draft import for `calendar_dates.txt` by name, and a master feed with
+no calendar exceptions - whose zip has none - was refused (`file_not_in_zip`);
+a feed with no trips at all (stop lists alone) read as missing its required
+files and drafted nothing, while the report said prod had everything. Both now
+go in. A record row prod made, changed or took out itself is kept and listed as
+a conflict (`record:<entity>:<key>`, the draft import's `exclude_records`).
+A route's trips that master has none of stay as prod has them, as in 18.8.
 
 Each read-in drafts the first step with anything to do and stops: commit its
 drafts, then read the **same file** in again for the next. A step whose every
@@ -5339,8 +5368,11 @@ while migration drafts of the feed are still open is refused
 (`migration_open`), because it plans against what is committed.
 
 What prod has that master does not stays: a stop, route or stage only prod has,
-a stage list only prod has (`notes`). Nothing prod took out is brought back
-(`deleted_on_prod`). A stop's code is set when it is made, so a code that
+a stage list or stop order only prod has (`notes`). Nothing prod took out is
+brought back (`deleted_on_prod`). A geofence, a temporary route and a GTFS
+record row have no deleted row to tell one master took out from one only prod
+has, so one master has none of is taken out on prod - unless prod made or
+changed it itself after `since_version`, which keeps it as prod's own edit. A stop's code is set when it is made, so a code that
 differs is reported (`stop_code_differs`) and left. A station master has with
 fewer than two platforms stays on master.
 
@@ -5350,7 +5382,10 @@ a stop, route, stage list, stage or route's timetable that a committed prod
 draft of prod's own changed after `since_version`, and after the last migration
 that set it, is a conflict: left as prod has it and listed (`changed_on_prod`,
 with the version). The admin may take master's side of any (`take=<kind>:<key>`:
-`stop:C`, `route:21G`, `route_list:2614`, `stage:143|down`, `timetable:2614`).
+`stop:C`, `route:21G`, `route_list:2614` (its stage list, or its own stop list;
+`route_list:2614#2` its second stop order), `stage:143|down`, `timetable:2614`,
+`geofence:C`, `variant:2614@<variant_id>` (`variant:2614@active` for the list
+it wears), `record:fare_attribute:F1`).
 A migration's own drafts are told apart by `gtfs_migration_import`. The first
 full migration of a feed must say `since_version`: the prod version up to which
 master already has what prod changed (for chennai_bus's stage work, the prod
@@ -5397,7 +5432,7 @@ read-in, each commit changing nothing, and the migration never reached
 | method | path | |
 |---|---|---|
 | GET | `/change-sets/{id}/migration` | a committed draft as a migration file (409 `not_committed` otherwise). Admin |
-| GET | `/feeds/{g}/migration?scopes=` | the whole feed as a migration file; `scopes` of `stops,routes,stages,timetables`, all if left out (`invalid_scope`). Admin |
+| GET | `/feeds/{g}/migration?scopes=` | the whole feed as a migration file; `scopes` of `stops,routes,stages,timetables,records`, all if left out (`invalid_scope`). Admin |
 | POST | `/feeds/{g}/migrations?dry_run=&since_version=&take=&background=` | read a migration file in: the body, up to 64 MB. A dry run unless `dry_run=false`; `take` is conflict ids, comma separated, or `all`; `background=true` answers 202 with a job (section 18.15, kind `migration`). One draft's file: editor of the feed; the whole feed's: admin. Never on master |
 | GET | `/feeds/{g}/migrations` | what was read in, newest first, with each read-in's drafts and their status. Editor of the feed |
 
@@ -5413,8 +5448,11 @@ writing a file is audited `migration_exported`.
 
 ### Dashboard
 
-On master, the Feed page's **Move to prod** (admin): what the file carries, and
-**Download for prod**; a committed draft's page has **Download for prod** too.
+On master, the Feed page's **Move to prod** (admin): what the file carries -
+always the whole feed, nothing to leave out (2026-11-27; it had a box per scope,
+and a file downloaded without timetables moved no stop list of a feed without
+stages, shillong_shared_cab v19) - and **Download for prod**; a committed
+draft's page has **Download for prod** too.
 On prod, the Feed page's **Bring from master** (admin): the file, "Prod's own
 edits count from version" for the first whole-feed migration, **Check** (a dry
 run in the background), the report - each step, the drafts it would make, prod's
@@ -5426,7 +5464,7 @@ drafts**, with the boxes ticked; then the history of read-ins with their drafts.
 1. `0025`..`0031` on prod's database, then the image (the stage tables must be
    there; the feed stays `use_stages = false`).
 2. On master: every stage draft committed, the ladder and MTC checks done. The
-   Feed page's **Download for prod** with stops, routes and stages.
+   Feed page's **Download for prod** (the whole feed).
 3. On prod: **Bring from master**, with `since_version` the prod version the
    stage plan read. Read the report - prod's own edits, what prod refuses - and
    **Make the drafts**; a second person commits them. Again for `stages`, again
@@ -5434,8 +5472,13 @@ drafts**, with the boxes ticked; then the history of read-ins with their drafts.
    that is right, or give those routes stages on prod.
 4. Again: the `switch` draft. Its warnings say how many routes change; commit it
    at a quiet hour. Turning it back off is the same change the other way.
-5. With timetables in the file: again, for the two timetable steps.
+5. Again: the temporary routes, then the timetable and the other GTFS files
+   (the draft import's two steps).
 6. From then on, a master draft moves to prod by its own **Download for prod**.
+
+A feed **without stages** (shillong_shared_cab): the same file and the same
+read-ins, `stops_routes`, then `route_stops` (the routes' stop lists), then the
+timetable and GTFS files; the stage steps have nothing to do.
 
 Tests: `tests/editor_migration_flow.rs`, registered in
 `scripts/editor_flow_test.sh` (it needs a second local database with the editor
@@ -5446,9 +5489,16 @@ commits, the stages changing nothing prod serves until the switch, prod's own
 edits kept and listed until one is taken, the switch refused while an active
 route has no stages; then a single draft that goes in, the same one refused
 again, and one that conflicts with prod's own edit until its master side is
-taken. Unit tests in `src/editor/migration.rs` (the file read back and a damaged
-one refused, merge chains, field and hash comparisons, prod's history, the
-plans). The dashboard: `node dev/ui_smoke.mjs --migration` against the mock,
+taken. `tests/editor_migration_whole_feed_flow.rs`: a feed without stages and
+without trips, whose calendar has no exceptions; master changes a stop list,
+adds a second stop order, makes a route with its stops, tags a route, makes a
+depot with a geofence, renames the agency and adds a fare, while prod changes a
+stop list and adds a geofence and a fare of its own; the file carries every
+part by default, and reading it in step by step leaves prod with all of
+master's and its own. Unit tests in `src/editor/migration.rs` (the file read
+back and a damaged one refused, merge chains, field and hash comparisons,
+prod's history, the plans of stops, stop lists, geofences, stages and temporary
+routes, what a file lacks). The dashboard: `node dev/ui_smoke.mjs --migration` against the mock,
 which plays master or prod (`--environment`, or `/__dev/environment`).
 
 ## 24. Stop, terminal and depot geofencing (2026-10-17)

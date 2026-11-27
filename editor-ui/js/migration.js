@@ -13,19 +13,23 @@ import { h, clear, fmtCount, plural, errorText, fmtDate } from "./util.js";
 // Which side of a migration this editor is: master writes files, prod reads them.
 export const environment = () => (state.me && state.me.environment) || "prod";
 
-const SCOPES = [
-  ["stops", "Stops and stations"],
-  ["routes", "Routes"],
-  ["stages", "Stages, and each route's list of them"],
-  ["timetables", "Timetables: calendars and trips"],
+// What the whole feed's file carries: all of it, always (docs section 23).
+const CARRIES = [
+  "stops, stations and their geofences",
+  "routes and their stop lists",
+  "stages, each route's list of them and its temporary routes",
+  "calendars and trips",
+  "every other GTFS file: agency, fares, shapes, transfers, …",
 ];
 
 const STEP_TITLE = {
-  stops_routes: "Stops, stations and routes",
+  stops_routes: "Stops, stations, geofences and routes",
+  route_stops: "The routes' stop lists",
   stages: "Stages",
   route_stages: "The routes' stage lists",
   switch: "Serve the feed from its stages",
-  timetables: "Timetables",
+  variants: "Temporary routes",
+  timetables: "Calendars, trips and the other GTFS files",
 };
 
 const REASON = {
@@ -53,24 +57,15 @@ export function migrationSection() {
 
 function exportSection() {
   const g = enc(state.feedId);
-  const inputs = SCOPES.map(([k]) => h("input", { type: "checkbox", value: k, id: `scope-${k}`, checked: true }));
-  const link = h("a.btn.secondary", { id: "download-migration", download: "" }, "Download for prod");
-  const none = h("p.hint", { hidden: true }, "Choose at least one.");
-  const sync = () => {
-    // the scopes from the page's own list, never read back from the DOM
-    const picked = SCOPES.filter((_, i) => inputs[i].checked).map(([k]) => enc(k));
-    link.href = `${API_BASE}feeds/${g}/migration?scopes=${picked.join(",")}`;
-    link.hidden = !picked.length;
-    none.hidden = !!picked.length;
-  };
-  inputs.forEach((i) => i.addEventListener("change", sync));
-  sync();
+  // no scopes: the server writes the whole feed
+  const link = h("a.btn.secondary", { id: "download-migration", download: "", href: `${API_BASE}feeds/${g}/migration` },
+    "Download for prod");
   return h("section.feed-section#migration",
     h("h2", "Move to prod"),
-    h("p.hint", "Master and prod each have their own database. Download what prod should have, then read the file in on prod's Feed page: it becomes prod drafts that a second person approves and commits there. One committed draft downloads from its own page."),
-    h("fieldset.migration-scopes", h("legend", "What the file carries"),
-      SCOPES.map(([, label], i) => h("label.check", { for: inputs[i].id }, inputs[i], label))),
-    h("div.btn-row", link, none));
+    h("p.hint", "Master and prod each have their own database. Download the whole feed, then read the file in on prod's Feed page: it becomes prod drafts that a second person approves and commits there. One committed draft downloads from its own page."),
+    h("div.migration-scopes", h("p", "The file carries every part of the feed:"),
+      h("ul", CARRIES.map((c) => h("li", c)))),
+    h("div.btn-row", link));
 }
 
 function importSection() {

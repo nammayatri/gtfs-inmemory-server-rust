@@ -502,6 +502,8 @@ T9,09:00:00,09:00:15,S1,1\nT9,09:02:15,09:02:15,S3,2\n"),
         user_id: editor_id.unwrap(),
         email: EDITOR.into(),
         exclude_routes: Default::default(),
+        exclude_records: Default::default(),
+        whole_feed: false,
         title: None,
     };
     let r = draft_import::draft_import(&pool, &next, Some(FEED), &import(None, true))

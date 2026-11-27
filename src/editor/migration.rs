@@ -14,15 +14,18 @@
 //!   trips or timing profile it was based on. Otherwise it is a *conflict*: left
 //!   out and listed with both sides, and the admin may take master's side of any
 //!   of them. A change prod already has is left out as done.
-//! - **The whole feed** (`full`): master's stops and stations, routes, stages,
-//!   the routes' lists of stages and its timetable, set beside prod's. What
-//!   differs becomes changes in steps, each needing the one before it
-//!   committed: stops and routes; stages; the routes' stage lists; turning
-//!   `use_stages` on; the timetable (through [`draft_import`]). Each run drafts
-//!   the first step with anything to do. What prod changed itself - after the
-//!   version the first full migration names (`since_version`), and after the
-//!   last migration that set it - is prod's own edit: kept, and listed as a
-//!   conflict the admin may still take master's side of.
+//! - **The whole feed** (`full`): every row of master's feed - stops,
+//!   stations and their geofences, routes, the routes' stop lists, stages, the
+//!   routes' lists of stages and their temporary routes, calendars, trips and
+//!   every other GTFS file - set beside prod's. What differs becomes changes in
+//!   steps, each needing the one before it committed: stops, routes and
+//!   geofences; the routes' stop lists; stages; the routes' stage lists;
+//!   turning `use_stages` on; temporary routes; the timetable and the other
+//!   GTFS files (through [`draft_import`]). Each run drafts the first step with
+//!   anything to do. What prod changed itself - after the version the first
+//!   full migration names (`since_version`), and after the last migration that
+//!   set it - is prod's own edit: kept, and listed as a conflict the admin may
+//!   still take master's side of.
 //!
 //! A change prod refuses - a stop still in use, a fare rule a stage list would
 //! break - is dropped from its draft and listed, and the draft keeps the rest.
@@ -39,6 +42,7 @@ use super::service::{self, ChangeSet, NewChange};
 use super::stages::{self, StageKey};
 use super::validation::{RouteRow, StageLink};
 use super::EditorState;
+use crate::gtfs::spec;
 use actix_web::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -51,8 +55,12 @@ use uuid::Uuid;
 /// What a migration file says it is, in its `manifest.json`.
 pub const FORMAT: &str = "gtfs-editor-migration/1";
 
-/// What a full migration may carry, in the order its steps need them.
-pub const SCOPES: &[&str] = &["stops", "routes", "stages", "timetables"];
+/// What a full migration may carry, in the order its steps need them: stops
+/// (with stations and geofences), routes (with their stop lists), stages (with
+/// the routes' stage lists and temporary routes), timetables (calendars and
+/// trips) and records (every other GTFS file: agency, fares, shapes, transfers,
+/// ...). A file carries all of them unless asked for fewer.
+pub const SCOPES: &[&str] = &["stops", "routes", "stages", "timetables", "records"];
 
 /// The most stages one draft of the stages step makes or changes.
 const STAGES_PER_SET: usize = 1_000;
@@ -63,7 +71,7 @@ const LISTS_PER_SET: usize = 250;
 /// How many conflicts, dropped changes and notes a report lists; its counts are
 /// whole.
 const LISTED: usize = 500;
-/// The files of master's GTFS the timetable step brings, and only those.
+/// The files of master's GTFS the `timetables` scope brings.
 const TIMETABLE_FILES: &[&str] = &[
     "calendar.txt",
     "calendar_dates.txt",
@@ -71,6 +79,21 @@ const TIMETABLE_FILES: &[&str] = &[
     "stop_times.txt",
     "frequencies.txt",
 ];
+
+/// The files of master's GTFS the `records` scope brings: every file the
+/// editor keeps as records (agency, fares, shapes, transfers, pathways, ...).
+fn record_files() -> Vec<String> {
+    spec::FILES
+        .iter()
+        .filter(|f| f.entity().is_some())
+        .map(|f| f.name.to_string())
+        .collect()
+}
+
+/// Whether a change's entity is a record file's row.
+fn is_record_entity(entity: &str) -> bool {
+    spec::FILES.iter().any(|f| f.entity() == Some(entity))
+}
 /// A change may need others taken out before it replays clean; this many rounds
 /// of that is far more than any real draft needs.
 const MAX_ROUNDS: usize = 12;
@@ -387,12 +410,23 @@ pub async fn export_feed(
     let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
     if has("stops") {
         files.push(("stops.json", to_json_bytes(&read_stops(&mut tx, g).await?)?));
+        files.push((
+            "geofences.json",
+            to_json_bytes(&read_geofences(&mut tx, g).await?)?,
+        ));
     }
     if has("routes") {
         files.push((
             "routes.json",
             to_json_bytes(&read_routes(&mut tx, g).await?)?,
         ));
+        // a feed served from its stages has its routes' stops in its stages
+        if !src.use_stages {
+            files.push((
+                "route_stops.json",
+                to_json_bytes(&read_stop_lists(&mut tx, g).await?)?,
+            ));
+        }
     }
     if has("stages") {
         files.push((
@@ -403,8 +437,12 @@ pub async fn export_feed(
             "route_stages.json",
             to_json_bytes(&read_lists(&mut tx, g).await?)?,
         ));
+        files.push((
+            "variants.json",
+            to_json_bytes(&read_variants(&mut tx, g).await?)?,
+        ));
     }
-    if has("timetables") {
+    if has("timetables") || has("records") {
         let (model, _) = super::feed_io::load_model(&mut tx, g).await?;
         let raw = crate::gtfs::write::to_raw(&model);
         files.push((
@@ -466,6 +504,7 @@ const STOP_FIELDS: &[&str] = &[
     "wheelchair_boarding",
     "level_id",
     "stop_access",
+    "is_depot",
     "deleted",
 ];
 
@@ -509,6 +548,7 @@ const STOP_UPDATE_FIELDS: &[&str] = &[
     "stop_access",
     "location_type",
     "parent_station",
+    "is_depot",
 ];
 
 const ROUTE_FIELDS: &[&str] = &[
@@ -529,6 +569,7 @@ const ROUTE_FIELDS: &[&str] = &[
     "continuous_pickup",
     "continuous_drop_off",
     "network_id",
+    "route_tag",
     "deleted",
 ];
 
@@ -565,7 +606,11 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "continuous_pickup",
     "continuous_drop_off",
     "network_id",
+    "route_tag",
 ];
+
+/// What a geofence carries, as a `geofence/create` takes it.
+const GEOFENCE_FIELDS: &[&str] = &["stop_id", "lat", "lon", "shape", "radius_m", "polygon"];
 
 fn pick(row: &Value, fields: &[&str]) -> Value {
     let mut out = Map::new();
@@ -655,7 +700,102 @@ pub async fn read_lists(conn: &mut PgConnection, g: &str) -> EditorResult<Vec<Va
     .await
 }
 
-/// A feed's state as a full migration sets master's beside prod's.
+/// Every stop's geofence, as `{stop_id, lat, lon, shape, radius_m, polygon}`.
+pub async fn read_geofences(conn: &mut PgConnection, g: &str) -> EditorResult<Vec<Value>> {
+    let all = super::geofence::list_geofences(conn, g).await?;
+    Ok(all["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| pick(r, GEOFENCE_FIELDS))
+        .collect())
+}
+
+/// Every stop order of every route - its own stop list (pattern 1) and the
+/// others its trips run - as `{route_id, pattern_key, name, direction_id,
+/// rows}`, `rows` as a `route_stops/replace` takes them.
+pub async fn read_stop_lists(conn: &mut PgConnection, g: &str) -> EditorResult<Vec<Value>> {
+    let heads = sqlx::query(
+        "SELECT k.route_id, k.pattern_key, p.name, p.direction_id \
+         FROM (SELECT DISTINCT route_id, pattern_key FROM gtfs_route_stop WHERE gtfs_id = $1) k \
+         LEFT JOIN gtfs_pattern p \
+           ON p.gtfs_id = $1 AND p.route_id = k.route_id AND p.pattern_key = k.pattern_key \
+         ORDER BY k.route_id, k.pattern_key",
+    )
+    .bind(g)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut keys = Vec::with_capacity(heads.len());
+    let mut meta = Vec::with_capacity(heads.len());
+    for r in &heads {
+        let key: (String, i16) = (r.try_get("route_id")?, r.try_get("pattern_key")?);
+        meta.push((
+            key.clone(),
+            r.try_get::<Option<String>, _>("name")?,
+            r.try_get::<Option<i16>, _>("direction_id")?,
+        ));
+        keys.push(key);
+    }
+    let mut rows = service::load_patterns_rows(conn, g, &keys).await?;
+    Ok(meta
+        .into_iter()
+        .filter_map(|(key, name, direction_id)| {
+            let list = rows.remove(&key)?;
+            Some(
+                json!({"route_id": key.0, "pattern_key": key.1, "name": name,
+                        "direction_id": direction_id, "rows": list}),
+            )
+        })
+        .collect())
+}
+
+/// Every route with temporary routes or wearing one, as `{route_id,
+/// active_variant_id, variants: [{variant_id, stages: [{stage_id, direction,
+/// stage_no}]}]}`.
+pub async fn read_variants(conn: &mut PgConnection, g: &str) -> EditorResult<Vec<Value>> {
+    json_rows(
+        conn,
+        "SELECT json_build_object('route_id', r.route_id, \
+                'active_variant_id', r.active_variant_id, \
+                'variants', coalesce((SELECT json_agg(json_build_object( \
+                        'variant_id', v.variant_id, 'stages', v.stages) ORDER BY v.variant_id) \
+                    FROM (SELECT rs.variant_id, json_agg(json_build_object( \
+                                'stage_id', rs.stage_id, 'direction', rs.direction, \
+                                'stage_no', rs.stage_no) ORDER BY rs.position) AS stages \
+                          FROM gtfs_route_stage rs \
+                          WHERE rs.gtfs_id = r.gtfs_id AND rs.route_id = r.route_id \
+                            AND rs.variant_id IS NOT NULL \
+                          GROUP BY rs.variant_id) v), '[]'::json))::text \
+         FROM gtfs_route r \
+         WHERE r.gtfs_id = $1 \
+           AND (r.active_variant_id IS NOT NULL \
+                OR EXISTS (SELECT 1 FROM gtfs_route_stage x \
+                            WHERE x.gtfs_id = r.gtfs_id AND x.route_id = r.route_id \
+                              AND x.variant_id IS NOT NULL)) \
+         ORDER BY r.route_id",
+        g,
+    )
+    .await
+}
+
+/// One stop order of a route, as both sides compare it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StopList {
+    pub name: Option<String>,
+    pub direction_id: Option<i64>,
+    pub rows: Vec<RouteRow>,
+}
+
+/// A route's temporary routes, and the one it wears (`None`: its normal list).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RouteVariants {
+    pub active: Option<String>,
+    pub lists: BTreeMap<String, Vec<Link>>,
+}
+
+/// A feed's state as a full migration sets master's beside prod's. The parts
+/// a file written before migrations carried them does not have are `None`:
+/// unknown, not empty, so nothing of prod's is taken out for them.
 #[derive(Debug, Default)]
 pub struct State {
     pub stops: BTreeMap<String, Value>,
@@ -665,6 +805,13 @@ pub struct State {
     /// route -> its normal list of stages.
     pub lists: BTreeMap<String, Vec<Link>>,
     pub use_stages: bool,
+    /// stop -> its geofence.
+    pub geofences: Option<BTreeMap<String, Value>>,
+    /// (route, pattern) -> that stop order. A feed served from its stages has
+    /// none of its own: its stages are its routes' stops.
+    pub stop_lists: Option<BTreeMap<(String, i16), StopList>>,
+    /// route -> its temporary routes; routes with none are absent.
+    pub variants: Option<BTreeMap<String, RouteVariants>>,
 }
 
 /// One stage of a route's list, as both sides compare it.
@@ -693,22 +840,77 @@ fn stage_key_of(v: &Value) -> String {
     )
 }
 
+fn links_of(v: &Value) -> Vec<Link> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|l| Link {
+                    stage_id: l["stage_id"].as_str().unwrap_or("").to_string(),
+                    direction: l["direction"].as_str().unwrap_or("").to_string(),
+                    stage_no: l["stage_no"].as_i64().unwrap_or(0) as i32,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn lists_of(rows: Vec<Value>) -> BTreeMap<String, Vec<Link>> {
     rows.into_iter()
         .map(|r| {
-            let links = r["stages"]
+            (
+                r["route_id"].as_str().unwrap_or("").to_string(),
+                links_of(&r["stages"]),
+            )
+        })
+        .collect()
+}
+
+fn geofences_of(rows: Vec<Value>) -> BTreeMap<String, Value> {
+    by_key(rows, |r| r["stop_id"].as_str().unwrap_or("").to_string())
+}
+
+fn stop_lists_of(rows: Vec<Value>) -> EditorResult<BTreeMap<(String, i16), StopList>> {
+    rows.into_iter()
+        .map(|r| {
+            let key = (
+                r["route_id"].as_str().unwrap_or("").to_string(),
+                r["pattern_key"].as_i64().unwrap_or(1) as i16,
+            );
+            let rows: Vec<RouteRow> = serde_json::from_value(r["rows"].clone())
+                .map_err(|e| invalid(format!("route_stops.json: route {}: {e}", key.0)))?;
+            Ok((
+                key,
+                StopList {
+                    name: r["name"].as_str().map(str::to_string),
+                    direction_id: r["direction_id"].as_i64(),
+                    rows,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn variants_of(rows: Vec<Value>) -> BTreeMap<String, RouteVariants> {
+    rows.into_iter()
+        .map(|r| {
+            let lists = r["variants"]
                 .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|l| Link {
-                            stage_id: l["stage_id"].as_str().unwrap_or("").to_string(),
-                            direction: l["direction"].as_str().unwrap_or("").to_string(),
-                            stage_no: l["stage_no"].as_i64().unwrap_or(0) as i32,
-                        })
-                        .collect()
+                .into_iter()
+                .flatten()
+                .map(|v| {
+                    (
+                        v["variant_id"].as_str().unwrap_or("").to_string(),
+                        links_of(&v["stages"]),
+                    )
                 })
-                .unwrap_or_default();
-            (r["route_id"].as_str().unwrap_or("").to_string(), links)
+                .collect();
+            (
+                r["route_id"].as_str().unwrap_or("").to_string(),
+                RouteVariants {
+                    active: r["active_variant_id"].as_str().map(str::to_string),
+                    lists,
+                },
+            )
         })
         .collect()
 }
@@ -716,6 +918,8 @@ fn lists_of(rows: Vec<Value>) -> BTreeMap<String, Vec<Link>> {
 impl State {
     fn from_files(pkg: &Package) -> EditorResult<State> {
         let has = |s: &str| pkg.manifest.scopes.iter().any(|x| x == s);
+        // a part a file written before migrations carried it does not have
+        let carries = |name: &str| pkg.manifest.files.contains_key(name);
         let mut st = State {
             use_stages: pkg.manifest.source.use_stages,
             ..State::default()
@@ -724,15 +928,24 @@ impl State {
             st.stops = by_key(pkg.json("stops.json")?, |r| {
                 r["stop_id"].as_str().unwrap_or("").to_string()
             });
+            if carries("geofences.json") {
+                st.geofences = Some(geofences_of(pkg.json("geofences.json")?));
+            }
         }
         if has("routes") {
             st.routes = by_key(pkg.json("routes.json")?, |r| {
                 r["route_id"].as_str().unwrap_or("").to_string()
             });
+            if carries("route_stops.json") {
+                st.stop_lists = Some(stop_lists_of(pkg.json("route_stops.json")?)?);
+            }
         }
         if has("stages") {
             st.stages = by_key(pkg.json("stages.json")?, stage_key_of);
             st.lists = lists_of(pkg.json("route_stages.json")?);
+            if carries("variants.json") {
+                st.variants = Some(variants_of(pkg.json("variants.json")?));
+            }
         }
         Ok(st)
     }
@@ -747,15 +960,20 @@ impl State {
             st.stops = by_key(read_stops(conn, g).await?, |r| {
                 r["stop_id"].as_str().unwrap_or("").to_string()
             });
+            st.geofences = Some(geofences_of(read_geofences(conn, g).await?));
         }
         if has("routes") {
             st.routes = by_key(read_routes(conn, g).await?, |r| {
                 r["route_id"].as_str().unwrap_or("").to_string()
             });
+            if !st.use_stages {
+                st.stop_lists = Some(stop_lists_of(read_stop_lists(conn, g).await?)?);
+            }
         }
         if has("stages") {
             st.stages = by_key(read_stages(conn, g).await?, stage_key_of);
             st.lists = lists_of(read_lists(conn, g).await?);
+            st.variants = Some(variants_of(read_variants(conn, g).await?));
         }
         Ok(st)
     }
@@ -1714,12 +1932,22 @@ fn prepare(c: &SourceChange, rebase: Option<(&'static str, String)>) -> NewChang
 /// What a full migration does, in order: each step needs the one before it
 /// committed.
 const STEPS: &[(&str, &str)] = &[
-    ("stops_routes", "Stops, stations and routes"),
+    ("stops_routes", "Stops, stations, geofences and routes"),
+    ("route_stops", "The routes' stop lists"),
     ("stages", "Stages"),
     ("route_stages", "The routes' stage lists"),
     ("switch", "Serve the feed from its stages"),
-    ("timetables", "Timetables"),
+    ("variants", "Temporary routes"),
+    ("timetables", "Calendars, trips and the other GTFS files"),
 ];
+
+/// [`STEPS`] by name.
+const STEP_STOPS_ROUTES: usize = 0;
+const STEP_ROUTE_STOPS: usize = 1;
+const STEP_STAGES: usize = 2;
+const STEP_ROUTE_STAGES: usize = 3;
+const STEP_SWITCH: usize = 4;
+const STEP_VARIANTS: usize = 5;
 
 /// A row of prod's history, as a full migration reads it: what a committed
 /// change touched, and at which version.
@@ -1755,7 +1983,8 @@ fn stage_label(key: &str, direction: Option<&str>) -> String {
 
 /// What a committed change touched, as a full migration keys it: a stop or
 /// station, a route, a route's list of stops or stages, a stage, a route's
-/// timetable, or a service.
+/// timetable, a service, a stop's geofence, or a row of a record file
+/// (`<entity>:<key>`).
 fn touched(
     entity: &str,
     op: &str,
@@ -1806,6 +2035,8 @@ fn touched(
             out.push(("timetable", key.to_string()))
         }
         ("service", _) => out.push(("service", key.to_string())),
+        ("geofence", _) => out.push(("geofence", key.to_string())),
+        (e, _) if is_record_entity(e) => out.push(("record", format!("{e}:{key}"))),
         _ => {}
     }
     out
@@ -1965,6 +2196,11 @@ fn station_parent(stops: &BTreeMap<String, Value>, s: &Value) -> bool {
 fn changed_fields(master: &Value, prod: &Value, fields: &[&str]) -> Map<String, Value> {
     let mut out = Map::new();
     for f in fields {
+        // a field a file written before migrations carried it does not have
+        // is unknown, not cleared (`is_depot`, `route_tag`)
+        if master.get(*f).is_none() {
+            continue;
+        }
         if master[*f] != prod[*f] {
             out.insert(f.to_string(), master[*f].clone());
         }
@@ -2025,7 +2261,7 @@ fn plan_stops_routes(
                     non_null(m, &["name", "lat", "lon", "description"], &mut after);
                     after.insert("member_stop_ids".into(), json!(ids));
                     stations.push(plan(
-                        0,
+                        STEP_STOPS_ROUTES,
                         "stop",
                         id,
                         "station",
@@ -2047,7 +2283,7 @@ fn plan_stops_routes(
                         after.insert("parent_station".into(), m["parent_station"].clone());
                     }
                     creates.push(plan(
-                        0,
+                        STEP_STOPS_ROUTES,
                         "stop",
                         id,
                         "stop",
@@ -2056,15 +2292,22 @@ fn plan_stops_routes(
                         Value::Object(after),
                         what.clone(),
                     ));
-                    if m["unserviceable"] == true {
+                    // what a create does not take, set by an update in the same draft
+                    let mut rest = Map::new();
+                    for f in ["unserviceable", "is_depot"] {
+                        if m[f] == true {
+                            rest.insert(f.into(), json!(true));
+                        }
+                    }
+                    if !rest.is_empty() {
                         updates.push(plan(
-                            0,
+                            STEP_STOPS_ROUTES,
                             "stop",
                             id,
                             "stop",
                             "update",
                             id,
-                            json!({"unserviceable": true}),
+                            Value::Object(rest),
                             what,
                         ));
                     }
@@ -2092,7 +2335,7 @@ fn plan_stops_routes(
                         }
                         if !after.is_empty() {
                             updates.push(plan(
-                                0,
+                                STEP_STOPS_ROUTES,
                                 "stop",
                                 id,
                                 "station",
@@ -2126,7 +2369,7 @@ fn plan_stops_routes(
                     }
                     if !after.is_empty() {
                         updates.push(plan(
-                            0,
+                            STEP_STOPS_ROUTES,
                             "stop",
                             id,
                             "stop",
@@ -2146,7 +2389,7 @@ fn plan_stops_routes(
                             ("into_stop_id", "stop")
                         };
                         let mut p = plan(
-                            0,
+                            STEP_STOPS_ROUTES,
                             "stop",
                             id,
                             entity,
@@ -2158,7 +2401,16 @@ fn plan_stops_routes(
                         p.guards.push(("stop", into.to_string()));
                         merges.push(p);
                     }
-                    _ => deletes.push(plan(0, "stop", id, entity, "delete", id, Value::Null, what)),
+                    _ => deletes.push(plan(
+                        STEP_STOPS_ROUTES,
+                        "stop",
+                        id,
+                        entity,
+                        "delete",
+                        id,
+                        Value::Null,
+                        what,
+                    )),
                 },
             }
         }
@@ -2168,9 +2420,12 @@ fn plan_stops_routes(
                 "sample": only.iter().take(20).collect::<Vec<_>>(),
                 "message": "stops only prod has stay as they are"}));
         }
+        let (fences, fences_gone) = plan_geofences(master, prod, report);
         out.extend(creates);
         out.extend(stations);
         out.extend(updates);
+        out.extend(fences);
+        out.extend(fences_gone);
         out.extend(merges);
         out.extend(deletes);
     }
@@ -2186,7 +2441,7 @@ fn plan_stops_routes(
                     non_null(m, &["short_name"], &mut after);
                     non_null(m, ROUTE_CREATE_FIELDS, &mut after);
                     out.push(plan(
-                        0,
+                        STEP_STOPS_ROUTES,
                         "route",
                         id,
                         "route",
@@ -2202,12 +2457,17 @@ fn plan_stops_routes(
                     }
                     non_null(
                         m,
-                        &["encoded_polyline", "polyline_source", "schedule_source"],
+                        &[
+                            "encoded_polyline",
+                            "polyline_source",
+                            "schedule_source",
+                            "route_tag",
+                        ],
                         &mut rest,
                     );
                     if !rest.is_empty() {
                         later.push(plan(
-                            0,
+                            STEP_STOPS_ROUTES,
                             "route",
                             id,
                             "route",
@@ -2229,7 +2489,7 @@ fn plan_stops_routes(
                     let after = changed_fields(m, p, ROUTE_UPDATE_FIELDS);
                     if !after.is_empty() {
                         later.push(plan(
-                            0,
+                            STEP_STOPS_ROUTES,
                             "route",
                             id,
                             "route",
@@ -2241,7 +2501,7 @@ fn plan_stops_routes(
                     }
                 }
                 Some(_) => later.push(plan(
-                    0,
+                    STEP_STOPS_ROUTES,
                     "route",
                     id,
                     "route",
@@ -2303,7 +2563,7 @@ fn plan_stages(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mu
                 non_null(m, &["description"], &mut after);
                 after.insert("rows".into(), m["rows"].clone());
                 out.push(plan(
-                    1,
+                    STEP_STAGES,
                     "stage",
                     k,
                     "stage",
@@ -2324,7 +2584,7 @@ fn plan_stages(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mu
                 let after = changed_fields(m, p, &["name", "description", "rows"]);
                 if !after.is_empty() {
                     out.push(plan(
-                        1,
+                        STEP_STAGES,
                         "stage",
                         k,
                         "stage",
@@ -2335,7 +2595,16 @@ fn plan_stages(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mu
                     ));
                 }
             }
-            Some(_) => deletes.push(plan(2, "stage", k, "stage", "delete", k, Value::Null, what)),
+            Some(_) => deletes.push(plan(
+                STEP_ROUTE_STAGES,
+                "stage",
+                k,
+                "stage",
+                "delete",
+                k,
+                Value::Null,
+                what,
+            )),
         }
     }
     let routes_live = |id: &str| master.routes.get(id).map_or(true, live);
@@ -2347,22 +2616,13 @@ fn plan_stages(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mu
         if *links == theirs {
             continue;
         }
-        let base = stages::links_hash(
-            &theirs
-                .iter()
-                .map(|l| StageLink {
-                    stage_id: l.stage_id.clone(),
-                    direction: Some(l.direction.clone()),
-                    stage_no: Some(l.stage_no),
-                })
-                .collect::<Vec<_>>(),
-        );
+        let base = links_hash_of(&theirs);
         let stages: Vec<Value> = links
             .iter()
             .map(|l| json!({"stage_id": l.key(), "stage_no": l.stage_no}))
             .collect();
         out.push(plan(
-            2,
+            STEP_ROUTE_STAGES,
             "route_list",
             route,
             "route_stages",
@@ -2385,8 +2645,343 @@ fn plan_stages(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mu
     out.extend(deletes);
 }
 
+/// The hash a stage list change is based on, as prod's live list hashes.
+fn links_hash_of(links: &[Link]) -> String {
+    stages::links_hash(
+        &links
+            .iter()
+            .map(|l| StageLink {
+                stage_id: l.stage_id.clone(),
+                direction: Some(l.direction.clone()),
+                stage_no: Some(l.stage_no),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// `p`, conflicting with prod's own edits of `guards` instead of its own id.
+fn guarded(mut p: Planned, guards: Vec<(&'static str, String)>) -> Planned {
+    p.guards = guards;
+    p
+}
+
+/// Geofences (step 0, after the stops they fence): made, changed, and taken
+/// out where master has none. A geofence has no deleted row to tell a fence
+/// master took out from one only prod has, so prod's goes unless prod made or
+/// changed it itself after `since_version` (then it is a conflict). Returns
+/// the creates and updates, then the deletes.
+fn plan_geofences(
+    master: &State,
+    prod: &State,
+    report: &mut Report,
+) -> (Vec<Planned>, Vec<Planned>) {
+    let (Some(mg), Some(pg)) = (&master.geofences, &prod.geofences) else {
+        return (Vec::new(), Vec::new());
+    };
+    let (mut out, mut gone) = (Vec::new(), Vec::new());
+    for (id, m) in mg {
+        // a stop master took out keeps the fence it had
+        if master.stops.get(id).is_some_and(|s| !live(s)) {
+            continue;
+        }
+        let what = json!({"entity": "geofence", "key": id, "shape": m["shape"]});
+        let own = if m["shape"] == "polygon" {
+            "polygon"
+        } else {
+            "radius_m"
+        };
+        match pg.get(id) {
+            None => {
+                let mut after = Map::new();
+                for f in ["stop_id", "lat", "lon", "shape", own] {
+                    after.insert(f.into(), m[f].clone());
+                }
+                out.push(plan(
+                    STEP_STOPS_ROUTES,
+                    "geofence",
+                    id,
+                    "geofence",
+                    "create",
+                    id,
+                    Value::Object(after),
+                    what,
+                ));
+            }
+            Some(p) => {
+                let mut after = Map::new();
+                if m["shape"] != p["shape"] || m[own] != p[own] {
+                    after.insert("shape".into(), m["shape"].clone());
+                    after.insert(own.into(), m[own].clone());
+                }
+                if m["lat"] != p["lat"] || m["lon"] != p["lon"] {
+                    after.insert("lat".into(), m["lat"].clone());
+                    after.insert("lon".into(), m["lon"].clone());
+                }
+                if !after.is_empty() {
+                    out.push(plan(
+                        STEP_STOPS_ROUTES,
+                        "geofence",
+                        id,
+                        "geofence",
+                        "update",
+                        id,
+                        Value::Object(after),
+                        what,
+                    ));
+                }
+            }
+        }
+    }
+    for id in pg.keys().filter(|id| !mg.contains_key(*id)) {
+        gone.push(plan(
+            STEP_STOPS_ROUTES,
+            "geofence",
+            id,
+            "geofence",
+            "delete",
+            id,
+            Value::Null,
+            json!({"entity": "geofence", "key": id}),
+        ));
+    }
+    if !gone.is_empty() {
+        report.note(json!({"code": "geofences_not_on_master", "count": gone.len(),
+            "message": "prod's geofences master has none of are taken out, but for those prod made or changed itself"}));
+    }
+    (out, gone)
+}
+
+/// The routes' stop lists (step 1): every stop order master has otherwise than
+/// prod - a route's own list (pattern 1) and the others its trips run -
+/// replaced whole on prod's own rows hash, then its name and direction. Only
+/// where neither side serves the feed from its stages: there a route's stops
+/// are its stages, which the stage steps bring.
+fn plan_stop_lists(master: &State, prod: &State, out: &mut Vec<Planned>, report: &mut Report) {
+    let Some(ml) = &master.stop_lists else {
+        return;
+    };
+    if master.use_stages || prod.use_stages {
+        return;
+    }
+    let none = BTreeMap::new();
+    let pl = prod.stop_lists.as_ref().unwrap_or(&none);
+    let gone = |routes: &BTreeMap<String, Value>, r: &str| routes.get(r).is_some_and(|v| !live(v));
+    let mut meta = Vec::new();
+    for ((route, key), m) in ml {
+        // a route taken out on either side keeps the rows it had
+        if gone(&master.routes, route) || gone(&prod.routes, route) {
+            continue;
+        }
+        let label = if *key == service::FIRST_PATTERN {
+            route.clone()
+        } else {
+            format!("{route}#{key}")
+        };
+        let p = pl.get(&(route.clone(), *key));
+        let theirs = p.map(|p| p.rows.as_slice()).unwrap_or(&[]);
+        if theirs != m.rows.as_slice() {
+            let mut after = json!({"rows": m.rows, "base_rows_hash": service::rows_hash(theirs)});
+            if *key != service::FIRST_PATTERN {
+                after["pattern_key"] = json!(key);
+            }
+            out.push(guarded(
+                plan(
+                    STEP_ROUTE_STOPS,
+                    "route_list",
+                    &label,
+                    "route_stops",
+                    "replace",
+                    route,
+                    after,
+                    json!({"entity": "route_stops", "key": route, "pattern_key": key,
+                           "stops": m.rows.len()}),
+                ),
+                vec![("route_list", route.clone())],
+            ));
+        }
+        // a stop order's name and direction, which a trip change sets too
+        let (name, direction_id) = p
+            .map(|p| (p.name.clone(), p.direction_id))
+            .unwrap_or_default();
+        let mut after = Map::new();
+        if m.name != name {
+            after.insert("name".into(), json!(m.name));
+        }
+        if m.direction_id != direction_id {
+            after.insert("direction_id".into(), json!(m.direction_id));
+        }
+        if !after.is_empty() {
+            after.insert("pattern_key".into(), json!(key));
+            meta.push(guarded(
+                plan(
+                    STEP_ROUTE_STOPS,
+                    "pattern",
+                    &label,
+                    "pattern",
+                    "update",
+                    route,
+                    Value::Object(after),
+                    json!({"entity": "pattern", "key": route, "pattern_key": key}),
+                ),
+                vec![("timetable", route.clone())],
+            ));
+        }
+    }
+    out.extend(meta);
+    let only: Vec<String> = pl
+        .keys()
+        .filter(|k| !ml.contains_key(*k))
+        .map(|(r, k)| format!("{r}#{k}"))
+        .collect();
+    if !only.is_empty() {
+        report.note(
+            json!({"code": "stop_orders_only_on_prod", "count": only.len(),
+            "sample": only.iter().take(20).collect::<Vec<_>>(),
+            "message": "stop orders only prod has stay as they are"}),
+        );
+    }
+}
+
+/// Temporary routes (step 5, once prod serves its stages as master does): each
+/// one master has, made or given master's stages; then the list each route
+/// wears; then the ones master no longer has, unless prod made or changed the
+/// route's lists itself (a temporary route, like a geofence, has no deleted
+/// row to tell them apart).
+fn plan_variants(master: &State, prod: &State, out: &mut Vec<Planned>) {
+    let Some(mv) = &master.variants else {
+        return;
+    };
+    let empty = BTreeMap::new();
+    let pv = prod.variants.as_ref().unwrap_or(&empty);
+    let none = RouteVariants::default();
+    let gone = |routes: &BTreeMap<String, Value>, r: &str| routes.get(r).is_some_and(|v| !live(v));
+    let (mut lists, mut wear, mut drop) = (Vec::new(), Vec::new(), Vec::new());
+    let routes: BTreeSet<&String> = mv.keys().chain(pv.keys()).collect();
+    for route in routes {
+        if gone(&master.routes, route) || gone(&prod.routes, route) {
+            continue;
+        }
+        // a route only prod has is prod's
+        if !master.routes.is_empty() && !master.routes.contains_key(route) {
+            continue;
+        }
+        let guard = vec![("route_list", route.clone())];
+        let (m, p) = (
+            mv.get(route).unwrap_or(&none),
+            pv.get(route).unwrap_or(&none),
+        );
+        for (id, links) in &m.lists {
+            let stages: Vec<Value> = links
+                .iter()
+                .map(|l| json!({"stage_id": l.key(), "stage_no": l.stage_no}))
+                .collect();
+            let what = json!({"entity": "route_variant", "key": route, "variant_id": id,
+                              "stages": links.len()});
+            let label = format!("{route}@{id}");
+            let (op, after) = match p.lists.get(id) {
+                None => ("create", json!({"variant_id": id, "stages": stages})),
+                Some(theirs) if theirs != links => (
+                    "update",
+                    json!({"variant_id": id, "stages": stages,
+                           "base_stages_hash": links_hash_of(theirs)}),
+                ),
+                Some(_) => continue,
+            };
+            lists.push(guarded(
+                plan(
+                    STEP_VARIANTS,
+                    "variant",
+                    &label,
+                    "route_variant",
+                    op,
+                    route,
+                    after,
+                    what,
+                ),
+                guard.clone(),
+            ));
+        }
+        if m.active != p.active {
+            // based on the list it switches to, as prod has it
+            let target = match &m.active {
+                Some(id) => p.lists.get(id).cloned().unwrap_or_default(),
+                None => prod.lists.get(route).cloned().unwrap_or_default(),
+            };
+            wear.push(guarded(
+                plan(
+                    STEP_VARIANTS,
+                    "variant",
+                    &format!("{route}@active"),
+                    "route_variant",
+                    "activate",
+                    route,
+                    json!({"variant_id": m.active, "base_stages_hash": links_hash_of(&target)}),
+                    json!({"entity": "route_variant", "key": route, "active": m.active}),
+                ),
+                guard.clone(),
+            ));
+        }
+        for id in p.lists.keys().filter(|id| !m.lists.contains_key(*id)) {
+            drop.push(guarded(
+                plan(
+                    STEP_VARIANTS,
+                    "variant",
+                    &format!("{route}@{id}"),
+                    "route_variant",
+                    "delete",
+                    route,
+                    json!({"variant_id": id}),
+                    json!({"entity": "route_variant", "key": route, "variant_id": id}),
+                ),
+                guard.clone(),
+            ));
+        }
+    }
+    out.extend(lists);
+    out.extend(wear);
+    out.extend(drop);
+}
+
 fn kind_of(c: &NewChange) -> String {
     format!("{}/{}", c.entity, c.op)
+}
+
+/// What of the feed a file does not carry - asked for fewer scopes, or written
+/// before migrations carried it - noted, so the admin knows to download the
+/// whole feed again: nothing of prod's is changed for what the file lacks.
+fn note_not_in_file(master: &State, scopes: &[String], report: &mut Report) {
+    let has = |s: &str| scopes.iter().any(|x| x == s);
+    let mut missing = Vec::new();
+    for (scope, what) in [
+        ("stops", "stops and stations"),
+        ("routes", "routes"),
+        ("stages", "stages and the routes' stage lists"),
+        ("timetables", "calendars and trips"),
+        (
+            "records",
+            "the other GTFS files (agency, fares, shapes, transfers, ...)",
+        ),
+    ] {
+        if !has(scope) {
+            missing.push(what);
+        }
+    }
+    if has("stops") && master.geofences.is_none() {
+        missing.push("geofences");
+    }
+    if has("routes") && !master.use_stages && master.stop_lists.is_none() {
+        missing.push("the routes' stop lists");
+    }
+    if has("stages") && master.variants.is_none() {
+        missing.push("temporary routes");
+    }
+    if !missing.is_empty() {
+        report.note(json!({"code": "not_in_file", "missing": missing,
+            "message": format!(
+                "this file does not carry {}: prod keeps what it has of them. Download the feed again on master for a file with all of it",
+                missing.join(", ")
+            )}));
+    }
 }
 
 async fn import_full(
@@ -2407,6 +3002,7 @@ async fn import_full(
         ..Report::default()
     };
     let master = State::from_files(pkg)?;
+    note_not_in_file(&master, &scopes, &mut report);
 
     let mut tx = pool.begin().await?;
     lock_feed(&mut tx, g).await?;
@@ -2436,13 +3032,17 @@ async fn import_full(
 
     let mut planned = Vec::new();
     plan_stops_routes(&master, &prod, &scopes, &mut planned, &mut report);
+    if scopes.iter().any(|s| s == "routes") {
+        plan_stop_lists(&master, &prod, &mut planned, &mut report);
+    }
     if scopes.iter().any(|s| s == "stages") {
         plan_stages(&master, &prod, &mut planned, &mut report);
+        plan_variants(&master, &prod, &mut planned);
     }
-    // turning stages on, once prod has them (step 3)
+    // turning stages on, once prod has them
     if master.use_stages && !prod.use_stages && scopes.iter().any(|s| s == "stages") {
         planned.push(Planned {
-            step: 3,
+            step: STEP_SWITCH,
             id: "feed:use_stages".into(),
             guards: Vec::new(),
             change: NewChange {
@@ -2523,7 +3123,7 @@ async fn import_full(
         }
         let chunk = match STEPS[i].0 {
             "stages" => STAGES_PER_SET,
-            "route_stages" => LISTS_PER_SET,
+            "route_stops" | "route_stages" | "variants" => LISTS_PER_SET,
             _ => usize::MAX,
         };
         let items: Vec<Item> = std::mem::take(&mut steps[i])
@@ -2620,11 +3220,13 @@ async fn import_full(
     }
     tx.rollback().await?;
 
-    // the timetable, once everything before it is in: master's trips run on
-    // stop orders prod serves only once both serve the same stages
+    // the timetable and the other GTFS files, once everything before them is
+    // in: master's trips run on stop orders prod serves only once both serve
+    // the same stages, and the files name its stops and routes
     let has_timetable = scopes.iter().any(|s| s == "timetables");
+    let has_records = scopes.iter().any(|s| s == "records");
     let dropped_now = report.counts.get("dropped").copied().unwrap_or(0);
-    if !(timetable_turn && has_timetable) {
+    if !(timetable_turn && (has_timetable || has_records)) {
         report.next = Some(if dropped_now > 0 {
             "nothing could be drafted: prod refused what is left (see dropped)".into()
         } else {
@@ -2643,7 +3245,7 @@ async fn import_full(
     let exclude: HashSet<String> = history
         .own
         .iter()
-        .filter(|((kind, _), _)| *kind == "timetable")
+        .filter(|((kind, _), _)| has_timetable && *kind == "timetable")
         .filter_map(|((_, route), _)| {
             history
                 .changed_on_prod("timetable", route, since)
@@ -2666,17 +3268,50 @@ async fn import_full(
             );
         }
     }
+    // a record row prod made, changed or took out itself stays as prod has it
+    let exclude_records: HashSet<String> = history
+        .own
+        .keys()
+        .filter(|(kind, _)| *kind == "record")
+        .filter_map(|(_, key)| {
+            history
+                .changed_on_prod("record", key, since)
+                .filter(|_| !opts.takes(&format!("record:{key}")))
+                .map(|_| key.clone())
+        })
+        .collect();
+    let mut files: Vec<String> = Vec::new();
+    if has_timetable {
+        files.extend(TIMETABLE_FILES.iter().map(|s| s.to_string()));
+    }
+    if has_records {
+        files.extend(record_files());
+    }
     let di = draft_import::DraftImport {
-        files: Some(TIMETABLE_FILES.iter().map(|s| s.to_string()).collect()),
+        files: Some(files),
         // a route's details and line move with the route rows, not the timetable
         with_routes: false,
         dry_run: opts.dry_run,
         user_id: ctx.user.user_id,
         email: ctx.user.email.clone(),
         exclude_routes: exclude,
-        title: Some(format!("From master v{}: timetable", m.source.version)),
+        exclude_records,
+        // master's whole feed: a file it has no rows of is not in its zip
+        whole_feed: true,
+        title: Some(format!(
+            "From master v{}: timetable and GTFS files",
+            m.source.version
+        )),
     };
     let tt = draft_import::draft_import(pool, pkg.file("gtfs.zip")?, Some(g), &di).await?;
+    for key in &tt.records_kept {
+        report.steps[i].conflicts += 1;
+        let (entity, row) = key.split_once(':').unwrap_or((key.as_str(), ""));
+        report.conflict(json!({"id": format!("record:{key}"),
+            "what": {"entity": entity, "key": row},
+            "reason": "changed_on_prod",
+            "message": format!("prod changed this {entity} row itself after version {since}; prod's is kept")}));
+    }
     let tt_sets: Vec<Uuid> = tt
         .change_sets
         .iter()
@@ -2715,6 +3350,11 @@ async fn import_full(
     }
     if tt.change_sets.is_empty() && tt.errors == 0 {
         report.next = Some("prod has everything this file brings".into());
+    } else if tt.change_sets.is_empty() {
+        report.next = Some(format!(
+            "master's calendars, trips and GTFS files could not be drafted ({} errors): see timetable.findings and timetable.problems",
+            tt.errors
+        ));
     }
     Ok(report)
 }
@@ -3083,6 +3723,301 @@ mod tests {
             vec!["stops".to_string(), "stages".to_string()]
         );
         assert!(parse_scopes(Some("trips")).is_err());
+    }
+
+    #[test]
+    fn the_step_names_are_the_steps_they_name() {
+        for (i, name) in [
+            (STEP_STOPS_ROUTES, "stops_routes"),
+            (STEP_ROUTE_STOPS, "route_stops"),
+            (STEP_STAGES, "stages"),
+            (STEP_ROUTE_STAGES, "route_stages"),
+            (STEP_SWITCH, "switch"),
+            (STEP_VARIANTS, "variants"),
+            (STEPS.len() - 1, "timetables"),
+        ] {
+            assert_eq!(STEPS[i].0, name);
+        }
+        let files = record_files();
+        for f in [
+            "agency.txt",
+            "fare_attributes.txt",
+            "shapes.txt",
+            "feed_info.txt",
+        ] {
+            assert!(files.contains(&f.to_string()), "{f}: {files:?}");
+        }
+        for f in ["stops.txt", "routes.txt", "trips.txt", "calendar.txt"] {
+            assert!(!files.contains(&f.to_string()), "{f}");
+        }
+        assert!(is_record_entity("fare_rule") && !is_record_entity("stop"));
+        assert_eq!(
+            touched("agency", "update", "AG", &Value::Null, &Value::Null),
+            vec![("record", "agency:AG".to_string())]
+        );
+        assert_eq!(
+            touched("geofence", "create", "B", &Value::Null, &Value::Null),
+            vec![("geofence", "B".to_string())]
+        );
+    }
+
+    fn route_row(stop: &str, kind: &str, no: i32) -> RouteRow {
+        RouteRow {
+            stop_id: Some(stop.into()),
+            stop_type: kind.into(),
+            stage_no: no,
+            stage_name: format!("S{no}"),
+            ..RouteRow::default()
+        }
+    }
+
+    fn stop_lists(
+        lists: Vec<(&str, i16, Vec<RouteRow>)>,
+    ) -> Option<BTreeMap<(String, i16), StopList>> {
+        Some(
+            lists
+                .into_iter()
+                .map(|(r, k, rows)| {
+                    (
+                        (r.to_string(), k),
+                        StopList {
+                            name: None,
+                            direction_id: None,
+                            rows,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_stop_list_is_replaced_whole_on_prods_hash_and_only_without_stages() {
+        let theirs = vec![route_row("A", "NEW STOP", 1), route_row("E", "NEW STOP", 2)];
+        let mine = vec![
+            route_row("A", "NEW STOP", 1),
+            route_row("C", "NEW STOP", 2),
+            route_row("E", "NEW STOP", 3),
+        ];
+        let master = State {
+            stop_lists: stop_lists(vec![
+                ("R1", 1, mine.clone()),
+                ("R1", 2, theirs.clone()),
+                ("R2", 1, theirs.clone()),
+            ]),
+            ..State::default()
+        };
+        let prod = State {
+            stop_lists: stop_lists(vec![
+                ("R1", 1, theirs.clone()),
+                ("R2", 1, theirs.clone()),
+                ("R9", 1, theirs.clone()),
+            ]),
+            ..State::default()
+        };
+        let mut out = Vec::new();
+        let mut report = Report::default();
+        plan_stop_lists(&master, &prod, &mut out, &mut report);
+        let got: Vec<(String, String, Value)> = out
+            .iter()
+            .map(|p| {
+                (
+                    p.id.clone(),
+                    kind_of(&p.change),
+                    p.change.after["pattern_key"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "route_list:R1".into(),
+                    "route_stops/replace".into(),
+                    Value::Null
+                ),
+                (
+                    "route_list:R1#2".into(),
+                    "route_stops/replace".into(),
+                    json!(2)
+                ),
+            ]
+        );
+        assert_eq!(
+            out[0].change.after["base_rows_hash"],
+            json!(service::rows_hash(&theirs))
+        );
+        assert_eq!(
+            out[1].change.after["base_rows_hash"],
+            json!(service::rows_hash(&[]))
+        );
+        assert!(out
+            .iter()
+            .all(|p| p.guards == vec![("route_list", "R1".to_string())]));
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n["code"] == "stop_orders_only_on_prod" && n["count"] == 1));
+
+        // a feed served from its stages has its routes' stops in its stages
+        for (m, p) in [(true, false), (false, true)] {
+            let mut out = Vec::new();
+            let master = State {
+                use_stages: m,
+                stop_lists: master.stop_lists.clone(),
+                ..State::default()
+            };
+            let prod = State {
+                use_stages: p,
+                ..State::default()
+            };
+            plan_stop_lists(&master, &prod, &mut out, &mut Report::default());
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn geofences_are_made_changed_and_taken_out_with_their_shape() {
+        let fence = |id: &str, r: i64| {
+            json!({"stop_id": id, "lat": 25.5, "lon": 91.8, "shape": "circle", "radius_m": r,
+                   "polygon": null})
+        };
+        let poly = json!({"stop_id": "P", "lat": 25.5, "lon": 91.8, "shape": "polygon",
+                          "radius_m": null, "polygon": [{"lat": 1.0, "lon": 2.0}]});
+        let master = State {
+            geofences: Some(geofences_of(vec![
+                fence("NEW", 100),
+                fence("SAME", 50),
+                poly,
+            ])),
+            ..State::default()
+        };
+        let prod = State {
+            geofences: Some(geofences_of(vec![
+                fence("SAME", 50),
+                fence("P", 80),
+                fence("GONE", 70),
+            ])),
+            ..State::default()
+        };
+        let (out, gone) = plan_geofences(&master, &prod, &mut Report::default());
+        let kinds: Vec<(String, String)> = out
+            .iter()
+            .chain(&gone)
+            .map(|p| (kind_of(&p.change), p.change.entity_key.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("geofence/create".into(), "NEW".into()),
+                ("geofence/update".into(), "P".into()),
+                ("geofence/delete".into(), "GONE".into()),
+            ]
+        );
+        assert_eq!(out[0].change.after["radius_m"], 100);
+        assert!(out[0].change.after.get("polygon").is_none());
+        // a circle becoming a polygon says so, with no radius
+        assert_eq!(out[1].change.after["shape"], "polygon");
+        assert!(out[1].change.after.get("radius_m").is_none());
+        // a file without geofences takes none out
+        let old = State::default();
+        let (out, gone) = plan_geofences(&old, &prod, &mut Report::default());
+        assert!(out.is_empty() && gone.is_empty());
+    }
+
+    #[test]
+    fn temporary_routes_are_made_worn_and_taken_out_after_their_lists() {
+        let link = |id: &str, no: i32| Link {
+            stage_id: id.into(),
+            direction: String::new(),
+            stage_no: no,
+        };
+        let master = State {
+            variants: Some(
+                [(
+                    "R1".to_string(),
+                    RouteVariants {
+                        active: Some("DIV".into()),
+                        lists: [("DIV".to_string(), vec![link("a", 1), link("c", 2)])].into(),
+                    },
+                )]
+                .into(),
+            ),
+            ..State::default()
+        };
+        let prod = State {
+            variants: Some(
+                [(
+                    "R1".to_string(),
+                    RouteVariants {
+                        active: None,
+                        lists: [("OLD".to_string(), vec![link("a", 1)])].into(),
+                    },
+                )]
+                .into(),
+            ),
+            lists: [("R1".to_string(), vec![link("a", 1), link("b", 2)])].into(),
+            ..State::default()
+        };
+        let mut out = Vec::new();
+        plan_variants(&master, &prod, &mut out);
+        let ops: Vec<(String, String)> = out
+            .iter()
+            .map(|p| (p.id.clone(), p.change.op.clone()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("variant:R1@DIV".into(), "create".into()),
+                ("variant:R1@active".into(), "activate".into()),
+                ("variant:R1@OLD".into(), "delete".into()),
+            ]
+        );
+        // switching to a list this draft makes is based on prod's (none)
+        assert_eq!(out[1].change.after["variant_id"], "DIV");
+        assert_eq!(
+            out[1].change.after["base_stages_hash"],
+            json!(links_hash_of(&[]))
+        );
+        assert!(out
+            .iter()
+            .all(|p| p.guards == vec![("route_list", "R1".to_string())]));
+    }
+
+    #[test]
+    fn a_file_missing_parts_of_the_feed_says_so_and_takes_nothing_out() {
+        let mut report = Report::default();
+        let scopes: Vec<String> = ["stops", "routes", "stages"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        note_not_in_file(&State::default(), &scopes, &mut report);
+        let missing = &report.notes[0]["missing"];
+        for what in [
+            "calendars and trips",
+            "geofences",
+            "the routes' stop lists",
+            "temporary routes",
+        ] {
+            assert!(
+                missing.as_array().unwrap().contains(&json!(what)),
+                "{missing}"
+            );
+        }
+        let all: Vec<String> = SCOPES.iter().map(|s| s.to_string()).collect();
+        let whole = State {
+            geofences: Some(BTreeMap::new()),
+            stop_lists: Some(BTreeMap::new()),
+            variants: Some(BTreeMap::new()),
+            ..State::default()
+        };
+        let mut report = Report::default();
+        note_not_in_file(&whole, &all, &mut report);
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        // a field an older file does not carry is not cleared
+        let m = json!({"name": "B"});
+        let p = json!({"name": "B", "is_depot": true});
+        assert!(changed_fields(&m, &p, STOP_UPDATE_FIELDS).is_empty());
     }
 
     #[test]

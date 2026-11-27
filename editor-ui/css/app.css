@@ -927,7 +927,9 @@ fieldset.days { display: flex; flex-wrap: wrap; gap: 10px; border: 1px solid var
 .calendar-table code { letter-spacing: 2px; }
 
 /* master's work moved to prod as a file (docs section 23) */
-fieldset.migration-scopes { display: grid; gap: 8px; border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.migration-scopes { border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.migration-scopes p { margin: 0 0 6px; }
+.migration-scopes ul { margin: 0; padding-left: 1.2em; display: grid; gap: 4px; }
 #migration .field { margin-top: 10px; max-width: 32em; }
 .migration-report { display: grid; gap: 10px; margin-top: 12px; }
 .migration-report h3 { margin: 8px 0 4px; font-size: 15px; }
