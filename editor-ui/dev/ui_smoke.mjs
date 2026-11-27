@@ -9,6 +9,7 @@
 //   node dev/ui_smoke.mjs --route-active     # only making a route inactive and active again
 //   node dev/ui_smoke.mjs --migration        # only moving work from master to prod (section 23)
 //   node dev/ui_smoke.mjs --map-line-edit    # only a map line edited by hand (section 28)
+//   node dev/ui_smoke.mjs --line-toolkit     # only the map line toolkit (section 31)
 //   node dev/ui_smoke.mjs --routes-map       # only several routes on the map (section 29)
 //   node dev/ui_smoke.mjs --map-tiles        # only the base map, OpenStreetMap or Google Maps JS (section 30)
 //
@@ -35,7 +36,8 @@
 // stops and stations, and importing stop details. Then the map line flows
 // (mapLineFlows; `--map-line`): a line through the stops and from GPS, and the
 // reason when either fails; one edited by hand on the map (mapLineEditFlow;
-// `--map-line-edit`); several routes on the map at once (routesMapFlow;
+// `--map-line-edit`) and with the toolkit (lineToolkitFlow; `--line-toolkit`);
+// several routes on the map at once (routesMapFlow;
 // `--routes-map`); and the base map, OpenStreetMap or Google (mapTilesFlow;
 // `--map-tiles`). Last, who may work on which feed (feedAccessFlows;
 // `--feed-access`): a system account at the gate, the no-feeds screen, the
@@ -1735,6 +1737,195 @@ async function mapLineEditFlow() {
   await shot("mle-04-in-draft");
 }
 
+// docs section 31: the map line toolkit - drawing on from either end and
+// afresh from the first stop (by road and straight), trim, reverse, import a
+// file (GeoJSON, GPX, KML, and one that is not a line), simplify, snap to the
+// roads (and the router failing), through a stop, copy another route's line,
+// export, each one undo; into the draft as manual.
+async function lineToolkitFlow() {
+  const setMode = (m) => evaluate(`fetch("/__dev/map-line", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: ${JSON.stringify(JSON.stringify(m))} }).then((r) => r.json())`);
+  const draftId = await activeDraftId().catch(() => null);
+  const drafted = new Set(draftId ? ((await api(`change-sets/${draftId}`)).changes || []).filter((c) => c.entity === "route").map((c) => c.entity_key) : []);
+  const routes = (await api("feeds/chennai_bus/routes?q=21G&limit=30")).items
+    .filter((r) => r.route_id !== "1369" && r.stop_count >= 6 && !r.deleted && !r.has_polyline && !drafted.has(r.route_id));
+  if (!check(routes.length > 0, "a route with no map line")) return;
+  const route = routes[routes.length - 1];
+  const detail = await api(`feeds/chennai_bus/routes/${route.route_id}`);
+  const boarded = detail.rows.filter((r) => !["ROUTE CORRECTION", "JUMP STOP", "HIDDEN STOP"].includes(r.stop_type) && r.lat != null);
+  await go(`#/route/${route.route_id}`);
+  await waitFor(`document.body.innerText.includes("Edit name, colour and map line")`, "route actions");
+  await click("Edit name, colour and map line");
+  await sleep(300);
+  if (await evaluate(`!!document.querySelector("dialog #new-draft-title")`)) await chooseNewDraft("Map line toolkit");
+  await waitFor(`!!document.querySelector("#edit-line")`, "Edit the line on the map");
+  await click("Edit the line on the map");
+  await waitFor(`!!document.querySelector("[data-toolkit]")`, "the toolkit");
+
+  const line = () => mapCall(`let pts = null; map.eachLayer((l) => { if (l.options && l.options.lineEdit) pts = l.getLatLngs().map((p) => [p.lat, p.lng]); }); return pts;`);
+  const near = (p, q, d = 2e-5) => Math.abs(p[0] - q[0]) < d && Math.abs(p[1] - q[1]) < d;
+  const tool = (id) => evaluate(`(() => { const b = document.querySelector('[data-tool="${id}"]'); if (!b || b.disabled) return false; b.click(); return true; })()`);
+  const status = () => text("[data-tool-status]");
+  const fit = async (pts) => { await mapCall(`map.fitBounds(${JSON.stringify(pts)}, { padding: [90, 90], animate: false }); return true;`); await sleep(600); };
+  // a place on screen ~160 px from (lat, lon), at least 80 px from the line;
+  // diagonal first, so a stretch by the mock's roads has a corner of its own
+  const clearOf = (lat, lon) => evaluate(`Promise.all([import(${JSON.stringify(MAPJS)}), import(${JSON.stringify(`${UI}js/line.js`)})]).then(([m, ln]) => {
+    const map = m.getMap(); let pts = null;
+    map.eachLayer((l) => { if (l.options && l.options.lineEdit) pts = l.getLatLngs().map((p) => [p.lat, p.lng]); });
+    const o = map.latLngToContainerPoint([${lat}, ${lon}]), r = map.getContainer().getBoundingClientRect();
+    for (const [dx, dy] of [[120, -120], [-120, 120], [120, 120], [-120, -120], [160, 0], [0, -160], [-160, 0], [0, 160]]) {
+      const q = o.add([dx, dy]);
+      if (q.x < 140 || q.y < 120 || q.x > r.width - 20 || q.y > r.height - 60) continue;
+      const ll = map.containerPointToLatLng(q), at = ln.nearestOnLine(pts, ll.lat, ll.lng);
+      if (map.latLngToContainerPoint([at.lat, at.lon]).distanceTo(q) > 80) return { x: r.left + q.x, y: r.top + q.y, lat: ll.lat, lon: ll.lng };
+    }
+    return null;
+  })`);
+  const importFile = async (name, content, type = "application/octet-stream") => {
+    await evaluate(`(() => { const input = document.getElementById("line-file"); const dt = new DataTransfer();
+      dt.items.add(new File([${JSON.stringify(content)}], ${JSON.stringify(name)}, { type: ${JSON.stringify(type)} }));
+      input.files = dt.files; input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+    await sleep(600);
+  };
+  let pts = await line();
+  check(pts && pts.length >= 2, `a line through the stops to start from (${pts && pts.length} points)`);
+  const groups = await evaluate(`[...document.querySelectorAll("[data-toolkit] h3")].map((x) => x.textContent)`);
+  check(JSON.stringify(groups) === JSON.stringify(["Draw", "Tidy", "From elsewhere"]), `the tools in three groups: ${groups}`);
+
+  // ---- draw on from the end, by road: one click, one stretch, one undo
+  await fit(pts.slice(-3));
+  check(await tool("draw-end"), "Draw on from the end");
+  check(await mapCall(`let n = 0; map.eachLayer((l) => { if (l.options && l.options.drawAnchor) n++; }); return n;`) === 1, "a ring where the next stretch starts");
+  check(await evaluate(`document.querySelectorAll(".line-vertex").length`) === 0, "no point handles while drawing");
+  let at = await clearOf(...pts[pts.length - 1]);
+  await mouseClick(at.x, at.y);
+  await waitFor(`(document.querySelector("[data-line-stats]")?.innerText || "").includes("${pts.length + 2} points")`, "a stretch by road added");
+  let now = await line();
+  const end = pts[pts.length - 1];
+  check(near(now[now.length - 1], [at.lat, at.lon], 1e-4) && now.some((p) => near(p, [at.lat, end[1]], 1e-4)), "it ends at the click, along the mock's roads (an L)");
+  await click("↶ Undo");
+  await waitFor(`(document.querySelector("[data-line-stats]")?.innerText || "").includes("${pts.length} points")`, "undo: the stretch gone");
+  await click("↷ Redo");
+  await sleep(400);
+  // straight now: the next click is one more point
+  await evaluate(`document.getElementById("draw-by-straight").click(), true`);
+  pts = await line();
+  at = await clearOf(...pts[pts.length - 1]);
+  await mouseClick(at.x, at.y);
+  await sleep(500);
+  now = await line();
+  check(now.length === pts.length + 1 && near(now[now.length - 1], [at.lat, at.lon], 1e-4), "a straight stretch: one point, at the click");
+  await click("Stop drawing");
+  check(!(await has("[data-drawing]")) && await evaluate(`document.querySelectorAll(".line-vertex").length`) > 0, "drawing stopped: the handles back");
+
+  // ---- back from the start, straight
+  pts = await line();
+  await fit(pts.slice(0, 3));
+  check(await tool("draw-start"), "Draw back from the start");
+  at = await clearOf(...pts[0]);
+  await mouseClick(at.x, at.y);
+  await sleep(500);
+  now = await line();
+  check(now.length === pts.length + 1 && near(now[0], [at.lat, at.lon], 1e-4), "the line now starts at the click");
+  await click("Stop drawing");
+
+  // ---- trim to the stops: both drawn tails go
+  pts = await line();
+  check(await tool("trim"), "Trim to the first and last stop");
+  await sleep(400);
+  now = await line();
+  check(near(now[0], [boarded[0].lat, boarded[0].lon], 1e-4) && near(now[now.length - 1], [boarded[boarded.length - 1].lat, boarded[boarded.length - 1].lon], 1e-4), "it starts at the first stop and ends at the last");
+  check((await status()).includes("ran past the first and last stops"), "and says how much it cut");
+  check(await tool("trim") && (await status()).includes("does not run past"), "trimming again: nothing to cut");
+
+  // ---- reverse, and back
+  pts = await line();
+  await tool("reverse");
+  await sleep(300);
+  now = await line();
+  check(near(now[0], pts[pts.length - 1]) && near(now[now.length - 1], pts[0]), "reversed: it runs the other way");
+  await tool("reverse");
+  await sleep(300);
+
+  // ---- import: GeoJSON, then simplify it
+  pts = await line();
+  const [a, b] = [pts[0], pts[pts.length - 1]];
+  const run = Array.from({ length: 30 }, (_, i) => [a[0] + ((b[0] - a[0]) * i) / 29, a[1] + ((b[1] - a[1]) * i) / 29]);
+  await importFile("run.geojson", JSON.stringify({ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: run.map(([la, lo]) => [lo, la]) } }));
+  check((await status()).includes("Imported the GeoJSON line from run.geojson") && (await line()).length === 30, `a GeoJSON file: its 30 points (${(await line()).length})`);
+  await tool("simplify");
+  await sleep(300);
+  check((await line()).length === 2 && (await status()).includes("30 points down to 2"), "simplify: a straight run keeps its ends");
+  check(await tool("simplify") && (await status()).includes("Nothing to take away"), "simplify again: nothing left to take");
+  const gpx = `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg>${run.slice(0, 5).map(([la, lo]) => `<trkpt lat="${la}" lon="${lo}"/>`).join("")}</trkseg></trk></gpx>`;
+  await importFile("run.gpx", gpx);
+  check((await line()).length === 5 && (await status()).includes("GPX"), "a GPX track");
+  const kml = `<kml><Document><Placemark><LineString><coordinates>${run.slice(0, 4).map(([la, lo]) => `${lo},${la},0`).join(" ")}</coordinates></LineString></Placemark></Document></kml>`;
+  await importFile("run.kml", kml);
+  check((await line()).length === 4 && (await status()).includes("KML"), "a KML LineString");
+  await importFile("notes.txt", "this is not a line");
+  check((await status()).includes("notes.txt:") && (await line()).length === 4, "a file that is no line: said, and the line kept");
+  for (let i = 0; i < 4; i++) { await click("↶ Undo"); await sleep(250); }
+  check(JSON.stringify(await line()) === JSON.stringify(pts), "four undos: the line before the imports");
+
+  // ---- snap to the roads: the mock's roads run 2 m north
+  check(await tool("snap"), "Snap to the roads");
+  await waitFor(`!!document.querySelector("[data-snapped]")`, "snapped");
+  now = await line();
+  check(now.length === pts.length && now.every((p, i) => Math.abs(p[0] - pts[i][0] - 0.00002) < 2e-6 && Math.abs(p[1] - pts[i][1]) < 2e-6), "every point moved onto the road");
+  check((await status()).includes("Snapped 100% of the line"), "and it says how much");
+  await click("↶ Undo");
+  await sleep(300);
+  await setMode({ snap: "none" });
+  await tool("snap");
+  await waitFor(`(document.querySelector("[data-tool-status]")?.innerText || "").includes("could not fit")`, "the router failing");
+  check(JSON.stringify(await line()) === JSON.stringify(pts), "the line as it was");
+  await setMode({ snap: "ok" });
+
+  // ---- through a stop: a line that misses one, put right in one click
+  const missing = pts.map((p, i) => (i === 2 ? [p[0], p[1] + 0.0045] : p));
+  await importFile("missing.geojson", JSON.stringify({ type: "LineString", coordinates: missing.map(([la, lo]) => [lo, la]) }));
+  await waitFor(`!!document.querySelector('[data-via-stop]')`, "a stop to route through");
+  const via = await evaluate(`document.querySelector("[data-via-stop]").dataset.viaStop`);
+  check(await tool("via-stop"), `Route through it (${via})`);
+  await waitFor(`!document.querySelector('[data-via-stop="${via}"]')`, "that stop no longer passed by");
+  check((await status()).includes("The line now goes through"), "and it says so");
+
+  // ---- copy another route's line, reversed
+  check(await tool("copy"), "Copy another route's line");
+  await type("#copy-route-search", "1558");
+  await waitFor(`!!document.querySelector('[data-copy] [data-route="1558"] button')`, "route 45B (1558) in the results");
+  const other = (await api("feeds/chennai_bus/routes/1558")).encoded_polyline;
+  await evaluate(`document.querySelector('[data-copy] [data-route="1558"] button').click(), true`);
+  await waitFor(`(document.querySelector("[data-tool-status]")?.innerText || "").includes("Copied route 45B")`, "copied");
+  // as the editor keeps a line: a point that repeats the one before it dropped
+  const theirs = await evaluate(`Promise.all([import(${JSON.stringify(`${UI}js/util.js`)}), import(${JSON.stringify(`${UI}js/line.js`)})]).then(([u, ln]) => ln.tidy(u.decodePolyline(${JSON.stringify(other)})))`);
+  now = await line();
+  check(now.length === theirs.length && near(now[0], theirs[theirs.length - 1]) && near(now[now.length - 1], theirs[0]),
+    `45B's line, reversed (${now.length} vs ${theirs.length} points; ${JSON.stringify(now[0])} vs ${JSON.stringify(theirs[theirs.length - 1])})`);
+  await click("↶ Undo");
+  await sleep(300);
+
+  // ---- export: what is written reads back as the line
+  await evaluate(`(() => { window.__exports = []; const make = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = (blob) => { blob.text().then((t) => window.__exports.push({ type: blob.type, text: t })); return make(blob); }; return true; })()`);
+  for (const k of ["export-geojson", "export-gpx", "export-kml"]) await tool(k);
+  await waitFor(`(window.__exports || []).length === 3`, "three files written");
+  now = await line();
+  const back = await evaluate(`import(${JSON.stringify(`${UI}js/line.js`)}).then((ln) => window.__exports.map((e) => ({ type: e.type, n: ln.parseLineFile(e.text).points.length, first: ln.parseLineFile(e.text).points[0] })))`);
+  check(back.map((x) => x.type).join() === "application/geo+json,application/gpx+xml,application/vnd.google-earth.kml+xml", `GeoJSON, GPX and KML (${back.map((x) => x.type)})`);
+  check(back.every((x) => x.n === now.length && near(x.first, now[0], 1e-6)), "each reads back as the line");
+  await shot("tk-01-toolkit");
+
+  // ---- into the draft as a line drawn by hand
+  await click("Done editing");
+  await click("Add to draft", ".sticky-actions");
+  await sleep(800);
+  const set = await api(`change-sets/${await activeDraftId()}`);
+  const change = (set.changes || []).find((c) => c.entity === "route" && c.entity_key === route.route_id);
+  check(!!change && change.after.polyline_source === "manual", "into the draft as polyline_source manual");
+}
+
 // docs section 29: several routes' map lines on the map at once - added by
 // search, each its own colour, one drawn as the draft has it, picked out by
 // pointing, hidden, removed; the address keeping them; from a stop's routes and
@@ -2250,6 +2441,30 @@ if (process.argv.includes("--gps-trips")) {
     await load(UI);
     await signIn("editor1@nammayatri.in");
     await gpsTripsFlow();
+    check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
+  } catch (e) {
+    failures.push(e.message);
+    console.log(`FAIL ${e.message}`);
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await sleep(800);
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  }
+  console.log(`\n${failures.length ? `${failures.length} failure(s)` : "all passed"}; screenshots in ${SHOTS}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+// ---- only the map line toolkit
+if (process.argv.includes("--line-toolkit")) {
+  try {
+    await connect();
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await load(UI);
+    await signIn("editor1@nammayatri.in");
+    await lineToolkitFlow();
     check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.slice(0, 5).join(" | ")}` : ""}`);
   } catch (e) {
     failures.push(e.message);
@@ -3616,6 +3831,8 @@ try {
   await mapLineFlows();
   // ================================================================ a map line edited by hand: see mapLineEditFlow above
   await mapLineEditFlow();
+  // ================================================================ the map line toolkit: see lineToolkitFlow above
+  await lineToolkitFlow();
   // ================================================================ several routes on the map: see routesMapFlow above
   await routesMapFlow();
   // ================================================================ the base map: see mapTilesFlow above (last: it reloads the page)

@@ -18,7 +18,7 @@ js/state.js         shared state; UI preferences in localStorage (never secrets)
 js/auth.js          sign-in gate: SSO problems, TOTP enrolment (QR), code entry, lockout
 js/main.js          boot, top bar, hash router
 js/map.js           Leaflet: the base map (OpenStreetMap or Google), stops by area, routes, several routes at once, drag a stop, pick a stop, station selection, insets, a map line edited by hand
-js/line.js          a map line as points: encode it, snap a click to it, replace a stretch, the stops it passes by (no DOM; tested by dev/line_test.mjs)
+js/line.js          a map line as points: encode it, snap a click to it, replace a stretch, the stops it passes by, and the toolkit's trim, simplify, files in and out (no DOM; tested by dev/line_test.mjs and dev/line_toolkit_test.mjs)
 js/routes_map.js    several routes' map lines on the map at once, each in its own colour (#/routes-map?ids=)
 js/explore.js       search (paged), stop panel with its CSV download, route panel with the fare-stage ladder
 js/editors.js       stop, route stop list, route details and map line (suggested, or edited on the map), station editors
@@ -69,7 +69,11 @@ dev/                development only - never served by GIMS
   one-click fix. Or edit the name, colour and map line: suggest a line through
   the stops or from GPS, or edit it on the map (drag a point, bend it, redraw a
   stretch along the roads or straight), with the stops it passes by more than
-  100 m listed as it changes (docs section 28).
+  100 m listed as it changes (docs section 28). Its toolkit (section 31) draws
+  on from either end by road or straight, routes the line through a stop it
+  passes by, snaps it to the roads, trims it to the first and last stop,
+  reverses and simplifies it, copies another route's line, and reads and
+  writes GeoJSON, GPX and KML.
 - **New** (top bar) - New stop (`#/new/stop`: click the map, name, optional
   platform label; the id is made by the server unless typed), New route
   (`#/new/route`: id, number, name, colour, then its stop list; it reaches

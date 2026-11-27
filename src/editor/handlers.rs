@@ -1497,11 +1497,10 @@ pub async fn polyline_road(
             ),
         ));
     }
-    if let Some(i) = pts.iter().position(|p| {
-        !(p.lat.is_finite() && p.lon.is_finite())
-            || !(-90.0..=90.0).contains(&p.lat)
-            || !(-180.0..=180.0).contains(&p.lon)
-    }) {
+    if let Some(i) = pts
+        .iter()
+        .position(|p| !((-90.0..=90.0).contains(&p.lat) && (-180.0..=180.0).contains(&p.lon)))
+    {
         return Err(EditorError::bad_request(
             "invalid_payload",
             format!("points[{i}]: lat is -90 to 90 and lon -180 to 180"),
@@ -1538,6 +1537,73 @@ pub async fn polyline_road(
         "encoded_polyline": osrm::encode_polyline(&line.points),
         "points": points.len(),
         "distance_m": distance.round(),
+    }))
+}
+
+/// A line to snap to the roads (section 31): the line as it is drawn.
+#[derive(Deserialize)]
+pub struct SnapBody {
+    encoded_polyline: String,
+}
+
+/// The most of a line `polyline:snap` takes: a long GPS line, not a feed.
+pub const SNAP_MAX_POINTS: usize = 20_000;
+const SNAP_MAX_M: f64 = 300_000.0;
+const SNAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// `POST /feeds/{g}/polyline:snap` - the line given, fitted to the roads it
+/// follows with OSRM's map matching: the dashboard's "Snap to the roads" for a
+/// line traced by hand (section 31). What OSRM cannot match, or matches onto
+/// another road than the one drawn (more than 40 m away), stays as drawn, and
+/// the answer says how much was snapped. Nothing is read or saved.
+pub async fn polyline_snap(
+    req: HttpRequest,
+    st: Data,
+    path: web::Path<String>,
+    body: web::Json<SnapBody>,
+) -> EditorResult<HttpResponse> {
+    let g = path.into_inner();
+    auth::require_feed(&req, &st, &g, Role::Editor).await?;
+    let Some(points) = osrm::decode_polyline(&body.encoded_polyline).filter(|p| p.len() >= 2)
+    else {
+        return Err(EditorError::bad_request(
+            "invalid_polyline",
+            "encoded_polyline does not decode to at least two points",
+        ));
+    };
+    let length = osrm::length_m(&points);
+    if points.len() > SNAP_MAX_POINTS || length > SNAP_MAX_M {
+        return Err(EditorError::bad_request(
+            "invalid_polyline",
+            format!(
+                "a line to snap has at most {SNAP_MAX_POINTS} points and {} km ({} points, {} km given)",
+                SNAP_MAX_M / 1000.0,
+                points.len(),
+                (length / 1000.0).round()
+            ),
+        ));
+    }
+    let Some(base) = st.osrm_url.as_deref().filter(|u| !u.is_empty()) else {
+        return Err(EditorError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "osrm_unavailable",
+            "no OSRM server is configured",
+        ));
+    };
+    // points a click apart: closer samples, and a little more room to a road
+    // than a GPS ping gets
+    let opts = osrm::MatchOptions {
+        step_m: 25.0,
+        radius_m: 35.0,
+        ..Default::default()
+    };
+    let m = osrm::match_path(&st.http, Some(base), &points, &opts, SNAP_BUDGET).await;
+    ok(json!({
+        "encoded_polyline": osrm::encode_polyline(&m.points),
+        "quality": m.quality,
+        "matched_share": (m.matched_share * 1000.0).round() / 1000.0,
+        "kept_as_drawn": m.detours + m.off_path,
+        "error": m.error,
     }))
 }
 
