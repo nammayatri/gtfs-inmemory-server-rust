@@ -3853,8 +3853,8 @@ change sets, in two steps, because the second needs the first live:
 2. **Trips**: once that set is committed, a `route_trips/replace` for every route
    whose trips differ, at most 5,000 trips a set, a route never split.
 
-Stops, routes and the feed's own stop orders are compared and reported
-(`differences`), never written. A trip on the default timing carries only its
+Stops and the feed's own stop orders are compared and reported
+(`differences`), never written; routes too, unless asked for (section 32). A trip on the default timing carries only its
 start time, so a route whose one stop order in the zip the feed has otherwise
 gets its trips on the feed's first stop order (`moved`: a zip made before the
 stop order was edited says when the route runs, not where); any other route
@@ -3865,8 +3865,8 @@ importing a seeded feed's own zip finds nothing to do. The changes are planned
 as uploads of the same rows are (`bulk::plan_into_set`) and each set is replayed
 as a review would; any error writes nothing.
 
-`gtfs_feed draft-import --db URL --zip Z --as EMAIL [--files F,F] [--write]`, or
-`POST /feeds/{g}/import?mode=drafts[&files=][&dry_run=false]` (admin; a dry run
+`gtfs_feed draft-import --db URL --zip Z --as EMAIL [--files F,F] [--routes] [--write]`, or
+`POST /feeds/{g}/import?mode=drafts[&files=][&routes=true][&dry_run=false]` (admin; a dry run
 unless asked). Audited `gtfs_draft_import`.
 
 **chennai_bus, locally** (seeded from nandi's mapping, as master was, then the
@@ -3971,7 +3971,8 @@ Going back is the same draft the other way.
   stop time calling at a Flex zone is a finding and not stored.
 - `stop_code` is not editable; a stop's code stays what it was seeded or created
   with.
-- A draft import never writes stops, routes or the feed's own stop orders.
+- A draft import never writes stops or the feed's own stop orders, nor routes
+  unless asked (section 32), and never makes or deletes a route.
 - The MTC sync (16.8) is still to build.
 
 Settled while implementing:
@@ -6196,3 +6197,93 @@ file and one that is no line; simplify; snap, and the router failing; route
 through a stop; copy route 45B's line reversed; export read back; into the
 draft as manual). The mock snaps 2 m north, and `/__dev/map-line` with
 `{"snap": "none"}` makes it match nothing.
+
+## 32. Map lines in and out of GTFS zips, and routes updated by an import (2026-11-27)
+
+A route's map line (`gtfs_route.encoded_polyline`, what GIMS serves and the
+editor draws) and a zip's `shapes.txt` (kept as records, section 18.5) were
+never connected: a line drawn in the editor was not in the zip a feed gives,
+so it was lost on the way to nandi and to any other tool, and a zip's shapes
+never gave a route its line. A draft import compared `routes.txt` and never
+wrote it, so a zip with new route names or colours could not update them.
+
+**A route's main shape** is the shape most of its trips run (the first of them
+on a tie); for a route with no trips, a shape named with its id that no trip
+runs. Code: `src/editor/route_lines.rs`.
+
+**In: a seed** (an empty feed, a new feed, a reload) gives each route its main
+shape as its line, with `polyline_source = 'imported'`. Its report counts
+them (`map_lines`). The shapes stay records, as before.
+
+**Out: the zip a feed gives** - the Feed page's download (full and published),
+the feed report, `gtfs_feed export` (what nandi publishes, 18.11) and
+`gtfs_feed validate` - carries each route's line as its main shape, after the
+published zip has left its inactive routes out:
+
+```
+the route's line                      the zip
+------------------------------------  ---------------------------------------------
+same as its main shape                unchanged
+drawn in the editor (osrm, gps,       the main shape, when only this route's trips
+manual, or no source)                   run it, takes the line's points (its
+                                        shape_dist_traveled goes);
+                                      a main shape the trips name that the feed
+                                        does not keep (chennai_bus) is made from it;
+                                      a main shape other routes run too stays
+                                        theirs, and this route's trips that ran it
+                                        run a new shape;
+                                      no shape run at all: a new shape, which its
+                                        trips run (a route with no trips: a shape
+                                        with its id, as a seed reads it back)
+imported, its main shape kept         unchanged: the shapes are what it came from,
+                                        or have been edited since, as records
+imported, its main shape not kept     written as a drawn line is
+```
+
+A new shape takes the route's id, or `{route_id}_line2`, ... when that is
+taken. A route's other shapes (a short working's) stay as they are. The
+download says how many routes' lines it wrote (`X-Map-Lines-As-Shapes`), and
+`gtfs_feed export` prints it. Exporting again gives the same bytes, and a seed
+of that zip gives the same lines back. The draft import's comparison, the
+seed's own check and a migration's bundle read the tables as they are, without
+this.
+
+**Routes updated by a draft import, when asked.** `routes=true` (the Feed
+page's "Also update the routes", `gtfs_feed draft-import --routes`) or
+`files=routes.txt` adds `routes.txt` to what the import writes; it is not in
+the default files, so an import of calendars or fares never undoes the
+routes' editing. Then each route the feed has that the zip changes gets one
+`route` update in the first change set (after the records, so it may name an
+agency they make):
+
+- the `routes.txt` fields that differ (`route_short_name`, `route_long_name`,
+  `route_color`, `route_text_color`, `route_type`, `agency_id`, `route_desc`,
+  `route_url`, `route_sort_order`, `continuous_*`, `network_id`); a field the
+  zip leaves out is cleared, but never `route_type`;
+- `active`, when the zip marks inactive routes (a full download's
+  `route_active`);
+- its map line, when the zip has a main shape for it that is not the feed's
+  line: `polyline_source` `imported` when the import brings `shapes.txt` and
+  the timetable too (the line comes with its shape and the trips that run
+  it), else `manual` (a line given by hand, which the export then writes and
+  the weekly GPS sync leaves alone).
+
+A route the feed does not have is not made, and one the zip leaves out is not
+deleted. The report's `routes` gives `updated`, `lines`, `not_in_feed` and
+samples, and the Feed page shows them. Nothing changes until the set is
+reviewed and committed.
+
+Tests: `editor::route_lines::tests` (the main shape; a seed's lines, by trips
+and by name; an imported line and its shape left alone, also when the shape
+was edited since; one whose shape the feed lacks written; a drawn line
+redrawing the shape only its route runs, a shape other routes run kept, a
+named shape the feed lacks made, a route with no shape given one, and read
+back in); `tests/gtfs_route_lines_flow.rs` against a local Postgres (a seed's
+lines and its zip back unchanged; lines drawn by hand and from GPS in the
+download, a shared shape kept, the header, the same bytes twice, that zip
+seeded as another feed giving the same lines; a draft import touching no route
+unless asked, `routes=true` with the default files and `routes.txt` alone, the
+exact route updates drafted, a route the feed lacks not made, committed
+through review, and the downloaded zip then carrying the new line). The Feed
+page's checkbox and report are not covered by the mock's smoke test, which
+does not have the Feed page (18.10).

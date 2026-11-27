@@ -14,8 +14,12 @@
 //! 2. **trips**: once that set is committed, a `route_trips/replace` for each
 //!    route whose trips differ, at most [`MAX_TRIPS_PER_SET`] trips a set.
 //!
-//! Stops, routes and the feed's own stop orders are never written: they are
-//! compared, and what differs is reported. A trip carries only its start time
+//! Stops and the feed's own stop orders are never written: they are compared,
+//! and what differs is reported. Routes are compared too, and written only when
+//! `routes.txt` is asked for (section 32): the routes the feed has get their
+//! `routes.txt` fields and their map line (their main shape in the zip) as
+//! route updates in the first set. A route the feed does not have is not
+//! made, nor one the zip leaves out deleted. A trip carries only its start time
 //! when it runs on the feed's default timing, so a route whose one stop order
 //! in the zip the feed has otherwise gets its trips on the feed's first stop
 //! order, timed as the feed times it (a zip made before the stop order was
@@ -52,7 +56,12 @@ use uuid::Uuid;
 pub const MAX_TRIPS_PER_SET: usize = 5_000;
 
 /// Files a draft import compares but never writes: the editor's own.
-pub const COMPARED_ONLY: &[&str] = &["stops.txt", "routes.txt"];
+pub const COMPARED_ONLY: &[&str] = &["stops.txt"];
+
+/// Files a draft import writes only when asked for by name: the routes' details
+/// and map lines are the editor's work, and an import that is about calendars
+/// or fares should not undo them (section 32).
+pub const ASKED_ONLY: &[&str] = &["routes.txt"];
 
 /// The timetable: in or out of an import together, and written as trips.
 const TIMETABLE: &[&str] = &["trips.txt", "stop_times.txt", "frequencies.txt"];
@@ -60,8 +69,11 @@ const TIMETABLE: &[&str] = &["trips.txt", "stop_times.txt", "frequencies.txt"];
 /// What to import, and as whom.
 pub struct DraftImport {
     /// The files it may write, by their GTFS names; None: every file the zip
-    /// has but [`COMPARED_ONLY`].
+    /// has but [`COMPARED_ONLY`] and [`ASKED_ONLY`].
     pub files: Option<Vec<String>>,
+    /// `routes.txt` too, besides `files` (or the default files): update the
+    /// routes the feed has, their details and map lines (section 32).
+    pub with_routes: bool,
     pub dry_run: bool,
     /// Who the change sets are drafted by.
     pub user_id: Uuid,
@@ -88,6 +100,9 @@ pub struct DraftImportReport {
     pub differences: BTreeMap<String, usize>,
     pub differences_sample: Vec<compare::Diff>,
     pub stop_orders: StopOrders,
+    /// With `routes.txt` asked for: the routes the feed has whose details or
+    /// map line the zip changes (section 32).
+    pub routes: RouteUpdates,
     /// Which step this run drafted: `records` or `trips`; `none` when the feed
     /// already holds what the zip says.
     pub step: &'static str,
@@ -101,6 +116,19 @@ pub struct DraftImportReport {
     pub next: Option<String>,
     /// What the zip breaks of the GTFS reference, as the feed report reads it.
     pub validation: crate::gtfs::validate::Report,
+}
+
+/// The routes an import with `routes.txt` updates (section 32).
+#[derive(Debug, Default, Serialize)]
+pub struct RouteUpdates {
+    /// Routes the feed has that the zip changes: their fields, their line.
+    pub updated: usize,
+    /// Of those, the ones whose map line changes.
+    pub lines: usize,
+    pub updated_sample: Vec<String>,
+    /// Routes in the zip the feed does not have: not made by an import.
+    pub not_in_feed: usize,
+    pub not_in_feed_sample: Vec<String>,
 }
 
 /// How the zip's stop orders sit on the feed's.
@@ -150,7 +178,10 @@ fn scope(raw: &RawFeed, asked: Option<&[String]>) -> EditorResult<BTreeSet<Strin
     match asked {
         None => {
             for f in spec::FILES {
-                if present(raw, f.name) && !COMPARED_ONLY.contains(&f.name) {
+                if present(raw, f.name)
+                    && !COMPARED_ONLY.contains(&f.name)
+                    && !ASKED_ONLY.contains(&f.name)
+                {
                     out.insert(f.name.to_string());
                 }
             }
@@ -210,7 +241,13 @@ pub async fn draft_import(
             ))
         }
     };
-    let files = scope(&raw, opts.files.as_deref())?;
+    let mut files = scope(&raw, opts.files.as_deref())?;
+    if opts.with_routes {
+        if !present(&raw, "routes.txt") {
+            return Err(bad("file_not_in_zip", "the zip has no routes.txt".into()));
+        }
+        files.insert("routes.txt".to_string());
+    }
     let timetable = files.contains("trips.txt") && files.contains("stop_times.txt");
     let mut report = DraftImportReport {
         gtfs_id: g.clone(),
@@ -264,6 +301,18 @@ pub async fn draft_import(
     let mut problems = Problems::default();
     let record_changes =
         record_changes(&mut tx, &g, &zip, &live, &files, &raw, &mut problems).await?;
+    let route_updates = if files.contains("routes.txt") {
+        // a line comes in as `imported` only with the shape it is and the
+        // trips that run it; on its own it is a line given by hand
+        let source = if files.contains("shapes.txt") && timetable {
+            super::route_lines::IMPORTED
+        } else {
+            "manual"
+        };
+        route_updates(&mut tx, &g, &zip, &live, &raw, source, &mut report.routes).await?
+    } else {
+        vec![]
+    };
     let service_rows = if files.contains("calendar.txt") || files.contains("calendar_dates.txt") {
         service_rows(&zip, &live, &files)
     } else {
@@ -315,6 +364,7 @@ pub async fn draft_import(
         );
     }
     let step1 = !record_changes.is_empty()
+        || !route_updates.is_empty()
         || !service_rows.is_empty()
         || !mapping.route_stop_rows.is_empty()
         || !mapping.profile_rows.is_empty();
@@ -329,6 +379,24 @@ pub async fn draft_import(
         let title = format!("{head}: records, calendars and stop orders");
         let set = new_set(&mut tx, &g, opts.user_id, &title, bytes.len()).await?;
         let mut changes = service::insert_changes(&mut tx, set, opts.user_id, &record_changes)
+            .await?
+            .len();
+        // after the records: a route may name an agency they make
+        let mut routes = Vec::with_capacity(route_updates.len());
+        for (route_id, mut after) in route_updates {
+            let (before, version) =
+                service::snapshot(&mut tx, set, &g, "route", "update", &route_id, &mut after)
+                    .await?;
+            routes.push(ChangeInsert {
+                entity: "route".into(),
+                op: "update".into(),
+                entity_key: route_id,
+                base_row_version: version,
+                before,
+                after,
+            });
+        }
+        changes += service::insert_changes(&mut tx, set, opts.user_id, &routes)
             .await?
             .len();
         for (kind, rows) in [
@@ -684,6 +752,100 @@ async fn record_changes(
                 after,
             });
         }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- routes
+
+/// The route updates that give each route the feed has what the zip says of
+/// it (section 32): the `routes.txt` fields that differ (a field the zip leaves
+/// out is cleared; `route_type` is never cleared), whether it is active when
+/// the zip marks inactive routes (a full download), and its map line when the
+/// zip has a main shape for it that is not the feed's line, with `source` as
+/// its `polyline_source`. `(route_id, after)` in the zip's order.
+async fn route_updates(
+    conn: &mut PgConnection,
+    g: &str,
+    zip: &FeedModel,
+    live: &FeedModel,
+    raw: &RawFeed,
+    source: &str,
+    report: &mut RouteUpdates,
+) -> EditorResult<Vec<(String, Value)>> {
+    let fspec = spec::file("routes.txt").expect("routes.txt");
+    let ours: HashMap<&str, &model::Route> = live
+        .routes
+        .iter()
+        .map(|r| (r.route_id.as_str(), r))
+        .collect();
+    // a full download marks inactive routes; any other zip says nothing of it
+    let marks_active = raw
+        .table("routes.txt")
+        .is_some_and(|t| t.col(feed_io::ROUTE_ACTIVE).is_some());
+    let lines = if raw.files.contains_key("shapes.txt") {
+        super::route_lines::lines_from_shapes(zip)
+    } else {
+        HashMap::new()
+    };
+    let feed_lines: HashMap<String, String> = super::route_lines::feed_lines(conn, g)
+        .await?
+        .into_iter()
+        .map(|l| {
+            (
+                l.route_id,
+                crate::services::osrm::encode_polyline(&l.points),
+            )
+        })
+        .collect();
+    let mut out = Vec::new();
+    for t in &zip.routes {
+        let Some(o) = ours.get(t.route_id.as_str()) else {
+            report.not_in_feed += 1;
+            if report.not_in_feed_sample.len() < 20 {
+                report.not_in_feed_sample.push(t.route_id.clone());
+            }
+            continue;
+        };
+        let mut after = Map::new();
+        for (field, api) in feed_io::ROUTE_COLUMNS {
+            let fs = fspec.field(field).expect("a routes.txt field");
+            let (theirs, was) = (t.values.get(field), o.values.get(field));
+            if theirs == was {
+                continue;
+            }
+            match theirs {
+                Some(v) => {
+                    after.insert(api.to_string(), spec::to_api(fs, &Some(v.clone())));
+                }
+                None if *field != "route_type" => {
+                    after.insert(api.to_string(), Value::Null);
+                }
+                None => {}
+            }
+        }
+        if marks_active {
+            let inactive = feed_io::route_inactive(&t.values);
+            if inactive != feed_io::route_inactive(&o.values) {
+                after.insert("active".into(), json!(!inactive));
+            }
+        }
+        if let Some(line) = lines.get(&t.route_id) {
+            let encoded = crate::services::osrm::encode_polyline(line);
+            if feed_lines.get(&t.route_id) != Some(&encoded) {
+                after.insert("encoded_polyline".into(), json!(encoded));
+                after.insert("polyline_source".into(), json!(source));
+                report.lines += 1;
+            }
+        }
+        if after.is_empty() {
+            continue;
+        }
+        report.updated += 1;
+        if report.updated_sample.len() < 20 {
+            report.updated_sample.push(t.route_id.clone());
+        }
+        out.push((t.route_id.clone(), Value::Object(after)));
     }
     Ok(out)
 }

@@ -160,7 +160,7 @@ pub struct Record {
 }
 
 /// A whole feed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeedModel {
     pub gtfs_id: String,
     pub stops: Vec<Stop>,

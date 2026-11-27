@@ -2668,6 +2668,8 @@ async fn import_full(
     }
     let di = draft_import::DraftImport {
         files: Some(TIMETABLE_FILES.iter().map(|s| s.to_string()).collect()),
+        // a route's details and line move with the route rows, not the timetable
+        with_routes: false,
         dry_run: opts.dry_run,
         user_id: ctx.user.user_id,
         email: ctx.user.email.clone(),

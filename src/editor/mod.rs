@@ -30,6 +30,7 @@ pub mod position_reviews;
 pub mod proposals;
 pub mod records;
 pub mod route_issues;
+pub mod route_lines;
 pub mod service;
 pub mod stage_reviews;
 pub mod stages;

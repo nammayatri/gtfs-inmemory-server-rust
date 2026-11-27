@@ -11,7 +11,7 @@
 //!     yet, from Z: written, read back, compared with Z in one transaction,
 //!     committed only with --seed and when nothing differs. Without --seed it
 //!     is a dry run that writes nothing.
-//! gtfs_feed draft-import --db URL --zip Z --as EMAIL [--gtfs-id G] [--files F,F] [--write]
+//! gtfs_feed draft-import --db URL --zip Z --as EMAIL [--gtfs-id G] [--files F,F] [--routes] [--write]
 //!     bring Z into feed G, which already has rows, through change sets
 //!     drafted by EMAIL: its records and calendars first, its trips once
 //!     those are committed (run it again). Stops, routes and the feed's stop
@@ -45,7 +45,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: gtfs_feed roundtrip --zip Z [--gtfs-id G] [--show N]\n       \
          gtfs_feed import --db URL --zip Z [--gtfs-id G] [--seed]\n       \
-         gtfs_feed draft-import --db URL --zip Z --as EMAIL [--gtfs-id G] [--files F,F] [--write]\n       \
+         gtfs_feed draft-import --db URL --zip Z --as EMAIL [--gtfs-id G] [--files F,F] [--routes] [--write]\n       \
          gtfs_feed export --db URL --gtfs-id G --out FILE [--full]\n       \
          gtfs_feed validate (--zip Z | --db URL --gtfs-id G) [--today D] [--show N]\n       \
          gtfs_feed compare --a Z --b Z [--files F,F] [--show N]"
@@ -175,6 +175,8 @@ async fn draft_import(args: &[String]) -> ExitCode {
     };
     let opts = draft_import::DraftImport {
         files: arg(args, "--files").map(|f| f.split(',').map(str::to_string).collect()),
+        // section 32: the routes' details and map lines too
+        with_routes: args.iter().any(|a| a == "--routes"),
         dry_run: !args.iter().any(|a| a == "--write"),
         user_id,
         email,
@@ -234,6 +236,18 @@ async fn export(args: &[String]) -> ExitCode {
                 left_out.len(),
                 left_out.join(", ")
             );
+        }
+    }
+    // the lines drawn in the editor, as the routes' shapes (section 32)
+    match feed_io::with_route_lines(&mut conn, &g, &mut m).await {
+        Ok(r) if r.routes > 0 => println!(
+            "{} route(s)' map lines written as shapes ({} added, {} redrawn, {} trips pointed at them)",
+            r.routes, r.shapes_added, r.shapes_redrawn, r.trips_repointed
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("{}: {}", e.code, e.message);
+            return ExitCode::from(1);
         }
     }
     let bytes = match write::zip_bytes(&write::to_raw(&m)) {
@@ -298,13 +312,20 @@ async fn validate(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        match feed_io::load_model(&mut conn, &g).await {
-            Ok((m, findings)) => (m, findings, format!("feed {g}")),
+        let loaded = match feed_io::load_model(&mut conn, &g).await {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("{}: {}", e.code, e.message);
                 return ExitCode::from(1);
             }
+        };
+        let (mut m, findings) = loaded;
+        // the zip it would give: with its map lines as shapes (section 32)
+        if let Err(e) = feed_io::with_route_lines(&mut conn, &g, &mut m).await {
+            eprintln!("{}: {}", e.code, e.message);
+            return ExitCode::from(1);
         }
+        (m, findings, format!("feed {g}"))
     };
     findings.extend(validate::validate(&m, &today));
     let report = validate::summarise(&findings, show);
