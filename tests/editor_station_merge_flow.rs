@@ -446,6 +446,7 @@ fn app_config(dir: &Path, db_url: &str) -> AppConfig {
         repeater_min_run_interval_secs: 3600,
         repeater_stuck_lock_timeout_secs: 600,
         route_schedule_drop_past_trips: true,
+        gps_processor_url: None,
         gtfs_editor_enabled: false,
         gtfs_editor_pomerium_jwks_url: None,
         gtfs_editor_audience: None,

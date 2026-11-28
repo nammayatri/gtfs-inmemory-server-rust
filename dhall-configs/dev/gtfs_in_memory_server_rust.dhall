@@ -93,6 +93,7 @@ in {
 
  enable_schedule_reconciliation=True,
  route_schedule_drop_past_trips=True,
+ gps_processor_url = None Text,
   -- OSRTC station cache configuration
   osrtc_base_url = Some "OSRTC_BASE_URL",
   osrtc_username = secrets.osrtc_username,

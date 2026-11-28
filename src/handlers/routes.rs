@@ -34,6 +34,7 @@ use crate::services::db_vehicle_reader::{
     chalo_gtfs_ids, filter_vehicles_by_status, is_chalo_gtfs_id,
 };
 use crate::services::depot_monitoring::DepotDayRequest;
+use crate::services::gps_segment_eta::SegmentSecondsByHour;
 use crate::services::osrtc_station_cache::osrtc_station_to_route_stop_mapping;
 // alias for query param map (string->string)
 type MapStringString = std::collections::HashMap<String, String>;
@@ -3600,15 +3601,17 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_KM * c
 }
 
-fn calculate_eta_from_db(
+fn calculate_stop_etas(
     route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
     trip_start_time: Option<i64>,
-    db_etas: &HashMap<(String, String), i32>,
+    model_seconds: Option<&SegmentSecondsByHour>,
+    db_etas: Option<&HashMap<(String, String), i32>>,
 ) -> Vec<crate::models::BusStopETA> {
-    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
     let now = chrono::Utc::now();
-
-    // Calculate cumulative travel time to each stop
+    let start = trip_start_time
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or(now);
+    let mut bus_stop_etas = Vec::with_capacity(route_stop_mappings.len());
     let mut cumulative_time_seconds: f64 = 0.0;
 
     for (idx, mapping) in route_stop_mappings.iter().enumerate() {
@@ -3618,51 +3621,30 @@ fn calculate_eta_from_db(
                 prev_mapping.stop_code.to_string(),
                 mapping.stop_code.to_string(),
             );
-
-            let time_seconds = if let Some(&eta_secs) = db_etas.get(&pair) {
-                // Get ETA for this consecutive pair from DB (value is already in seconds)
-                let prev_eta = eta_secs as f64;
-                info!(
-                    "calculate_eta_from_db - using DB pair ({}, {}): {} secs",
-                    prev_mapping.stop_code, mapping.stop_code, eta_secs
-                );
-                prev_eta
-            } else {
-                // If not found (new stop inserted), calculate distance from previous stop to current stop
-                let distance_km = haversine_distance(
-                    prev_mapping.stop_point.lat,
-                    prev_mapping.stop_point.lon,
-                    mapping.stop_point.lat,
-                    mapping.stop_point.lon,
-                );
-
-                // Calculate time to travel this distance at 25 km/hr
-                let time_hours = distance_km / SPEED_KM_PER_HOUR;
-                let haversine_eta = time_hours * 3600.0;
-                info!(
-                    "calculate_eta_from_db - fallback haversine pair ({}, {}): {} km -> {} secs",
-                    prev_mapping.stop_code, mapping.stop_code, distance_km, haversine_eta
-                );
-                haversine_eta
-            };
-
+            let departure_hour =
+                (start + chrono::Duration::seconds(cumulative_time_seconds as i64)).hour() as usize;
+            let time_seconds = db_etas
+                .and_then(|d| d.get(&pair))
+                .map(|&secs| secs as f64)
+                .or_else(|| {
+                    model_seconds
+                        .and_then(|m| m.get(&pair))
+                        .and_then(|by_hour| by_hour.get(departure_hour))
+                        .map(|&secs| secs as f64)
+                })
+                .unwrap_or_else(|| {
+                    haversine_distance(
+                        prev_mapping.stop_point.lat,
+                        prev_mapping.stop_point.lon,
+                        mapping.stop_point.lat,
+                        mapping.stop_point.lon,
+                    ) / SPEED_KM_PER_HOUR
+                        * 3600.0
+                });
             cumulative_time_seconds += time_seconds;
         }
 
-        // Calculate arrival time
-        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
-            // Calculate arrival time from trip start time
-            let start_utc =
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
-            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        } else {
-            // If no start time, use current time + cumulative time
-            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        };
-
-        let arrival_epoch = arrival_time.timestamp();
-
-        // Calculate ETA in seconds (time until arrival)
+        let arrival_time = start + chrono::Duration::seconds(cumulative_time_seconds as i64);
         let eta_seconds = if arrival_time > now {
             Some((arrival_time - now).num_seconds())
         } else {
@@ -3671,7 +3653,7 @@ fn calculate_eta_from_db(
 
         bus_stop_etas.push(crate::models::BusStopETA {
             stop_code: mapping.stop_code.to_string(),
-            arrival_time: arrival_epoch,
+            arrival_time: arrival_time.timestamp(),
             eta_seconds,
             stop_name: Some(mapping.stop_name.to_string()),
         });
@@ -3680,64 +3662,26 @@ fn calculate_eta_from_db(
     bus_stop_etas
 }
 
-/// Calculate arrival time and ETA based on haversine distance between stops
-/// Assumes constant speed of 25 km/hr
-fn calculate_eta_from_haversine_distance(
-    route_stop_mappings: &[std::sync::Arc<RouteStopMapping>],
+async fn model_segment_seconds(
+    app_state: &AppState,
+    gtfs_id: &str,
+    route_id: &str,
     trip_start_time: Option<i64>,
-) -> Vec<crate::models::BusStopETA> {
-    let mut bus_stop_etas: Vec<crate::models::BusStopETA> = Vec::new();
-    let now = chrono::Utc::now();
-
-    // Calculate cumulative travel time to each stop
-    let mut cumulative_time_seconds: f64 = 0.0;
-
-    for (idx, mapping) in route_stop_mappings.iter().enumerate() {
-        if idx > 0 {
-            // Calculate distance from previous stop to current stop
-            let prev_mapping = &route_stop_mappings[idx - 1];
-            let distance_km = haversine_distance(
-                prev_mapping.stop_point.lat,
-                prev_mapping.stop_point.lon,
-                mapping.stop_point.lat,
-                mapping.stop_point.lon,
-            );
-
-            // Calculate time to travel this distance at 25 km/hr
-            let time_hours = distance_km / SPEED_KM_PER_HOUR;
-            let time_seconds = time_hours * 3600.0;
-            cumulative_time_seconds += time_seconds;
-        }
-
-        // Calculate arrival time
-        let arrival_time = if let Some(start_epoch_millis) = trip_start_time {
-            // Calculate arrival time from trip start time
-            let start_utc =
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_epoch_millis).unwrap();
-            start_utc + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        } else {
-            // If no start time, use current time + cumulative time
-            now + chrono::Duration::seconds(cumulative_time_seconds as i64)
-        };
-
-        let arrival_epoch = arrival_time.timestamp();
-
-        // Calculate ETA in seconds (time until arrival)
-        let eta_seconds = if arrival_time > now {
-            Some((arrival_time - now).num_seconds())
-        } else {
-            None
-        };
-
-        bus_stop_etas.push(crate::models::BusStopETA {
-            stop_code: mapping.stop_code.to_string(),
-            arrival_time: arrival_epoch,
-            eta_seconds,
-            stop_name: Some(mapping.stop_name.to_string()),
-        });
+    by_day: &mut HashMap<u8, Option<Arc<SegmentSecondsByHour>>>,
+) -> Option<Arc<SegmentSecondsByHour>> {
+    let start = trip_start_time
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    let day_of_week = chrono::Datelike::weekday(&start).num_days_from_monday() as u8;
+    if let Some(cached) = by_day.get(&day_of_week) {
+        return cached.clone();
     }
-
-    bus_stop_etas
+    let fetched = app_state
+        .gps_segment_eta
+        .segment_seconds(gtfs_id, route_id, day_of_week)
+        .await;
+    by_day.insert(day_of_week, fetched.clone());
+    fetched
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3826,6 +3770,7 @@ pub async fn get_bus_trip_schedule(
         .collect();
 
     let db_etas = station_etas_for(&app_state, &gtfs_id, !all.is_empty()).await;
+    let mut model_by_day = HashMap::new();
     let mut schedule_details: BusScheduleDetails = Vec::new();
     for row in all {
         let trip_start_time: Option<i64> = if let (Some(hhmm), Some(duty)) =
@@ -3853,12 +3798,20 @@ pub async fn get_bus_trip_schedule(
                 .and_then(|s| s.parse::<i64>().ok())
         };
 
-        // Calculate ETAs
-
-        let bus_stop_etas = match &db_etas {
-            Some(db_etas) => calculate_eta_from_db(&route_stop_mappings, trip_start_time, db_etas),
-            None => calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time),
-        };
+        let model_seconds = model_segment_seconds(
+            &app_state,
+            &gtfs_id,
+            &route_id,
+            trip_start_time,
+            &mut model_by_day,
+        )
+        .await;
+        let bus_stop_etas = calculate_stop_etas(
+            &route_stop_mappings,
+            trip_start_time,
+            model_seconds.as_deref(),
+            db_etas.as_ref(),
+        );
 
         schedule_details.push(crate::models::BusScheduleDetail {
             eta: bus_stop_etas,
@@ -3941,6 +3894,7 @@ pub async fn get_bus_route_schedule(
         }
 
         let db_etas = station_etas_for(&app_state, &gtfs_id, !all_rows.is_empty()).await;
+        let mut model_by_day = HashMap::new();
         let now_secs = chrono::Utc::now().timestamp();
         let mut schedule_details: BusScheduleDetails = Vec::new();
         for row in all_rows {
@@ -3971,14 +3925,20 @@ pub async fn get_bus_route_schedule(
                     .and_then(|s| s.parse::<i64>().ok())
             };
 
-            let bus_stop_etas = match &db_etas {
-                Some(db_etas) => {
-                    calculate_eta_from_db(&route_stop_mappings, trip_start_time, db_etas)
-                }
-                None => {
-                    calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time)
-                }
-            };
+            let model_seconds = model_segment_seconds(
+                &app_state,
+                &gtfs_id,
+                &route_id,
+                trip_start_time,
+                &mut model_by_day,
+            )
+            .await;
+            let bus_stop_etas = calculate_stop_etas(
+                &route_stop_mappings,
+                trip_start_time,
+                model_seconds.as_deref(),
+                db_etas.as_ref(),
+            );
             let past_last_stop = app_state.config.route_schedule_drop_past_trips
                 && row.is_active_trip != Some(true)
                 && bus_stop_etas
@@ -4126,13 +4086,12 @@ pub async fn get_bus_route_schedule(
             });
 
             // Calculate ETAs using haversine distance function
-            bus_stop_etas =
-                calculate_eta_from_haversine_distance(&route_stop_mappings, trip_start_time);
+            bus_stop_etas = calculate_stop_etas(&route_stop_mappings, trip_start_time, None, None);
         }
 
         // If no trip details, calculate ETAs using haversine distance without start time
         if bus_stop_etas.is_empty() {
-            bus_stop_etas = calculate_eta_from_haversine_distance(&route_stop_mappings, None);
+            bus_stop_etas = calculate_stop_etas(&route_stop_mappings, None, None, None);
         }
 
         schedule_details.push(crate::models::BusScheduleDetail {
@@ -6238,5 +6197,96 @@ mod depot_v2_tests {
         let err = AppError::NotFoundCoded(error_codes::FLEET_NOT_FOUND, "nope".to_string());
         let resp = err.error_response();
         assert_eq!(resp.status().as_u16(), 404);
+    }
+}
+
+#[cfg(test)]
+mod stop_eta_tests {
+    use super::*;
+
+    fn stop(code: &str, lat: f64, lon: f64) -> Arc<RouteStopMapping> {
+        Arc::new(
+            serde_json::from_value(json!({
+                "providerCode": "GTFS",
+                "routeCode": "R1",
+                "sequenceNum": 0,
+                "stopCode": code,
+                "stopName": code,
+                "stopPoint": {"lat": lat, "lon": lon},
+                "vehicleType": "BUS"
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    fn utc_millis(h: u32, m: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 27)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn station_eta_then_model_then_haversine_per_pair() {
+        let stops = vec![
+            stop("a", 13.0, 80.0),
+            stop("b", 13.01, 80.0),
+            stop("c", 13.02, 80.0),
+            stop("d", 13.03, 80.0),
+        ];
+        let start = utc_millis(5, 0);
+        let mut bc = vec![999; 24];
+        bc[5] = 100;
+        let model: SegmentSecondsByHour =
+            HashMap::from([(pair("a", "b"), vec![999; 24]), (pair("b", "c"), bc)]);
+        let db = HashMap::from([(pair("a", "b"), 7)]);
+
+        let etas = calculate_stop_etas(&stops, Some(start), Some(&model), Some(&db));
+
+        let haversine_cd =
+            (haversine_distance(13.02, 80.0, 13.03, 80.0) / SPEED_KM_PER_HOUR * 3600.0) as i64;
+        let start_secs = start / 1000;
+        assert_eq!(etas.len(), 4);
+        assert_eq!(etas[0].arrival_time, start_secs);
+        assert_eq!(etas[1].arrival_time, start_secs + 7);
+        assert_eq!(etas[2].arrival_time, start_secs + 107);
+        assert_eq!(etas[3].arrival_time, start_secs + 107 + haversine_cd);
+    }
+
+    #[test]
+    fn model_uses_the_utc_hour_the_bus_leaves_the_previous_stop() {
+        let stops = vec![
+            stop("a", 13.0, 80.0),
+            stop("b", 13.01, 80.0),
+            stop("c", 13.02, 80.0),
+        ];
+        let start = utc_millis(5, 50);
+        let mut ab = vec![0; 24];
+        ab[5] = 900;
+        let mut bc = vec![0; 24];
+        bc[5] = 50;
+        bc[6] = 400;
+        let model: SegmentSecondsByHour =
+            HashMap::from([(pair("a", "b"), ab), (pair("b", "c"), bc)]);
+
+        let etas = calculate_stop_etas(&stops, Some(start), Some(&model), None);
+
+        assert_eq!(etas[2].arrival_time, start / 1000 + 900 + 400);
+    }
+
+    #[test]
+    fn without_model_or_station_eta_matches_plain_haversine() {
+        let stops = vec![stop("a", 13.0, 80.0), stop("b", 13.05, 80.05)];
+        let start = utc_millis(10, 0);
+        let etas = calculate_stop_etas(&stops, Some(start), None, None);
+        let expected =
+            (haversine_distance(13.0, 80.0, 13.05, 80.05) / SPEED_KM_PER_HOUR * 3600.0) as i64;
+        assert_eq!(etas[1].arrival_time, start / 1000 + expected);
     }
 }

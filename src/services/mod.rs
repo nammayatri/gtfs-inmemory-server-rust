@@ -7,6 +7,7 @@ pub mod db_vehicle_reader_internal;
 pub mod depot_monitoring;
 pub mod field_generator;
 pub mod fleet_operator;
+pub mod gps_segment_eta;
 pub mod gtfs_db_source;
 pub mod gtfs_service;
 pub mod gtfs_timing;

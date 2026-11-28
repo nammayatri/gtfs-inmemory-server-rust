@@ -18,6 +18,7 @@ use crate::services::{
         DBVehicleReaderInternal, MockDBVehicleReaderInternal, VehicleDataReaderInternal,
     },
     fleet_operator::{DBFleetOperatorService, FleetOperatorService, MockFleetOperatorService},
+    gps_segment_eta::GpsSegmentEtaClient,
     gtfs_service::GTFSService,
     metro_graph::MetroGraph,
     operator::{DBOperatorService, MockOperatorService, OperatorService},
@@ -136,6 +137,8 @@ pub struct AppConfig {
     pub repeater_stuck_lock_timeout_secs: i64,
     #[serde(default = "default_route_schedule_drop_past_trips")]
     pub route_schedule_drop_past_trips: bool,
+    #[serde(default)]
+    pub gps_processor_url: Option<String>,
     /// GTFS metadata editor (docs/gtfs-editor.md). Every field is optional so
     /// existing dhall configs still parse; the editor stays off unless enabled.
     #[serde(default)]
@@ -423,6 +426,7 @@ pub struct AppState {
     pub service_hopper: Arc<ArcSwap<HashMap<String, Arc<FeedHoppers>>>>,
     pub depot_manager_details: Arc<HashMap<String, crate::models::DepotManagerDetails>>,
     pub chennai_service_type_cache: Arc<RwLock<HashMap<String, (Instant, Option<String>)>>>,
+    pub gps_segment_eta: Arc<GpsSegmentEtaClient>,
 }
 
 impl AppState {
@@ -644,6 +648,10 @@ impl AppState {
         // Load depot manager details from CSV
         let depot_manager_details = Arc::new(Self::load_depot_manager_details().await?);
 
+        let gps_segment_eta = Arc::new(GpsSegmentEtaClient::new(
+            app_config.gps_processor_url.clone(),
+        ));
+
         let app_state = AppState {
             gtfs_service,
             db_vehicle_reader,
@@ -662,6 +670,7 @@ impl AppState {
             service_hopper,
             depot_manager_details,
             chennai_service_type_cache: Arc::new(RwLock::new(HashMap::new())),
+            gps_segment_eta,
         };
 
         Ok(app_state)
